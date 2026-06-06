@@ -413,3 +413,32 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
 
   return is_separate;
 }
+
+void validate_sparse_single_layer_inputs(
+    const torch::Tensor &slot_mapping_packed,
+    const torch::Tensor &selected_token_idx) {
+  if (slot_mapping_packed.dim() != 1 || selected_token_idx.dim() != 1) {
+    PyErr_SetString(PyExc_ValueError,
+                    "slot_mapping_packed and selected_token_idx must be 1D.");
+    throw py::error_already_set();
+  }
+
+  if (slot_mapping_packed.size(0) != selected_token_idx.size(0)) {
+    PyErr_SetString(
+        PyExc_ValueError,
+        "slot_mapping_packed and selected_token_idx must have the same length.");
+    throw py::error_already_set();
+  }
+
+  if (selected_token_idx.scalar_type() != at::ScalarType::Int) {
+    PyErr_SetString(PyExc_ValueError,
+                    "selected_token_idx must be torch.int32.");
+    throw py::error_already_set();
+  }
+
+  if (!selected_token_idx.device().is_privateuseone()) {
+    PyErr_SetString(PyExc_ValueError,
+                    "selected_token_idx must be on NPU device.");
+    throw py::error_already_set();
+  }
+}

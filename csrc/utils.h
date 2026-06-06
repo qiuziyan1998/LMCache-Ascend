@@ -185,6 +185,10 @@ void execute_batched_memcpy(
 bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
                           int kvcache_format_raw);
 
+void validate_sparse_single_layer_inputs(
+    const torch::Tensor &slot_mapping_packed,
+    const torch::Tensor &selected_token_idx);
+
 template <typename KernelLauncher>
 void run_batched_fused_transfer(const SingleLayerKVConfig &config,
                                 const std::vector<torch::Tensor> &lmc_tensors,
@@ -212,6 +216,30 @@ void run_batched_fused_transfer(const SingleLayerKVConfig &config,
       kernel_launcher(true); // Gather Kernel
       execute_batched_memcpy(config, meta, chunk_offsets, true); // D2H
     }
+    return 0;
+  });
+  cmd.Run();
+}
+
+template <typename SparseKernelLauncher>
+void run_batched_fused_sparse_transfer(
+    const SingleLayerKVConfig &config,
+    const std::vector<torch::Tensor> &lmc_tensors,
+    const std::vector<int64_t> &chunk_offsets,
+    const std::vector<int64_t> &chunk_sizes, int64_t element_size,
+    SparseKernelLauncher kernel_launcher) {
+
+  HostChunkMetadata meta =
+      prepare_host_chunk_metadata(lmc_tensors, chunk_sizes, config.strides,
+                                  element_size, config.token_major);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("batched_fused_sparse_single_layer_kv_transfer");
+
+  cmd.SetCustomHandler([config, meta, chunk_offsets, kernel_launcher]() -> int {
+    // Swap in only: CPU -> staging -> sparse scatter to paged memory.
+    execute_batched_memcpy(config, meta, chunk_offsets, false);
+    kernel_launcher();
     return 0;
   });
   cmd.Run();

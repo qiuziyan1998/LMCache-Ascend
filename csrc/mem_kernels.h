@@ -55,6 +55,29 @@ void single_layer_kv_transfer_kernel_v2_separate(
     const int32_t numHeads, const int32_t headDims, const int32_t numTokens,
     const int32_t blockSize, const bool page2L, const bool lmcTokensMajor);
 
+void single_layer_kv_transfer_kernel_v2_sparse(
+    kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
+    uint32_t blockDim, void *stream, uint8_t *lmcKeyValueCachePtr,
+    uint8_t *vllmKeyValueCache, uint8_t *slotMappingPtr,
+    uint8_t *selectedTokenIdxPtr, const int64_t vllmBlockStride,
+    const int64_t vllmValueOffset, const int64_t vllmBufferSize,
+    const int64_t lmcTokenStride, const int64_t lmcValueOffset,
+    const int64_t lmcBufferSize, const int32_t maxTokensPerLoop,
+    const int32_t numHeads, const int32_t headDims, const int32_t numTokens,
+    const int32_t blockSize, const bool lmcTokensMajor);
+
+void single_layer_kv_transfer_kernel_v2_separate_sparse(
+    kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
+    uint32_t blockDim, void *stream, uint8_t *lmcKeyValueCachePtr,
+    uint8_t *vllmKeyPtr, uint8_t *vllmValuePtr, uint8_t *slotMappingPtr,
+    uint8_t *selectedTokenIdxPtr, const int64_t keyBlockStride,
+    const int64_t valueBlockStride, const int64_t vllmKeyBufferSize,
+    const int64_t vllmValueBufferSize, const int64_t lmcTokenStride,
+    const int64_t lmcValueOffset, const int64_t lmcBufferSize,
+    const int32_t maxTokensPerLoop, const int32_t numHeads,
+    const int32_t headDims, const int32_t numTokens, const int32_t blockSize,
+    const bool lmcTokensMajor);
+
 void load_and_reshape_flash_kernel(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     uint32_t blockDim, void *stream, uint8_t *dstCacheTensor,
@@ -108,6 +131,24 @@ void batched_fused_single_layer_kv_transfer(
     std::vector<torch::Tensor> &vllm_kv_caches,
     torch::Tensor &slot_mapping_full, std::vector<int64_t> &chunk_offsets,
     std::vector<int64_t> &chunk_sizes, const bool direction,
+    const int kvcache_format_raw, const bool token_major = false,
+    const bool vllm_two_major = false);
+
+// Sparse scatter: staging (LMC layout) -> paged vLLM KV.
+// slot_mapping_packed and selected_token_idx are parallel packed arrays with no
+// -1 holes. selected_token_idx[i] is the LMC staging token index for entry i.
+void sparse_single_layer_kv_transfer(
+    torch::Tensor &lmc_key_value_cache, std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    const int kvcache_format_raw, const bool token_major = false,
+    const bool vllm_two_major = false);
+
+// Fused sparse scatter: N x H2D memcpy + sparse scatter kernel.
+void batched_fused_sparse_single_layer_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors, torch::Tensor &staging_cache,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    std::vector<int64_t> &chunk_offsets, std::vector<int64_t> &chunk_sizes,
     const int kvcache_format_raw, const bool token_major = false,
     const bool vllm_two_major = false);
 

@@ -49,6 +49,30 @@ void batched_fused_single_layer_kv_transfer_wrapper(
       vllm_two_major);
 }
 
+void sparse_single_layer_kv_transfer_wrapper(
+    torch::Tensor &lmc_key_value_cache, const py::object &vllm_kv_caches_obj,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    int kvcache_format_raw, bool token_major, bool vllm_two_major) {
+  auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
+  sparse_single_layer_kv_transfer(lmc_key_value_cache, vllm_kv_caches,
+                                  slot_mapping_packed, selected_token_idx,
+                                  kvcache_format_raw, token_major,
+                                  vllm_two_major);
+}
+
+void batched_fused_sparse_single_layer_kv_transfer_wrapper(
+    std::vector<torch::Tensor> &lmc_tensors, torch::Tensor &staging_cache,
+    const py::object &vllm_kv_caches_obj, torch::Tensor &slot_mapping_packed,
+    torch::Tensor &selected_token_idx, std::vector<int64_t> &chunk_offsets,
+    std::vector<int64_t> &chunk_sizes, int kvcache_format_raw, bool token_major,
+    bool vllm_two_major) {
+  auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
+  batched_fused_sparse_single_layer_kv_transfer(
+      lmc_tensors, staging_cache, vllm_kv_caches, slot_mapping_packed,
+      selected_token_idx, chunk_offsets, chunk_sizes, kvcache_format_raw,
+      token_major, vllm_two_major);
+}
+
 PYBIND11_MODULE(c_ops, m) {
   m.def("get_device_ptr", [](uintptr_t ptr_addr) {
     return reinterpret_cast<uintptr_t>(
@@ -69,6 +93,10 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("single_layer_kv_transfer", &single_layer_kv_transfer_wrapper);
   m.def("batched_fused_single_layer_kv_transfer",
         &batched_fused_single_layer_kv_transfer_wrapper);
+  m.def("sparse_single_layer_kv_transfer",
+        &sparse_single_layer_kv_transfer_wrapper);
+  m.def("batched_fused_sparse_single_layer_kv_transfer",
+        &batched_fused_sparse_single_layer_kv_transfer_wrapper);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
   m.def("load_and_reshape_flash", &load_and_reshape_flash);

@@ -352,6 +352,93 @@ void batched_fused_single_layer_kv_transfer(
   }
 }
 
+static void launch_sparse_single_layer_kernel(
+    const SingleLayerKVConfig &config, bool is_separate,
+    uint8_t *selected_token_idx_ptr) {
+  if (!is_separate) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_sparse(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, config.ptrs.lmc_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, config.strides.vllm_k_stride,
+        config.strides.vllm_val_offset, config.strides.vllm_k_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.strides.lmc_bytes, config.ub_params.max_tokens_per_loop,
+        config.dims.num_heads, config.dims.head_dims, config.dims.num_tokens,
+        config.dims.block_size, config.token_major);
+  } else {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_separate_sparse(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, config.ptrs.lmc_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.slot_mapping_ptr, selected_token_idx_ptr,
+        config.strides.vllm_k_stride, config.strides.vllm_v_stride,
+        config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.strides.lmc_bytes, config.ub_params.max_tokens_per_loop,
+        config.dims.num_heads, config.dims.head_dims, config.dims.num_tokens,
+        config.dims.block_size, config.token_major);
+  }
+}
+
+void sparse_single_layer_kv_transfer(
+    torch::Tensor &lmc_key_value_cache, std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major) {
+  bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      lmc_key_value_cache, vllm_kv_caches, slot_mapping_packed, false,
+      token_major, vllm_two_major, is_separate);
+
+  uint8_t *selected_token_idx_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name(is_separate ? "single_layer_kv_transfer_kernel_v2_separate_sparse"
+                       : "single_layer_kv_transfer_kernel_v2_sparse");
+
+  cmd.SetCustomHandler([config, is_separate, selected_token_idx_ptr]() -> int {
+    launch_sparse_single_layer_kernel(config, is_separate,
+                                      selected_token_idx_ptr);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void batched_fused_sparse_single_layer_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors, torch::Tensor &staging_cache,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    std::vector<int64_t> &chunk_offsets, std::vector<int64_t> &chunk_sizes,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major) {
+  bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      staging_cache, vllm_kv_caches, slot_mapping_packed, false, token_major,
+      vllm_two_major, is_separate);
+
+  uint8_t *selected_token_idx_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  int64_t element_size = staging_cache.element_size();
+
+  auto launcher = [config, is_separate, selected_token_idx_ptr]() {
+    launch_sparse_single_layer_kernel(config, is_separate,
+                                      selected_token_idx_ptr);
+  };
+
+  run_batched_fused_sparse_transfer(config, lmc_tensors, chunk_offsets,
+                                    chunk_sizes, element_size, launcher);
+}
+
 void load_and_reshape_flash(
     torch::Tensor &key_value, // [2, num_layer, num_tokens, num_heads*head_size]
                               // must be one gpu / pinned cpu
