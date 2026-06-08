@@ -5,7 +5,8 @@ LMCacheEngine for Ascend NPU.
 """
 
 # Standard
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 import queue
 import threading
 import time
@@ -15,6 +16,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
+    _lmcache_nvtx_annotate,
     convert_tokens_to_list,
 )
 from lmcache.v1.cache_engine import LMCacheEngine
@@ -26,6 +28,40 @@ from lmcache.v1.token_database import TokenDatabase
 import torch
 
 logger = init_logger(__name__)
+
+# Thread-local guard for retrieve_layer() on LocalCPUBackend.  Upstream
+# retrieve_layer() unpins disk staging objects after the device sync, but
+# lookup_unpin() in wait_for_save() already unpins LocalCPU hot-cache objects
+# pinned by lookup(pin=True).  batched_get_non_blocking() returns the same
+# Python object, so both paths unpin once -> pin_count goes negative (#2954).
+_retrieve_layer_skip_localcpu_unpin = threading.local()
+
+
+@contextmanager
+def _skip_localcpu_unpin_in_retrieve_layer():
+    _retrieve_layer_skip_localcpu_unpin.active = True
+    try:
+        yield
+    finally:
+        _retrieve_layer_skip_localcpu_unpin.active = False
+
+
+def _install_memory_obj_unpin_guard() -> None:
+    if getattr(MemoryObj, "_ascend_unpin_guard_installed", False):
+        return
+
+    original_unpin = MemoryObj.unpin
+
+    def guarded_unpin(self: MemoryObj) -> None:
+        if getattr(_retrieve_layer_skip_localcpu_unpin, "active", False):
+            return
+        original_unpin(self)
+
+    MemoryObj.unpin = guarded_unpin  # type: ignore[method-assign]
+    MemoryObj._ascend_unpin_guard_installed = True
+
+
+_install_memory_obj_unpin_guard()
 
 
 class ThreadSafeEventList:
@@ -444,6 +480,54 @@ class AscendLMCacheEngine(LMCacheEngine):
     def lookup_unpin(self, lookup_id: str) -> None:
         with self._engine_state_lock:
             super().lookup_unpin(lookup_id)
+
+    def _resolve_layerwise_retrieve_location(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        kwargs: dict,
+    ) -> Optional[str]:
+        location = None
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        for _start, _end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            keys_multi_layer = key.split_layers(self.num_layers)
+            if current_location := self.storage_manager.contains(
+                keys_multi_layer[0], self.retrieve_locations
+            ):
+                if location is None:
+                    location = current_location
+                else:
+                    assert location == current_location, (
+                        "All retrieved keys should be from the same location "
+                        "when use layerwise retrieval."
+                    )
+            else:
+                break
+        return location
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def retrieve_layer(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Layerwise retrieve with LocalCPU double-unpin guard (LMCache #2954)."""
+        location = self._resolve_layerwise_retrieve_location(tokens, mask, kwargs)
+        if location == "LocalCPUBackend":
+            with _skip_localcpu_unpin_in_retrieve_layer():
+                yield from super().retrieve_layer(tokens, mask=mask, **kwargs)
+            return
+        yield from super().retrieve_layer(tokens, mask=mask, **kwargs)
 
     @torch.inference_mode()
     def store(
