@@ -1276,14 +1276,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         :param sparse_retrieve: When True, scatter only selected tokens via the
             sparse kernel instead of dense ``slot_mapping_full`` load.
 
-        :param slot_mapping_packed: Packed destination paged slots for sparse
-            retrieve, shape ``[num_sparse]``. Placeholder until vLLM adapter
-            supplies it.
-
-        :param selected_token_idx: LMC staging source token indices for sparse
-            retrieve, shape ``[num_sparse]``, ``torch.int32`` on NPU.
-            Placeholder until vLLM adapter supplies it.
-
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
@@ -1345,14 +1337,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
-            packed_objects = yield
-            if len(packed_objects) == 3:
-                memory_objs_layer, selected_token_idx, token_start_index = packed_objects
-                slot_mapping_packed = slot_mapping_full[token_start_index]
-            elif len(packed_objects) == 1:
-                memory_objs_layer = packed_objects[0]
-                slot_mapping_packed = slot_mapping_full
+            memory_objs_layer, selected_token_idx, token_start_index = yield
+            slot_mapping_packed = slot_mapping_full[token_start_index] # mayb not right, expect slot_mapping_full == slot_mapping
+            if selected_token_idx is None:
                 selected_token_idx = torch.arange(slot_mapping_packed.shape[0], dtype=torch.int32, device=self.kv_device)
+            else:
+                selected_token_idx = selected_token_idx.to(self.kv_device)
 
             if sync:
                 current_stream.wait_stream(self.load_stream)
