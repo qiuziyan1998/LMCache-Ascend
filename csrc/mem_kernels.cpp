@@ -10,6 +10,25 @@
 
 namespace py = pybind11;
 
+static bool is_mla_dsa_format(kvcache_ops::KVCacheFormat format) {
+  return format == kvcache_ops::KVCacheFormat::MLA_KV ||
+         format == kvcache_ops::KVCacheFormat::DSA_KV;
+}
+
+static void launch_single_layer_mla_dsa_kernel(const SingleLayerKVConfig &config,
+                                               bool page2L) {
+  kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa(
+      config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+      config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
+      config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+      config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+      config.strides.lmc_bytes, config.strides.vllm_k_bytes,
+      config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
+      config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
+      config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
+      config.dims.lmc_num_tokens, config.dims.block_size, page2L);
+}
+
 /**
  * Quickly offload KV cache from vLLM paged memory to the offloading buffer
  * Processes all the layers at the same time
@@ -231,24 +250,30 @@ void single_layer_kv_transfer(
     const int kvcache_format_raw, // 1: MERGED_KV, 2: SEPARATE_KV
     const bool
         token_major, // true: [tokens, 2, hidden], false: [2, tokens, hidden]
-    const bool vllm_two_major // true: [2, blocks, ...], false: [blocks, 2, ...]
-                              // (only for MERGED_KV)
-) {
+    const bool vllm_two_major, // true: [2, blocks, ...], false: [blocks, 2, ...]
+                               // (only for MERGED_KV)
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
   bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
 
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping));
 
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       lmc_key_value_cache, vllm_kv_caches, slot_mapping, direction, token_major,
-      vllm_two_major, is_separate);
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
 
   at_npu::native::OpCommand cmd;
-  cmd.Name(is_separate ? "single_layer_kv_transfer_kernel_v2_separate"
-                       : "single_layer_kv_transfer_kernel_v2");
 
-  cmd.SetCustomHandler([config, is_separate]() -> int {
-    if (!is_separate) {
-      // Merged KV Kernel
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    cmd.Name("single_layer_kv_transfer_kernel_v2_mla_dsa");
+    cmd.SetCustomHandler([config]() -> int {
+      launch_single_layer_mla_dsa_kernel(config, config.direction);
+      return 0;
+    });
+  } else if (!is_separate) {
+    cmd.Name("single_layer_kv_transfer_kernel_v2");
+    cmd.SetCustomHandler([config]() -> int {
       kvcache_ops::single_layer_kv_transfer_kernel_v2(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
           config.ub_params.aiv_num, config.ub_params.stream,
@@ -259,8 +284,11 @@ void single_layer_kv_transfer(
           config.strides.lmc_bytes, config.ub_params.max_tokens_per_loop,
           config.dims.num_heads, config.dims.head_dims, config.dims.num_tokens,
           config.dims.block_size, config.direction, config.token_major);
-    } else {
-      // Separate KV Kernel
+      return 0;
+    });
+  } else {
+    cmd.Name("single_layer_kv_transfer_kernel_v2_separate");
+    cmd.SetCustomHandler([config]() -> int {
       kvcache_ops::single_layer_kv_transfer_kernel_v2_separate(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
           config.ub_params.aiv_num, config.ub_params.stream,
@@ -272,9 +300,9 @@ void single_layer_kv_transfer(
           config.ub_params.max_tokens_per_loop, config.dims.num_heads,
           config.dims.head_dims, config.dims.num_tokens, config.dims.block_size,
           config.direction, config.token_major);
-    }
-    return 0;
-  });
+      return 0;
+    });
+  }
   cmd.Run();
 }
 
@@ -303,8 +331,9 @@ void batched_fused_single_layer_kv_transfer(
     const int kvcache_format_raw,
     const bool
         token_major, // true: [tokens, 2, hidden], false: [2, tokens, hidden]
-    const bool vllm_two_major // true: [2, blocks, ...], false: [blocks, 2, ...]
-) {
+    const bool vllm_two_major, // true: [2, blocks, ...], false: [blocks, 2, ...]
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
 
   bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
 
@@ -313,11 +342,18 @@ void batched_fused_single_layer_kv_transfer(
 
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       staging_cache, vllm_kv_caches, slot_mapping_full, direction, token_major,
-      vllm_two_major, is_separate);
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
 
   int64_t element_size = staging_cache.element_size();
 
-  if (!is_separate) {
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    auto launcher = [config](bool is_gather) {
+      launch_single_layer_mla_dsa_kernel(config, is_gather);
+    };
+    run_batched_fused_transfer(config, lmc_tensors, chunk_offsets, chunk_sizes,
+                               element_size, launcher);
+  } else if (!is_separate) {
     auto launcher = [config](bool is_gather) {
       kvcache_ops::single_layer_kv_transfer_kernel_v2(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
@@ -352,9 +388,25 @@ void batched_fused_single_layer_kv_transfer(
   }
 }
 
-static void launch_sparse_single_layer_kernel(
-    const SingleLayerKVConfig &config, bool is_separate,
-    uint8_t *selected_token_idx_ptr) {
+static void launch_sparse_single_layer_kernel(const SingleLayerKVConfig &config,
+                                              uint8_t *selected_token_idx_ptr) {
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
+        config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, config.strides.lmc_bytes,
+        config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+        config.strides.vllm_dsa_bytes, config.ub_params.max_tokens_per_loop,
+        config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims,
+        config.dims.num_tokens, config.dims.lmc_num_tokens,
+        config.dims.block_size);
+    return;
+  }
+
+  bool is_separate =
+      config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV;
   if (!is_separate) {
     kvcache_ops::single_layer_kv_transfer_kernel_v2_sparse(
         config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
@@ -385,26 +437,33 @@ void sparse_single_layer_kv_transfer(
     torch::Tensor &lmc_key_value_cache, std::vector<torch::Tensor> &vllm_kv_caches,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     const int kvcache_format_raw, const bool token_major,
-    const bool vllm_two_major) {
-  bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
   validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
 
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
 
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       lmc_key_value_cache, vllm_kv_caches, slot_mapping_packed, false,
-      token_major, vllm_two_major, is_separate);
+      token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
+      v_hidden_dims, dsa_hidden_dims);
 
   uint8_t *selected_token_idx_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
 
   at_npu::native::OpCommand cmd;
-  cmd.Name(is_separate ? "single_layer_kv_transfer_kernel_v2_separate_sparse"
-                       : "single_layer_kv_transfer_kernel_v2_sparse");
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    cmd.Name("single_layer_kv_transfer_kernel_v2_mla_dsa_sparse");
+  } else {
+    bool is_separate =
+        config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV;
+    cmd.Name(is_separate ? "single_layer_kv_transfer_kernel_v2_separate_sparse"
+                         : "single_layer_kv_transfer_kernel_v2_sparse");
+  }
 
-  cmd.SetCustomHandler([config, is_separate, selected_token_idx_ptr]() -> int {
-    launch_sparse_single_layer_kernel(config, is_separate,
-                                      selected_token_idx_ptr);
+  cmd.SetCustomHandler([config, selected_token_idx_ptr]() -> int {
+    launch_sparse_single_layer_kernel(config, selected_token_idx_ptr);
     return 0;
   });
   cmd.Run();
@@ -416,23 +475,24 @@ void batched_fused_sparse_single_layer_kv_transfer(
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     std::vector<int64_t> &chunk_offsets, std::vector<int64_t> &chunk_sizes,
     const int kvcache_format_raw, const bool token_major,
-    const bool vllm_two_major) {
-  bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
   validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
 
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
 
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       staging_cache, vllm_kv_caches, slot_mapping_packed, false, token_major,
-      vllm_two_major, is_separate);
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
 
   uint8_t *selected_token_idx_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
   int64_t element_size = staging_cache.element_size();
 
-  auto launcher = [config, is_separate, selected_token_idx_ptr]() {
-    launch_sparse_single_layer_kernel(config, is_separate,
-                                      selected_token_idx_ptr);
+  auto launcher = [config, selected_token_idx_ptr]() {
+    launch_sparse_single_layer_kernel(config, selected_token_idx_ptr);
   };
 
   run_batched_fused_sparse_transfer(config, lmc_tensors, chunk_offsets,

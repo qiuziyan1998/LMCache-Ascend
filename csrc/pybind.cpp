@@ -25,15 +25,16 @@ std::vector<torch::Tensor> normalize_kv_caches(const py::object &input) {
   }
 }
 
-void single_layer_kv_transfer_wrapper(torch::Tensor &lmc_key_value_cache,
-                                      const py::object &vllm_kv_caches_obj,
-                                      torch::Tensor &slot_mapping,
-                                      bool direction, int kvcache_format_raw,
-                                      bool token_major, bool vllm_two_major) {
+void single_layer_kv_transfer_wrapper(
+    torch::Tensor &lmc_key_value_cache, const py::object &vllm_kv_caches_obj,
+    torch::Tensor &slot_mapping, bool direction, int kvcache_format_raw,
+    bool token_major, bool vllm_two_major, int64_t k_hidden_dims = 0,
+    int64_t v_hidden_dims = 0, int64_t dsa_hidden_dims = 0) {
   auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
   single_layer_kv_transfer(lmc_key_value_cache, vllm_kv_caches, slot_mapping,
                            direction, kvcache_format_raw, token_major,
-                           vllm_two_major);
+                           vllm_two_major, k_hidden_dims, v_hidden_dims,
+                           dsa_hidden_dims);
 }
 
 void batched_fused_single_layer_kv_transfer_wrapper(
@@ -41,23 +42,27 @@ void batched_fused_single_layer_kv_transfer_wrapper(
     const py::object &vllm_kv_caches_obj, torch::Tensor &slot_mapping_full,
     std::vector<int64_t> &chunk_offsets, std::vector<int64_t> &chunk_sizes,
     bool direction, int kvcache_format_raw, bool token_major,
-    bool vllm_two_major) {
+    bool vllm_two_major, int64_t k_hidden_dims = 0, int64_t v_hidden_dims = 0,
+    int64_t dsa_hidden_dims = 0) {
   auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
   batched_fused_single_layer_kv_transfer(
       lmc_tensors, staging_cache, vllm_kv_caches, slot_mapping_full,
       chunk_offsets, chunk_sizes, direction, kvcache_format_raw, token_major,
-      vllm_two_major);
+      vllm_two_major, k_hidden_dims, v_hidden_dims, dsa_hidden_dims);
 }
 
 void sparse_single_layer_kv_transfer_wrapper(
     torch::Tensor &lmc_key_value_cache, const py::object &vllm_kv_caches_obj,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
-    int kvcache_format_raw, bool token_major, bool vllm_two_major) {
+    int kvcache_format_raw, bool token_major, bool vllm_two_major,
+    int64_t k_hidden_dims = 0, int64_t v_hidden_dims = 0,
+    int64_t dsa_hidden_dims = 0) {
   auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
   sparse_single_layer_kv_transfer(lmc_key_value_cache, vllm_kv_caches,
                                   slot_mapping_packed, selected_token_idx,
                                   kvcache_format_raw, token_major,
-                                  vllm_two_major);
+                                  vllm_two_major, k_hidden_dims, v_hidden_dims,
+                                  dsa_hidden_dims);
 }
 
 void batched_fused_sparse_single_layer_kv_transfer_wrapper(
@@ -65,12 +70,14 @@ void batched_fused_sparse_single_layer_kv_transfer_wrapper(
     const py::object &vllm_kv_caches_obj, torch::Tensor &slot_mapping_packed,
     torch::Tensor &selected_token_idx, std::vector<int64_t> &chunk_offsets,
     std::vector<int64_t> &chunk_sizes, int kvcache_format_raw, bool token_major,
-    bool vllm_two_major) {
+    bool vllm_two_major, int64_t k_hidden_dims = 0, int64_t v_hidden_dims = 0,
+    int64_t dsa_hidden_dims = 0) {
   auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
   batched_fused_sparse_single_layer_kv_transfer(
       lmc_tensors, staging_cache, vllm_kv_caches, slot_mapping_packed,
       selected_token_idx, chunk_offsets, chunk_sizes, kvcache_format_raw,
-      token_major, vllm_two_major);
+      token_major, vllm_two_major, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
 }
 
 PYBIND11_MODULE(c_ops, m) {
@@ -90,13 +97,36 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("multi_layer_kv_transfer", &multi_layer_kv_transfer);
   m.def("fused_multi_layer_kv_transfer", &fused_multi_layer_kv_transfer);
   m.def("multi_layer_kv_transfer_310p", &multi_layer_kv_transfer_310p);
-  m.def("single_layer_kv_transfer", &single_layer_kv_transfer_wrapper);
+  m.def("single_layer_kv_transfer", &single_layer_kv_transfer_wrapper,
+        py::arg("lmc_key_value_cache"), py::arg("vllm_kv_caches"),
+        py::arg("slot_mapping"), py::arg("direction"),
+        py::arg("kvcache_format_raw"), py::arg("token_major") = false,
+        py::arg("vllm_two_major") = false, py::arg("k_hidden_dims") = 0,
+        py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0);
   m.def("batched_fused_single_layer_kv_transfer",
-        &batched_fused_single_layer_kv_transfer_wrapper);
+        &batched_fused_single_layer_kv_transfer_wrapper,
+        py::arg("lmc_tensors"), py::arg("staging_cache"),
+        py::arg("vllm_kv_caches"), py::arg("slot_mapping_full"),
+        py::arg("chunk_offsets"), py::arg("chunk_sizes"), py::arg("direction"),
+        py::arg("kvcache_format_raw"), py::arg("token_major") = false,
+        py::arg("vllm_two_major") = false, py::arg("k_hidden_dims") = 0,
+        py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0);
   m.def("sparse_single_layer_kv_transfer",
-        &sparse_single_layer_kv_transfer_wrapper);
+        &sparse_single_layer_kv_transfer_wrapper, py::arg("lmc_key_value_cache"),
+        py::arg("vllm_kv_caches"), py::arg("slot_mapping_packed"),
+        py::arg("selected_token_idx"), py::arg("kvcache_format_raw"),
+        py::arg("token_major") = false, py::arg("vllm_two_major") = false,
+        py::arg("k_hidden_dims") = 0, py::arg("v_hidden_dims") = 0,
+        py::arg("dsa_hidden_dims") = 0);
   m.def("batched_fused_sparse_single_layer_kv_transfer",
-        &batched_fused_sparse_single_layer_kv_transfer_wrapper);
+        &batched_fused_sparse_single_layer_kv_transfer_wrapper,
+        py::arg("lmc_tensors"), py::arg("staging_cache"),
+        py::arg("vllm_kv_caches"), py::arg("slot_mapping_packed"),
+        py::arg("selected_token_idx"), py::arg("chunk_offsets"),
+        py::arg("chunk_sizes"), py::arg("kvcache_format_raw"),
+        py::arg("token_major") = false, py::arg("vllm_two_major") = false,
+        py::arg("k_hidden_dims") = 0, py::arg("v_hidden_dims") = 0,
+        py::arg("dsa_hidden_dims") = 0);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
   m.def("load_and_reshape_flash", &load_and_reshape_flash);

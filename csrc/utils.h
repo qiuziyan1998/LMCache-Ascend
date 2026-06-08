@@ -91,6 +91,7 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
                                    const torch::Tensor &key_value_ptrs);
 struct KVTransferDims {
   int32_t num_tokens;
+  int32_t lmc_num_tokens; // MLA/DSA stacked-plane capacity (>= num_tokens for sparse)
   int32_t num_heads;
   int32_t head_dims;
   int32_t block_size;
@@ -102,6 +103,7 @@ struct KVTransferPointers {
   uint8_t *vllm_k_ptr;
   uint8_t
       *vllm_v_ptr; // valid only in Separate mode and is nullptr in Merged mode
+  uint8_t *vllm_dsa_ptr; // valid only in DSA_KV mode
   uint8_t *slot_mapping_ptr;
 };
 
@@ -124,6 +126,9 @@ struct KVTransferStrides {
 
   int64_t vllm_k_bytes;
   int64_t vllm_v_bytes;
+  int64_t vllm_dsa_bytes;
+  int64_t lmc_v_plane_offset;  // stacked-plane offset to V in elements
+  int64_t lmc_dsa_plane_offset; // stacked-plane offset to DSA in elements
 };
 
 struct KVTransferUBParams {
@@ -142,6 +147,11 @@ struct SingleLayerKVConfig {
   KVTransferStrides strides;
   KVTransferUBParams ub_params;
 
+  kvcache_ops::KVCacheFormat kvcache_format;
+  int64_t k_hidden_dims;
+  int64_t v_hidden_dims;
+  int64_t dsa_hidden_dims;
+
   bool direction;   // false: H2D, true: D2H
   bool token_major; // true: [tokens, ...], false: [..., tokens, ...]
 };
@@ -150,31 +160,41 @@ struct HostChunkMetadata {
   std::vector<uint8_t *> ptrs;
   std::vector<int64_t> copy_sizes; // Bytes to copy per chunk
   std::vector<int64_t> v_offsets;  // Offset to V plane (only for !token_major)
+  std::vector<int64_t> dsa_offsets; // Offset to DSA plane in host chunk
   int64_t bytes_per_token;
   int64_t element_size;
 };
 
 void compute_single_layer_ub_params(const KVTransferDims &dims,
                                     KVTransferUBParams &ub_params,
-                                    const torch::Tensor &vllm_cache);
+                                    const torch::Tensor &vllm_cache,
+                                    kvcache_ops::KVCacheFormat format,
+                                    int64_t k_hidden_dims, int64_t v_hidden_dims,
+                                    int64_t dsa_hidden_dims);
 
 void compute_single_layer_strides(
     const KVTransferDims &dims, KVTransferStrides &strides,
     const torch::Tensor &lmc_cache, const torch::Tensor &vllm_k_cache,
     bool token_major,
     bool vllm_two_major, // valid only in Merged mode
-    bool is_separate, const torch::Tensor *vllm_v_cache = nullptr);
+    kvcache_ops::KVCacheFormat format, int64_t k_hidden_dims, int64_t v_hidden_dims,
+    int64_t dsa_hidden_dims, const torch::Tensor *vllm_v_cache = nullptr,
+    const torch::Tensor *vllm_dsa_cache = nullptr);
 
 SingleLayerKVConfig prepare_single_layer_kv_config(
     torch::Tensor &lmc_dst_cache, std::vector<torch::Tensor> &vllm_kv_caches,
     torch::Tensor &slot_mapping, bool direction, bool token_major,
-    bool vllm_two_major, bool is_separate);
+    bool vllm_two_major, int kvcache_format_raw, int64_t k_hidden_dims = 0,
+    int64_t v_hidden_dims = 0, int64_t dsa_hidden_dims = 0);
 
 HostChunkMetadata
 prepare_host_chunk_metadata(const std::vector<torch::Tensor> &lmc_tensors,
                             const std::vector<int64_t> &chunk_sizes,
                             const KVTransferStrides &strides,
-                            int64_t element_size, bool token_major);
+                            int64_t element_size, bool token_major,
+                            kvcache_ops::KVCacheFormat format,
+                            int64_t k_hidden_dims, int64_t v_hidden_dims,
+                            int64_t dsa_hidden_dims);
 
 void execute_batched_memcpy(
     const SingleLayerKVConfig &config, const HostChunkMetadata &meta,
@@ -199,7 +219,9 @@ void run_batched_fused_transfer(const SingleLayerKVConfig &config,
 
   HostChunkMetadata meta =
       prepare_host_chunk_metadata(lmc_tensors, chunk_sizes, config.strides,
-                                  element_size, config.token_major);
+                                  element_size, config.token_major,
+                                  config.kvcache_format, config.k_hidden_dims,
+                                  config.v_hidden_dims, config.dsa_hidden_dims);
 
   at_npu::native::OpCommand cmd;
   cmd.Name("batched_fused_single_layer_kv_transfer");
@@ -231,7 +253,9 @@ void run_batched_fused_sparse_transfer(
 
   HostChunkMetadata meta =
       prepare_host_chunk_metadata(lmc_tensors, chunk_sizes, config.strides,
-                                  element_size, config.token_major);
+                                  element_size, config.token_major,
+                                  config.kvcache_format, config.k_hidden_dims,
+                                  config.v_hidden_dims, config.dsa_hidden_dims);
 
   at_npu::native::OpCommand cmd;
   cmd.Name("batched_fused_sparse_single_layer_kv_transfer");

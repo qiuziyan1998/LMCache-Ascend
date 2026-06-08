@@ -148,7 +148,10 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
 
 void compute_single_layer_ub_params(const KVTransferDims &dims,
                                     KVTransferUBParams &ub_params,
-                                    const torch::Tensor &vllm_cache) {
+                                    const torch::Tensor &vllm_cache,
+                                    kvcache_ops::KVCacheFormat format,
+                                    int64_t k_hidden_dims, int64_t v_hidden_dims,
+                                    int64_t dsa_hidden_dims) {
 
   const c10::OptionalDeviceGuard device_guard(device_of(vllm_cache));
 
@@ -163,9 +166,16 @@ void compute_single_layer_ub_params(const KVTransferDims &dims,
   ub_params.aiv_num = static_cast<uint32_t>(std::min(4, dims.num_tokens));
 
   uint32_t numBuffsOnDev = 2;
-  // each token buffer is kv * heads * headdims * size
-  uint64_t baseBuffSize = numBuffsOnDev * dims.kv_size * dims.num_heads *
-                          dims.head_dims * vllm_cache.element_size();
+  int64_t perTokenBufferElems = dims.kv_size * dims.num_heads * dims.head_dims;
+  if (format == kvcache_ops::KVCacheFormat::MLA_KV) {
+    perTokenBufferElems = std::max(k_hidden_dims, v_hidden_dims);
+  } else if (format == kvcache_ops::KVCacheFormat::DSA_KV) {
+    perTokenBufferElems =
+        std::max({k_hidden_dims, v_hidden_dims, dsa_hidden_dims});
+  }
+
+  uint64_t baseBuffSize =
+      numBuffsOnDev * perTokenBufferElems * vllm_cache.element_size();
 
   if (ubSize < baseBuffSize) {
     std::string errStr =
@@ -186,11 +196,22 @@ void compute_single_layer_strides(
     const KVTransferDims &dims, KVTransferStrides &strides,
     const torch::Tensor &lmc_cache,
     const torch::Tensor &vllm_k_cache, // for merged
-    bool token_major, bool vllm_two_major, bool is_separate,
-    const torch::Tensor *vllm_v_cache) { // for separate
+    bool token_major, bool vllm_two_major,
+    kvcache_ops::KVCacheFormat format, int64_t k_hidden_dims, int64_t v_hidden_dims,
+    int64_t dsa_hidden_dims, const torch::Tensor *vllm_v_cache,
+    const torch::Tensor *vllm_dsa_cache) {
+
+  const bool is_mla_dsa =
+      format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      format == kvcache_ops::KVCacheFormat::DSA_KV;
+  const bool is_separate =
+      format == kvcache_ops::KVCacheFormat::SEPARATE_KV || is_mla_dsa;
 
   // LMC strides
-  if (token_major) {
+  if (is_mla_dsa) {
+    strides.lmc_token_stride = k_hidden_dims;
+    strides.lmc_val_offset = 0;
+  } else if (token_major) {
     // Shape: [tokens, 2, heads*headdim]
     strides.lmc_token_stride = lmc_cache.stride(0);
     strides.lmc_val_offset = lmc_cache.stride(1);
@@ -200,6 +221,10 @@ void compute_single_layer_strides(
     strides.lmc_val_offset = lmc_cache.stride(0);
   }
   strides.lmc_bytes = static_cast<int64_t>(lmc_cache.nbytes());
+  strides.lmc_v_plane_offset =
+      static_cast<int64_t>(dims.lmc_num_tokens) * k_hidden_dims;
+  strides.lmc_dsa_plane_offset = static_cast<int64_t>(dims.lmc_num_tokens) *
+                                 (k_hidden_dims + v_hidden_dims);
 
   // vLLM buffer strides
   if (!is_separate) {
@@ -229,6 +254,11 @@ void compute_single_layer_strides(
 
     strides.vllm_k_bytes = static_cast<int64_t>(vllm_k_cache.nbytes());
     strides.vllm_v_bytes = static_cast<int64_t>(vllm_v_cache->nbytes());
+    if (vllm_dsa_cache != nullptr) {
+      strides.vllm_dsa_bytes = static_cast<int64_t>(vllm_dsa_cache->nbytes());
+    } else {
+      strides.vllm_dsa_bytes = 0;
+    }
 
     // only for merged
     strides.vllm_val_offset = 0;
@@ -238,19 +268,63 @@ void compute_single_layer_strides(
 SingleLayerKVConfig prepare_single_layer_kv_config(
     torch::Tensor &lmc_dst_cache, std::vector<torch::Tensor> &vllm_kv_caches,
     torch::Tensor &slot_mapping, bool direction, bool token_major,
-    bool vllm_two_major, bool is_separate) {
+    bool vllm_two_major, int kvcache_format_raw, int64_t k_hidden_dims,
+    int64_t v_hidden_dims, int64_t dsa_hidden_dims) {
 
   SingleLayerKVConfig config;
+  config.kvcache_format =
+      static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
 
   torch::Tensor &vllm_k_cache = vllm_kv_caches[0];
-  torch::Tensor *vllm_v_cache = is_separate ? &vllm_kv_caches[1] : nullptr;
+  torch::Tensor *vllm_v_cache =
+      (config.kvcache_format == kvcache_ops::KVCacheFormat::MERGED_KV)
+          ? nullptr
+          : &vllm_kv_caches[1];
+  torch::Tensor *vllm_dsa_cache =
+      (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV)
+          ? &vllm_kv_caches[2]
+          : nullptr;
+
+  if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+    if (k_hidden_dims <= 0) {
+      k_hidden_dims = vllm_k_cache.size(-2) * vllm_k_cache.size(-1);
+    }
+    if (v_hidden_dims <= 0 && vllm_v_cache != nullptr) {
+      v_hidden_dims = vllm_v_cache->size(-2) * vllm_v_cache->size(-1);
+    }
+    if (dsa_hidden_dims <= 0 && vllm_dsa_cache != nullptr) {
+      dsa_hidden_dims = vllm_dsa_cache->size(-2) * vllm_dsa_cache->size(-1);
+    }
+  }
+
+  config.k_hidden_dims = k_hidden_dims;
+  config.v_hidden_dims = v_hidden_dims;
+  config.dsa_hidden_dims = dsa_hidden_dims;
 
   // Dims
   config.dims.num_tokens = slot_mapping.size(0);
+  config.dims.lmc_num_tokens = config.dims.num_tokens;
   config.dims.num_heads = vllm_k_cache.size(-2);
   config.dims.head_dims = vllm_k_cache.size(-1);
   config.dims.block_size = vllm_k_cache.size(-3);
-  config.dims.kv_size = 2;
+  if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+    int64_t plane_elems = config.k_hidden_dims + config.v_hidden_dims;
+    if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+      plane_elems += config.dsa_hidden_dims;
+    }
+    TORCH_CHECK(plane_elems > 0, "MLA/DSA plane size must be positive");
+    config.dims.lmc_num_tokens =
+        static_cast<int32_t>(lmc_dst_cache.numel() / plane_elems);
+  }
+  if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+    config.dims.kv_size = 3;
+  } else if (config.kvcache_format == kvcache_ops::KVCacheFormat::MERGED_KV) {
+    config.dims.kv_size = 2;
+  } else {
+    config.dims.kv_size = 2;
+  }
 
   // ptrs
   config.ptrs.lmc_ptr =
@@ -267,6 +341,13 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
     config.ptrs.vllm_v_ptr = nullptr;
   }
 
+  if (vllm_dsa_cache != nullptr) {
+    config.ptrs.vllm_dsa_ptr =
+        get_kernel_ptr<uint8_t, const torch::Tensor>(*vllm_dsa_cache);
+  } else {
+    config.ptrs.vllm_dsa_ptr = nullptr;
+  }
+
   config.ub_params.scalar_type_num =
       vllm_ascend::get_dtype_from_torch(vllm_k_cache.scalar_type());
   config.ub_params.slot_type_num =
@@ -275,25 +356,14 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
   config.direction = direction;
   config.token_major = token_major;
 
-  // MLA
-  bool is_mla = false;
-  if (token_major) {
-    is_mla = lmc_dst_cache.size(1) == 1; // [tokens, 1, hidden]
-  } else {
-    is_mla = lmc_dst_cache.size(0) == 1; // [1, tokens, hidden]
-  }
-  if (is_mla) {
-    PyErr_SetString(PyExc_RuntimeError, "MLA is not supported yet.");
-    throw py::error_already_set();
-  }
+  compute_single_layer_ub_params(config.dims, config.ub_params, vllm_k_cache,
+                                   config.kvcache_format, config.k_hidden_dims,
+                                   config.v_hidden_dims, config.dsa_hidden_dims);
 
-  // Compute UB Params
-  compute_single_layer_ub_params(config.dims, config.ub_params, vllm_k_cache);
-
-  // Compute Strides
-  compute_single_layer_strides(config.dims, config.strides, lmc_dst_cache,
-                               vllm_k_cache, token_major, vllm_two_major,
-                               is_separate, vllm_v_cache);
+  compute_single_layer_strides(
+      config.dims, config.strides, lmc_dst_cache, vllm_k_cache, token_major,
+      vllm_two_major, config.kvcache_format, config.k_hidden_dims,
+      config.v_hidden_dims, config.dsa_hidden_dims, vllm_v_cache, vllm_dsa_cache);
 
   return config;
 }
@@ -302,24 +372,44 @@ HostChunkMetadata
 prepare_host_chunk_metadata(const std::vector<torch::Tensor> &lmc_tensors,
                             const std::vector<int64_t> &chunk_sizes,
                             const KVTransferStrides &strides,
-                            int64_t element_size, bool token_major) {
+                            int64_t element_size, bool token_major,
+                            kvcache_ops::KVCacheFormat format,
+                            int64_t k_hidden_dims, int64_t v_hidden_dims,
+                            int64_t dsa_hidden_dims) {
 
   size_t num_chunks = lmc_tensors.size();
   HostChunkMetadata meta;
   meta.ptrs.resize(num_chunks);
   meta.copy_sizes.resize(num_chunks);
   meta.v_offsets.resize(num_chunks);
+  meta.dsa_offsets.resize(num_chunks);
   meta.element_size = element_size;
-  meta.bytes_per_token = strides.lmc_token_stride * element_size;
+
+  const bool is_mla_dsa =
+      format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      format == kvcache_ops::KVCacheFormat::DSA_KV;
+
+  if (is_mla_dsa) {
+    meta.bytes_per_token = k_hidden_dims * element_size;
+  } else {
+    meta.bytes_per_token = strides.lmc_token_stride * element_size;
+  }
 
   for (size_t i = 0; i < num_chunks; ++i) {
     meta.ptrs[i] = static_cast<uint8_t *>(lmc_tensors[i].data_ptr());
-    meta.copy_sizes[i] = chunk_sizes[i] * meta.bytes_per_token;
-
-    if (!token_major) {
+    if (is_mla_dsa) {
+      meta.copy_sizes[i] = chunk_sizes[i] * k_hidden_dims * element_size;
+      meta.v_offsets[i] = chunk_sizes[i] * k_hidden_dims * element_size;
+      meta.dsa_offsets[i] =
+          chunk_sizes[i] * (k_hidden_dims + v_hidden_dims) * element_size;
+    } else if (!token_major) {
+      meta.copy_sizes[i] = chunk_sizes[i] * meta.bytes_per_token;
       meta.v_offsets[i] = lmc_tensors[i].stride(0) * element_size;
+      meta.dsa_offsets[i] = 0;
     } else {
+      meta.copy_sizes[i] = chunk_sizes[i] * meta.bytes_per_token;
       meta.v_offsets[i] = 0;
+      meta.dsa_offsets[i] = 0;
     }
   }
   return meta;
@@ -334,6 +424,127 @@ void execute_batched_memcpy(
   size_t num_chunks = meta.ptrs.size();
   aclrtMemcpyKind kind =
       is_d2h ? ACL_MEMCPY_DEVICE_TO_HOST : ACL_MEMCPY_HOST_TO_DEVICE;
+
+  aclrtStream stream = config.ub_params.stream;
+  const bool is_mla_dsa =
+      config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV;
+
+  if (is_mla_dsa) {
+    int64_t k_bytes_per_token = config.k_hidden_dims * meta.element_size;
+    int64_t v_bytes_per_token = config.v_hidden_dims * meta.element_size;
+    int64_t dsa_bytes_per_token = config.dsa_hidden_dims * meta.element_size;
+    int64_t staging_v_plane_offset =
+        config.strides.lmc_v_plane_offset * meta.element_size;
+    int64_t staging_dsa_plane_offset =
+        config.strides.lmc_dsa_plane_offset * meta.element_size;
+    int64_t host_bytes_per_token =
+        k_bytes_per_token + v_bytes_per_token +
+        (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV
+             ? dsa_bytes_per_token
+             : 0);
+
+    for (size_t i = 0; i < num_chunks; ++i) {
+      int64_t token_offset = chunk_offsets[i];
+      int64_t chunk_tokens = meta.copy_sizes[i] / k_bytes_per_token;
+      uint8_t *host_base = meta.ptrs[i];
+
+      if (config.token_major) {
+        for (int64_t t = 0; t < chunk_tokens; ++t) {
+          int64_t staging_token_idx = token_offset + t;
+          uint8_t *host_token = host_base + t * host_bytes_per_token;
+          uint8_t *staging_k =
+              config.ptrs.lmc_ptr + staging_token_idx * k_bytes_per_token;
+          uint8_t *staging_v = config.ptrs.lmc_ptr + staging_v_plane_offset +
+                               staging_token_idx * v_bytes_per_token;
+
+          if (!is_d2h) {
+            ret = aclrtMemcpyAsync(staging_k, k_bytes_per_token, host_token,
+                                   k_bytes_per_token, kind, stream);
+            TORCH_CHECK(ret == ACL_ERROR_NONE,
+                        "Memcpy (MLA/DSA interleaved K) failed chunk ", i);
+            ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
+                                   host_token + k_bytes_per_token,
+                                   v_bytes_per_token, kind, stream);
+            TORCH_CHECK(ret == ACL_ERROR_NONE,
+                        "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+              uint8_t *staging_dsa =
+                  config.ptrs.lmc_ptr + staging_dsa_plane_offset +
+                  staging_token_idx * dsa_bytes_per_token;
+              ret = aclrtMemcpyAsync(
+                  staging_dsa, dsa_bytes_per_token,
+                  host_token + k_bytes_per_token + v_bytes_per_token,
+                  dsa_bytes_per_token, kind, stream);
+              TORCH_CHECK(ret == ACL_ERROR_NONE,
+                          "Memcpy (DSA interleaved) failed chunk ", i);
+            }
+          } else {
+            ret = aclrtMemcpyAsync(host_token, k_bytes_per_token, staging_k,
+                                   k_bytes_per_token, kind, stream);
+            TORCH_CHECK(ret == ACL_ERROR_NONE,
+                        "Memcpy (MLA/DSA interleaved K) failed chunk ", i);
+            ret = aclrtMemcpyAsync(host_token + k_bytes_per_token,
+                                   v_bytes_per_token, staging_v,
+                                   v_bytes_per_token, kind, stream);
+            TORCH_CHECK(ret == ACL_ERROR_NONE,
+                        "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+              uint8_t *staging_dsa =
+                  config.ptrs.lmc_ptr + staging_dsa_plane_offset +
+                  staging_token_idx * dsa_bytes_per_token;
+              ret = aclrtMemcpyAsync(
+                  host_token + k_bytes_per_token + v_bytes_per_token,
+                  dsa_bytes_per_token, staging_dsa, dsa_bytes_per_token, kind,
+                  stream);
+              TORCH_CHECK(ret == ACL_ERROR_NONE,
+                          "Memcpy (DSA interleaved) failed chunk ", i);
+            }
+          }
+        }
+        continue;
+      }
+
+      int64_t k_size = chunk_tokens * k_bytes_per_token;
+      int64_t v_size = chunk_tokens * v_bytes_per_token;
+      int64_t dsa_size = chunk_tokens * dsa_bytes_per_token;
+
+      uint8_t *staging_k =
+          config.ptrs.lmc_ptr + token_offset * k_bytes_per_token;
+      uint8_t *staging_v = config.ptrs.lmc_ptr + staging_v_plane_offset +
+                           token_offset * v_bytes_per_token;
+      uint8_t *host_k = host_base;
+      uint8_t *host_v = host_k + meta.v_offsets[i];
+      uint8_t *host_dsa = host_v + meta.dsa_offsets[i];
+
+      if (!is_d2h) {
+        ret = aclrtMemcpyAsync(staging_k, k_size, host_k, k_size, kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA K) failed chunk ", i);
+        ret = aclrtMemcpyAsync(staging_v, v_size, host_v, v_size, kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+          uint8_t *staging_dsa = config.ptrs.lmc_ptr + staging_dsa_plane_offset +
+                                 token_offset * dsa_bytes_per_token;
+          ret = aclrtMemcpyAsync(staging_dsa, dsa_size, host_dsa, dsa_size, kind,
+                                 stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (DSA) failed chunk ", i);
+        }
+      } else {
+        ret = aclrtMemcpyAsync(host_k, k_size, staging_k, k_size, kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA K) failed chunk ", i);
+        ret = aclrtMemcpyAsync(host_v, v_size, staging_v, v_size, kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+          uint8_t *staging_dsa = config.ptrs.lmc_ptr + staging_dsa_plane_offset +
+                                 token_offset * dsa_bytes_per_token;
+          ret = aclrtMemcpyAsync(host_dsa, dsa_size, staging_dsa, dsa_size, kind,
+                                 stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (DSA) failed chunk ", i);
+        }
+      }
+    }
+    return;
+  }
 
   // only for !token_major
   int64_t staging_v_plane_offset =
@@ -380,12 +591,14 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
                           int kvcache_format_raw) {
   kvcache_ops::KVCacheFormat format =
       static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
-  bool is_separate = (format == kvcache_ops::KVCacheFormat::SEPARATE_KV);
 
-  if (!is_separate && format != kvcache_ops::KVCacheFormat::MERGED_KV) {
+  if (format != kvcache_ops::KVCacheFormat::MERGED_KV &&
+      format != kvcache_ops::KVCacheFormat::SEPARATE_KV &&
+      format != kvcache_ops::KVCacheFormat::MLA_KV &&
+      format != kvcache_ops::KVCacheFormat::DSA_KV) {
     std::string err =
         "Invalid KV cache format: " + std::to_string(kvcache_format_raw) +
-        ". Expected 1 (MERGED_KV) or 2 (SEPARATE_KV)";
+        ". Expected 1 (MERGED_KV), 2 (SEPARATE_KV), 3 (MLA_KV), or 4 (DSA_KV)";
     PyErr_SetString(PyExc_ValueError, err.c_str());
     throw py::error_already_set();
   }
@@ -395,7 +608,22 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
     throw py::error_already_set();
   }
 
-  if (is_separate) {
+  if (format == kvcache_ops::KVCacheFormat::DSA_KV) {
+    if (vllm_kv_caches.size() != 3) {
+      PyErr_SetString(PyExc_ValueError,
+                      "DSA_KV expects 3 tensors (K, V, and DSA_K).");
+      throw py::error_already_set();
+    }
+  } else if (format == kvcache_ops::KVCacheFormat::MLA_KV) {
+    if (vllm_kv_caches.size() != 2) {
+      PyErr_SetString(PyExc_ValueError, "MLA_KV expects 2 tensors (K and V).");
+      throw py::error_already_set();
+    }
+    if (vllm_kv_caches[0].sizes() == vllm_kv_caches[1].sizes()) {
+      throw py::value_error(
+          "MLA_KV expects K and V caches to have different shapes.");
+    }
+  } else if (format == kvcache_ops::KVCacheFormat::SEPARATE_KV) {
     if (vllm_kv_caches.size() != 2) {
       PyErr_SetString(PyExc_ValueError,
                       "SEPARATE_KV expects 2 tensors (K and V).");
@@ -411,7 +639,7 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
     }
   }
 
-  return is_separate;
+  return format != kvcache_ops::KVCacheFormat::MERGED_KV;
 }
 
 void validate_sparse_single_layer_inputs(
