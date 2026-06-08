@@ -1338,7 +1338,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         for layer_id in range(self.num_layers):
             memory_objs_layer, selected_token_idx, token_start_index = yield
-            slot_mapping_packed = slot_mapping_full[token_start_index] # mayb not right, expect slot_mapping_full == slot_mapping
+            slot_mapping_packed = slot_mapping_full[token_start_index:] # mayb not right, expect slot_mapping_full == slot_mapping
             if selected_token_idx is None:
                 selected_token_idx = torch.arange(slot_mapping_packed.shape[0], dtype=torch.int32, device=self.kv_device)
             else:
