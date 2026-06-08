@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from functools import lru_cache
-from typing import List, Sequence, Tuple, Union
-import inspect
+from typing import List, Literal, Sequence, Tuple, Union
 
 # Third Party
 from lmcache.v1.gpu_connector.utils import permute_to_contiguous
@@ -52,34 +50,37 @@ def permute_kv_caches_to_contiguous(
     return results
 
 
-@lru_cache(maxsize=1)
-def _op_param_names(op_name: str) -> frozenset[str]:
-    fn = getattr(lmc_ops, op_name)
-    return frozenset(inspect.signature(fn).parameters.keys())
+_FusedOpMode = Literal["extended", "legacy"]
+_FUSED_OP_MODES: dict[str, _FusedOpMode | None] = {
+    "batched_fused_single_layer_kv_transfer": None,
+    "batched_fused_sparse_single_layer_kv_transfer": None,
+}
 
 
-def _call_fused_op(op_name: str, kwargs: dict) -> None:
-    fn = getattr(lmc_ops, op_name)
-    params = _op_param_names(op_name)
-    if "k_hidden_dims" in params:
-        fn(**{name: kwargs[name] for name in params})
-        return
+def _is_pybind_arity_type_error(exc: TypeError) -> bool:
+    msg = str(exc)
+    return "incompatible function arguments" in msg or "takes" in msg and "positional" in msg
 
-    if op_name == "batched_fused_sparse_single_layer_kv_transfer":
-        fn(
-            kwargs["lmc_tensors"],
-            kwargs["staging_cache"],
-            kwargs["vllm_kv_caches"],
-            kwargs["slot_mapping"],
-            kwargs["selected_token_idx"],
-            kwargs["chunk_offsets"],
-            kwargs["chunk_sizes"],
-            kwargs["kvcache_format_raw"],
-            kwargs["token_major"],
-            kwargs["vllm_two_major"],
-        )
-        return
 
+def _call_dense_extended(fn, kwargs: dict) -> None:
+    fn(
+        kwargs["lmc_tensors"],
+        kwargs["staging_cache"],
+        kwargs["vllm_kv_caches"],
+        kwargs["slot_mapping"],
+        kwargs["chunk_offsets"],
+        kwargs["chunk_sizes"],
+        kwargs["direction"],
+        kwargs["kvcache_format_raw"],
+        kwargs["token_major"],
+        kwargs["vllm_two_major"],
+        kwargs["k_hidden_dims"],
+        kwargs["v_hidden_dims"],
+        kwargs["dsa_hidden_dims"],
+    )
+
+
+def _call_dense_legacy(fn, kwargs: dict) -> None:
     fn(
         kwargs["lmc_tensors"],
         kwargs["staging_cache"],
@@ -92,6 +93,64 @@ def _call_fused_op(op_name: str, kwargs: dict) -> None:
         kwargs["token_major"],
         kwargs["vllm_two_major"],
     )
+
+
+def _call_sparse_extended(fn, kwargs: dict) -> None:
+    fn(
+        kwargs["lmc_tensors"],
+        kwargs["staging_cache"],
+        kwargs["vllm_kv_caches"],
+        kwargs["slot_mapping"],
+        kwargs["selected_token_idx"],
+        kwargs["chunk_offsets"],
+        kwargs["chunk_sizes"],
+        kwargs["kvcache_format_raw"],
+        kwargs["token_major"],
+        kwargs["vllm_two_major"],
+        kwargs["k_hidden_dims"],
+        kwargs["v_hidden_dims"],
+        kwargs["dsa_hidden_dims"],
+    )
+
+
+def _call_sparse_legacy(fn, kwargs: dict) -> None:
+    fn(
+        kwargs["lmc_tensors"],
+        kwargs["staging_cache"],
+        kwargs["vllm_kv_caches"],
+        kwargs["slot_mapping"],
+        kwargs["selected_token_idx"],
+        kwargs["chunk_offsets"],
+        kwargs["chunk_sizes"],
+        kwargs["kvcache_format_raw"],
+        kwargs["token_major"],
+        kwargs["vllm_two_major"],
+    )
+
+
+def _call_fused_op(op_name: str, kwargs: dict) -> None:
+    """Invoke a pybind fused op, probing extended vs legacy arity once."""
+    fn = getattr(lmc_ops, op_name)
+    is_sparse = op_name == "batched_fused_sparse_single_layer_kv_transfer"
+    call_extended = _call_sparse_extended if is_sparse else _call_dense_extended
+    call_legacy = _call_sparse_legacy if is_sparse else _call_dense_legacy
+
+    mode = _FUSED_OP_MODES.get(op_name)
+    if mode == "extended":
+        call_extended(fn, kwargs)
+        return
+    if mode == "legacy":
+        call_legacy(fn, kwargs)
+        return
+
+    try:
+        call_extended(fn, kwargs)
+        _FUSED_OP_MODES[op_name] = "extended"
+    except TypeError as exc:
+        if not _is_pybind_arity_type_error(exc):
+            raise
+        call_legacy(fn, kwargs)
+        _FUSED_OP_MODES[op_name] = "legacy"
 
 
 def batched_fused_single_layer_kv_transfer(
