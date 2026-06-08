@@ -1352,7 +1352,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # TODO: Remove this after the sparse retrieve is supported
         use_sparse = True
         slot_mapping_packed = slot_mapping
-        selected_token_idx = torch.arange(slot_mapping.shape[0], device=self.kv_device)
+        selected_token_idx = torch.arange(slot_mapping.shape[0], dtype=torch.int32, device=self.kv_device)
 
         self._lazy_initialize_buffer(self.kvcaches)
 
