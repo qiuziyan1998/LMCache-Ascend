@@ -549,7 +549,6 @@ void execute_batched_memcpy(
   // only for !token_major
   int64_t staging_v_plane_offset =
       config.strides.lmc_val_offset * meta.element_size;
-  aclrtStream stream = config.ub_params.stream;
 
   for (size_t i = 0; i < num_chunks; ++i) {
     uint8_t *staging_ptr =
