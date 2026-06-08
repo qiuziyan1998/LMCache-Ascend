@@ -1303,12 +1303,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 "MLA/DSA layerwise transfer requires use_gpu=True with a staging buffer."
             )
 
-        slot_mapping_chunks = []
-        for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
+        #slot_mapping_chunks = []
+        #for start, end in zip(starts, ends, strict=False):
+        #    slot_mapping_chunks.append(slot_mapping[start:end])
 
-        # TODO(Jiayi): Optimize away this `cat`
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        ## TODO(Jiayi): Optimize away this `cat`
+        #slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+
+        # slot_mapping should already be the continuous vllm block address, maybe after sparse and compact
+        slot_mapping_full = slot_mapping
 
         num_tokens = len(slot_mapping_full)
 
