@@ -1141,53 +1141,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return not self._is_mla_dsa_format()
 
     def _single_layer_hidden_dim_args(self) -> tuple[int, int, int]:
-        return (0, 0, 0)
-
-    def _resolve_sparse_retrieve_params(
-        self, kwargs: dict
-    ) -> tuple[bool, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Resolve sparse retrieve kwargs supplied by the vLLM adapter (TBD).
-
-        Expected kwargs (placeholders until adapter wiring lands):
-        - ``sparse_retrieve`` (bool): enable sparse scatter instead of dense load.
-        - ``slot_mapping_packed`` (Tensor): destination paged slots, shape [num_sparse].
-        - ``selected_token_idx`` (Tensor): LMC staging token indices, shape
-          [num_sparse], ``torch.int32`` on NPU.
-        """
-        sparse_retrieve = kwargs.get("sparse_retrieve", False)
-        slot_mapping_packed = kwargs.get("slot_mapping_packed")
-        selected_token_idx = kwargs.get("selected_token_idx")
-
-        if not sparse_retrieve and (
-            slot_mapping_packed is None and selected_token_idx is None
-        ):
-            return False, None, None
-
-        if slot_mapping_packed is None or selected_token_idx is None:
-            raise ValueError(
-                "sparse layerwise retrieve requires both 'slot_mapping_packed' "
-                "and 'selected_token_idx' in kwargs when sparse_retrieve=True"
-            )
-
-        if not isinstance(slot_mapping_packed, torch.Tensor):
-            raise ValueError("slot_mapping_packed must be a torch.Tensor")
-        if not isinstance(selected_token_idx, torch.Tensor):
-            raise ValueError("selected_token_idx must be a torch.Tensor")
-
-        npu_device = getattr(self, "device", None) or getattr(self, "kv_device", None)
-        if npu_device is not None:
-            if slot_mapping_packed.device != npu_device:
-                slot_mapping_packed = slot_mapping_packed.to(
-                    device=npu_device, non_blocking=True
-                )
-            if selected_token_idx.device != npu_device or selected_token_idx.dtype != torch.int32:
-                selected_token_idx = selected_token_idx.to(
-                    device=npu_device, dtype=torch.int32, non_blocking=True
-                )
-        elif selected_token_idx.dtype != torch.int32:
-            selected_token_idx = selected_token_idx.to(dtype=torch.int32)
-
-        return True, slot_mapping_packed, selected_token_idx
+        return (self.k_hidden_dims, self.v_hidden_dims, self.dsa_hidden_dims)
 
     def _expected_memory_format(self) -> MemoryFormat:
         if self._is_mla_dsa_format():
@@ -1346,13 +1300,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
-        use_sparse, slot_mapping_packed, selected_token_idx = (
-            self._resolve_sparse_retrieve_params(kwargs)
-        )
+
         # TODO: Remove this after the sparse retrieve is supported
-        use_sparse = True
-        slot_mapping_packed = slot_mapping
-        selected_token_idx = torch.arange(slot_mapping.shape[0], dtype=torch.int32, device=self.kv_device)
+        use_sparse = kwargs.get("sparse_retrieve", False)
 
         self._lazy_initialize_buffer(self.kvcaches)
 
@@ -1395,7 +1345,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
-            memory_objs_layer = yield
+            packed_objects = yield
+            if len(packed_objects) == 3:
+                memory_objs_layer, selected_token_idx, token_start_index = packed_objects
+                slot_mapping_packed = slot_mapping_full[token_start_index]
+            elif len(packed_objects) == 1:
+                memory_objs_layer = packed_objects[0]
+                slot_mapping_packed = slot_mapping_full
+                selected_token_idx = torch.arange(slot_mapping_packed.shape[0], dtype=torch.int32, device=self.kv_device)
+
             if sync:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
