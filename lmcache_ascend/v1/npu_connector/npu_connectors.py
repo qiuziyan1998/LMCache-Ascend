@@ -1198,8 +1198,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
         Lazily initialize format metadata and the GPU buffer allocator.
         """
-        self.kv_device = kv_caches[0].device
-
         if self.kv_format == KVCacheFormat.UNDEFINED:
             self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
             if self.kv_format == KVCacheFormat.UNDEFINED:
@@ -1218,9 +1216,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     f"Key and Value tensors must have identical shapes, "
                     f"got key={key_tensor.shape}, value={value_tensor.shape}"
                 )
+                self.kv_device = key_tensor.device
                 self.vllm_two_major = False
             elif self.kv_format == KVCacheFormat.MLA_KV:
                 key_tensor, value_tensor = first_layer_cache
+                self.kv_device = key_tensor.device
                 self.vllm_two_major = False
                 self.kv_lora_rank = key_tensor.shape[-1]
                 self.qk_rope_head_dim = value_tensor.shape[-1]
@@ -1228,6 +1228,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 self.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
             elif self.kv_format == KVCacheFormat.DSA_KV:
                 key_tensor, value_tensor, dsa_tensor = first_layer_cache
+                self.kv_device = key_tensor.device
                 self.vllm_two_major = False
                 self.kv_lora_rank = key_tensor.shape[-1]
                 self.qk_rope_head_dim = value_tensor.shape[-1]
@@ -1244,6 +1245,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "[num_layers, num_blocks, 2, block_size, num_heads, head_size]"
                     f"Got shape: {first_layer_cache.shape}"
                 )
+                self.kv_device = first_layer_cache.device
                 self.vllm_two_major = first_layer_cache.shape[0] == 2
             else:
                 raise ValueError(f"Unsupported KV cache format: {self.kv_format}")
