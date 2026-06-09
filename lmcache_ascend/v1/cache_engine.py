@@ -624,40 +624,61 @@ class AscendLMCacheEngine(LMCacheEngine):
             if mem_obj.tensor is not None
         )
 
+    def _append_retrieve_layer_cache(
+        self,
+        layer_id: int,
+        mem_objs_layer: List[MemoryObj],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+    ) -> None:
+        """Retain storage-get results in ReqMeta for later retrieve calls (same request)."""
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend(
+                    [] for _ in range(self.num_layers)
+                )
+            assert len(cached_memory_objs) == self.num_layers
+            cached_memory_objs[layer_id].extend(mem_objs_layer)
+        if cached_tensors is not None:
+            if not cached_tensors:
+                cached_tensors.extend([] for _ in range(self.num_layers))
+            while len(cached_tensors) <= layer_id:
+                cached_tensors.append([])
+            cached_tensors[layer_id].extend(
+                mem_obj.tensor
+                for mem_obj in mem_objs_layer
+                if mem_obj.tensor is not None
+            )
+
     @staticmethod
-    def _layerwise_cache_matches_retrieve(
-        *,
+    def _needs_retrieve_metadata_refresh(
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        tokens: Union[torch.Tensor, list[int]],
+    ) -> bool:
+        if not cached_keys or not cached_starts or not cached_ends:
+            return True
+        return len(tokens) > max(cached_ends)
+
+    @staticmethod
+    def _has_retrieve_data_cache(
         cached_starts: Optional[List[int]],
         cached_ends: Optional[List[int]],
         cached_keys: Optional[List],
         cached_tensors: Optional[List],
         cached_memory_objs: Optional[List],
-        retrieve_starts: List[int],
-        retrieve_ends: List[int],
-        retrieve_keys: List[List[CacheEngineKey]],
         num_layers: int,
     ) -> bool:
-        if not retrieve_starts:
+        if not cached_starts or not cached_ends or not cached_keys:
             return False
 
-        num_chunks = len(retrieve_starts)
-        if num_chunks != len(retrieve_ends):
+        num_chunks = len(cached_starts)
+        if num_chunks == 0 or len(cached_ends) != num_chunks:
             return False
-        if cached_starts is None or len(cached_starts) != num_chunks:
-            return False
-        if cached_ends is None or len(cached_ends) != num_chunks:
-            return False
-        if list(cached_starts) != list(retrieve_starts):
-            return False
-        if list(cached_ends) != list(retrieve_ends):
-            return False
-        if cached_keys is None or len(cached_keys) != num_layers:
+        if len(cached_keys) != num_layers:
             return False
         if not all(len(cached_keys[layer_id]) == num_chunks for layer_id in range(num_layers)):
-            return False
-        if len(retrieve_keys) != num_layers:
-            return False
-        if not all(len(retrieve_keys[layer_id]) == num_chunks for layer_id in range(num_layers)):
             return False
 
         has_tensors = (
@@ -697,10 +718,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         List[List[CacheEngineKey]],
     ]:
         """Resolve retrieve chunk metadata once per request; reuse ReqMeta cache after."""
-        if not cached_keys:
+        if self._needs_retrieve_metadata_refresh(
+            cached_keys, cached_starts, cached_ends, tokens
+        ):
             location: Optional[str] = None
-            starts: List[int] = []
-            ends: List[int] = []
+            new_starts: List[int] = []
+            new_ends: List[int] = []
             keys: List[List[CacheEngineKey]] = []
 
             for start, end, key in self.token_database.process_tokens(
@@ -725,23 +748,45 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     break
 
-                starts.append(start)
-                ends.append(end)
+                new_starts.append(start)
+                new_ends.append(end)
                 keys.append(keys_multi_layer)
-                ret_mask[start:end] = True
 
-            retrieve_keys = (
+            new_keys = (
                 [list(row) for row in zip(*keys, strict=False)] if keys else []
             )
-            if retrieve_keys:
-                cached_keys[:] = retrieve_keys
-                cached_starts[:] = starts
-                cached_ends[:] = ends
-            return location, starts, ends, retrieve_keys
+            if not new_keys:
+                return location, new_starts, new_ends, new_keys
+
+            if not cached_keys:
+                cached_keys[:] = new_keys
+                cached_starts[:] = new_starts
+                cached_ends[:] = new_ends
+            else:
+                prev_chunks = len(cached_starts)
+                for chunk_idx, (start, end) in enumerate(
+                    zip(new_starts, new_ends, strict=False)
+                ):
+                    if chunk_idx < prev_chunks:
+                        if (
+                            cached_starts[chunk_idx] == start
+                            and cached_ends[chunk_idx] == end
+                        ):
+                            continue
+                    cached_starts.append(start)
+                    cached_ends.append(end)
+                    for layer_id in range(self.num_layers):
+                        cached_keys[layer_id].append(new_keys[layer_id][chunk_idx])
+
+            ret_mask.zero_()
+            for start, end in zip(cached_starts, cached_ends, strict=False):
+                ret_mask[start:end] = True
+            return location, list(cached_starts), list(cached_ends), cached_keys
 
         starts = list(cached_starts)
         ends = list(cached_ends)
         retrieve_keys = cached_keys
+        ret_mask.zero_()
         for start, end in zip(starts, ends, strict=False):
             ret_mask[start:end] = True
 
@@ -1055,16 +1100,13 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         assert_layerwise_gpu_connector(self.gpu_connector)
 
-        use_cached_retrieve = self._layerwise_cache_matches_retrieve(
-            cached_starts=cached_starts,
-            cached_ends=cached_ends,
-            cached_keys=cached_keys,
-            cached_tensors=cached_tensors,
-            cached_memory_objs=cached_memory_objs,
-            retrieve_starts=starts,
-            retrieve_ends=ends,
-            retrieve_keys=retrieve_keys,
-            num_layers=self.num_layers,
+        use_cached_retrieve = self._has_retrieve_data_cache(
+            cached_starts,
+            cached_ends,
+            cached_keys,
+            cached_tensors,
+            cached_memory_objs,
+            self.num_layers,
         )
 
         get_generator = None
@@ -1073,7 +1115,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 retrieve_keys, location=location
             )
 
-        to_count_down: List[MemoryObj] = []
         batched_to_gpu_kwargs = dict(kwargs)
         if use_cached_retrieve and cached_tensors is not None:
             batched_to_gpu_kwargs["cached_tensors"] = cached_tensors
@@ -1102,7 +1143,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                 mem_objs_layer = task.result()
                 if mem_objs_layer is None:
                     continue
-                to_count_down.extend(mem_objs_layer)
+                layer_cached_chunks = (
+                    len(cached_tensors[layer_id])
+                    if cached_tensors is not None
+                    and len(cached_tensors) > layer_id
+                    else 0
+                )
+                if layer_cached_chunks < len(starts):
+                    self._append_retrieve_layer_cache(
+                        layer_id,
+                        mem_objs_layer,
+                        cached_memory_objs,
+                        cached_tensors,
+                    )
 
             if not mem_obj_consumer:
                 mem_obj_consumer = self.gpu_connector.batched_to_gpu(
@@ -1119,10 +1172,6 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if mem_obj_consumer is not None:
             next(mem_obj_consumer)
-
-        if not use_cached_retrieve:
-            for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
 
         yield ret_mask
 
