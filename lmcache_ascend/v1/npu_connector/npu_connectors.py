@@ -1132,6 +1132,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.k_hidden_dims: int = 0
         self.v_hidden_dims: int = 0
         self.dsa_hidden_dims: int = 0
+        self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
+
+    def _sparse_selected_token_idx(
+        self,
+        selected_token_idx: Optional[torch.Tensor],
+        num_sparse: int,
+    ) -> torch.Tensor:
+        if selected_token_idx is None:
+            cached = self._layerwise_sparse_idx_cache
+            if cached is None or cached.shape[0] != num_sparse:
+                cached = torch.arange(
+                    num_sparse, dtype=torch.int32, device=self.kv_device
+                )
+                self._layerwise_sparse_idx_cache = cached
+            return cached
+        if (
+            selected_token_idx.dtype == torch.int32
+            and selected_token_idx.device == self.kv_device
+        ):
+            return selected_token_idx
+        return selected_token_idx.to(device=self.kv_device, dtype=torch.int32)
 
     def _is_mla_dsa_format(self) -> bool:
         return self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV)
@@ -1329,6 +1350,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         staging_num_tokens = current_offset
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
         if self.use_gpu:
             buffer_shape = self.get_shape(staging_num_tokens)
             assert self.gpu_buffer_allocator is not None
@@ -1338,66 +1360,61 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate NPU buffer in NPUConnector"
             )
-            assert tmp_gpu_buffer_obj.tensor is not None
+            staging_tensor = tmp_gpu_buffer_obj.tensor
+            assert staging_tensor is not None
 
         current_stream = torch.cuda.current_stream()
+        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
+            self._single_layer_hidden_dim_args()
+        )
+        token_major = self._layerwise_token_major()
+        kv_format_raw = self.kv_format.value
+        use_gpu = self.use_gpu
+        has_cached_tensors = cached_tensors_by_layer is not None
 
         try:
             for layer_id in range(self.num_layers):
                 memory_objs_layer, selected_token_idx, token_start_index = yield
-                slot_mapping_packed = slot_mapping_full[token_start_index:]
-                if selected_token_idx is None:
-                    selected_token_idx = torch.arange(
-                        slot_mapping_packed.shape[0],
-                        dtype=torch.int32,
-                        device=self.kv_device,
-                    )
-                else:
-                    selected_token_idx = selected_token_idx.to(self.kv_device)
+                slot_mapping_packed = (
+                    slot_mapping_full
+                    if token_start_index == 0
+                    else slot_mapping_full[token_start_index:]
+                )
+                selected_token_idx = self._sparse_selected_token_idx(
+                    selected_token_idx, slot_mapping_packed.shape[0]
+                )
 
-                if sync:
+                if sync and layer_id > 0:
                     current_stream.wait_stream(self.load_stream)
-                if layer_id > 0:
-                    logger.debug(f"Finished loading layer {layer_id - 1}")
-                # memobj -> gpu_buffer -> kvcaches
                 with torch.cuda.stream(self.load_stream):
-                    if self.use_gpu:
-                        expected_fmt = self._expected_memory_format()
-                        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
-                            self._single_layer_hidden_dim_args()
-                        )
+                    if use_gpu:
                         layer_cached_tensors = (
                             cached_tensors_by_layer[layer_id]
-                            if cached_tensors_by_layer is not None
+                            if has_cached_tensors
                             and layer_id < len(cached_tensors_by_layer)
                             and cached_tensors_by_layer[layer_id]
                             else None
                         )
                         if layer_cached_tensors is not None:
-                            cpu_tensors = list(layer_cached_tensors)
+                            cpu_tensors = layer_cached_tensors
                         else:
-                            cpu_tensors = []
-                            for memory_obj in memory_objs_layer:
-                                assert memory_obj.tensor is not None
-                                assert memory_obj.metadata.fmt == expected_fmt, (
-                                    f"Expected memory format {expected_fmt}, "
-                                    f"got {memory_obj.metadata.fmt}"
-                                )
-                                cpu_tensors.append(memory_obj.tensor)
+                            cpu_tensors = [
+                                memory_obj.tensor
+                                for memory_obj in memory_objs_layer
+                                if memory_obj.tensor is not None
+                            ]
 
                         if use_sparse:
-                            assert slot_mapping_packed is not None
-                            assert selected_token_idx is not None
                             batched_fused_sparse_single_layer_kv_transfer(
                                 cpu_tensors,
-                                tmp_gpu_buffer_obj.tensor,
+                                staging_tensor,
                                 self.kvcaches[layer_id],
                                 slot_mapping_packed,
                                 selected_token_idx,
                                 chunk_offsets,
                                 chunk_sizes,
-                                self.kv_format.value,
-                                self._layerwise_token_major(),
+                                kv_format_raw,
+                                token_major,
                                 self.vllm_two_major,
                                 k_hidden_dims,
                                 v_hidden_dims,
@@ -1406,14 +1423,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         else:
                             batched_fused_single_layer_kv_transfer(
                                 cpu_tensors,
-                                tmp_gpu_buffer_obj.tensor,
+                                staging_tensor,
                                 self.kvcaches[layer_id],
                                 slot_mapping_full,
                                 chunk_offsets,
                                 chunk_sizes,
                                 False,
-                                self.kv_format.value,
-                                self._layerwise_token_major(),
+                                kv_format_raw,
+                                token_major,
                                 self.vllm_two_major,
                                 k_hidden_dims,
                                 v_hidden_dims,
@@ -1421,45 +1438,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             )
 
                     else:
-                        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
-                            self._single_layer_hidden_dim_args()
-                        )
                         layer_cached_tensors = (
                             cached_tensors_by_layer[layer_id]
-                            if cached_tensors_by_layer is not None
+                            if has_cached_tensors
                             and layer_id < len(cached_tensors_by_layer)
                             and cached_tensors_by_layer[layer_id]
                             else None
                         )
                         if use_sparse:
                             if layer_cached_tensors is not None:
-                                if len(layer_cached_tensors) != 1:
-                                    raise ValueError(
-                                        "sparse layerwise retrieve without a staging "
-                                        "buffer requires exactly one cached tensor "
-                                        "per layer"
-                                    )
                                 lmc_tensor = layer_cached_tensors[0]
                             else:
-                                if len(memory_objs_layer) != 1:
-                                    raise ValueError(
-                                        "sparse layerwise retrieve without a staging "
-                                        "buffer requires exactly one memory object per "
-                                        "layer; set use_gpu=True for multi-chunk sparse "
-                                        "retrieve"
-                                    )
-                                memory_obj = memory_objs_layer[0]
-                                assert memory_obj.tensor is not None
-                                lmc_tensor = memory_obj.tensor
-                            assert slot_mapping_packed is not None
-                            assert selected_token_idx is not None
+                                lmc_tensor = memory_objs_layer[0].tensor
                             lmc_ops.sparse_single_layer_kv_transfer(
                                 lmc_tensor,
                                 self.kvcaches[layer_id],
                                 slot_mapping_packed,
                                 selected_token_idx,
-                                self.kv_format.value,
-                                self._layerwise_token_major(),
+                                kv_format_raw,
+                                token_major,
                                 self.vllm_two_major,
                                 k_hidden_dims,
                                 v_hidden_dims,
@@ -1474,8 +1471,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                     self.kvcaches[layer_id],
                                     slot_mapping[start:end],
                                     False,
-                                    self.kv_format.value,
-                                    self._layerwise_token_major(),
+                                    kv_format_raw,
+                                    token_major,
                                     self.vllm_two_major,
                                     k_hidden_dims,
                                     v_hidden_dims,
@@ -1485,21 +1482,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             for start, end, memory_obj in zip(
                                 starts, ends, memory_objs_layer, strict=False
                             ):
-                                assert memory_obj.tensor is not None
-
                                 lmc_ops.single_layer_kv_transfer(
                                     memory_obj.tensor,
                                     self.kvcaches[layer_id],
                                     slot_mapping[start:end],
                                     False,
-                                    self.kv_format.value,
-                                    self._layerwise_token_major(),
+                                    kv_format_raw,
+                                    token_major,
                                     self.vllm_two_major,
                                     k_hidden_dims,
                                     v_hidden_dims,
                                     dsa_hidden_dims,
                                 )
-                    logger.debug(f"Finished loading layer {layer_id}")
             yield
 
             if sync:

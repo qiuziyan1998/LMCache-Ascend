@@ -203,6 +203,38 @@ def batched_fused_sparse_single_layer_kv_transfer(
     v_hidden_dims: int = 0,
     dsa_hidden_dims: int = 0,
 ) -> None:
+    mode = _FUSED_OP_MODES["batched_fused_sparse_single_layer_kv_transfer"]
+    if mode == "extended":
+        lmc_ops.batched_fused_sparse_single_layer_kv_transfer(
+            lmc_tensors,
+            staging_cache,
+            vllm_kv_caches,
+            slot_mapping_packed,
+            selected_token_idx,
+            chunk_offsets,
+            chunk_sizes,
+            kvcache_format_raw,
+            token_major,
+            vllm_two_major,
+            k_hidden_dims,
+            v_hidden_dims,
+            dsa_hidden_dims,
+        )
+        return
+    if mode == "legacy":
+        lmc_ops.batched_fused_sparse_single_layer_kv_transfer(
+            lmc_tensors,
+            staging_cache,
+            vllm_kv_caches,
+            slot_mapping_packed,
+            selected_token_idx,
+            chunk_offsets,
+            chunk_sizes,
+            kvcache_format_raw,
+            token_major,
+            vllm_two_major,
+        )
+        return
     _call_fused_op(
         "batched_fused_sparse_single_layer_kv_transfer",
         {

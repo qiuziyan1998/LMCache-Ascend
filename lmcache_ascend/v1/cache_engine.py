@@ -656,33 +656,21 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> bool:
         if not cached_keys or not cached_starts or not cached_ends:
             return True
-        return len(tokens) > max(cached_ends)
+        return len(tokens) > cached_ends[-1]
 
     @staticmethod
     def _has_retrieve_data_cache(
-        cached_starts: Optional[List[int]],
-        cached_ends: Optional[List[int]],
-        cached_keys: Optional[List],
         cached_tensors: Optional[List],
         cached_memory_objs: Optional[List],
         num_layers: int,
     ) -> bool:
-        if not cached_starts or not cached_ends or not cached_keys:
-            return False
-
-        num_chunks = len(cached_starts)
-        if num_chunks == 0 or len(cached_ends) != num_chunks:
-            return False
-
-        has_tensors = (
+        return (
             cached_tensors is not None
             and len(cached_tensors) == num_layers
-        )
-        has_mem_objs = (
+        ) or (
             cached_memory_objs is not None
             and len(cached_memory_objs) == num_layers
         )
-        return has_tensors or has_mem_objs
 
     def _ensure_retrieve_chunk_metadata(
         self,
@@ -694,6 +682,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_starts: List[int],
         cached_ends: List[int],
         ret_mask: torch.Tensor,
+        retrieve_kwargs: Optional[dict] = None,
     ) -> tuple[
         Optional[str],
         List[int],
@@ -764,21 +753,23 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask.zero_()
             for start, end in zip(cached_starts, cached_ends, strict=False):
                 ret_mask[start:end] = True
-            return location, list(cached_starts), list(cached_ends), cached_keys
+            if retrieve_kwargs is not None and location is not None:
+                retrieve_kwargs["cached_retrieve_location"] = location
+            return location, cached_starts, cached_ends, cached_keys
 
-        starts = list(cached_starts)
-        ends = list(cached_ends)
-        retrieve_keys = cached_keys
-        ret_mask.zero_()
-        for start, end in zip(starts, ends, strict=False):
+        for start, end in zip(cached_starts, cached_ends, strict=False):
             ret_mask[start:end] = True
 
         location = None
-        if retrieve_keys and retrieve_keys[0]:
+        if retrieve_kwargs is not None:
+            location = retrieve_kwargs.get("cached_retrieve_location")
+        if location is None and cached_keys and cached_keys[0]:
             location = self.storage_manager.contains(
-                retrieve_keys[0][0], self.retrieve_locations
+                cached_keys[0][0], self.retrieve_locations
             )
-        return location, starts, ends, retrieve_keys
+            if retrieve_kwargs is not None and location is not None:
+                retrieve_kwargs["cached_retrieve_location"] = location
+        return location, cached_starts, cached_ends, cached_keys
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1040,8 +1031,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         request_configs = kwargs.get("request_configs")
-        if request_configs is not None and len(request_configs) != 0:
-            assert isinstance(request_configs, dict)
 
         cached_keys = kwargs.get("cached_keys")
         assert cached_keys is not None
@@ -1058,8 +1047,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs = kwargs.get("cached_memory_objs")
         cached_tensors = kwargs.get("cached_tensors")
 
-        req_id = self._get_req_id(kwargs)
-
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -1068,6 +1055,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_starts=cached_starts,
             cached_ends=cached_ends,
             ret_mask=ret_mask,
+            retrieve_kwargs=kwargs,
         )
 
         if not retrieve_keys:
@@ -1084,9 +1072,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert_layerwise_gpu_connector(self.gpu_connector)
 
         use_cached_retrieve = self._has_retrieve_data_cache(
-            cached_starts,
-            cached_ends,
-            cached_keys,
             cached_tensors,
             cached_memory_objs,
             self.num_layers,
@@ -1098,27 +1083,26 @@ class AscendLMCacheEngine(LMCacheEngine):
                 retrieve_keys, location=location
             )
 
-        batched_to_gpu_kwargs = dict(kwargs)
         if use_cached_retrieve and cached_tensors is not None:
-            batched_to_gpu_kwargs["cached_tensors"] = cached_tensors
+            kwargs["cached_tensors"] = cached_tensors
+
+        cached_mem_layers = (
+            cached_memory_objs
+            if use_cached_retrieve
+            and cached_memory_objs is not None
+            and len(cached_memory_objs) == self.num_layers
+            else None
+        )
 
         for layer_id in range(self.num_layers):
-            try:
-                selected_tokens, token_start_index = yield ret_mask
-                if selected_tokens is None:
-                    raise ValueError("selected_tokens must be provided")
-            except GeneratorExit:
-                raise
+            selected_tokens, token_start_index = yield ret_mask
+            if selected_tokens is None:
+                raise ValueError("selected_tokens must be provided")
 
-            if use_cached_retrieve:
-                if (
-                    cached_memory_objs is not None
-                    and len(cached_memory_objs) == self.num_layers
-                    and cached_memory_objs[layer_id]
-                ):
-                    mem_objs_layer = cached_memory_objs[layer_id]
-                else:
-                    mem_objs_layer = []
+            if cached_mem_layers is not None:
+                mem_objs_layer = cached_mem_layers[layer_id]
+            elif use_cached_retrieve:
+                mem_objs_layer = []
             else:
                 assert get_generator is not None
                 task = next(get_generator)
@@ -1145,7 +1129,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     starts,
                     ends,
                     sparse_retrieve=True,
-                    **batched_to_gpu_kwargs,
+                    **kwargs,
                 )
                 next(mem_obj_consumer)
 
