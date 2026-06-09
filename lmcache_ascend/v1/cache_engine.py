@@ -680,6 +680,78 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         return has_tensors or has_mem_objs
 
+    def _ensure_retrieve_chunk_metadata(
+        self,
+        *,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        ret_mask: torch.Tensor,
+    ) -> tuple[
+        Optional[str],
+        List[int],
+        List[int],
+        List[List[CacheEngineKey]],
+    ]:
+        """Resolve retrieve chunk metadata once per request; reuse ReqMeta cache after."""
+        if not cached_keys:
+            location: Optional[str] = None
+            starts: List[int] = []
+            ends: List[int] = []
+            keys: List[List[CacheEngineKey]] = []
+
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+
+                keys_multi_layer = key.split_layers(self.num_layers)
+                if current_location := self.storage_manager.contains(
+                    keys_multi_layer[0], self.retrieve_locations
+                ):
+                    if location is None:
+                        location = current_location
+                    else:
+                        assert location == current_location, (
+                            "All retrieved keys should be from the same location "
+                            "when use layerwise retrieval."
+                            "Please support multi-location retrieval in the future."
+                        )
+                else:
+                    break
+
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
+                ret_mask[start:end] = True
+
+            retrieve_keys = (
+                [list(row) for row in zip(*keys, strict=False)] if keys else []
+            )
+            if retrieve_keys:
+                cached_keys[:] = retrieve_keys
+                cached_starts[:] = starts
+                cached_ends[:] = ends
+            return location, starts, ends, retrieve_keys
+
+        starts = list(cached_starts)
+        ends = list(cached_ends)
+        retrieve_keys = cached_keys
+        for start, end in zip(starts, ends, strict=False):
+            ret_mask[start:end] = True
+
+        location = None
+        if retrieve_keys and retrieve_keys[0]:
+            location = self.storage_manager.contains(
+                retrieve_keys[0][0], self.retrieve_locations
+            )
+        return location, starts, ends, retrieve_keys
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def store_layer(
@@ -939,10 +1011,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         mem_obj_consumer = None
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
-        starts = []
-        ends = []
-        keys = []
-
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -962,40 +1030,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs = kwargs.get("cached_memory_objs")
         cached_tensors = kwargs.get("cached_tensors")
 
-        # Get req_id for logging
         req_id = self._get_req_id(kwargs)
 
-        location = None
-        for start, end, key in self.token_database.process_tokens(
+        location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
-        ):
-            assert isinstance(key, CacheEngineKey)
-
-            keys_multi_layer = key.split_layers(self.num_layers)
-
-            if current_location := self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
-            ):
-                if location is None:
-                    location = current_location
-                else:
-                    assert location == current_location, (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
-                    )
-            else:
-                break
-
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
-            ret_mask[start:end] = True
-
-        retrieve_keys = (
-            [list(row) for row in zip(*keys, strict=False)] if keys else []
+            cached_keys=cached_keys,
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+            ret_mask=ret_mask,
         )
 
         if not retrieve_keys:
