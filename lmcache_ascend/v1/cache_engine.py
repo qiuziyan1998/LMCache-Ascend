@@ -637,13 +637,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_memory_objs.extend(
                     [] for _ in range(self.num_layers)
                 )
-            assert len(cached_memory_objs) == self.num_layers
             cached_memory_objs[layer_id].extend(mem_objs_layer)
         if cached_tensors is not None:
             if not cached_tensors:
                 cached_tensors.extend([] for _ in range(self.num_layers))
-            while len(cached_tensors) <= layer_id:
-                cached_tensors.append([])
             cached_tensors[layer_id].extend(
                 mem_obj.tensor
                 for mem_obj in mem_objs_layer
@@ -676,28 +673,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         num_chunks = len(cached_starts)
         if num_chunks == 0 or len(cached_ends) != num_chunks:
             return False
-        if len(cached_keys) != num_layers:
-            return False
-        if not all(len(cached_keys[layer_id]) == num_chunks for layer_id in range(num_layers)):
-            return False
 
         has_tensors = (
             cached_tensors is not None
             and len(cached_tensors) == num_layers
-            and all(
-                len(cached_tensors[layer_id]) == num_chunks
-                and cached_tensors[layer_id]
-                for layer_id in range(num_layers)
-            )
         )
         has_mem_objs = (
             cached_memory_objs is not None
             and len(cached_memory_objs) == num_layers
-            and all(
-                len(cached_memory_objs[layer_id]) == num_chunks
-                and cached_memory_objs[layer_id]
-                for layer_id in range(num_layers)
-            )
         )
         return has_tensors or has_mem_objs
 
