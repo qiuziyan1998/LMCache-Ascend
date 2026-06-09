@@ -206,7 +206,7 @@ void execute_batched_sparse_memcpy(
     const SingleLayerKVConfig &config, const HostChunkMetadata &meta,
     const std::vector<int64_t> &chunk_offsets,
     const std::vector<int64_t> &chunk_sizes,
-    const torch::Tensor &selected_token_idx, bool is_d2h);
+    const std::vector<int32_t> &selected_indices, bool is_d2h);
 
 bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
                           int kvcache_format_raw);
@@ -264,13 +264,27 @@ void run_batched_fused_sparse_transfer(
                                   config.kvcache_format, config.k_hidden_dims,
                                   config.v_hidden_dims, config.dsa_hidden_dims);
 
+  // Copy indices on CPU before OpCommand. Doing NPU->CPU inside the custom
+  // handler deadlocks because the handler runs on the active NPU stream.
+  std::vector<int32_t> sparse_indices;
+  if (selected_token_idx.defined() && selected_token_idx.numel() > 0) {
+    TORCH_CHECK(selected_token_idx.scalar_type() == at::ScalarType::Int,
+                "selected_token_idx must be int32.");
+    at::Tensor idx_cpu = selected_token_idx.device().is_cpu()
+                             ? selected_token_idx.contiguous()
+                             : selected_token_idx.detach().cpu().contiguous();
+    sparse_indices.assign(idx_cpu.data_ptr<int32_t>(),
+                          idx_cpu.data_ptr<int32_t>() + idx_cpu.numel());
+  }
+
   at_npu::native::OpCommand cmd;
   cmd.Name("batched_fused_sparse_single_layer_kv_transfer");
 
   cmd.SetCustomHandler([config, meta, chunk_offsets, chunk_sizes,
-                        selected_token_idx, kernel_launcher]() -> int {
+                        sparse_indices = std::move(sparse_indices),
+                        kernel_launcher]() -> int {
     execute_batched_sparse_memcpy(config, meta, chunk_offsets, chunk_sizes,
-                                  selected_token_idx, false);
+                                  sparse_indices, false);
     kernel_launcher();
     return 0;
   });

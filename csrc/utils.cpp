@@ -606,14 +606,11 @@ void execute_batched_sparse_memcpy(
     const SingleLayerKVConfig &config, const HostChunkMetadata &meta,
     const std::vector<int64_t> &chunk_offsets,
     const std::vector<int64_t> &chunk_sizes,
-    const torch::Tensor &selected_token_idx, bool is_d2h) {
+    const std::vector<int32_t> &selected_indices, bool is_d2h) {
   TORCH_CHECK(!is_d2h, "Sparse retrieve only supports H2D.");
-  TORCH_CHECK(selected_token_idx.scalar_type() == at::ScalarType::Int,
-              "selected_token_idx must be int32.");
 
-  auto idx_cpu = selected_token_idx.detach().to(at::kCPU).contiguous();
-  const int32_t *indices = idx_cpu.data_ptr<int32_t>();
-  const int32_t num_sparse = static_cast<int32_t>(idx_cpu.size(0));
+  const int32_t *indices = selected_indices.data();
+  const int32_t num_sparse = static_cast<int32_t>(selected_indices.size());
   const int32_t total_tokens = config.dims.lmc_num_tokens;
 
   if (num_sparse <= 0) {
