@@ -572,7 +572,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         yield ret_mask
 
-    def _populate_layerwise_store_cache(
+    def _append_layerwise_store_cache_chunks(
         self,
         *,
         keys: List[List[CacheEngineKey]],
@@ -585,25 +585,30 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs: Optional[List],
         cached_tensors: Optional[List],
     ) -> None:
-        if cached_keys is not None:
-            cached_keys.clear()
-            cached_keys.extend(keys)
+        """Append one store_layer batch; never clear (chunked prefill calls many times)."""
+        num_layers = len(keys)
         if cached_starts is not None:
-            cached_starts.clear()
             cached_starts.extend(starts)
         if cached_ends is not None:
-            cached_ends.clear()
             cached_ends.extend(ends)
+        if cached_keys is not None:
+            if not cached_keys:
+                cached_keys.extend([] for _ in range(num_layers))
+            assert len(cached_keys) == num_layers, (
+                f"cached_keys has {len(cached_keys)} layers, expected {num_layers}"
+            )
+            for layer_id, layer_keys in enumerate(keys):
+                cached_keys[layer_id].extend(layer_keys)
         if cached_memory_objs is not None:
-            cached_memory_objs.clear()
-            for layer_objs in memory_objs:
-                cached_memory_objs.append(list(layer_objs))
-        if cached_tensors is not None:
-            cached_tensors.clear()
-            for _ in memory_objs:
-                cached_tensors.append([])
+            if not cached_memory_objs:
+                cached_memory_objs.extend([] for _ in range(num_layers))
+            assert len(cached_memory_objs) == num_layers
+            for layer_id, layer_objs in enumerate(memory_objs):
+                cached_memory_objs[layer_id].extend(layer_objs)
+        if cached_tensors is not None and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
 
-    def _snapshot_layer_store_tensors(
+    def _append_layer_store_tensors(
         self,
         layer_id: int,
         memory_objs: List[List[MemoryObj]],
@@ -613,31 +618,67 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
         while len(cached_tensors) <= layer_id:
             cached_tensors.append([])
-        cached_tensors[layer_id] = [
+        cached_tensors[layer_id].extend(
             mem_obj.tensor
             for mem_obj in memory_objs[layer_id]
             if mem_obj.tensor is not None
-        ]
-
-    @staticmethod
-    def _can_use_cached_retrieve_memory_objs(
-        cached_memory_objs: Optional[List],
-        num_layers: int,
-    ) -> bool:
-        return (
-            cached_memory_objs is not None
-            and len(cached_memory_objs) == num_layers
         )
 
     @staticmethod
-    def _can_use_cached_retrieve_tensors(
+    def _layerwise_cache_matches_retrieve(
+        *,
+        cached_starts: Optional[List[int]],
+        cached_ends: Optional[List[int]],
+        cached_keys: Optional[List],
         cached_tensors: Optional[List],
+        cached_memory_objs: Optional[List],
+        retrieve_starts: List[int],
+        retrieve_ends: List[int],
+        retrieve_keys: List[List[CacheEngineKey]],
         num_layers: int,
     ) -> bool:
-        return (
+        if not retrieve_starts:
+            return False
+
+        num_chunks = len(retrieve_starts)
+        if num_chunks != len(retrieve_ends):
+            return False
+        if cached_starts is None or len(cached_starts) != num_chunks:
+            return False
+        if cached_ends is None or len(cached_ends) != num_chunks:
+            return False
+        if list(cached_starts) != list(retrieve_starts):
+            return False
+        if list(cached_ends) != list(retrieve_ends):
+            return False
+        if cached_keys is None or len(cached_keys) != num_layers:
+            return False
+        if not all(len(cached_keys[layer_id]) == num_chunks for layer_id in range(num_layers)):
+            return False
+        if len(retrieve_keys) != num_layers:
+            return False
+        if not all(len(retrieve_keys[layer_id]) == num_chunks for layer_id in range(num_layers)):
+            return False
+
+        has_tensors = (
             cached_tensors is not None
             and len(cached_tensors) == num_layers
+            and all(
+                len(cached_tensors[layer_id]) == num_chunks
+                and cached_tensors[layer_id]
+                for layer_id in range(num_layers)
+            )
         )
+        has_mem_objs = (
+            cached_memory_objs is not None
+            and len(cached_memory_objs) == num_layers
+            and all(
+                len(cached_memory_objs[layer_id]) == num_chunks
+                and cached_memory_objs[layer_id]
+                for layer_id in range(num_layers)
+            )
+        )
+        return has_tensors or has_mem_objs
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -806,24 +847,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            t_start = time.perf_counter()
-            mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **kwargs
-            )
-
-            next(mem_obj_generator)
-
-            for layer_id in range(self.num_layers):
-                yield
-                next(mem_obj_generator)
-                self._snapshot_layer_store_tensors(
-                    layer_id, memory_objs, cached_tensors
-                )
-                self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
-                )
-
-            self._populate_layerwise_store_cache(
+            self._append_layerwise_store_cache_chunks(
                 keys=keys,
                 starts=starts,
                 ends=ends,
@@ -834,6 +858,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_memory_objs=cached_memory_objs,
                 cached_tensors=cached_tensors,
             )
+
+            t_start = time.perf_counter()
+            mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                memory_objs, starts, ends, **kwargs
+            )
+
+            next(mem_obj_generator)
+
+            for layer_id in range(self.num_layers):
+                yield
+                next(mem_obj_generator)
+                self._append_layer_store_tensors(
+                    layer_id, memory_objs, cached_tensors
+                )
+                self.storage_manager.batched_put(
+                    keys[layer_id], memory_objs[layer_id], location=self.store_location
+                )
 
             tot_time = time.perf_counter() - t_start
             logger.info(
@@ -924,45 +965,40 @@ class AscendLMCacheEngine(LMCacheEngine):
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
 
-        if not cached_keys:
-            # prefix cache hit, first retrieve
-            #logger.info(f"[req_id={req_id}] [retrieve_layer_head_token_wise] Prefix cache hit, construct key for prefill")
-            location = None
-            for start, end, key in self.token_database.process_tokens(
-                tokens=tokens,
-                mask=mask,
-                request_configs=request_configs,
+        location = None
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+
+            keys_multi_layer = key.split_layers(self.num_layers)
+
+            if current_location := self.storage_manager.contains(
+                keys_multi_layer[0], self.retrieve_locations
             ):
-                assert isinstance(key, CacheEngineKey)
-
-                keys_multi_layer = key.split_layers(self.num_layers)
-
-                # NOTE: Only check the first layer
-                if current_location := self.storage_manager.contains(
-                    keys_multi_layer[0], self.retrieve_locations
-                ):
-                    if location is None:
-                        location = current_location
-                    else:
-                        # TODO(Jiayi): Support multi-location retrieval in the future
-                        assert location == current_location, (
-                            "All retrieved keys should be from the same location "
-                            "when use layerwise retrieval."
-                            "Please support multi-location retrieval in the future."
-                        )
+                if location is None:
+                    location = current_location
                 else:
-                    break
+                    assert location == current_location, (
+                        "All retrieved keys should be from the same location "
+                        "when use layerwise retrieval."
+                        "Please support multi-location retrieval in the future."
+                    )
+            else:
+                break
 
-                starts.append(start)
-                ends.append(end)
-                keys.append(keys_multi_layer)
+            starts.append(start)
+            ends.append(end)
+            keys.append(keys_multi_layer)
+            ret_mask[start:end] = True
 
-                ret_mask[start:end] = True
-            cached_keys[:] = [list(row) for row in zip(*keys, strict=False)]
-            cached_starts[:] = starts
-            cached_ends[:] = ends
+        retrieve_keys = (
+            [list(row) for row in zip(*keys, strict=False)] if keys else []
+        )
 
-        if not cached_keys:
+        if not retrieve_keys:
             # If no cache are found, we still need to yield to avoid `StopIteration`
             for layer_id in range(self.num_layers):
                 yield None
@@ -975,16 +1011,23 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         assert_layerwise_gpu_connector(self.gpu_connector)
 
-        use_cached_retrieve = (
-            self._can_use_cached_retrieve_tensors(cached_tensors, self.num_layers)
-            or self._can_use_cached_retrieve_memory_objs(
-                cached_memory_objs, self.num_layers
-            )
+        use_cached_retrieve = self._layerwise_cache_matches_retrieve(
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+            cached_keys=cached_keys,
+            cached_tensors=cached_tensors,
+            cached_memory_objs=cached_memory_objs,
+            retrieve_starts=starts,
+            retrieve_ends=ends,
+            retrieve_keys=retrieve_keys,
+            num_layers=self.num_layers,
         )
 
         get_generator = None
         if not use_cached_retrieve:
-            get_generator = self.storage_manager.layerwise_batched_get(cached_keys)
+            get_generator = self.storage_manager.layerwise_batched_get(
+                retrieve_keys, location=location
+            )
 
         to_count_down: List[MemoryObj] = []
         batched_to_gpu_kwargs = dict(kwargs)
@@ -1000,8 +1043,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 raise
 
             if use_cached_retrieve:
-                if self._can_use_cached_retrieve_memory_objs(
-                    cached_memory_objs, self.num_layers
+                if (
+                    cached_memory_objs is not None
+                    and len(cached_memory_objs) == self.num_layers
+                    and cached_memory_objs[layer_id]
                 ):
                     mem_objs_layer = cached_memory_objs[layer_id]
                 else:
@@ -1017,8 +1062,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             if not mem_obj_consumer:
                 mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                    cached_starts,
-                    cached_ends,
+                    starts,
+                    ends,
                     sparse_retrieve=True,
                     **batched_to_gpu_kwargs,
                 )
