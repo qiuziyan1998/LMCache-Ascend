@@ -449,6 +449,9 @@ void sparse_single_layer_kv_transfer(
       token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
       v_hidden_dims, dsa_hidden_dims);
 
+  validate_sparse_selected_token_bounds(selected_token_idx,
+                                      config.dims.lmc_num_tokens);
+
   uint8_t *selected_token_idx_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
 
@@ -486,6 +489,9 @@ void batched_fused_sparse_single_layer_kv_transfer(
       staging_cache, vllm_kv_caches, slot_mapping_packed, false, token_major,
       vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
       dsa_hidden_dims);
+
+  validate_sparse_selected_token_bounds(selected_token_idx,
+                                      config.dims.lmc_num_tokens);
 
   uint8_t *selected_token_idx_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);

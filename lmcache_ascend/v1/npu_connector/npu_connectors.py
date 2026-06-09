@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -28,6 +29,50 @@ from lmcache_ascend.v1.npu_connector.utils import (
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
+
+_DEBUG_SYNC = os.environ.get("LMCACHE_ASCEND_DEBUG_SYNC", "0") == "1"
+
+
+def _validate_sparse_layerwise_inputs(
+    *,
+    layer_id: int,
+    staging_num_tokens: int,
+    slot_mapping_packed: torch.Tensor,
+    selected_token_idx: torch.Tensor,
+    chunk_sizes: List[int],
+) -> None:
+    num_sparse = slot_mapping_packed.shape[0]
+    if num_sparse != selected_token_idx.shape[0]:
+        raise ValueError(
+            f"sparse layerwise layer {layer_id}: slot_mapping_packed length "
+            f"({num_sparse}) != selected_token_idx length "
+            f"({selected_token_idx.shape[0]})"
+        )
+    if selected_token_idx.numel() == 0:
+        raise ValueError(
+            f"sparse layerwise layer {layer_id}: selected_token_idx is empty"
+        )
+
+    idx_cpu = selected_token_idx.detach().cpu()
+    min_idx = int(idx_cpu.min())
+    max_idx = int(idx_cpu.max())
+    if min_idx < 0 or max_idx >= staging_num_tokens:
+        raise ValueError(
+            f"sparse layerwise layer {layer_id}: selected_token_idx out of "
+            f"range [{min_idx}, {max_idx}] for staging_num_tokens="
+            f"{staging_num_tokens} (chunk_sizes={chunk_sizes})"
+        )
+
+    logger.info(
+        "sparse layerwise retrieve layer=%d: staging_tokens=%d sparse_tokens=%d "
+        "selected_idx=[%d,%d] slot_mapping_len=%d",
+        layer_id,
+        staging_num_tokens,
+        num_sparse,
+        min_idx,
+        max_idx,
+        num_sparse,
+    )
 
 logger = init_logger(__name__)
 
@@ -1313,8 +1358,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # slot_mapping should already be the continuous vllm block address, maybe after sparse and compact
         slot_mapping_full = slot_mapping
 
-        num_tokens = len(slot_mapping_full)
-
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
@@ -1325,9 +1368,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             chunk_offsets.append(current_offset)
             current_offset += chunk_size
 
+        # Staging holds all retrieved LMC tokens (sum of chunks). Sparse
+        # slot_mapping is packed and usually shorter than staging_num_tokens.
+        staging_num_tokens = current_offset
+        if use_sparse:
+            if staging_num_tokens == 0:
+                raise ValueError(
+                    "sparse_retrieve with empty retrieved chunks (staging_num_tokens=0)"
+                )
+        elif len(slot_mapping_full) != staging_num_tokens:
+            raise ValueError(
+                "dense layerwise retrieve expects slot_mapping length "
+                f"({len(slot_mapping_full)}) to match retrieved tokens "
+                f"({staging_num_tokens}); chunk_sizes={chunk_sizes}"
+            )
+
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         if self.use_gpu:
-            buffer_shape = self.get_shape(num_tokens)
+            buffer_shape = self.get_shape(staging_num_tokens)
             assert self.gpu_buffer_allocator is not None
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, self._expected_memory_format()
@@ -1343,7 +1401,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for layer_id in range(self.num_layers):
                 memory_objs_layer, selected_token_idx, token_start_index = yield
                 slot_mapping_packed = slot_mapping_full[token_start_index:]
-                if selected_token_idx is None:
+                if use_sparse:
+                    if selected_token_idx is None:
+                        raise ValueError(
+                            "sparse_retrieve requires selected_token_idx from "
+                            "retrieve_layer_head_token_wise; arange(slot_mapping) "
+                            "is not valid when slot_mapping is packed sparse slots"
+                        )
+                    selected_token_idx = selected_token_idx.to(
+                        device=self.kv_device, dtype=torch.int32
+                    )
+                    if slot_mapping_packed.device != self.kv_device:
+                        slot_mapping_packed = slot_mapping_packed.to(
+                            device=self.kv_device, non_blocking=True
+                        )
+                    _validate_sparse_layerwise_inputs(
+                        layer_id=layer_id,
+                        staging_num_tokens=staging_num_tokens,
+                        slot_mapping_packed=slot_mapping_packed,
+                        selected_token_idx=selected_token_idx,
+                        chunk_sizes=chunk_sizes,
+                    )
+                    if _DEBUG_SYNC:
+                        torch.npu.synchronize()
+                elif selected_token_idx is None:
                     selected_token_idx = torch.arange(
                         slot_mapping_packed.shape[0],
                         dtype=torch.int32,
@@ -1460,6 +1541,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 current_stream.wait_stream(self.load_stream)
         finally:
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
+                # Always wait for in-flight H2D/sparse kernels before freeing staging.
+                current_stream.wait_stream(self.load_stream)
+                if _DEBUG_SYNC:
+                    torch.npu.synchronize()
                 tmp_gpu_buffer_obj.ref_count_down()
 
         yield

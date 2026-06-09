@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "dcmi_management.h"
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -666,6 +667,25 @@ void validate_sparse_single_layer_inputs(
   if (!selected_token_idx.device().is_privateuseone()) {
     PyErr_SetString(PyExc_ValueError,
                     "selected_token_idx must be on NPU device.");
+    throw py::error_already_set();
+  }
+}
+
+void validate_sparse_selected_token_bounds(
+    const torch::Tensor &selected_token_idx, int32_t lmc_num_tokens) {
+  if (lmc_num_tokens <= 0) {
+    PyErr_SetString(PyExc_ValueError, "lmc_num_tokens must be positive.");
+    throw py::error_already_set();
+  }
+
+  auto idx_cpu = selected_token_idx.to(at::kCPU);
+  int32_t min_idx = idx_cpu.min().item<int32_t>();
+  int32_t max_idx = idx_cpu.max().item<int32_t>();
+  if (min_idx < 0 || max_idx >= lmc_num_tokens) {
+    std::ostringstream oss;
+    oss << "selected_token_idx out of range [" << min_idx << ", " << max_idx
+        << "] for lmc_num_tokens=" << lmc_num_tokens;
+    PyErr_SetString(PyExc_ValueError, oss.str().c_str());
     throw py::error_already_set();
   }
 }

@@ -466,6 +466,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             "gpu_connector is required for retrieve_layer operation"
         )
 
+        if kwargs.get("sparse_retrieve", False):
+            raise ValueError(
+                "sparse_retrieve requires retrieve_layer_head_token_wise(); "
+                "retrieve_layer() always sends selected_token_idx=None"
+            )
+
         req_id = self._get_req_id(kwargs)
 
         if mask is not None:
