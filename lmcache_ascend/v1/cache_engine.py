@@ -540,8 +540,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 mem_obj_consumer.send((mem_objs_layer, None, 0))
                 to_count_down.extend(mem_objs_layer)
 
-            for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
         else:
             for _layer_id in range(self.num_layers):
                 yield None
@@ -550,6 +548,9 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if keys:
             next(mem_obj_consumer)
+
+            for mem_obj in to_count_down:
+                mem_obj.ref_count_down()
 
             # LocalCPU hot-cache objects are unpinned by lookup_unpin() in
             # wait_for_save().  batched_get returns the same object that lookup
@@ -719,15 +720,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 next(mem_obj_consumer)
 
             mem_obj_consumer.send((mem_objs_layer, selected_tokens, token_start_index))
-            # TODO: refine the ref count logic in new async get inferface
-            # to_count_down.extend(mem_objs_layer)
+            to_count_down.extend(mem_objs_layer)
+
+        if mem_obj_consumer is not None:
+            next(mem_obj_consumer)
+
         for mem_obj in to_count_down:
             mem_obj.ref_count_down()
-
-        # synchronize the last layer
-        if not mem_obj_consumer:
-            mem_obj_consumer = (x for x in [])  
-        #next(mem_obj_consumer)
 
         yield ret_mask
 
