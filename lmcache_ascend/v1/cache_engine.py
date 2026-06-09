@@ -673,7 +673,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 keys.append(keys_multi_layer)
 
                 ret_mask[start:end] = True
-            cached_keys[:] = [[key.to_string() for key in row] for row in zip(*keys, strict=False)]
+            cached_keys[:] = [list(row) for row in zip(*keys, strict=False)]
             cached_starts[:] = starts
             cached_ends[:] = ends
 
