@@ -1371,6 +1371,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_format_raw = self.kv_format.value
         use_gpu = self.use_gpu
         has_cached_tensors = cached_tensors_by_layer is not None
+        sparse_indices_cpu: Optional[torch.Tensor] = None
 
         try:
             for layer_id in range(self.num_layers):
@@ -1383,6 +1384,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx = self._sparse_selected_token_idx(
                     selected_token_idx, slot_mapping_packed.shape[0]
                 )
+                if use_sparse and sparse_indices_cpu is None:
+                    sparse_indices_cpu = selected_token_idx.detach().cpu().contiguous()
 
                 if sync and layer_id > 0:
                     current_stream.wait_stream(self.load_stream)
@@ -1419,6 +1422,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 k_hidden_dims,
                                 v_hidden_dims,
                                 dsa_hidden_dims,
+                                sparse_indices_cpu,
                             )
                         else:
                             batched_fused_single_layer_kv_transfer(

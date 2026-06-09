@@ -177,7 +177,8 @@ void batched_fused_sparse_single_layer_kv_transfer(
     std::vector<int64_t> &chunk_offsets, std::vector<int64_t> &chunk_sizes,
     const int kvcache_format_raw, const bool token_major = false,
     const bool vllm_two_major = false, const int64_t k_hidden_dims = 0,
-    const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0);
+    const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0,
+    const c10::optional<torch::Tensor> &sparse_indices_cpu = c10::nullopt);
 
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,

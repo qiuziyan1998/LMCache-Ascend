@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Literal, Sequence, Tuple, Union
+from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 # Third Party
 from lmcache.v1.gpu_connector.utils import permute_to_contiguous
@@ -110,6 +110,7 @@ def _call_sparse_extended(fn, kwargs: dict) -> None:
         kwargs["k_hidden_dims"],
         kwargs["v_hidden_dims"],
         kwargs["dsa_hidden_dims"],
+        kwargs.get("sparse_indices_cpu"),
     )
 
 
@@ -202,6 +203,7 @@ def batched_fused_sparse_single_layer_kv_transfer(
     k_hidden_dims: int = 0,
     v_hidden_dims: int = 0,
     dsa_hidden_dims: int = 0,
+    sparse_indices_cpu: Optional[torch.Tensor] = None,
 ) -> None:
     mode = _FUSED_OP_MODES["batched_fused_sparse_single_layer_kv_transfer"]
     if mode == "extended":
@@ -219,6 +221,7 @@ def batched_fused_sparse_single_layer_kv_transfer(
             k_hidden_dims,
             v_hidden_dims,
             dsa_hidden_dims,
+            sparse_indices_cpu,
         )
         return
     if mode == "legacy":
@@ -251,5 +254,6 @@ def batched_fused_sparse_single_layer_kv_transfer(
             "k_hidden_dims": k_hidden_dims,
             "v_hidden_dims": v_hidden_dims,
             "dsa_hidden_dims": dsa_hidden_dims,
+            "sparse_indices_cpu": sparse_indices_cpu,
         },
     )

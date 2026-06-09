@@ -476,7 +476,8 @@ void batched_fused_sparse_single_layer_kv_transfer(
     std::vector<int64_t> &chunk_offsets, std::vector<int64_t> &chunk_sizes,
     const int kvcache_format_raw, const bool token_major,
     const bool vllm_two_major, const int64_t k_hidden_dims,
-    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
+    const c10::optional<torch::Tensor> &sparse_indices_cpu) {
   validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
   validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
 
@@ -497,7 +498,8 @@ void batched_fused_sparse_single_layer_kv_transfer(
 
   run_batched_fused_sparse_transfer(config, lmc_tensors, chunk_offsets,
                                     chunk_sizes, element_size,
-                                    selected_token_idx, launcher);
+                                    selected_token_idx, sparse_indices_cpu,
+                                    launcher);
 }
 
 void load_and_reshape_flash(
