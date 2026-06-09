@@ -688,7 +688,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         get_generator = self.storage_manager.layerwise_batched_get(
             cached_keys,
-            location=location,
+            #location=location,
         )
 
         to_count_down = []
@@ -715,7 +715,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             # TODO: make batched_to_gpu_head_token_wise able to deal with memory_obj's metadata
             if not mem_obj_consumer:
-                mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
                 next(mem_obj_consumer)
 
             mem_obj_consumer.send((mem_objs_layer, selected_tokens, token_start_index))
