@@ -209,9 +209,6 @@ void validate_sparse_single_layer_inputs(
     const torch::Tensor &slot_mapping_packed,
     const torch::Tensor &selected_token_idx);
 
-void validate_sparse_selected_token_bounds(
-    const torch::Tensor &selected_token_idx, int32_t lmc_num_tokens);
-
 template <typename KernelLauncher>
 void run_batched_fused_transfer(const SingleLayerKVConfig &config,
                                 const std::vector<torch::Tensor> &lmc_tensors,

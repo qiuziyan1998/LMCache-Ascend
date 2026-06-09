@@ -466,12 +466,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             "gpu_connector is required for retrieve_layer operation"
         )
 
-        if kwargs.get("sparse_retrieve", False):
-            raise ValueError(
-                "sparse_retrieve requires retrieve_layer_head_token_wise(); "
-                "retrieve_layer() always sends selected_token_idx=None"
-            )
-
         req_id = self._get_req_id(kwargs)
 
         if mask is not None:
@@ -634,6 +628,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert cached_keys is not None
         assert isinstance(cached_keys, list)
 
+        cached_starts = kwargs.get("cached_starts")
+        assert cached_starts is not None
+        assert isinstance(cached_starts, list)
+
+        cached_ends = kwargs.get("cached_ends")
+        assert cached_ends is not None
+        assert isinstance(cached_ends, list)
+
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
 
@@ -671,8 +673,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 keys.append(keys_multi_layer)
 
                 ret_mask[start:end] = True
-            #cached_keys[:] = [[key.to_string() for key in row] for row in zip(*keys, strict=False)]
-            cached_keys[:] = [list(row) for row in zip(*keys, strict=False)]
+            cached_keys[:] = [[key.to_string() for key in row] for row in zip(*keys, strict=False)]
+            cached_starts[:] = starts
+            cached_ends[:] = ends
 
         if not cached_keys:
             # If no cache are found, we still need to yield to avoid `StopIteration`
@@ -722,7 +725,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             # TODO: make batched_to_gpu_head_token_wise able to deal with memory_obj's metadata
             if not mem_obj_consumer:
-                mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu(cached_starts, cached_ends, sparse_retrieve=True, **kwargs)
                 next(mem_obj_consumer)
 
             mem_obj_consumer.send((mem_objs_layer, selected_tokens, token_start_index))
