@@ -571,6 +571,167 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         yield ret_mask
 
+
+    def retrieve_layer_head_token_wise(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """
+        Retrieve the KV cache in a layerwise manner.
+
+        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask will be all True for
+            sparse attention with chunk size 1
+
+        :param **kwargs: The additional arguments for the storage backend which
+            will be passed into the gpu_connector.
+
+        return: A generator that yields Optional[torch.Tensor]. The tensor will
+            be the boolean mask indicating which tokens are retrieved and will
+            only be returned in the last iteration. In the first iteration,
+            the generator retrieve the memory objects of the first layer from
+            the storage backends. In the next iterations, it moves the KV cache
+            of layer i from the memory objects (on CPU) to GPU and retrieves
+            the memory objects of layer i+1 from the storage backends. In the
+            last iteration, it moves the memory objects of the last layer to
+            the GPU.
+        """
+
+        # Health check: block operation if LMCache is unhealthy
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
+            yield torch.zeros(len(tokens), dtype=torch.bool)
+            return
+
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve_layer operation"
+        )
+
+        mem_obj_consumer = None
+        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+
+        starts = []
+        ends = []
+        keys = []
+
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        cached_keys = kwargs.get("cached_keys")
+        assert cached_keys is not None
+        assert isinstance(cached_keys, list)
+
+        # Get req_id for logging
+        req_id = self._get_req_id(kwargs)
+
+        if not cached_keys:
+            # prefix cache hit, first retrieve
+            #logger.info(f"[req_id={req_id}] [retrieve_layer_head_token_wise] Prefix cache hit, construct key for prefill")
+            location = None
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+
+                keys_multi_layer = key.split_layers(self.num_layers)
+
+                # NOTE: Only check the first layer
+                if current_location := self.storage_manager.contains(
+                    keys_multi_layer[0], self.retrieve_locations
+                ):
+                    if location is None:
+                        location = current_location
+                    else:
+                        # TODO(Jiayi): Support multi-location retrieval in the future
+                        assert location == current_location, (
+                            "All retrieved keys should be from the same location "
+                            "when use layerwise retrieval."
+                            "Please support multi-location retrieval in the future."
+                        )
+                else:
+                    break
+
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
+
+                ret_mask[start:end] = True
+            #cached_keys[:] = [[key.to_string() for key in row] for row in zip(*keys, strict=False)]
+            cached_keys[:] = [list(row) for row in zip(*keys, strict=False)]
+
+        if not cached_keys:
+            # If no cache are found, we still need to yield to avoid `StopIteration`
+            for layer_id in range(self.num_layers):
+                yield None
+            # synchronize the last layer
+            if not mem_obj_consumer:
+                mem_obj_consumer = (x for x in range(self.num_layers))  
+            next(mem_obj_consumer)
+            yield ret_mask
+            return
+
+        assert_layerwise_gpu_connector(self.gpu_connector)
+
+        # generator of each layer's get
+        #get_generator = self.storage_manager.layerwise_batched_get_device_ptr_async(
+        #    cached_keys,
+        #    # location=location,
+        #)
+
+        get_generator = self.storage_manager.layerwise_batched_get(
+            cached_keys,
+            location=location,
+        )
+
+        to_count_down = []
+        for layer_id in range(self.num_layers):
+            task = next(get_generator)
+            assert task is not None
+
+            try:
+                selected_tokens, token_start_index = yield ret_mask
+                if selected_tokens is None:
+                    raise ValueError(f"selected_tokens must be provided")
+            except GeneratorExit:
+                raise
+
+            #mem_objs_layer = task.get() # list[int]
+            mem_objs_layer = task.result()
+            if mem_objs_layer is None:
+                continue
+
+            # NL_X_TWO_NB_BS_NH_HS
+            # layers[(2, num_blocks, block_size, num_heads, head_size)]
+            # NL_X_NB_TWO_BS_NH_HS
+            # layers[(num_blocks, 2, block_size, num_heads, head_size)]
+
+            # TODO: make batched_to_gpu_head_token_wise able to deal with memory_obj's metadata
+            if not mem_obj_consumer:
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+                next(mem_obj_consumer)
+
+            mem_obj_consumer.send((mem_objs_layer, selected_tokens, token_start_index))
+            # TODO: refine the ref count logic in new async get inferface
+            # to_count_down.extend(mem_objs_layer)
+        for mem_obj in to_count_down:
+            mem_obj.ref_count_down()
+
+        # synchronize the last layer
+        if not mem_obj_consumer:
+            mem_obj_consumer = (x for x in [])  
+        #next(mem_obj_consumer)
+
+        yield ret_mask
+
+
     @torch.inference_mode()
     def store(
         self,
