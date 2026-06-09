@@ -496,7 +496,8 @@ void batched_fused_sparse_single_layer_kv_transfer(
   };
 
   run_batched_fused_sparse_transfer(config, lmc_tensors, chunk_offsets,
-                                    chunk_sizes, element_size, launcher);
+                                    chunk_sizes, element_size,
+                                    selected_token_idx, launcher);
 }
 
 void load_and_reshape_flash(

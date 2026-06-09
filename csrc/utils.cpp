@@ -586,6 +586,170 @@ void execute_batched_memcpy(
   }
 }
 
+namespace {
+
+int find_chunk_for_staging_token(
+    int32_t staging_token_idx, const std::vector<int64_t> &chunk_offsets,
+    const std::vector<int64_t> &chunk_sizes) {
+  for (size_t i = 0; i < chunk_offsets.size(); ++i) {
+    if (staging_token_idx >= chunk_offsets[i] &&
+        staging_token_idx < chunk_offsets[i] + chunk_sizes[i]) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+} // namespace
+
+void execute_batched_sparse_memcpy(
+    const SingleLayerKVConfig &config, const HostChunkMetadata &meta,
+    const std::vector<int64_t> &chunk_offsets,
+    const std::vector<int64_t> &chunk_sizes,
+    const torch::Tensor &selected_token_idx, bool is_d2h) {
+  TORCH_CHECK(!is_d2h, "Sparse retrieve only supports H2D.");
+  TORCH_CHECK(selected_token_idx.scalar_type() == at::ScalarType::Int,
+              "selected_token_idx must be int32.");
+
+  auto idx_cpu = selected_token_idx.detach().to(at::kCPU).contiguous();
+  const int32_t *indices = idx_cpu.data_ptr<int32_t>();
+  const int32_t num_sparse = static_cast<int32_t>(idx_cpu.size(0));
+  const int32_t total_tokens = config.dims.lmc_num_tokens;
+
+  if (num_sparse <= 0) {
+    return;
+  }
+  // Bulk chunk memcpy is faster when most tokens are selected.
+  if (num_sparse >= (total_tokens * 3) / 4) {
+    execute_batched_memcpy(config, meta, chunk_offsets, false);
+    return;
+  }
+
+  aclError ret;
+  aclrtMemcpyKind kind = ACL_MEMCPY_HOST_TO_DEVICE;
+  aclrtStream stream = config.ub_params.stream;
+  const bool is_mla_dsa =
+      config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV;
+
+  if (is_mla_dsa) {
+    int64_t k_bytes_per_token = config.k_hidden_dims * meta.element_size;
+    int64_t v_bytes_per_token = config.v_hidden_dims * meta.element_size;
+    int64_t dsa_bytes_per_token = config.dsa_hidden_dims * meta.element_size;
+    int64_t staging_v_plane_offset =
+        config.strides.lmc_v_plane_offset * meta.element_size;
+    int64_t staging_dsa_plane_offset =
+        config.strides.lmc_dsa_plane_offset * meta.element_size;
+    int64_t host_bytes_per_token =
+        k_bytes_per_token + v_bytes_per_token +
+        (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV
+             ? dsa_bytes_per_token
+             : 0);
+
+    for (int32_t s = 0; s < num_sparse; ++s) {
+      const int32_t staging_token_idx = indices[s];
+      const int chunk_i =
+          find_chunk_for_staging_token(staging_token_idx, chunk_offsets, chunk_sizes);
+      TORCH_CHECK(chunk_i >= 0, "selected_token_idx out of chunk range: ",
+                  staging_token_idx);
+      const int64_t t = staging_token_idx - chunk_offsets[chunk_i];
+      uint8_t *host_base = meta.ptrs[chunk_i];
+
+      if (config.token_major) {
+        uint8_t *host_token = host_base + t * host_bytes_per_token;
+        uint8_t *staging_k =
+            config.ptrs.lmc_ptr + staging_token_idx * k_bytes_per_token;
+        uint8_t *staging_v = config.ptrs.lmc_ptr + staging_v_plane_offset +
+                             staging_token_idx * v_bytes_per_token;
+        ret = aclrtMemcpyAsync(staging_k, k_bytes_per_token, host_token,
+                               k_bytes_per_token, kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE,
+                    "Sparse memcpy (MLA/DSA K) failed at index ", staging_token_idx);
+        ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
+                               host_token + k_bytes_per_token, v_bytes_per_token,
+                               kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE,
+                    "Sparse memcpy (MLA/DSA V) failed at index ", staging_token_idx);
+        if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+          uint8_t *staging_dsa =
+              config.ptrs.lmc_ptr + staging_dsa_plane_offset +
+              staging_token_idx * dsa_bytes_per_token;
+          ret = aclrtMemcpyAsync(
+              staging_dsa, dsa_bytes_per_token,
+              host_token + k_bytes_per_token + v_bytes_per_token,
+              dsa_bytes_per_token, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE,
+                      "Sparse memcpy (DSA) failed at index ", staging_token_idx);
+        }
+      } else {
+        uint8_t *host_k = host_base + t * k_bytes_per_token;
+        uint8_t *host_v = host_k + meta.v_offsets[chunk_i];
+        uint8_t *host_dsa = host_v + meta.dsa_offsets[chunk_i];
+        uint8_t *staging_k =
+            config.ptrs.lmc_ptr + staging_token_idx * k_bytes_per_token;
+        uint8_t *staging_v = config.ptrs.lmc_ptr + staging_v_plane_offset +
+                             staging_token_idx * v_bytes_per_token;
+        ret = aclrtMemcpyAsync(staging_k, k_bytes_per_token, host_k,
+                               k_bytes_per_token, kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE,
+                    "Sparse memcpy (MLA/DSA stacked K) failed at index ",
+                    staging_token_idx);
+        ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token, host_v,
+                               v_bytes_per_token, kind, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE,
+                    "Sparse memcpy (MLA/DSA stacked V) failed at index ",
+                    staging_token_idx);
+        if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+          uint8_t *staging_dsa =
+              config.ptrs.lmc_ptr + staging_dsa_plane_offset +
+              staging_token_idx * dsa_bytes_per_token;
+          ret = aclrtMemcpyAsync(staging_dsa, dsa_bytes_per_token, host_dsa,
+                                 dsa_bytes_per_token, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE,
+                      "Sparse memcpy (DSA stacked) failed at index ",
+                      staging_token_idx);
+        }
+      }
+    }
+    return;
+  }
+
+  int64_t staging_v_plane_offset =
+      config.strides.lmc_val_offset * meta.element_size;
+  for (int32_t s = 0; s < num_sparse; ++s) {
+    const int32_t staging_token_idx = indices[s];
+    const int chunk_i =
+        find_chunk_for_staging_token(staging_token_idx, chunk_offsets, chunk_sizes);
+    TORCH_CHECK(chunk_i >= 0, "selected_token_idx out of chunk range: ",
+                staging_token_idx);
+    const int64_t t = staging_token_idx - chunk_offsets[chunk_i];
+    uint8_t *host_ptr = meta.ptrs[chunk_i];
+    uint8_t *staging_ptr =
+        config.ptrs.lmc_ptr + staging_token_idx * meta.bytes_per_token;
+
+    if (config.token_major) {
+      ret = aclrtMemcpyAsync(staging_ptr, meta.bytes_per_token,
+                             host_ptr + t * meta.bytes_per_token,
+                             meta.bytes_per_token, kind, stream);
+      TORCH_CHECK(ret == ACL_ERROR_NONE, "Sparse memcpy failed at index ",
+                  staging_token_idx);
+    } else {
+      ret = aclrtMemcpyAsync(staging_ptr, meta.bytes_per_token,
+                             host_ptr + t * meta.bytes_per_token,
+                             meta.bytes_per_token, kind, stream);
+      TORCH_CHECK(ret == ACL_ERROR_NONE, "Sparse memcpy (K) failed at index ",
+                  staging_token_idx);
+      uint8_t *staging_v = staging_ptr + staging_v_plane_offset;
+      uint8_t *host_v = host_ptr + meta.v_offsets[chunk_i] +
+                        t * meta.bytes_per_token;
+      ret = aclrtMemcpyAsync(staging_v, meta.bytes_per_token, host_v,
+                             meta.bytes_per_token, kind, stream);
+      TORCH_CHECK(ret == ACL_ERROR_NONE, "Sparse memcpy (V) failed at index ",
+                  staging_token_idx);
+    }
+  }
+}
+
 bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
                           int kvcache_format_raw) {
   kvcache_ops::KVCacheFormat format =
