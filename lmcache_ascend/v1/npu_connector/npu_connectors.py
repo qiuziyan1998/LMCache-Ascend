@@ -1295,6 +1295,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         # TODO: Remove this after the sparse retrieve is supported
         use_sparse = kwargs.get("sparse_retrieve", False)
+        cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
+            "cached_tensors"
+        )
 
         self._lazy_initialize_buffer(self.kvcaches)
 
@@ -1359,18 +1362,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # memobj -> gpu_buffer -> kvcaches
                 with torch.cuda.stream(self.load_stream):
                     if self.use_gpu:
-                        cpu_tensors = []
                         expected_fmt = self._expected_memory_format()
                         k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
                             self._single_layer_hidden_dim_args()
                         )
-                        for memory_obj in memory_objs_layer:
-                            assert memory_obj.tensor is not None
-                            assert memory_obj.metadata.fmt == expected_fmt, (
-                                f"Expected memory format {expected_fmt}, "
-                                f"got {memory_obj.metadata.fmt}"
-                            )
-                            cpu_tensors.append(memory_obj.tensor)
+                        layer_cached_tensors = (
+                            cached_tensors_by_layer[layer_id]
+                            if cached_tensors_by_layer is not None
+                            and layer_id < len(cached_tensors_by_layer)
+                            and cached_tensors_by_layer[layer_id]
+                            else None
+                        )
+                        if layer_cached_tensors is not None:
+                            cpu_tensors = list(layer_cached_tensors)
+                        else:
+                            cpu_tensors = []
+                            for memory_obj in memory_objs_layer:
+                                assert memory_obj.tensor is not None
+                                assert memory_obj.metadata.fmt == expected_fmt, (
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}"
+                                )
+                                cpu_tensors.append(memory_obj.tensor)
 
                         if use_sparse:
                             assert slot_mapping_packed is not None
@@ -1411,20 +1424,37 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
                             self._single_layer_hidden_dim_args()
                         )
+                        layer_cached_tensors = (
+                            cached_tensors_by_layer[layer_id]
+                            if cached_tensors_by_layer is not None
+                            and layer_id < len(cached_tensors_by_layer)
+                            and cached_tensors_by_layer[layer_id]
+                            else None
+                        )
                         if use_sparse:
-                            if len(memory_objs_layer) != 1:
-                                raise ValueError(
-                                    "sparse layerwise retrieve without a staging "
-                                    "buffer requires exactly one memory object per "
-                                    "layer; set use_gpu=True for multi-chunk sparse "
-                                    "retrieve"
-                                )
-                            memory_obj = memory_objs_layer[0]
-                            assert memory_obj.tensor is not None
+                            if layer_cached_tensors is not None:
+                                if len(layer_cached_tensors) != 1:
+                                    raise ValueError(
+                                        "sparse layerwise retrieve without a staging "
+                                        "buffer requires exactly one cached tensor "
+                                        "per layer"
+                                    )
+                                lmc_tensor = layer_cached_tensors[0]
+                            else:
+                                if len(memory_objs_layer) != 1:
+                                    raise ValueError(
+                                        "sparse layerwise retrieve without a staging "
+                                        "buffer requires exactly one memory object per "
+                                        "layer; set use_gpu=True for multi-chunk sparse "
+                                        "retrieve"
+                                    )
+                                memory_obj = memory_objs_layer[0]
+                                assert memory_obj.tensor is not None
+                                lmc_tensor = memory_obj.tensor
                             assert slot_mapping_packed is not None
                             assert selected_token_idx is not None
                             lmc_ops.sparse_single_layer_kv_transfer(
-                                memory_obj.tensor,
+                                lmc_tensor,
                                 self.kvcaches[layer_id],
                                 slot_mapping_packed,
                                 selected_token_idx,
@@ -1435,6 +1465,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 v_hidden_dims,
                                 dsa_hidden_dims,
                             )
+                        elif layer_cached_tensors is not None:
+                            for start, end, lmc_tensor in zip(
+                                starts, ends, layer_cached_tensors, strict=False
+                            ):
+                                lmc_ops.single_layer_kv_transfer(
+                                    lmc_tensor,
+                                    self.kvcaches[layer_id],
+                                    slot_mapping[start:end],
+                                    False,
+                                    self.kv_format.value,
+                                    self._layerwise_token_major(),
+                                    self.vllm_two_major,
+                                    k_hidden_dims,
+                                    v_hidden_dims,
+                                    dsa_hidden_dims,
+                                )
                         else:
                             for start, end, memory_obj in zip(
                                 starts, ends, memory_objs_layer, strict=False
