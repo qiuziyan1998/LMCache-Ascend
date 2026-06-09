@@ -1096,8 +1096,6 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         for layer_id in range(self.num_layers):
             selected_tokens, token_start_index = yield ret_mask
-            if selected_tokens is None:
-                raise ValueError("selected_tokens must be provided")
 
             if cached_mem_layers is not None:
                 mem_objs_layer = cached_mem_layers[layer_id]
