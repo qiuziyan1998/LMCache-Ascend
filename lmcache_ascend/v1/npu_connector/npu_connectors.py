@@ -1166,10 +1166,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return (self.k_hidden_dims, self.v_hidden_dims, self.dsa_hidden_dims)
 
     def _lmc_plane_num_tokens(self, lmc_tensor: torch.Tensor) -> int:
-        plane = self.k_hidden_dims + self.v_hidden_dims
-        if self.kv_format == KVCacheFormat.DSA_KV:
-            plane += self.dsa_hidden_dims
-        return lmc_tensor.numel() // plane
+        if self._is_mla_dsa_format():
+            plane = self.k_hidden_dims + self.v_hidden_dims
+            if self.kv_format == KVCacheFormat.DSA_KV:
+                plane += self.dsa_hidden_dims
+            assert plane > 0, (
+                "MLA/DSA hidden dims must be initialized before sparse retrieve."
+            )
+            return lmc_tensor.numel() // plane
+        if lmc_tensor.ndim >= 3:
+            return int(lmc_tensor.shape[0])
+        per_token = 2 * self.hidden_dim_size
+        assert per_token > 0, (
+            "hidden_dim_size must be positive for GQA sparse retrieve."
+        )
+        return lmc_tensor.numel() // per_token
 
     def _sparse_retrieve_total_tokens(self, lmc_tensors: List[torch.Tensor]) -> int:
         num_chunks = len(lmc_tensors)
@@ -1212,6 +1223,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 self.kv_device = key_tensor.device
                 self.vllm_two_major = False
+                self.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
+                self.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
             elif self.kv_format == KVCacheFormat.MLA_KV:
                 key_tensor, value_tensor = first_layer_cache
                 self.kv_device = key_tensor.device
@@ -1241,6 +1254,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 self.kv_device = first_layer_cache.device
                 self.vllm_two_major = first_layer_cache.shape[0] == 2
+                if self.vllm_two_major:
+                    head_tensor = first_layer_cache[0]
+                else:
+                    head_tensor = first_layer_cache[:, 0]
+                head_elems = head_tensor.shape[-2] * head_tensor.shape[-1]
+                self.k_hidden_dims = head_elems
+                self.v_hidden_dims = head_elems
             else:
                 raise ValueError(f"Unsupported KV cache format: {self.kv_format}")
 
@@ -1433,6 +1453,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
+        self._lazy_initialize_buffer(self.kvcaches)
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
