@@ -1353,6 +1353,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         self._lazy_initialize_buffer(self.kvcaches)
 
+        if self._is_mla_dsa_format() and not self.use_gpu:
+            raise ValueError(
+                "MLA/DSA layerwise transfer requires use_gpu=True with a staging buffer."
+            )
+
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
             slot_mapping_chunks.append(slot_mapping[start:end])
@@ -1377,7 +1382,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                buffer_shape, self.dtype, self._expected_memory_format()
             )
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate NPU buffer in NPUConnector"
@@ -1394,15 +1399,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 logger.debug(f"Finished loading layer {layer_id - 1}")
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
+                k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
+                    self._single_layer_hidden_dim_args()
+                )
+                token_major = self._layerwise_token_major()
                 if self.use_gpu:
                     cpu_tensors = []
+                    expected_fmt = self._expected_memory_format()
                     for memory_obj in memory_objs_layer:
                         assert memory_obj.tensor is not None
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                        if memory_obj.metadata.fmt != expected_fmt:
+                            raise ValueError(
+                                f"Expected memory format {expected_fmt}, "
+                                f"got {memory_obj.metadata.fmt}."
+                            )
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: N H2D memcpy + 1 scatter kernel
-                    lmc_ops.batched_fused_single_layer_kv_transfer(
+                    batched_fused_single_layer_kv_transfer(
                         cpu_tensors,  # CPU memory objects
                         tmp_gpu_buffer_obj.tensor,  # GPU staging buffer
                         self.kvcaches[layer_id],
@@ -1410,9 +1424,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         chunk_offsets,  # offset for each chunk
                         chunk_sizes,  # size for each chunk
                         False,  # to_gpu
-                        self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                        True,  # token_major
+                        self.kv_format.value,
+                        token_major,
                         self.vllm_two_major,
+                        k_hidden_dims,
+                        v_hidden_dims,
+                        dsa_hidden_dims,
                     )
 
                 else:
@@ -1426,9 +1443,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             self.kvcaches[layer_id],
                             slot_mapping[start:end],
                             False,
-                            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                            True,
+                            self.kv_format.value,
+                            token_major,
                             self.vllm_two_major,
+                            k_hidden_dims,
+                            v_hidden_dims,
+                            dsa_hidden_dims,
                         )
                 logger.debug(f"Finished loading layer {layer_id}")
         yield
