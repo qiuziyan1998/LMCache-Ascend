@@ -1094,6 +1094,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             else None
         )
 
+        mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+        next(mem_obj_consumer)
+
         for layer_id in range(self.num_layers):
             selected_tokens, token_start_index = yield ret_mask
 
@@ -1106,34 +1109,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                 task = next(get_generator)
                 assert task is not None
                 mem_objs_layer = task.result()
-                if mem_objs_layer is None:
-                    continue
-                layer_cached_chunks = (
-                    len(cached_tensors[layer_id])
-                    if cached_tensors is not None
-                    and len(cached_tensors) > layer_id
-                    else 0
-                )
-                if layer_cached_chunks < len(retrieve_keys[0]):
-                    self._append_retrieve_layer_cache(
-                        layer_id,
-                        mem_objs_layer,
-                        cached_memory_objs,
-                        cached_tensors,
+                if mem_objs_layer is not None:
+                    layer_cached_chunks = (
+                        len(cached_tensors[layer_id])
+                        if cached_tensors is not None
+                        and len(cached_tensors) > layer_id
+                        else 0
                     )
-
-            if not mem_obj_consumer:
-                mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
-                    **kwargs
-                )
-                next(mem_obj_consumer)
+                    if layer_cached_chunks < len(retrieve_keys[0]):
+                        self._append_retrieve_layer_cache(
+                            layer_id,
+                            mem_objs_layer,
+                            cached_memory_objs,
+                            cached_tensors,
+                        )
+                else:
+                    mem_objs_layer = []
 
             mem_obj_consumer.send(
                 (mem_objs_layer, selected_tokens, token_start_index)
             )
 
-        if mem_obj_consumer is not None:
-            next(mem_obj_consumer)
+        next(mem_obj_consumer)
 
         yield ret_mask
 

@@ -472,21 +472,51 @@ void sparse_single_layer_kv_transfer(
 
 namespace {
 
-static void launch_sparse_mla_dsa_multi_chunk_direct_kernel(
+static void launch_sparse_multi_chunk_direct_kernel(
     const SingleLayerKVConfig &config, uint8_t *selected_token_idx_ptr,
     uint8_t *chunk_ptrs_ptr, int32_t num_chunks, int32_t chunk_size,
     int32_t total_tokens) {
-  kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
-      config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
-      config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
-      chunk_ptrs_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
-      config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
-      selected_token_idx_ptr, config.strides.vllm_k_bytes,
-      config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
-      config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
-      config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
-      num_chunks, chunk_size, total_tokens, config.dims.block_size,
-      config.token_major);
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
+        chunk_ptrs_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, config.strides.vllm_k_bytes,
+        config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
+        config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
+        config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
+        num_chunks, chunk_size, total_tokens, config.dims.block_size,
+        config.token_major);
+    return;
+  }
+
+  const bool is_separate =
+      config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV;
+  if (!is_separate) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_sparse_multi_chunk(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, chunk_ptrs_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, config.strides.vllm_k_stride,
+        config.strides.vllm_val_offset, config.strides.vllm_k_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.ub_params.max_tokens_per_loop, config.dims.num_heads,
+        config.dims.head_dims, config.dims.num_tokens, num_chunks, chunk_size,
+        total_tokens, config.dims.block_size, config.token_major);
+  } else {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_separate_sparse_multi_chunk(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, chunk_ptrs_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.slot_mapping_ptr, selected_token_idx_ptr,
+        config.strides.vllm_k_stride, config.strides.vllm_v_stride,
+        config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.ub_params.max_tokens_per_loop, config.dims.num_heads,
+        config.dims.head_dims, config.dims.num_tokens, num_chunks, chunk_size,
+        total_tokens, config.dims.block_size, config.token_major);
+  }
 }
 
 } // namespace
@@ -501,9 +531,6 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
     const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
   validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
   validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
-  TORCH_CHECK(is_mla_dsa_format(static_cast<kvcache_ops::KVCacheFormat>(
-                    kvcache_format_raw)),
-              "sparse_mla_dsa_batched_direct_kv_transfer requires MLA/DSA.");
   TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
   TORCH_CHECK(total_tokens > 0, "total_tokens must be positive.");
   TORCH_CHECK(!lmc_tensors.empty(), "lmc_tensors must not be empty.");
@@ -511,7 +538,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   for (const auto &chunk : lmc_tensors) {
     TORCH_CHECK(
         chunk.device().is_cpu(),
-        "Direct MLA/DSA retrieve requires CPU pinned memory objects.");
+        "Direct sparse retrieve requires CPU pinned memory objects.");
   }
 
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
@@ -553,7 +580,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
   cmd.SetCustomHandler([config, selected_ptr, chunk_ptrs_ptr, num_chunks,
                         chunk_size_i, total_tokens_i]() -> int {
-    launch_sparse_mla_dsa_multi_chunk_direct_kernel(
+    launch_sparse_multi_chunk_direct_kernel(
         config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
         total_tokens_i);
     return 0;
