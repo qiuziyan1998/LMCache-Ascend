@@ -537,7 +537,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     yield None
 
                 mem_objs_layer = task.result()
-                mem_obj_consumer.send((mem_objs_layer, None, 0))
+                mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
         else:
