@@ -26,7 +26,8 @@ static void launch_single_layer_mla_dsa_kernel(const SingleLayerKVConfig &config
       config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
       config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
       config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
-      config.dims.lmc_num_tokens, config.dims.block_size, page2L);
+      config.dims.lmc_num_tokens, config.dims.block_size, page2L,
+      config.token_major);
 }
 
 /**
@@ -401,7 +402,7 @@ static void launch_sparse_single_layer_kernel(const SingleLayerKVConfig &config,
         config.strides.vllm_dsa_bytes, config.ub_params.max_tokens_per_loop,
         config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims,
         config.dims.num_tokens, config.dims.lmc_num_tokens,
-        config.dims.block_size);
+        config.dims.block_size, config.token_major);
     return;
   }
 
@@ -464,6 +465,97 @@ void sparse_single_layer_kv_transfer(
 
   cmd.SetCustomHandler([config, selected_token_idx_ptr]() -> int {
     launch_sparse_single_layer_kernel(config, selected_token_idx_ptr);
+    return 0;
+  });
+  cmd.Run();
+}
+
+namespace {
+
+static void launch_sparse_mla_dsa_multi_chunk_direct_kernel(
+    const SingleLayerKVConfig &config, uint8_t *selected_token_idx_ptr,
+    uint8_t *chunk_ptrs_ptr, int32_t num_chunks, int32_t chunk_size,
+    int32_t total_tokens) {
+  kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
+      config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+      config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
+      chunk_ptrs_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+      config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+      selected_token_idx_ptr, config.strides.vllm_k_bytes,
+      config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
+      config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
+      config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
+      num_chunks, chunk_size, total_tokens, config.dims.block_size,
+      config.token_major);
+}
+
+} // namespace
+
+void sparse_mla_dsa_batched_direct_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    const int64_t chunk_size, const int64_t total_tokens,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+  TORCH_CHECK(is_mla_dsa_format(static_cast<kvcache_ops::KVCacheFormat>(
+                    kvcache_format_raw)),
+              "sparse_mla_dsa_batched_direct_kv_transfer requires MLA/DSA.");
+  TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
+  TORCH_CHECK(total_tokens > 0, "total_tokens must be positive.");
+  TORCH_CHECK(!lmc_tensors.empty(), "lmc_tensors must not be empty.");
+
+  for (const auto &chunk : lmc_tensors) {
+    TORCH_CHECK(
+        chunk.device().is_cpu(),
+        "Direct MLA/DSA retrieve requires CPU pinned memory objects.");
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  const int32_t num_sparse =
+      static_cast<int32_t>(selected_token_idx.size(0));
+  if (num_sparse == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(lmc_tensors.size());
+  std::vector<int64_t> chunk_ptrs_host(num_chunks);
+  for (int32_t chunk_i = 0; chunk_i < num_chunks; ++chunk_i) {
+    chunk_ptrs_host[chunk_i] = reinterpret_cast<int64_t>(
+        get_kernel_ptr<uint8_t, torch::Tensor>(lmc_tensors[chunk_i]));
+  }
+
+  auto npu_options = slot_mapping_packed.options();
+  torch::Tensor chunk_ptrs_npu =
+      torch::tensor(chunk_ptrs_host, npu_options.dtype(at::ScalarType::Long));
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      lmc_tensors[0], vllm_kv_caches, slot_mapping_packed, false, token_major,
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
+  config.dims.num_tokens = num_sparse;
+  config.ub_params.aiv_num =
+      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+
+  uint8_t *selected_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+
+  const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, selected_ptr, chunk_ptrs_ptr, num_chunks,
+                        chunk_size_i, total_tokens_i]() -> int {
+    launch_sparse_mla_dsa_multi_chunk_direct_kernel(
+        config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
+        total_tokens_i);
     return 0;
   });
   cmd.Run();

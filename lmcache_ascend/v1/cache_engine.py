@@ -1114,7 +1114,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     and len(cached_tensors) > layer_id
                     else 0
                 )
-                if layer_cached_chunks < len(starts):
+                if layer_cached_chunks < len(retrieve_keys[0]):
                     self._append_retrieve_layer_cache(
                         layer_id,
                         mem_objs_layer,
@@ -1123,11 +1123,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
 
             if not mem_obj_consumer:
-                mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                    starts,
-                    ends,
-                    sparse_retrieve=True,
-                    **kwargs,
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
+                    **kwargs
                 )
                 next(mem_obj_consumer)
 

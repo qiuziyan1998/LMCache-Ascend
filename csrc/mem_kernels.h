@@ -87,7 +87,7 @@ void single_layer_kv_transfer_kernel_v2_mla_dsa(
     const int64_t vllmDsaBufferSize, const int32_t maxTokensPerLoop,
     const int64_t kHiddenDims, const int64_t vHiddenDims,
     const int64_t dsaHiddenDims, const int32_t numTokens, const int32_t numLmcTokens,
-    const int32_t blockSize, const bool page2L);
+    const int32_t blockSize, const bool page2L, const bool lmcHostInterleaved = false);
 
 void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
@@ -98,7 +98,19 @@ void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse(
     const int64_t vllmValueBufferSize, const int64_t vllmDsaBufferSize,
     const int32_t maxTokensPerLoop, const int64_t kHiddenDims, const int64_t vHiddenDims,
     const int64_t dsaHiddenDims, const int32_t numTokens, const int32_t numLmcTokens,
-    const int32_t blockSize);
+    const int32_t blockSize, const bool lmcHostInterleaved = false);
+
+void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
+    kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
+    kvcache_ops::KVCacheFormat format, uint32_t blockDim, void *stream,
+    uint8_t *chunkPtrsPtr, uint8_t *vllmKeyPtr, uint8_t *vllmValuePtr,
+    uint8_t *vllmDsaPtr, uint8_t *slotMappingPtr, uint8_t *selectedTokenIdxPtr,
+    const int64_t vllmKeyBufferSize, const int64_t vllmValueBufferSize,
+    const int64_t vllmDsaBufferSize, const int32_t maxTokensPerLoop,
+    const int64_t kHiddenDims, const int64_t vHiddenDims, const int64_t dsaHiddenDims,
+    const int32_t numTokens, const int32_t numChunks, const int32_t chunkSize,
+    const int32_t totalTokens, const int32_t blockSize,
+    const bool lmcHostInterleaved = false);
 
 void load_and_reshape_flash_kernel(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
@@ -179,6 +191,17 @@ void batched_fused_sparse_single_layer_kv_transfer(
     const bool vllm_two_major = false, const int64_t k_hidden_dims = 0,
     const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0,
     const c10::optional<torch::Tensor> &sparse_indices_cpu = c10::nullopt);
+
+// MLA/DSA sparse retrieve directly from CPU pinned memory objects to paged KV.
+// No NPU staging buffer or aclrtMemcpyAsync H2D is used.
+void sparse_mla_dsa_batched_direct_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    const int64_t chunk_size, const int64_t total_tokens,
+    const int kvcache_format_raw, const bool token_major = false,
+    const bool vllm_two_major = false, const int64_t k_hidden_dims = 0,
+    const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0);
 
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,

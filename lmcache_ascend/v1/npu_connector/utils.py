@@ -189,6 +189,36 @@ def batched_fused_single_layer_kv_transfer(
     )
 
 
+def sparse_mla_dsa_batched_direct_kv_transfer(
+    lmc_tensors: Sequence[torch.Tensor],
+    vllm_kv_caches: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    slot_mapping_packed: torch.Tensor,
+    selected_token_idx: torch.Tensor,
+    chunk_size: int,
+    total_tokens: int,
+    kvcache_format_raw: int,
+    token_major: bool,
+    vllm_two_major: bool,
+    k_hidden_dims: int = 0,
+    v_hidden_dims: int = 0,
+    dsa_hidden_dims: int = 0,
+) -> None:
+    lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer(
+        lmc_tensors,
+        vllm_kv_caches,
+        slot_mapping_packed,
+        selected_token_idx,
+        chunk_size,
+        total_tokens,
+        kvcache_format_raw,
+        token_major,
+        vllm_two_major,
+        k_hidden_dims,
+        v_hidden_dims,
+        dsa_hidden_dims,
+    )
+
+
 def batched_fused_sparse_single_layer_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     staging_cache: torch.Tensor,
