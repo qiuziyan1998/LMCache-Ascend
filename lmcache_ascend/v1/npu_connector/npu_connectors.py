@@ -60,10 +60,6 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         self.use_mla = bool(kwargs.get("use_mla", False))
         self.fused_rotary_emb: Any = None
 
-        self.load_stream_num = 4
-        self.load_stream_list = [torch.cuda.Stream() for __ in range(self.load_stream_num)]
-        self.load_stream_idx = 0
-
     def _lazy_initialize_buffer(self, kv_caches):
         """
         Lazily initialize the GPU buffer allocator if it is not initialized yet.
@@ -1126,6 +1122,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         **kwargs,
     ):
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
+
+        self.load_stream_num = 4
+        self.load_stream_list = [torch.cuda.Stream() for __ in range(self.load_stream_num)]
+        self.load_stream_idx = 0
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
