@@ -60,6 +60,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         self.use_mla = bool(kwargs.get("use_mla", False))
         self.fused_rotary_emb: Any = None
 
+        self.load_stream_num = 4
+        self.load_stream_list = [torch.cuda.Stream() for __ in range(self.load_stream_num)]
+        self.load_stream_idx = 0
+
     def _lazy_initialize_buffer(self, kv_caches):
         """
         Lazily initialize the GPU buffer allocator if it is not initialized yet.
@@ -1487,6 +1491,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
 
         current_stream = torch.cuda.current_stream()
+
+        load_stream_idx = self.load_stream_idx
+        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
+
         k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
             self._single_layer_hidden_dim_args()
         )
@@ -1506,9 +1514,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx, slot_mapping_packed.shape[0]
             )
 
-            if sync and layer_id > 0:
-                current_stream.wait_stream(self.load_stream)
-            with torch.cuda.stream(self.load_stream):
+            with torch.cuda.stream(self.load_stream_list[load_stream_idx]):
+                self.load_stream_list[load_stream_idx].wait_stream(current_stream)
                 layer_cached_tensors = (
                     cached_tensors_by_layer[layer_id]
                     if has_cached_tensors
@@ -1541,6 +1548,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         v_hidden_dims,
                         dsa_hidden_dims,
                     )
+            current_stream.wait_stream(self.load_stream_list[load_stream_idx])
 
         yield
 
