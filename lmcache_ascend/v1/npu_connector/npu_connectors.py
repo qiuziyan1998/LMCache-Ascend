@@ -1571,7 +1571,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         for req_i, chunks in enumerate(req_cpu_tensors):
             for chunk in chunks:
                 flat_chunks.append(chunk)
-                chunk_write += 1
 
             sm = slot_mappings[req_i]
             t_start = int(
