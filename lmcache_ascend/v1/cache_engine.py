@@ -1134,9 +1134,171 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         yield ret_mask
 
-
+    @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def store(
+    def retrieve_layer_head_token_wise_batched(
+        self,
+        requests: List[dict],
+        kvcaches: list,
+        sync: bool = True,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """
+        Batched sparse layerwise retrieve for multiple decode requests.
+
+        Each entry in ``requests`` carries the same kwargs as a single
+        ``retrieve_layer_head_token_wise`` call (tokens, mask, slot_mapping,
+        cached_* fields, etc.).  H2D for all requests is fused into one kernel
+        launch per layer via ``batched_to_gpu_head_token_wise_multi``.
+        """
+        if not self.is_healthy():
+            for _ in requests:
+                yield torch.zeros(0, dtype=torch.bool)
+            return
+
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+        assert_layerwise_gpu_connector(self.gpu_connector)
+
+        num_reqs = len(requests)
+        if num_reqs == 0:
+            return
+
+        ret_masks = [
+            torch.zeros(len(req["tokens"]), dtype=torch.bool, device="cpu")
+            for req in requests
+        ]
+        per_req_get_generators: List[Optional[Generator]] = [None] * num_reqs
+        per_req_cached_mem_layers: List[Optional[List[List[MemoryObj]]]] = [
+            None
+        ] * num_reqs
+        per_req_use_cache: List[bool] = [False] * num_reqs
+        any_keys = False
+
+        for req_i, req in enumerate(requests):
+            tokens = req["tokens"]
+            mask = req.get("mask")
+            cached_keys = req["cached_keys"]
+            cached_starts = req["cached_starts"]
+            cached_ends = req["cached_ends"]
+            cached_memory_objs = req.get("cached_memory_objs")
+            cached_tensors = req.get("cached_tensors")
+            request_configs = req.get("request_configs")
+
+            retrieve_kwargs: dict = {}
+            location, starts, ends, retrieve_keys = (
+                self._ensure_retrieve_chunk_metadata(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    cached_keys=cached_keys,
+                    cached_starts=cached_starts,
+                    cached_ends=cached_ends,
+                    ret_mask=ret_masks[req_i],
+                    retrieve_kwargs=retrieve_kwargs,
+                )
+            )
+            req["cached_retrieve_location"] = retrieve_kwargs.get(
+                "cached_retrieve_location"
+            )
+
+            if not retrieve_keys:
+                continue
+
+            any_keys = True
+            use_cached_retrieve = self._has_retrieve_data_cache(
+                cached_tensors,
+                cached_memory_objs,
+                self.num_layers,
+            )
+            per_req_use_cache[req_i] = use_cached_retrieve
+
+            if use_cached_retrieve and cached_memory_objs is not None:
+                per_req_cached_mem_layers[req_i] = cached_memory_objs
+            elif not use_cached_retrieve:
+                per_req_get_generators[req_i] = (
+                    self.storage_manager.layerwise_batched_get(
+                        retrieve_keys, location=location
+                    )
+                )
+
+        if not any_keys:
+            for _ in range(self.num_layers):
+                yield None
+            for ret_mask in ret_masks:
+                yield ret_mask
+            return
+
+        slot_mappings = [req["slot_mapping"] for req in requests]
+        cached_tensors_per_req = [
+            req.get("cached_tensors") if per_req_use_cache[i] else None
+            for i, req in enumerate(requests)
+        ]
+
+        batched_consumer = self.gpu_connector.batched_to_gpu_head_token_wise_multi(
+            kvcaches=kvcaches,
+            slot_mappings=slot_mappings,
+            cached_tensors_per_req=cached_tensors_per_req,
+            sync=sync,
+        )
+        next(batched_consumer)
+
+        for layer_id in range(self.num_layers):
+            selected_tokens, token_start_index = yield None
+
+            mem_objs_per_req: List[List[MemoryObj]] = []
+            for req_i, req in enumerate(requests):
+                cached_mem_layers = per_req_cached_mem_layers[req_i]
+                if cached_mem_layers is not None:
+                    mem_objs_per_req.append(cached_mem_layers[layer_id])
+                    continue
+
+                if per_req_use_cache[req_i]:
+                    mem_objs_per_req.append([])
+                    continue
+
+                get_gen = per_req_get_generators[req_i]
+                if get_gen is None:
+                    mem_objs_per_req.append([])
+                    continue
+
+                task = next(get_gen)
+                if task is None:
+                    mem_objs_per_req.append([])
+                    continue
+
+                mem_objs_layer = task.result()
+                if mem_objs_layer is None:
+                    mem_objs_layer = []
+                else:
+                    cached_memory_objs = req.get("cached_memory_objs")
+                    cached_tensors = req.get("cached_tensors")
+                    retrieve_keys_len = len(req["cached_keys"][0]) if req[
+                        "cached_keys"
+                    ] else 0
+                    layer_cached_chunks = (
+                        len(cached_tensors[layer_id])
+                        if cached_tensors is not None
+                        and len(cached_tensors) > layer_id
+                        else 0
+                    )
+                    if layer_cached_chunks < retrieve_keys_len:
+                        self._append_retrieve_layer_cache(
+                            layer_id,
+                            mem_objs_layer,
+                            cached_memory_objs,
+                            cached_tensors,
+                        )
+                mem_objs_per_req.append(mem_objs_layer)
+
+            batched_consumer.send(
+                (mem_objs_per_req, selected_tokens, token_start_index)
+            )
+
+        next(batched_consumer)
+
+        for ret_mask in ret_masks:
+            yield ret_mask
+
         self,
         tokens: Optional[Union[torch.Tensor, list[int]]] = None,
         hashes: Optional[List[int]] = None,

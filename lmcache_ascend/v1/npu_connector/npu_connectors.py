@@ -1554,6 +1554,185 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         yield
 
+    def _build_fused_sparse_batch_inputs(
+        self,
+        req_cpu_tensors: List[List[torch.Tensor]],
+        slot_mappings: List[torch.Tensor],
+        selected_tokens: Optional[torch.Tensor],
+        token_start_index: torch.Tensor,
+    ) -> tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, int]:
+        """Flatten per-request CPU chunks and sparse indices for one kernel launch."""
+        num_reqs = len(req_cpu_tensors)
+        flat_chunks: List[torch.Tensor] = []
+        token_offset = 0
+        combined_slot_parts: List[torch.Tensor] = []
+        combined_selected_parts: List[torch.Tensor] = []
+
+        for req_i, chunks in enumerate(req_cpu_tensors):
+            for chunk in chunks:
+                flat_chunks.append(chunk)
+                chunk_write += 1
+
+            sm = slot_mappings[req_i]
+            t_start = int(
+                token_start_index[req_i].detach().cpu().item()
+            )
+            sm_packed = sm[t_start:] if t_start > 0 else sm
+
+            if selected_tokens is None:
+                sel = None
+            elif selected_tokens.ndim == 1:
+                sel = selected_tokens[req_i : req_i + 1]
+            else:
+                sel = selected_tokens[req_i]
+                if sel.ndim == 0:
+                    sel = sel.unsqueeze(0)
+
+            if sel is None:
+                num_sparse = sm_packed.shape[0]
+                sel_i = torch.arange(
+                    num_sparse, dtype=torch.int32, device=self.kv_device
+                )
+                slot_i = sm_packed.to(device=self.kv_device, dtype=torch.long)
+            else:
+                sel_cpu = sel.detach().to(device="cpu", dtype=torch.long)
+                if sel_cpu.numel() == 0:
+                    token_offset += self._sparse_retrieve_total_tokens(chunks)
+                    continue
+                sel_i = sel_cpu.to(device=self.kv_device, dtype=torch.int32)
+                slot_i = sm_packed[sel_cpu].to(
+                    device=self.kv_device, dtype=torch.long
+                )
+
+            if sel_i.numel() > 0:
+                combined_selected_parts.append(sel_i + int(token_offset))
+                combined_slot_parts.append(slot_i)
+
+            token_offset += self._sparse_retrieve_total_tokens(chunks)
+
+        if not combined_slot_parts:
+            empty_long = torch.empty(0, dtype=torch.long, device=self.kv_device)
+            empty_int = torch.empty(0, dtype=torch.int32, device=self.kv_device)
+            return flat_chunks, empty_long, empty_int, token_offset
+
+        slot_mapping_packed = torch.cat(combined_slot_parts, dim=0)
+        selected_token_idx = torch.cat(combined_selected_parts, dim=0)
+        return flat_chunks, slot_mapping_packed, selected_token_idx, token_offset
+
+    def _launch_fused_sparse_batch_layer(
+        self,
+        req_cpu_tensors: List[List[torch.Tensor]],
+        slot_mappings: List[torch.Tensor],
+        selected_tokens: Optional[torch.Tensor],
+        token_start_index: torch.Tensor,
+        layer_id: int,
+        load_stream_idx: int,
+        current_stream: torch.cuda.Stream,
+    ) -> None:
+        flat_chunks, slot_mapping_packed, selected_token_idx, total_tokens = (
+            self._build_fused_sparse_batch_inputs(
+                req_cpu_tensors,
+                slot_mappings,
+                selected_tokens,
+                token_start_index,
+            )
+        )
+        if total_tokens <= 0 or selected_token_idx.numel() == 0:
+            return
+
+        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
+            self._single_layer_hidden_dim_args()
+        )
+        with torch.cuda.stream(self.load_stream_list[load_stream_idx]):
+            self.load_stream_list[load_stream_idx].wait_stream(current_stream)
+            sparse_mla_dsa_batched_direct_kv_transfer(
+                flat_chunks,
+                self.kvcaches[layer_id],
+                slot_mapping_packed,
+                selected_token_idx,
+                self.lmcache_chunk_size,
+                total_tokens,
+                self.kv_format.value,
+                self._layerwise_token_major(),
+                self.vllm_two_major,
+                k_hidden_dims,
+                v_hidden_dims,
+                dsa_hidden_dims,
+            )
+        current_stream.wait_stream(self.load_stream_list[load_stream_idx])
+
+    def batched_to_gpu_head_token_wise_multi(self, **kwargs):
+        """
+        Fused sparse layerwise retrieve for multiple decode requests in one batch.
+        All requests share a single H2D kernel launch per layer.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        self._lazy_initialize_buffer(self.kvcaches)
+
+        slot_mappings: List[torch.Tensor] = kwargs["slot_mappings"]
+        sync: bool = kwargs["sync"]
+        cached_tensors_by_layer_per_req: Optional[
+            List[Optional[List[List[torch.Tensor]]]]
+        ] = kwargs.get("cached_tensors_per_req")
+
+        current_stream = torch.cuda.current_stream()
+        load_stream_idx = self.load_stream_idx
+        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
+        num_reqs = len(slot_mappings)
+
+        for layer_id in range(self.num_layers):
+            (
+                memory_objs_per_req,
+                selected_tokens,
+                token_start_index,
+            ) = yield
+
+            req_cpu_tensors: List[List[torch.Tensor]] = []
+            for req_i in range(num_reqs):
+                layer_cached = None
+                if (
+                    cached_tensors_by_layer_per_req is not None
+                    and req_i < len(cached_tensors_by_layer_per_req)
+                ):
+                    per_req_cache = cached_tensors_by_layer_per_req[req_i]
+                    if (
+                        per_req_cache is not None
+                        and layer_id < len(per_req_cache)
+                        and per_req_cache[layer_id]
+                    ):
+                        layer_cached = per_req_cache[layer_id]
+
+                if layer_cached is not None:
+                    req_cpu_tensors.append(layer_cached)
+                else:
+                    mem_objs_layer = memory_objs_per_req[req_i]
+                    req_cpu_tensors.append(
+                        [
+                            memory_obj.tensor
+                            for memory_obj in mem_objs_layer
+                            if memory_obj.tensor is not None
+                        ]
+                    )
+
+            self._launch_fused_sparse_batch_layer(
+                req_cpu_tensors,
+                slot_mappings,
+                selected_tokens,
+                token_start_index,
+                layer_id,
+                load_stream_idx,
+                current_stream,
+            )
+
+        if sync:
+            current_stream.synchronize()
+
+        yield
+        yield
+
     def batched_from_gpu(
         self,
         memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
