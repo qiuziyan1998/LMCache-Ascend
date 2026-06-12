@@ -1138,6 +1138,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.v_hidden_dims: int = 0
         self.dsa_hidden_dims: int = 0
         self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
+        # Reusable fused multi-request sparse decode buffers (P1).
+        self._sparse_batch_num_reqs: int = 0
+        self._sparse_batch_max_sparse: int = 0
+        self._sparse_batch_slot_buf: Optional[torch.Tensor] = None
+        self._sparse_batch_sel_buf: Optional[torch.Tensor] = None
+
+    def _ensure_sparse_batch_fused_buffers(
+        self, num_reqs: int, max_sparse: int
+    ) -> None:
+        """Grow reusable NPU buffers for fused sparse batch metadata."""
+        if max_sparse <= 0:
+            max_sparse = 1
+        if (
+            self._sparse_batch_slot_buf is None
+            or self._sparse_batch_max_sparse < max_sparse
+        ):
+            self._sparse_batch_max_sparse = max_sparse
+            self._sparse_batch_slot_buf = torch.empty(
+                max_sparse, dtype=torch.long, device=self.kv_device
+            )
+            self._sparse_batch_sel_buf = torch.empty(
+                max_sparse, dtype=torch.int32, device=self.kv_device
+            )
+        self._sparse_batch_num_reqs = num_reqs
 
     def _sparse_selected_token_idx(
         self,
@@ -1554,6 +1578,39 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         yield
 
+    def _per_request_sparse_pair(
+        self,
+        slot_mapping: torch.Tensor,
+        t_start: int,
+        selected_row: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build parallel ``(slot_mapping_packed, selected_token_idx)`` for one request.
+
+        Matches ``batched_to_gpu_head_token_wise`` semantics: the two tensors are
+        parallel arrays of equal length, not a gather of slots by token index.
+        """
+        sm_packed = slot_mapping if t_start == 0 else slot_mapping[t_start:]
+        if sm_packed.numel() == 0:
+            empty_long = torch.empty(0, dtype=torch.long, device=self.kv_device)
+            empty_int = torch.empty(0, dtype=torch.int32, device=self.kv_device)
+            return empty_long, empty_int
+
+        if selected_row is None:
+            sel_i = self._sparse_selected_token_idx(None, sm_packed.shape[0])
+            slot_i = sm_packed
+        else:
+            if selected_row.ndim == 0:
+                selected_row = selected_row.unsqueeze(0)
+            sel_i = self._sparse_selected_token_idx(
+                selected_row, sm_packed.shape[0]
+            )
+            n = sel_i.shape[0]
+            slot_i = sm_packed[:n] if sm_packed.shape[0] >= n else sm_packed
+
+        if slot_i.device != self.kv_device or slot_i.dtype != torch.long:
+            slot_i = slot_i.to(device=self.kv_device, dtype=torch.long)
+        return slot_i, sel_i
+
     def _build_fused_sparse_batch_inputs(
         self,
         req_cpu_tensors: List[List[torch.Tensor]],
@@ -1565,58 +1622,65 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         num_reqs = len(req_cpu_tensors)
         flat_chunks: List[torch.Tensor] = []
         token_offset = 0
-        combined_slot_parts: List[torch.Tensor] = []
-        combined_selected_parts: List[torch.Tensor] = []
+        write_pos = 0
 
+        # One host read per layer for all requests (P0).
+        if token_start_index.device.type == "cpu":
+            t_starts = token_start_index[:num_reqs].tolist()
+        else:
+            t_starts = token_start_index[:num_reqs].detach().cpu().tolist()
+
+        max_sparse_this_layer = 0
+        per_req_pairs: list[tuple[torch.Tensor, torch.Tensor, int]] = []
         for req_i, chunks in enumerate(req_cpu_tensors):
             for chunk in chunks:
                 flat_chunks.append(chunk)
 
-            sm = slot_mappings[req_i]
-            t_start = int(
-                token_start_index[req_i].detach().cpu().item()
+            selected_row: Optional[torch.Tensor] = None
+            if selected_tokens is not None:
+                if selected_tokens.ndim == 1:
+                    selected_row = selected_tokens[req_i : req_i + 1]
+                else:
+                    selected_row = selected_tokens[req_i]
+                    if selected_row.ndim == 0:
+                        selected_row = selected_row.unsqueeze(0)
+
+            slot_i, sel_i = self._per_request_sparse_pair(
+                slot_mappings[req_i],
+                int(t_starts[req_i]),
+                selected_row,
             )
-            sm_packed = sm[t_start:] if t_start > 0 else sm
-
-            if selected_tokens is None:
-                sel = None
-            elif selected_tokens.ndim == 1:
-                sel = selected_tokens[req_i : req_i + 1]
-            else:
-                sel = selected_tokens[req_i]
-                if sel.ndim == 0:
-                    sel = sel.unsqueeze(0)
-
-            if sel is None:
-                num_sparse = sm_packed.shape[0]
-                sel_i = torch.arange(
-                    num_sparse, dtype=torch.int32, device=self.kv_device
-                )
-                slot_i = sm_packed.to(device=self.kv_device, dtype=torch.long)
-            else:
-                sel_cpu = sel.detach().to(device="cpu", dtype=torch.long)
-                if sel_cpu.numel() == 0:
-                    token_offset += self._sparse_retrieve_total_tokens(chunks)
-                    continue
-                sel_i = sel_cpu.to(device=self.kv_device, dtype=torch.int32)
-                slot_i = sm_packed[sel_cpu].to(
-                    device=self.kv_device, dtype=torch.long
-                )
-
+            req_total = self._sparse_retrieve_total_tokens(chunks)
             if sel_i.numel() > 0:
-                combined_selected_parts.append(sel_i + int(token_offset))
-                combined_slot_parts.append(slot_i)
+                per_req_pairs.append((slot_i, sel_i, token_offset))
+                max_sparse_this_layer += sel_i.numel()
+            token_offset += req_total
 
-            token_offset += self._sparse_retrieve_total_tokens(chunks)
-
-        if not combined_slot_parts:
+        if not per_req_pairs:
             empty_long = torch.empty(0, dtype=torch.long, device=self.kv_device)
             empty_int = torch.empty(0, dtype=torch.int32, device=self.kv_device)
             return flat_chunks, empty_long, empty_int, token_offset
 
-        slot_mapping_packed = torch.cat(combined_slot_parts, dim=0)
-        selected_token_idx = torch.cat(combined_selected_parts, dim=0)
-        return flat_chunks, slot_mapping_packed, selected_token_idx, token_offset
+        self._ensure_sparse_batch_fused_buffers(num_reqs, max_sparse_this_layer)
+        assert self._sparse_batch_slot_buf is not None
+        assert self._sparse_batch_sel_buf is not None
+        slot_buf = self._sparse_batch_slot_buf
+        sel_buf = self._sparse_batch_sel_buf
+
+        for slot_i, sel_i, req_token_offset in per_req_pairs:
+            n = sel_i.numel()
+            slot_buf[write_pos : write_pos + n].copy_(slot_i)
+            sel_buf[write_pos : write_pos + n].copy_(sel_i)
+            if req_token_offset != 0:
+                sel_buf[write_pos : write_pos + n].add_(req_token_offset)
+            write_pos += n
+
+        return (
+            flat_chunks,
+            slot_buf[:write_pos],
+            sel_buf[:write_pos],
+            token_offset,
+        )
 
     def _launch_fused_sparse_batch_layer(
         self,
@@ -1677,10 +1741,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             List[Optional[List[List[torch.Tensor]]]]
         ] = kwargs.get("cached_tensors_per_req")
 
+        num_reqs = len(slot_mappings)
+        max_sparse_hint = sum(int(sm.shape[0]) for sm in slot_mappings)
+        self._ensure_sparse_batch_fused_buffers(num_reqs, max_sparse_hint)
+
         current_stream = torch.cuda.current_stream()
         load_stream_idx = self.load_stream_idx
         self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
-        num_reqs = len(slot_mappings)
 
         for layer_id in range(self.num_layers):
             (
