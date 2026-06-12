@@ -1552,9 +1552,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         yield
 
-        if sync:
-            current_stream.wait_stream(self.load_stream)
-
         yield
 
     def batched_from_gpu(
