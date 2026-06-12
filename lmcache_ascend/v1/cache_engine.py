@@ -1299,6 +1299,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         for ret_mask in ret_masks:
             yield ret_mask
 
+    @torch.inference_mode()
+    def store(
         self,
         tokens: Optional[Union[torch.Tensor, list[int]]] = None,
         hashes: Optional[List[int]] = None,
