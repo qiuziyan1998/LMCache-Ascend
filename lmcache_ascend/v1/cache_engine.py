@@ -1095,6 +1095,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+        notify_fn = getattr(self.gpu_connector, "notify_sparse_memory_objs_updated", None)
+        if notify_fn is not None and not use_cached_retrieve:
+            notify_fn()
         next(mem_obj_consumer)
 
         for layer_id in range(self.num_layers):

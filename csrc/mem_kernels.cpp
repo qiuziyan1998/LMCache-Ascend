@@ -475,7 +475,7 @@ namespace {
 static void launch_sparse_multi_chunk_direct_kernel(
     const SingleLayerKVConfig &config, uint8_t *selected_token_idx_ptr,
     uint8_t *chunk_ptrs_ptr, int32_t num_chunks, int32_t chunk_size,
-    int32_t total_tokens) {
+    int32_t total_tokens, bool lmc_host_interleaved) {
   if (is_mla_dsa_format(config.kvcache_format)) {
     kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
         config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
@@ -487,7 +487,7 @@ static void launch_sparse_multi_chunk_direct_kernel(
         config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
         config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
         num_chunks, chunk_size, total_tokens, config.dims.block_size,
-        config.token_major);
+        lmc_host_interleaved);
     return;
   }
 
@@ -528,7 +528,9 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
     const int64_t chunk_size, const int64_t total_tokens,
     const int kvcache_format_raw, const bool token_major,
     const bool vllm_two_major, const int64_t k_hidden_dims,
-    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
+    const bool lmc_host_interleaved,
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu) {
   validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
   validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
   TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
@@ -550,15 +552,20 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   }
 
   const int32_t num_chunks = static_cast<int32_t>(lmc_tensors.size());
-  std::vector<int64_t> chunk_ptrs_host(num_chunks);
-  for (int32_t chunk_i = 0; chunk_i < num_chunks; ++chunk_i) {
-    chunk_ptrs_host[chunk_i] = reinterpret_cast<int64_t>(
-        get_kernel_ptr<uint8_t, torch::Tensor>(lmc_tensors[chunk_i]));
+  torch::Tensor chunk_ptrs_tensor;
+  if (chunk_ptrs_npu.has_value() && chunk_ptrs_npu->defined() &&
+      chunk_ptrs_npu->numel() == num_chunks) {
+    chunk_ptrs_tensor = *chunk_ptrs_npu;
+  } else {
+    std::vector<int64_t> chunk_ptrs_host(num_chunks);
+    for (int32_t chunk_i = 0; chunk_i < num_chunks; ++chunk_i) {
+      chunk_ptrs_host[chunk_i] = reinterpret_cast<int64_t>(
+          get_kernel_ptr<uint8_t, torch::Tensor>(lmc_tensors[chunk_i]));
+    }
+    auto npu_options = slot_mapping_packed.options();
+    chunk_ptrs_tensor =
+        torch::tensor(chunk_ptrs_host, npu_options.dtype(at::ScalarType::Long));
   }
-
-  auto npu_options = slot_mapping_packed.options();
-  torch::Tensor chunk_ptrs_npu =
-      torch::tensor(chunk_ptrs_host, npu_options.dtype(at::ScalarType::Long));
 
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       lmc_tensors[0], vllm_kv_caches, slot_mapping_packed, false, token_major,
@@ -571,7 +578,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
   uint8_t *chunk_ptrs_ptr =
-      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
 
   const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
   const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
@@ -579,10 +586,10 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   at_npu::native::OpCommand cmd;
   cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
   cmd.SetCustomHandler([config, selected_ptr, chunk_ptrs_ptr, num_chunks,
-                        chunk_size_i, total_tokens_i]() -> int {
+                        chunk_size_i, total_tokens_i, lmc_host_interleaved]() -> int {
     launch_sparse_multi_chunk_direct_kernel(
         config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
-        total_tokens_i);
+        total_tokens_i, lmc_host_interleaved);
     return 0;
   });
   cmd.Run();

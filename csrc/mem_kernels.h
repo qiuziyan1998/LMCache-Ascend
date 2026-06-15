@@ -225,7 +225,9 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
     const int64_t chunk_size, const int64_t total_tokens,
     const int kvcache_format_raw, const bool token_major = false,
     const bool vllm_two_major = false, const int64_t k_hidden_dims = 0,
-    const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0);
+    const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0,
+    const bool lmc_host_interleaved = false,
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu = c10::nullopt);
 
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,

@@ -202,6 +202,8 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
     k_hidden_dims: int = 0,
     v_hidden_dims: int = 0,
     dsa_hidden_dims: int = 0,
+    lmc_host_interleaved: bool = False,
+    chunk_ptrs_npu: Optional[torch.Tensor] = None,
 ) -> None:
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer(
         lmc_tensors,
@@ -216,6 +218,8 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
         k_hidden_dims,
         v_hidden_dims,
         dsa_hidden_dims,
+        lmc_host_interleaved,
+        chunk_ptrs_npu,
     )
 
 
