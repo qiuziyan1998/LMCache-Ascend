@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-import os
-import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -1140,143 +1138,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.v_hidden_dims: int = 0
         self.dsa_hidden_dims: int = 0
         self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
-        self._sparse_h2d_perf_acc: Optional[dict[str, Any]] = None
         # Cached registered device pointers for sparse direct multi-chunk H2D.
         self._sparse_chunk_ptr_cache: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
         self._sparse_memory_objs_updated: bool = False
-
-    @staticmethod
-    def _sparse_h2d_perf_enabled() -> bool:
-        return os.environ.get("LMCACHE_SPARSE_H2D_PERF_LOG", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-
-    @staticmethod
-    def _sparse_h2d_perf_layer_enabled() -> bool:
-        return os.environ.get("LMCACHE_SPARSE_H2D_PERF_LAYER", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-
-    def _reset_sparse_h2d_perf(self) -> None:
-        self._sparse_h2d_perf_acc = {
-            "layers": 0,
-            "skipped_layers": 0,
-            "sparse_tokens": 0,
-            "num_chunks": 0,
-            "yield_wait_ms": 0.0,
-            "prep_ms": 0.0,
-            "kernel_ms": 0.0,
-            "wait_ms": 0.0,
-            "bytes": 0,
-        }
-
-    def _sparse_kv_element_size(self) -> int:
-        connector_elem_size = getattr(self, "element_size", None)
-        if isinstance(connector_elem_size, int) and connector_elem_size > 0:
-            return connector_elem_size
-
-        assert self.kvcaches is not None and len(self.kvcaches) > 0
-        first_layer = self.kvcaches[0]
-        tensor = first_layer[0] if isinstance(first_layer, tuple) else first_layer
-        return tensor.dtype.itemsize
-
-    def _sparse_h2d_bytes_per_token(self) -> int:
-        if self._is_mla_dsa_format():
-            plane_elems = self.k_hidden_dims + self.v_hidden_dims
-            if self.kv_format == KVCacheFormat.DSA_KV:
-                plane_elems += self.dsa_hidden_dims
-            return plane_elems * self._sparse_kv_element_size()
-        return 2 * self.hidden_dim_size * self._sparse_kv_element_size()
-
-    def _record_sparse_h2d_layer_perf(
-        self,
-        *,
-        layer_id: int,
-        yield_wait_ms: float,
-        prep_ms: float,
-        kernel_ms: float,
-        wait_ms: float,
-        num_sparse: int,
-        num_chunks: int,
-    ) -> None:
-        acc = self._sparse_h2d_perf_acc
-        if acc is None:
-            return
-        bytes_moved = num_sparse * self._sparse_h2d_bytes_per_token()
-        load_ms = prep_ms + kernel_ms + wait_ms
-        acc["layers"] += 1
-        acc["sparse_tokens"] += num_sparse
-        acc["num_chunks"] += num_chunks
-        acc["yield_wait_ms"] += yield_wait_ms
-        acc["prep_ms"] += prep_ms
-        acc["kernel_ms"] += kernel_ms
-        acc["wait_ms"] += wait_ms
-        acc["bytes"] += bytes_moved
-
-        if self._sparse_h2d_perf_layer_enabled():
-            kernel_gb_s = (
-                bytes_moved / (kernel_ms / 1000.0) / 1e9
-                if kernel_ms > 0
-                else 0.0
-            )
-            load_gb_s = (
-                bytes_moved / (load_ms / 1000.0) / 1e9 if load_ms > 0 else 0.0
-            )
-            logger.info(
-                "[sparse_h2d_perf] batched_to_gpu_head_token_wise layer=%d "
-                "chunks=%d sparse_tokens=%d bytes=%d yield_wait=%.3fms "
-                "prep=%.3fms kernel=%.3fms wait=%.3fms load=%.3fms "
-                "kernel_bw=%.2fGB/s load_bw=%.2fGB/s",
-                layer_id,
-                num_chunks,
-                num_sparse,
-                bytes_moved,
-                yield_wait_ms,
-                prep_ms,
-                kernel_ms,
-                wait_ms,
-                load_ms,
-                kernel_gb_s,
-                load_gb_s,
-            )
-
-    def _flush_sparse_h2d_perf_summary(self) -> None:
-        acc = self._sparse_h2d_perf_acc
-        if acc is None or acc["layers"] == 0:
-            self._sparse_h2d_perf_acc = None
-            return
-        load_ms = acc["prep_ms"] + acc["kernel_ms"] + acc["wait_ms"]
-        kernel_gb_s = (
-            acc["bytes"] / (acc["kernel_ms"] / 1000.0) / 1e9
-            if acc["kernel_ms"] > 0
-            else 0.0
-        )
-        load_gb_s = (
-            acc["bytes"] / (load_ms / 1000.0) / 1e9 if load_ms > 0 else 0.0
-        )
-        logger.info(
-            "[sparse_h2d_perf] batched_to_gpu_head_token_wise summary "
-            "layers=%d skipped=%d sparse_tokens=%d chunks=%d bytes=%.4fMB "
-            "yield_wait=%.3fms prep=%.3fms kernel=%.3fms wait=%.3fms "
-            "load=%.3fms kernel_bw=%.2fGB/s load_bw=%.2fGB/s",
-            acc["layers"],
-            acc["skipped_layers"],
-            acc["sparse_tokens"],
-            acc["num_chunks"],
-            acc["bytes"] / 1e6,
-            acc["yield_wait_ms"],
-            acc["prep_ms"],
-            acc["kernel_ms"],
-            acc["wait_ms"],
-            load_ms,
-            kernel_gb_s,
-            load_gb_s,
-        )
-        self._sparse_h2d_perf_acc = None
 
     def _run_sparse_direct_kv_transfer_layer(
         self,
@@ -1289,31 +1153,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         selected_token_idx: torch.Tensor,
         chunk_size: int,
         total_tokens: int,
-        prep_ms: float,
-        yield_wait_ms: float = 0.0,
     ) -> None:
         num_sparse = int(selected_token_idx.numel())
         num_chunks = len(cpu_tensors)
-        perf = self._sparse_h2d_perf_enabled()
 
         if num_sparse == 0 or num_chunks == 0 or total_tokens <= 0:
-            if perf and self._sparse_h2d_perf_acc is not None:
-                self._sparse_h2d_perf_acc["skipped_layers"] += 1
             return
 
         k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
             self._single_layer_hidden_dim_args()
         )
         chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(layer_id, cpu_tensors)
-        k_start = k_end = None
-        if perf:
-            k_start = torch.npu.Event(enable_timing=True)
-            k_end = torch.npu.Event(enable_timing=True)
 
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
-            if perf and k_start is not None and k_end is not None:
-                k_start.record(load_stream)
             sparse_mla_dsa_batched_direct_kv_transfer(
                 cpu_tensors,
                 self.kvcaches[layer_id],
@@ -1330,24 +1183,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 self._sparse_lmc_host_interleaved(),
                 chunk_ptrs_npu,
             )
-            if perf and k_start is not None and k_end is not None:
-                k_end.record(load_stream)
 
-        wait_t0 = time.perf_counter()
         current_stream.wait_stream(load_stream)
-        wait_ms = (time.perf_counter() - wait_t0) * 1000.0
-
-        if perf and k_start is not None and k_end is not None:
-            kernel_ms = k_start.elapsed_time(k_end)
-            self._record_sparse_h2d_layer_perf(
-                layer_id=layer_id,
-                yield_wait_ms=yield_wait_ms,
-                prep_ms=prep_ms,
-                kernel_ms=kernel_ms,
-                wait_ms=wait_ms,
-                num_sparse=num_sparse,
-                num_chunks=num_chunks,
-            )
 
     def _sparse_selected_token_idx(
         self,
@@ -1742,18 +1579,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         has_cached_tensors = cached_tensors_by_layer is not None
         chunk_size = self.lmcache_chunk_size
-        perf = self._sparse_h2d_perf_enabled()
-        if perf:
-            self._reset_sparse_h2d_perf()
 
         for layer_id in range(self.num_layers):
-            yield_wait_t0 = time.perf_counter() if perf else 0.0
             memory_objs_layer, selected_token_idx, token_start_index = yield
-            yield_wait_ms = (
-                (time.perf_counter() - yield_wait_t0) * 1000.0 if perf else 0.0
-            )
-
-            prep_t0 = time.perf_counter() if perf else 0.0
             slot_mapping_packed = (
                 slot_mapping
                 if token_start_index == 0
@@ -1780,7 +1608,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
 
             total_tokens = self._sparse_retrieve_total_tokens(cpu_tensors)
-            prep_ms = (time.perf_counter() - prep_t0) * 1000.0 if perf else 0.0
             self._run_sparse_direct_kv_transfer_layer(
                 layer_id=layer_id,
                 load_stream=self.load_stream_list[load_stream_idx],
@@ -1790,12 +1617,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx=selected_token_idx,
                 chunk_size=chunk_size,
                 total_tokens=total_tokens,
-                prep_ms=prep_ms,
-                yield_wait_ms=yield_wait_ms,
             )
-
-        if perf:
-            self._flush_sparse_h2d_perf_summary()
 
         yield
 
