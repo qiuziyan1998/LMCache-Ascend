@@ -205,12 +205,6 @@ static void gather_to_staging_impl(const GatherChunkTable &table,
   }
 }
 
-struct MicroBatchPlan {
-  int32_t mb_start;
-  int32_t mb_count;
-  int32_t slot;
-};
-
 } // namespace
 
 int32_t compute_effective_batch_tokens(int32_t micro_batch_tokens,
@@ -357,6 +351,8 @@ void sparse_mla_dsa_pghs_layer_transfer(
                   static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw)),
               "PGHS supports MLA/DSA only");
   validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  TORCH_CHECK(slot_mapping_packed.defined(),
+              "slot_mapping_packed must be defined");
 
   const int32_t num_sparse = static_cast<int32_t>(slot_mapping_packed.size(0));
   if (num_sparse == 0) {
@@ -382,14 +378,21 @@ void sparse_mla_dsa_pghs_layer_transfer(
   const GatherChunkTable gather_table = build_gather_chunk_table(
       lmc_tensors, chunk_size_i, num_chunks, static_cast<int32_t>(total_tokens));
 
-  std::vector<MicroBatchPlan> plans;
+  struct BatchPlan {
+    int32_t mb_start;
+    int32_t mb_count;
+    int32_t slot;
+  };
+
+  std::vector<BatchPlan> plans;
   plans.reserve(8);
   for (int32_t mb_start = 0; mb_start < num_sparse;) {
     const int32_t remaining = num_sparse - mb_start;
     const int32_t mb_count =
         compute_pghs_step_tokens(remaining, slot_cap, micro_batch_tokens);
     plans.push_back(
-        MicroBatchPlan{mb_start, mb_count, static_cast<int32_t>(plans.size() % kNumSlots)});
+        BatchPlan{mb_start, mb_count,
+                  static_cast<int32_t>(plans.size() % StagingBufferPool::kNumSlots)});
     mb_start += mb_count;
   }
 
@@ -401,28 +404,61 @@ void sparse_mla_dsa_pghs_layer_transfer(
         bytes_per_token, gather_thread_num);
   }
 
+  // CPU staging views must be built without NPU device guard (from_blob only).
+  std::vector<torch::Tensor> staging_views;
+  staging_views.reserve(plans.size());
+  for (const auto &plan : plans) {
+    const torch::Tensor cpu_slot_buf = pool.cpu_staging(plan.slot);
+    TORCH_CHECK(cpu_slot_buf.defined(), "cpu staging buffer undefined");
+    const int64_t staging_elems =
+        static_cast<int64_t>(plan.mb_count) * plane_elems;
+    staging_views.push_back(torch::from_blob(
+        cpu_slot_buf.data_ptr(), {staging_elems},
+        torch::TensorOptions()
+            .dtype(cpu_slot_buf.scalar_type())
+            .device(torch::kCPU)));
+    TORCH_CHECK(staging_views.back().defined(),
+                "cpu staging view construction failed");
+  }
+
+  struct Launch {
+    SingleLayerKVConfig config;
+    uint8_t *staging_idx_ptr;
+  };
+
+  std::vector<torch::Tensor> slot_mapping_batches;
+  std::vector<torch::Tensor> staging_indices;
+  std::vector<Launch> launches;
+  slot_mapping_batches.reserve(plans.size());
+  staging_indices.reserve(plans.size());
+  launches.reserve(plans.size());
+
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
+  for (size_t i = 0; i < plans.size(); ++i) {
+    const auto &plan = plans[i];
+    auto slot_mb = slot_mapping_packed.slice(
+        0, plan.mb_start, plan.mb_start + plan.mb_count);
+    TORCH_CHECK(slot_mb.defined(), "slot_mapping micro-batch slice failed");
+    slot_mapping_batches.push_back(std::move(slot_mb));
+    staging_indices.push_back(pool.staging_token_idx(plan.mb_count));
+
+    SingleLayerKVConfig config = build_scatter_config(
+        staging_views[i], vllm_kv_caches, slot_mapping_batches.back(),
+        kvcache_format_raw, k_hidden_dims, v_hidden_dims, dsa_hidden_dims,
+        scatter_aiv_num, stream);
+    launches.push_back(
+        Launch{config,
+               get_kernel_ptr<uint8_t, torch::Tensor>(staging_indices.back())});
+  }
+
   at_npu::native::OpCommand cmd;
   cmd.Name("sparse_mla_dsa_pghs_layer_transfer");
-  cmd.SetCustomHandler([plans = std::move(plans), &pool, &vllm_kv_caches,
-                        &slot_mapping_packed, kvcache_format_raw, k_hidden_dims,
-                        v_hidden_dims, dsa_hidden_dims, scatter_aiv_num,
-                        plane_elems, stream]() -> int {
-    for (const auto &plan : plans) {
-      auto slot_mapping_mb =
-          slot_mapping_packed.slice(0, plan.mb_start, plan.mb_start + plan.mb_count);
-      auto staging_idx = pool.staging_token_idx(plan.mb_count);
-      torch::Tensor staging_view =
-          pool.cpu_staging(plan.slot).slice(0, 0, plan.mb_count * plane_elems);
-
-      SingleLayerKVConfig config = build_scatter_config(
-          staging_view, vllm_kv_caches, slot_mapping_mb, kvcache_format_raw,
-          k_hidden_dims, v_hidden_dims, dsa_hidden_dims, scatter_aiv_num, stream);
-      uint8_t *staging_idx_ptr =
-          get_kernel_ptr<uint8_t, torch::Tensor>(staging_idx);
-      launch_sparse_mla_dsa_scatter_from_staging(config, staging_idx_ptr, true);
+  cmd.SetCustomHandler([launches = std::move(launches)]() -> int {
+    for (const auto &launch : launches) {
+      launch_sparse_mla_dsa_scatter_from_staging(launch.config,
+                                                 launch.staging_idx_ptr, true);
     }
     return 0;
   });
