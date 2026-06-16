@@ -1,4 +1,5 @@
 #include "mem_kernels.h"
+#include "sparse_pghs.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "utils.h"
 #include <ATen/ATen.h>

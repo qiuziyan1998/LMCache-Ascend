@@ -1,10 +1,11 @@
 #pragma once
 
-#include "sparse_pghs.h"
 #include "kernels/types.h"
 #include "managed_mem.h"
 #include <torch/extension.h>
 #include <torch/torch.h>
+
+class StagingBufferPool;
 
 namespace kvcache_ops {
 void multi_layer_kv_transfer_kernel(
@@ -249,7 +250,7 @@ void sparse_mla_dsa_pghs_layer_transfer(
     int64_t chunk_size, int64_t total_tokens, int kvcache_format_raw,
     int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
     int32_t micro_batch_tokens, int32_t gather_thread_num,
-    int32_t scatter_aiv_num, int32_t event_timeout_ms = 30000);
+    int32_t scatter_aiv_num, int32_t event_timeout_ms);
 
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,

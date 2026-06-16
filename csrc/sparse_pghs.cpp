@@ -1,4 +1,5 @@
 #include "sparse_pghs.h"
+#include "mem_kernels.h"
 #include "mem_alloc.h"
 #include "utils.h"
 
@@ -75,7 +76,7 @@ static void gather_token_range(const uint8_t *const *chunk_bases,
 
 static bool query_event_done(aclrtEvent event) {
   aclrtEventStatus status = ACL_EVENT_STATUS_COMPLETE;
-  aclError ret = aclrtQueryEvent(event, &status);
+  aclError ret = aclrtQueryEventStatus(event, &status);
   if (ret != ACL_SUCCESS) {
     return false;
   }
