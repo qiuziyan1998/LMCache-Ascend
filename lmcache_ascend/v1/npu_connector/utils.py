@@ -223,6 +223,43 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
     )
 
 
+def sparse_mla_dsa_pghs_layer_transfer(
+    pool: object,
+    lmc_tensors: Sequence[torch.Tensor],
+    vllm_kv_caches: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    slot_mapping_packed: torch.Tensor,
+    selected_token_idx: torch.Tensor,
+    chunk_size: int,
+    total_tokens: int,
+    kvcache_format_raw: int,
+    k_hidden_dims: int,
+    v_hidden_dims: int,
+    dsa_hidden_dims: int,
+    micro_batch_tokens: int = 512,
+    gather_thread_num: int = 4,
+    scatter_aiv_num: int = 4,
+    event_timeout_ms: int = 30000,
+) -> None:
+    """Pipelined gather + H2D + scatter for sparse MLA/DSA retrieve."""
+    lmc_ops.sparse_mla_dsa_pghs_layer_transfer(
+        pool,
+        list(lmc_tensors),
+        vllm_kv_caches,
+        slot_mapping_packed,
+        selected_token_idx,
+        chunk_size,
+        total_tokens,
+        kvcache_format_raw,
+        k_hidden_dims,
+        v_hidden_dims,
+        dsa_hidden_dims,
+        micro_batch_tokens,
+        gather_thread_num,
+        scatter_aiv_num,
+        event_timeout_ms,
+    )
+
+
 def batched_fused_sparse_single_layer_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     staging_cache: torch.Tensor,

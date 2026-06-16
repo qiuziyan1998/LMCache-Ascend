@@ -24,6 +24,7 @@ from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
     sparse_mla_dsa_batched_direct_kv_transfer,
+    sparse_mla_dsa_pghs_layer_transfer,
 )
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
@@ -1142,6 +1143,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_chunk_ptr_cache: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
         self._sparse_memory_objs_updated: bool = False
 
+        # PGHS (pipelined gather + H2D + scatter) optional path.
+        self.sparse_h2d_mode: str = str(kwargs.get("sparse_h2d_mode", "direct"))
+        self._sparse_h2d_micro_batch_tokens: int = int(
+            kwargs.get("sparse_h2d_micro_batch_tokens", 512)
+        )
+        self._sparse_h2d_max_slot_bytes: int = int(
+            kwargs.get("sparse_h2d_max_slot_bytes", 4 * 1024 * 1024)
+        )
+        self._sparse_h2d_gather_threads: int = int(
+            kwargs.get("sparse_h2d_gather_threads", 4)
+        )
+        self._sparse_h2d_scatter_aiv_num: int = int(
+            kwargs.get("sparse_h2d_scatter_aiv_num", 4)
+        )
+        self._pghs_pool: Optional[object] = None
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -1185,6 +1202,103 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
         current_stream.wait_stream(load_stream)
+
+    def _lazy_initialize_pghs_pool(self, dtype: torch.dtype) -> None:
+        if self._pghs_pool is not None:
+            return
+        plane = self.k_hidden_dims + self.v_hidden_dims
+        if self.kv_format == KVCacheFormat.DSA_KV:
+            plane += self.dsa_hidden_dims
+        bytes_per_token = plane * dtype.itemsize
+        effective_batch = lmc_ops.compute_effective_batch_tokens(
+            self._sparse_h2d_micro_batch_tokens,
+            self._sparse_h2d_max_slot_bytes,
+            bytes_per_token,
+        )
+        self._pghs_pool = lmc_ops.StagingBufferPool(
+            self._sparse_h2d_max_slot_bytes,
+            effective_batch,
+            bytes_per_token,
+            dtype,
+            self.kv_device,
+        )
+
+    def _run_sparse_pghs_kv_transfer_layer(
+        self,
+        *,
+        layer_id: int,
+        load_stream: torch.cuda.Stream,
+        current_stream: torch.cuda.Stream,
+        cpu_tensors: List[torch.Tensor],
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        chunk_size: int,
+        total_tokens: int,
+    ) -> None:
+        num_sparse = int(selected_token_idx.numel())
+        if num_sparse == 0 or not cpu_tensors or total_tokens <= 0:
+            return
+
+        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
+            self._single_layer_hidden_dim_args()
+        )
+        self._lazy_initialize_pghs_pool(cpu_tensors[0].dtype)
+
+        with torch.cuda.stream(load_stream):
+            load_stream.wait_stream(current_stream)
+            sparse_mla_dsa_pghs_layer_transfer(
+                self._pghs_pool,
+                cpu_tensors,
+                self.kvcaches[layer_id],
+                slot_mapping_packed,
+                selected_token_idx,
+                chunk_size,
+                total_tokens,
+                self.kv_format.value,
+                k_hidden_dims,
+                v_hidden_dims,
+                dsa_hidden_dims,
+                self._sparse_h2d_micro_batch_tokens,
+                self._sparse_h2d_gather_threads,
+                self._sparse_h2d_scatter_aiv_num,
+            )
+
+        current_stream.wait_stream(load_stream)
+
+    def _run_sparse_kv_transfer_layer(
+        self,
+        *,
+        layer_id: int,
+        load_stream: torch.cuda.Stream,
+        current_stream: torch.cuda.Stream,
+        cpu_tensors: List[torch.Tensor],
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        chunk_size: int,
+        total_tokens: int,
+    ) -> None:
+        if self.sparse_h2d_mode == "pghs" and self._is_mla_dsa_format():
+            self._run_sparse_pghs_kv_transfer_layer(
+                layer_id=layer_id,
+                load_stream=load_stream,
+                current_stream=current_stream,
+                cpu_tensors=cpu_tensors,
+                slot_mapping_packed=slot_mapping_packed,
+                selected_token_idx=selected_token_idx,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+            )
+            return
+        self._run_sparse_direct_kv_transfer_layer(
+            layer_id=layer_id,
+            load_stream=load_stream,
+            current_stream=current_stream,
+            cpu_tensors=cpu_tensors,
+            slot_mapping_packed=slot_mapping_packed,
+            selected_token_idx=selected_token_idx,
+            chunk_size=chunk_size,
+            total_tokens=total_tokens,
+        )
 
     def _sparse_selected_token_idx(
         self,
@@ -1608,7 +1722,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
 
             total_tokens = self._sparse_retrieve_total_tokens(cpu_tensors)
-            self._run_sparse_direct_kv_transfer_layer(
+            self._run_sparse_kv_transfer_layer(
                 layer_id=layer_id,
                 load_stream=self.load_stream_list[load_stream_idx],
                 current_stream=current_stream,

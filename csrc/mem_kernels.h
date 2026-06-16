@@ -1,4 +1,6 @@
 #pragma once
+
+#include "sparse_pghs.h"
 #include "kernels/types.h"
 #include "managed_mem.h"
 #include <torch/extension.h>
@@ -228,6 +230,26 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
     const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0,
     const bool lmc_host_interleaved = false,
     const c10::optional<torch::Tensor> &chunk_ptrs_npu = c10::nullopt);
+
+// PGHS: pipelined gather + H2D + scatter for sparse MLA/DSA retrieve.
+int32_t compute_effective_batch_tokens(int32_t micro_batch_tokens,
+                                       int64_t max_slot_bytes,
+                                       int64_t bytes_per_token);
+
+void sparse_mla_dsa_scatter_from_staging(
+    torch::Tensor &staging_cache, std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &staging_token_idx,
+    int kvcache_format_raw, int64_t k_hidden_dims, int64_t v_hidden_dims,
+    int64_t dsa_hidden_dims, int32_t scatter_aiv_num);
+
+void sparse_mla_dsa_pghs_layer_transfer(
+    StagingBufferPool &pool, std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    int64_t chunk_size, int64_t total_tokens, int kvcache_format_raw,
+    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
+    int32_t micro_batch_tokens, int32_t gather_thread_num,
+    int32_t scatter_aiv_num, int32_t event_timeout_ms = 30000);
 
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,

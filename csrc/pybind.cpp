@@ -6,6 +6,7 @@
 #include "mem_alloc.h"
 #include "mem_kernels.h"
 #include "pos_kernels.h"
+#include "sparse_pghs.h"
 #include <iostream>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -97,6 +98,22 @@ void sparse_mla_dsa_batched_direct_kv_transfer_wrapper(
       chunk_ptrs_npu);
 }
 
+void sparse_mla_dsa_pghs_layer_transfer_wrapper(
+    StagingBufferPool &pool, std::vector<torch::Tensor> &lmc_tensors,
+    const py::object &vllm_kv_caches_obj, torch::Tensor &slot_mapping_packed,
+    torch::Tensor &selected_token_idx, int64_t chunk_size, int64_t total_tokens,
+    int kvcache_format_raw, int64_t k_hidden_dims, int64_t v_hidden_dims,
+    int64_t dsa_hidden_dims, int32_t micro_batch_tokens,
+    int32_t gather_thread_num, int32_t scatter_aiv_num,
+    int32_t event_timeout_ms) {
+  auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
+  sparse_mla_dsa_pghs_layer_transfer(
+      pool, lmc_tensors, vllm_kv_caches, slot_mapping_packed, selected_token_idx,
+      chunk_size, total_tokens, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims, micro_batch_tokens, gather_thread_num, scatter_aiv_num,
+      event_timeout_ms);
+}
+
 PYBIND11_MODULE(c_ops, m) {
   m.def("get_device_ptr", [](uintptr_t ptr_addr) {
     return reinterpret_cast<uintptr_t>(
@@ -154,6 +171,30 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0,
         py::arg("lmc_host_interleaved") = false,
         py::arg("chunk_ptrs_npu") = py::none());
+  py::class_<StagingBufferPool>(m, "StagingBufferPool")
+      .def(py::init<int64_t, int32_t, int64_t, at::ScalarType, torch::Device>(),
+           py::arg("max_slot_bytes"), py::arg("max_tokens"),
+           py::arg("bytes_per_token"), py::arg("dtype"), py::arg("npu_device"))
+      .def("max_tokens", &StagingBufferPool::max_tokens)
+      .def("slot_bytes", &StagingBufferPool::slot_bytes)
+      .def("bytes_per_token", &StagingBufferPool::bytes_per_token)
+      .def("cpu_staging", &StagingBufferPool::cpu_staging, py::arg("slot_id"))
+      .def("npu_staging", &StagingBufferPool::npu_staging, py::arg("slot_id"))
+      .def("staging_token_idx", &StagingBufferPool::staging_token_idx,
+           py::arg("count"))
+      .def("reset", &StagingBufferPool::reset);
+  m.def("compute_effective_batch_tokens", &compute_effective_batch_tokens,
+        py::arg("micro_batch_tokens"), py::arg("max_slot_bytes"),
+        py::arg("bytes_per_token"));
+  m.def("sparse_mla_dsa_pghs_layer_transfer",
+        &sparse_mla_dsa_pghs_layer_transfer_wrapper, py::arg("pool"),
+        py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),
+        py::arg("slot_mapping_packed"), py::arg("selected_token_idx"),
+        py::arg("chunk_size"), py::arg("total_tokens"),
+        py::arg("kvcache_format_raw"), py::arg("k_hidden_dims") = 0,
+        py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0,
+        py::arg("micro_batch_tokens") = 512, py::arg("gather_thread_num") = 4,
+        py::arg("scatter_aiv_num") = 4, py::arg("event_timeout_ms") = 30000);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
   m.def("load_and_reshape_flash", &load_and_reshape_flash);

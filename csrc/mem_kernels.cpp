@@ -628,6 +628,19 @@ void batched_fused_sparse_single_layer_kv_transfer(
                                     launcher);
 }
 
+void sparse_mla_dsa_scatter_from_staging(
+    torch::Tensor &staging_cache, std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &staging_token_idx,
+    int kvcache_format_raw, int64_t k_hidden_dims, int64_t v_hidden_dims,
+    int64_t dsa_hidden_dims, int32_t scatter_aiv_num) {
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  detail_sparse_mla_dsa_scatter_from_staging(staging_cache, vllm_kv_caches,
+                                      slot_mapping_packed, staging_token_idx,
+                                      kvcache_format_raw, k_hidden_dims,
+                                      v_hidden_dims, dsa_hidden_dims,
+                                      scatter_aiv_num, stream);
+}
+
 void load_and_reshape_flash(
     torch::Tensor &key_value, // [2, num_layer, num_tokens, num_heads*head_size]
                               // must be one gpu / pinned cpu
