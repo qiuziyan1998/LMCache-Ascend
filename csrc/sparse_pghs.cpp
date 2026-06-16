@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <torch_npu/csrc/core/npu/NPUStream.h>
+#include <torch_npu/csrc/framework/OpCommand.h>
 
 namespace {
 
@@ -50,6 +51,54 @@ static int32_t resolve_last_chunk_tokens(int32_t num_chunks, int32_t chunk_size,
   return total_tokens - (num_chunks - 1) * chunk_size;
 }
 
+static bool is_dense_global_selection(const int32_t *global_token_idx,
+                                      int32_t batch_tokens) {
+  if (batch_tokens <= 1) {
+    return true;
+  }
+  const int32_t base = global_token_idx[0];
+  for (int32_t i = 1; i < batch_tokens; ++i) {
+    if (global_token_idx[i] != base + i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void gather_dense_global_range(const uint8_t *const *chunk_bases,
+                                      int32_t chunk_size, int32_t num_chunks,
+                                      int32_t total_tokens, int32_t global_begin,
+                                      int32_t global_count, uint8_t *dst,
+                                      int64_t bytes_per_token) {
+  TORCH_CHECK(global_count > 0, "global_count must be positive");
+  const int32_t global_end = global_begin + global_count;
+  int32_t dst_token = 0;
+  int32_t global = global_begin;
+
+  while (global < global_end) {
+    const int32_t chunk_id = global / chunk_size;
+    TORCH_CHECK(chunk_id >= 0 && chunk_id < num_chunks,
+                "global token index out of chunk range: ", global);
+    const int32_t chunk_limit =
+        (chunk_id + 1 == num_chunks)
+            ? resolve_last_chunk_tokens(num_chunks, chunk_size, total_tokens)
+            : chunk_size;
+    const int32_t local_begin = global % chunk_size;
+    const int32_t tokens_in_chunk =
+        std::min(global_end - global, chunk_limit - local_begin);
+    const uint8_t *src =
+        chunk_bases[chunk_id] +
+        static_cast<int64_t>(local_begin) * bytes_per_token;
+    uint8_t *dst_ptr =
+        dst + static_cast<int64_t>(dst_token) * bytes_per_token;
+    std::memcpy(dst_ptr, src,
+                static_cast<size_t>(tokens_in_chunk * bytes_per_token));
+    dst_token += tokens_in_chunk;
+    global += tokens_in_chunk;
+  }
+  TORCH_CHECK(dst_token == global_count, "dense gather size mismatch");
+}
+
 static void gather_token_range(const uint8_t *const *chunk_bases,
                                const int32_t *last_chunk_tokens, int32_t chunk_size,
                                int32_t num_chunks, int32_t total_tokens,
@@ -76,57 +125,6 @@ static void gather_token_range(const uint8_t *const *chunk_bases,
   }
 }
 
-static bool query_event_done(aclrtEvent event) {
-  aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
-  aclError ret = aclrtQueryEventStatus(event, &status);
-  if (ret != ACL_SUCCESS) {
-    return false;
-  }
-  return status == ACL_EVENT_RECORDED_STATUS_COMPLETE;
-}
-
-static void wait_event_or_throw(aclrtEvent event, int32_t timeout_ms,
-                                const char *label) {
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(timeout_ms);
-  while (!query_event_done(event)) {
-    if (std::chrono::steady_clock::now() > deadline) {
-      TORCH_CHECK(false, "PGHS timeout waiting for ", label);
-    }
-    std::this_thread::yield();
-  }
-}
-
-struct PersistentSlotEvents {
-  aclrtEvent h2d_done[kNumSlots]{nullptr, nullptr};
-  aclrtEvent scatter_done[kNumSlots]{nullptr, nullptr};
-
-  PersistentSlotEvents() {
-    for (int i = 0; i < kNumSlots; ++i) {
-      TORCH_CHECK(aclrtCreateEvent(&h2d_done[i]) == ACL_SUCCESS,
-                  "aclrtCreateEvent h2d failed");
-      TORCH_CHECK(aclrtCreateEvent(&scatter_done[i]) == ACL_SUCCESS,
-                  "aclrtCreateEvent scatter failed");
-    }
-  }
-
-  ~PersistentSlotEvents() {
-    for (int i = 0; i < kNumSlots; ++i) {
-      if (h2d_done[i] != nullptr) {
-        aclrtDestroyEvent(h2d_done[i]);
-      }
-      if (scatter_done[i] != nullptr) {
-        aclrtDestroyEvent(scatter_done[i]);
-      }
-    }
-  }
-};
-
-PersistentSlotEvents &persistent_slot_events() {
-  static thread_local PersistentSlotEvents events;
-  return events;
-}
-
 static SingleLayerKVConfig
 build_scatter_config(torch::Tensor &staging_view,
                      std::vector<torch::Tensor> &vllm_kv_caches,
@@ -143,9 +141,74 @@ build_scatter_config(torch::Tensor &staging_view,
   return config;
 }
 
-struct SlotTracker {
-  enum class State { FREE, SCATTER_INFLIGHT };
-  State state[kNumSlots]{State::FREE, State::FREE};
+struct GatherChunkTable {
+  std::vector<const uint8_t *> bases;
+  std::vector<int32_t> last_chunk_tokens;
+};
+
+static GatherChunkTable build_gather_chunk_table(
+    const std::vector<torch::Tensor> &lmc_chunks, int32_t chunk_size,
+    int32_t num_chunks, int32_t total_tokens) {
+  GatherChunkTable table;
+  table.bases.resize(lmc_chunks.size());
+  table.last_chunk_tokens.resize(lmc_chunks.size());
+  for (size_t i = 0; i < lmc_chunks.size(); ++i) {
+    TORCH_CHECK(lmc_chunks[i].device().is_cpu(), "lmc chunk must be CPU pinned");
+    table.bases[i] = static_cast<const uint8_t *>(lmc_chunks[i].data_ptr());
+    table.last_chunk_tokens[i] = (static_cast<int32_t>(i) == num_chunks - 1)
+                                     ? resolve_last_chunk_tokens(
+                                           num_chunks, chunk_size, total_tokens)
+                                     : chunk_size;
+  }
+  return table;
+}
+
+static void gather_to_staging_impl(const GatherChunkTable &table,
+                                   const int32_t *global_token_idx,
+                                   int32_t batch_tokens, int32_t chunk_size,
+                                   int32_t num_chunks, int32_t total_tokens,
+                                   uint8_t *dst_staging, int64_t bytes_per_token,
+                                   int32_t gather_thread_num) {
+  if (is_dense_global_selection(global_token_idx, batch_tokens)) {
+    gather_dense_global_range(table.bases.data(), chunk_size, num_chunks,
+                              total_tokens, global_token_idx[0], batch_tokens,
+                              dst_staging, bytes_per_token);
+    return;
+  }
+
+  const int32_t threads = std::max(1, gather_thread_num);
+  const int32_t parallel_threshold = std::max(threads * 64, 256);
+  if (threads == 1 || batch_tokens < parallel_threshold) {
+    gather_token_range(table.bases.data(), table.last_chunk_tokens.data(),
+                       chunk_size, num_chunks, total_tokens, global_token_idx,
+                       0, batch_tokens, dst_staging, bytes_per_token);
+    return;
+  }
+
+  const int32_t per_thread = (batch_tokens + threads - 1) / threads;
+  std::vector<std::future<void>> futures;
+  futures.reserve(threads);
+  for (int32_t t = 0; t < threads; ++t) {
+    const int32_t begin = t * per_thread;
+    const int32_t end = std::min(batch_tokens, begin + per_thread);
+    if (begin >= end) {
+      break;
+    }
+    futures.push_back(std::async(std::launch::async, [=, &table]() {
+      gather_token_range(table.bases.data(), table.last_chunk_tokens.data(),
+                         chunk_size, num_chunks, total_tokens, global_token_idx,
+                         begin, end, dst_staging, bytes_per_token);
+    }));
+  }
+  for (auto &f : futures) {
+    f.get();
+  }
+}
+
+struct MicroBatchPlan {
+  int32_t mb_start;
+  int32_t mb_count;
+  int32_t slot;
 };
 
 } // namespace
@@ -196,13 +259,11 @@ StagingBufferPool::StagingBufferPool(int64_t max_slot_bytes, int32_t max_tokens,
   for (int i = 0; i < kNumSlots; ++i) {
     cpu_ptrs_[i] = reinterpret_cast<void *>(
         alloc_pinned_ptr(static_cast<size_t>(slot_bytes_), 0));
-
-    npu_tensors_[i] = torch::empty(
-        {max_tokens_ * plane_elems},
-        torch::TensorOptions().dtype(dtype_).device(npu_device_));
     cpu_views_.push_back(torch::from_blob(
         cpu_ptrs_[i], {max_tokens_ * plane_elems},
         torch::TensorOptions().dtype(dtype_).device(torch::kCPU)));
+    // NPU staging is optional; keep a lightweight placeholder for API compat.
+    npu_tensors_[i] = torch::empty({0}, torch::TensorOptions().dtype(dtype_).device(npu_device_));
   }
 }
 
@@ -249,45 +310,11 @@ void sparse_mla_dsa_gather_to_staging(
   TORCH_CHECK(dst_staging != nullptr, "dst_staging is null");
   TORCH_CHECK(batch_tokens > 0, "batch_tokens must be positive");
   TORCH_CHECK(!lmc_chunks.empty(), "lmc_chunks must not be empty");
-
-  std::vector<const uint8_t *> chunk_bases(lmc_chunks.size());
-  std::vector<int32_t> last_chunk_tokens(lmc_chunks.size());
-  for (size_t i = 0; i < lmc_chunks.size(); ++i) {
-    TORCH_CHECK(lmc_chunks[i].device().is_cpu(), "lmc chunk must be CPU pinned");
-    chunk_bases[i] = static_cast<const uint8_t *>(lmc_chunks[i].data_ptr());
-    last_chunk_tokens[i] = (static_cast<int32_t>(i) == num_chunks - 1)
-                               ? resolve_last_chunk_tokens(num_chunks, chunk_size,
-                                                           total_tokens)
-                               : chunk_size;
-  }
-
-  const int32_t threads = std::max(1, gather_thread_num);
-  const int32_t parallel_threshold = std::max(threads * 64, 256);
-  if (threads == 1 || batch_tokens < parallel_threshold) {
-    gather_token_range(chunk_bases.data(), last_chunk_tokens.data(), chunk_size,
-                       num_chunks, total_tokens, global_token_idx, 0,
-                       batch_tokens, dst_staging, bytes_per_token);
-    return;
-  }
-
-  const int32_t per_thread = (batch_tokens + threads - 1) / threads;
-  std::vector<std::future<void>> futures;
-  futures.reserve(threads);
-  for (int32_t t = 0; t < threads; ++t) {
-    const int32_t begin = t * per_thread;
-    const int32_t end = std::min(batch_tokens, begin + per_thread);
-    if (begin >= end) {
-      break;
-    }
-    futures.push_back(std::async(std::launch::async, [=]() {
-      gather_token_range(chunk_bases.data(), last_chunk_tokens.data(),
-                         chunk_size, num_chunks, total_tokens, global_token_idx,
-                         begin, end, dst_staging, bytes_per_token);
-    }));
-  }
-  for (auto &f : futures) {
-    f.get();
-  }
+  const GatherChunkTable table =
+      build_gather_chunk_table(lmc_chunks, chunk_size, num_chunks, total_tokens);
+  gather_to_staging_impl(table, global_token_idx, batch_tokens, chunk_size,
+                         num_chunks, total_tokens, dst_staging, bytes_per_token,
+                         gather_thread_num);
 }
 
 void detail_sparse_mla_dsa_scatter_from_staging(
@@ -325,32 +352,7 @@ void sparse_mla_dsa_pghs_layer_transfer(
     int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
     int32_t micro_batch_tokens, int32_t gather_thread_num,
     int32_t scatter_aiv_num, int32_t event_timeout_ms) {
-  thread_local aclrtStream h2d_stream = nullptr;
-  thread_local aclrtStream scatter_stream = nullptr;
-  if (h2d_stream == nullptr) {
-    TORCH_CHECK(aclrtCreateStream(&h2d_stream) == ACL_SUCCESS,
-                "aclrtCreateStream h2d failed");
-  }
-  if (scatter_stream == nullptr) {
-    TORCH_CHECK(aclrtCreateStream(&scatter_stream) == ACL_SUCCESS,
-                "aclrtCreateStream scatter failed");
-  }
-  sparse_mla_dsa_pghs_layer_transfer_streams(
-      pool, lmc_tensors, vllm_kv_caches, slot_mapping_packed, selected_token_idx,
-      chunk_size, total_tokens, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
-      dsa_hidden_dims, micro_batch_tokens, gather_thread_num, scatter_aiv_num,
-      h2d_stream, scatter_stream, event_timeout_ms);
-}
-
-void sparse_mla_dsa_pghs_layer_transfer_streams(
-    StagingBufferPool &pool, std::vector<torch::Tensor> &lmc_tensors,
-    std::vector<torch::Tensor> &vllm_kv_caches,
-    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
-    int64_t chunk_size, int64_t total_tokens, int kvcache_format_raw,
-    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
-    int32_t micro_batch_tokens, int32_t gather_thread_num,
-    int32_t scatter_aiv_num, aclrtStream h2d_stream, aclrtStream scatter_stream,
-    int32_t event_timeout_ms) {
+  (void)event_timeout_ms;
   TORCH_CHECK(is_mla_dsa_format(
                   static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw)),
               "PGHS supports MLA/DSA only");
@@ -375,75 +377,73 @@ void sparse_mla_dsa_pghs_layer_transfer_streams(
   const int64_t bytes_per_token = pool.bytes_per_token();
   const int64_t plane_elems =
       bytes_per_token /
-      static_cast<int64_t>(pool.npu_staging(0).element_size());
+      static_cast<int64_t>(pool.cpu_staging(0).element_size());
 
-  auto &events = persistent_slot_events();
-  SlotTracker tracker;
-  int next_slot = 0;
+  const GatherChunkTable gather_table = build_gather_chunk_table(
+      lmc_tensors, chunk_size_i, num_chunks, static_cast<int32_t>(total_tokens));
 
+  std::vector<MicroBatchPlan> plans;
+  plans.reserve(8);
   for (int32_t mb_start = 0; mb_start < num_sparse;) {
     const int32_t remaining = num_sparse - mb_start;
     const int32_t mb_count =
         compute_pghs_step_tokens(remaining, slot_cap, micro_batch_tokens);
-    const int32_t mb_end = mb_start + mb_count;
-    const int64_t copy_bytes = static_cast<int64_t>(mb_count) * bytes_per_token;
-    const int32_t slot = next_slot;
-
-    if (tracker.state[slot] == SlotTracker::State::SCATTER_INFLIGHT) {
-      wait_event_or_throw(events.scatter_done[slot], event_timeout_ms,
-                          "scatter_done");
-      tracker.state[slot] = SlotTracker::State::FREE;
-    }
-
-    sparse_mla_dsa_gather_to_staging(
-        static_cast<uint8_t *>(pool.cpu_staging(slot).data_ptr()), lmc_tensors,
-        selected_ptr + mb_start, mb_count, chunk_size_i, num_chunks,
-        static_cast<int32_t>(total_tokens), bytes_per_token, gather_thread_num);
-
-    TORCH_CHECK(aclrtMemcpyAsync(pool.npu_staging(slot).data_ptr(), copy_bytes,
-                                 pool.cpu_staging(slot).data_ptr(), copy_bytes,
-                                 ACL_MEMCPY_HOST_TO_DEVICE,
-                                 h2d_stream) == ACL_SUCCESS,
-                "H2D memcpy failed in PGHS micro-batch");
-    TORCH_CHECK(aclrtRecordEvent(events.h2d_done[slot], h2d_stream) ==
-                    ACL_SUCCESS,
-                "aclrtRecordEvent h2d failed");
-    TORCH_CHECK(aclrtStreamWaitEvent(scatter_stream, events.h2d_done[slot]) ==
-                    ACL_SUCCESS,
-                "aclrtStreamWaitEvent h2d failed");
-
-    auto slot_mapping_mb = slot_mapping_packed.slice(0, mb_start, mb_end);
-    auto staging_idx = pool.staging_token_idx(mb_count);
-    auto staging_view =
-        pool.npu_staging(slot).slice(0, 0, mb_count * plane_elems);
-
-    SingleLayerKVConfig config = build_scatter_config(
-        staging_view, vllm_kv_caches, slot_mapping_mb, kvcache_format_raw,
-        k_hidden_dims, v_hidden_dims, dsa_hidden_dims, scatter_aiv_num,
-        scatter_stream);
-    uint8_t *staging_idx_ptr =
-        get_kernel_ptr<uint8_t, torch::Tensor>(staging_idx);
-    launch_sparse_mla_dsa_scatter_from_staging(config, staging_idx_ptr, true);
-
-    TORCH_CHECK(aclrtRecordEvent(events.scatter_done[slot], scatter_stream) ==
-                    ACL_SUCCESS,
-                "aclrtRecordEvent scatter failed");
-    tracker.state[slot] = SlotTracker::State::SCATTER_INFLIGHT;
-
-    mb_start = mb_end;
-    next_slot = 1 - slot;
+    plans.push_back(
+        MicroBatchPlan{mb_start, mb_count, static_cast<int32_t>(plans.size() % kNumSlots)});
+    mb_start += mb_count;
   }
 
-  for (int i = 0; i < kNumSlots; ++i) {
-    if (tracker.state[i] == SlotTracker::State::SCATTER_INFLIGHT) {
-      wait_event_or_throw(events.scatter_done[i], event_timeout_ms,
-                          "final scatter_done");
-      tracker.state[i] = SlotTracker::State::FREE;
-    }
+  for (const auto &plan : plans) {
+    gather_to_staging_impl(
+        gather_table, selected_ptr + plan.mb_start, plan.mb_count, chunk_size_i,
+        num_chunks, static_cast<int32_t>(total_tokens),
+        static_cast<uint8_t *>(pool.cpu_staging(plan.slot).data_ptr()),
+        bytes_per_token, gather_thread_num);
   }
 
-  TORCH_CHECK(aclrtSynchronizeStream(h2d_stream) == ACL_SUCCESS,
-              "aclrtSynchronizeStream h2d failed");
-  TORCH_CHECK(aclrtSynchronizeStream(scatter_stream) == ACL_SUCCESS,
-              "aclrtSynchronizeStream scatter failed");
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_pghs_layer_transfer");
+  cmd.SetCustomHandler([plans = std::move(plans), &pool, &vllm_kv_caches,
+                        &slot_mapping_packed, kvcache_format_raw, k_hidden_dims,
+                        v_hidden_dims, dsa_hidden_dims, scatter_aiv_num,
+                        plane_elems, stream]() -> int {
+    for (const auto &plan : plans) {
+      auto slot_mapping_mb =
+          slot_mapping_packed.slice(0, plan.mb_start, plan.mb_start + plan.mb_count);
+      auto staging_idx = pool.staging_token_idx(plan.mb_count);
+      torch::Tensor staging_view =
+          pool.cpu_staging(plan.slot).slice(0, 0, plan.mb_count * plane_elems);
+
+      SingleLayerKVConfig config = build_scatter_config(
+          staging_view, vllm_kv_caches, slot_mapping_mb, kvcache_format_raw,
+          k_hidden_dims, v_hidden_dims, dsa_hidden_dims, scatter_aiv_num, stream);
+      uint8_t *staging_idx_ptr =
+          get_kernel_ptr<uint8_t, torch::Tensor>(staging_idx);
+      launch_sparse_mla_dsa_scatter_from_staging(config, staging_idx_ptr, true);
+    }
+    return 0;
+  });
+  cmd.Run();
+}
+
+void sparse_mla_dsa_pghs_layer_transfer_streams(
+    StagingBufferPool &pool, std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    int64_t chunk_size, int64_t total_tokens, int kvcache_format_raw,
+    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
+    int32_t micro_batch_tokens, int32_t gather_thread_num,
+    int32_t scatter_aiv_num, aclrtStream h2d_stream, aclrtStream scatter_stream,
+    int32_t event_timeout_ms) {
+  (void)h2d_stream;
+  (void)scatter_stream;
+  (void)event_timeout_ms;
+  sparse_mla_dsa_pghs_layer_transfer(
+      pool, lmc_tensors, vllm_kv_caches, slot_mapping_packed, selected_token_idx,
+      chunk_size, total_tokens, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims, micro_batch_tokens, gather_thread_num, scatter_aiv_num,
+      30000);
 }

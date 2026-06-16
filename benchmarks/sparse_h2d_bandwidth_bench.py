@@ -476,7 +476,7 @@ def bench_lmcache_pghs_kernel(
         gb_s=_gb_s(moved, wall_s),
         kernel_gb_s=_gb_s(payload_bytes, kernel_ms / 1000.0),
         note=(
-            f"PGHS gather+H2D+scatter micro_batch={micro_batch_tokens} "
+            f"PGHS pinned gather+scatter micro_batch={micro_batch_tokens} "
             f"gather_threads={gather_thread_num} aiv={scatter_aiv_num}."
         ),
     )
@@ -959,7 +959,7 @@ def _run_benchmarks(
     print("  - multi_chunk_copy:     same bytes, fragmented pinned sources.")
     print("  - indexed_gather_copy:  adds CPU index/chunk lookup before H2D.")
     print("  - lmcache_sparse_*:     production direct multi-chunk path (baseline).")
-    print("  - lmcache_pghs_*:       gather + bulk H2D + scatter (optional).")
+    print("  - lmcache_pghs_*:       pinned gather + direct scatter (no staging H2D).")
     print("  - PGHS coalesces to one batch when num_sparse fits in max-slot-mb.")
     print("  - PGHS may still lose to direct when pinned multi-chunk GM-read is fast.")
     print("  - kernel_bw on lmcache_* should be comparable to LMCache perf logs.")
