@@ -75,12 +75,12 @@ static void gather_token_range(const uint8_t *const *chunk_bases,
 }
 
 static bool query_event_done(aclrtEvent event) {
-  aclrtEventStatus status = ACL_EVENT_STATUS_COMPLETE;
+  aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
   aclError ret = aclrtQueryEventStatus(event, &status);
   if (ret != ACL_SUCCESS) {
     return false;
   }
-  return status == ACL_EVENT_STATUS_COMPLETE;
+  return status == ACL_EVENT_RECORDED_STATUS_COMPLETE;
 }
 
 static void wait_event_or_throw(aclrtEvent event, int32_t timeout_ms,
