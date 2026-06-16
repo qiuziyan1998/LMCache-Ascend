@@ -186,6 +186,11 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("compute_effective_batch_tokens", &compute_effective_batch_tokens,
         py::arg("micro_batch_tokens"), py::arg("max_slot_bytes"),
         py::arg("bytes_per_token"));
+  m.def("compute_slot_token_capacity", &compute_slot_token_capacity,
+        py::arg("max_slot_bytes"), py::arg("bytes_per_token"));
+  m.def("compute_pghs_step_tokens", &compute_pghs_step_tokens,
+        py::arg("num_remaining"), py::arg("slot_cap"),
+        py::arg("micro_batch_tokens"));
   m.def("sparse_mla_dsa_pghs_layer_transfer",
         &sparse_mla_dsa_pghs_layer_transfer_wrapper, py::arg("pool"),
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),

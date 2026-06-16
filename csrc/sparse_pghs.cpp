@@ -5,8 +5,8 @@
 
 #include <acl/acl.h>
 #include <algorithm>
-#include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <future>
 #include <thread>
@@ -15,6 +15,8 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
 namespace {
+
+constexpr int kNumSlots = StagingBufferPool::kNumSlots;
 
 static bool is_mla_dsa_format(kvcache_ops::KVCacheFormat format) {
   return format == kvcache_ops::KVCacheFormat::MLA_KV ||
@@ -56,7 +58,7 @@ static void gather_token_range(const uint8_t *const *chunk_bases,
   for (int32_t t = begin; t < end; ++t) {
     const int32_t global_idx = global_token_idx[t];
     const int32_t chunk_id = global_idx / chunk_size;
-    int32_t local_t = global_idx % chunk_size;
+    const int32_t local_t = global_idx % chunk_size;
     if (chunk_id >= num_chunks || chunk_id < 0) {
       TORCH_CHECK(false, "global_token_idx out of range: ", global_idx);
     }
@@ -91,17 +93,59 @@ static void wait_event_or_throw(aclrtEvent event, int32_t timeout_ms,
     if (std::chrono::steady_clock::now() > deadline) {
       TORCH_CHECK(false, "PGHS timeout waiting for ", label);
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    std::this_thread::yield();
   }
 }
 
-constexpr int kNumSlots = StagingBufferPool::kNumSlots;
-
-struct SlotTracker {
-  enum class State { FREE, GATHERING, H2D_INFLIGHT, SCATTER_INFLIGHT };
-  State state[kNumSlots]{State::FREE, State::FREE};
+struct PersistentSlotEvents {
   aclrtEvent h2d_done[kNumSlots]{nullptr, nullptr};
   aclrtEvent scatter_done[kNumSlots]{nullptr, nullptr};
+
+  PersistentSlotEvents() {
+    for (int i = 0; i < kNumSlots; ++i) {
+      TORCH_CHECK(aclrtCreateEvent(&h2d_done[i]) == ACL_SUCCESS,
+                  "aclrtCreateEvent h2d failed");
+      TORCH_CHECK(aclrtCreateEvent(&scatter_done[i]) == ACL_SUCCESS,
+                  "aclrtCreateEvent scatter failed");
+    }
+  }
+
+  ~PersistentSlotEvents() {
+    for (int i = 0; i < kNumSlots; ++i) {
+      if (h2d_done[i] != nullptr) {
+        aclrtDestroyEvent(h2d_done[i]);
+      }
+      if (scatter_done[i] != nullptr) {
+        aclrtDestroyEvent(scatter_done[i]);
+      }
+    }
+  }
+};
+
+PersistentSlotEvents &persistent_slot_events() {
+  static thread_local PersistentSlotEvents events;
+  return events;
+}
+
+static SingleLayerKVConfig
+build_scatter_config(torch::Tensor &staging_view,
+                     std::vector<torch::Tensor> &vllm_kv_caches,
+                     torch::Tensor &slot_mapping_mb, int kvcache_format_raw,
+                     int64_t k_hidden_dims, int64_t v_hidden_dims,
+                     int64_t dsa_hidden_dims, int32_t scatter_aiv_num,
+                     aclrtStream stream) {
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      staging_view, vllm_kv_caches, slot_mapping_mb, false, false, false,
+      kvcache_format_raw, k_hidden_dims, v_hidden_dims, dsa_hidden_dims);
+  config.ub_params.stream = stream;
+  config.ub_params.aiv_num = static_cast<uint32_t>(std::max(
+      1, std::min(scatter_aiv_num, config.dims.num_tokens)));
+  return config;
+}
+
+struct SlotTracker {
+  enum class State { FREE, SCATTER_INFLIGHT };
+  State state[kNumSlots]{State::FREE, State::FREE};
 };
 
 } // namespace
@@ -114,6 +158,24 @@ int32_t compute_effective_batch_tokens(int32_t micro_batch_tokens,
       static_cast<int32_t>(max_slot_bytes / bytes_per_token);
   TORCH_CHECK(cap > 0, "max_slot_bytes too small for one token");
   return std::max(1, std::min(micro_batch_tokens, cap));
+}
+
+int32_t compute_slot_token_capacity(int64_t max_slot_bytes,
+                                    int64_t bytes_per_token) {
+  return compute_effective_batch_tokens(INT32_MAX, max_slot_bytes,
+                                        bytes_per_token);
+}
+
+int32_t compute_pghs_step_tokens(int32_t num_remaining, int32_t slot_cap,
+                                 int32_t micro_batch_tokens) {
+  TORCH_CHECK(num_remaining > 0, "num_remaining must be positive");
+  TORCH_CHECK(slot_cap > 0, "slot_cap must be positive");
+  if (num_remaining <= slot_cap) {
+    return num_remaining;
+  }
+  const int32_t configured =
+      micro_batch_tokens > 0 ? micro_batch_tokens : slot_cap;
+  return std::max(1, std::min(configured, slot_cap));
 }
 
 StagingBufferPool::StagingBufferPool(int64_t max_slot_bytes, int32_t max_tokens,
@@ -200,15 +262,15 @@ void sparse_mla_dsa_gather_to_staging(
   }
 
   const int32_t threads = std::max(1, gather_thread_num);
-  if (threads == 1 || batch_tokens < threads) {
+  const int32_t parallel_threshold = std::max(threads * 64, 256);
+  if (threads == 1 || batch_tokens < parallel_threshold) {
     gather_token_range(chunk_bases.data(), last_chunk_tokens.data(), chunk_size,
                        num_chunks, total_tokens, global_token_idx, 0,
                        batch_tokens, dst_staging, bytes_per_token);
     return;
   }
 
-  const int32_t per_thread =
-      (batch_tokens + threads - 1) / threads;
+  const int32_t per_thread = (batch_tokens + threads - 1) / threads;
   std::vector<std::future<void>> futures;
   futures.reserve(threads);
   for (int32_t t = 0; t < threads; ++t) {
@@ -240,15 +302,9 @@ void detail_sparse_mla_dsa_scatter_from_staging(
 
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
 
-  SingleLayerKVConfig config = prepare_single_layer_kv_config(
-      staging_cache, vllm_kv_caches, slot_mapping_packed, false,
-      false, /* token_major: interleaved staging */
-      false, kvcache_format_raw, k_hidden_dims, v_hidden_dims, dsa_hidden_dims);
-
-  config.ub_params.stream = stream;
-  config.ub_params.aiv_num = static_cast<uint32_t>(
-      std::max(1, std::min(scatter_aiv_num, config.dims.num_tokens)));
-
+  SingleLayerKVConfig config = build_scatter_config(
+      staging_cache, vllm_kv_caches, slot_mapping_packed, kvcache_format_raw,
+      k_hidden_dims, v_hidden_dims, dsa_hidden_dims, scatter_aiv_num, stream);
   uint8_t *staging_idx_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(staging_token_idx);
 
@@ -298,6 +354,7 @@ void sparse_mla_dsa_pghs_layer_transfer_streams(
   TORCH_CHECK(is_mla_dsa_format(
                   static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw)),
               "PGHS supports MLA/DSA only");
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
 
   const int32_t num_sparse = static_cast<int32_t>(slot_mapping_packed.size(0));
   if (num_sparse == 0) {
@@ -312,80 +369,77 @@ void sparse_mla_dsa_pghs_layer_transfer_streams(
               "selected_token_idx must be int32");
   const int32_t *selected_ptr = selected_cpu.data_ptr<int32_t>();
 
-  const int32_t batch_tokens = compute_effective_batch_tokens(
-      micro_batch_tokens, pool.slot_bytes(), pool.bytes_per_token());
+  const int32_t slot_cap = pool.max_tokens();
   const int32_t num_chunks = static_cast<int32_t>(lmc_tensors.size());
   const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
   const int64_t bytes_per_token = pool.bytes_per_token();
+  const int64_t plane_elems =
+      bytes_per_token /
+      static_cast<int64_t>(pool.npu_staging(0).element_size());
 
+  auto &events = persistent_slot_events();
   SlotTracker tracker;
-  for (int i = 0; i < kNumSlots; ++i) {
-    aclError err = aclrtCreateEvent(&tracker.h2d_done[i]);
-    TORCH_CHECK(err == ACL_SUCCESS, "aclrtCreateEvent failed");
-    err = aclrtCreateEvent(&tracker.scatter_done[i]);
-    TORCH_CHECK(err == ACL_SUCCESS, "aclrtCreateEvent failed");
-  }
-
   int next_slot = 0;
-  for (int32_t mb_start = 0; mb_start < num_sparse; mb_start += batch_tokens) {
-    const int32_t mb_end = std::min(mb_start + batch_tokens, num_sparse);
-    const int32_t mb_count = mb_end - mb_start;
-    const int64_t copy_bytes = static_cast<int64_t>(mb_count) * bytes_per_token;
 
-    // Wait until chosen slot is free (scatter from prior use completed).
+  for (int32_t mb_start = 0; mb_start < num_sparse;) {
+    const int32_t remaining = num_sparse - mb_start;
+    const int32_t mb_count =
+        compute_pghs_step_tokens(remaining, slot_cap, micro_batch_tokens);
+    const int32_t mb_end = mb_start + mb_count;
+    const int64_t copy_bytes = static_cast<int64_t>(mb_count) * bytes_per_token;
     const int32_t slot = next_slot;
+
     if (tracker.state[slot] == SlotTracker::State::SCATTER_INFLIGHT) {
-      wait_event_or_throw(tracker.scatter_done[slot], event_timeout_ms,
+      wait_event_or_throw(events.scatter_done[slot], event_timeout_ms,
                           "scatter_done");
       tracker.state[slot] = SlotTracker::State::FREE;
     }
-    TORCH_CHECK(tracker.state[slot] == SlotTracker::State::FREE,
-                "staging slot not free");
 
-    tracker.state[slot] = SlotTracker::State::GATHERING;
     sparse_mla_dsa_gather_to_staging(
         static_cast<uint8_t *>(pool.cpu_staging(slot).data_ptr()), lmc_tensors,
         selected_ptr + mb_start, mb_count, chunk_size_i, num_chunks,
         static_cast<int32_t>(total_tokens), bytes_per_token, gather_thread_num);
 
-    aclError ret = aclrtMemcpyAsync(
-        pool.npu_staging(slot).data_ptr(), copy_bytes,
-        pool.cpu_staging(slot).data_ptr(), copy_bytes,
-        ACL_MEMCPY_HOST_TO_DEVICE, h2d_stream);
-    TORCH_CHECK(ret == ACL_SUCCESS, "H2D memcpy failed in PGHS micro-batch");
-    ret = aclrtRecordEvent(tracker.h2d_done[slot], h2d_stream);
-    TORCH_CHECK(ret == ACL_SUCCESS, "aclrtRecordEvent h2d failed");
-    tracker.state[slot] = SlotTracker::State::H2D_INFLIGHT;
-
-    ret = aclrtStreamWaitEvent(scatter_stream, tracker.h2d_done[slot]);
-    TORCH_CHECK(ret == ACL_SUCCESS, "aclrtStreamWaitEvent h2d failed");
+    TORCH_CHECK(aclrtMemcpyAsync(pool.npu_staging(slot).data_ptr(), copy_bytes,
+                                 pool.cpu_staging(slot).data_ptr(), copy_bytes,
+                                 ACL_MEMCPY_HOST_TO_DEVICE,
+                                 h2d_stream) == ACL_SUCCESS,
+                "H2D memcpy failed in PGHS micro-batch");
+    TORCH_CHECK(aclrtRecordEvent(events.h2d_done[slot], h2d_stream) ==
+                    ACL_SUCCESS,
+                "aclrtRecordEvent h2d failed");
+    TORCH_CHECK(aclrtStreamWaitEvent(scatter_stream, events.h2d_done[slot]) ==
+                    ACL_SUCCESS,
+                "aclrtStreamWaitEvent h2d failed");
 
     auto slot_mapping_mb = slot_mapping_packed.slice(0, mb_start, mb_end);
     auto staging_idx = pool.staging_token_idx(mb_count);
-    const int64_t plane_elems = bytes_per_token /
-        static_cast<int64_t>(pool.npu_staging(slot).element_size());
     auto staging_view =
         pool.npu_staging(slot).slice(0, 0, mb_count * plane_elems);
 
-    detail_sparse_mla_dsa_scatter_from_staging(
-        staging_view, vllm_kv_caches, slot_mapping_mb, staging_idx,
-        kvcache_format_raw, k_hidden_dims, v_hidden_dims, dsa_hidden_dims,
-        scatter_aiv_num, scatter_stream);
+    SingleLayerKVConfig config = build_scatter_config(
+        staging_view, vllm_kv_caches, slot_mapping_mb, kvcache_format_raw,
+        k_hidden_dims, v_hidden_dims, dsa_hidden_dims, scatter_aiv_num,
+        scatter_stream);
+    uint8_t *staging_idx_ptr =
+        get_kernel_ptr<uint8_t, torch::Tensor>(staging_idx);
+    launch_sparse_mla_dsa_scatter_from_staging(config, staging_idx_ptr, true);
 
-    ret = aclrtRecordEvent(tracker.scatter_done[slot], scatter_stream);
-    TORCH_CHECK(ret == ACL_SUCCESS, "aclrtRecordEvent scatter failed");
+    TORCH_CHECK(aclrtRecordEvent(events.scatter_done[slot], scatter_stream) ==
+                    ACL_SUCCESS,
+                "aclrtRecordEvent scatter failed");
     tracker.state[slot] = SlotTracker::State::SCATTER_INFLIGHT;
 
+    mb_start = mb_end;
     next_slot = 1 - slot;
   }
 
   for (int i = 0; i < kNumSlots; ++i) {
     if (tracker.state[i] == SlotTracker::State::SCATTER_INFLIGHT) {
-      wait_event_or_throw(tracker.scatter_done[i], event_timeout_ms,
+      wait_event_or_throw(events.scatter_done[i], event_timeout_ms,
                           "final scatter_done");
+      tracker.state[i] = SlotTracker::State::FREE;
     }
-    aclrtDestroyEvent(tracker.h2d_done[i]);
-    aclrtDestroyEvent(tracker.scatter_done[i]);
   }
 
   TORCH_CHECK(aclrtSynchronizeStream(h2d_stream) == ACL_SUCCESS,

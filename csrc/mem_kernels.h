@@ -237,6 +237,9 @@ int32_t compute_effective_batch_tokens(int32_t micro_batch_tokens,
                                        int64_t max_slot_bytes,
                                        int64_t bytes_per_token);
 
+int32_t compute_slot_token_capacity(int64_t max_slot_bytes,
+                                    int64_t bytes_per_token);
+
 void sparse_mla_dsa_scatter_from_staging(
     torch::Tensor &staging_cache, std::vector<torch::Tensor> &vllm_kv_caches,
     torch::Tensor &slot_mapping_packed, torch::Tensor &staging_token_idx,

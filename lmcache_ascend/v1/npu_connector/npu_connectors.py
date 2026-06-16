@@ -1210,14 +1210,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self.kv_format == KVCacheFormat.DSA_KV:
             plane += self.dsa_hidden_dims
         bytes_per_token = plane * dtype.itemsize
-        effective_batch = lmc_ops.compute_effective_batch_tokens(
-            self._sparse_h2d_micro_batch_tokens,
-            self._sparse_h2d_max_slot_bytes,
-            bytes_per_token,
+        slot_cap = lmc_ops.compute_slot_token_capacity(
+            self._sparse_h2d_max_slot_bytes, bytes_per_token
         )
         self._pghs_pool = lmc_ops.StagingBufferPool(
             self._sparse_h2d_max_slot_bytes,
-            effective_batch,
+            slot_cap,
             bytes_per_token,
             dtype,
             self.kv_device,

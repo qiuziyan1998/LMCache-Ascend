@@ -84,3 +84,11 @@ void sparse_mla_dsa_pghs_layer_transfer_streams(
 int32_t compute_effective_batch_tokens(int32_t micro_batch_tokens,
                                        int64_t max_slot_bytes,
                                        int64_t bytes_per_token);
+
+// Max tokens that fit in one staging slot (4MB cap etc.).
+int32_t compute_slot_token_capacity(int64_t max_slot_bytes,
+                                    int64_t bytes_per_token);
+
+// Choose micro-batch size for one pipeline step.
+int32_t compute_pghs_step_tokens(int32_t num_remaining, int32_t slot_cap,
+                                 int32_t micro_batch_tokens);

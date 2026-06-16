@@ -398,12 +398,10 @@ def _make_pghs_pool(
     max_slot_bytes: int,
 ) -> object:
     bytes_per_token = plane_elems * dtype.itemsize
-    effective = lmc_ops.compute_effective_batch_tokens(
-        micro_batch_tokens, max_slot_bytes, bytes_per_token
-    )
+    slot_cap = lmc_ops.compute_slot_token_capacity(max_slot_bytes, bytes_per_token)
     return lmc_ops.StagingBufferPool(
         max_slot_bytes,
-        effective,
+        slot_cap,
         bytes_per_token,
         dtype,
         torch.device(device),
@@ -960,9 +958,10 @@ def _run_benchmarks(
     print("  - contiguous_copy:      DMA ceiling with aclrt-registered host memory.")
     print("  - multi_chunk_copy:     same bytes, fragmented pinned sources.")
     print("  - indexed_gather_copy:  adds CPU index/chunk lookup before H2D.")
-    print("  - lmcache_sparse_*:     same as production direct multi-chunk path.")
-    print("  - lmcache_pghs_*:       pipelined gather + H2D + scatter (optional).")
-    print("  - Compare lmcache_sparse_* vs lmcache_pghs_* for end-to-end latency.")
+    print("  - lmcache_sparse_*:     production direct multi-chunk path (baseline).")
+    print("  - lmcache_pghs_*:       gather + bulk H2D + scatter (optional).")
+    print("  - PGHS coalesces to one batch when num_sparse fits in max-slot-mb.")
+    print("  - PGHS may still lose to direct when pinned multi-chunk GM-read is fast.")
     print("  - kernel_bw on lmcache_* should be comparable to LMCache perf logs.")
 
 
