@@ -693,6 +693,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         if self._needs_retrieve_metadata_refresh(
             cached_keys, cached_starts, cached_ends, tokens
         ):
+            if retrieve_kwargs is not None:
+                retrieve_kwargs.pop("_retrieve_metadata_warm", None)
+
             location: Optional[str] = None
             new_starts: List[int] = []
             new_ends: List[int] = []
@@ -753,8 +756,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask.zero_()
             for start, end in zip(cached_starts, cached_ends, strict=False):
                 ret_mask[start:end] = True
-            if retrieve_kwargs is not None and location is not None:
-                retrieve_kwargs["cached_retrieve_location"] = location
+            if retrieve_kwargs is not None:
+                if location is not None:
+                    retrieve_kwargs["cached_retrieve_location"] = location
+                retrieve_kwargs["_retrieve_metadata_warm"] = True
+            return location, cached_starts, cached_ends, cached_keys
+
+        if retrieve_kwargs is not None and retrieve_kwargs.get(
+            "_retrieve_metadata_warm"
+        ):
+            location = retrieve_kwargs.get("cached_retrieve_location")
             return location, cached_starts, cached_ends, cached_keys
 
         for start, end in zip(cached_starts, cached_ends, strict=False):
@@ -769,6 +780,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             if retrieve_kwargs is not None and location is not None:
                 retrieve_kwargs["cached_retrieve_location"] = location
+        if retrieve_kwargs is not None:
+            retrieve_kwargs["_retrieve_metadata_warm"] = True
         return location, cached_starts, cached_ends, cached_keys
 
     @_lmcache_nvtx_annotate
@@ -1028,7 +1041,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         mem_obj_consumer = None
-        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        num_tokens = len(tokens)
+        metadata_warm = kwargs.get("_retrieve_metadata_warm", False)
+        ret_mask = kwargs.get("ret_mask")
+        if (
+            ret_mask is None
+            or ret_mask.numel() != num_tokens
+            or ret_mask.device.type != "cpu"
+        ):
+            ret_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
+            kwargs["ret_mask"] = ret_mask
+            metadata_warm = False
+        elif not metadata_warm:
+            ret_mask.zero_()
 
         request_configs = kwargs.get("request_configs")
 
