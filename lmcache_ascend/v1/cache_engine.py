@@ -572,6 +572,59 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         yield ret_mask
 
+    def _append_cached_chunk_keys(
+        self,
+        *,
+        keys: List[List[CacheEngineKey]],
+        starts: List[int],
+        ends: List[int],
+        cached_keys: Optional[List],
+        cached_starts: Optional[List[int]],
+        cached_ends: Optional[List[int]],
+    ) -> None:
+        """Record chunk keys for retrieve reuse; dedup by (start, end) span."""
+        if cached_keys is None or cached_starts is None or cached_ends is None:
+            return
+        if not keys:
+            return
+
+        num_layers = len(keys)
+        if not cached_keys:
+            cached_keys.extend([] for _ in range(num_layers))
+        assert len(cached_keys) == num_layers, (
+            f"cached_keys has {len(cached_keys)} layers, expected {num_layers}"
+        )
+
+        existing_spans = set(zip(cached_starts, cached_ends, strict=False))
+        for chunk_idx, (start, end) in enumerate(zip(starts, ends, strict=False)):
+            if (start, end) in existing_spans:
+                continue
+            cached_starts.append(start)
+            cached_ends.append(end)
+            existing_spans.add((start, end))
+            for layer_id in range(num_layers):
+                cached_keys[layer_id].append(keys[layer_id][chunk_idx])
+
+    def _append_layerwise_store_memory_objs(
+        self,
+        *,
+        memory_objs: List[List[MemoryObj]],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+    ) -> None:
+        """Append memory objects for a newly stored batch only."""
+        if not memory_objs:
+            return
+        num_layers = len(memory_objs)
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend([] for _ in range(num_layers))
+            assert len(cached_memory_objs) == num_layers
+            for layer_id, layer_objs in enumerate(memory_objs):
+                cached_memory_objs[layer_id].extend(layer_objs)
+        if cached_tensors is not None and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
+
     def _append_layerwise_store_cache_chunks(
         self,
         *,
@@ -586,27 +639,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
     ) -> None:
         """Append one store_layer batch; never clear (chunked prefill calls many times)."""
-        num_layers = len(keys)
-        if cached_starts is not None:
-            cached_starts.extend(starts)
-        if cached_ends is not None:
-            cached_ends.extend(ends)
-        if cached_keys is not None:
-            if not cached_keys:
-                cached_keys.extend([] for _ in range(num_layers))
-            assert len(cached_keys) == num_layers, (
-                f"cached_keys has {len(cached_keys)} layers, expected {num_layers}"
-            )
-            for layer_id, layer_keys in enumerate(keys):
-                cached_keys[layer_id].extend(layer_keys)
-        if cached_memory_objs is not None:
-            if not cached_memory_objs:
-                cached_memory_objs.extend([] for _ in range(num_layers))
-            assert len(cached_memory_objs) == num_layers
-            for layer_id, layer_objs in enumerate(memory_objs):
-                cached_memory_objs[layer_id].extend(layer_objs)
-        if cached_tensors is not None and not cached_tensors:
-            cached_tensors.extend([] for _ in range(num_layers))
+        self._append_cached_chunk_keys(
+            keys=keys,
+            starts=starts,
+            ends=ends,
+            cached_keys=cached_keys,
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+        )
+        self._append_layerwise_store_memory_objs(
+            memory_objs=memory_objs,
+            cached_memory_objs=cached_memory_objs,
+            cached_tensors=cached_tensors,
+        )
 
     def _append_layer_store_tensors(
         self,
@@ -655,6 +700,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         tokens: Union[torch.Tensor, list[int]],
     ) -> bool:
         if not cached_keys or not cached_starts or not cached_ends:
+            return True
+        if not any(layer_keys for layer_keys in cached_keys):
             return True
         return len(tokens) > cached_ends[-1]
 
@@ -853,10 +900,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs = kwargs.get("cached_memory_objs")
         cached_tensors = kwargs.get("cached_tensors")
 
-        starts = []
-        ends = []
-        keys = []
-        memory_objs = []
+        all_starts: List[int] = []
+        all_ends: List[int] = []
+        all_keys: List[List[CacheEngineKey]] = []
+        starts: List[int] = []
+        ends: List[int] = []
+        keys: List[List[CacheEngineKey]] = []
+        memory_objs: List[List[MemoryObj]] = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
         request_configs = kwargs.get("request_configs")
@@ -870,6 +920,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
+            all_starts.append(start)
+            all_ends.append(end)
+            all_keys.append(keys_multi_layer)
+
             # Only check the first layer
             if self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
@@ -926,6 +980,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
+        if all_keys:
+            all_keys_layer_major = [
+                list(row) for row in zip(*all_keys, strict=False)
+            ]
+            self._append_cached_chunk_keys(
+                keys=all_keys_layer_major,
+                starts=all_starts,
+                ends=all_ends,
+                cached_keys=cached_keys,
+                cached_starts=cached_starts,
+                cached_ends=cached_ends,
+            )
+
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -938,14 +1005,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            self._append_layerwise_store_cache_chunks(
-                keys=keys,
-                starts=starts,
-                ends=ends,
+            self._append_layerwise_store_memory_objs(
                 memory_objs=memory_objs,
-                cached_keys=cached_keys,
-                cached_starts=cached_starts,
-                cached_ends=cached_ends,
                 cached_memory_objs=cached_memory_objs,
                 cached_tensors=cached_tensors,
             )
