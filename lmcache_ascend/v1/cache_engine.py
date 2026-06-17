@@ -630,6 +630,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         mem_objs_layer: List[MemoryObj],
         cached_memory_objs: Optional[List],
         cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
     ) -> None:
         """Retain storage-get results in ReqMeta for later retrieve calls (same request)."""
         if cached_memory_objs is not None:
@@ -638,14 +640,27 @@ class AscendLMCacheEngine(LMCacheEngine):
                     [] for _ in range(self.num_layers)
                 )
             cached_memory_objs[layer_id].extend(mem_objs_layer)
+        new_tensors: List[torch.Tensor] = []
         if cached_tensors is not None:
             if not cached_tensors:
                 cached_tensors.extend([] for _ in range(self.num_layers))
-            cached_tensors[layer_id].extend(
-                mem_obj.tensor
-                for mem_obj in mem_objs_layer
-                if mem_obj.tensor is not None
+            for mem_obj in mem_objs_layer:
+                if mem_obj.tensor is not None:
+                    cached_tensors[layer_id].append(mem_obj.tensor)
+                    new_tensors.append(mem_obj.tensor)
+        if new_tensors and cached_chunk_dev_ptrs is not None:
+            append_ptrs_fn = getattr(
+                self.gpu_connector,
+                "append_sparse_chunk_ptr_cache_for_layer",
+                None,
             )
+            if append_ptrs_fn is not None:
+                append_ptrs_fn(
+                    layer_id,
+                    new_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
 
     @staticmethod
     def _needs_retrieve_metadata_refresh(
@@ -865,6 +880,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         cached_memory_objs = kwargs.get("cached_memory_objs")
         cached_tensors = kwargs.get("cached_tensors")
+        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
 
         starts = []
         ends = []
@@ -1071,6 +1088,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         cached_memory_objs = kwargs.get("cached_memory_objs")
         cached_tensors = kwargs.get("cached_tensors")
+        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
 
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
@@ -1110,6 +1129,10 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if use_cached_retrieve and cached_tensors is not None:
             kwargs["cached_tensors"] = cached_tensors
+            if cached_chunk_dev_ptrs is not None:
+                kwargs["cached_chunk_dev_ptrs"] = cached_chunk_dev_ptrs
+            if cached_chunk_ptrs_npu is not None:
+                kwargs["cached_chunk_ptrs_npu"] = cached_chunk_ptrs_npu
 
         cached_mem_layers = (
             cached_memory_objs
@@ -1150,6 +1173,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                             mem_objs_layer,
                             cached_memory_objs,
                             cached_tensors,
+                            cached_chunk_dev_ptrs,
+                            cached_chunk_ptrs_npu,
                         )
                 else:
                     mem_objs_layer = []

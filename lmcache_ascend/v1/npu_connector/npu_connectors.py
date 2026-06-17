@@ -1138,9 +1138,51 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.v_hidden_dims: int = 0
         self.dsa_hidden_dims: int = 0
         self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
-        # Cached registered device pointers for sparse direct multi-chunk H2D.
-        self._sparse_chunk_ptr_cache: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
-        self._sparse_memory_objs_updated: bool = False
+
+    def append_sparse_chunk_ptr_cache_for_layer(
+        self,
+        layer_id: int,
+        new_tensors: List[torch.Tensor],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> None:
+        """Resolve and append NPU device ptrs for newly retrieved chunks only."""
+        if not new_tensors:
+            return
+
+        num_layers = self.num_layers
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) <= layer_id:
+            cached_chunk_dev_ptrs.append([])
+
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+        while (
+            cached_chunk_ptrs_npu is not None
+            and len(cached_chunk_ptrs_npu) <= layer_id
+        ):
+            cached_chunk_ptrs_npu.append(None)
+
+        new_dev_ptrs = [
+            int(lmc_ops.get_device_ptr(int(tensor.data_ptr())))
+            for tensor in new_tensors
+        ]
+        cached_chunk_dev_ptrs[layer_id].extend(new_dev_ptrs)
+
+        if cached_chunk_ptrs_npu is None:
+            return
+
+        new_ptrs_npu = torch.tensor(
+            new_dev_ptrs, dtype=torch.long, device=self.kv_device
+        )
+        existing = cached_chunk_ptrs_npu[layer_id]
+        if existing is None:
+            cached_chunk_ptrs_npu[layer_id] = new_ptrs_npu
+        else:
+            cached_chunk_ptrs_npu[layer_id] = torch.cat(
+                (existing, new_ptrs_npu), dim=0
+            )
 
     def _run_sparse_direct_kv_transfer_layer(
         self,
@@ -1153,6 +1195,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         selected_token_idx: torch.Tensor,
         chunk_size: int,
         total_tokens: int,
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> None:
         num_sparse = int(selected_token_idx.numel())
         num_chunks = len(cpu_tensors)
@@ -1163,7 +1206,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
             self._single_layer_hidden_dim_args()
         )
-        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(layer_id, cpu_tensors)
+        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+            layer_id,
+            cpu_tensors,
+            cached_chunk_ptrs_npu,
+        )
 
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
@@ -1218,34 +1265,35 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return self._is_mla_dsa_format()
 
     def notify_sparse_memory_objs_updated(self) -> None:
-        """Mark cached sparse chunk device pointers stale after mem_obj refresh."""
-        self._sparse_memory_objs_updated = True
+        """No-op: sparse chunk device ptrs live in ReqMeta and update incrementally."""
 
     def invalidate_sparse_chunk_ptr_cache(self) -> None:
-        """Drop all cached sparse chunk device pointer tables."""
-        self._sparse_memory_objs_updated = True
-        self._sparse_chunk_ptr_cache.clear()
+        """No-op: sparse chunk device ptrs live in ReqMeta and update incrementally."""
 
     def _resolve_sparse_chunk_ptrs_npu(
         self,
         layer_id: int,
         cpu_tensors: List[torch.Tensor],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> torch.Tensor:
-        if self._sparse_memory_objs_updated:
-            self._sparse_chunk_ptr_cache.clear()
-            self._sparse_memory_objs_updated = False
-
-        cache_key = (layer_id, tuple(int(tensor.data_ptr()) for tensor in cpu_tensors))
-        cached = self._sparse_chunk_ptr_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        num_chunks = len(cpu_tensors)
+        if (
+            cached_chunk_ptrs_npu is not None
+            and layer_id < len(cached_chunk_ptrs_npu)
+        ):
+            cached = cached_chunk_ptrs_npu[layer_id]
+            if cached is not None and cached.numel() == num_chunks:
+                return cached
 
         dev_ptrs = [
             int(lmc_ops.get_device_ptr(int(tensor.data_ptr())))
             for tensor in cpu_tensors
         ]
         chunk_ptrs_npu = torch.tensor(dev_ptrs, dtype=torch.long, device=self.kv_device)
-        self._sparse_chunk_ptr_cache[cache_key] = chunk_ptrs_npu
+        if cached_chunk_ptrs_npu is not None:
+            while len(cached_chunk_ptrs_npu) <= layer_id:
+                cached_chunk_ptrs_npu.append(None)
+            cached_chunk_ptrs_npu[layer_id] = chunk_ptrs_npu
         return chunk_ptrs_npu
 
     def _single_layer_hidden_dim_args(self) -> tuple[int, int, int]:
@@ -1571,6 +1619,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
             "cached_tensors"
         )
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = kwargs.get(
+            "cached_chunk_ptrs_npu"
+        )
 
         current_stream = torch.cuda.current_stream()
 
@@ -1617,6 +1668,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx=selected_token_idx,
                 chunk_size=chunk_size,
                 total_tokens=total_tokens,
+                cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
             )
 
         yield
