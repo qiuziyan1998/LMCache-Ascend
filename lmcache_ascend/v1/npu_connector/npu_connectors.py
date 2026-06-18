@@ -1256,6 +1256,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_layer_states[layer_id] = state
         return state
 
+    def _sparse_pack_cache_key(
+        self,
+        slot_mapping: torch.Tensor,
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        token_start_index: int,
+    ) -> tuple:
+        if selected_token_idx is None:
+            selected_key = None
+        elif isinstance(selected_token_idx, torch.Tensor):
+            selected_key = (
+                "tensor",
+                selected_token_idx.data_ptr(),
+                selected_token_idx.numel(),
+            )
+        else:
+            selected_key = ("list", id(selected_token_idx), len(selected_token_idx))
+        return (
+            int(token_start_index),
+            slot_mapping.data_ptr(),
+            slot_mapping.numel(),
+            selected_key,
+        )
+
     def _pack_sparse_layer_inputs(
         self,
         slot_mapping: torch.Tensor,
@@ -1273,31 +1296,39 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if selected_token_idx is not None and selected_token_idx.numel() > 0:
             num_sparse = int(selected_token_idx.numel())
             start = int(token_start_index)
-            end = start + num_sparse
-            if end <= slot_mapping.numel():
-                slot_mapping_packed = slot_mapping[start:end]
-            elif start < slot_mapping.numel():
-                slot_mapping_packed = slot_mapping[start:]
-                selected_token_idx = selected_token_idx[
-                    : slot_mapping_packed.numel()
-                ]
+
+            if start == 0 and num_sparse == slot_mapping.numel():
+                slot_mapping_packed = slot_mapping
+            elif start == 0:
+                slot_mapping_packed = slot_mapping[:num_sparse]
             else:
-                slot_mapping_packed = slot_mapping[:0]
-                selected_token_idx = selected_token_idx[:0]
-            selected_token_idx = self._sparse_selected_token_idx(
-                selected_token_idx, slot_mapping_packed.shape[0]
-            )
+                end = start + num_sparse
+                if end <= slot_mapping.numel():
+                    slot_mapping_packed = slot_mapping[start:end]
+                elif start < slot_mapping.numel():
+                    slot_mapping_packed = slot_mapping[start:]
+                    num_sparse = int(slot_mapping_packed.numel())
+                    selected_token_idx = selected_token_idx[:num_sparse]
+                else:
+                    slot_mapping_packed = slot_mapping[:0]
+                    selected_token_idx = selected_token_idx[:0]
+
+            if not (
+                selected_token_idx.dtype == torch.int32
+                and selected_token_idx.device == self.kv_device
+            ):
+                selected_token_idx = selected_token_idx.to(
+                    device=self.kv_device, dtype=torch.int32
+                )
             return slot_mapping_packed, selected_token_idx
 
-        slot_mapping_packed = (
-            slot_mapping
-            if token_start_index == 0
-            else slot_mapping[int(token_start_index) :]
-        )
-        selected_token_idx = self._sparse_selected_token_idx(
+        if token_start_index == 0:
+            slot_mapping_packed = slot_mapping
+        else:
+            slot_mapping_packed = slot_mapping[int(token_start_index) :]
+        return slot_mapping_packed, self._sparse_selected_token_idx(
             None, slot_mapping_packed.shape[0]
         )
-        return slot_mapping_packed, selected_token_idx
 
     def _run_sparse_direct_kv_transfer_layer(
         self,
@@ -1797,13 +1828,33 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_kv_format = self.kv_format.value
         sparse_vllm_two_major = self.vllm_two_major
 
+        packed_slot_mapping: Optional[torch.Tensor] = None
+        packed_selected: Optional[torch.Tensor] = None
+        pack_cache_key: Optional[tuple] = None
+
         for layer_id in range(self.num_layers):
             memory_objs_layer, selected_token_idx, token_start_index = yield
-            slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
-                slot_mapping,
-                selected_token_idx,
-                token_start_index,
+            pack_key = self._sparse_pack_cache_key(
+                slot_mapping, selected_token_idx, token_start_index
             )
+            if pack_key != pack_cache_key:
+                pack_cache_key = pack_key
+                packed_slot_mapping, packed_selected = (
+                    self._pack_sparse_layer_inputs(
+                        slot_mapping,
+                        selected_token_idx,
+                        token_start_index,
+                    )
+                )
+            slot_mapping_packed = packed_slot_mapping
+            selected_token_idx = packed_selected
+            if (
+                slot_mapping_packed is None
+                or selected_token_idx is None
+                or slot_mapping_packed.numel() == 0
+                or selected_token_idx.numel() == 0
+            ):
+                continue
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
