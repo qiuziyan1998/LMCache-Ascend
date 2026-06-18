@@ -1282,10 +1282,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
 
+        resolve_tensors = (
+            layer_tensors
+            if layer_tensors is not None
+            else (cpu_tensors if cpu_tensors is not None else [])
+        )
+        resolve_slot_mapping = (
+            slot_mapping_ref
+            if slot_mapping_ref is not None
+            else slot_mapping_packed
+        )
+
         layer_state = self._get_or_create_sparse_direct_layer_state(
             layer_id=layer_id,
-            layer_tensors=layer_tensors or cpu_tensors or [],
-            slot_mapping_ref=slot_mapping_ref or slot_mapping_packed,
+            layer_tensors=resolve_tensors,
+            slot_mapping_ref=resolve_slot_mapping,
             total_tokens=total_tokens,
             sparse_kv_format=sparse_kv_format,
             sparse_token_major=sparse_token_major,
