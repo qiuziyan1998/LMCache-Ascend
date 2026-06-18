@@ -223,6 +223,54 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
     )
 
 
+def prepare_sparse_direct_layer_state(
+    lmc_layout_sample: torch.Tensor,
+    vllm_kv_caches: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    slot_mapping_ref: torch.Tensor,
+    token_major: bool,
+    vllm_two_major: bool,
+    kvcache_format_raw: int,
+    k_hidden_dims: int,
+    v_hidden_dims: int,
+    dsa_hidden_dims: int,
+    lmc_num_tokens: int,
+):
+    return lmc_ops.prepare_sparse_direct_layer_state(
+        lmc_layout_sample,
+        vllm_kv_caches,
+        slot_mapping_ref,
+        token_major,
+        vllm_two_major,
+        kvcache_format_raw,
+        k_hidden_dims,
+        v_hidden_dims,
+        dsa_hidden_dims,
+        lmc_num_tokens,
+    )
+
+
+def sparse_mla_dsa_batched_direct_kv_transfer_fast(
+    layer_state,
+    slot_mapping_packed: torch.Tensor,
+    selected_token_idx: torch.Tensor,
+    chunk_ptrs_npu: torch.Tensor,
+    chunk_size: int,
+    total_tokens: int,
+    lmc_host_interleaved: bool,
+    validate_inputs: bool = False,
+) -> None:
+    lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer_fast(
+        layer_state,
+        slot_mapping_packed,
+        selected_token_idx,
+        chunk_ptrs_npu,
+        chunk_size,
+        total_tokens,
+        lmc_host_interleaved,
+        validate_inputs,
+    )
+
+
 def batched_fused_sparse_single_layer_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     staging_cache: torch.Tensor,

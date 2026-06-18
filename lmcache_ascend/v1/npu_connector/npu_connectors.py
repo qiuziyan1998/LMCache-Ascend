@@ -23,7 +23,9 @@ import torch
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
+    prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
+    sparse_mla_dsa_batched_direct_kv_transfer_fast,
 )
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
@@ -1138,6 +1140,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.v_hidden_dims: int = 0
         self.dsa_hidden_dims: int = 0
         self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
+        self._sparse_direct_layer_states: Optional[list] = None
+        self._sparse_direct_kvcaches_id: Optional[int] = None
+        self._sparse_direct_validated_layers: set[int] = set()
+
+    def _reset_sparse_direct_layer_states(self) -> None:
+        self._sparse_direct_layer_states = None
+        self._sparse_direct_kvcaches_id = None
+        self._sparse_direct_validated_layers = set()
+
+    def _sparse_total_tokens_from_layer_chunks(
+        self,
+        layer_tensors: List[torch.Tensor],
+    ) -> int:
+        num_chunks = len(layer_tensors)
+        if num_chunks == 0:
+            return 0
+        if num_chunks == 1:
+            return self._lmc_plane_num_tokens(layer_tensors[0])
+        last_tokens = self._lmc_plane_num_tokens(layer_tensors[-1])
+        return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
 
     def append_sparse_chunk_ptr_cache_for_layer(
         self,
@@ -1184,52 +1206,129 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 (existing, new_ptrs_npu), dim=0
             )
 
+    def _get_or_create_sparse_direct_layer_state(
+        self,
+        *,
+        layer_id: int,
+        layer_tensors: List[torch.Tensor],
+        slot_mapping_ref: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+    ):
+        if self.kvcaches is None:
+            return None
+
+        kvcaches_id = id(self.kvcaches)
+        if self._sparse_direct_kvcaches_id != kvcaches_id:
+            self._reset_sparse_direct_layer_states()
+            self._sparse_direct_kvcaches_id = kvcaches_id
+
+        if self._sparse_direct_layer_states is None:
+            self._sparse_direct_layer_states = [None] * self.num_layers
+
+        state = self._sparse_direct_layer_states[layer_id]
+        if state is not None:
+            return state
+
+        if not layer_tensors:
+            return None
+
+        if total_tokens <= 0:
+            total_tokens = self._sparse_total_tokens_from_layer_chunks(layer_tensors)
+
+        state = prepare_sparse_direct_layer_state(
+            layer_tensors[0],
+            self.kvcaches[layer_id],
+            slot_mapping_ref,
+            sparse_token_major,
+            sparse_vllm_two_major,
+            sparse_kv_format,
+            sparse_k_hidden_dims,
+            sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims,
+            total_tokens,
+        )
+        self._sparse_direct_layer_states[layer_id] = state
+        return state
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
         layer_id: int,
         load_stream: torch.cuda.Stream,
         current_stream: torch.cuda.Stream,
-        cpu_tensors: List[torch.Tensor],
         slot_mapping_packed: torch.Tensor,
         selected_token_idx: torch.Tensor,
         chunk_size: int,
         total_tokens: int,
-        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
+        chunk_ptrs_npu: torch.Tensor,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        sparse_host_interleaved: bool,
+        layer_tensors: Optional[List[torch.Tensor]] = None,
+        slot_mapping_ref: Optional[torch.Tensor] = None,
+        cpu_tensors: Optional[List[torch.Tensor]] = None,
     ) -> None:
         num_sparse = int(selected_token_idx.numel())
-        num_chunks = len(cpu_tensors)
-
-        if num_sparse == 0 or num_chunks == 0 or total_tokens <= 0:
+        if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
 
-        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
-            self._single_layer_hidden_dim_args()
-        )
-        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
-            layer_id,
-            cpu_tensors,
-            cached_chunk_ptrs_npu,
+        layer_state = self._get_or_create_sparse_direct_layer_state(
+            layer_id=layer_id,
+            layer_tensors=layer_tensors or cpu_tensors or [],
+            slot_mapping_ref=slot_mapping_ref or slot_mapping_packed,
+            total_tokens=total_tokens,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
 
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
-            sparse_mla_dsa_batched_direct_kv_transfer(
-                cpu_tensors,
-                self.kvcaches[layer_id],
-                slot_mapping_packed,
-                selected_token_idx,
-                chunk_size,
-                total_tokens,
-                self.kv_format.value,
-                self._layerwise_token_major(),
-                self.vllm_two_major,
-                k_hidden_dims,
-                v_hidden_dims,
-                dsa_hidden_dims,
-                self._sparse_lmc_host_interleaved(),
-                chunk_ptrs_npu,
-            )
+            if layer_state is not None:
+                validate_inputs = layer_id not in self._sparse_direct_validated_layers
+                sparse_mla_dsa_batched_direct_kv_transfer_fast(
+                    layer_state,
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    chunk_ptrs_npu,
+                    chunk_size,
+                    total_tokens,
+                    sparse_host_interleaved,
+                    validate_inputs,
+                )
+                if validate_inputs:
+                    self._sparse_direct_validated_layers.add(layer_id)
+            else:
+                assert cpu_tensors is not None and len(cpu_tensors) > 0
+                sparse_mla_dsa_batched_direct_kv_transfer(
+                    cpu_tensors,
+                    self.kvcaches[layer_id],
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    chunk_size,
+                    total_tokens,
+                    sparse_kv_format,
+                    sparse_token_major,
+                    sparse_vllm_two_major,
+                    sparse_k_hidden_dims,
+                    sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims,
+                    sparse_host_interleaved,
+                    chunk_ptrs_npu,
+                )
 
         current_stream.wait_stream(load_stream)
 
@@ -1346,6 +1445,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
 
             logger.info(f"Detected KV cache format: {self.kv_format.name}")
+            self._reset_sparse_direct_layer_states()
             first_layer_cache = kv_caches[0]
 
             if self.kv_format == KVCacheFormat.SEPARATE_KV:
@@ -1622,14 +1722,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = kwargs.get(
             "cached_chunk_ptrs_npu"
         )
+        lmcache_cached_tokens: int = int(kwargs.get("lmcache_cached_tokens", 0) or 0)
+        use_cached_retrieve = (
+            cached_tensors_by_layer is not None
+            and len(cached_tensors_by_layer) == self.num_layers
+        )
 
         current_stream = torch.cuda.current_stream()
 
         load_stream_idx = self.load_stream_idx
         self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
 
-        has_cached_tensors = cached_tensors_by_layer is not None
         chunk_size = self.lmcache_chunk_size
+
+        sparse_k_hidden_dims, sparse_v_hidden_dims, sparse_dsa_hidden_dims = (
+            self._single_layer_hidden_dim_args()
+        )
+        sparse_token_major = self._layerwise_token_major()
+        sparse_host_interleaved = self._sparse_lmc_host_interleaved()
+        sparse_kv_format = self.kv_format.value
+        sparse_vllm_two_major = self.vllm_two_major
 
         for layer_id in range(self.num_layers):
             memory_objs_layer, selected_token_idx, token_start_index = yield
@@ -1644,7 +1756,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
-                if has_cached_tensors
+                if use_cached_retrieve
                 and layer_id < len(cached_tensors_by_layer)
                 and cached_tensors_by_layer[layer_id]
                 else None
@@ -1658,17 +1770,41 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     if memory_obj.tensor is not None
                 ]
 
-            total_tokens = self._sparse_retrieve_total_tokens(cpu_tensors)
+            if not cpu_tensors:
+                continue
+
+            chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                layer_id,
+                cpu_tensors,
+                cached_chunk_ptrs_npu,
+            )
+            if (
+                use_cached_retrieve
+                and lmcache_cached_tokens > 0
+            ):
+                total_tokens = lmcache_cached_tokens
+            else:
+                total_tokens = self._sparse_total_tokens_from_layer_chunks(cpu_tensors)
+
             self._run_sparse_direct_kv_transfer_layer(
                 layer_id=layer_id,
                 load_stream=self.load_stream_list[load_stream_idx],
                 current_stream=current_stream,
-                cpu_tensors=cpu_tensors,
                 slot_mapping_packed=slot_mapping_packed,
                 selected_token_idx=selected_token_idx,
                 chunk_size=chunk_size,
                 total_tokens=total_tokens,
-                cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                sparse_kv_format=sparse_kv_format,
+                sparse_token_major=sparse_token_major,
+                sparse_vllm_two_major=sparse_vllm_two_major,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                sparse_host_interleaved=sparse_host_interleaved,
+                layer_tensors=cpu_tensors,
+                slot_mapping_ref=slot_mapping,
+                cpu_tensors=cpu_tensors,
             )
 
         yield

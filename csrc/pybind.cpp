@@ -97,6 +97,28 @@ void sparse_mla_dsa_batched_direct_kv_transfer_wrapper(
       chunk_ptrs_npu);
 }
 
+SparseDirectLayerState prepare_sparse_direct_layer_state_wrapper(
+    torch::Tensor &lmc_layout_sample, const py::object &vllm_kv_caches_obj,
+    torch::Tensor &slot_mapping_ref, bool token_major, bool vllm_two_major,
+    int kvcache_format_raw, int64_t k_hidden_dims, int64_t v_hidden_dims,
+    int64_t dsa_hidden_dims, int32_t lmc_num_tokens) {
+  auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
+  return prepare_sparse_direct_layer_state(
+      lmc_layout_sample, vllm_kv_caches, slot_mapping_ref, token_major,
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims, lmc_num_tokens);
+}
+
+void sparse_mla_dsa_batched_direct_kv_transfer_fast_wrapper(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_packed,
+    torch::Tensor &selected_token_idx, torch::Tensor &chunk_ptrs_npu,
+    int64_t chunk_size, int64_t total_tokens, bool lmc_host_interleaved,
+    bool validate_inputs) {
+  sparse_mla_dsa_batched_direct_kv_transfer_fast(
+      layer_state, slot_mapping_packed, selected_token_idx, chunk_ptrs_npu,
+      chunk_size, total_tokens, lmc_host_interleaved, validate_inputs);
+}
+
 PYBIND11_MODULE(c_ops, m) {
   m.def("get_device_ptr", [](uintptr_t ptr_addr) {
     return reinterpret_cast<uintptr_t>(
@@ -154,6 +176,20 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0,
         py::arg("lmc_host_interleaved") = false,
         py::arg("chunk_ptrs_npu") = py::none());
+  py::class_<SparseDirectLayerState>(m, "SparseDirectLayerState");
+  m.def("prepare_sparse_direct_layer_state",
+        &prepare_sparse_direct_layer_state_wrapper,
+        py::arg("lmc_layout_sample"), py::arg("vllm_kv_caches"),
+        py::arg("slot_mapping_ref"), py::arg("token_major"),
+        py::arg("vllm_two_major"), py::arg("kvcache_format_raw"),
+        py::arg("k_hidden_dims"), py::arg("v_hidden_dims"),
+        py::arg("dsa_hidden_dims"), py::arg("lmc_num_tokens"));
+  m.def("sparse_mla_dsa_batched_direct_kv_transfer_fast",
+        &sparse_mla_dsa_batched_direct_kv_transfer_fast_wrapper,
+        py::arg("layer_state"), py::arg("slot_mapping_packed"),
+        py::arg("selected_token_idx"), py::arg("chunk_ptrs_npu"),
+        py::arg("chunk_size"), py::arg("total_tokens"),
+        py::arg("lmc_host_interleaved"), py::arg("validate_inputs") = false);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
   m.def("load_and_reshape_flash", &load_and_reshape_flash);

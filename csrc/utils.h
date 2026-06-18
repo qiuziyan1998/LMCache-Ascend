@@ -156,6 +156,11 @@ struct SingleLayerKVConfig {
   bool token_major; // true: [tokens, ...], false: [..., tokens, ...]
 };
 
+// Cached per-layer config for sparse direct KV retrieve (host-side hot path).
+struct SparseDirectLayerState {
+  SingleLayerKVConfig config;
+};
+
 struct HostChunkMetadata {
   std::vector<uint8_t *> ptrs;
   std::vector<int64_t> copy_sizes; // Bytes to copy per chunk
@@ -186,6 +191,13 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
     torch::Tensor &slot_mapping, bool direction, bool token_major,
     bool vllm_two_major, int kvcache_format_raw, int64_t k_hidden_dims = 0,
     int64_t v_hidden_dims = 0, int64_t dsa_hidden_dims = 0);
+
+SparseDirectLayerState prepare_sparse_direct_layer_state(
+    torch::Tensor &lmc_layout_sample,
+    std::vector<torch::Tensor> &vllm_kv_caches, torch::Tensor &slot_mapping_ref,
+    bool token_major, bool vllm_two_major, int kvcache_format_raw,
+    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
+    int32_t lmc_num_tokens);
 
 HostChunkMetadata
 prepare_host_chunk_metadata(const std::vector<torch::Tensor> &lmc_tensors,

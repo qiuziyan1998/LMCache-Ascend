@@ -1,6 +1,7 @@
 #pragma once
 #include "kernels/types.h"
 #include "managed_mem.h"
+#include "utils.h"
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -228,6 +229,13 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
     const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0,
     const bool lmc_host_interleaved = false,
     const c10::optional<torch::Tensor> &chunk_ptrs_npu = c10::nullopt);
+
+// Hot path: reuse cached per-layer config; no CPU chunk tensors required.
+void sparse_mla_dsa_batched_direct_kv_transfer_fast(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_packed,
+    torch::Tensor &selected_token_idx, torch::Tensor &chunk_ptrs_npu,
+    const int64_t chunk_size, const int64_t total_tokens,
+    const bool lmc_host_interleaved, const bool validate_inputs = false);
 
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,

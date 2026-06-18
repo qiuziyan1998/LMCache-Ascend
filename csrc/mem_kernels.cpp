@@ -595,6 +595,58 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   cmd.Run();
 }
 
+void sparse_mla_dsa_batched_direct_kv_transfer_fast(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_packed,
+    torch::Tensor &selected_token_idx, torch::Tensor &chunk_ptrs_npu,
+    const int64_t chunk_size, const int64_t total_tokens,
+    const bool lmc_host_interleaved, const bool validate_inputs) {
+  if (validate_inputs) {
+    validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+    TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
+    TORCH_CHECK(total_tokens > 0, "total_tokens must be positive.");
+    TORCH_CHECK(chunk_ptrs_npu.defined() && chunk_ptrs_npu.numel() > 0,
+                "chunk_ptrs_npu must not be empty.");
+    TORCH_CHECK(chunk_ptrs_npu.device().is_privateuseone(),
+                "chunk_ptrs_npu must be on NPU.");
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  const int32_t num_sparse =
+      static_cast<int32_t>(selected_token_idx.size(0));
+  if (num_sparse == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+
+  SingleLayerKVConfig config = layer_state.config;
+  config.dims.num_tokens = num_sparse;
+  config.ub_params.aiv_num =
+      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  config.ptrs.slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
+
+  uint8_t *selected_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+
+  const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, selected_ptr, chunk_ptrs_ptr, num_chunks,
+                        chunk_size_i, total_tokens_i, lmc_host_interleaved]() -> int {
+    launch_sparse_multi_chunk_direct_kernel(
+        config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
+        total_tokens_i, lmc_host_interleaved);
+    return 0;
+  });
+  cmd.Run();
+}
+
 void batched_fused_sparse_single_layer_kv_transfer(
     std::vector<torch::Tensor> &lmc_tensors, torch::Tensor &staging_cache,
     std::vector<torch::Tensor> &vllm_kv_caches,

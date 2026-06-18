@@ -368,6 +368,23 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
   return config;
 }
 
+SparseDirectLayerState prepare_sparse_direct_layer_state(
+    torch::Tensor &lmc_layout_sample,
+    std::vector<torch::Tensor> &vllm_kv_caches, torch::Tensor &slot_mapping_ref,
+    bool token_major, bool vllm_two_major, int kvcache_format_raw,
+    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
+    int32_t lmc_num_tokens) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+
+  SparseDirectLayerState state;
+  state.config = prepare_single_layer_kv_config(
+      lmc_layout_sample, vllm_kv_caches, slot_mapping_ref, false, token_major,
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
+  state.config.dims.lmc_num_tokens = lmc_num_tokens;
+  return state;
+}
+
 HostChunkMetadata
 prepare_host_chunk_metadata(const std::vector<torch::Tensor> &lmc_tensors,
                             const std::vector<int64_t> &chunk_sizes,
