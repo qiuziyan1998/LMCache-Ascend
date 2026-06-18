@@ -1256,6 +1256,49 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_layer_states[layer_id] = state
         return state
 
+    def _pack_sparse_layer_inputs(
+        self,
+        slot_mapping: torch.Tensor,
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        token_start_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Align slot_mapping and selected_token_idx to equal length for kernel."""
+        if selected_token_idx is not None and not isinstance(
+            selected_token_idx, torch.Tensor
+        ):
+            selected_token_idx = torch.tensor(
+                selected_token_idx, dtype=torch.int32, device=self.kv_device
+            )
+
+        if selected_token_idx is not None and selected_token_idx.numel() > 0:
+            num_sparse = int(selected_token_idx.numel())
+            start = int(token_start_index)
+            end = start + num_sparse
+            if end <= slot_mapping.numel():
+                slot_mapping_packed = slot_mapping[start:end]
+            elif start < slot_mapping.numel():
+                slot_mapping_packed = slot_mapping[start:]
+                selected_token_idx = selected_token_idx[
+                    : slot_mapping_packed.numel()
+                ]
+            else:
+                slot_mapping_packed = slot_mapping[:0]
+                selected_token_idx = selected_token_idx[:0]
+            selected_token_idx = self._sparse_selected_token_idx(
+                selected_token_idx, slot_mapping_packed.shape[0]
+            )
+            return slot_mapping_packed, selected_token_idx
+
+        slot_mapping_packed = (
+            slot_mapping
+            if token_start_index == 0
+            else slot_mapping[int(token_start_index) :]
+        )
+        selected_token_idx = self._sparse_selected_token_idx(
+            None, slot_mapping_packed.shape[0]
+        )
+        return slot_mapping_packed, selected_token_idx
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -1756,13 +1799,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         for layer_id in range(self.num_layers):
             memory_objs_layer, selected_token_idx, token_start_index = yield
-            slot_mapping_packed = (
-                slot_mapping
-                if token_start_index == 0
-                else slot_mapping[token_start_index:]
-            )
-            selected_token_idx = self._sparse_selected_token_idx(
-                selected_token_idx, slot_mapping_packed.shape[0]
+            slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
+                slot_mapping,
+                selected_token_idx,
+                token_start_index,
             )
 
             layer_cached_tensors = (
