@@ -245,6 +245,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # A preempted request may leave that path before its metadata is replayed.
         for req_id in preempted_req_ids:
             self.lmcache_engine.lookup_unpin(req_id)
+            self._drop_worker_retrieve_state(req_id)
 
         if not self.store_async or self.kv_role == "kv_consumer":
             return
