@@ -6,6 +6,7 @@ LMCacheEngine for Ascend NPU.
 
 # Standard
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
+import os
 import queue
 import threading
 import time
@@ -28,6 +29,16 @@ from lmcache.v1.token_database import TokenDatabase
 import torch
 
 logger = init_logger(__name__)
+
+_DECODE_DIAG_LOG_PREFIX = "[LMCacheDecodeDiag]"
+
+
+def _decode_diag_enabled() -> bool:
+    return os.environ.get("LMCACHE_DECODE_DIAG", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 class ThreadSafeEventList:
@@ -341,6 +352,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
             store_stats.put_time * 1000,
         )
+
+    def get_decode_diag_pending_stores(self) -> tuple[int, int]:
+        """Return (pending_request_count, pending_store_op_count) for decode diag."""
+        if not self.is_store_async:
+            return 0, 0
+        with self._store_lock:
+            pending_ops = sum(self._pending_store_reqs.values())
+            return len(self._pending_store_reqs), pending_ops
 
     def get_finished_stores(self, finished_req_ids: set) -> set:
         if not self.is_store_async:
@@ -1069,6 +1088,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
             kwargs["ret_mask"] = ret_mask
             metadata_warm = False
+            if _decode_diag_enabled():
+                logger.info(
+                    "%s phase=retrieve_engine req=%s ret_mask_recreated=True "
+                    "num_tokens=%d had_warm_flag=%s",
+                    _DECODE_DIAG_LOG_PREFIX,
+                    kwargs.get("req_id", "?"),
+                    num_tokens,
+                    kwargs.get("_retrieve_metadata_warm", False),
+                )
         elif not metadata_warm:
             ret_mask.zero_()
 
@@ -1091,6 +1119,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
 
+        diag_enabled = _decode_diag_enabled()
+        meta_t0 = time.perf_counter() if diag_enabled else 0.0
+        needs_meta_refresh = self._needs_retrieve_metadata_refresh(
+            cached_keys,
+            cached_starts,
+            cached_ends,
+            tokens,
+        )
+
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -1101,6 +1138,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask=ret_mask,
             retrieve_kwargs=kwargs,
         )
+
+        if diag_enabled:
+            meta_ms = (time.perf_counter() - meta_t0) * 1000.0
+            if needs_meta_refresh:
+                meta_path = "cold"
+            elif kwargs.get("_retrieve_metadata_warm"):
+                meta_path = "warm_flag"
+            else:
+                meta_path = "warm_rebuild"
+            kwargs["_decode_diag_meta_ms"] = meta_ms
+            kwargs["_decode_diag_meta_path"] = meta_path
 
         if not retrieve_keys:
             # If no cache are found, we still need to yield to avoid `StopIteration`
@@ -1120,6 +1168,37 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_memory_objs,
             self.num_layers,
         )
+
+        if diag_enabled:
+            tensor_chunks = [
+                len(cached_tensors[layer_id])
+                if cached_tensors is not None and layer_id < len(cached_tensors)
+                else 0
+                for layer_id in range(self.num_layers)
+            ]
+            nonempty_layers = sum(1 for count in tensor_chunks if count > 0)
+            kwargs["_decode_diag_use_cached_retrieve"] = use_cached_retrieve
+            kwargs["_decode_diag_storage_get"] = not use_cached_retrieve
+            kwargs["_decode_diag_tensor_chunks"] = tensor_chunks
+            pending_reqs, pending_ops = self.get_decode_diag_pending_stores()
+            logger.info(
+                "%s phase=retrieve_engine req=%s meta_path=%s meta_ms=%.3f "
+                "use_cached_retrieve=%s storage_get=%s retrieve_key_chunks=%d "
+                "tensor_layers=%d/%d nonempty_tensor_layers=%d "
+                "pending_async_stores=%d/%d",
+                _DECODE_DIAG_LOG_PREFIX,
+                kwargs.get("req_id", "?"),
+                kwargs.get("_decode_diag_meta_path", "?"),
+                kwargs.get("_decode_diag_meta_ms", 0.0),
+                use_cached_retrieve,
+                not use_cached_retrieve,
+                len(retrieve_keys[0]) if retrieve_keys else 0,
+                len(cached_tensors) if cached_tensors is not None else 0,
+                self.num_layers,
+                nonempty_layers,
+                pending_reqs,
+                pending_ops,
+            )
 
         get_generator = None
         if not use_cached_retrieve:
