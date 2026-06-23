@@ -781,6 +781,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             "_retrieve_metadata_warm"
         ):
             location = retrieve_kwargs.get("cached_retrieve_location")
+            if cached_keys and cached_keys[0]:
+                # Prefer the hottest tier (LocalCPUBackend is checked first).
+                # After Mooncake write-back, stale cached_retrieve_location may
+                # still point at RemoteBackend and force slow remote reads.
+                preferred_location = self.storage_manager.contains(
+                    cached_keys[0][0], self.retrieve_locations
+                )
+                if preferred_location is not None:
+                    location = preferred_location
+                    retrieve_kwargs["cached_retrieve_location"] = location
             return location, cached_starts, cached_ends, cached_keys
 
         for start, end in zip(cached_starts, cached_ends, strict=False):
