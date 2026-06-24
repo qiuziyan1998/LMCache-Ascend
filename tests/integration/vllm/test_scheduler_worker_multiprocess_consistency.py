@@ -21,7 +21,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 pytest.importorskip("lmcache")
 
 from scheduler_worker_multiprocess_harness import (
+    _make_normal_decode_meta,
     _make_sparse_req_meta,
+    npu_available,
     start_multiprocess_harness,
 )
 
@@ -41,6 +43,13 @@ def mp_harness():
         yield harness
     finally:
         harness.shutdown()
+
+
+@pytest.fixture
+def mp_npu_harness(mp_harness):
+    if not mp_harness.npu_enabled:
+        pytest.skip("NPU worker backend not available in multiprocess harness")
+    return mp_harness
 
 
 class TestSchedulerWorkerLookupPinSplit:
@@ -238,3 +247,82 @@ class TestZombieMetadataBoundary:
             {"op": "has_lookup_pins", "req_id": req_id}
         )
         assert pin_state["has_pins"] is False
+
+
+class TestNpuWaitForSaveAcrossProcesses:
+    """Ascend LMCacheAscendConnectorV1Impl.wait_for_save on real NPU engine."""
+
+    @pytest.mark.skipif(not npu_available(), reason="NPU required")
+    def test_npu_sparse_decode_pins_deferred_across_wait_for_save(
+        self, mp_npu_harness
+    ) -> None:
+        req_id = "mp-npu-sparse-defer"
+        mp_npu_harness.scheduler_call(
+            {
+                "op": "lookup",
+                "token_ids": mp_npu_harness.prompt_tokens,
+                "lookup_id": req_id,
+            }
+        )
+        mp_npu_harness.worker_call({"op": "save_worker_state", "req_id": req_id})
+
+        sparse_meta = _make_sparse_req_meta(req_id, can_load=True, can_save=False)
+        for _ in range(3):
+            mp_npu_harness.worker_wait_for_save([sparse_meta], path="npu")
+            pin_state = mp_npu_harness.worker_call(
+                {"op": "has_lookup_pins", "req_id": req_id}
+            )
+            assert pin_state["has_pins"] is True
+
+    @pytest.mark.skipif(not npu_available(), reason="NPU required")
+    def test_npu_normal_decode_unpins_on_wait_for_save(self, mp_npu_harness) -> None:
+        req_id = "mp-npu-normal-unpin"
+        mp_npu_harness.scheduler_call(
+            {
+                "op": "lookup",
+                "token_ids": mp_npu_harness.prompt_tokens,
+                "lookup_id": req_id,
+            }
+        )
+        pin_state = mp_npu_harness.worker_call(
+            {"op": "has_lookup_pins", "req_id": req_id}
+        )
+        assert pin_state["has_pins"] is True
+
+        normal_meta = _make_normal_decode_meta(
+            req_id, can_load=True, can_save=False
+        )
+        mp_npu_harness.worker_wait_for_save([normal_meta], path="npu")
+
+        pin_state = mp_npu_harness.worker_call(
+            {"op": "has_lookup_pins", "req_id": req_id}
+        )
+        assert pin_state["has_pins"] is False
+
+    @pytest.mark.skipif(not npu_available(), reason="NPU required")
+    def test_npu_normal_decode_store_via_wait_for_save(self, mp_npu_harness) -> None:
+        req_id = "mp-npu-normal-store"
+        mp_npu_harness.scheduler_call(
+            {
+                "op": "lookup",
+                "token_ids": mp_npu_harness.prompt_tokens,
+                "lookup_id": req_id,
+            }
+        )
+
+        save_meta = _make_normal_decode_meta(
+            req_id,
+            can_load=False,
+            can_save=True,
+            skip_leading_tokens=0,
+        )
+        mp_npu_harness.worker_wait_for_save([save_meta], path="npu", timeout=120)
+
+        hits = mp_npu_harness.scheduler_call(
+            {
+                "op": "lookup",
+                "token_ids": mp_npu_harness.prompt_tokens,
+                "lookup_id": "mp-npu-normal-store-verify",
+            }
+        )
+        assert hits["hits"] == 256
