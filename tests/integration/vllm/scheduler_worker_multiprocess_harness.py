@@ -208,6 +208,12 @@ def _run_ascend_wait_for_save(
         adapter.wait_for_save()
 
 
+def _prime_npu_gpu_connector(connector: Any, kvcaches: list[torch.Tensor]) -> None:
+    """Register paged KV caches on the NPU connector before store/retrieve."""
+    connector.initialize_kvcaches_ptr(kvcaches=kvcaches)
+    connector._initialize_pointers(kvcaches)
+
+
 def _rebuild_lookup_client_config_and_metadata(scheduler_init: dict[str, Any]) -> tuple[Any, Any]:
     """Rebuild config/metadata in scheduler child (must match worker ZMQ paths)."""
     # Third Party
@@ -308,6 +314,7 @@ def _worker_run(
     slot_mapping = torch.arange(PROMPT_LEN, dtype=torch.long, device="cpu")
     if use_npu:
         slot_mapping = slot_mapping.pin_memory()
+        _prime_npu_gpu_connector(engine.gpu_connector, kvcaches)
     store_mask = torch.ones(PROMPT_LEN, dtype=torch.bool)
     engine.store(
         tokens,

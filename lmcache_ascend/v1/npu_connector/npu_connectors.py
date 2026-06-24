@@ -819,6 +819,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
+        with torch.npu.stream(self.store_stream):
+            self._initialize_pointers(self.kvcaches)
+
         if "slot_mapping_npu" in kwargs:
             slot_mapping: torch.Tensor = kwargs["slot_mapping_npu"]
         elif "slot_mapping" in kwargs:
@@ -839,7 +842,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
 
         with torch.npu.stream(self.store_stream):
-            kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+            kv_cache_pointers = self.kv_cache_pointers_on_gpu[
+                self.kvcaches_device.index
+            ]
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
