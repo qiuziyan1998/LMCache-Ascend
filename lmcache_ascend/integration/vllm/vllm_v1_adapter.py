@@ -59,7 +59,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.kv_role == "kv_consumer":
             if self.lmcache_engine is not None:
                 for request in connector_metadata.requests:
-                    self.lmcache_engine.lookup_unpin(request.req_id)
+                    self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
             return
 
@@ -73,7 +73,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
                 if layerwise_storer is not None:
                     next(layerwise_storer)
-                self.lmcache_engine.lookup_unpin(request.req_id)
+                self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()
             return
@@ -89,7 +89,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # lmcache-ascend end ---------------------
 
         for request in connector_metadata.requests:
-            self.lmcache_engine.lookup_unpin(request.req_id)
+            self._maybe_lookup_unpin_for_request(request)
 
             try:
                 save_spec = request.save_spec
@@ -241,10 +241,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             sorted(preempted_req_ids),
         )
 
-        # Lookup pins are request-scoped and normally released in wait_for_save().
-        # A preempted request may leave that path before its metadata is replayed.
+        # Lookup pins are request-scoped; release via _drop_worker_retrieve_state.
         for req_id in preempted_req_ids:
-            self.lmcache_engine.lookup_unpin(req_id)
             self._drop_worker_retrieve_state(req_id)
 
         if not self.store_async or self.kv_role == "kv_consumer":
@@ -267,18 +265,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if (
             request.status == RequestStatus.FINISHED_ABORTED
             and self.lmcache_engine is not None
+            and self.store_async
+            and self.kv_role != "kv_consumer"
         ):
-            self.lmcache_engine.lookup_unpin(request.request_id)
-
-            if self.store_async and self.kv_role != "kv_consumer":
-                try:
-                    self.lmcache_engine.wait_for_pending_stores({request.request_id})
-                except Exception:
-                    logger.warning(
-                        "wait_for_pending_stores failed for aborted request %s",
-                        request.request_id,
-                        exc_info=True,
-                    )
+            try:
+                self.lmcache_engine.wait_for_pending_stores({request.request_id})
+            except Exception:
+                logger.warning(
+                    "wait_for_pending_stores failed for aborted request %s",
+                    request.request_id,
+                    exc_info=True,
+                )
 
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params
