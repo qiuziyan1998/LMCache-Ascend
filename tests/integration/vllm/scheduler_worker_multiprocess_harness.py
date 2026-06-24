@@ -107,6 +107,22 @@ def _create_worker_adapter(engine: Any) -> Any:
     return adapter
 
 
+def _rebuild_lookup_client_config_and_metadata(scheduler_init: dict[str, Any]) -> tuple[Any, Any]:
+    """Rebuild config/metadata in scheduler child (must match worker ZMQ paths)."""
+    # Third Party
+    from tests.v1.utils import create_test_config, create_test_metadata
+
+    config = create_test_config(
+        instance_id=scheduler_init["instance_id"],
+        local_cpu=True,
+        max_local_cpu_size=0.5,
+        rpc_port=scheduler_init["rpc_port"],
+    )
+    metadata = create_test_metadata(engine_id=scheduler_init["engine_id"])
+    metadata.kv_connector_extra_config = config.extra_config
+    return config, metadata
+
+
 def _worker_process(
     instance_id: str,
     cmd_queue: mp.Queue,
@@ -115,6 +131,19 @@ def _worker_process(
 ) -> None:
     _init_spawn_env()
 
+    try:
+        _worker_run(instance_id, cmd_queue, result_queue, ready_queue)
+    except Exception as exc:
+        ready_queue.put({"error": f"{type(exc).__name__}: {exc}"})
+        raise
+
+
+def _worker_run(
+    instance_id: str,
+    cmd_queue: mp.Queue,
+    result_queue: mp.Queue,
+    ready_queue: mp.Queue,
+) -> None:
     # Third Party
     from tests.v1.utils import (
         create_test_config,
@@ -169,9 +198,9 @@ def _worker_process(
     ready_queue.put(
         {
             "instance_id": instance_id,
-            "config": config,
-            "metadata": metadata,
             "prompt_tokens": tokens.tolist(),
+            "engine_id": metadata.engine_id,
+            "rpc_port": config.extra_config.get("lmcache_rpc_port", 0),
         }
     )
 
@@ -264,15 +293,14 @@ def _worker_process(
 
 
 def _scheduler_process(
-    instance_id: str,
-    config: Any,
-    metadata: Any,
+    scheduler_init: dict[str, Any],
     cmd_queue: mp.Queue,
     result_queue: mp.Queue,
     ready_queue: mp.Queue,
 ) -> None:
     _init_spawn_env()
 
+    config, metadata = _rebuild_lookup_client_config_and_metadata(scheduler_init)
     transport = LookupClientFactory._create_zmq_client_transport(config, metadata)
     client = LMCacheLookupClient(config, metadata, transport)
     ready_queue.put({"ok": True})
@@ -312,8 +340,6 @@ class MultiprocessHarness:
     scheduler_cmd: mp.Queue
     scheduler_res: mp.Queue
     instance_id: str
-    config: Any
-    metadata: Any
     prompt_tokens: list[int]
 
     def worker_call(self, cmd: dict[str, Any], timeout: float = 60) -> dict[str, Any]:
@@ -370,12 +396,19 @@ def start_multiprocess_harness() -> MultiprocessHarness:
     worker.start()
 
     init_info = worker_ready.get(timeout=120)
-    config = init_info["config"]
-    metadata = init_info["metadata"]
+    if init_info.get("error"):
+        worker.join(timeout=10)
+        raise RuntimeError(f"worker failed to start: {init_info['error']}")
+
+    scheduler_init = {
+        "instance_id": init_info["instance_id"],
+        "engine_id": init_info["engine_id"],
+        "rpc_port": init_info["rpc_port"],
+    }
 
     scheduler = ctx.Process(
         target=_scheduler_process,
-        args=(instance_id, config, metadata, scheduler_cmd, scheduler_res, scheduler_ready),
+        args=(scheduler_init, scheduler_cmd, scheduler_res, scheduler_ready),
         name="lmcache-mp-scheduler",
     )
     scheduler.start()
@@ -390,8 +423,6 @@ def start_multiprocess_harness() -> MultiprocessHarness:
         worker_res=worker_res,
         scheduler_cmd=scheduler_cmd,
         scheduler_res=scheduler_res,
-        instance_id=instance_id,
-        config=config,
-        metadata=metadata,
+        instance_id=init_info["instance_id"],
         prompt_tokens=init_info["prompt_tokens"],
     )
