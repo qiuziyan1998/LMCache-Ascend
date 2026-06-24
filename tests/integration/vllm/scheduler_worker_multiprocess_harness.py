@@ -229,11 +229,12 @@ def _worker_process(
     cmd_queue: mp.Queue,
     result_queue: mp.Queue,
     ready_queue: mp.Queue,
+    npu_worker: bool,
 ) -> None:
     _init_spawn_env()
 
     try:
-        _worker_run(instance_id, cmd_queue, result_queue, ready_queue)
+        _worker_run(instance_id, cmd_queue, result_queue, ready_queue, npu_worker)
     except Exception as exc:
         ready_queue.put({"error": f"{type(exc).__name__}: {exc}"})
         raise
@@ -244,8 +245,14 @@ def _worker_run(
     cmd_queue: mp.Queue,
     result_queue: mp.Queue,
     ready_queue: mp.Queue,
+    npu_worker: bool,
 ) -> None:
-    use_npu = npu_available()
+    use_npu = npu_worker and npu_available()
+    if npu_worker and not use_npu:
+        raise RuntimeError("NPU worker requested but torch.npu is not available")
+
+    if use_npu:
+        torch.npu.set_device(0)
 
     # Third Party
     from tests.v1.utils import (
@@ -296,8 +303,11 @@ def _worker_run(
     )
     adapter = _create_worker_adapter(engine, device=device, kvcaches=kvcaches)
 
-    tokens = generate_tokens(PROMPT_LEN, device, fixed=True)
-    slot_mapping = torch.arange(PROMPT_LEN, dtype=torch.long, device=device)
+    # CPU tokens/slot_mapping: NPU connector copies slot indices on store_stream.
+    tokens = generate_tokens(PROMPT_LEN, "cpu", fixed=True)
+    slot_mapping = torch.arange(PROMPT_LEN, dtype=torch.long, device="cpu")
+    if use_npu:
+        slot_mapping = slot_mapping.pin_memory()
     store_mask = torch.ones(PROMPT_LEN, dtype=torch.bool)
     engine.store(
         tokens,
@@ -508,7 +518,7 @@ class MultiprocessHarness:
             self.scheduler.terminate()
 
 
-def start_multiprocess_harness() -> MultiprocessHarness:
+def start_multiprocess_harness(npu_worker: bool = False) -> MultiprocessHarness:
     ctx = mp.get_context("spawn")
     instance_id = f"mp_sched_worker_{uuid.uuid4().hex[:8]}"
 
@@ -521,7 +531,7 @@ def start_multiprocess_harness() -> MultiprocessHarness:
 
     worker = ctx.Process(
         target=_worker_process,
-        args=(instance_id, worker_cmd, worker_res, worker_ready),
+        args=(instance_id, worker_cmd, worker_res, worker_ready, npu_worker),
         name="lmcache-mp-worker",
     )
     worker.start()

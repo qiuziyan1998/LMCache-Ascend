@@ -46,10 +46,14 @@ def mp_harness():
 
 
 @pytest.fixture
-def mp_npu_harness(mp_harness):
-    if not mp_harness.npu_enabled:
-        pytest.skip("NPU worker backend not available in multiprocess harness")
-    return mp_harness
+def mp_npu_harness():
+    if not npu_available():
+        pytest.skip("NPU required")
+    harness = start_multiprocess_harness(npu_worker=True)
+    try:
+        yield harness
+    finally:
+        harness.shutdown()
 
 
 class TestSchedulerWorkerLookupPinSplit:
