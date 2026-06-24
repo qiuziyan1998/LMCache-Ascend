@@ -11,6 +11,7 @@ import copy
 import multiprocessing as mp
 import os
 import queue
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -54,6 +55,20 @@ def npu_available() -> bool:
         return False
 
 
+def _patch_loaded_lmc_ops_bindings() -> None:
+    """Re-bind lmc_ops on modules imported before Ascend c_ops patch."""
+    import lmcache_ascend.c_ops as ascend_c_ops
+
+    for mod_name in (
+        "lmcache.v1.memory_management",
+        "lmcache.v1.lazy_memory_allocator",
+        "lmcache.v1.gpu_connector.utils",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "lmc_ops"):
+            mod.lmc_ops = ascend_c_ops
+
+
 def _init_spawn_env() -> None:
     """Bootstrap LMCache path and PYTHONHASHSEED in spawned child processes."""
     import os
@@ -65,12 +80,16 @@ def _init_spawn_env() -> None:
         if path not in sys.path:
             sys.path.insert(0, path)
     os.environ.setdefault("PYTHONHASHSEED", "0")
+    if npu_available():
+        # Must run before any lmcache import so memory_management binds ascend c_ops.
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
     # Local
     from bootstrap import prepare_environment
 
     prepare_environment()
     if npu_available():
         import lmcache_ascend  # noqa: F401  # patches Ascend engine + connectors
+        _patch_loaded_lmc_ops_bindings()
 
 
 def _make_sparse_req_meta(
@@ -259,6 +278,7 @@ def _worker_run(
 
     if use_npu:
         torch.npu.set_device(0)
+        _patch_loaded_lmc_ops_bindings()
 
     # Third Party
     from tests.v1.utils import (
@@ -312,15 +332,26 @@ def _worker_run(
     # CPU tokens/slot_mapping: NPU connector copies slot indices on store_stream.
     tokens = generate_tokens(PROMPT_LEN, "cpu", fixed=True)
     slot_mapping = torch.arange(PROMPT_LEN, dtype=torch.long, device="cpu")
+    store_kwargs: dict[str, Any] = {
+        "kvcaches": kvcaches,
+        "slot_mapping": slot_mapping,
+    }
     if use_npu:
-        slot_mapping = slot_mapping.pin_memory()
         _prime_npu_gpu_connector(engine.gpu_connector, kvcaches)
+        connector = engine.gpu_connector
+        with torch.npu.stream(connector.store_stream):
+            slot_mapping_npu = slot_mapping.to(
+                device=kvcaches[0].device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
+        connector.store_stream.synchronize()
+        store_kwargs["slot_mapping_npu"] = slot_mapping_npu
     store_mask = torch.ones(PROMPT_LEN, dtype=torch.bool)
     engine.store(
         tokens,
         mask=store_mask,
-        kvcaches=kvcaches,
-        slot_mapping=slot_mapping,
+        **store_kwargs,
     )
     recover_engine_states(engine)
 

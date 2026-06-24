@@ -244,6 +244,10 @@ def _patch_ops():
         ascend_c_ops.GPUKVFormat = GPUKVFormat
 
     sys.modules["lmcache.c_ops"] = ascend_c_ops
+    # When torch.cuda.is_available() is False, upstream memory_management imports
+    # non_cuda_equivalents whose alloc_pinned_ptr is not aclrtHostRegister'd.
+    # Ascend KV kernels require host-registered CPU buffers (get_device_ptr).
+    sys.modules["lmcache.non_cuda_equivalents"] = ascend_c_ops
 
 
 def _patch_storage_backend_init():
