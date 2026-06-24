@@ -7,8 +7,6 @@ import os
 import pytest
 
 # Local
-# Local Bootstrap
-# We import the function we just created to handle the git/alias logic
 from .bootstrap import TEST_ALIAS, prepare_environment
 
 # Skip multiprocess tests entirely — NPU does not support IPC sharing
@@ -18,7 +16,7 @@ collect_ignore_glob = ["v1/multiprocess/test_*.py"]
 # 1. RUN BOOTSTRAP
 # ==============================================================================
 try:
-    prepare_environment()
+    _HAS_UPSTREAM_TESTS = prepare_environment()
 except Exception as e:
     pytest.exit(f"❌ Bootstrap failed: {e}", returncode=1)
 
@@ -51,6 +49,13 @@ def patch_lmcache_test_utils():
     NOTE (gingfung): in some of the tests like test_cache_engine directly uses
     fixtures for gpu_connector, and we want to patch this prior the tests loaded.
     """
+    if not _HAS_UPSTREAM_TESTS:
+        print(
+            "ℹ️ Skipping lmcache_tests GPU connector patch "
+            "(upstream LMCache tests tree not available)."
+        )
+        return
+
     try:
         # Third Party
         import lmcache_tests.v1.utils as original_utils
@@ -61,7 +66,6 @@ def patch_lmcache_test_utils():
         )
 
         # 2. Load it safely as a standalone module
-        #    We give it a unique name "local_npu_utils" to avoid conflicts
         spec = importlib.util.spec_from_file_location(
             "local_npu_utils", local_utils_path
         )
@@ -87,5 +91,5 @@ patch_lmcache_test_utils()
 # ==============================================================================
 # 3. PLUGIN REGISTRATION
 # ==============================================================================
-# Inherit fixtures from the upstream repo
-pytest_plugins = [f"{TEST_ALIAS}.conftest"]
+if _HAS_UPSTREAM_TESTS:
+    pytest_plugins = [f"{TEST_ALIAS}.conftest"]
