@@ -29,6 +29,10 @@ import torch
 
 logger = init_logger(__name__)
 
+LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
+
+LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
+
 
 class ThreadSafeEventList:
     """queue.Queue-backed, list-compatible thread-safe buffer for
@@ -687,6 +691,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             and len(cached_memory_objs) == num_layers
         )
 
+    def _resolve_local_cpu_retrieve_location(
+        self,
+        fallback: Optional[str] = None,
+    ) -> Optional[str]:
+        """Prefer LocalCPUBackend for in-process tensor cache hits."""
+        if (
+            self.storage_manager is not None
+            and LOCAL_CPU_BACKEND_NAME in self.storage_manager.storage_backends
+        ):
+            return LOCAL_CPU_BACKEND_NAME
+        return fallback
+
     def _ensure_retrieve_chunk_metadata(
         self,
         *,
@@ -780,6 +796,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         if retrieve_kwargs is not None and retrieve_kwargs.get(
             "_retrieve_metadata_warm"
         ):
+            if retrieve_kwargs.get("_use_cached_retrieve"):
+                location = self._resolve_local_cpu_retrieve_location(
+                    retrieve_kwargs.get("cached_retrieve_location"),
+                )
+                if retrieve_kwargs is not None and location is not None:
+                    retrieve_kwargs["cached_retrieve_location"] = location
+                return location, cached_starts, cached_ends, cached_keys
+
             location = retrieve_kwargs.get("cached_retrieve_location")
             if cached_keys and cached_keys[0]:
                 # Prefer the hottest tier (LocalCPUBackend is checked first).
@@ -1101,6 +1125,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
 
+        use_cached_retrieve = self._has_retrieve_data_cache(
+            cached_tensors,
+            cached_memory_objs,
+            self.num_layers,
+        )
+        if use_cached_retrieve:
+            kwargs["_use_cached_retrieve"] = True
+
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -1111,6 +1143,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask=ret_mask,
             retrieve_kwargs=kwargs,
         )
+        kwargs.pop("_use_cached_retrieve", None)
+
+        if use_cached_retrieve:
+            location = self._resolve_local_cpu_retrieve_location(location)
+            if location is not None:
+                kwargs["cached_retrieve_location"] = location
 
         if not retrieve_keys:
             # If no cache are found, we still need to yield to avoid `StopIteration`
@@ -1124,12 +1162,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
 
         assert_layerwise_gpu_connector(self.gpu_connector)
-
-        use_cached_retrieve = self._has_retrieve_data_cache(
-            cached_tensors,
-            cached_memory_objs,
-            self.num_layers,
-        )
 
         get_generator = None
         if not use_cached_retrieve:
