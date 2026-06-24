@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import importlib
 import importlib.util
 import os
 import subprocess
@@ -164,8 +165,6 @@ def register_alias():
         return False
 
     # LMCache-NPU / dev trees may omit tests/__init__.py; alias the `tests` package.
-    import importlib
-
     tests_pkg = importlib.import_module("tests")
     sys.modules[TEST_ALIAS] = tests_pkg
     for name, mod in list(sys.modules.items()):
