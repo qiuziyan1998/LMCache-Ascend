@@ -46,4 +46,5 @@ def test_handle_preemptions_without_engine_is_safe() -> None:
     adapter._worker_retrieve_state = {"req-1": WorkerRetrieveState(metadata_warm=True)}
 
     adapter.handle_preemptions({"req-1"})
-    assert adapter._worker_retrieve_state == {"req-1"}
+    assert "req-1" in adapter._worker_retrieve_state
+    assert len(adapter._worker_retrieve_state) == 1
