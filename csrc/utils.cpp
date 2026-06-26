@@ -697,8 +697,10 @@ void execute_batched_sparse_memcpy(
         }
       } else {
         uint8_t *host_k = host_base + t * k_bytes_per_token;
-        uint8_t *host_v = host_k + meta.v_offsets[chunk_i];
-        uint8_t *host_dsa = host_v + meta.dsa_offsets[chunk_i];
+        uint8_t *host_v =
+            host_base + meta.v_offsets[chunk_i] + t * v_bytes_per_token;
+        uint8_t *host_dsa =
+            host_base + meta.dsa_offsets[chunk_i] + t * dsa_bytes_per_token;
         uint8_t *staging_k =
             config.ptrs.lmc_ptr + staging_token_idx * k_bytes_per_token;
         uint8_t *staging_v = config.ptrs.lmc_ptr + staging_v_plane_offset +

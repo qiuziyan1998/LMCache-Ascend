@@ -1415,12 +1415,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV)
 
     def _layerwise_token_major(self) -> bool:
-        # MLA/DSA CPU memory uses interleaved [token, k+v(+dsa)] layout.
+        # GQA uses token-interleaved CPU chunks; MLA/DSA use stacked K|V|DSA planes.
         return not self._is_mla_dsa_format()
 
     def _sparse_lmc_host_interleaved(self) -> bool:
-        # Sparse direct kernel reads [token, k+v(+dsa)] planes in one copy.
-        return self._is_mla_dsa_format()
+        # Must match batched_fused CPU layout (_layerwise_token_major).
+        return self._layerwise_token_major()
 
     def notify_sparse_memory_objs_updated(self) -> None:
         """No-op: sparse chunk device ptrs live in ReqMeta and update incrementally."""
