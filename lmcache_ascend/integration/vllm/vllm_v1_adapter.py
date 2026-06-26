@@ -100,16 +100,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
                 token_ids = request.token_ids
 
-                slot_mapping = request.slot_mapping
-                assert isinstance(slot_mapping, torch.Tensor)
+                assert request.slot_mapping is not None and len(request.slot_mapping) > 0
+                slot_mapping = request.slot_mapping[0]
                 assert len(slot_mapping) == len(token_ids)
 
                 # lmcache-ascend start ---------------------
-                slot_mapping = slot_mapping.pin_memory()
-                with torch.npu.stream(self.lmcache_engine.gpu_connector.store_stream):
-                    slot_mapping_npu = slot_mapping.to(
-                        device="npu", dtype=torch.long, non_blocking=True
-                    )
+                if slot_mapping.device.type == "npu":
+                    slot_mapping_npu = slot_mapping.to(dtype=torch.long)
+                else:
+                    slot_mapping = slot_mapping.pin_memory()
+                    with torch.npu.stream(
+                        self.lmcache_engine.gpu_connector.store_stream
+                    ):
+                        slot_mapping_npu = slot_mapping.to(
+                            device="npu", dtype=torch.long, non_blocking=True
+                        )
                 # lmcache-ascend end ---------------------
 
                 skip_leading_tokens = save_spec.skip_leading_tokens
