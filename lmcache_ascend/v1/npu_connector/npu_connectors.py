@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Any, List, Optional, Set, Union
+import os
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -34,6 +35,106 @@ import lmcache_ascend.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 _IS_310P = None
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_debug_summary_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
+    ).lower() in ("summary", "trace", "verbose", "all")
+
+
+def _dsa_debug_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
+    except ValueError:
+        return 8
+
+
+def _dsa_debug_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_debug_enabled():
+        return False
+    if not _dsa_debug_summary_enabled():
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_shrink_debug_counts", counts)
+    count = counts.get(site, 0)
+    if count >= _dsa_debug_limit():
+        return False
+    counts[site] = count + 1
+    return True
+
+
+def _dsa_debug_failure_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_debug_enabled():
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_shrink_debug_counts", counts)
+    key = f"fail:{site}"
+    count = counts.get(key, 0)
+    if count >= _dsa_debug_limit():
+        return False
+    counts[key] = count + 1
+    return True
+
+
+def _dsa_debug_shape(value: Any) -> Any:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
+    if value is None:
+        return None
+    limit = _dsa_debug_limit() if limit is None else limit
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+        return list(value[:limit])
+    except Exception as exc:
+        return f"{type(value).__name__}:sample_failed:{exc}"
+
+
+def _dsa_debug_minmax_count(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            flat = value.detach().reshape(-1)
+            return (
+                flat.min().to(device="cpu").item(),
+                flat.max().to(device="cpu").item(),
+                int(flat.numel()),
+            )
+        seq = list(value)
+        if not seq:
+            return None
+        return (min(seq), max(seq), len(seq))
+    except Exception as exc:
+        return f"{type(value).__name__}:minmax_failed:{exc}"
 
 
 def is_310p():
@@ -1268,6 +1369,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_start_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Align slot_mapping and selected_token_idx to equal length for kernel."""
+        debug_pack = _dsa_debug_should_log(self, "pack_sparse_layer_inputs")
+        input_selected_shape = _dsa_debug_shape(selected_token_idx)
+        input_selected_sample = _dsa_debug_sample(selected_token_idx)
+        input_selected_minmax = _dsa_debug_minmax_count(selected_token_idx)
         if selected_token_idx is not None and not isinstance(
             selected_token_idx, torch.Tensor
         ):
@@ -1279,6 +1384,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             num_sparse = int(selected_token_idx.numel())
             start = int(token_start_index)
             end = start + num_sparse
+            truncated = False
+            empty_due_to_start = False
             if end <= slot_mapping.numel():
                 slot_mapping_packed = slot_mapping[start:end]
             elif start < slot_mapping.numel():
@@ -1286,12 +1393,52 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx = selected_token_idx[
                     : slot_mapping_packed.numel()
                 ]
+                truncated = True
             else:
                 slot_mapping_packed = slot_mapping[:0]
                 selected_token_idx = selected_token_idx[:0]
+                truncated = True
+                empty_due_to_start = True
             selected_token_idx = self._sparse_selected_token_idx(
                 selected_token_idx, slot_mapping_packed.shape[0]
             )
+            should_log_pack = debug_pack or (
+                truncated
+                and _dsa_debug_failure_should_log(
+                    self, "pack_sparse_layer_inputs_fail"
+                )
+            )
+            if should_log_pack:
+                log_fn = logger.error if truncated else logger.warning
+                log_fn(
+                    "[DSA_SHRINK_CHECK] npu_pack_sparse "
+                    "slot_mapping_shape=%s slot_mapping_sample=%s "
+                    "slot_mapping_minmax_count=%s input_selected_shape=%s "
+                    "input_selected_sample=%s input_selected_minmax_count=%s "
+                    "token_start_index=%s start=%s end=%s num_sparse=%s "
+                    "truncated=%s empty_due_to_start=%s "
+                    "packed_slot_shape=%s packed_slot_sample=%s "
+                    "packed_slot_minmax_count=%s output_selected_shape=%s "
+                    "output_selected_sample=%s output_selected_minmax_count=%s",
+                    _dsa_debug_shape(slot_mapping),
+                    _dsa_debug_sample(slot_mapping),
+                    _dsa_debug_minmax_count(slot_mapping),
+                    input_selected_shape,
+                    input_selected_sample,
+                    input_selected_minmax,
+                    token_start_index,
+                    start,
+                    end,
+                    num_sparse,
+                    truncated,
+                    empty_due_to_start,
+                    _dsa_debug_shape(slot_mapping_packed),
+                    _dsa_debug_sample(slot_mapping_packed),
+                    _dsa_debug_minmax_count(slot_mapping_packed),
+                    _dsa_debug_shape(selected_token_idx),
+                    _dsa_debug_sample(selected_token_idx),
+                    _dsa_debug_minmax_count(selected_token_idx),
+                )
             return slot_mapping_packed, selected_token_idx
 
         slot_mapping_packed = (
@@ -1302,6 +1449,36 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         selected_token_idx = self._sparse_selected_token_idx(
             None, slot_mapping_packed.shape[0]
         )
+        if debug_pack:
+            logger.warning(
+                "[DSA_SHRINK_CHECK] npu_pack_sparse "
+                "slot_mapping_shape=%s slot_mapping_sample=%s "
+                "slot_mapping_minmax_count=%s input_selected_shape=%s "
+                "input_selected_sample=%s input_selected_minmax_count=%s "
+                "token_start_index=%s start=%s end=%s num_sparse=%s "
+                "truncated=%s empty_due_to_start=%s packed_slot_shape=%s "
+                "packed_slot_sample=%s packed_slot_minmax_count=%s "
+                "output_selected_shape=%s output_selected_sample=%s "
+                "output_selected_minmax_count=%s",
+                _dsa_debug_shape(slot_mapping),
+                _dsa_debug_sample(slot_mapping),
+                _dsa_debug_minmax_count(slot_mapping),
+                input_selected_shape,
+                input_selected_sample,
+                input_selected_minmax,
+                token_start_index,
+                int(token_start_index),
+                int(token_start_index) + int(slot_mapping_packed.shape[0]),
+                int(slot_mapping_packed.shape[0]),
+                False,
+                False,
+                _dsa_debug_shape(slot_mapping_packed),
+                _dsa_debug_sample(slot_mapping_packed),
+                _dsa_debug_minmax_count(slot_mapping_packed),
+                _dsa_debug_shape(selected_token_idx),
+                _dsa_debug_sample(selected_token_idx),
+                _dsa_debug_minmax_count(selected_token_idx),
+            )
         return slot_mapping_packed, selected_token_idx
 
     def _run_sparse_direct_kv_transfer_layer(
@@ -1327,6 +1504,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cpu_tensors: Optional[List[torch.Tensor]] = None,
     ) -> None:
         num_sparse = int(selected_token_idx.numel())
+        debug_run = _dsa_debug_should_log(self, "run_sparse_direct_layer")
+        if debug_run:
+            logger.warning(
+                "[DSA_SHRINK_CHECK] npu_sparse_direct_run "
+                "layer=%s num_sparse=%s total_tokens=%s chunk_ptrs_shape=%s "
+                "slot_mapping_shape=%s slot_mapping_sample=%s "
+                "slot_mapping_minmax_count=%s selected_shape=%s "
+                "selected_sample=%s selected_minmax_count=%s skip=%s "
+                "layer_tensors=%s cpu_tensors=%s",
+                layer_id,
+                num_sparse,
+                total_tokens,
+                _dsa_debug_shape(chunk_ptrs_npu),
+                _dsa_debug_shape(slot_mapping_packed),
+                _dsa_debug_sample(slot_mapping_packed),
+                _dsa_debug_minmax_count(slot_mapping_packed),
+                _dsa_debug_shape(selected_token_idx),
+                _dsa_debug_sample(selected_token_idx),
+                _dsa_debug_minmax_count(selected_token_idx),
+                num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0,
+                len(layer_tensors) if layer_tensors is not None else None,
+                len(cpu_tensors) if cpu_tensors is not None else None,
+            )
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
 
@@ -1358,6 +1558,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
                 validate_inputs = layer_id not in self._sparse_direct_validated_layers
+                if debug_run:
+                    logger.warning(
+                        "[DSA_SHRINK_CHECK] npu_sparse_direct_path "
+                        "layer=%s path=fast validate_inputs=%s "
+                        "state_cached_layers=%s",
+                        layer_id,
+                        validate_inputs,
+                        sum(
+                            1
+                            for state in self._sparse_direct_layer_states
+                            if state is not None
+                        )
+                        if self._sparse_direct_layer_states is not None else None,
+                    )
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_packed,
@@ -1372,6 +1586,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._sparse_direct_validated_layers.add(layer_id)
             else:
                 assert cpu_tensors is not None and len(cpu_tensors) > 0
+                if debug_run:
+                    logger.warning(
+                        "[DSA_SHRINK_CHECK] npu_sparse_direct_path "
+                        "layer=%s path=direct validate_inputs=None",
+                        layer_id,
+                    )
                 sparse_mla_dsa_batched_direct_kv_transfer(
                     cpu_tensors,
                     self.kvcaches[layer_id],
@@ -1827,6 +2047,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
 
             if not cpu_tensors:
+                if _dsa_debug_failure_should_log(
+                    self, "sparse_direct_no_cpu_tensors"
+                ):
+                    logger.error(
+                        "[DSA_SHRINK_CHECK] npu_sparse_direct_prepare "
+                        "layer=%s skip=no_cpu_tensors use_cached_retrieve=%s "
+                        "memory_objs=%s selected_shape=%s selected_sample=%s "
+                        "slot_mapping_packed_shape=%s",
+                        layer_id,
+                        use_cached_retrieve,
+                        len(memory_objs_layer) if memory_objs_layer is not None else None,
+                        _dsa_debug_shape(selected_token_idx),
+                        _dsa_debug_sample(selected_token_idx),
+                        _dsa_debug_shape(slot_mapping_packed),
+                    )
                 continue
 
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
@@ -1841,6 +2076,63 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens = lmcache_cached_tokens
             else:
                 total_tokens = self._sparse_total_tokens_from_layer_chunks(cpu_tensors)
+
+            selected_max = None
+            selected_oob = False
+            try:
+                if selected_token_idx.numel() > 0:
+                    selected_max = int(
+                        selected_token_idx.detach().max().to(device="cpu").item()
+                    )
+                    selected_oob = selected_max >= total_tokens
+            except Exception as exc:
+                selected_max = f"failed:{exc}"
+                selected_oob = True
+            slot_selected_match = int(slot_mapping_packed.shape[0]) == int(
+                selected_token_idx.numel()
+            )
+            prepare_failure = selected_oob or not slot_selected_match
+            should_log_prepare = _dsa_debug_should_log(
+                self, "sparse_direct_prepare"
+            ) or (
+                prepare_failure
+                and _dsa_debug_failure_should_log(
+                    self, "sparse_direct_prepare_fail"
+                )
+            )
+            if should_log_prepare:
+                log_fn = logger.error if prepare_failure else logger.warning
+                log_fn(
+                    "[DSA_SHRINK_CHECK] npu_sparse_direct_prepare "
+                    "layer=%s use_cached_retrieve=%s lmcache_cached_tokens=%s "
+                    "total_tokens=%s selected_oob=%s selected_max=%s "
+                    "slot_mapping_full_shape=%s slot_mapping_packed_shape=%s "
+                    "slot_selected_match=%s selected_shape=%s selected_sample=%s "
+                    "selected_minmax_count=%s chunk_ptrs_shape=%s "
+                    "cpu_tensors=%s memory_objs=%s kv_format=%s "
+                    "token_major=%s host_interleaved=%s hidden_dims=(%s,%s,%s)",
+                    layer_id,
+                    use_cached_retrieve,
+                    lmcache_cached_tokens,
+                    total_tokens,
+                    selected_oob,
+                    selected_max,
+                    _dsa_debug_shape(slot_mapping),
+                    _dsa_debug_shape(slot_mapping_packed),
+                    slot_selected_match,
+                    _dsa_debug_shape(selected_token_idx),
+                    _dsa_debug_sample(selected_token_idx),
+                    _dsa_debug_minmax_count(selected_token_idx),
+                    _dsa_debug_shape(chunk_ptrs_npu),
+                    len(cpu_tensors),
+                    len(memory_objs_layer) if memory_objs_layer is not None else None,
+                    sparse_kv_format,
+                    sparse_token_major,
+                    sparse_host_interleaved,
+                    sparse_k_hidden_dims,
+                    sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims,
+                )
 
             self._run_sparse_direct_kv_transfer_layer(
                 layer_id=layer_id,
