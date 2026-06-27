@@ -25,6 +25,8 @@ from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.token_database import TokenDatabase
+from lmcache.v1.sparse_tp_diag import log_sparse_tp_diag
+from lmcache.v1.ext_prefix_hit_diag import record_store_layer_if_enabled
 import torch
 
 logger = init_logger(__name__)
@@ -752,6 +754,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                             "Please support multi-location retrieval in the future."
                         )
                 else:
+                    req_id = (
+                        retrieve_kwargs.get("req_id")
+                        if retrieve_kwargs is not None
+                        else None
+                    )
+                    log_sparse_tp_diag(
+                        "sparse_metadata contains_miss req=%s rank=%d at_start=%d "
+                        "chunk_hash=%s keys_found=%d token_len=%d",
+                        req_id,
+                        self.metadata.worker_id,
+                        start,
+                        key.chunk_hash,
+                        len(keys),
+                        len(tokens),
+                    )
                     break
 
                 new_starts.append(start)
@@ -762,6 +779,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                 [list(row) for row in zip(*keys, strict=False)] if keys else []
             )
             if not new_keys:
+                req_id = (
+                    retrieve_kwargs.get("req_id")
+                    if retrieve_kwargs is not None
+                    else None
+                )
+                log_sparse_tp_diag(
+                    "sparse_metadata no_keys req=%s rank=%d token_len=%d",
+                    req_id,
+                    self.metadata.worker_id,
+                    len(tokens),
+                )
                 return location, new_starts, new_ends, new_keys
 
             if not cached_keys:
@@ -791,6 +819,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if location is not None:
                     retrieve_kwargs["cached_retrieve_location"] = location
                 retrieve_kwargs["_retrieve_metadata_warm"] = True
+            log_sparse_tp_diag(
+                "sparse_metadata refreshed req=%s rank=%d chunks=%d "
+                "ret_tokens=%d location=%s",
+                retrieve_kwargs.get("req_id") if retrieve_kwargs else None,
+                self.metadata.worker_id,
+                len(cached_starts),
+                int(ret_mask.sum().item()),
+                location,
+            )
             return location, cached_starts, cached_ends, cached_keys
 
         if retrieve_kwargs is not None and retrieve_kwargs.get(
@@ -928,6 +965,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        skipped_existing = 0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -938,6 +976,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             if self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
             ):
+                skipped_existing += 1
                 continue
 
             # Allocate the memory object
@@ -989,6 +1028,27 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
+
+        log_sparse_tp_diag(
+            "store_layer req=%s rank=%d new_chunks=%d stored_tokens=%d "
+            "skipped_existing=%d total_tokens=%d cached_chunks=%d",
+            req_id,
+            self.metadata.worker_id,
+            len(keys),
+            tot_token_num,
+            skipped_existing,
+            len(tokens),
+            len(cached_starts),
+        )
+        record_store_layer_if_enabled(
+            req_id=req_id,
+            token_ids=tokens,
+            worker_id=self.metadata.worker_id,
+            new_chunks=len(keys),
+            stored_tokens=tot_token_num,
+            skipped_existing=skipped_existing,
+            total_tokens=len(tokens),
+        )
 
         if keys:
             # Transpose the keys and memory objects into layer major format
@@ -1151,6 +1211,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kwargs["cached_retrieve_location"] = location
 
         if not retrieve_keys:
+            log_sparse_tp_diag(
+                "sparse_retrieve no_keys req=%s rank=%d metadata_warm=%s "
+                "cached_chunks=%d token_len=%d ret_mask_sum=%d",
+                kwargs.get("req_id"),
+                self.metadata.worker_id,
+                metadata_warm,
+                len(cached_starts),
+                num_tokens,
+                int(ret_mask.sum().item()),
+            )
             # If no cache are found, we still need to yield to avoid `StopIteration`
             for layer_id in range(self.num_layers):
                 yield None
