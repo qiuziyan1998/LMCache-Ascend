@@ -17,6 +17,7 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.kv_checksum_diag import log_sparse_scatter_entry
 import torch
 
 # First Party
@@ -1330,6 +1331,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
 
+        log_sparse_scatter_entry(
+            req_id=getattr(self, "_sparse_transfer_req_id", None),
+            layer_id=layer_id,
+            worker_id=0,
+            num_sparse=num_sparse,
+            total_tokens=total_tokens,
+            chunk_size=chunk_size,
+            chunk_ptrs=int(chunk_ptrs_npu.numel()),
+            use_fast_path=layer_state is not None,
+        )
+
         resolve_tensors = (
             layer_tensors
             if layer_tensors is not None
@@ -1775,6 +1787,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        self._sparse_transfer_req_id = kwargs.get("req_id")
         cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
             "cached_tensors"
         )
