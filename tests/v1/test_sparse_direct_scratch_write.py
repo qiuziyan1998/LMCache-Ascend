@@ -74,12 +74,17 @@ def _assert_direct_write_result(
     selected_token_idx: torch.Tensor,
     sentinel: float,
     label: str,
+    planes_to_check: int | None = None,
 ) -> None:
     page_tokens = int(src_layer[0].shape[0] * src_layer[0].shape[1])
     src_slots = slot_mapping_full.index_select(0, selected_token_idx.to(torch.long))
     expected_changed = sorted(slot_mapping_packed.detach().cpu().tolist())
 
-    for plane_id, (src, dst) in enumerate(zip(src_layer, dst_layer, strict=True)):
+    planes = list(zip(src_layer, dst_layer, strict=True))
+    if planes_to_check is not None:
+        planes = planes[:planes_to_check]
+
+    for plane_id, (src, dst) in enumerate(planes):
         src_flat = src.reshape(page_tokens, -1)
         dst_flat = dst.reshape(page_tokens, -1)
         expected = src_flat.index_select(0, src_slots)
@@ -119,9 +124,14 @@ def _assert_full_staging_roundtrip(
     dst_layer: tuple[torch.Tensor, ...],
     slot_mapping_full: torch.Tensor,
     label: str,
+    planes_to_check: int | None = None,
 ) -> None:
     page_tokens = int(src_layer[0].shape[0] * src_layer[0].shape[1])
-    for plane_id, (src, dst) in enumerate(zip(src_layer, dst_layer, strict=True)):
+    planes = list(zip(src_layer, dst_layer, strict=True))
+    if planes_to_check is not None:
+        planes = planes[:planes_to_check]
+
+    for plane_id, (src, dst) in enumerate(planes):
         src_flat = src.reshape(page_tokens, -1)
         dst_flat = dst.reshape(page_tokens, -1)
         expected = src_flat.index_select(0, slot_mapping_full)
@@ -183,6 +193,9 @@ def test_sparse_direct_retrieve_writes_original_tokens_to_compact_scratch_slots(
     qk_rope_head_dim = 128
     dsa_head_dim = 128
     sentinel = -7.0
+    # Sparse attention consumes latent K/PE, i.e. the first two planes. The DSA
+    # indexer plane is not part of the LMCache latent scratch path under test.
+    planes_to_check = 2
 
     kv_format = KV_FORMAT_MLA if fmt == "mla" else KV_FORMAT_DSA
     common = dict(
@@ -270,6 +283,7 @@ def test_sparse_direct_retrieve_writes_original_tokens_to_compact_scratch_slots(
                 f"{fmt}/batched_fused_single_layer_kv_transfer"
                 "(populate_cpu_chunks+dense_load)"
             ),
+            planes_to_check=planes_to_check,
         )
 
         if direct_path == "fast_cached_state":
@@ -327,6 +341,7 @@ def test_sparse_direct_retrieve_writes_original_tokens_to_compact_scratch_slots(
             selected_token_idx=selected_token_idx,
             sentinel=sentinel,
             label=f"{fmt}/{direct_path}: {kernel_label}",
+            planes_to_check=planes_to_check,
         )
     finally:
         release_pin_memory_objects(mem_objs)
