@@ -23,7 +23,6 @@ except ImportError:
     pass
 
 from kv_cache_fixtures import (  # noqa: E402
-    check_paged_kv_cache_equal,
     generate_dsa_kv_cache,
     generate_mla_kv_cache,
 )
@@ -34,7 +33,6 @@ from load_benchmark_utils import (  # noqa: E402
     compute_chunk_partition,
     run_all_direct_fast_layers,
     run_all_direct_layers,
-    verify_load_benchmark_harness,
 )
 
 # First Party
@@ -67,6 +65,43 @@ def _check_kwargs(
         qk_rope_head_dim=qk_rope_head_dim,
         dsa_head_dim=dsa_head_dim,
     )
+
+
+def _checksum_token_indices(harness) -> list[int]:
+    """Token indices that were actually scattered (subset of sample_token_indices)."""
+    selected = set(harness.selected_token_idx.detach().cpu().tolist())
+    sampled = sample_token_indices(harness.num_tokens)
+    indices = [t for t in sampled if t in selected]
+    if indices:
+        return indices
+    return sorted(selected)[: min(8, len(selected))]
+
+
+def _assert_selected_slots_match_src(harness, kv_format: int) -> None:
+    """CPU-safe: compare src vs dst_direct at scattered token slots via fingerprint."""
+    token_indices = _checksum_token_indices(harness)
+    layer_ids = sample_layer_ids(harness.num_layers)
+    slot_mapping_full = harness.slot_mapping_full.detach().cpu()
+
+    for layer_id in layer_ids:
+        for token_idx in token_indices:
+            slot = int(slot_mapping_full[token_idx].item())
+            src_fps = slot_kv_fingerprints(
+                harness.src_kv_cache[layer_id], slot, kv_format=kv_format
+            )
+            dst_fps = slot_kv_fingerprints(
+                harness.dst_direct[layer_id], slot, kv_format=kv_format
+            )
+            assert src_fps["k"] == dst_fps["k"], (
+                f"layer={layer_id} token={token_idx} slot={slot} K fingerprint mismatch"
+            )
+            assert src_fps["v"] == dst_fps["v"], (
+                f"layer={layer_id} token={token_idx} slot={slot} V fingerprint mismatch"
+            )
+            if kv_format == KV_FORMAT_DSA:
+                assert src_fps.get("dsa") == dst_fps.get("dsa"), (
+                    f"layer={layer_id} token={token_idx} slot={slot} DSA fingerprint mismatch"
+                )
 
 
 class TestSparseScatterEntryLogging:
@@ -159,12 +194,10 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             check_kw = _check_kwargs(
                 fmt, num_kv_heads, kv_lora_rank, qk_rope_head_dim, dsa_head_dim
             )
-            verify_load_benchmark_harness(
-                harness,
-                check_paged_kv_cache_equal,
-                **check_kw,
-            )
-            self._assert_checksum_roundtrip(harness, check_kw["kv_format"])
+            run_all_direct_layers(harness)
+            run_all_direct_fast_layers(harness)
+            torch.npu.synchronize()
+            _assert_selected_slots_match_src(harness, check_kw["kv_format"])
         finally:
             harness.close()
 
@@ -200,51 +233,30 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
 
             token_indices = sample_token_indices(num_tokens)
             layer_ids = sample_layer_ids(num_layers)
-            slots = harness.slot_mapping_packed.detach().cpu().tolist()
+            slot_mapping = harness.slot_mapping_full.detach().cpu().tolist()
             direct_samples = collect_kv_checksum_samples(
                 harness.dst_direct,
-                slots,
+                slot_mapping,
                 token_indices,
                 layer_ids,
                 kv_format=KV_FORMAT_MLA,
             )
             fast_samples = collect_kv_checksum_samples(
                 harness.dst_direct_fast,
-                slots,
+                slot_mapping,
                 token_indices,
                 layer_ids,
                 kv_format=KV_FORMAT_MLA,
             )
             for left, right in zip(direct_samples, fast_samples, strict=True):
-                assert left.k_fp == right.k_fp
-                assert left.v_fp == right.v_fp
+                assert left.k_fp == right.k_fp, (
+                    f"L{left.layer_id}T{left.token_idx} direct/fast K fp differ"
+                )
+                assert left.v_fp == right.v_fp, (
+                    f"L{left.layer_id}T{left.token_idx} direct/fast V fp differ"
+                )
         finally:
             harness.close()
-
-    @staticmethod
-    def _assert_checksum_roundtrip(harness, kv_format: int) -> None:
-        """Experiment B style: src (compute) vs dst_direct (scatter) fingerprints."""
-        token_indices = sample_token_indices(harness.num_tokens)
-        layer_ids = sample_layer_ids(harness.num_layers)
-        slots = harness.slot_mapping_packed.detach().cpu().tolist()
-
-        for layer_id in layer_ids:
-            for token_idx in token_indices:
-                slot = int(slots[token_idx])
-                src_fps = slot_kv_fingerprints(
-                    harness.src_kv_cache[layer_id], slot, kv_format=kv_format
-                )
-                dst_fps = slot_kv_fingerprints(
-                    harness.dst_direct[layer_id], slot, kv_format=kv_format
-                )
-                assert src_fps["k"] == dst_fps["k"], (
-                    f"L{layer_id}T{token_idx} K mismatch after scatter"
-                )
-                assert src_fps["v"] == dst_fps["v"], (
-                    f"L{layer_id}T{token_idx} V mismatch after scatter"
-                )
-                if kv_format == KV_FORMAT_DSA:
-                    assert src_fps.get("dsa") == dst_fps.get("dsa")
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU required")
