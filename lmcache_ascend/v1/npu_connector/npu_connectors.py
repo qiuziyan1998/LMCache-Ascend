@@ -1366,6 +1366,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             use_fast_path=layer_state is not None,
         )
 
+        # Diag: log selected_token_idx[0..7] and slot_mapping_packed[0..7] to
+        # detect whether Run2 cache-hit passes a degenerate selection (all 0 /
+        # all same) that makes the scatter broadcast one token's KV to all
+        # slots. Gated by LMCACHE_DIAG_KV_CHECKSUM.
+        try:
+            from lmcache.v1.kv_checksum_diag import kv_checksum_diag_enabled
+            if kv_checksum_diag_enabled() and layer_id == 0:
+                sti = selected_token_idx.detach().cpu().tolist()[:8]
+                smp = slot_mapping_packed.detach().cpu().tolist()[:8]
+                n_unique_sti = len(set(selected_token_idx.detach().cpu().tolist()))
+                from lmcache.v1.kv_checksum_diag import log_kv_checksum_diag
+                log_kv_checksum_diag(
+                    "scatter_inputs req=%s layer=0 num_sparse=%d "
+                    "selected_token_idx[:8]=%s slot_mapping_packed[:8]=%s "
+                    "unique_selected=%d/%d",
+                    getattr(self, "_sparse_transfer_req_id", None),
+                    num_sparse,
+                    sti,
+                    smp,
+                    n_unique_sti,
+                    num_sparse,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
