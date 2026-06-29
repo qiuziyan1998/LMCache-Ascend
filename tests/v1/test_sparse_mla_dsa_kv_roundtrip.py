@@ -334,6 +334,113 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU required")
+class TestDsaPopulateVsScatterIsolation:
+    """Isolate whether DSA is lost in src->cpu (populate) or cpu->dst (scatter).
+
+    Uses a single-chunk DSA layout so localTokenIdx == globalTokenIdx, making
+    the CPU chunk DSA plane offset trivially auditable.
+
+    CPU chunk (non-interleaved) layout for DSA, per chunk of N tokens:
+        [ K plane: N*kH | V plane: N*vH | DSA plane: N*dsaH ]
+    DSA for local token t lives at:
+        offset = N*(kH+vH) + t*dsaH, length dsaH
+    """
+
+    def test_dsa_populate_and_scatter_isolation(self) -> None:
+        num_tokens = 256
+        chunk_size = 256  # single chunk
+        num_layers = 1
+        num_blocks = 512
+        block_size = 16
+        num_kv_heads = 8
+        kv_lora_rank = 512
+        qk_rope_head_dim = 128
+        dsa_head_dim = 128
+        kH = num_kv_heads * kv_lora_rank  # 4096
+        vH = num_kv_heads * qk_rope_head_dim  # 1024
+        dsaH = dsa_head_dim  # 128
+        common = dict(
+            num_blocks=num_blocks,
+            device="npu",
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_size=block_size,
+            dtype=torch.bfloat16,
+        )
+        harness = None
+        try:
+            src = generate_dsa_kv_cache(dsa_head_dim=dsa_head_dim, **common)
+            harness = build_load_benchmark_harness(
+                fmt="dsa",
+                src_kv_cache=src,
+                num_tokens=num_tokens,
+                chunk_size=chunk_size,
+                num_layers=num_layers,
+                num_selected=num_tokens,  # dense select: all tokens
+                seed=42,
+            )
+            # populate already ran inside build_load_benchmark_harness.
+            slot_mapping_full = harness.slot_mapping_full.detach().cpu().tolist()
+            chunk0 = harness.stacked_by_layer[0][0].detach().cpu()
+            num_lmc = chunk_size  # single full chunk
+
+            # ---- Stage 1: src DSA vs CPU chunk DSA plane (populate check) ----
+            src_dsa = harness.src_kv_cache[0][2].reshape(-1, dsaH).detach().cpu()
+            dsa_plane_start = num_lmc * (kH + vH)
+            populate_mismatches: list[str] = []
+            for t in range(num_tokens):
+                cpu_dsa_t = chunk0[dsa_plane_start + t * dsaH : dsa_plane_start + (t + 1) * dsaH]
+                slot = int(slot_mapping_full[t])
+                if not torch.equal(src_dsa[slot], cpu_dsa_t):
+                    populate_mismatches.append(f"token{t}slot{slot}")
+
+            # ---- Stage 2: scatter cpu->dst_direct DSA ----
+            run_all_direct_layers(harness)
+            torch.npu.synchronize()
+            slots_packed = harness.slot_mapping_packed.detach().cpu().tolist()
+            selected = harness.selected_token_idx.detach().cpu().tolist()
+            dst_dsa = harness.dst_direct[0][2].reshape(-1, dsaH).detach().cpu()
+            scatter_mismatches: list[str] = []
+            for pi, gtok in enumerate(selected):
+                local_t = gtok % chunk_size
+                cpu_dsa_t = chunk0[dsa_plane_start + local_t * dsaH : dsa_plane_start + (local_t + 1) * dsaH]
+                slot = int(slots_packed[pi])
+                if not torch.equal(dst_dsa[slot], cpu_dsa_t):
+                    scatter_mismatches.append(f"packed{pi}gtok{gtok}slot{slot}")
+
+            populate_ok = not populate_mismatches
+            scatter_ok = not scatter_mismatches
+            summary = (
+                f"populate(src->cpu)={'OK' if populate_ok else 'BROKEN'} "
+                f"({len(populate_mismatches)}/{num_tokens} mismatched, "
+                f"first 5: {populate_mismatches[:5]}); "
+                f"scatter(cpu->dst)={'OK' if scatter_ok else 'BROKEN'} "
+                f"({len(scatter_mismatches)}/{len(selected)} mismatched, "
+                f"first 5: {scatter_mismatches[:5]})"
+            )
+            # Don't hard-fail: report which stage is broken. But assert so the
+            # test surfaces in CI with the summary.
+            if not (populate_ok and scatter_ok):
+                raise AssertionError(f"DSA isolation: {summary}")
+            # If both OK but the full roundtrip test still fails, the issue is
+            # elsewhere (layout interpretation in the roundtrip checker).
+        except AssertionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(
+                f"test failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            ) from None
+        finally:
+            if harness is not None:
+                try:
+                    harness.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU required")
 def test_chunk_partition_matches_long_prompt() -> None:
     """Sanity: 18879-token partition matches production chunk layout."""
     part = compute_chunk_partition(18879, 256)
