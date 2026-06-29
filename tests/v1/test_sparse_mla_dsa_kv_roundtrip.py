@@ -38,12 +38,10 @@ from load_benchmark_utils import (  # noqa: E402
 
 # First Party
 from lmcache.v1.kv_checksum_diag import (  # noqa: E402
-    collect_kv_checksum_samples,
     log_sparse_scatter_entry,
     reset_kv_checksum_diag_state,
     sample_layer_ids,
     sample_token_indices,
-    slot_kv_fingerprints,
 )
 
 
@@ -51,14 +49,11 @@ def _npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _checksum_token_indices(selected_idx_npu, num_tokens: int) -> list[int]:
-    """Token indices that were actually scattered AND in the diagnostic sample set."""
-    selected = set(selected_idx_npu.detach().cpu().tolist())
-    sampled = sample_token_indices(num_tokens)
-    indices = [t for t in sampled if t in selected]
-    if indices:
-        return indices
-    return sorted(selected)[: min(8, len(selected))]
+def _sample_packed_indices(num_packed: int, max_samples: int = 32) -> list[int]:
+    if num_packed <= max_samples:
+        return list(range(num_packed))
+    step = max(1, num_packed // max_samples)
+    return list(range(0, num_packed, step))[:max_samples]
 
 
 class TestSparseScatterEntryLogging:
@@ -107,11 +102,15 @@ class TestSparseScatterEntryLogging:
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU required")
 class TestSparseMlaDsaStoreRetrieveRoundtrip:
-    """GPU compute KV (src) vs sparse_mla_dsa scatter (dst) checksum on NPU.
+    """sparse_mla_dsa_batched_direct_kv_transfer store/retrieve roundtrip.
 
-    All NPU-tensor-bearing logic is inlined and wrapped in try/except so pytest
-    never has to repr an NPU tensor (which segfaults on Ascend) when reporting
-    failures. Assertions are converted to plain-text AssertionError.
+    Comparison mirrors kv_cache_fixtures.check_paged_kv_cache_equal but is
+    inlined and done on CPU so that:
+      1. MLA/DSA layout is reshaped correctly to [-1, num_heads, kv_lora_rank]
+         (NOT [-1, kv_lora_rank] which would read a single head's row).
+      2. pytest never reprs an NPU tensor (segfaults on Ascend) -- the only
+         frame with NPU tensors is the test method body, whose args are
+         (self, fmt, num_selected): plain str/int.
     """
 
     @pytest.mark.parametrize("fmt", ["mla", "dsa"])
@@ -158,41 +157,77 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             run_all_direct_fast_layers(harness)
             torch.npu.synchronize()
 
-            token_indices = _checksum_token_indices(
-                harness.selected_token_idx, harness.num_tokens
-            )
+            slots_npu = harness.slot_mapping_packed
+            num_packed = int(slots_npu.numel())
+            slots = slots_npu.detach().cpu().tolist()
+            packed_idx_to_check = _sample_packed_indices(num_packed)
             layer_ids = sample_layer_ids(harness.num_layers)
-            slot_mapping_full = harness.slot_mapping_full.detach().cpu()
+
             mismatches: list[str] = []
             for layer_id in layer_ids:
-                for token_idx in token_indices:
-                    slot = int(slot_mapping_full[token_idx].item())
-                    src_fps = slot_kv_fingerprints(
-                        harness.src_kv_cache[layer_id], slot, kv_format=kv_format
-                    )
-                    dst_fps = slot_kv_fingerprints(
-                        harness.dst_direct[layer_id], slot, kv_format=kv_format
-                    )
-                    if src_fps["k"] != dst_fps["k"]:
+                src_layer = harness.src_kv_cache[layer_id]
+                dst_dir = harness.dst_direct[layer_id]
+                dst_fast = harness.dst_direct_fast[layer_id]
+
+                src_k = src_layer[0].reshape(
+                    -1, num_kv_heads, kv_lora_rank
+                ).detach().cpu()
+                dst_dir_k = dst_dir[0].reshape(
+                    -1, num_kv_heads, kv_lora_rank
+                ).detach().cpu()
+                dst_fast_k = dst_fast[0].reshape(
+                    -1, num_kv_heads, kv_lora_rank
+                ).detach().cpu()
+                src_v = src_layer[1].reshape(
+                    -1, num_kv_heads, qk_rope_head_dim
+                ).detach().cpu()
+                dst_dir_v = dst_dir[1].reshape(
+                    -1, num_kv_heads, qk_rope_head_dim
+                ).detach().cpu()
+                dst_fast_v = dst_fast[1].reshape(
+                    -1, num_kv_heads, qk_rope_head_dim
+                ).detach().cpu()
+
+                src_dsa = dst_dir_dsa = dst_fast_dsa = None
+                if kv_format == KV_FORMAT_DSA:
+                    src_dsa = src_layer[2].reshape(-1, dsa_head_dim).detach().cpu()
+                    dst_dir_dsa = dst_dir[2].reshape(-1, dsa_head_dim).detach().cpu()
+                    dst_fast_dsa = dst_fast[2].reshape(-1, dsa_head_dim).detach().cpu()
+
+                for pi in packed_idx_to_check:
+                    slot = int(slots[pi])
+                    if not torch.equal(src_k[slot], dst_dir_k[slot]):
                         mismatches.append(
-                            f"L{layer_id}T{token_idx}slot{slot} K "
-                            f"{src_fps['k']}!={dst_fps['k']}"
+                            f"direct L{layer_id}P{pi}slot{slot} K mismatch"
                         )
-                    if src_fps["v"] != dst_fps["v"]:
+                    if not torch.equal(src_v[slot], dst_dir_v[slot]):
                         mismatches.append(
-                            f"L{layer_id}T{token_idx}slot{slot} V "
-                            f"{src_fps['v']}!={dst_fps['v']}"
+                            f"direct L{layer_id}P{pi}slot{slot} V mismatch"
                         )
-                    if kv_format == KV_FORMAT_DSA and src_fps.get("dsa") != dst_fps.get(
-                        "dsa"
-                    ):
+                    if not torch.equal(src_k[slot], dst_fast_k[slot]):
                         mismatches.append(
-                            f"L{layer_id}T{token_idx}slot{slot} DSA mismatch"
+                            f"fast L{layer_id}P{pi}slot{slot} K mismatch"
                         )
+                    if not torch.equal(src_v[slot], dst_fast_v[slot]):
+                        mismatches.append(
+                            f"fast L{layer_id}P{pi}slot{slot} V mismatch"
+                        )
+                    if src_dsa is not None:
+                        if not torch.equal(src_dsa[slot], dst_dir_dsa[slot]):
+                            mismatches.append(
+                                f"direct L{layer_id}P{pi}slot{slot} DSA mismatch"
+                            )
+                        if not torch.equal(src_dsa[slot], dst_fast_dsa[slot]):
+                            mismatches.append(
+                                f"fast L{layer_id}P{pi}slot{slot} DSA mismatch"
+                            )
             assert not mismatches, (
-                f"sparse scatter vs src checksum mismatch "
-                f"fmt={fmt} num_selected={num_selected}: {mismatches[:5]}"
+                f"sparse scatter roundtrip mismatch fmt={fmt} "
+                f"num_selected={num_selected} (showing first 8 of "
+                f"{len(mismatches)}): {mismatches[:8]}"
             )
+        except AssertionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise AssertionError(
                 f"test failed fmt={fmt} num_selected={num_selected}: "
@@ -205,17 +240,20 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def test_direct_and_fast_paths_agree_on_checksum(self) -> None:
+    def test_direct_and_fast_paths_agree(self) -> None:
         num_tokens = 512
         num_layers = 2
         num_selected = 512
+        num_kv_heads = 8
+        kv_lora_rank = 512
+        qk_rope_head_dim = 128
         common = dict(
             num_blocks=256,
             device="npu",
             num_layers=num_layers,
-            num_kv_heads=8,
-            kv_lora_rank=512,
-            qk_rope_head_dim=128,
+            num_kv_heads=num_kv_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             block_size=16,
             dtype=torch.bfloat16,
         )
@@ -235,36 +273,35 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             run_all_direct_fast_layers(harness)
             torch.npu.synchronize()
 
-            token_indices = sample_token_indices(num_tokens)
+            slots = harness.slot_mapping_packed.detach().cpu().tolist()
+            packed_idx_to_check = _sample_packed_indices(len(slots))
             layer_ids = sample_layer_ids(num_layers)
-            slot_mapping = harness.slot_mapping_full.detach().cpu().tolist()
-            direct_samples = collect_kv_checksum_samples(
-                harness.dst_direct,
-                slot_mapping,
-                token_indices,
-                layer_ids,
-                kv_format=KV_FORMAT_MLA,
-            )
-            fast_samples = collect_kv_checksum_samples(
-                harness.dst_direct_fast,
-                slot_mapping,
-                token_indices,
-                layer_ids,
-                kv_format=KV_FORMAT_MLA,
-            )
             mismatches: list[str] = []
-            for left, right in zip(direct_samples, fast_samples, strict=True):
-                if left.k_fp != right.k_fp:
-                    mismatches.append(
-                        f"L{left.layer_id}T{left.token_idx} K "
-                        f"{left.k_fp}!={right.k_fp}"
-                    )
-                if left.v_fp != right.v_fp:
-                    mismatches.append(
-                        f"L{left.layer_id}T{left.token_idx} V "
-                        f"{left.v_fp}!={right.v_fp}"
-                    )
-            assert not mismatches, f"direct vs fast disagree: {mismatches[:5]}"
+            for layer_id in layer_ids:
+                dst_dir_k = harness.dst_direct[layer_id][0].reshape(
+                    -1, num_kv_heads, kv_lora_rank
+                ).detach().cpu()
+                dst_fast_k = harness.dst_direct_fast[layer_id][0].reshape(
+                    -1, num_kv_heads, kv_lora_rank
+                ).detach().cpu()
+                dst_dir_v = harness.dst_direct[layer_id][1].reshape(
+                    -1, num_kv_heads, qk_rope_head_dim
+                ).detach().cpu()
+                dst_fast_v = harness.dst_direct_fast[layer_id][1].reshape(
+                    -1, num_kv_heads, qk_rope_head_dim
+                ).detach().cpu()
+                for pi in packed_idx_to_check:
+                    slot = int(slots[pi])
+                    if not torch.equal(dst_dir_k[slot], dst_fast_k[slot]):
+                        mismatches.append(f"L{layer_id}P{pi}slot{slot} K direct/fast differ")
+                    if not torch.equal(dst_dir_v[slot], dst_fast_v[slot]):
+                        mismatches.append(f"L{layer_id}P{pi}slot{slot} V direct/fast differ")
+            assert not mismatches, (
+                f"direct vs fast disagree (first 8 of {len(mismatches)}): "
+                f"{mismatches[:8]}"
+            )
+        except AssertionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise AssertionError(
                 f"test failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
