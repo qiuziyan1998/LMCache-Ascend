@@ -113,26 +113,7 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
          (self, fmt, num_selected): plain str/int.
     """
 
-    @pytest.mark.parametrize(
-        "fmt",
-        [
-            "mla",
-            pytest.param(
-                "dsa",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason=(
-                        "sparse_mla_dsa_batched_direct_kv_transfer does not "
-                        "correctly scatter the DSA plane (K/V are fine) -- "
-                        "under investigation in "
-                        "LMCache-Ascend/csrc/mem_kernels.cpp "
-                        "launch_sparse_multi_chunk_direct_kernel"
-                    ),
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("fmt", ["mla", "dsa"])
     @pytest.mark.parametrize("num_selected", [256, 2048])
     def test_sparse_direct_matches_src_checksum(
         self, fmt: str, num_selected: int
