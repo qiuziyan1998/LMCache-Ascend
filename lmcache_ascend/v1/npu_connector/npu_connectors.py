@@ -1601,16 +1601,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if self.kv_format == KVCacheFormat.SEPARATE_KV:
                 key_tensor = first_layer_cache[0]
                 k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = first_layer_cache[1].shape
                 num_elements = key_tensor.numel() * 2
                 max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
             elif self.kv_format == KVCacheFormat.MLA_KV:
                 key_tensor, value_tensor = first_layer_cache
                 k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = value_tensor.shape
                 max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
                 num_elements = max_tokens * (self.k_hidden_dims + self.v_hidden_dims)
             elif self.kv_format == KVCacheFormat.DSA_KV:
-                key_tensor, _, _ = first_layer_cache
+                key_tensor, value_tensor, dsa_tensor = first_layer_cache
                 k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = value_tensor.shape
                 max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
                 num_elements = max_tokens * (
                     self.k_hidden_dims + self.v_hidden_dims + self.dsa_hidden_dims
@@ -1618,8 +1621,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else:
                 if self.vllm_two_major:
                     k_cache_shape_per_layer = first_layer_cache[0].shape
+                    v_cache_shape_per_layer = first_layer_cache[1].shape
                 else:
                     k_cache_shape_per_layer = first_layer_cache[:, 0].shape
+                    v_cache_shape_per_layer = first_layer_cache[:, 1].shape
                 num_elements = k_cache_shape_per_layer.numel() * 2
                 max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
 
@@ -1627,7 +1632,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"Lazily initializing GPU buffer:\n"
                 f"  - Format: {self.kv_format.name}\n"
                 f"  - Key cache shape per layer: {k_cache_shape_per_layer}\n"
-                f"  - Max tokens: {max_tokens}"
+                f"  - Value cache shape per layer: {v_cache_shape_per_layer}\n"
+                f"  - Max tokens: {max_tokens}\n"
+                f"  - k_hidden_dims={self.k_hidden_dims} "
+                f"v_hidden_dims={self.v_hidden_dims} "
+                f"dsa_hidden_dims={getattr(self, 'dsa_hidden_dims', 0)}"
             )
 
             gpu_buffer_size = num_elements * self.element_size
@@ -2019,6 +2028,68 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         v_hidden_dims,
                         dsa_hidden_dims,
                     )
+
+                    # Diag: verify store kernel wrote correct KV to CPU chunk.
+                    # Compare CPU chunk K/V (after kernel) vs GPU K/V (source)
+                    # for a few tokens in the first chunk. Gated by
+                    # LMCACHE_DIAG_KV_CHECKSUM.
+                    if (
+                        layer_id == 0
+                        and os.environ.get(
+                            "LMCACHE_DIAG_KV_CHECKSUM", ""
+                        ).lower()
+                        in ("1", "true", "yes")
+                        and cpu_tensors
+                        and len(chunk_sizes) > 0
+                    ):
+                        try:
+                            self.store_stream.synchronize()
+                            from lmcache.v1.kv_checksum_diag import (
+                                tensor_fingerprint,
+                                log_kv_checksum_diag,
+                            )
+
+                            ct = cpu_tensors[0].cpu()
+                            ct_k = ct[: chunk_sizes[0] * k_hidden_dims].reshape(
+                                chunk_sizes[0], k_hidden_dims
+                            )
+                            ct_v = ct[
+                                chunk_sizes[0] * k_hidden_dims :
+                                chunk_sizes[0] * (k_hidden_dims + v_hidden_dims)
+                            ].reshape(chunk_sizes[0], v_hidden_dims)
+                            gpu_k = self.kvcaches[layer_id][0].reshape(
+                                -1, k_hidden_dims
+                            )
+                            gpu_v = self.kvcaches[layer_id][1].reshape(
+                                -1, v_hidden_dims
+                            )
+                            slots = slot_mapping_full[: chunk_sizes[0]].cpu()
+                            mismatches = []
+                            for t in [0, chunk_sizes[0] // 2, chunk_sizes[0] - 1]:
+                                if t >= chunk_sizes[0]:
+                                    continue
+                                slot = int(slots[t].item())
+                                cpu_k_fp = tensor_fingerprint(ct_k[t])
+                                gpu_k_fp = tensor_fingerprint(gpu_k[slot])
+                                cpu_v_fp = tensor_fingerprint(ct_v[t])
+                                gpu_v_fp = tensor_fingerprint(gpu_v[slot])
+                                if cpu_k_fp != gpu_k_fp or cpu_v_fp != gpu_v_fp:
+                                    mismatches.append(
+                                        f"t{t}slot{slot} "
+                                        f"K cpu={cpu_k_fp} gpu={gpu_k_fp} "
+                                        f"V cpu={cpu_v_fp} gpu={gpu_v_fp}"
+                                    )
+                            log_kv_checksum_diag(
+                                "store_kernel_check layer=0 chunk0 "
+                                "tokens=%d kH=%d vH=%d mismatches=%d %s",
+                                chunk_sizes[0],
+                                k_hidden_dims,
+                                v_hidden_dims,
+                                len(mismatches),
+                                mismatches[:3],
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                 else:
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
