@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # Standard
 import sys
+import traceback
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,58 +51,14 @@ def _npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _check_kwargs(
-    fmt: str,
-    num_kv_heads: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    dsa_head_dim: int,
-) -> dict:
-    return dict(
-        num_heads=num_kv_heads,
-        head_size=128,
-        kv_format=KV_FORMAT_MLA if fmt == "mla" else KV_FORMAT_DSA,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        dsa_head_dim=dsa_head_dim,
-    )
-
-
-def _checksum_token_indices(harness) -> list[int]:
-    """Token indices that were actually scattered (subset of sample_token_indices)."""
-    selected = set(harness.selected_token_idx.detach().cpu().tolist())
-    sampled = sample_token_indices(harness.num_tokens)
+def _checksum_token_indices(selected_idx_npu, num_tokens: int) -> list[int]:
+    """Token indices that were actually scattered AND in the diagnostic sample set."""
+    selected = set(selected_idx_npu.detach().cpu().tolist())
+    sampled = sample_token_indices(num_tokens)
     indices = [t for t in sampled if t in selected]
     if indices:
         return indices
     return sorted(selected)[: min(8, len(selected))]
-
-
-def _assert_selected_slots_match_src(harness, kv_format: int) -> None:
-    """CPU-safe: compare src vs dst_direct at scattered token slots via fingerprint."""
-    token_indices = _checksum_token_indices(harness)
-    layer_ids = sample_layer_ids(harness.num_layers)
-    slot_mapping_full = harness.slot_mapping_full.detach().cpu()
-
-    for layer_id in layer_ids:
-        for token_idx in token_indices:
-            slot = int(slot_mapping_full[token_idx].item())
-            src_fps = slot_kv_fingerprints(
-                harness.src_kv_cache[layer_id], slot, kv_format=kv_format
-            )
-            dst_fps = slot_kv_fingerprints(
-                harness.dst_direct[layer_id], slot, kv_format=kv_format
-            )
-            assert src_fps["k"] == dst_fps["k"], (
-                f"layer={layer_id} token={token_idx} slot={slot} K fingerprint mismatch"
-            )
-            assert src_fps["v"] == dst_fps["v"], (
-                f"layer={layer_id} token={token_idx} slot={slot} V fingerprint mismatch"
-            )
-            if kv_format == KV_FORMAT_DSA:
-                assert src_fps.get("dsa") == dst_fps.get("dsa"), (
-                    f"layer={layer_id} token={token_idx} slot={slot} DSA fingerprint mismatch"
-                )
 
 
 class TestSparseScatterEntryLogging:
@@ -150,7 +107,12 @@ class TestSparseScatterEntryLogging:
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU required")
 class TestSparseMlaDsaStoreRetrieveRoundtrip:
-    """GPU compute KV (src) vs sparse_mla_dsa scatter (dst) checksum on NPU."""
+    """GPU compute KV (src) vs sparse_mla_dsa scatter (dst) checksum on NPU.
+
+    All NPU-tensor-bearing logic is inlined and wrapped in try/except so pytest
+    never has to repr an NPU tensor (which segfaults on Ascend) when reporting
+    failures. Assertions are converted to plain-text AssertionError.
+    """
 
     @pytest.mark.parametrize("fmt", ["mla", "dsa"])
     @pytest.mark.parametrize("num_selected", [256, 2048])
@@ -158,14 +120,14 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
         self, fmt: str, num_selected: int
     ) -> None:
         num_tokens = 1024 if num_selected <= 1024 else 4096
-        chunk_size = 256
         num_layers = 2
-        num_blocks = 2048
+        num_blocks = 512
         block_size = 16
         num_kv_heads = 8
         kv_lora_rank = 512
         qk_rope_head_dim = 128
         dsa_head_dim = 128
+        kv_format = KV_FORMAT_MLA if fmt == "mla" else KV_FORMAT_DSA
         common = dict(
             num_blocks=num_blocks,
             device="npu",
@@ -176,38 +138,79 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             block_size=block_size,
             dtype=torch.bfloat16,
         )
-        src = (
-            generate_mla_kv_cache(**common)
-            if fmt == "mla"
-            else generate_dsa_kv_cache(dsa_head_dim=dsa_head_dim, **common)
-        )
-        harness = build_load_benchmark_harness(
-            fmt=fmt,
-            src_kv_cache=src,
-            num_tokens=num_tokens,
-            chunk_size=chunk_size,
-            num_layers=num_layers,
-            num_selected=num_selected,
-            seed=42,
-        )
+        harness = None
         try:
-            check_kw = _check_kwargs(
-                fmt, num_kv_heads, kv_lora_rank, qk_rope_head_dim, dsa_head_dim
+            src = (
+                generate_mla_kv_cache(**common)
+                if fmt == "mla"
+                else generate_dsa_kv_cache(dsa_head_dim=dsa_head_dim, **common)
+            )
+            harness = build_load_benchmark_harness(
+                fmt=fmt,
+                src_kv_cache=src,
+                num_tokens=num_tokens,
+                chunk_size=256,
+                num_layers=num_layers,
+                num_selected=num_selected,
+                seed=42,
             )
             run_all_direct_layers(harness)
             run_all_direct_fast_layers(harness)
             torch.npu.synchronize()
-            _assert_selected_slots_match_src(harness, check_kw["kv_format"])
+
+            token_indices = _checksum_token_indices(
+                harness.selected_token_idx, harness.num_tokens
+            )
+            layer_ids = sample_layer_ids(harness.num_layers)
+            slot_mapping_full = harness.slot_mapping_full.detach().cpu()
+            mismatches: list[str] = []
+            for layer_id in layer_ids:
+                for token_idx in token_indices:
+                    slot = int(slot_mapping_full[token_idx].item())
+                    src_fps = slot_kv_fingerprints(
+                        harness.src_kv_cache[layer_id], slot, kv_format=kv_format
+                    )
+                    dst_fps = slot_kv_fingerprints(
+                        harness.dst_direct[layer_id], slot, kv_format=kv_format
+                    )
+                    if src_fps["k"] != dst_fps["k"]:
+                        mismatches.append(
+                            f"L{layer_id}T{token_idx}slot{slot} K "
+                            f"{src_fps['k']}!={dst_fps['k']}"
+                        )
+                    if src_fps["v"] != dst_fps["v"]:
+                        mismatches.append(
+                            f"L{layer_id}T{token_idx}slot{slot} V "
+                            f"{src_fps['v']}!={dst_fps['v']}"
+                        )
+                    if kv_format == KV_FORMAT_DSA and src_fps.get("dsa") != dst_fps.get(
+                        "dsa"
+                    ):
+                        mismatches.append(
+                            f"L{layer_id}T{token_idx}slot{slot} DSA mismatch"
+                        )
+            assert not mismatches, (
+                f"sparse scatter vs src checksum mismatch "
+                f"fmt={fmt} num_selected={num_selected}: {mismatches[:5]}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(
+                f"test failed fmt={fmt} num_selected={num_selected}: "
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            ) from None
         finally:
-            harness.close()
+            if harness is not None:
+                try:
+                    harness.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def test_direct_and_fast_paths_agree_on_checksum(self) -> None:
         num_tokens = 512
-        chunk_size = 256
         num_layers = 2
         num_selected = 512
         common = dict(
-            num_blocks=512,
+            num_blocks=256,
             device="npu",
             num_layers=num_layers,
             num_kv_heads=8,
@@ -216,17 +219,18 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             block_size=16,
             dtype=torch.bfloat16,
         )
-        src = generate_mla_kv_cache(**common)
-        harness = build_load_benchmark_harness(
-            fmt="mla",
-            src_kv_cache=src,
-            num_tokens=num_tokens,
-            chunk_size=chunk_size,
-            num_layers=num_layers,
-            num_selected=num_selected,
-            seed=7,
-        )
+        harness = None
         try:
+            src = generate_mla_kv_cache(**common)
+            harness = build_load_benchmark_harness(
+                fmt="mla",
+                src_kv_cache=src,
+                num_tokens=num_tokens,
+                chunk_size=256,
+                num_layers=num_layers,
+                num_selected=num_selected,
+                seed=7,
+            )
             run_all_direct_layers(harness)
             run_all_direct_fast_layers(harness)
             torch.npu.synchronize()
@@ -248,15 +252,29 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
                 layer_ids,
                 kv_format=KV_FORMAT_MLA,
             )
+            mismatches: list[str] = []
             for left, right in zip(direct_samples, fast_samples, strict=True):
-                assert left.k_fp == right.k_fp, (
-                    f"L{left.layer_id}T{left.token_idx} direct/fast K fp differ"
-                )
-                assert left.v_fp == right.v_fp, (
-                    f"L{left.layer_id}T{left.token_idx} direct/fast V fp differ"
-                )
+                if left.k_fp != right.k_fp:
+                    mismatches.append(
+                        f"L{left.layer_id}T{left.token_idx} K "
+                        f"{left.k_fp}!={right.k_fp}"
+                    )
+                if left.v_fp != right.v_fp:
+                    mismatches.append(
+                        f"L{left.layer_id}T{left.token_idx} V "
+                        f"{left.v_fp}!={right.v_fp}"
+                    )
+            assert not mismatches, f"direct vs fast disagree: {mismatches[:5]}"
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(
+                f"test failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            ) from None
         finally:
-            harness.close()
+            if harness is not None:
+                try:
+                    harness.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU required")
