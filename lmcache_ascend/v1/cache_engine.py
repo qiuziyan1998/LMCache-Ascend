@@ -580,6 +580,31 @@ class AscendLMCacheEngine(LMCacheEngine):
             and len(cached_memory_objs) == num_layers
         )
 
+    def _ensure_layerwise_connector_layout(self, **kwargs) -> None:
+        """Initialize connector KV layout before allocating layerwise chunks.
+
+        gpu_connector.get_shape(num_tokens) depends on the MLA/DSA layout
+        being detected (kv_format, kv_lora_rank, qk_rope_head_dim, etc.),
+        which happens in _lazy_initialize_buffer. If store_layer is called
+        before that lazy init has run, get_shape returns a wrong shape and
+        the allocated MemoryObj chunks have the wrong size -- the store
+        kernel then writes KV into a malformed buffer, corrupting the cache.
+        This ensures the layout is initialized before any chunk allocation.
+        """
+        init_kvcaches = getattr(
+            self.gpu_connector, "initialize_kvcaches_ptr", None
+        )
+        lazy_init = getattr(
+            self.gpu_connector, "_lazy_initialize_buffer", None
+        )
+        if not callable(init_kvcaches) or not callable(lazy_init):
+            return
+        if "kvcaches" in kwargs:
+            init_kvcaches(**kwargs)
+        kvcaches = getattr(self.gpu_connector, "kvcaches", None)
+        if kvcaches is not None:
+            lazy_init(kvcaches)
+
     def _resolve_local_cpu_retrieve_location(
         self,
         fallback: Optional[str] = None,
@@ -850,6 +875,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+
+        # Ensure the connector's MLA/DSA layout is detected before allocating
+        # chunks -- get_shape(num_tokens) below depends on kv_lora_rank etc.
+        self._ensure_layerwise_connector_layout(**kwargs)
 
         prev_key = 0
         skipped_existing = 0
