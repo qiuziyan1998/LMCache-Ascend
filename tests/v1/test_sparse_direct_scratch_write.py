@@ -146,6 +146,51 @@ def _assert_full_staging_roundtrip(
             )
 
 
+def _assert_cpu_chunks_match_source(
+    *,
+    src_layer: tuple[torch.Tensor, ...],
+    stacked_cpu_chunks: list[torch.Tensor],
+    slot_mapping_full: torch.Tensor,
+    selected_token_idx: torch.Tensor,
+    chunk_size: int,
+    planes_to_check: int,
+    label: str,
+) -> None:
+    page_tokens = int(src_layer[0].shape[0] * src_layer[0].shape[1])
+    plane_widths = [
+        int(src_layer[plane_id].reshape(page_tokens, -1).shape[1])
+        for plane_id in range(planes_to_check)
+    ]
+    plane_offsets = [0]
+    for width in plane_widths[:-1]:
+        plane_offsets.append(plane_offsets[-1] + chunk_size * width)
+
+    selected_cpu = selected_token_idx.detach().cpu().to(torch.long).tolist()
+    slot_mapping_cpu = slot_mapping_full.detach().cpu().to(torch.long)
+    for logical_token in selected_cpu:
+        chunk_id = logical_token // chunk_size
+        local_token = logical_token % chunk_size
+        cpu_chunk = stacked_cpu_chunks[chunk_id]
+        source_slot = int(slot_mapping_cpu[logical_token].item())
+
+        for plane_id in range(planes_to_check):
+            src_flat = src_layer[plane_id].reshape(page_tokens, -1)
+            width = plane_widths[plane_id]
+            start = plane_offsets[plane_id] + local_token * width
+            actual = cpu_chunk[start : start + width].detach().cpu()
+            expected = src_flat[source_slot].detach().cpu().reshape(-1)
+            if not torch.equal(actual, expected):
+                diff = (actual.float() - expected.float()).abs()
+                max_diff = float(diff.max().item()) if diff.numel() else 0.0
+                pytest.fail(
+                    f"{label}: CPU chunk content mismatch before direct kernel; "
+                    f"logical_token={logical_token} chunk_id={chunk_id} "
+                    f"local_token={local_token} source_slot={source_slot} "
+                    f"plane={plane_id} max_abs_diff={max_diff}. "
+                    "This means LMCache stored wrong data before retrieve."
+                )
+
+
 @pytest.mark.parametrize("fmt", ["mla", "dsa"])
 @pytest.mark.parametrize(
     "direct_path",
@@ -257,6 +302,16 @@ def test_sparse_direct_retrieve_writes_original_tokens_to_compact_scratch_slots(
             partition=partition,
             dims=dims,
             kv_format=kv_format,
+        )
+        torch.npu.synchronize()
+        _assert_cpu_chunks_match_source(
+            src_layer=src_layer,
+            stacked_cpu_chunks=stacked_cpu_chunks,
+            slot_mapping_full=slot_mapping_full,
+            selected_token_idx=selected_token_idx,
+            chunk_size=chunk_size,
+            planes_to_check=planes_to_check,
+            label=f"{fmt}/populate_stacked_cpu_from_src",
         )
         chunk_ptrs_npu = build_chunk_ptrs_npu(stacked_cpu_chunks, torch.device(device))
         batched_fused_single_layer_kv_transfer(
