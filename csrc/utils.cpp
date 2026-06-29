@@ -532,7 +532,12 @@ void execute_batched_memcpy(
                            token_offset * v_bytes_per_token;
       uint8_t *host_k = host_base;
       uint8_t *host_v = host_k + meta.v_offsets[i];
-      uint8_t *host_dsa = host_v + meta.dsa_offsets[i];
+      // meta.dsa_offsets[i] is an absolute offset from host_base (=
+      // chunk*(kH+vH)*es), NOT relative to the V plane. Add it to host_k
+      // (== host_base), not host_v, otherwise the K plane is double-counted
+      // and DSA is copied to/from an out-of-chunk location, leaving the CPU
+      // chunk's DSA plane zero. See TestDsaPopulateVsScatterIsolation.
+      uint8_t *host_dsa = host_k + meta.dsa_offsets[i];
 
       if (!is_d2h) {
         ret = aclrtMemcpyAsync(staging_k, k_size, host_k, k_size, kind, stream);
