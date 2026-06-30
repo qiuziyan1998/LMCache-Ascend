@@ -27,7 +27,7 @@ logger = init_logger(__name__)
 
 def resolve_memory_format(use_mla: bool) -> MemoryFormat:
     """Return the appropriate :class:`MemoryFormat` based on MLA usage."""
-    return MemoryFormat.KV_MLA_FMT if use_mla else MemoryFormat.KV_2LTD
+    return MemoryFormat.KV_MLA_LATENT_FMT if use_mla else MemoryFormat.KV_2LTD
 
 
 def build_channel_transfer_spec(

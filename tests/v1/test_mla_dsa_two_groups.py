@@ -395,7 +395,7 @@ class TestStoreLayerPassiveGuard:
         engine.storage_manager = MagicMock()
         engine.gpu_connector = MagicMock()
         engine.metadata = MagicMock()
-        engine.fmt = MemoryFormat.KV_MLA_FMT
+        engine.fmt = MemoryFormat.KV_MLA_LATENT_FMT
         engine.token_database = MagicMock()
         engine.kv_dtype = torch.bfloat16
         engine.stats_monitor = MagicMock()

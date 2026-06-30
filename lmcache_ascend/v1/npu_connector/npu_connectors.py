@@ -1499,12 +1499,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
 
     def _expected_memory_format(self) -> MemoryFormat:
-        if self.kv_format == KVCacheFormat.MLA_LATENT:
+        if self.kv_format in (
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.MLA_LATENT,
+        ):
             return MemoryFormat.KV_MLA_LATENT_FMT
         if self.kv_format == KVCacheFormat.DSA_INDEX:
             return MemoryFormat.KV_DSA_INDEX_FMT
-        if self._is_mla_dsa_format():
-            return MemoryFormat.KV_MLA_FMT
+        if self.kv_format == KVCacheFormat.DSA_KV:
+            return MemoryFormat.KV_MLA_LATENT_FMT
         return MemoryFormat.KV_T2D
 
     def _lazy_initialize_buffer(self, kv_caches):
