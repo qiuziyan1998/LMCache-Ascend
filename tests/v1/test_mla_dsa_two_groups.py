@@ -203,6 +203,14 @@ class TestSaveSpec:
         assert spec.can_save is False
 
 
+def _block_ids(num_tokens: int, block_size: int = 16) -> list[int]:
+    """Enough vLLM block ids for slot_mapping construction in tests."""
+    if num_tokens <= 0:
+        return [0]
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    return list(range(num_blocks))
+
+
 # ---------------------------------------------------------------------------
 # from_request_tracker decode-full-chunk rule tests
 # ---------------------------------------------------------------------------
@@ -257,11 +265,12 @@ class TestFromRequestTrackerDecodeFullChunk:
         from lmcache.integration.vllm.vllm_v1_adapter import RequestTracker, ReqMeta
 
         # 256 saved + 256 new decode tokens = 512 → boundary crossed
+        num_tokens = 512
         tracker = RequestTracker(
             req_id="test_req",
             prompt_len=256,
-            token_ids=list(range(512)),
-            allocated_block_ids=[0],
+            token_ids=list(range(num_tokens)),
+            allocated_block_ids=_block_ids(num_tokens, block_size=16),
             num_saved_tokens=256,
         )
         tracker.is_decode_phase = True
@@ -322,15 +331,17 @@ class TestFromRequestTrackerDecodeFullChunk:
         assert req_meta.save_spec.can_save_latent is True
 
     def test_decode_without_full_chunk_rule_saves_normally(self):
-        """Regression: without save_full_chunk_in_decode, decode save works
-        as before (gated only by save_decode_cache)."""
+        """Regression: without save_full_chunk_in_decode, decode save still
+        requires the standard LMCache chunk boundary (not just save_decode_cache)."""
         from lmcache.integration.vllm.vllm_v1_adapter import RequestTracker, ReqMeta
 
+        # After 256 tokens saved, the next chunk boundary is 512 tokens total.
+        num_tokens = 512
         tracker = RequestTracker(
             req_id="test_req",
             prompt_len=256,
-            token_ids=list(range(257)),
-            allocated_block_ids=[0],
+            token_ids=list(range(num_tokens)),
+            allocated_block_ids=_block_ids(num_tokens, block_size=16),
             num_saved_tokens=256,
         )
         tracker.is_decode_phase = True
@@ -343,8 +354,6 @@ class TestFromRequestTrackerDecodeFullChunk:
             save_full_chunk_in_decode=False,
             dsa_two_groups=False,
         )
-        # Without the full-chunk rule, decode with save_decode_cache=True
-        # should allow saving (can_save=True)
         assert req_meta is not None
         assert req_meta.save_spec.can_save is True
 
@@ -359,32 +368,26 @@ class TestStoreLayerPassiveGuard:
     def test_passive_rank_skips_store_layer(self):
         """A passive rank (save_only_first_rank=True, not first rank) should
         skip store_layer entirely and just yield num_layers times."""
-        from lmcache.v1.cache_engine import CacheEngine
+        from lmcache.v1.cache_engine import LMCacheEngine
 
-        engine = MagicMock(spec=CacheEngine)
+        engine = MagicMock(spec=LMCacheEngine)
         engine._is_passive = MagicMock(return_value=True)
         engine.num_layers = 4
         engine.is_healthy = MagicMock(return_value=True)
 
-        # The store_layer method is defined on CacheEngine, but we need to
-        # call it with the right self. Use the actual method.
-        # Since store_layer is a generator, we need to drive it.
         tokens = [1, 2, 3, 4]
         mask = torch.tensor([True, True, True, True])
 
-        # Get the unbound method and call it with our mock
-        gen = CacheEngine.store_layer(engine, tokens, mask=mask)
+        gen = LMCacheEngine.store_layer(engine, tokens, mask=mask)
         results = list(gen)
-        # Should yield num_layers times (4) for the passive skip path
+        # Passive path yields once per layer, then returns.
         assert len(results) == 4
-        # storage_manager should NOT have been accessed (no actual store)
-        # The mock's storage_manager should not be touched
 
     def test_active_rank_proceeds_to_store(self):
         """An active rank (rank 0) should NOT skip — it should proceed."""
-        from lmcache.v1.cache_engine import CacheEngine
+        from lmcache.v1.cache_engine import LMCacheEngine
 
-        engine = MagicMock(spec=CacheEngine)
+        engine = MagicMock(spec=LMCacheEngine)
         engine._is_passive = MagicMock(return_value=False)
         engine.num_layers = 4
         engine.is_healthy = MagicMock(return_value=True)
@@ -394,12 +397,16 @@ class TestStoreLayerPassiveGuard:
         engine.metadata = MagicMock()
         engine.fmt = MemoryFormat.KV_MLA_FMT
         engine.token_database = MagicMock()
-        engine.num_layers = 4
         engine.kv_dtype = torch.bfloat16
         engine.stats_monitor = MagicMock()
         engine.stats_monitor.on_store_request = MagicMock(return_value="mon")
+        engine.stats_monitor.on_store_finished = MagicMock()
+        engine.kv_events_enabled = False
+        engine.retrieve_locations = None
+        engine.store_location = None
+        engine.config = MagicMock()
+        engine.config.get_extra_config_value = MagicMock(return_value=False)
 
-        # Make process_tokens return empty so the generator finishes quickly
         engine.token_database.process_tokens = MagicMock(return_value=iter([]))
         engine._get_req_id = MagicMock(return_value="test")
         engine._log_kvcache_for_check = MagicMock()
@@ -407,10 +414,10 @@ class TestStoreLayerPassiveGuard:
         tokens = [1, 2, 3, 4]
         mask = torch.tensor([True, True, True, True])
 
-        gen = CacheEngine.store_layer(engine, tokens, mask=mask)
-        # Drive it — should not raise; passive guard did not skip
+        gen = LMCacheEngine.store_layer(
+            engine, tokens, mask=mask, cached_keys=[]
+        )
         list(gen)
-        # storage_manager was accessed (not passive)
         engine.token_database.process_tokens.assert_called()
 
 
