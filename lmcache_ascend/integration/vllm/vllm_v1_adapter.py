@@ -72,7 +72,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    try:
+                        next(layerwise_storer)
+                    except StopIteration:
+                        pass
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()

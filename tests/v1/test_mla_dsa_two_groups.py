@@ -380,8 +380,8 @@ class TestStoreLayerPassiveGuard:
 
         gen = LMCacheEngine.store_layer(engine, tokens, mask=mask)
         results = list(gen)
-        # Passive path yields once per layer, then returns.
-        assert len(results) == 4
+        # num_layers yields (one per save_kv_layer) + final wait_for_save yield
+        assert len(results) == 5
 
     def test_active_rank_proceeds_to_store(self):
         """An active rank (rank 0) should NOT skip — it should proceed."""
