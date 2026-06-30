@@ -778,6 +778,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             return
 
+        # Passive rank guard: when save_only_first_rank is enabled, only rank 0
+        # stores. Closes the known TODO — store_layer had no _is_passive() check,
+        # causing duplicate stores on non-rank-0 workers under MLA + layerwise.
+        if self._is_passive():
+            logger.debug(
+                "Passive rank (save_only_first_rank), skipping store_layer"
+            )
+            for layer_id in range(self.num_layers):
+                yield
+            return
+
         assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store_layer operation"
@@ -844,8 +855,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._ensure_layerwise_connector_layout(**kwargs)
 
         prev_key = 0
+        kv_group = kwargs.get("kv_group", 0)
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs
+            tokens=tokens, mask=mask, request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
 

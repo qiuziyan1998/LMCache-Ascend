@@ -65,6 +65,7 @@ def CreateNPUConnector(
                 conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
+            conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
             return conn
 
         if config.use_gpu_connector_v3:

@@ -1137,6 +1137,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
         self.use_mla = kwargs.get("use_mla", False)
+        self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
 
         self.kv_lora_rank: int = 0
         self.qk_rope_head_dim: int = 0
@@ -1412,7 +1413,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return selected_token_idx.to(device=self.kv_device, dtype=torch.int32)
 
     def _is_mla_dsa_format(self) -> bool:
-        return self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV)
+        return self.kv_format in (
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.DSA_KV,
+            KVCacheFormat.MLA_LATENT,
+            KVCacheFormat.DSA_INDEX,
+        )
+
+    def _is_latent_format(self) -> bool:
+        return self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.MLA_LATENT)
+
+    def _is_indexer_format(self) -> bool:
+        return self.kv_format == KVCacheFormat.DSA_INDEX
 
     def _layerwise_token_major(self) -> bool:
         # GQA uses token-interleaved CPU chunks; MLA/DSA use stacked K|V|DSA planes.
@@ -1487,6 +1499,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
 
     def _expected_memory_format(self) -> MemoryFormat:
+        if self.kv_format == KVCacheFormat.MLA_LATENT:
+            return MemoryFormat.KV_MLA_LATENT_FMT
+        if self.kv_format == KVCacheFormat.DSA_INDEX:
+            return MemoryFormat.KV_DSA_INDEX_FMT
         if self._is_mla_dsa_format():
             return MemoryFormat.KV_MLA_FMT
         return MemoryFormat.KV_T2D
@@ -1496,7 +1512,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         Lazily initialize format metadata and the GPU buffer allocator.
         """
         if self.kv_format == KVCacheFormat.UNDEFINED:
-            self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
+            self.kv_format = KVCacheFormat.detect(
+                kv_caches,
+                use_mla=self.use_mla,
+                dsa_two_groups=getattr(self, "dsa_two_groups", False),
+            )
             if self.kv_format == KVCacheFormat.UNDEFINED:
                 raise ValueError(
                     "Undefined KV cache format detected. "
@@ -1526,6 +1546,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 self.qk_rope_head_dim = value_tensor.shape[-1]
                 self.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
                 self.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
+            elif self.kv_format == KVCacheFormat.MLA_LATENT:
+                # Two-group latent: (k_nope, k_pe) — same dim structure as MLA_KV
+                key_tensor, value_tensor = first_layer_cache
+                self.kv_device = key_tensor.device
+                self.vllm_two_major = False
+                self.kv_lora_rank = key_tensor.shape[-1]
+                self.qk_rope_head_dim = value_tensor.shape[-1]
+                self.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
+                self.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
+            elif self.kv_format == KVCacheFormat.DSA_INDEX:
+                # Two-group indexer: (indexer_k,) — single tensor, single plane
+                indexer_tensor = first_layer_cache[0]
+                self.kv_device = indexer_tensor.device
+                self.vllm_two_major = False
+                self.dsa_head_dim = indexer_tensor.shape[-1]
+                self.dsa_hidden_dims = (
+                    indexer_tensor.shape[-2] * indexer_tensor.shape[-1]
+                )
+                # Map onto MLA_KV kernel: k=dsa, v=0
+                self.k_hidden_dims = self.dsa_hidden_dims
+                self.v_hidden_dims = 0
             elif self.kv_format == KVCacheFormat.DSA_KV:
                 key_tensor, value_tensor, dsa_tensor = first_layer_cache
                 self.kv_device = key_tensor.device
@@ -1573,6 +1614,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 v_cache_shape_per_layer = value_tensor.shape
                 max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
                 num_elements = max_tokens * (self.k_hidden_dims + self.v_hidden_dims)
+            elif self.kv_format == KVCacheFormat.MLA_LATENT:
+                key_tensor, value_tensor = first_layer_cache
+                k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = value_tensor.shape
+                max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
+                num_elements = max_tokens * (self.k_hidden_dims + self.v_hidden_dims)
+            elif self.kv_format == KVCacheFormat.DSA_INDEX:
+                indexer_tensor = first_layer_cache[0]
+                k_cache_shape_per_layer = indexer_tensor.shape
+                v_cache_shape_per_layer = indexer_tensor.shape
+                max_tokens = indexer_tensor.shape[0] * indexer_tensor.shape[1]
+                num_elements = max_tokens * self.dsa_hidden_dims
             elif self.kv_format == KVCacheFormat.DSA_KV:
                 key_tensor, value_tensor, dsa_tensor = first_layer_cache
                 k_cache_shape_per_layer = key_tensor.shape
@@ -1610,6 +1663,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def get_shape(self, num_tokens: int) -> torch.Size:
         if self.kv_format == KVCacheFormat.MLA_KV:
             plane_elems = self.k_hidden_dims + self.v_hidden_dims
+            return torch.Size([num_tokens * plane_elems])
+        if self.kv_format == KVCacheFormat.MLA_LATENT:
+            plane_elems = self.k_hidden_dims + self.v_hidden_dims
+            return torch.Size([num_tokens * plane_elems])
+        if self.kv_format == KVCacheFormat.DSA_INDEX:
+            plane_elems = self.dsa_hidden_dims
             return torch.Size([num_tokens * plane_elems])
         if self.kv_format == KVCacheFormat.DSA_KV:
             plane_elems = (
