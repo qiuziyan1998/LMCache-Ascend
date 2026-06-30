@@ -9,11 +9,13 @@ Paths timed per layer:
   direct_fast — same kernel with cached per-layer state
 
 Examples:
-  python benchmark/v1/kv_transfer/benchmark_direct_vs_staging_load.py \\
-      --format mla --num-tokens 65536 --num-layers 32 --verify
+  python benchmark/v1/kv_transfer/benchmark_direct_vs_staging_load.py --verify
 
   python benchmark/v1/kv_transfer/benchmark_direct_vs_staging_load.py \\
       --format mla --num-selected 2048 --verify
+
+  python benchmark/v1/kv_transfer/benchmark_direct_vs_staging_load.py \\
+      --format mla --num-tokens 65536 --num-layers 32 --num-blocks 8192 --verify
 
   python benchmark/v1/kv_transfer/benchmark_direct_vs_staging_load.py \\
       --sweep --format mla --sparse-token-counts 2048,65536
@@ -66,10 +68,25 @@ def _parse_int_list(raw: str) -> List[int]:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--format", choices=("mla", "dsa"), default="mla")
-    p.add_argument("--num-tokens", type=int, default=65536)
+    p.add_argument(
+        "--num-tokens",
+        type=int,
+        default=4096,
+        help="Prompt tokens in the benchmark case (default: 4096).",
+    )
     p.add_argument("--chunk-size", type=int, default=256)
-    p.add_argument("--num-layers", type=int, default=32)
-    p.add_argument("--num-blocks", type=int, default=8192)
+    p.add_argument(
+        "--num-layers",
+        type=int,
+        default=4,
+        help="Model layers exercised (default: 4).",
+    )
+    p.add_argument(
+        "--num-blocks",
+        type=int,
+        default=512,
+        help="Paged KV blocks per layer (default: 512; increase for large --num-tokens).",
+    )
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--num-kv-heads", type=int, default=8)
     p.add_argument("--kv-lora-rank", type=int, default=512)
@@ -87,13 +104,13 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Extra num_selected values when sweeping (comma-separated).",
     )
-    p.add_argument("--warmup", type=int, default=5)
-    p.add_argument("--iters", type=int, default=20)
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--iters", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--verify", action="store_true")
     p.add_argument("--sweep", action="store_true")
-    p.add_argument("--sweep-num-tokens", type=str, default="4096,16384,65536")
-    p.add_argument("--sweep-num-layers", type=str, default="1,32")
+    p.add_argument("--sweep-num-tokens", type=str, default="4096,16384")
+    p.add_argument("--sweep-num-layers", type=str, default="1,4")
     p.add_argument("--output-csv", type=str, default="")
     p.add_argument("--output-json", type=str, default="")
     return p.parse_args()
