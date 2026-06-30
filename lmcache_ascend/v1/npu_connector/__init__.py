@@ -76,6 +76,7 @@ def CreateNPUConnector(
             conn = VLLMPagedMemNPUConnectorV2.from_metadata(
                 metadata, use_gpu, device, layout_hints=layout_hints
             )
+            conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
             return conn
     elif engine == EngineType.SGLANG:
         # First Party

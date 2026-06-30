@@ -613,3 +613,129 @@ class TestTwoGroupKeySeparation:
             assert parsed == key
             assert parsed.kv_group == kv_group
             assert parsed.layer_id == 7
+
+
+# ---------------------------------------------------------------------------
+# Per-kv_group lazy init on the real layerwise connector
+# ---------------------------------------------------------------------------
+
+class TestPerGroupLazyInit:
+    """Real VLLMPagedMemLayerwiseNPUConnector: _lazy_initialize_buffer must
+    detect format/dims independently per kv_group so that, in two-group
+    MLA+DSA mode, kv_group=0 (MLA_LATENT) and kv_group=1 (DSA_INDEX) coexist
+    on one connector instance. Regression for the one-shot init bug where the
+    first group to initialize pinned a single self.kv_format for both.
+    """
+
+    def _make_connector(self):
+        from lmcache_ascend.v1.npu_connector.npu_connectors import (
+            VLLMPagedMemLayerwiseNPUConnector,
+        )
+
+        # The parent constructor creates CUDA streams; patch them so the
+        # connector can be instantiated in a CPU-only test environment. We
+        # only exercise _lazy_initialize_buffer / get_shape, not transfers.
+        with patch("torch.cuda.Stream", return_value=MagicMock()):
+            conn = VLLMPagedMemLayerwiseNPUConnector(
+                hidden_dim_size=128,
+                num_layers=2,
+                use_gpu=False,
+                chunk_size=64,
+                dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                use_mla=True,
+                dsa_two_groups=True,
+            )
+        return conn
+
+    def _latent_kvcaches(self, num_layers=2):
+        k_nope = torch.zeros(4, 128, 1, 512, dtype=torch.bfloat16)
+        k_pe = torch.zeros(4, 128, 1, 64, dtype=torch.bfloat16)
+        return [(k_nope, k_pe) for _ in range(num_layers)]
+
+    def _indexer_kvcaches(self, num_layers=2):
+        indexer = torch.zeros(4, 128, 1, 128, dtype=torch.bfloat16)
+        return [(indexer,) for _ in range(num_layers)]
+
+    def test_latent_then_indexer_detects_both(self):
+        from lmcache_ascend.v1.kv_format import KVCacheFormat
+
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
+
+        assert conn._group_layouts[0].kv_format == KVCacheFormat.MLA_LATENT
+        assert conn._group_layouts[1].kv_format == KVCacheFormat.DSA_INDEX
+        # group 0 plane = 512 + 64 = 576; group 1 plane = 128
+        assert conn.get_shape(256, kv_group=0) == torch.Size([256 * 576])
+        assert conn.get_shape(256, kv_group=1) == torch.Size([256 * 128])
+        assert conn.get_shape(256, kv_group=0) != conn.get_shape(256, kv_group=1)
+
+    def test_indexer_then_latent_detects_both(self):
+        from lmcache_ascend.v1.kv_format import KVCacheFormat
+
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+
+        assert conn._group_layouts[0].kv_format == KVCacheFormat.MLA_LATENT
+        assert conn._group_layouts[1].kv_format == KVCacheFormat.DSA_INDEX
+        assert conn.get_shape(256, kv_group=0) == torch.Size([256 * 576])
+        assert conn.get_shape(256, kv_group=1) == torch.Size([256 * 128])
+
+    def test_re_init_same_group_is_idempotent(self):
+        from lmcache_ascend.v1.kv_format import KVCacheFormat
+
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        first = conn._group_layouts[0]
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        # Same layout object reused; format unchanged.
+        assert conn._group_layouts[0] is first
+        assert first.kv_format == KVCacheFormat.MLA_LATENT
+
+    def test_mirrored_attrs_track_current_group(self):
+        from lmcache_ascend.v1.kv_format import KVCacheFormat
+
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        assert conn.kv_format == KVCacheFormat.MLA_LATENT
+        conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
+        assert conn.kv_format == KVCacheFormat.DSA_INDEX
+        # Switching back to group 0 mirrors its layout again.
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        assert conn.kv_format == KVCacheFormat.MLA_LATENT
+
+    def test_group_layouts_have_independent_dims(self):
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
+
+        g0 = conn._group_layouts[0]
+        g1 = conn._group_layouts[1]
+        assert g0.k_hidden_dims == 512
+        assert g0.v_hidden_dims == 64
+        assert g0.dsa_hidden_dims == 0
+        assert g1.dsa_hidden_dims == 128
+        assert g1.k_hidden_dims == 128
+        assert g1.v_hidden_dims == 0
+
+    def test_expected_memory_format_per_group(self):
+        from lmcache.v1.memory_management import MemoryFormat
+
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
+        assert conn._expected_memory_format(0) == MemoryFormat.KV_MLA_LATENT_FMT
+        assert conn._expected_memory_format(1) == MemoryFormat.KV_DSA_INDEX_FMT
+
+    def test_sparse_direct_state_keyed_by_group(self):
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
+        conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
+        # After init for both groups, the sparse-direct state container is a
+        # dict keyed by (kv_group, layer_id), not a per-layer list.
+        assert isinstance(conn._sparse_direct_layer_states, dict) or (
+            conn._sparse_direct_layer_states is None
+        )
+

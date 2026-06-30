@@ -601,7 +601,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             init_kvcaches(**kwargs)
         kvcaches = getattr(self.gpu_connector, "kvcaches", None)
         if kvcaches is not None:
-            lazy_init(kvcaches)
+            kv_group = kwargs.get("kv_group", 0)
+            # The layerwise NPU connector detects format per kv_group; other
+            # connectors (e.g. the blending buffer connector) may not accept
+            # the kwarg, so fall back to the positional call for them.
+            try:
+                lazy_init(kvcaches, kv_group=kv_group)
+            except TypeError:
+                lazy_init(kvcaches)
 
     def _resolve_local_cpu_retrieve_location(
         self,
@@ -871,7 +878,9 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             # Allocate the memory object
             num_tokens = end - start
-            kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+            kv_shape_single_layer = self.gpu_connector.get_shape(
+                num_tokens, kv_group=kv_group
+            )
 
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
