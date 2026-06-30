@@ -6,7 +6,6 @@ from __future__ import annotations
 import sys
 import traceback
 from pathlib import Path
-from unittest.mock import patch
 
 # Third Party
 import pytest
@@ -36,14 +35,6 @@ from load_benchmark_utils import (  # noqa: E402
     run_all_direct_layers,
 )
 
-# First Party
-from lmcache.v1.kv_checksum_diag import (  # noqa: E402
-    log_sparse_scatter_entry,
-    reset_kv_checksum_diag_state,
-    sample_layer_ids,
-    sample_token_indices,
-)
-
 
 def _npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
@@ -56,48 +47,11 @@ def _sample_packed_indices(num_packed: int, max_samples: int = 32) -> list[int]:
     return list(range(0, num_packed, step))[:max_samples]
 
 
-class TestSparseScatterEntryLogging:
-    """log_sparse_scatter_entry is wired at scatter kernel entry."""
-
-    def test_log_sparse_scatter_entry_when_enabled(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("LMCACHE_DIAG_KV_CHECKSUM", "1")
-        reset_kv_checksum_diag_state()
-        with patch("lmcache.v1.kv_checksum_diag.log_kv_checksum_diag") as mock_log:
-            log_sparse_scatter_entry(
-                req_id="req-abc",
-                layer_id=3,
-                worker_id=2,
-                num_sparse=2048,
-                total_tokens=18879,
-                chunk_size=256,
-                chunk_ptrs=74,
-                use_fast_path=True,
-            )
-            mock_log.assert_called_once()
-            call_args = mock_log.call_args[0]
-            assert "sparse_scatter_entry" in call_args[0]
-            assert "sparse_mla_dsa_batched_direct_kv_transfer" in call_args[0]
-            assert call_args[1] == "req-abc"
-            assert call_args[2] == 3
-
-    def test_log_sparse_scatter_entry_disabled(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("LMCACHE_DIAG_KV_CHECKSUM", raising=False)
-        with patch("lmcache.v1.kv_checksum_diag.log_kv_checksum_diag") as mock_log:
-            log_sparse_scatter_entry(
-                req_id="req-x",
-                layer_id=0,
-                worker_id=0,
-                num_sparse=1,
-                total_tokens=1,
-                chunk_size=256,
-                chunk_ptrs=1,
-                use_fast_path=False,
-            )
-            mock_log.assert_not_called()
+def _sample_layer_ids(num_layers: int, max_samples: int = 4) -> list[int]:
+    if num_layers <= max_samples:
+        return list(range(num_layers))
+    step = max(1, num_layers // max_samples)
+    return list(range(0, num_layers, step))[:max_samples]
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU required")
@@ -161,7 +115,7 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             num_packed = int(slots_npu.numel())
             slots = slots_npu.detach().cpu().tolist()
             packed_idx_to_check = _sample_packed_indices(num_packed)
-            layer_ids = sample_layer_ids(harness.num_layers)
+            layer_ids = _sample_layer_ids(harness.num_layers)
 
             mismatches: list[str] = []
             for layer_id in layer_ids:
@@ -275,7 +229,7 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
 
             slots = harness.slot_mapping_packed.detach().cpu().tolist()
             packed_idx_to_check = _sample_packed_indices(len(slots))
-            layer_ids = sample_layer_ids(num_layers)
+            layer_ids = _sample_layer_ids(num_layers)
             mismatches: list[str] = []
             for layer_id in layer_ids:
                 dst_dir_k = harness.dst_direct[layer_id][0].reshape(

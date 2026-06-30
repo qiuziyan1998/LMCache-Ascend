@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-import os
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -18,7 +17,6 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.kv_checksum_diag import log_sparse_scatter_entry
 import torch
 
 # First Party
@@ -1356,42 +1354,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
 
-        log_sparse_scatter_entry(
-            req_id=getattr(self, "_sparse_transfer_req_id", None),
-            layer_id=layer_id,
-            worker_id=0,
-            num_sparse=num_sparse,
-            total_tokens=total_tokens,
-            chunk_size=chunk_size,
-            chunk_ptrs=int(chunk_ptrs_npu.numel()),
-            use_fast_path=layer_state is not None,
-        )
-
-        # Diag: log selected_token_idx[0..7] and slot_mapping_packed[0..7] to
-        # detect whether Run2 cache-hit passes a degenerate selection (all 0 /
-        # all same) that makes the scatter broadcast one token's KV to all
-        # slots. Gated by LMCACHE_DIAG_KV_CHECKSUM.
-        try:
-            from lmcache.v1.kv_checksum_diag import kv_checksum_diag_enabled
-            if kv_checksum_diag_enabled() and layer_id == 0:
-                sti = selected_token_idx.detach().cpu().tolist()[:8]
-                smp = slot_mapping_packed.detach().cpu().tolist()[:8]
-                n_unique_sti = len(set(selected_token_idx.detach().cpu().tolist()))
-                from lmcache.v1.kv_checksum_diag import log_kv_checksum_diag
-                log_kv_checksum_diag(
-                    "scatter_inputs req=%s layer=0 num_sparse=%d "
-                    "selected_token_idx[:8]=%s slot_mapping_packed[:8]=%s "
-                    "unique_selected=%d/%d",
-                    getattr(self, "_sparse_transfer_req_id", None),
-                    num_sparse,
-                    sti,
-                    smp,
-                    n_unique_sti,
-                    num_sparse,
-                )
-        except Exception:  # noqa: BLE001
-            pass
-
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
@@ -1822,7 +1784,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
-        self._sparse_transfer_req_id = kwargs.get("req_id")
         cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
             "cached_tensors"
         )
@@ -2029,68 +1990,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         v_hidden_dims,
                         dsa_hidden_dims,
                     )
-
-                    # Diag: verify store kernel wrote correct KV to CPU chunk.
-                    # Compare CPU chunk K/V (after kernel) vs GPU K/V (source)
-                    # for a few tokens in the first chunk. Gated by
-                    # LMCACHE_DIAG_KV_CHECKSUM.
-                    if (
-                        layer_id == 0
-                        and os.environ.get(
-                            "LMCACHE_DIAG_KV_CHECKSUM", ""
-                        ).lower()
-                        in ("1", "true", "yes")
-                        and cpu_tensors
-                        and len(chunk_sizes) > 0
-                    ):
-                        try:
-                            self.store_stream.synchronize()
-                            from lmcache.v1.kv_checksum_diag import (
-                                tensor_fingerprint,
-                                log_kv_checksum_diag,
-                            )
-
-                            ct = cpu_tensors[0].cpu()
-                            ct_k = ct[: chunk_sizes[0] * k_hidden_dims].reshape(
-                                chunk_sizes[0], k_hidden_dims
-                            )
-                            ct_v = ct[
-                                chunk_sizes[0] * k_hidden_dims :
-                                chunk_sizes[0] * (k_hidden_dims + v_hidden_dims)
-                            ].reshape(chunk_sizes[0], v_hidden_dims)
-                            gpu_k = self.kvcaches[layer_id][0].reshape(
-                                -1, k_hidden_dims
-                            )
-                            gpu_v = self.kvcaches[layer_id][1].reshape(
-                                -1, v_hidden_dims
-                            )
-                            slots = slot_mapping_full[: chunk_sizes[0]].cpu()
-                            mismatches = []
-                            for t in [0, chunk_sizes[0] // 2, chunk_sizes[0] - 1]:
-                                if t >= chunk_sizes[0]:
-                                    continue
-                                slot = int(slots[t].item())
-                                cpu_k_fp = tensor_fingerprint(ct_k[t])
-                                gpu_k_fp = tensor_fingerprint(gpu_k[slot])
-                                cpu_v_fp = tensor_fingerprint(ct_v[t])
-                                gpu_v_fp = tensor_fingerprint(gpu_v[slot])
-                                if cpu_k_fp != gpu_k_fp or cpu_v_fp != gpu_v_fp:
-                                    mismatches.append(
-                                        f"t{t}slot{slot} "
-                                        f"K cpu={cpu_k_fp} gpu={gpu_k_fp} "
-                                        f"V cpu={cpu_v_fp} gpu={gpu_v_fp}"
-                                    )
-                            log_kv_checksum_diag(
-                                "store_kernel_check layer=0 chunk0 "
-                                "tokens=%d kH=%d vH=%d mismatches=%d %s",
-                                chunk_sizes[0],
-                                k_hidden_dims,
-                                v_hidden_dims,
-                                len(mismatches),
-                                mismatches[:3],
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
                 else:
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
