@@ -763,7 +763,8 @@ class TestPerGroupLazyInit:
 
         pool_bytes = int(layout.gpu_buffer_allocator.tensor.numel())
         full_pool_bytes = 2048 * 128 * (512 + 64) * 2
-        assert pool_bytes == max_model_len * (512 + 64) * 2
+        per_slot_bytes = max_model_len * (512 + 64) * 2
+        assert pool_bytes == per_slot_bytes * conn._layerwise_staging_pool_slots()
         assert pool_bytes < full_pool_bytes
 
         pool_obj, staging_tensor = conn._allocate_layerwise_staging_buffer(
@@ -820,8 +821,10 @@ class TestPerGroupLazyInit:
         assert alloc0 is not None
         assert alloc1 is not None
         assert alloc0 is not alloc1
-        assert alloc0.tensor.numel() == max_model_len * (512 + 64) * 2
-        assert alloc1.tensor.numel() == max_model_len * 128 * 2
+        per_slot_latent = max_model_len * (512 + 64) * 2
+        per_slot_indexer = max_model_len * 128 * 2
+        assert alloc0.tensor.numel() == per_slot_latent * conn._layerwise_staging_pool_slots()
+        assert alloc1.tensor.numel() == per_slot_indexer * conn._layerwise_staging_pool_slots()
 
         pool_obj0, staging0 = conn._allocate_layerwise_staging_buffer(
             num_tokens=256,
@@ -845,6 +848,75 @@ class TestPerGroupLazyInit:
         assert pool_obj1 is not None
         assert staging0.numel() == 256 * (512 + 64)
         assert staging1.numel() == 256 * 128
+
+    def test_dsa_two_groups_staging_pool_supports_concurrent_allocs(self) -> None:
+        from lmcache.v1.memory_management import MemoryFormat
+
+        max_model_len = 8192
+        conn = self._make_connector(
+            use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
+        )
+        conn.set_layerwise_staging_concurrency(2)
+        latent = self._latent_kvcaches(num_layers=1)
+        conn._lazy_initialize_buffer(latent, kv_group=0)
+        layout = conn._group_layouts[0]
+
+        pool_obj0, _ = conn._allocate_layerwise_staging_buffer(
+            num_tokens=max_model_len,
+            kv_group=0,
+            layout=layout,
+            k_hidden_dims=512,
+            v_hidden_dims=64,
+            dsa_hidden_dims=0,
+            expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        )
+        pool_obj1, _ = conn._allocate_layerwise_staging_buffer(
+            num_tokens=max_model_len,
+            kv_group=0,
+            layout=layout,
+            k_hidden_dims=512,
+            v_hidden_dims=64,
+            dsa_hidden_dims=0,
+            expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        )
+        assert pool_obj0 is not None
+        assert pool_obj1 is not None
+        pool_obj0.ref_count_down()
+        pool_obj1.ref_count_down()
+
+    def test_dsa_two_groups_single_slot_pool_rejects_second_full_alloc(self) -> None:
+        from lmcache.v1.memory_management import MemoryFormat
+
+        max_model_len = 8192
+        conn = self._make_connector(
+            use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
+        )
+        conn.set_layerwise_staging_concurrency(1)
+        latent = self._latent_kvcaches(num_layers=1)
+        conn._lazy_initialize_buffer(latent, kv_group=0)
+        layout = conn._group_layouts[0]
+
+        pool_obj0, _ = conn._allocate_layerwise_staging_buffer(
+            num_tokens=max_model_len,
+            kv_group=0,
+            layout=layout,
+            k_hidden_dims=512,
+            v_hidden_dims=64,
+            dsa_hidden_dims=0,
+            expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        )
+        assert pool_obj0 is not None
+        with pytest.raises(AssertionError, match="Failed to allocate NPU buffer"):
+            conn._allocate_layerwise_staging_buffer(
+                num_tokens=max_model_len,
+                kv_group=0,
+                layout=layout,
+                k_hidden_dims=512,
+                v_hidden_dims=64,
+                dsa_hidden_dims=0,
+                expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+            )
+        pool_obj0.ref_count_down()
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,39 @@ from lmcache_ascend.v1.npu_connector.utils import (
     sparse_mla_dsa_batched_direct_kv_transfer_fast,
 )
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
+
+
+def _agent_debug_log(
+    location: str,
+    message: str,
+    data: dict,
+    *,
+    hypothesis_id: str = "A",
+    run_id: str = "pre-fix",
+) -> None:
+    # #region agent log
+    try:
+        import json
+        import time
+
+        with open("debug-d9c30c.log", "a", encoding="utf-8") as _f:
+            _f.write(
+                json.dumps(
+                    {
+                        "sessionId": "d9c30c",
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
+    # #endregion
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -1146,6 +1179,7 @@ class _GroupLayout:
         "vllm_two_major",
         "kv_device",
         "gpu_buffer_allocator",
+        "staging_bytes_per_slot",
     )
 
     def __init__(self) -> None:
@@ -1159,6 +1193,7 @@ class _GroupLayout:
         self.vllm_two_major: bool = False
         self.kv_device: Optional[torch.device] = None
         self.gpu_buffer_allocator: Optional[GPUMemoryAllocator] = None
+        self.staging_bytes_per_slot: int = 0
 
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
@@ -1179,6 +1214,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.use_mla = kwargs.get("use_mla", False)
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
         self.max_staging_tokens = int(kwargs.get("max_staging_tokens", 0) or 0)
+        # Concurrent layerwise staging buffers per kv_group (retrieve batch +
+        # overlapping store). Default 2 covers retrieve+store for one request.
+        self._layerwise_staging_concurrency = (
+            2 if self.dsa_two_groups else 1
+        )
 
         # Per-kv_group layout state. Detection and the GPU staging buffer
         # are initialized lazily per group by _lazy_initialize_buffer, so
@@ -1647,6 +1687,60 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group = self._current_kv_group
         return self._group_layouts.get(kv_group)
 
+    def set_layerwise_staging_concurrency(self, n: int) -> None:
+        """Size per-group staging pools for concurrent layerwise transfers."""
+        n = max(1, int(n))
+        if n <= self._layerwise_staging_concurrency:
+            return
+        self._layerwise_staging_concurrency = n
+        for kv_group, layout in self._group_layouts.items():
+            if layout.gpu_buffer_allocator is None:
+                continue
+            if layout.gpu_buffer_allocator.allocator.num_active_allocations > 0:
+                logger.warning(
+                    "Cannot grow staging pool for kv_group=%s while %d "
+                    "buffers are still in use",
+                    kv_group,
+                    layout.gpu_buffer_allocator.allocator.num_active_allocations,
+                )
+                continue
+            per_slot = layout.staging_bytes_per_slot
+            if per_slot <= 0:
+                continue
+            new_size = per_slot * self._layerwise_staging_pool_slots()
+            self._assign_group_gpu_allocator(new_size, layout, kv_group)
+            _agent_debug_log(
+                "npu_connectors:set_layerwise_staging_concurrency",
+                "grew staging pool",
+                {
+                    "kv_group": kv_group,
+                    "new_concurrency": n,
+                    "new_pool_bytes": new_size,
+                },
+                hypothesis_id="B",
+            )
+
+    def _layerwise_staging_pool_slots(self) -> int:
+        if not self.dsa_two_groups:
+            return 1
+        return max(1, self._layerwise_staging_concurrency)
+
+    def _staging_pool_stats(
+        self, layout: _GroupLayout
+    ) -> dict[str, int]:
+        alloc = layout.gpu_buffer_allocator
+        if alloc is None:
+            return {}
+        inner = alloc.allocator
+        return {
+            "pool_total_bytes": int(alloc.tensor.numel()),
+            "pool_free_bytes": int(inner.address_manager.get_free_size()),
+            "pool_allocated_bytes": int(
+                inner.address_manager.total_allocated_size
+            ),
+            "active_allocs": int(inner.num_active_allocations),
+        }
+
     def _layerwise_staging_num_tokens(self, cache_max_tokens: int) -> int:
         """Token count for sizing the layerwise GPU staging pool.
 
@@ -1706,9 +1800,40 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             f"GPU staging pool for kv_group={kv_group} is not initialized."
         )
         buffer_shape = self.get_shape(num_tokens, kv_group)
+        request_bytes = int(
+            buffer_shape.numel() * self.element_size
+            if hasattr(buffer_shape, "numel")
+            else buffer_shape[0] * self.element_size
+        )
+        pool_stats = self._staging_pool_stats(layout)
+        _agent_debug_log(
+            "npu_connectors:_allocate_layerwise_staging_buffer",
+            "staging alloc attempt",
+            {
+                "kv_group": kv_group,
+                "num_tokens": num_tokens,
+                "request_bytes": request_bytes,
+                "pool_slots": self._layerwise_staging_pool_slots(),
+                "staging_concurrency": self._layerwise_staging_concurrency,
+                **pool_stats,
+            },
+            hypothesis_id="A",
+        )
         tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, expected_fmt
         )
+        if tmp_gpu_buffer_obj is None:
+            _agent_debug_log(
+                "npu_connectors:_allocate_layerwise_staging_buffer",
+                "staging alloc failed",
+                {
+                    "kv_group": kv_group,
+                    "num_tokens": num_tokens,
+                    "request_bytes": request_bytes,
+                    **pool_stats,
+                },
+                hypothesis_id="A",
+            )
         assert tmp_gpu_buffer_obj is not None, (
             "Failed to allocate NPU buffer in NPUConnector"
         )
@@ -1925,7 +2050,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 plane_elems = num_elements // max_tokens
                 num_elements = staging_tokens * plane_elems
 
-            gpu_buffer_size = num_elements * self.element_size
+            pool_slots = self._layerwise_staging_pool_slots()
+            per_slot_bytes = num_elements * self.element_size
+            layout.staging_bytes_per_slot = per_slot_bytes
+            gpu_buffer_size = per_slot_bytes * pool_slots
 
             logger.info(
                 f"Lazily initializing GPU buffer:\n"
@@ -1934,6 +2062,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"  - Value cache shape per layer: {v_cache_shape_per_layer}\n"
                 f"  - Pool max tokens: {max_tokens}\n"
                 f"  - Staging tokens: {staging_tokens}\n"
+                f"  - Staging pool slots: {pool_slots}\n"
                 f"  - k_hidden_dims={layout.k_hidden_dims} "
                 f"v_hidden_dims={layout.v_hidden_dims} "
                 f"dsa_hidden_dims={layout.dsa_hidden_dims}\n"
@@ -1941,10 +2070,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
             self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
+            _agent_debug_log(
+                "npu_connectors:_lazy_initialize_buffer",
+                "staging pool created",
+                {
+                    "kv_group": kv_group,
+                    "staging_tokens": staging_tokens,
+                    "pool_slots": pool_slots,
+                    "staging_concurrency": self._layerwise_staging_concurrency,
+                    "gpu_buffer_size_bytes": gpu_buffer_size,
+                    "per_slot_bytes": per_slot_bytes,
+                },
+                hypothesis_id="B",
+            )
             if self.dsa_two_groups:
                 logger.info(
                     "dsa_two_groups: per-group NPU staging pool "
                     f"(kv_group={kv_group}, cap={staging_tokens} tokens, "
+                    f"slots={pool_slots}, "
                     f"{gpu_buffer_size / (1024 * 1024):.2f} MB)"
                 )
 
