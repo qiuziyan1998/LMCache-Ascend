@@ -748,30 +748,42 @@ class TestPerGroupLazyInit:
         )
 
     def test_dsa_two_groups_caps_staging_buffer_size(self) -> None:
+        from lmcache.v1.memory_management import MemoryFormat
+
         created_sizes: list[int] = []
 
-        class _FakeGpuAllocator:
-            def __init__(self, size: int, device=None, **kwargs) -> None:
-                created_sizes.append(size)
-                self.tensor = torch.zeros(size, dtype=torch.uint8)
+        def _fake_empty(size, *, dtype=None, device=None):
+            created_sizes.append(int(size) * torch.tensor([], dtype=dtype).element_size())
+            return torch.zeros(size, dtype=dtype)
 
         max_model_len = 8192
         conn = self._make_connector(
             use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
         )
-        with patch(
-            "lmcache_ascend.v1.npu_connector.npu_connectors.GPUMemoryAllocator",
-            _FakeGpuAllocator,
-        ):
-            k_nope = torch.zeros(2048, 128, 1, 512, dtype=torch.bfloat16)
-            k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
-            latent = [(k_nope, k_pe)]
-            conn._lazy_initialize_buffer(latent, kv_group=0)
+        k_nope = torch.zeros(2048, 128, 1, 512, dtype=torch.bfloat16)
+        k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
+        latent = [(k_nope, k_pe)]
+        with patch("torch.empty", side_effect=_fake_empty):
+            layout = conn._group_layouts.get(0)
+            if layout is None:
+                conn._lazy_initialize_buffer(latent, kv_group=0)
+                layout = conn._group_layouts[0]
+            assert layout.gpu_buffer_allocator is None
+            conn._allocate_layerwise_staging_buffer(
+                num_tokens=max_model_len,
+                kv_group=0,
+                layout=layout,
+                k_hidden_dims=512,
+                v_hidden_dims=64,
+                dsa_hidden_dims=0,
+                expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+                location="test",
+            )
 
         pool_bytes = 2048 * 128 * (512 + 64) * 2
         assert len(created_sizes) == 1
-        assert created_sizes[0] < pool_bytes
         assert created_sizes[0] == max_model_len * (512 + 64) * 2
+        assert created_sizes[0] < pool_bytes
 
     def test_from_metadata_wires_max_staging_tokens(self) -> None:
         from lmcache.v1.metadata import LMCacheMetadata
@@ -796,38 +808,53 @@ class TestPerGroupLazyInit:
             )
         assert conn.max_staging_tokens == 16384
 
-    def test_dsa_two_groups_uses_separate_capped_allocators(self) -> None:
+    def test_dsa_two_groups_uses_per_transfer_staging_buffers(self) -> None:
+        from lmcache.v1.memory_management import MemoryFormat
+
         created_sizes: list[int] = []
 
-        class _FakeGpuAllocator:
-            def __init__(self, size: int, device=None, **kwargs) -> None:
-                created_sizes.append(size)
-                self.tensor = torch.zeros(size, dtype=torch.uint8)
+        def _fake_empty(size, *, dtype=None, device=None):
+            created_sizes.append(int(size) * torch.tensor([], dtype=dtype).element_size())
+            return torch.zeros(size, dtype=dtype)
 
         max_model_len = 8192
         conn = self._make_connector(
             use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
         )
-        with patch(
-            "lmcache_ascend.v1.npu_connector.npu_connectors.GPUMemoryAllocator",
-            _FakeGpuAllocator,
-        ):
-            k_nope = torch.zeros(2048, 128, 1, 512, dtype=torch.bfloat16)
-            k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
-            latent = [(k_nope, k_pe)]
-            indexer = [(torch.zeros(2048, 128, 1, 128, dtype=torch.bfloat16),)]
-            conn._lazy_initialize_buffer(latent, kv_group=0)
-            conn._lazy_initialize_buffer(indexer, kv_group=1)
+        k_nope = torch.zeros(2048, 128, 1, 512, dtype=torch.bfloat16)
+        k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
+        latent = [(k_nope, k_pe)]
+        indexer = [(torch.zeros(2048, 128, 1, 128, dtype=torch.bfloat16),)]
+        conn._lazy_initialize_buffer(latent, kv_group=0)
+        conn._lazy_initialize_buffer(indexer, kv_group=1)
+        assert conn._group_layouts[0].gpu_buffer_allocator is None
+        assert conn._group_layouts[1].gpu_buffer_allocator is None
 
-        pool_latent_bytes = 2048 * 128 * (512 + 64) * 2
+        with patch("torch.empty", side_effect=_fake_empty):
+            conn._allocate_layerwise_staging_buffer(
+                num_tokens=256,
+                kv_group=0,
+                layout=conn._group_layouts[0],
+                k_hidden_dims=512,
+                v_hidden_dims=64,
+                dsa_hidden_dims=0,
+                expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+                location="test_latent",
+            )
+            conn._allocate_layerwise_staging_buffer(
+                num_tokens=256,
+                kv_group=1,
+                layout=conn._group_layouts[1],
+                k_hidden_dims=128,
+                v_hidden_dims=0,
+                dsa_hidden_dims=128,
+                expected_fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+                location="test_indexer",
+            )
+
         assert len(created_sizes) == 2
-        assert (
-            conn._group_layouts[0].gpu_buffer_allocator
-            is not conn._group_layouts[1].gpu_buffer_allocator
-        )
-        assert created_sizes[0] == max_model_len * (512 + 64) * 2
-        assert created_sizes[0] < pool_latent_bytes
-        assert created_sizes[1] == max_model_len * 128 * 2
+        assert created_sizes[0] == 256 * (512 + 64) * 2
+        assert created_sizes[1] == 256 * 128 * 2
 
 
 # ---------------------------------------------------------------------------

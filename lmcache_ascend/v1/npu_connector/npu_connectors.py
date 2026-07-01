@@ -1728,6 +1728,56 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             pass
         # #endregion
 
+    def _allocate_layerwise_staging_buffer(
+        self,
+        *,
+        num_tokens: int,
+        kv_group: int,
+        layout: _GroupLayout,
+        k_hidden_dims: int,
+        v_hidden_dims: int,
+        dsa_hidden_dims: int,
+        expected_fmt: MemoryFormat,
+        location: str,
+    ) -> tuple[Optional[MemoryObj], torch.Tensor]:
+        """Return (pool_obj_or_none, staging_tensor) for a layerwise transfer."""
+        plane_elems = k_hidden_dims + v_hidden_dims + dsa_hidden_dims
+        self._check_staging_transfer_tokens(num_tokens, kv_group)
+
+        if self.dsa_two_groups and self._is_mla_dsa_format(kv_group):
+            staging_tensor = torch.empty(
+                num_tokens * plane_elems,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._log_staging_transfer(
+                location=location,
+                kv_group=kv_group,
+                num_tokens=num_tokens,
+                pool_bytes=int(staging_tensor.numel() * staging_tensor.element_size()),
+                plane_elems=plane_elems,
+            )
+            return None, staging_tensor
+
+        gpu_buffer_allocator = layout.gpu_buffer_allocator
+        assert gpu_buffer_allocator is not None
+        buffer_shape = self.get_shape(num_tokens, kv_group)
+        self._log_staging_transfer(
+            location=location,
+            kv_group=kv_group,
+            num_tokens=num_tokens,
+            pool_bytes=int(gpu_buffer_allocator.tensor.numel()),
+            plane_elems=plane_elems,
+        )
+        tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
+            buffer_shape, self.dtype, expected_fmt
+        )
+        assert tmp_gpu_buffer_obj is not None, (
+            "Failed to allocate NPU buffer in NPUConnector"
+        )
+        assert tmp_gpu_buffer_obj.tensor is not None
+        return tmp_gpu_buffer_obj, tmp_gpu_buffer_obj.tensor
+
     @classmethod
     def from_metadata(
         cls,
@@ -1987,7 +2037,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 pass
             # #endregion
 
-            self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
+            if not self.dsa_two_groups:
+                self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
+            else:
+                logger.info(
+                    "dsa_two_groups: per-transfer NPU staging buffers "
+                    f"(kv_group={kv_group}, cap={staging_tokens} tokens)"
+                )
 
         return layout
 
@@ -2091,27 +2147,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
-        gpu_buffer_allocator = layout.gpu_buffer_allocator
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
         if self.use_gpu:
-            buffer_shape = self.get_shape(num_tokens, kv_group)
-            assert gpu_buffer_allocator is not None
-            plane_elems = k_hidden_dims + v_hidden_dims + dsa_hidden_dims
-            self._log_staging_transfer(
-                location="npu_connectors.py:batched_to_gpu",
-                kv_group=kv_group,
+            tmp_gpu_buffer_obj, staging_tensor = self._allocate_layerwise_staging_buffer(
                 num_tokens=num_tokens,
-                pool_bytes=int(gpu_buffer_allocator.tensor.numel()),
-                plane_elems=plane_elems,
+                kv_group=kv_group,
+                layout=layout,
+                k_hidden_dims=k_hidden_dims,
+                v_hidden_dims=v_hidden_dims,
+                dsa_hidden_dims=dsa_hidden_dims,
+                expected_fmt=expected_fmt,
+                location="npu_connectors.py:batched_to_gpu",
             )
-            tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, expected_fmt
-            )
-            assert tmp_gpu_buffer_obj is not None, (
-                "Failed to allocate NPU buffer in NPUConnector"
-            )
-            assert tmp_gpu_buffer_obj.tensor is not None
 
         current_stream = torch.cuda.current_stream()
 
@@ -2137,7 +2186,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     # Fused transfer: N H2D memcpy + 1 scatter kernel
                     batched_fused_single_layer_kv_transfer(
                         cpu_tensors,  # CPU memory objects
-                        tmp_gpu_buffer_obj.tensor,  # GPU staging buffer
+                        staging_tensor,  # GPU staging buffer
                         self.kvcaches[layer_id],
                         slot_mapping_full,
                         chunk_offsets,  # offset for each chunk
@@ -2383,27 +2432,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
-        gpu_buffer_allocator = layout.gpu_buffer_allocator
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
         if self.use_gpu:
-            buffer_shape = self.get_shape(num_tokens, kv_group)
-            assert gpu_buffer_allocator is not None
-            plane_elems = k_hidden_dims + v_hidden_dims + dsa_hidden_dims
-            self._log_staging_transfer(
-                location="npu_connectors.py:batched_from_gpu",
-                kv_group=kv_group,
+            tmp_gpu_buffer_obj, staging_tensor = self._allocate_layerwise_staging_buffer(
                 num_tokens=num_tokens,
-                pool_bytes=int(gpu_buffer_allocator.tensor.numel()),
-                plane_elems=plane_elems,
+                kv_group=kv_group,
+                layout=layout,
+                k_hidden_dims=k_hidden_dims,
+                v_hidden_dims=v_hidden_dims,
+                dsa_hidden_dims=dsa_hidden_dims,
+                expected_fmt=expected_fmt,
+                location="npu_connectors.py:batched_from_gpu",
             )
-            tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, expected_fmt
-            )
-            assert tmp_gpu_buffer_obj is not None, (
-                "Failed to allocate NPU buffer in NPUConnector"
-            )
-            assert tmp_gpu_buffer_obj.tensor is not None
 
         current_stream = torch.cuda.current_stream()
 
@@ -2422,7 +2464,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     # Fused transfer: 1 scatter kernel + N D2H memcpy
                     lmc_ops.batched_fused_single_layer_kv_transfer(
                         cpu_tensors,
-                        tmp_gpu_buffer_obj.tensor,
+                        staging_tensor,
                         self.kvcaches[layer_id],
                         slot_mapping_full,
                         chunk_offsets,
