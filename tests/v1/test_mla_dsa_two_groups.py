@@ -1575,7 +1575,13 @@ class TestVLLMCallSequence:
             _connector_metadata=meta,
             _get_connector_metadata=lambda: meta,
         )
-        forward_ctx = SimpleNamespace(attn_metadata=None)
+        forward_ctx = SimpleNamespace(
+            attn_metadata=SimpleNamespace(
+                slot_mapping=torch.arange(cached_tokens, dtype=torch.long),
+                indexer_slot_mapping=None,
+            ),
+            no_compile_layers={},
+        )
 
         fake.start_load_kv(forward_ctx)
 
