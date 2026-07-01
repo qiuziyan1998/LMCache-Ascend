@@ -902,6 +902,16 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             # Allocate the memory object
             num_tokens = end - start
+            if num_tokens <= 0:
+                logger.warning(
+                    "Skipping zero-token layerwise store chunk for req_id=%s "
+                    "(kv_group=%s, start=%d, end=%d)",
+                    req_id,
+                    kv_group,
+                    start,
+                    end,
+                )
+                continue
             kv_shape_single_layer = self.gpu_connector.get_shape(
                 num_tokens, kv_group=kv_group
             )
