@@ -1153,6 +1153,7 @@ class TestStorerDualPop:
             use_layerwise=True,
             _layerwise_save_storers=storers,
             _maybe_lookup_unpin_for_request=lambda req: None,
+            _maybe_seed_worker_retrieve_state_from_store=lambda req: None,
             _parent=SimpleNamespace(
                 _get_connector_metadata=lambda: meta,
             ),
@@ -1179,6 +1180,7 @@ class TestStorerDualPop:
             use_layerwise=True,
             _layerwise_save_storers=storers,
             _maybe_lookup_unpin_for_request=lambda req: None,
+            _maybe_seed_worker_retrieve_state_from_store=lambda req: None,
             _parent=SimpleNamespace(
                 _get_connector_metadata=lambda: meta,
             ),
@@ -1457,8 +1459,12 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         "_is_dsa_two_groups",
         "_indexer_retrieve_slot_mapping",
         "_request_has_retrieve_tensor_cache",
+        "_resolve_store_retrieve_location",
         "_maybe_seed_worker_retrieve_state_from_store",
         "_save_worker_retrieve_state_from_request",
+        "_should_invalidate_worker_retrieve_state",
+        "_bind_worker_retrieve_state_to_request",
+        "_drop_worker_retrieve_state",
         "save_kv_layer",
         "wait_for_save",
         "start_load_kv",
