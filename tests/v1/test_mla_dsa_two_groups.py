@@ -1377,6 +1377,13 @@ def _make_load_req(req_id, num_tokens, cached_tokens):
         cached_tensors=[],
         cached_chunk_dev_ptrs=[],
         cached_chunk_ptrs_npu=[],
+        cached_keys_indexer=[],
+        cached_starts_indexer=[],
+        cached_ends_indexer=[],
+        cached_memory_objs_indexer=[],
+        cached_tensors_indexer=[],
+        cached_chunk_dev_ptrs_indexer=[],
+        cached_chunk_ptrs_npu_indexer=[],
         decode_ret_mask=None,
     )
 
