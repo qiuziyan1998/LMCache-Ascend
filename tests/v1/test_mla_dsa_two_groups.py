@@ -796,7 +796,7 @@ class TestPerGroupLazyInit:
             )
         assert conn.max_staging_tokens == 16384
 
-    def test_dsa_two_groups_reuses_shared_gpu_staging_buffer(self) -> None:
+    def test_dsa_two_groups_uses_separate_capped_allocators(self) -> None:
         created_sizes: list[int] = []
 
         class _FakeGpuAllocator:
@@ -804,7 +804,10 @@ class TestPerGroupLazyInit:
                 created_sizes.append(size)
                 self.tensor = torch.zeros(size, dtype=torch.uint8)
 
-        conn = self._make_connector(use_gpu=True, chunk_size=256)
+        max_model_len = 8192
+        conn = self._make_connector(
+            use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
+        )
         with patch(
             "lmcache_ascend.v1.npu_connector.npu_connectors.GPUMemoryAllocator",
             _FakeGpuAllocator,
@@ -814,11 +817,13 @@ class TestPerGroupLazyInit:
             conn._lazy_initialize_buffer(latent, kv_group=0)
             conn._lazy_initialize_buffer(indexer, kv_group=1)
 
-        assert len(created_sizes) == 1
+        assert len(created_sizes) == 2
         assert (
             conn._group_layouts[0].gpu_buffer_allocator
-            is conn._group_layouts[1].gpu_buffer_allocator
+            is not conn._group_layouts[1].gpu_buffer_allocator
         )
+        assert created_sizes[0] == max_model_len * (512 + 64) * 2
+        assert created_sizes[1] == max_model_len * 128 * 2
 
 
 # ---------------------------------------------------------------------------

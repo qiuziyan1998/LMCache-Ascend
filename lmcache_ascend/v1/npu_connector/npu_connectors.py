@@ -1667,6 +1667,67 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         staging_tokens = min(cache_max_tokens, max_seq_tokens)
         return max(staging_tokens, self.lmcache_chunk_size)
 
+    def _staging_token_cap(self) -> int:
+        """Max tokens the layerwise GPU staging pool must cover per transfer."""
+        if not self.dsa_two_groups or self.lmcache_chunk_size <= 0:
+            return 0
+        max_seq_tokens = self.max_staging_tokens
+        if max_seq_tokens <= 0:
+            max_seq_tokens = self.lmcache_chunk_size * 512
+        return max(max_seq_tokens, self.lmcache_chunk_size)
+
+    def _check_staging_transfer_tokens(self, num_tokens: int, kv_group: int) -> None:
+        cap = self._staging_token_cap()
+        if cap <= 0 or num_tokens <= cap:
+            return
+        raise ValueError(
+            f"Layerwise transfer needs {num_tokens} staging tokens for "
+            f"kv_group={kv_group}, but the staging cap is {cap} "
+            f"(max_model_len={self.max_staging_tokens}). "
+            "Increase vLLM max_model_len or reduce tokens stored per forward."
+        )
+
+    def _log_staging_transfer(
+        self,
+        *,
+        location: str,
+        kv_group: int,
+        num_tokens: int,
+        pool_bytes: int,
+        plane_elems: int,
+    ) -> None:
+        # #region agent log
+        try:
+            import json
+            import time
+
+            with open("debug-d9c30c.log", "a", encoding="utf-8") as _dbg:
+                _dbg.write(
+                    json.dumps(
+                        {
+                            "sessionId": "d9c30c",
+                            "runId": "post-fix",
+                            "hypothesisId": "F",
+                            "location": location,
+                            "message": "staging transfer allocate",
+                            "data": {
+                                "kv_group": kv_group,
+                                "num_tokens": num_tokens,
+                                "staging_cap": self._staging_token_cap(),
+                                "pool_bytes": pool_bytes,
+                                "request_bytes": int(
+                                    num_tokens * plane_elems * self.element_size
+                                ),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except OSError:
+            pass
+        # #endregion
+
     @classmethod
     def from_metadata(
         cls,
@@ -1696,27 +1757,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _assign_group_gpu_allocator(
         self, gpu_buffer_size: int, layout: _GroupLayout, kv_group: int
     ) -> None:
-        """Create or reuse the per-group GPU staging allocator."""
-        if self.dsa_two_groups:
-            shared = getattr(self, "_shared_gpu_buffer_allocator", None)
-            prev_bytes = int(getattr(self, "_shared_gpu_buffer_bytes", 0) or 0)
-            target_bytes = max(prev_bytes, gpu_buffer_size)
-            if (
-                shared is not None
-                and shared.tensor.numel() >= target_bytes
-            ):
-                layout.gpu_buffer_allocator = shared
-                self.gpu_buffer_allocator = shared
-                self._shared_gpu_buffer_bytes = shared.tensor.numel()
-                return
-            layout.gpu_buffer_allocator = GPUMemoryAllocator(
-                target_bytes, device=self.device
-            )
-            self._shared_gpu_buffer_allocator = layout.gpu_buffer_allocator
-            self._shared_gpu_buffer_bytes = target_bytes
-            self.gpu_buffer_allocator = layout.gpu_buffer_allocator
-            return
+        """Create a per-kv_group GPU staging allocator.
 
+        Two-group forwards may keep latent and indexer store generators alive
+        at the same time, each holding a staging allocation for the whole
+        layer loop. Do not share one pool across groups.
+        """
         layout.gpu_buffer_allocator = GPUMemoryAllocator(
             gpu_buffer_size, device=self.device
         )
@@ -1917,8 +1963,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         json.dumps(
                             {
                                 "sessionId": "d9c30c",
-                                "runId": "pre-fix",
-                                "hypothesisId": "A,C,E",
+                                "runId": "post-fix",
+                                "hypothesisId": "F",
                                 "location": "npu_connectors.py:_lazy_initialize_buffer",
                                 "message": "layerwise gpu staging init",
                                 "data": {
@@ -1931,12 +1977,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                         gpu_buffer_size / (1024 * 1024), 2
                                     ),
                                     "dsa_two_groups": bool(self.dsa_two_groups),
-                                    "shared_reuse": bool(
-                                        getattr(
-                                            self, "_shared_gpu_buffer_allocator", None
-                                        )
-                                        is not None
-                                    ),
                                 },
                                 "timestamp": int(time.time() * 1000),
                             }
@@ -2028,6 +2068,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
+        self._check_staging_transfer_tokens(num_tokens, kv_group)
 
         chunk_offsets = []
         chunk_sizes = []
@@ -2056,6 +2097,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens, kv_group)
             assert gpu_buffer_allocator is not None
+            plane_elems = k_hidden_dims + v_hidden_dims + dsa_hidden_dims
+            self._log_staging_transfer(
+                location="npu_connectors.py:batched_to_gpu",
+                kv_group=kv_group,
+                num_tokens=num_tokens,
+                pool_bytes=int(gpu_buffer_allocator.tensor.numel()),
+                plane_elems=plane_elems,
+            )
             tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, expected_fmt
             )
@@ -2311,6 +2360,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
+        self._check_staging_transfer_tokens(num_tokens, kv_group)
 
         chunk_offsets = []
         chunk_sizes = []
@@ -2339,6 +2389,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens, kv_group)
             assert gpu_buffer_allocator is not None
+            plane_elems = k_hidden_dims + v_hidden_dims + dsa_hidden_dims
+            self._log_staging_transfer(
+                location="npu_connectors.py:batched_from_gpu",
+                kv_group=kv_group,
+                num_tokens=num_tokens,
+                pool_bytes=int(gpu_buffer_allocator.tensor.numel()),
+                plane_elems=plane_elems,
+            )
             tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, expected_fmt
             )
