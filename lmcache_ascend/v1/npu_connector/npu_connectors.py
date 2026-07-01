@@ -1340,6 +1340,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _get_or_create_sparse_direct_layer_state(
         self,
         *,
+        kvcaches_ref: list,
         kv_group: int,
         layer_id: int,
         layer_tensors: List[torch.Tensor],
@@ -1352,18 +1353,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_v_hidden_dims: int,
         sparse_dsa_hidden_dims: int,
     ):
-        if self.kvcaches is None:
+        if kvcaches_ref is None:
             return None
 
-        kvcaches_id = id(self.kvcaches)
-        if self._sparse_direct_kvcaches_id != kvcaches_id:
-            self._reset_sparse_direct_layer_states()
-            self._sparse_direct_kvcaches_id = kvcaches_id
-
+        kvcaches_id = id(kvcaches_ref)
         if self._sparse_direct_layer_states is None:
             self._sparse_direct_layer_states = {}
 
-        state_key = (kv_group, layer_id)
+        state_key = (kvcaches_id, kv_group, layer_id)
         state = self._sparse_direct_layer_states.get(state_key)
         if state is not None:
             return state
@@ -1376,9 +1373,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layer_tensors, kv_group
             )
 
+        vllm_layer_cache = kvcaches_ref[layer_id]
+        vllm_tensor_count = (
+            len(vllm_layer_cache)
+            if isinstance(vllm_layer_cache, (tuple, list))
+            else 1
+        )
+        _agent_debug_log(
+            "npu_connectors:_get_or_create_sparse_direct_layer_state",
+            "prepare sparse direct state",
+            {
+                "kv_group": kv_group,
+                "layer_id": layer_id,
+                "sparse_kv_format": sparse_kv_format,
+                "vllm_tensor_count": vllm_tensor_count,
+                "kvcaches_ref_is_connector_ptr": kvcaches_ref is self.kvcaches,
+            },
+            hypothesis_id="G",
+        )
+
         state = prepare_sparse_direct_layer_state(
             layer_tensors[0],
-            self.kvcaches[layer_id],
+            kvcaches_ref[layer_id],
             slot_mapping_ref,
             sparse_token_major,
             sparse_vllm_two_major,
@@ -1437,6 +1453,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
+        kvcaches_ref: list,
         kv_group: int,
         layer_id: int,
         load_stream: torch.cuda.Stream,
@@ -1473,6 +1490,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
 
         layer_state = self._get_or_create_sparse_direct_layer_state(
+            kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
             layer_id=layer_id,
             layer_tensors=resolve_tensors,
@@ -1509,7 +1527,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 assert cpu_tensors is not None and len(cpu_tensors) > 0
                 sparse_mla_dsa_batched_direct_kv_transfer(
                     cpu_tensors,
-                    self.kvcaches[layer_id],
+                    kvcaches_ref[layer_id],
                     slot_mapping_packed,
                     selected_token_idx,
                     chunk_size,
@@ -2327,6 +2345,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         sparse_vllm_two_major = layout.vllm_two_major
+        # Snapshot so interleaved latent/indexer sparse generators do not
+        # race on the shared connector self.kvcaches pointer.
+        kvcaches_snapshot = self.kvcaches
 
         for layer_id in range(self.num_layers):
             memory_objs_layer, selected_token_idx, token_start_index = yield
@@ -2371,6 +2392,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
 
             self._run_sparse_direct_kv_transfer_layer(
+                kvcaches_ref=kvcaches_snapshot,
                 kv_group=kv_group,
                 layer_id=layer_id,
                 load_stream=self.load_stream_list[load_stream_idx],

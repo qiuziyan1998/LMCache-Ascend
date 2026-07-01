@@ -742,10 +742,98 @@ class TestPerGroupLazyInit:
         conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
         conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
         # After init for both groups, the sparse-direct state container is a
-        # dict keyed by (kv_group, layer_id), not a per-layer list.
+        # dict keyed by (kvcaches_id, kv_group, layer_id).
         assert isinstance(conn._sparse_direct_layer_states, dict) or (
             conn._sparse_direct_layer_states is None
         )
+
+    def test_sparse_direct_uses_kvcaches_snapshot_not_shared_ptr(self):
+        """Interleaved latent/indexer sparse generators must not read the
+        connector's mutable self.kvcaches after the other group overwrote it."""
+        from lmcache.v1.memory_management import MemoryFormat
+
+        conn = self._make_connector(use_gpu=False, chunk_size=256)
+        latent = self._latent_kvcaches(num_layers=1)
+        indexer = self._indexer_kvcaches(num_layers=1)
+        conn._lazy_initialize_buffer(latent, kv_group=0)
+        conn._lazy_initialize_buffer(indexer, kv_group=1)
+        layout0 = conn._group_layouts[0]
+
+        slot_mapping = torch.arange(4, dtype=torch.long)
+        lmc_chunk = torch.zeros(256 * (512 + 64), dtype=torch.bfloat16)
+        chunk_ptrs = torch.tensor([12345], dtype=torch.long)
+
+        seen_vllm_caches = []
+
+        def _capture_prepare(
+            lmc_layout_sample,
+            vllm_kv_caches,
+            slot_mapping_ref,
+            token_major,
+            vllm_two_major,
+            kvcache_format_raw,
+            k_hidden_dims,
+            v_hidden_dims,
+            dsa_hidden_dims,
+            lmc_num_tokens,
+        ):
+            seen_vllm_caches.append(vllm_kv_caches)
+            return object()
+
+        with patch(
+            "lmcache_ascend.v1.npu_connector.npu_connectors.prepare_sparse_direct_layer_state",
+            side_effect=_capture_prepare,
+        ):
+            conn.kvcaches = latent
+            conn._run_sparse_direct_kv_transfer_layer(
+                kvcaches_ref=latent,
+                kv_group=0,
+                layer_id=0,
+                load_stream=MagicMock(),
+                current_stream=MagicMock(),
+                slot_mapping_packed=slot_mapping,
+                selected_token_idx=torch.arange(4, dtype=torch.int32),
+                chunk_size=256,
+                total_tokens=256,
+                chunk_ptrs_npu=chunk_ptrs,
+                sparse_kv_format=layout0.kv_format.value,
+                sparse_token_major=False,
+                sparse_vllm_two_major=False,
+                sparse_k_hidden_dims=512,
+                sparse_v_hidden_dims=64,
+                sparse_dsa_hidden_dims=0,
+                sparse_host_interleaved=False,
+                layer_tensors=[lmc_chunk],
+                slot_mapping_ref=slot_mapping,
+            )
+            # Simulate indexer generator overwriting the shared pointer.
+            conn.kvcaches = indexer
+            conn._run_sparse_direct_kv_transfer_layer(
+                kvcaches_ref=latent,
+                kv_group=0,
+                layer_id=0,
+                load_stream=MagicMock(),
+                current_stream=MagicMock(),
+                slot_mapping_packed=slot_mapping,
+                selected_token_idx=torch.arange(4, dtype=torch.int32),
+                chunk_size=256,
+                total_tokens=256,
+                chunk_ptrs_npu=chunk_ptrs,
+                sparse_kv_format=layout0.kv_format.value,
+                sparse_token_major=False,
+                sparse_vllm_two_major=False,
+                sparse_k_hidden_dims=512,
+                sparse_v_hidden_dims=64,
+                sparse_dsa_hidden_dims=0,
+                sparse_host_interleaved=False,
+                layer_tensors=[lmc_chunk],
+                slot_mapping_ref=slot_mapping,
+            )
+
+        assert len(seen_vllm_caches) == 1
+        assert seen_vllm_caches[0] is latent[0]
+        assert isinstance(seen_vllm_caches[0], tuple)
+        assert len(seen_vllm_caches[0]) == 2
 
     def test_dsa_two_groups_caps_staging_buffer_size(self) -> None:
         from lmcache.v1.memory_management import MemoryFormat
