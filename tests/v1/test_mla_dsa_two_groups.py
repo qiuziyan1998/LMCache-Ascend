@@ -937,7 +937,16 @@ class TestAdapterIndexerSlotMapping:
     def _make_fake(self):
         return SimpleNamespace(device=torch.device("cpu"))
 
-    def test_uses_attn_metadata_slot_mapping_sliced(self):
+    def test_prefers_indexer_slot_mapping_when_both_present(self):
+        fake = self._make_fake()
+        attn = SimpleNamespace(
+            slot_mapping=torch.arange(10),
+            indexer_slot_mapping=torch.arange(20, 28),
+        )
+        slot = _adapter_method("_indexer_retrieve_slot_mapping")(fake, attn, 5)
+        assert slot.tolist() == [20, 21, 22, 23, 24]
+
+    def test_falls_back_to_attn_slot_mapping(self):
         fake = self._make_fake()
         attn = SimpleNamespace(
             slot_mapping=torch.arange(10), indexer_slot_mapping=None
@@ -945,7 +954,7 @@ class TestAdapterIndexerSlotMapping:
         slot = _adapter_method("_indexer_retrieve_slot_mapping")(fake, attn, 5)
         assert slot.tolist() == list(range(5))
 
-    def test_falls_back_to_indexer_slot_mapping(self):
+    def test_falls_back_to_indexer_slot_mapping_only(self):
         fake = self._make_fake()
         attn = SimpleNamespace(
             slot_mapping=None, indexer_slot_mapping=torch.arange(8)

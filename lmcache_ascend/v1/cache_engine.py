@@ -667,6 +667,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             if retrieve_kwargs is not None:
                 retrieve_kwargs.pop("_retrieve_metadata_warm", None)
 
+            kv_group = 0
+            if retrieve_kwargs is not None:
+                kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+
             location: Optional[str] = None
             new_starts: List[int] = []
             new_ends: List[int] = []
@@ -676,6 +680,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tokens=tokens,
                 mask=mask,
                 request_configs=request_configs,
+                kv_group=kv_group,
             ):
                 assert isinstance(key, CacheEngineKey)
 
