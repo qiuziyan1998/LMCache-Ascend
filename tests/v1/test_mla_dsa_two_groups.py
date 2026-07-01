@@ -750,8 +750,6 @@ class TestPerGroupLazyInit:
     def test_sparse_direct_uses_kvcaches_snapshot_not_shared_ptr(self):
         """Interleaved latent/indexer sparse generators must not read the
         connector's mutable self.kvcaches after the other group overwrote it."""
-        from lmcache.v1.memory_management import MemoryFormat
-
         conn = self._make_connector(use_gpu=False, chunk_size=256)
         latent = self._latent_kvcaches(num_layers=1)
         indexer = self._indexer_kvcaches(num_layers=1)
@@ -761,7 +759,6 @@ class TestPerGroupLazyInit:
 
         slot_mapping = torch.arange(4, dtype=torch.long)
         lmc_chunk = torch.zeros(256 * (512 + 64), dtype=torch.bfloat16)
-        chunk_ptrs = torch.tensor([12345], dtype=torch.long)
 
         seen_vllm_caches = []
 
@@ -785,55 +782,46 @@ class TestPerGroupLazyInit:
             side_effect=_capture_prepare,
         ):
             conn.kvcaches = latent
-            conn._run_sparse_direct_kv_transfer_layer(
+            conn._get_or_create_sparse_direct_layer_state(
                 kvcaches_ref=latent,
                 kv_group=0,
                 layer_id=0,
-                load_stream=MagicMock(),
-                current_stream=MagicMock(),
-                slot_mapping_packed=slot_mapping,
-                selected_token_idx=torch.arange(4, dtype=torch.int32),
-                chunk_size=256,
+                layer_tensors=[lmc_chunk],
+                slot_mapping_ref=slot_mapping,
                 total_tokens=256,
-                chunk_ptrs_npu=chunk_ptrs,
                 sparse_kv_format=layout0.kv_format.value,
                 sparse_token_major=False,
                 sparse_vllm_two_major=False,
                 sparse_k_hidden_dims=512,
                 sparse_v_hidden_dims=64,
                 sparse_dsa_hidden_dims=0,
-                sparse_host_interleaved=False,
-                layer_tensors=[lmc_chunk],
-                slot_mapping_ref=slot_mapping,
             )
             # Simulate indexer generator overwriting the shared pointer.
             conn.kvcaches = indexer
-            conn._run_sparse_direct_kv_transfer_layer(
+            conn._get_or_create_sparse_direct_layer_state(
                 kvcaches_ref=latent,
                 kv_group=0,
                 layer_id=0,
-                load_stream=MagicMock(),
-                current_stream=MagicMock(),
-                slot_mapping_packed=slot_mapping,
-                selected_token_idx=torch.arange(4, dtype=torch.int32),
-                chunk_size=256,
+                layer_tensors=[lmc_chunk],
+                slot_mapping_ref=slot_mapping,
                 total_tokens=256,
-                chunk_ptrs_npu=chunk_ptrs,
                 sparse_kv_format=layout0.kv_format.value,
                 sparse_token_major=False,
                 sparse_vllm_two_major=False,
                 sparse_k_hidden_dims=512,
                 sparse_v_hidden_dims=64,
                 sparse_dsa_hidden_dims=0,
-                sparse_host_interleaved=False,
-                layer_tensors=[lmc_chunk],
-                slot_mapping_ref=slot_mapping,
             )
 
         assert len(seen_vllm_caches) == 1
         assert seen_vllm_caches[0] is latent[0]
         assert isinstance(seen_vllm_caches[0], tuple)
         assert len(seen_vllm_caches[0]) == 2
+
+    def _large_latent_kvcaches(self, num_layers=1):
+        k_nope = torch.zeros(2048, 128, 1, 512, dtype=torch.bfloat16)
+        k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
+        return [(k_nope, k_pe) for _ in range(num_layers)]
 
     def test_dsa_two_groups_caps_staging_buffer_size(self) -> None:
         from lmcache.v1.memory_management import MemoryFormat
@@ -945,7 +933,7 @@ class TestPerGroupLazyInit:
             use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
         )
         conn.set_layerwise_staging_concurrency(2)
-        latent = self._latent_kvcaches(num_layers=1)
+        latent = self._large_latent_kvcaches(num_layers=1)
         conn._lazy_initialize_buffer(latent, kv_group=0)
         layout = conn._group_layouts[0]
 
@@ -979,8 +967,8 @@ class TestPerGroupLazyInit:
         conn = self._make_connector(
             use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
         )
-        conn.set_layerwise_staging_concurrency(1)
-        latent = self._latent_kvcaches(num_layers=1)
+        conn._layerwise_staging_concurrency = 1
+        latent = self._large_latent_kvcaches(num_layers=1)
         conn._lazy_initialize_buffer(latent, kv_group=0)
         layout = conn._group_layouts[0]
 
@@ -1348,6 +1336,15 @@ def _make_save_req(req_id, num_tokens):
         cached_ends=[],
         cached_memory_objs=[],
         cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_keys_indexer=[],
+        cached_starts_indexer=[],
+        cached_ends_indexer=[],
+        cached_memory_objs_indexer=[],
+        cached_tensors_indexer=[],
+        cached_chunk_dev_ptrs_indexer=[],
+        cached_chunk_ptrs_npu_indexer=[],
     )
 
 
