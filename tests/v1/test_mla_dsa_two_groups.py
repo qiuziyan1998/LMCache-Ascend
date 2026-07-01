@@ -812,17 +812,21 @@ class TestPerGroupLazyInit:
             "lmcache_ascend.v1.npu_connector.npu_connectors.GPUMemoryAllocator",
             _FakeGpuAllocator,
         ):
-            latent = self._latent_kvcaches(num_layers=1)
-            indexer = self._indexer_kvcaches(num_layers=1)
+            k_nope = torch.zeros(2048, 128, 1, 512, dtype=torch.bfloat16)
+            k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
+            latent = [(k_nope, k_pe)]
+            indexer = [(torch.zeros(2048, 128, 1, 128, dtype=torch.bfloat16),)]
             conn._lazy_initialize_buffer(latent, kv_group=0)
             conn._lazy_initialize_buffer(indexer, kv_group=1)
 
+        pool_latent_bytes = 2048 * 128 * (512 + 64) * 2
         assert len(created_sizes) == 2
         assert (
             conn._group_layouts[0].gpu_buffer_allocator
             is not conn._group_layouts[1].gpu_buffer_allocator
         )
         assert created_sizes[0] == max_model_len * (512 + 64) * 2
+        assert created_sizes[0] < pool_latent_bytes
         assert created_sizes[1] == max_model_len * 128 * 2
 
 
