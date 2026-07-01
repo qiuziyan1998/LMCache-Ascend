@@ -1434,6 +1434,7 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         _layerwise_save_storers={},
         layerwise_retrievers=[],
         _layerwise_retriever_is_sparse=[],
+        _worker_retrieve_state={},
         # stubs
         _stats_monitor=MagicMock(),
         _maybe_lookup_unpin_for_request=lambda req: None,
@@ -1447,7 +1448,6 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         ),
         _finalize_worker_retrieve_state_from_metadata=lambda m: None,
         _sparse_decode_retrieve_warm_kwargs=lambda *a, **k: {},
-        _save_worker_retrieve_state_from_request=lambda *a, **k: None,
     )
     _bind_real(
         fake,
@@ -1456,6 +1456,9 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         "_num_layers_for_group",
         "_is_dsa_two_groups",
         "_indexer_retrieve_slot_mapping",
+        "_request_has_retrieve_tensor_cache",
+        "_maybe_seed_worker_retrieve_state_from_store",
+        "_save_worker_retrieve_state_from_request",
         "save_kv_layer",
         "wait_for_save",
         "start_load_kv",
@@ -1602,6 +1605,32 @@ class TestVLLMCallSequence:
         assert latent_ret is not None
         assert indexer_ret is None
         assert fake._layerwise_retriever_is_sparse == [True]
+
+    def test_wait_for_save_drains_two_group_storers_and_seeds_worker_state(self):
+        from lmcache.integration.vllm.vllm_v1_adapter import (
+            LMCacheConnectorMetadata,
+        )
+
+        fake = _make_fake_adapter(num_layers=2, dsa_two_groups=True)
+        req = _make_save_req("r1", 128)
+        req.cached_keys = [["k0"], ["k1"]]
+        req.cached_starts = [0]
+        req.cached_ends = [128]
+        req.cached_tensors = [[torch.zeros(1)], [torch.zeros(1)]]
+
+        fake._layerwise_save_storers[("r1", 0)] = _long_generator(n=1)
+        fake._layerwise_save_storers[("r1", 1)] = _long_generator(n=1)
+        meta = LMCacheConnectorMetadata(requests=[req])
+        fake._parent = SimpleNamespace(
+            _connector_metadata=meta,
+            _get_connector_metadata=lambda: meta,
+        )
+
+        fake.wait_for_save()
+
+        assert fake._layerwise_save_storers == {}
+        assert "r1" in fake._worker_retrieve_state
+        assert fake._worker_retrieve_state["r1"].cached_keys == [["k0"], ["k1"]]
 
     def test_save_sequence_without_dsa_two_groups_is_latent_only(self):
         from lmcache.integration.vllm.vllm_v1_adapter import (

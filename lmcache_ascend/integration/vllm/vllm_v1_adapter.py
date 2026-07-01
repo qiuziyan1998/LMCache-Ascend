@@ -68,14 +68,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "Layerwise storing is not supported with async store"
             )
             for request in connector_metadata.requests:
-                layerwise_storer = self._layerwise_save_storers.pop(
-                    request.req_id, None
-                )
-                if layerwise_storer is not None:
-                    try:
-                        next(layerwise_storer)
-                    except StopIteration:
-                        pass
+                for _kv_group in (0, 1):
+                    layerwise_storer = self._layerwise_save_storers.pop(
+                        (request.req_id, _kv_group), None
+                    )
+                    if layerwise_storer is not None:
+                        try:
+                            next(layerwise_storer)
+                        except StopIteration:
+                            pass
+                self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()

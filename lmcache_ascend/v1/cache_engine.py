@@ -573,13 +573,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs: Optional[List],
         num_layers: int,
     ) -> bool:
-        return (
-            cached_tensors is not None
-            and len(cached_tensors) == num_layers
-        ) or (
-            cached_memory_objs is not None
-            and len(cached_memory_objs) == num_layers
-        )
+        if cached_tensors is not None and len(cached_tensors) == num_layers:
+            return any(cached_tensors)
+        if cached_memory_objs is not None and len(cached_memory_objs) == num_layers:
+            return any(cached_memory_objs)
+        return False
 
     def _ensure_layerwise_connector_layout(self, **kwargs) -> None:
         """Initialize connector KV layout before allocating layerwise chunks.
