@@ -1728,6 +1728,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             pass
         # #endregion
 
+    def _staging_plane_elems(
+        self,
+        kv_group: int,
+        k_hidden_dims: int,
+        v_hidden_dims: int,
+        dsa_hidden_dims: int,
+    ) -> int:
+        """Element count per token in the layerwise staging buffer (matches get_shape)."""
+        fmt = self._fmt_for(kv_group)
+        if fmt == KVCacheFormat.DSA_INDEX:
+            return dsa_hidden_dims
+        if fmt == KVCacheFormat.DSA_KV:
+            return k_hidden_dims + v_hidden_dims + dsa_hidden_dims
+        if fmt in (KVCacheFormat.MLA_KV, KVCacheFormat.MLA_LATENT):
+            return k_hidden_dims + v_hidden_dims
+        return k_hidden_dims + v_hidden_dims
+
     def _allocate_layerwise_staging_buffer(
         self,
         *,
@@ -1741,7 +1758,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         location: str,
     ) -> tuple[Optional[MemoryObj], torch.Tensor]:
         """Return (pool_obj_or_none, staging_tensor) for a layerwise transfer."""
-        plane_elems = k_hidden_dims + v_hidden_dims + dsa_hidden_dims
+        plane_elems = self._staging_plane_elems(
+            kv_group, k_hidden_dims, v_hidden_dims, dsa_hidden_dims
+        )
         self._check_staging_transfer_tokens(num_tokens, kv_group)
 
         if self.dsa_two_groups and self._is_mla_dsa_format(kv_group):
