@@ -628,7 +628,13 @@ class TestPerGroupLazyInit:
     first group to initialize pinned a single self.kv_format for both.
     """
 
-    def _make_connector(self):
+    def _make_connector(
+        self,
+        *,
+        use_gpu: bool = False,
+        chunk_size: int = 64,
+        max_staging_tokens: int = 0,
+    ):
         from lmcache_ascend.v1.npu_connector.npu_connectors import (
             VLLMPagedMemLayerwiseNPUConnector,
         )
@@ -640,12 +646,13 @@ class TestPerGroupLazyInit:
             conn = VLLMPagedMemLayerwiseNPUConnector(
                 hidden_dim_size=128,
                 num_layers=2,
-                use_gpu=False,
-                chunk_size=64,
+                use_gpu=use_gpu,
+                chunk_size=chunk_size,
                 dtype=torch.bfloat16,
                 device=torch.device("cpu"),
                 use_mla=True,
                 dsa_two_groups=True,
+                max_staging_tokens=max_staging_tokens,
             )
         return conn
 
@@ -738,6 +745,79 @@ class TestPerGroupLazyInit:
         # dict keyed by (kv_group, layer_id), not a per-layer list.
         assert isinstance(conn._sparse_direct_layer_states, dict) or (
             conn._sparse_direct_layer_states is None
+        )
+
+    def test_dsa_two_groups_caps_staging_buffer_size(self) -> None:
+        created_sizes: list[int] = []
+
+        class _FakeGpuAllocator:
+            def __init__(self, size: int, device=None, **kwargs) -> None:
+                created_sizes.append(size)
+                self.tensor = torch.zeros(size, dtype=torch.uint8)
+
+        max_model_len = 8192
+        conn = self._make_connector(
+            use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
+        )
+        with patch(
+            "lmcache_ascend.v1.npu_connector.npu_connectors.GPUMemoryAllocator",
+            _FakeGpuAllocator,
+        ):
+            k_nope = torch.zeros(2048, 128, 1, 512, dtype=torch.bfloat16)
+            k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
+            latent = [(k_nope, k_pe)]
+            conn._lazy_initialize_buffer(latent, kv_group=0)
+
+        pool_bytes = 2048 * 128 * (512 + 64) * 2
+        assert len(created_sizes) == 1
+        assert created_sizes[0] < pool_bytes
+        assert created_sizes[0] == max_model_len * (512 + 64) * 2
+
+    def test_from_metadata_wires_max_staging_tokens(self) -> None:
+        from lmcache.v1.metadata import LMCacheMetadata
+        from lmcache_ascend.v1.npu_connector.npu_connectors import (
+            VLLMPagedMemLayerwiseNPUConnector,
+        )
+
+        metadata = LMCacheMetadata(
+            model_name="test",
+            world_size=1,
+            local_world_size=1,
+            worker_id=0,
+            local_worker_id=0,
+            kv_dtype=torch.bfloat16,
+            kv_shape=(2, 2, 256, 8, 128),
+            use_mla=True,
+            max_model_len=16384,
+        )
+        with patch("torch.cuda.Stream", return_value=MagicMock()):
+            conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
+                metadata, use_gpu=False, device=torch.device("cpu")
+            )
+        assert conn.max_staging_tokens == 16384
+
+    def test_dsa_two_groups_reuses_shared_gpu_staging_buffer(self) -> None:
+        created_sizes: list[int] = []
+
+        class _FakeGpuAllocator:
+            def __init__(self, size: int, device=None, **kwargs) -> None:
+                created_sizes.append(size)
+                self.tensor = torch.zeros(size, dtype=torch.uint8)
+
+        conn = self._make_connector(use_gpu=True, chunk_size=256)
+        with patch(
+            "lmcache_ascend.v1.npu_connector.npu_connectors.GPUMemoryAllocator",
+            _FakeGpuAllocator,
+        ):
+            latent = self._latent_kvcaches(num_layers=1)
+            indexer = self._indexer_kvcaches(num_layers=1)
+            conn._lazy_initialize_buffer(latent, kv_group=0)
+            conn._lazy_initialize_buffer(indexer, kv_group=1)
+
+        assert len(created_sizes) == 1
+        assert (
+            conn._group_layouts[0].gpu_buffer_allocator
+            is conn._group_layouts[1].gpu_buffer_allocator
         )
 
 

@@ -1178,6 +1178,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.use_mla = kwargs.get("use_mla", False)
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
+        self.max_staging_tokens = int(kwargs.get("max_staging_tokens", 0) or 0)
 
         # Per-kv_group layout state. Detection and the GPU staging buffer
         # are initialized lazily per group by _lazy_initialize_buffer, so
@@ -1646,6 +1647,81 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group = self._current_kv_group
         return self._group_layouts.get(kv_group)
 
+    def _layerwise_staging_num_tokens(self, cache_max_tokens: int) -> int:
+        """Token count for sizing the layerwise GPU staging pool.
+
+        ``cache_max_tokens`` comes from the paged KV tensor shape
+        (num_blocks * block_size), i.e. the vLLM block-pool capacity. That
+        capacity is shared across MLA latent and DSA indexer groups in
+        two-group mode, and in any case exceeds what a single layerwise
+        store/retrieve transfer holds (LMCache chunks). Size staging for
+        transfer headroom, not full pool capacity.
+        """
+        if not self.dsa_two_groups or self.lmcache_chunk_size <= 0:
+            return cache_max_tokens
+
+        max_seq_tokens = self.max_staging_tokens
+        if max_seq_tokens <= 0:
+            # Non-vLLM paths (unit tests, benchmarks) may omit max_model_len.
+            max_seq_tokens = self.lmcache_chunk_size * 512
+        staging_tokens = min(cache_max_tokens, max_seq_tokens)
+        return max(staging_tokens, self.lmcache_chunk_size)
+
+    @classmethod
+    def from_metadata(
+        cls,
+        metadata: LMCacheMetadata,
+        use_gpu: bool = False,
+        device: Optional[torch.device] = None,
+        layout_hints: Optional[LayoutHints] = None,
+    ) -> "VLLMPagedMemLayerwiseNPUConnector":
+        num_layers = metadata.kv_shape[0]
+        chunk_size = metadata.kv_shape[2]
+        num_kv_head = metadata.kv_shape[3]
+        head_size = metadata.kv_shape[4]
+        hidden_dim_size = num_kv_head * head_size
+        max_staging_tokens = int(getattr(metadata, "max_model_len", 0) or 0)
+        return cls(
+            hidden_dim_size=hidden_dim_size,
+            num_layers=num_layers,
+            use_gpu=use_gpu,
+            chunk_size=chunk_size,
+            dtype=metadata.kv_dtype,
+            device=device,
+            use_mla=metadata.use_mla,
+            layout_hints=layout_hints,
+            max_staging_tokens=max_staging_tokens,
+        )
+
+    def _assign_group_gpu_allocator(
+        self, gpu_buffer_size: int, layout: _GroupLayout, kv_group: int
+    ) -> None:
+        """Create or reuse the per-group GPU staging allocator."""
+        if self.dsa_two_groups:
+            shared = getattr(self, "_shared_gpu_buffer_allocator", None)
+            prev_bytes = int(getattr(self, "_shared_gpu_buffer_bytes", 0) or 0)
+            target_bytes = max(prev_bytes, gpu_buffer_size)
+            if (
+                shared is not None
+                and shared.tensor.numel() >= target_bytes
+            ):
+                layout.gpu_buffer_allocator = shared
+                self.gpu_buffer_allocator = shared
+                self._shared_gpu_buffer_bytes = shared.tensor.numel()
+                return
+            layout.gpu_buffer_allocator = GPUMemoryAllocator(
+                target_bytes, device=self.device
+            )
+            self._shared_gpu_buffer_allocator = layout.gpu_buffer_allocator
+            self._shared_gpu_buffer_bytes = target_bytes
+            self.gpu_buffer_allocator = layout.gpu_buffer_allocator
+            return
+
+        layout.gpu_buffer_allocator = GPUMemoryAllocator(
+            gpu_buffer_size, device=self.device
+        )
+        self.gpu_buffer_allocator = layout.gpu_buffer_allocator
+
     def _lazy_initialize_buffer(
         self, kv_caches, kv_group: int = 0
     ) -> _GroupLayout:
@@ -1811,23 +1887,67 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 num_elements = k_cache_shape_per_layer.numel() * 2
                 max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
 
+            staging_tokens = self._layerwise_staging_num_tokens(max_tokens)
+            if staging_tokens != max_tokens:
+                plane_elems = num_elements // max_tokens
+                num_elements = staging_tokens * plane_elems
+
+            gpu_buffer_size = num_elements * self.element_size
+
             logger.info(
                 f"Lazily initializing GPU buffer:\n"
                 f"  - Format: {layout.kv_format.name}\n"
                 f"  - Key cache shape per layer: {k_cache_shape_per_layer}\n"
                 f"  - Value cache shape per layer: {v_cache_shape_per_layer}\n"
-                f"  - Max tokens: {max_tokens}\n"
+                f"  - Pool max tokens: {max_tokens}\n"
+                f"  - Staging tokens: {staging_tokens}\n"
                 f"  - k_hidden_dims={layout.k_hidden_dims} "
                 f"v_hidden_dims={layout.v_hidden_dims} "
-                f"dsa_hidden_dims={layout.dsa_hidden_dims}"
+                f"dsa_hidden_dims={layout.dsa_hidden_dims}\n"
+                f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024):.2f} MB"
             )
 
-            gpu_buffer_size = num_elements * self.element_size
-            layout.gpu_buffer_allocator = GPUMemoryAllocator(
-                gpu_buffer_size, device=self.device
-            )
-            # Mirror the freshly created allocator too.
-            self.gpu_buffer_allocator = layout.gpu_buffer_allocator
+            # #region agent log
+            try:
+                import json
+                import time
+
+                with open("debug-d9c30c.log", "a", encoding="utf-8") as _dbg:
+                    _dbg.write(
+                        json.dumps(
+                            {
+                                "sessionId": "d9c30c",
+                                "runId": "pre-fix",
+                                "hypothesisId": "A,C,E",
+                                "location": "npu_connectors.py:_lazy_initialize_buffer",
+                                "message": "layerwise gpu staging init",
+                                "data": {
+                                    "kv_group": kv_group,
+                                    "kv_format": layout.kv_format.name,
+                                    "pool_max_tokens": max_tokens,
+                                    "staging_tokens": staging_tokens,
+                                    "max_staging_tokens": self.max_staging_tokens,
+                                    "gpu_buffer_size_mb": round(
+                                        gpu_buffer_size / (1024 * 1024), 2
+                                    ),
+                                    "dsa_two_groups": bool(self.dsa_two_groups),
+                                    "shared_reuse": bool(
+                                        getattr(
+                                            self, "_shared_gpu_buffer_allocator", None
+                                        )
+                                        is not None
+                                    ),
+                                },
+                                "timestamp": int(time.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except OSError:
+                pass
+            # #endregion
+
+            self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
 
         return layout
 
