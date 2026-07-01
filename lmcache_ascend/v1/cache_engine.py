@@ -625,6 +625,24 @@ class AscendLMCacheEngine(LMCacheEngine):
             return LOCAL_CPU_BACKEND_NAME
         return fallback
 
+    def _layerwise_chunk_location(
+        self,
+        keys_multi_layer: List[CacheEngineKey],
+    ) -> Optional[str]:
+        """Return storage location only if every layer key for a chunk exists."""
+        location: Optional[str] = None
+        for layer_key in keys_multi_layer:
+            current_location = self.storage_manager.contains(
+                layer_key, self.retrieve_locations
+            )
+            if current_location is None:
+                return None
+            if location is None:
+                location = current_location
+            elif location != current_location:
+                return None
+        return location
+
     def _ensure_retrieve_chunk_metadata(
         self,
         *,
@@ -662,8 +680,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 assert isinstance(key, CacheEngineKey)
 
                 keys_multi_layer = key.split_layers(self.num_layers)
-                if current_location := self.storage_manager.contains(
-                    keys_multi_layer[0], self.retrieve_locations
+                if current_location := self._layerwise_chunk_location(
+                    keys_multi_layer
                 ):
                     if location is None:
                         location = current_location
