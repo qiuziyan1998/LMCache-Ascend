@@ -767,6 +767,14 @@ class TestAdapterGroupSplit:
             _indexer_kvcaches=[],
             _kvcaches_list=[],
         )
+        # Bind the real helper methods so internal self._kvcaches_for_group
+        # calls (e.g. from _num_layers_for_group) resolve on the fake.
+        _bind_real(
+            fake,
+            "_kvcaches_for_group",
+            "_num_layers_for_group",
+            "_is_dsa_two_groups",
+        )
         return fake
 
     def test_partition_with_dsa_two_groups(self):
@@ -1177,7 +1185,10 @@ class TestVLLMCallSequence:
         meta = LMCacheConnectorMetadata(
             requests=[_make_save_req("r1", 64)]
         )
-        fake._parent = SimpleNamespace(_get_connector_metadata=lambda: meta)
+        fake._parent = SimpleNamespace(
+            _connector_metadata=meta,
+            _get_connector_metadata=lambda: meta,
+        )
         attn = SimpleNamespace(slot_mapping=torch.arange(64, dtype=torch.long),
                                indexer_slot_mapping=None)
 
@@ -1219,7 +1230,10 @@ class TestVLLMCallSequence:
         meta = LMCacheConnectorMetadata(
             requests=[_make_load_req("r1", 128, cached_tokens)]
         )
-        fake._parent = SimpleNamespace(_get_connector_metadata=lambda: meta)
+        fake._parent = SimpleNamespace(
+            _connector_metadata=meta,
+            _get_connector_metadata=lambda: meta,
+        )
         forward_ctx = SimpleNamespace(
             attn_metadata=SimpleNamespace(
                 slot_mapping=torch.arange(cached_tokens, dtype=torch.long),
@@ -1266,7 +1280,10 @@ class TestVLLMCallSequence:
         meta = LMCacheConnectorMetadata(
             requests=[_make_save_req("r1", 64)]
         )
-        fake._parent = SimpleNamespace(_get_connector_metadata=lambda: meta)
+        fake._parent = SimpleNamespace(
+            _connector_metadata=meta,
+            _get_connector_metadata=lambda: meta,
+        )
         attn = SimpleNamespace(slot_mapping=torch.arange(64, dtype=torch.long),
                                indexer_slot_mapping=None)
 
