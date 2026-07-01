@@ -29,11 +29,17 @@ def permute_kv_caches_to_contiguous(
         if isinstance(layer, torch.Tensor):
             results.append(permute_to_contiguous(layer))
         elif isinstance(layer, tuple):
-            if len(layer) < 2:
-                raise ValueError(
-                    "Tuple KV entries must contain at least two tensors; "
-                    f"got len={len(layer)}"
-                )
+            if len(layer) == 0:
+                raise ValueError("Tuple KV entries must not be empty")
+            if len(layer) == 1:
+                t = layer[0]
+                if not isinstance(t, torch.Tensor):
+                    raise ValueError(
+                        f"Expected torch.Tensor inside KV tuple, got {type(t)}"
+                    )
+                # DSA_INDEX: (indexer_k,) single-plane tuple
+                results.append((permute_to_contiguous(t),))
+                continue
             permuted: List[torch.Tensor] = []
             for t in layer:
                 if not isinstance(t, torch.Tensor):

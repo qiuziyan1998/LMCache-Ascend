@@ -1297,3 +1297,30 @@ class TestVLLMCallSequence:
         fake.wait_for_save()
         assert fake._layerwise_save_storers == {}
 
+
+class TestPermuteKvCachesToContiguous:
+    def test_dsa_index_one_tuple(self) -> None:
+        from lmcache_ascend.v1.npu_connector.utils import (
+            permute_kv_caches_to_contiguous,
+        )
+
+        indexer = torch.randn(4, 16, 1, 128)
+        result = permute_kv_caches_to_contiguous([(indexer,)])
+
+        assert len(result) == 1
+        assert isinstance(result[0], tuple)
+        assert len(result[0]) == 1
+        assert result[0][0].shape == indexer.shape
+
+    def test_mla_latent_two_tuple(self) -> None:
+        from lmcache_ascend.v1.npu_connector.utils import (
+            permute_kv_caches_to_contiguous,
+        )
+
+        k_nope = torch.randn(4, 16, 1, 512)
+        k_pe = torch.randn(4, 16, 1, 64)
+        result = permute_kv_caches_to_contiguous([(k_nope, k_pe)])
+
+        assert len(result) == 1
+        assert len(result[0]) == 2
+
