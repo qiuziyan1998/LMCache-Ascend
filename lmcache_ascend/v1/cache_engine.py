@@ -692,21 +692,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                             "Please support multi-location retrieval in the future."
                         )
                 else:
-                    # #region agent log
-                    from lmcache.v1.debug_agent_log import agent_debug_log
-
-                    agent_debug_log(
-                        "A",
-                        "cache_engine.py:_ensure_retrieve_chunk_metadata:contains_miss",
-                        "contains miss during metadata refresh",
-                        {
-                            "start": start,
-                            "end": end,
-                            "key": str(key),
-                            "layer0_key": str(keys_multi_layer[0]),
-                        },
-                    )
-                    # #endregion
                     break
 
                 new_starts.append(start)
@@ -738,25 +723,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_ends.append(end)
                     for layer_id in range(self.num_layers):
                         cached_keys[layer_id].append(new_keys[layer_id][chunk_idx])
-                    # #region agent log
-                    from lmcache.v1.debug_agent_log import agent_debug_log
-
-                    agent_debug_log(
-                        "A",
-                        "cache_engine.py:_ensure_retrieve_chunk_metadata:append",
-                        "appended chunk to cached_keys without contains",
-                        {
-                            "chunk_idx": chunk_idx,
-                            "start": start,
-                            "end": end,
-                            "layer7_key": (
-                                str(new_keys[7][chunk_idx])
-                                if len(new_keys) > 7
-                                else None
-                            ),
-                        },
-                    )
-                    # #endregion
 
             ret_mask.zero_()
             for start, end in zip(cached_starts, cached_ends, strict=False):
@@ -1126,28 +1092,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         if use_cached_retrieve:
             kwargs["_use_cached_retrieve"] = True
 
-        # #region agent log
-        from lmcache.v1.debug_agent_log import agent_debug_log
-
-        agent_debug_log(
-            "A",
-            "cache_engine.py:retrieve_layer_head_token_wise:entry",
-            "sparse decode retrieve start",
-            {
-                "num_tokens": num_tokens,
-                "use_cached_retrieve": use_cached_retrieve,
-                "metadata_warm": metadata_warm,
-                "cached_keys_layers": len(cached_keys),
-                "cached_keys_chunks_layer0": (
-                    len(cached_keys[0]) if cached_keys and cached_keys[0] else 0
-                ),
-                "has_cached_memory_objs": cached_memory_objs is not None,
-                "has_cached_tensors": cached_tensors is not None,
-                "req_id": kwargs.get("req_id"),
-            },
-        )
-        # #endregion
-
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -1164,34 +1108,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             location = self._resolve_local_cpu_retrieve_location(location)
             if location is not None:
                 kwargs["cached_retrieve_location"] = location
-
-        # #region agent log
-        agent_debug_log(
-            "C",
-            "cache_engine.py:retrieve_layer_head_token_wise:after_metadata",
-            "retrieve metadata resolved",
-            {
-                "location": location,
-                "num_chunks": len(starts),
-                "retrieve_keys_layers": len(retrieve_keys),
-                "retrieve_keys_chunks_layer0": (
-                    len(retrieve_keys[0]) if retrieve_keys and retrieve_keys[0] else 0
-                ),
-                "layer0_first_key": (
-                    str(retrieve_keys[0][0])
-                    if retrieve_keys and retrieve_keys[0]
-                    else None
-                ),
-                "layer7_first_key": (
-                    str(retrieve_keys[7][0])
-                    if retrieve_keys
-                    and len(retrieve_keys) > 7
-                    and retrieve_keys[7]
-                    else None
-                ),
-            },
-        )
-        # #endregion
 
         if not retrieve_keys:
             retrieve_keys = [[] for _ in range(self.num_layers)]
@@ -1240,22 +1156,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 assert get_generator is not None
                 task = next(get_generator)
                 assert task is not None
-                # #region agent log
-                agent_debug_log(
-                    "D",
-                    "cache_engine.py:retrieve_layer_head_token_wise:layer_get",
-                    "before layerwise batched get result",
-                    {
-                        "layer_id": layer_id,
-                        "num_chunks": (
-                            len(retrieve_keys[layer_id])
-                            if retrieve_keys and len(retrieve_keys) > layer_id
-                            else 0
-                        ),
-                        "location": location,
-                    },
-                )
-                # #endregion
                 mem_objs_layer = task.result()
                 if mem_objs_layer is not None:
                     layer_cached_chunks = (
