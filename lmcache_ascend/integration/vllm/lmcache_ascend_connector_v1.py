@@ -23,5 +23,6 @@ logger = init_logger(__name__)
 
 
 class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
+    supports_dsa_index_lmcache = True
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole) -> None:
         super().__init__(vllm_config=vllm_config, role=role)
