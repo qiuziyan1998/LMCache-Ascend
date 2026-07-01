@@ -1194,15 +1194,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         # #endregion
 
         if not retrieve_keys:
-            # If no cache are found, we still need to yield to avoid `StopIteration`
-            for layer_id in range(self.num_layers):
-                yield None
-            # synchronize the last layer
-            if not mem_obj_consumer:
-                mem_obj_consumer = (x for x in range(self.num_layers))  
-            next(mem_obj_consumer)
-            yield ret_mask
-            return
+            retrieve_keys = [[] for _ in range(self.num_layers)]
+        elif len(retrieve_keys) < self.num_layers:
+            retrieve_keys.extend(
+                [] for _ in range(self.num_layers - len(retrieve_keys))
+            )
 
         assert_layerwise_gpu_connector(self.gpu_connector)
 
