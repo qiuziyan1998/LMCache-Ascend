@@ -226,6 +226,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        kv_group = kwargs.get("kv_group", 0)
+
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
 
         with store_stats.profile_process_tokens():
@@ -236,6 +238,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 offsets,
                 mask,
                 request_configs=request_configs,
+                kv_group=kv_group,
             ):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
@@ -250,7 +253,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     busy_loop=self.config.get_extra_config_value(
                         "force_store_wait", False
                     ),
-                    fmt=self.fmt,
+                    fmt=self._memory_format_for_kv_group(kv_group),
                 )
                 if memory_obj is None:
                     logger.warning(
@@ -886,7 +889,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kv_shape_single_layer,
                 kv_dtype,
                 batch_size=self.num_layers,
-                fmt=self.fmt,
+                fmt=self._memory_format_for_kv_group(kv_group),
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
 
