@@ -2190,6 +2190,45 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         num_tokens = len(slot_mapping_full)
         self._check_staging_transfer_tokens(num_tokens, kv_group)
 
+        # #region agent log
+        if kv_group in (0, 1):
+            try:
+                import json as _j
+                import time as _t
+
+                _kc0 = self.kvcaches[0] if self.kvcaches else None
+                if isinstance(_kc0, (list, tuple)):
+                    _kc0 = _kc0[0] if _kc0 else None
+                _shape = list(_kc0.shape) if _kc0 is not None else []
+                _cap = _shape[0] * _shape[1] if len(_shape) >= 2 else 0
+                _smax = int(slot_mapping_full.max().item())
+                with open("debug-792df4.log", "a", encoding="utf-8") as _f:
+                    _f.write(
+                        _j.dumps(
+                            {
+                                "sessionId": "792df4",
+                                "runId": "pre-fix",
+                                "hypothesisId": "H_TP6",
+                                "location": "npu_connectors:batched_to_gpu",
+                                "message": "retrieve slot bounds",
+                                "data": {
+                                    "kv_group": kv_group,
+                                    "num_tokens": num_tokens,
+                                    "slot_max": _smax,
+                                    "kvcaches_shape": _shape,
+                                    "kvcaches_capacity": _cap,
+                                    "oob": _smax >= _cap,
+                                    "num_layers": self.num_layers,
+                                },
+                                "timestamp": int(_t.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except OSError:
+                pass
+        # #endregion
+
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
