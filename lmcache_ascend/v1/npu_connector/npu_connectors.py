@@ -1687,23 +1687,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "Increase vLLM max_model_len or reduce tokens stored per forward."
         )
 
-    def _staging_plane_elems(
-        self,
-        kv_group: int,
-        k_hidden_dims: int,
-        v_hidden_dims: int,
-        dsa_hidden_dims: int,
-    ) -> int:
-        """Element count per token in the layerwise staging buffer (matches get_shape)."""
-        fmt = self._fmt_for(kv_group)
-        if fmt == KVCacheFormat.DSA_INDEX:
-            return dsa_hidden_dims
-        if fmt == KVCacheFormat.DSA_KV:
-            return k_hidden_dims + v_hidden_dims + dsa_hidden_dims
-        if fmt in (KVCacheFormat.MLA_KV, KVCacheFormat.MLA_LATENT):
-            return k_hidden_dims + v_hidden_dims
-        return k_hidden_dims + v_hidden_dims
-
     def _allocate_layerwise_staging_buffer(
         self,
         *,
@@ -1716,21 +1699,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         expected_fmt: MemoryFormat,
     ) -> tuple[Optional[MemoryObj], torch.Tensor]:
         """Return (pool_obj_or_none, staging_tensor) for a layerwise transfer."""
-        plane_elems = self._staging_plane_elems(
-            kv_group, k_hidden_dims, v_hidden_dims, dsa_hidden_dims
-        )
         self._check_staging_transfer_tokens(num_tokens, kv_group)
 
-        if self.dsa_two_groups and self._is_mla_dsa_format(kv_group):
-            staging_tensor = torch.empty(
-                num_tokens * plane_elems,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            return None, staging_tensor
-
         gpu_buffer_allocator = layout.gpu_buffer_allocator
-        assert gpu_buffer_allocator is not None
+        assert gpu_buffer_allocator is not None, (
+            f"GPU staging pool for kv_group={kv_group} is not initialized."
+        )
         buffer_shape = self.get_shape(num_tokens, kv_group)
         tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, expected_fmt
@@ -1966,12 +1940,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024):.2f} MB"
             )
 
-            if not self.dsa_two_groups:
-                self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
-            else:
+            self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
+            if self.dsa_two_groups:
                 logger.info(
-                    "dsa_two_groups: per-transfer NPU staging buffers "
-                    f"(kv_group={kv_group}, cap={staging_tokens} tokens)"
+                    "dsa_two_groups: per-group NPU staging pool "
+                    f"(kv_group={kv_group}, cap={staging_tokens} tokens, "
+                    f"{gpu_buffer_size / (1024 * 1024):.2f} MB)"
                 )
 
         return layout
