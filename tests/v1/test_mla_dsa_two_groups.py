@@ -777,7 +777,6 @@ class TestPerGroupLazyInit:
                 v_hidden_dims=64,
                 dsa_hidden_dims=0,
                 expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
-                location="test",
             )
 
         pool_bytes = 2048 * 128 * (512 + 64) * 2
@@ -839,7 +838,6 @@ class TestPerGroupLazyInit:
                 v_hidden_dims=64,
                 dsa_hidden_dims=0,
                 expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
-                location="test_latent",
             )
             conn._allocate_layerwise_staging_buffer(
                 num_tokens=256,
@@ -849,7 +847,6 @@ class TestPerGroupLazyInit:
                 v_hidden_dims=0,
                 dsa_hidden_dims=128,
                 expected_fmt=MemoryFormat.KV_DSA_INDEX_FMT,
-                location="test_indexer",
             )
 
         assert len(created_sizes) == 2

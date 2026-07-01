@@ -1687,92 +1687,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "Increase vLLM max_model_len or reduce tokens stored per forward."
         )
 
-    def _log_staging_transfer(
-        self,
-        *,
-        location: str,
-        kv_group: int,
-        num_tokens: int,
-        pool_bytes: int,
-        plane_elems: int,
-    ) -> None:
-        # #region agent log
-        try:
-            import json
-            import time
-
-            with open("debug-d9c30c.log", "a", encoding="utf-8") as _dbg:
-                _dbg.write(
-                    json.dumps(
-                        {
-                            "sessionId": "d9c30c",
-                            "runId": "post-fix",
-                            "hypothesisId": "F",
-                            "location": location,
-                            "message": "staging transfer allocate",
-                            "data": {
-                                "kv_group": kv_group,
-                                "num_tokens": num_tokens,
-                                "staging_cap": self._staging_token_cap(),
-                                "pool_bytes": pool_bytes,
-                                "request_bytes": int(
-                                    num_tokens * plane_elems * self.element_size
-                                ),
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except OSError:
-            pass
-        # #endregion
-
-    def _log_fused_transfer(
-        self,
-        *,
-        location: str,
-        kv_group: int,
-        layer_id: int,
-        from_gpu: bool,
-        kv_format_value: int,
-        v_hidden_dims: int,
-        num_tokens: int,
-    ) -> None:
-        # #region agent log
-        try:
-            import json
-            import time
-
-            with open("debug-d9c30c.log", "a", encoding="utf-8") as _dbg:
-                _dbg.write(
-                    json.dumps(
-                        {
-                            "sessionId": "d9c30c",
-                            "runId": "post-fix",
-                            "hypothesisId": "G",
-                            "location": location,
-                            "message": "fused layerwise transfer",
-                            "data": {
-                                "kv_group": kv_group,
-                                "layer_id": layer_id,
-                                "from_gpu": from_gpu,
-                                "kv_format_value": kv_format_value,
-                                "v_hidden_dims": v_hidden_dims,
-                                "num_tokens": num_tokens,
-                                "v_memcpy_bytes": int(
-                                    num_tokens * v_hidden_dims * self.element_size
-                                ),
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except OSError:
-            pass
-        # #endregion
-
     def _staging_plane_elems(
         self,
         kv_group: int,
@@ -1800,7 +1714,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         v_hidden_dims: int,
         dsa_hidden_dims: int,
         expected_fmt: MemoryFormat,
-        location: str,
     ) -> tuple[Optional[MemoryObj], torch.Tensor]:
         """Return (pool_obj_or_none, staging_tensor) for a layerwise transfer."""
         plane_elems = self._staging_plane_elems(
@@ -1814,25 +1727,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 dtype=self.dtype,
                 device=self.device,
             )
-            self._log_staging_transfer(
-                location=location,
-                kv_group=kv_group,
-                num_tokens=num_tokens,
-                pool_bytes=int(staging_tensor.numel() * staging_tensor.element_size()),
-                plane_elems=plane_elems,
-            )
             return None, staging_tensor
 
         gpu_buffer_allocator = layout.gpu_buffer_allocator
         assert gpu_buffer_allocator is not None
         buffer_shape = self.get_shape(num_tokens, kv_group)
-        self._log_staging_transfer(
-            location=location,
-            kv_group=kv_group,
-            num_tokens=num_tokens,
-            pool_bytes=int(gpu_buffer_allocator.tensor.numel()),
-            plane_elems=plane_elems,
-        )
         tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, expected_fmt
         )
@@ -2067,40 +1966,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024):.2f} MB"
             )
 
-            # #region agent log
-            try:
-                import json
-                import time
-
-                with open("debug-d9c30c.log", "a", encoding="utf-8") as _dbg:
-                    _dbg.write(
-                        json.dumps(
-                            {
-                                "sessionId": "d9c30c",
-                                "runId": "post-fix",
-                                "hypothesisId": "F",
-                                "location": "npu_connectors.py:_lazy_initialize_buffer",
-                                "message": "layerwise gpu staging init",
-                                "data": {
-                                    "kv_group": kv_group,
-                                    "kv_format": layout.kv_format.name,
-                                    "pool_max_tokens": max_tokens,
-                                    "staging_tokens": staging_tokens,
-                                    "max_staging_tokens": self.max_staging_tokens,
-                                    "gpu_buffer_size_mb": round(
-                                        gpu_buffer_size / (1024 * 1024), 2
-                                    ),
-                                    "dsa_two_groups": bool(self.dsa_two_groups),
-                                },
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except OSError:
-                pass
-            # #endregion
-
             if not self.dsa_two_groups:
                 self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
             else:
@@ -2224,7 +2089,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 v_hidden_dims=v_hidden_dims,
                 dsa_hidden_dims=dsa_hidden_dims,
                 expected_fmt=expected_fmt,
-                location="npu_connectors.py:batched_to_gpu",
             )
 
         current_stream = torch.cuda.current_stream()
@@ -2249,15 +2113,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: N H2D memcpy + 1 scatter kernel
-                    self._log_fused_transfer(
-                        location="npu_connectors.py:batched_to_gpu",
-                        kv_group=kv_group,
-                        layer_id=layer_id,
-                        from_gpu=False,
-                        kv_format_value=kv_format_value,
-                        v_hidden_dims=v_hidden_dims,
-                        num_tokens=num_tokens,
-                    )
                     batched_fused_single_layer_kv_transfer(
                         cpu_tensors,  # CPU memory objects
                         staging_tensor,  # GPU staging buffer
@@ -2519,7 +2374,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 v_hidden_dims=v_hidden_dims,
                 dsa_hidden_dims=dsa_hidden_dims,
                 expected_fmt=expected_fmt,
-                location="npu_connectors.py:batched_from_gpu",
             )
 
         current_stream = torch.cuda.current_stream()
@@ -2537,15 +2391,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: 1 scatter kernel + N D2H memcpy
-                    self._log_fused_transfer(
-                        location="npu_connectors.py:batched_from_gpu",
-                        kv_group=kv_group,
-                        layer_id=layer_id,
-                        from_gpu=True,
-                        kv_format_value=kv_format_value,
-                        v_hidden_dims=v_hidden_dims,
-                        num_tokens=num_tokens,
-                    )
                     lmc_ops.batched_fused_single_layer_kv_transfer(
                         cpu_tensors,
                         staging_tensor,
