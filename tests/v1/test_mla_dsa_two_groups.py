@@ -1357,6 +1357,7 @@ def _make_save_req(req_id, num_tokens):
         cached_tensors_indexer=[],
         cached_chunk_dev_ptrs_indexer=[],
         cached_chunk_ptrs_npu_indexer=[],
+        resumed_from_preemption=False,
     )
 
 
@@ -1387,6 +1388,7 @@ def _make_load_req(req_id, num_tokens, cached_tokens):
         cached_chunk_dev_ptrs_indexer=[],
         cached_chunk_ptrs_npu_indexer=[],
         decode_ret_mask=None,
+        resumed_from_preemption=False,
     )
 
 
