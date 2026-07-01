@@ -1314,8 +1314,18 @@ class _RecordingEngine:
             "kvcaches": kwargs.get("kvcaches"),
             "kv_group": kwargs.get("kv_group"),
             "slot_mapping": kwargs.get("slot_mapping"),
+            "kind": "layer",
         })
         # Retrieve generators yield a ret_mask per layer; return a truthy mask.
+        return _long_generator(value=torch.ones(1, dtype=torch.bool))
+
+    def retrieve_layer_head_token_wise(self, *args, **kwargs):
+        self.retrieve_calls.append({
+            "kvcaches": kwargs.get("kvcaches"),
+            "kv_group": kwargs.get("kv_group"),
+            "slot_mapping": kwargs.get("slot_mapping"),
+            "kind": "sparse_head_token_wise",
+        })
         return _long_generator(value=torch.ones(1, dtype=torch.bool))
 
 
@@ -1371,6 +1381,12 @@ def _make_load_req(req_id, num_tokens, cached_tokens):
     )
 
 
+def _make_sparse_load_req(req_id, num_tokens, cached_tokens):
+    req = _make_load_req(req_id, num_tokens, cached_tokens)
+    req.is_sparse_decode = True
+    return req
+
+
 def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
     """Build a fake adapter with real per-group plumbing + mocked engine."""
     latent = [torch.zeros(1) for _ in range(num_layers)]
@@ -1423,6 +1439,8 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
             torch.ones(token_count, dtype=torch.bool)
         ),
         _finalize_worker_retrieve_state_from_metadata=lambda m: None,
+        _sparse_decode_retrieve_warm_kwargs=lambda *a, **k: {},
+        _save_worker_retrieve_state_from_request=lambda *a, **k: None,
     )
     _bind_real(
         fake,
@@ -1540,6 +1558,37 @@ class TestVLLMCallSequence:
         # After num_layers layers, retrievers are drained.
         assert fake.layerwise_retrievers == []
         assert fake._layerwise_retriever_is_sparse == []
+
+    def test_sparse_decode_load_sequence_retrieves_latent_only(self):
+        from lmcache.integration.vllm.vllm_v1_adapter import (
+            LMCacheConnectorMetadata,
+        )
+
+        fake = _make_fake_adapter(num_layers=2, dsa_two_groups=True)
+        engine: _RecordingEngine = fake.lmcache_engine
+
+        cached_tokens = 64
+        meta = LMCacheConnectorMetadata(
+            requests=[_make_sparse_load_req("r1", 128, cached_tokens)]
+        )
+        fake._parent = SimpleNamespace(
+            _connector_metadata=meta,
+            _get_connector_metadata=lambda: meta,
+        )
+        forward_ctx = SimpleNamespace(attn_metadata=None)
+
+        fake.start_load_kv(forward_ctx)
+
+        assert len(engine.retrieve_calls) == 1
+        assert engine.retrieve_calls[0]["kv_group"] == 0
+        assert engine.retrieve_calls[0]["kind"] == "sparse_head_token_wise"
+        assert engine.retrieve_calls[0]["kvcaches"] is fake._latent_kvcaches
+
+        assert len(fake.layerwise_retrievers) == 1
+        latent_ret, indexer_ret = fake.layerwise_retrievers[0]
+        assert latent_ret is not None
+        assert indexer_ret is None
+        assert fake._layerwise_retriever_is_sparse == [True]
 
     def test_save_sequence_without_dsa_two_groups_is_latent_only(self):
         from lmcache.integration.vllm.vllm_v1_adapter import (
