@@ -514,11 +514,13 @@ void execute_batched_memcpy(
                                    k_bytes_per_token, kind, stream);
             TORCH_CHECK(ret == ACL_ERROR_NONE,
                         "Memcpy (MLA/DSA interleaved K) failed chunk ", i);
-            ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
-                                   host_token + k_bytes_per_token,
-                                   v_bytes_per_token, kind, stream);
-            TORCH_CHECK(ret == ACL_ERROR_NONE,
-                        "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            if (v_bytes_per_token > 0) {
+              ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
+                                     host_token + k_bytes_per_token,
+                                     v_bytes_per_token, kind, stream);
+              TORCH_CHECK(ret == ACL_ERROR_NONE,
+                          "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            }
             if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
               uint8_t *staging_dsa =
                   config.ptrs.lmc_ptr + staging_dsa_plane_offset +
@@ -535,11 +537,13 @@ void execute_batched_memcpy(
                                    k_bytes_per_token, kind, stream);
             TORCH_CHECK(ret == ACL_ERROR_NONE,
                         "Memcpy (MLA/DSA interleaved K) failed chunk ", i);
-            ret = aclrtMemcpyAsync(host_token + k_bytes_per_token,
-                                   v_bytes_per_token, staging_v,
-                                   v_bytes_per_token, kind, stream);
-            TORCH_CHECK(ret == ACL_ERROR_NONE,
-                        "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            if (v_bytes_per_token > 0) {
+              ret = aclrtMemcpyAsync(host_token + k_bytes_per_token,
+                                     v_bytes_per_token, staging_v,
+                                     v_bytes_per_token, kind, stream);
+              TORCH_CHECK(ret == ACL_ERROR_NONE,
+                          "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            }
             if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
               uint8_t *staging_dsa =
                   config.ptrs.lmc_ptr + staging_dsa_plane_offset +
@@ -576,8 +580,10 @@ void execute_batched_memcpy(
       if (!is_d2h) {
         ret = aclrtMemcpyAsync(staging_k, k_size, host_k, k_size, kind, stream);
         TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA K) failed chunk ", i);
-        ret = aclrtMemcpyAsync(staging_v, v_size, host_v, v_size, kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        if (v_size > 0) {
+          ret = aclrtMemcpyAsync(staging_v, v_size, host_v, v_size, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa = config.ptrs.lmc_ptr + staging_dsa_plane_offset +
                                  token_offset * dsa_bytes_per_token;
@@ -588,8 +594,10 @@ void execute_batched_memcpy(
       } else {
         ret = aclrtMemcpyAsync(host_k, k_size, staging_k, k_size, kind, stream);
         TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA K) failed chunk ", i);
-        ret = aclrtMemcpyAsync(host_v, v_size, staging_v, v_size, kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        if (v_size > 0) {
+          ret = aclrtMemcpyAsync(host_v, v_size, staging_v, v_size, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa = config.ptrs.lmc_ptr + staging_dsa_plane_offset +
                                  token_offset * dsa_bytes_per_token;
@@ -720,11 +728,13 @@ void execute_batched_sparse_memcpy(
                                k_bytes_per_token, kind, stream);
         TORCH_CHECK(ret == ACL_ERROR_NONE,
                     "Sparse memcpy (MLA/DSA K) failed at index ", staging_token_idx);
-        ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
-                               host_token + k_bytes_per_token, v_bytes_per_token,
-                               kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE,
-                    "Sparse memcpy (MLA/DSA V) failed at index ", staging_token_idx);
+        if (v_bytes_per_token > 0) {
+          ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
+                                 host_token + k_bytes_per_token, v_bytes_per_token,
+                                 kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE,
+                      "Sparse memcpy (MLA/DSA V) failed at index ", staging_token_idx);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa =
               config.ptrs.lmc_ptr + staging_dsa_plane_offset +
@@ -751,11 +761,13 @@ void execute_batched_sparse_memcpy(
         TORCH_CHECK(ret == ACL_ERROR_NONE,
                     "Sparse memcpy (MLA/DSA stacked K) failed at index ",
                     staging_token_idx);
-        ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token, host_v,
-                               v_bytes_per_token, kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE,
-                    "Sparse memcpy (MLA/DSA stacked V) failed at index ",
-                    staging_token_idx);
+        if (v_bytes_per_token > 0) {
+          ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token, host_v,
+                                 v_bytes_per_token, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE,
+                      "Sparse memcpy (MLA/DSA stacked V) failed at index ",
+                      staging_token_idx);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa =
               config.ptrs.lmc_ptr + staging_dsa_plane_offset +

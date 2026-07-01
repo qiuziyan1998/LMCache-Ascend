@@ -1728,6 +1728,51 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             pass
         # #endregion
 
+    def _log_fused_transfer(
+        self,
+        *,
+        location: str,
+        kv_group: int,
+        layer_id: int,
+        from_gpu: bool,
+        kv_format_value: int,
+        v_hidden_dims: int,
+        num_tokens: int,
+    ) -> None:
+        # #region agent log
+        try:
+            import json
+            import time
+
+            with open("debug-d9c30c.log", "a", encoding="utf-8") as _dbg:
+                _dbg.write(
+                    json.dumps(
+                        {
+                            "sessionId": "d9c30c",
+                            "runId": "post-fix",
+                            "hypothesisId": "G",
+                            "location": location,
+                            "message": "fused layerwise transfer",
+                            "data": {
+                                "kv_group": kv_group,
+                                "layer_id": layer_id,
+                                "from_gpu": from_gpu,
+                                "kv_format_value": kv_format_value,
+                                "v_hidden_dims": v_hidden_dims,
+                                "num_tokens": num_tokens,
+                                "v_memcpy_bytes": int(
+                                    num_tokens * v_hidden_dims * self.element_size
+                                ),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except OSError:
+            pass
+        # #endregion
+
     def _staging_plane_elems(
         self,
         kv_group: int,
@@ -2166,6 +2211,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
+        kvcaches_snapshot = self.kvcaches
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
@@ -2203,10 +2249,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: N H2D memcpy + 1 scatter kernel
+                    self._log_fused_transfer(
+                        location="npu_connectors.py:batched_to_gpu",
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        from_gpu=False,
+                        kv_format_value=kv_format_value,
+                        v_hidden_dims=v_hidden_dims,
+                        num_tokens=num_tokens,
+                    )
                     batched_fused_single_layer_kv_transfer(
                         cpu_tensors,  # CPU memory objects
                         staging_tensor,  # GPU staging buffer
-                        self.kvcaches[layer_id],
+                        kvcaches_snapshot[layer_id],
                         slot_mapping_full,
                         chunk_offsets,  # offset for each chunk
                         chunk_sizes,  # size for each chunk
@@ -2227,7 +2282,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
-                            self.kvcaches[layer_id],
+                            kvcaches_snapshot[layer_id],
                             slot_mapping[start:end],
                             False,
                             kv_format_value,
@@ -2451,6 +2506,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
+        kvcaches_snapshot = self.kvcaches
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
@@ -2481,10 +2537,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: 1 scatter kernel + N D2H memcpy
+                    self._log_fused_transfer(
+                        location="npu_connectors.py:batched_from_gpu",
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        from_gpu=True,
+                        kv_format_value=kv_format_value,
+                        v_hidden_dims=v_hidden_dims,
+                        num_tokens=num_tokens,
+                    )
                     lmc_ops.batched_fused_single_layer_kv_transfer(
                         cpu_tensors,
                         staging_tensor,
-                        self.kvcaches[layer_id],
+                        kvcaches_snapshot[layer_id],
                         slot_mapping_full,
                         chunk_offsets,
                         chunk_sizes,
@@ -2504,7 +2569,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
-                            self.kvcaches[layer_id],
+                            kvcaches_snapshot[layer_id],
                             slot_mapping[start:end],
                             True,
                             kv_format_value,
