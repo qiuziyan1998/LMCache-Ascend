@@ -26,7 +26,10 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
     SGLangLayerwiseNPUConnector,
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
+    _accumulate_kvcache_fingerprint,
+    _kvcache_fingerprint_message,
     _layerwise_transfer_diag_message,
+    _new_kvcache_fingerprint,
 )
 from tests.v1.utils import check_sglang_npu_kv_cache_equal, generate_sglang_npu_kv_cache
 import lmcache_ascend.c_ops as lmc_ops
@@ -64,6 +67,35 @@ def test_dense_prefix_layerwise_transfer_diag_message() -> None:
     assert "slot_mapping_full.min=20" in message
     assert "slot_mapping_full.max=27" in message
     assert "kvcache_layer0_shapes=[(2, 4, 1, 16)]" in message
+
+
+def test_dense_prefix_kvcache_fingerprint_message() -> None:
+    fingerprint = _new_kvcache_fingerprint()
+    layer_cache = (torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2),)
+
+    _accumulate_kvcache_fingerprint(
+        fingerprint,
+        layer_cache,
+        torch.tensor([1, 3], dtype=torch.long),
+    )
+    message = _kvcache_fingerprint_message(
+        operation="npu_dense_prefix_load_kvcache_fingerprint",
+        req_id="req-diag",
+        kv_group=1,
+        fingerprint=fingerprint,
+    )
+
+    assert "operation=npu_dense_prefix_load_kvcache_fingerprint" in message
+    assert "req_id=req-diag" in message
+    assert "kv_group=1" in message
+    assert "group=dsa_index" in message
+    assert "layers=1" in message
+    assert "numel=4" in message
+    assert "sum=1.800000e+01" in message
+    assert "abs_sum=1.800000e+01" in message
+    assert "sq_sum=9.800000e+01" in message
+    assert "min=2.0" in message
+    assert "max=7.0" in message
 
 
 @pytest.mark.parametrize("use_npu", [True])

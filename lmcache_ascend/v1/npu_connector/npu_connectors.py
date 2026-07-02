@@ -141,6 +141,87 @@ def _layerwise_transfer_diag_message(
     return " ".join(pieces)
 
 
+def _new_kvcache_fingerprint() -> dict[str, Any]:
+    return {
+        "layers": 0,
+        "numel": 0,
+        "sum": 0.0,
+        "abs_sum": 0.0,
+        "sq_sum": 0.0,
+        "min": None,
+        "max": None,
+        "errors": [],
+    }
+
+
+def _iter_layer_tensors(layer_cache) -> List[torch.Tensor]:
+    if isinstance(layer_cache, torch.Tensor):
+        return [layer_cache]
+    if isinstance(layer_cache, (list, tuple)):
+        return [tensor for tensor in layer_cache if isinstance(tensor, torch.Tensor)]
+    return []
+
+
+def _accumulate_kvcache_fingerprint(
+    acc: dict[str, Any],
+    layer_cache,
+    slot_mapping_full: torch.Tensor,
+) -> None:
+    acc["layers"] += 1
+    for tensor in _iter_layer_tensors(layer_cache):
+        try:
+            if tensor.ndim < 2 or slot_mapping_full.numel() == 0:
+                continue
+            slot_idx = slot_mapping_full.to(device=tensor.device, dtype=torch.long)
+            flat = tensor.reshape(tensor.shape[0] * tensor.shape[1], -1)
+            selected = flat.index_select(0, slot_idx).float().reshape(-1)
+            if selected.numel() == 0:
+                continue
+            acc["numel"] += int(selected.numel())
+            acc["sum"] += float(selected.sum().cpu().item())
+            acc["abs_sum"] += float(selected.abs().sum().cpu().item())
+            acc["sq_sum"] += float((selected * selected).sum().cpu().item())
+            selected_min = float(selected.min().cpu().item())
+            selected_max = float(selected.max().cpu().item())
+            acc["min"] = (
+                selected_min
+                if acc["min"] is None
+                else min(float(acc["min"]), selected_min)
+            )
+            acc["max"] = (
+                selected_max
+                if acc["max"] is None
+                else max(float(acc["max"]), selected_max)
+            )
+        except Exception as exc:  # pragma: no cover - diagnostics must not fail path
+            acc["errors"].append(type(exc).__name__)
+
+
+def _kvcache_fingerprint_message(
+    *,
+    operation: str,
+    req_id: Optional[str],
+    kv_group: int,
+    fingerprint: dict[str, Any],
+) -> str:
+    pieces = [
+        f"operation={operation}",
+        f"req_id={req_id}",
+        f"kv_group={kv_group}",
+        f"group={'mla_latent' if kv_group == 0 else 'dsa_index'}",
+        f"layers={fingerprint['layers']}",
+        f"numel={fingerprint['numel']}",
+        f"sum={fingerprint['sum']:.6e}",
+        f"abs_sum={fingerprint['abs_sum']:.6e}",
+        f"sq_sum={fingerprint['sq_sum']:.6e}",
+        f"min={fingerprint['min']}",
+        f"max={fingerprint['max']}",
+    ]
+    if fingerprint["errors"]:
+        pieces.append(f"errors={fingerprint['errors']}")
+    return " ".join(pieces)
+
+
 def is_310p():
     global _IS_310P
     if _IS_310P is None:
@@ -2312,7 +2393,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
-        if _dense_prefix_diag_enabled():
+        diag_enabled = _dense_prefix_diag_enabled()
+        kvcache_fingerprint = (
+            _new_kvcache_fingerprint() if diag_enabled else None
+        )
+        if diag_enabled:
             logger.info(
                 "DENSE_PREFIX_DIAG %s",
                 _layerwise_transfer_diag_message(
@@ -2398,12 +2483,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             v_hidden_dims,
                             dsa_hidden_dims,
                         )
+                if kvcache_fingerprint is not None:
+                    _accumulate_kvcache_fingerprint(
+                        kvcache_fingerprint,
+                        kvcaches_snapshot[layer_id],
+                        slot_mapping_full,
+                    )
                 logger.debug(f"Finished loading layer {layer_id}")
         yield
 
         # synchronize the last layer
         if sync:
             current_stream.wait_stream(self.load_stream)
+
+        if kvcache_fingerprint is not None:
+            logger.info(
+                "DENSE_PREFIX_DIAG %s",
+                _kvcache_fingerprint_message(
+                    operation="npu_dense_prefix_load_kvcache_fingerprint",
+                    req_id=kwargs.get("req_id"),
+                    kv_group=kv_group,
+                    fingerprint=kvcache_fingerprint,
+                ),
+            )
 
         # free the buffer memory
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
@@ -2632,7 +2734,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
-        if _dense_prefix_diag_enabled():
+        diag_enabled = _dense_prefix_diag_enabled()
+        kvcache_fingerprint = (
+            _new_kvcache_fingerprint() if diag_enabled else None
+        )
+        if diag_enabled:
             logger.info(
                 "DENSE_PREFIX_DIAG %s",
                 _layerwise_transfer_diag_message(
@@ -2669,6 +2775,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # kvcaches -> gpu_buffer -> memobj
             with torch.npu.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
+                if kvcache_fingerprint is not None:
+                    _accumulate_kvcache_fingerprint(
+                        kvcache_fingerprint,
+                        kvcaches_snapshot[layer_id],
+                        slot_mapping_full,
+                    )
 
                 if self.use_gpu:
                     cpu_tensors = []
@@ -2716,6 +2828,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             if sync:
                 self.store_stream.synchronize()
+
+        if kvcache_fingerprint is not None:
+            logger.info(
+                "DENSE_PREFIX_DIAG %s",
+                _kvcache_fingerprint_message(
+                    operation="npu_dense_prefix_store_kvcache_fingerprint",
+                    req_id=kwargs.get("req_id"),
+                    kv_group=kv_group,
+                    fingerprint=kvcache_fingerprint,
+                ),
+            )
 
         # free the buffer memory
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
