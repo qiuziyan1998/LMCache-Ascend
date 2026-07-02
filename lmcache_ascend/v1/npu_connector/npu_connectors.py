@@ -2661,6 +2661,35 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if sync:
                 self.store_stream.synchronize()
 
+        # Always drain store_stream before recycling staging. Indexer storers use
+        # sync=False; interleaved attn/indexer forwards often end on an indexer
+        # layer, leaving async MTE ops in flight when staging is freed.
+        if not sync:
+            self.store_stream.synchronize()
+            # #region agent log
+            try:
+                import json as _j
+                import time as _t
+
+                with open("debug-792df4.log", "a", encoding="utf-8") as _f:
+                    _f.write(
+                        _j.dumps(
+                            {
+                                "sessionId": "792df4",
+                                "runId": "post-fix",
+                                "hypothesisId": "H_ASYNC",
+                                "location": "npu_connectors:batched_from_gpu",
+                                "message": "final store_stream sync before staging free",
+                                "data": {"kv_group": kv_group},
+                                "timestamp": int(_t.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except OSError:
+                pass
+            # #endregion
+
         # free the buffer memory
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
             tmp_gpu_buffer_obj.ref_count_down()
