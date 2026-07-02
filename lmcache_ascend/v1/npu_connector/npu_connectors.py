@@ -2610,6 +2610,46 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
+            if self.dsa_two_groups:
+                self.store_stream.synchronize()
+                # #region agent log
+                if layer_id == 0 and kv_group in (0, 1):
+                    try:
+                        import json as _j
+                        import time as _t
+
+                        _tp_rank = None
+                        try:
+                            from vllm.distributed.parallel_state import (
+                                get_tensor_model_parallel_rank,
+                            )
+
+                            _tp_rank = get_tensor_model_parallel_rank()
+                        except Exception:
+                            pass
+                        with open("debug-792df4.log", "a", encoding="utf-8") as _f:
+                            _f.write(
+                                _j.dumps(
+                                    {
+                                        "sessionId": "792df4",
+                                        "runId": "post-fix",
+                                        "hypothesisId": "H_INTERLEAVE",
+                                        "location": "npu_connectors:batched_from_gpu",
+                                        "message": "pre-layer store_stream sync",
+                                        "data": {
+                                            "kv_group": kv_group,
+                                            "layer_id": layer_id,
+                                            "num_tokens": num_tokens,
+                                            "tp_rank": _tp_rank,
+                                        },
+                                        "timestamp": int(_t.time() * 1000),
+                                    }
+                                )
+                                + "\n"
+                            )
+                    except OSError:
+                        pass
+                # #endregion
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
             with torch.cuda.stream(self.store_stream):
