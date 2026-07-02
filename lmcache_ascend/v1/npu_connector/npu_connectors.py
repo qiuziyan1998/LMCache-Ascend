@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Any, List, Optional, Set, Union
+import os
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -35,6 +36,109 @@ import lmcache_ascend.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 _IS_310P = None
+DENSE_PREFIX_DIAG_ENV = "LMCACHE_DENSE_PREFIX_DIAG"
+
+
+def _dense_prefix_diag_enabled() -> bool:
+    return os.environ.get(DENSE_PREFIX_DIAG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _diag_tensor_summary(name: str, tensor, sample: int = 4) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    if not isinstance(tensor, torch.Tensor):
+        return f"{name}=type({type(tensor).__name__})"
+    try:
+        flat = tensor.detach().reshape(-1)
+        numel = flat.numel()
+        pieces = [
+            f"{name}.len={numel}",
+            f"{name}.shape={tuple(tensor.shape)}",
+            f"{name}.device={tensor.device}",
+            f"{name}.dtype={tensor.dtype}",
+        ]
+        if numel:
+            head = flat[:sample].cpu().tolist()
+            tail = flat[-sample:].cpu().tolist() if numel > sample else head
+            pieces.extend(
+                [
+                    f"{name}.min={flat.min().cpu().item()}",
+                    f"{name}.max={flat.max().cpu().item()}",
+                    f"{name}.head={head}",
+                    f"{name}.tail={tail}",
+                ]
+            )
+        return " ".join(pieces)
+    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
+        return f"{name}=unavailable({type(exc).__name__})"
+
+
+def _diag_span_summary(starts: List[int], ends: List[int], sample: int = 4) -> str:
+    sizes = [end - start for start, end in zip(starts, ends, strict=False)]
+    head = list(zip(starts, ends, sizes, strict=False))[:sample]
+    tail = list(zip(starts, ends, sizes, strict=False))[-sample:]
+    return (
+        f"chunks={len(sizes)} total_span_tokens={sum(sizes)} "
+        f"spans.head={head} spans.tail={tail}"
+    )
+
+
+def _diag_kvcache_shapes(kvcaches_ref) -> str:
+    try:
+        if not kvcaches_ref:
+            return "kvcaches=[]"
+        first_layer = kvcaches_ref[0]
+        if isinstance(first_layer, (list, tuple)):
+            shapes = [
+                tuple(tensor.shape)
+                for tensor in first_layer
+                if isinstance(tensor, torch.Tensor)
+            ]
+        elif isinstance(first_layer, torch.Tensor):
+            shapes = [tuple(first_layer.shape)]
+        else:
+            shapes = [type(first_layer).__name__]
+        return f"kvcache_layer0_shapes={shapes}"
+    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
+        return f"kvcache_layer0_shapes=unavailable({type(exc).__name__})"
+
+
+def _layerwise_transfer_diag_message(
+    *,
+    operation: str,
+    req_id: Optional[str],
+    kv_group: int,
+    starts: List[int],
+    ends: List[int],
+    slot_mapping_full: torch.Tensor,
+    layout,
+    token_major: bool,
+    expected_fmt: MemoryFormat,
+    kvcaches_ref,
+) -> str:
+    fmt_name = getattr(getattr(layout, "kv_format", None), "name", None)
+    pieces = [
+        f"operation={operation}",
+        f"req_id={req_id}",
+        f"kv_group={kv_group}",
+        f"group={'mla_latent' if kv_group == 0 else 'dsa_index'}",
+        f"kv_format={fmt_name}",
+        f"expected_fmt={expected_fmt}",
+        f"token_major={token_major}",
+        f"vllm_two_major={getattr(layout, 'vllm_two_major', None)}",
+        f"k_hidden_dims={getattr(layout, 'k_hidden_dims', None)}",
+        f"v_hidden_dims={getattr(layout, 'v_hidden_dims', None)}",
+        f"dsa_hidden_dims={getattr(layout, 'dsa_hidden_dims', None)}",
+        _diag_span_summary(starts, ends),
+        _diag_tensor_summary("slot_mapping_full", slot_mapping_full),
+        _diag_kvcache_shapes(kvcaches_ref),
+    ]
+    return " ".join(pieces)
 
 
 def is_310p():
@@ -2208,6 +2312,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
+        if _dense_prefix_diag_enabled():
+            logger.info(
+                "DENSE_PREFIX_DIAG %s",
+                _layerwise_transfer_diag_message(
+                    operation="npu_dense_prefix_load",
+                    req_id=kwargs.get("req_id"),
+                    kv_group=kv_group,
+                    starts=starts,
+                    ends=ends,
+                    slot_mapping_full=slot_mapping_full,
+                    layout=layout,
+                    token_major=token_major,
+                    expected_fmt=expected_fmt,
+                    kvcaches_ref=kvcaches_snapshot,
+                ),
+            )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
@@ -2512,6 +2632,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
+        if _dense_prefix_diag_enabled():
+            logger.info(
+                "DENSE_PREFIX_DIAG %s",
+                _layerwise_transfer_diag_message(
+                    operation="npu_dense_prefix_store",
+                    req_id=kwargs.get("req_id"),
+                    kv_group=kv_group,
+                    starts=starts,
+                    ends=ends,
+                    slot_mapping_full=slot_mapping_full,
+                    layout=layout,
+                    token_major=token_major,
+                    expected_fmt=expected_fmt,
+                    kvcaches_ref=kvcaches_snapshot,
+                ),
+            )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None

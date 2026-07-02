@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Standard
+from types import SimpleNamespace
 from unittest.mock import patch
 import random
 
@@ -25,9 +26,44 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
     SGLangLayerwiseNPUConnector,
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
+    _layerwise_transfer_diag_message,
 )
 from tests.v1.utils import check_sglang_npu_kv_cache_equal, generate_sglang_npu_kv_cache
 import lmcache_ascend.c_ops as lmc_ops
+
+
+def test_dense_prefix_layerwise_transfer_diag_message() -> None:
+    layout = SimpleNamespace(
+        kv_format=SimpleNamespace(name="DSA_INDEX"),
+        vllm_two_major=False,
+        k_hidden_dims=16,
+        v_hidden_dims=0,
+        dsa_hidden_dims=16,
+    )
+    message = _layerwise_transfer_diag_message(
+        operation="npu_dense_prefix_load",
+        req_id="req-diag",
+        kv_group=1,
+        starts=[0, 4],
+        ends=[4, 8],
+        slot_mapping_full=torch.arange(20, 28, dtype=torch.long),
+        layout=layout,
+        token_major=False,
+        expected_fmt=MemoryFormat.KV_T2D,
+        kvcaches_ref=[(torch.zeros((2, 4, 1, 16)),)],
+    )
+
+    assert "operation=npu_dense_prefix_load" in message
+    assert "req_id=req-diag" in message
+    assert "kv_group=1" in message
+    assert "group=dsa_index" in message
+    assert "kv_format=DSA_INDEX" in message
+    assert "chunks=2" in message
+    assert "total_span_tokens=8" in message
+    assert "slot_mapping_full.len=8" in message
+    assert "slot_mapping_full.min=20" in message
+    assert "slot_mapping_full.max=27" in message
+    assert "kvcache_layer0_shapes=[(2, 4, 1, 16)]" in message
 
 
 @pytest.mark.parametrize("use_npu", [True])

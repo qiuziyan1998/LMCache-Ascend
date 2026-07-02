@@ -336,10 +336,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         tot_time = store_stats.time_to_store()
 
         logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
+            "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
             "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
             "offload_time: %.4f ms, put_time: %.4f ms",
             req_id,
+            kv_group,
             tot_token_num,
             num_to_store_tokens,
             tot_kv_size / 1024**3,
@@ -1041,9 +1042,10 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             tot_time = time.perf_counter() - t_start
             logger.info(
-                "[req_id=%s] Stored %d out of total %d tokens. "
+                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
                 "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
                 req_id,
+                kv_group,
                 tot_token_num,
                 len(tokens),
                 tot_kv_size / 1024**3,
