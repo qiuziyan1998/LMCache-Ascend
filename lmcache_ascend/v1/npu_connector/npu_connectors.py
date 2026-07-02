@@ -2530,6 +2530,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 _shape = list(_kc0.shape) if _kc0 is not None else []
                 _cap = _shape[0] * _shape[1] if len(_shape) >= 2 else 0
                 _smax = int(slot_mapping_full.max().item())
+                _tp_rank = None
+                try:
+                    from vllm.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank,
+                    )
+
+                    _tp_rank = get_tensor_model_parallel_rank()
+                except Exception:
+                    pass
                 with open("debug-792df4.log", "a", encoding="utf-8") as _f:
                     _f.write(
                         _j.dumps(
@@ -2551,6 +2560,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                     if self.kvcaches
                                     else 0,
                                     "kv_format": layout.kv_format.name,
+                                    "tp_rank": _tp_rank,
                                 },
                                 "timestamp": int(_t.time() * 1000),
                             }
