@@ -399,6 +399,7 @@ def _patch_vllm_v1_adapter():
         if callable(method):
             method(preempted_req_ids)
 
+    vllm_lmcache_connector.LMCacheConnectorV1.supports_dsa_index_lmcache = True
     vllm_lmcache_connector.LMCacheConnectorV1.handle_preemptions = handle_preemptions
 
 

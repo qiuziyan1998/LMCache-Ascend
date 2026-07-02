@@ -1071,6 +1071,26 @@ class TestAdapterGroupSplit:
         assert fake._indexer_kvcaches == []
         assert _adapter_method("_kvcaches_for_group")(fake, 1) == [t0, i0]
 
+    def test_scheduler_side_missing_indexer_cache_does_not_warn(self, caplog):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        fake = self._make_fake({"layer.0": object()}, dsa_two_groups=True)
+        fake._role = KVConnectorRole.SCHEDULER
+
+        _adapter_method("_refresh_kvcaches_list")(fake)
+
+        assert "no indexer KV caches" not in caplog.text
+
+    def test_worker_side_missing_indexer_cache_warns(self, caplog):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        fake = self._make_fake({"layer.0": object()}, dsa_two_groups=True)
+        fake._role = KVConnectorRole.WORKER
+
+        _adapter_method("_refresh_kvcaches_list")(fake)
+
+        assert "no indexer KV caches" in caplog.text
+
     def test_is_dsa_two_groups_flag(self):
         fake_on = SimpleNamespace(config=SimpleNamespace(dsa_two_groups=True))
         fake_off = SimpleNamespace(config=SimpleNamespace(dsa_two_groups=False))

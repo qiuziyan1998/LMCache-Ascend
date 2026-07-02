@@ -44,6 +44,13 @@ def test_lmcache_connector_delegates_preemptions_after_ascend_patch():
     )
 
 
+def test_lmcache_connector_patch_advertises_dsa_index_support():
+    """Ascend's vLLM patch must make LMCache receive DSA indexer KV caches."""
+    LMCacheConnectorV1 = _import_and_patch_vllm_connector()
+
+    assert getattr(LMCacheConnectorV1, "supports_dsa_index_lmcache", False) is True
+
+
 def test_lmcache_connector_preemption_patch_handles_no_inner_impl():
     """The Ascend patch should tolerate inner implementations without a hook."""
     LMCacheConnectorV1 = _import_and_patch_vllm_connector()
