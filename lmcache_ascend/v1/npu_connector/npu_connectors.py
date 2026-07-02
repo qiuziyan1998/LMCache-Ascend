@@ -1477,6 +1477,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         num_sparse = int(selected_token_idx.numel())
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
+        chunk_count = int(chunk_ptrs_npu.numel())
+        chunk_size_int = int(chunk_size)
+        covered_tokens = chunk_count * chunk_size_int
+        if covered_tokens < int(total_tokens):
+            message = (
+                "Sparse direct retrieve has insufficient chunk pointers: "
+                f"kv_group={kv_group} layer_id={layer_id} "
+                f"num_sparse={num_sparse} chunk_count={chunk_count} "
+                f"chunk_size={chunk_size_int} covered_tokens={covered_tokens} "
+                f"total_tokens={int(total_tokens)}"
+            )
+            logger.error(message)
+            raise ValueError(message)
 
         resolve_tensors = (
             layer_tensors
