@@ -818,6 +818,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             for layer_id in range(self.num_layers):
                 yield
+            # Extra yield consumed by wait_for_save() after the last layer.
+            yield
             return
 
         assert self.storage_manager is not None
