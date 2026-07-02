@@ -2607,52 +2607,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 expected_fmt=expected_fmt,
             )
 
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.npu.current_stream()
 
         for layer_id in range(self.num_layers):
-            if self.dsa_two_groups:
-                self.store_stream.synchronize()
-                # #region agent log
-                if layer_id == 0 and kv_group in (0, 1):
-                    try:
-                        import json as _j
-                        import time as _t
-
-                        _tp_rank = None
-                        try:
-                            from vllm.distributed.parallel_state import (
-                                get_tensor_model_parallel_rank,
-                            )
-
-                            _tp_rank = get_tensor_model_parallel_rank()
-                        except Exception:
-                            pass
-                        with open("debug-792df4.log", "a", encoding="utf-8") as _f:
-                            _f.write(
-                                _j.dumps(
-                                    {
-                                        "sessionId": "792df4",
-                                        "runId": "post-fix",
-                                        "hypothesisId": "H_INTERLEAVE",
-                                        "location": "npu_connectors:batched_from_gpu",
-                                        "message": "pre-layer store_stream sync",
-                                        "data": {
-                                            "kv_group": kv_group,
-                                            "layer_id": layer_id,
-                                            "num_tokens": num_tokens,
-                                            "tp_rank": _tp_rank,
-                                        },
-                                        "timestamp": int(_t.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
-                    except OSError:
-                        pass
-                # #endregion
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
+            with torch.npu.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
 
                 if self.use_gpu:
@@ -2660,6 +2620,77 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for memory_obj in memory_objs_layer:
                         assert memory_obj.tensor is not None
                         cpu_tensors.append(memory_obj.tensor)
+
+                    # #region agent log
+                    if (
+                        kv_group == 0
+                        and layer_id == 0
+                        and len(starts) > 0
+                    ):
+                        try:
+                            import json as _j
+                            import time as _t
+
+                            _tp_rank = None
+                            try:
+                                from vllm.distributed.parallel_state import (
+                                    get_tensor_model_parallel_rank,
+                                )
+
+                                _tp_rank = get_tensor_model_parallel_rank()
+                            except Exception:
+                                pass
+                            _layer_kv = kvcaches_snapshot[layer_id]
+                            _k0 = (
+                                _layer_kv[0]
+                                if isinstance(_layer_kv, (list, tuple))
+                                else _layer_kv
+                            )
+                            _v0 = (
+                                _layer_kv[1]
+                                if isinstance(_layer_kv, (list, tuple))
+                                and len(_layer_kv) > 1
+                                else None
+                            )
+                            with open("debug-792df4.log", "a", encoding="utf-8") as _f:
+                                _f.write(
+                                    _j.dumps(
+                                        {
+                                            "sessionId": "792df4",
+                                            "runId": "post-fix",
+                                            "hypothesisId": "H_KERNEL",
+                                            "location": "npu_connectors:batched_from_gpu",
+                                            "message": "latent transfer params",
+                                            "data": {
+                                                "kv_group": kv_group,
+                                                "layer_id": layer_id,
+                                                "tp_rank": _tp_rank,
+                                                "starts": starts,
+                                                "ends": ends,
+                                                "slot_min": int(
+                                                    slot_mapping_full.min().item()
+                                                ),
+                                                "slot_max": int(
+                                                    slot_mapping_full.max().item()
+                                                ),
+                                                "k_hidden_dims": k_hidden_dims,
+                                                "v_hidden_dims": v_hidden_dims,
+                                                "k_shape": list(_k0.shape),
+                                                "v_shape": (
+                                                    list(_v0.shape)
+                                                    if _v0 is not None
+                                                    else None
+                                                ),
+                                                "kv_format": layout.kv_format.name,
+                                            },
+                                            "timestamp": int(_t.time() * 1000),
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                        except OSError:
+                            pass
+                    # #endregion
 
                     # Fused transfer: 1 scatter kernel + N D2H memcpy
                     lmc_ops.batched_fused_single_layer_kv_transfer(
