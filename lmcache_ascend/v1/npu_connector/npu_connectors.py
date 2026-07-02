@@ -1490,6 +1490,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             logger.error(message)
             raise ValueError(message)
+        selected_min = int(selected_token_idx.min().to(device="cpu").item())
+        selected_max = int(selected_token_idx.max().to(device="cpu").item())
+        if selected_min < 0 or selected_max >= int(total_tokens):
+            message = (
+                "Sparse direct retrieve selected token is outside source chunks: "
+                f"kv_group={kv_group} layer_id={layer_id} "
+                f"num_sparse={num_sparse} selected_min={selected_min} "
+                f"selected_max={selected_max} chunk_count={chunk_count} "
+                f"chunk_size={chunk_size_int} covered_tokens={covered_tokens} "
+                f"total_tokens={int(total_tokens)}"
+            )
+            logger.error(message)
+            raise ValueError(message)
 
         resolve_tensors = (
             layer_tensors
@@ -2494,15 +2507,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
             )
-            if (
-                use_cached_retrieve
-                and lmcache_cached_tokens > 0
-            ):
-                total_tokens = lmcache_cached_tokens
+            chunk_total_tokens = self._sparse_total_tokens_from_layer_chunks(
+                cpu_tensors, kv_group
+            )
+            if lmcache_cached_tokens > 0:
+                total_tokens = min(lmcache_cached_tokens, chunk_total_tokens)
+                if layer_id == 0 and lmcache_cached_tokens > chunk_total_tokens:
+                    logger.warning(
+                        "Sparse direct retrieve chunk coverage is smaller than "
+                        "LMCache lookup hit: kv_group=%s chunk_tokens=%s "
+                        "lmcache_cached_tokens=%s num_chunks=%s",
+                        kv_group,
+                        chunk_total_tokens,
+                        lmcache_cached_tokens,
+                        len(cpu_tensors),
+                    )
             else:
-                total_tokens = self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group
-                )
+                total_tokens = chunk_total_tokens
 
             self._run_sparse_direct_kv_transfer_layer(
                 kvcaches_ref=kvcaches_snapshot,

@@ -579,6 +579,40 @@ class AscendLMCacheEngine(LMCacheEngine):
             return any(cached_memory_objs)
         return False
 
+    @staticmethod
+    def _retrieve_data_cache_covers(
+        cache_by_layer: Optional[List],
+        num_layers: int,
+        required_chunks: int,
+    ) -> bool:
+        if required_chunks <= 0:
+            return False
+        if cache_by_layer is None or len(cache_by_layer) != num_layers:
+            return False
+        for layer_id in range(num_layers):
+            layer_cache = cache_by_layer[layer_id]
+            if layer_cache is None or len(layer_cache) < required_chunks:
+                return False
+        return True
+
+    @staticmethod
+    def _min_layer_cache_chunks(
+        cache_by_layer: Optional[List],
+        num_layers: int,
+    ) -> int:
+        if cache_by_layer is None or len(cache_by_layer) != num_layers:
+            return 0
+        min_chunks: Optional[int] = None
+        for layer_id in range(num_layers):
+            layer_cache = cache_by_layer[layer_id]
+            layer_chunks = 0 if layer_cache is None else len(layer_cache)
+            min_chunks = (
+                layer_chunks
+                if min_chunks is None
+                else min(min_chunks, layer_chunks)
+            )
+        return 0 if min_chunks is None else min_chunks
+
     def _ensure_layerwise_connector_layout(self, **kwargs) -> None:
         """Initialize connector KV layout before allocating layerwise chunks.
 
@@ -1129,13 +1163,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
 
-        use_cached_retrieve = self._has_retrieve_data_cache(
+        has_cached_retrieve_data = self._has_retrieve_data_cache(
             cached_tensors,
             cached_memory_objs,
             self.num_layers,
         )
-        if use_cached_retrieve:
-            kwargs["_use_cached_retrieve"] = True
 
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
@@ -1148,6 +1180,28 @@ class AscendLMCacheEngine(LMCacheEngine):
             retrieve_kwargs=kwargs,
         )
         kwargs.pop("_use_cached_retrieve", None)
+
+        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        cached_tensors_cover = self._retrieve_data_cache_covers(
+            cached_tensors,
+            self.num_layers,
+            required_chunks,
+        )
+        cached_memory_objs_cover = self._retrieve_data_cache_covers(
+            cached_memory_objs,
+            self.num_layers,
+            required_chunks,
+        )
+        use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
+        if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
+            logger.warning(
+                "Layerwise sparse retrieve cache is incomplete; falling back to "
+                "storage get. required_chunks=%d cached_tensor_chunks=%d "
+                "cached_memory_obj_chunks=%d",
+                required_chunks,
+                self._min_layer_cache_chunks(cached_tensors, self.num_layers),
+                self._min_layer_cache_chunks(cached_memory_objs, self.num_layers),
+            )
 
         if use_cached_retrieve:
             location = self._resolve_local_cpu_retrieve_location(location)
@@ -1169,7 +1223,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 retrieve_keys, location=location
             )
 
-        if use_cached_retrieve and cached_tensors is not None:
+        if cached_tensors_cover and cached_tensors is not None:
             kwargs["cached_tensors"] = cached_tensors
             if cached_chunk_dev_ptrs is not None:
                 kwargs["cached_chunk_dev_ptrs"] = cached_chunk_dev_ptrs
@@ -1178,7 +1232,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         cached_mem_layers = (
             cached_memory_objs
-            if use_cached_retrieve
+            if cached_memory_objs_cover
             and cached_memory_objs is not None
             and len(cached_memory_objs) == self.num_layers
             else None
