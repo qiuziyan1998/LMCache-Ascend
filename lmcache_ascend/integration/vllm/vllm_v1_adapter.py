@@ -43,6 +43,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._late_finished_sending: set[str] = set()
         logger.debug("store_async: %s", self.store_async)
 
+    @staticmethod
+    def _save_storer_key(req_id: str, kv_group: int) -> tuple[str, int]:
+        """Use explicit group keys for Ascend two-group layerwise stores."""
+        return (req_id, kv_group)
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         self.current_layer = 0
@@ -67,20 +72,61 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             assert not self.store_async, (
                 "Layerwise storing is not supported with async store"
             )
+            should_defer_latent = getattr(
+                self, "_should_defer_latent_save_under_tp", None
+            )
+            if callable(should_defer_latent) and should_defer_latent():
+                pending = getattr(self, "_deferred_latent_pending", set())
+                for request in connector_metadata.requests:
+                    if request.req_id in pending:
+                        logger.warning(
+                            "Flushing deferred MLA latent store in "
+                            "wait_for_save fallback: req_id=%s",
+                            request.req_id,
+                        )
+                        self._flush_deferred_latent_store(
+                            request, request.save_spec
+                        )
+
             for request in connector_metadata.requests:
                 for _kv_group in (0, 1):
-                    layerwise_storer = self._layerwise_save_storers.pop(
-                        (request.req_id, _kv_group), None
+                    storer_key = self._save_storer_key(
+                        request.req_id, _kv_group
                     )
+                    layerwise_storer = self._layerwise_save_storers.pop(
+                        storer_key, None
+                    )
+                    if layerwise_storer is None and _kv_group == 0:
+                        layerwise_storer = self._layerwise_save_storers.pop(
+                            request.req_id, None
+                        )
+                        if layerwise_storer is not None:
+                            logger.warning(
+                                "Draining legacy MLA latent storer key for "
+                                "request %s; expected key=%s. A stale latent "
+                                "store can otherwise survive across forwards.",
+                                request.req_id,
+                                storer_key,
+                            )
                     if layerwise_storer is not None:
-                        try:
-                            next(layerwise_storer)
-                        except StopIteration:
-                            pass
+                        drain_storer = getattr(
+                            self, "_drain_layerwise_storer_fully", None
+                        )
+                        if callable(drain_storer):
+                            drain_storer(layerwise_storer)
+                        else:
+                            try:
+                                next(layerwise_storer)
+                            except StopIteration:
+                                pass
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
-            self._replay_finished_stores_after_save()
+            replay_finished = getattr(
+                self, "_replay_finished_stores_after_save", None
+            )
+            if callable(replay_finished):
+                replay_finished()
             return
 
         assert len(self.kv_caches) > 0
@@ -271,6 +317,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         _, return_params = super().request_finished(request, block_ids)
+        if getattr(self, "use_layerwise", False) and hasattr(
+            self, "_layerwise_save_storers"
+        ):
+            self._layerwise_save_storers.pop(request.request_id, None)
 
         if (
             request.status == RequestStatus.FINISHED_ABORTED

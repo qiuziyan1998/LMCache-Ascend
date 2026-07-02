@@ -1799,6 +1799,56 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "Increase vLLM max_model_len or reduce tokens stored per forward."
         )
 
+    def _check_layerwise_transfer_invariants(
+        self,
+        *,
+        operation: str,
+        kv_group: int,
+        slot_mapping_full: torch.Tensor,
+        kvcaches_ref: list,
+    ) -> None:
+        """Fail before the NPU kernel if per-group transfer metadata is invalid."""
+        if not self.dsa_two_groups or kv_group not in (0, 1):
+            return
+        kvcaches_len = len(kvcaches_ref) if kvcaches_ref is not None else 0
+        if kvcaches_len != self.num_layers:
+            logger.warning(
+                "%s layerwise transfer has mismatched layer counts: "
+                "kv_group=%s connector_num_layers=%s kvcaches_len=%s",
+                operation,
+                kv_group,
+                self.num_layers,
+                kvcaches_len,
+            )
+        if slot_mapping_full is None or slot_mapping_full.numel() == 0:
+            return
+        if kvcaches_len == 0:
+            return
+
+        first_layer = kvcaches_ref[0]
+        first_tensor = (
+            first_layer[0]
+            if isinstance(first_layer, (list, tuple)) and first_layer
+            else first_layer
+        )
+        shape = list(first_tensor.shape) if first_tensor is not None else []
+        capacity = shape[0] * shape[1] if len(shape) >= 2 else 0
+        if capacity <= 0:
+            return
+
+        slot_min = int(slot_mapping_full.min().item())
+        slot_max = int(slot_mapping_full.max().item())
+        if slot_min < 0 or slot_max >= capacity:
+            message = (
+                f"{operation} layerwise transfer slot mapping is out of range: "
+                f"kv_group={kv_group} slot_min={slot_min} slot_max={slot_max} "
+                f"kvcaches_capacity={capacity} kvcaches_shape={shape} "
+                f"connector_num_layers={self.num_layers} "
+                f"kvcaches_len={kvcaches_len}"
+            )
+            logger.error(message)
+            raise ValueError(message)
+
     def _allocate_layerwise_staging_buffer(
         self,
         *,
@@ -2194,6 +2244,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         num_tokens = len(slot_mapping_full)
         self._check_staging_transfer_tokens(num_tokens, kv_group)
+        self._check_layerwise_transfer_invariants(
+            operation="retrieve",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping_full,
+            kvcaches_ref=self.kvcaches,
+        )
 
         # #region agent log
         if kv_group in (0, 1):
@@ -2522,6 +2578,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         num_tokens = len(slot_mapping_full)
         self._check_staging_transfer_tokens(num_tokens, kv_group)
+        self._check_layerwise_transfer_invariants(
+            operation="store",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping_full,
+            kvcaches_ref=self.kvcaches,
+        )
 
         # #region agent log
         if kv_group in (0, 1):
