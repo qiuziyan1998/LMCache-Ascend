@@ -1913,10 +1913,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layout = self._group_layouts.get(kv_group)
         if layout is None:
             layout = _GroupLayout()
+            # Latent (kv_group=0) uses MLA_KV detection like dev-qzy; only the
+            # indexer group (kv_group=1) needs dsa_two_groups detection.
+            detect_two_groups = (
+                getattr(self, "dsa_two_groups", False) and kv_group != 0
+            )
             layout.kv_format = KVCacheFormat.detect(
                 kv_caches,
                 use_mla=self.use_mla,
-                dsa_two_groups=getattr(self, "dsa_two_groups", False),
+                dsa_two_groups=detect_two_groups,
             )
             if layout.kv_format == KVCacheFormat.UNDEFINED:
                 raise ValueError(
@@ -2626,6 +2631,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         kv_group == 0
                         and layer_id == 0
                         and len(starts) > 0
+                        and (starts[0] == 0 or len(starts) == 1)
                     ):
                         try:
                             import json as _j
