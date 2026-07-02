@@ -29,38 +29,6 @@ from lmcache_ascend.v1.npu_connector.utils import (
 )
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 
-
-def _agent_debug_log(
-    location: str,
-    message: str,
-    data: dict,
-    *,
-    hypothesis_id: str = "A",
-    run_id: str = "pre-fix",
-) -> None:
-    # #region agent log
-    try:
-        import json
-        import time
-
-        with open("debug-d9c30c.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "d9c30c",
-                        "runId": run_id,
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except OSError:
-        pass
-    # #endregion
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -1379,18 +1347,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if isinstance(vllm_layer_cache, (tuple, list))
             else 1
         )
-        _agent_debug_log(
-            "npu_connectors:_get_or_create_sparse_direct_layer_state",
-            "prepare sparse direct state",
-            {
-                "kv_group": kv_group,
-                "layer_id": layer_id,
-                "sparse_kv_format": sparse_kv_format,
-                "vllm_tensor_count": vllm_tensor_count,
-                "kvcaches_ref_is_connector_ptr": kvcaches_ref is self.kvcaches,
-            },
-            hypothesis_id="G",
-        )
 
         state = prepare_sparse_direct_layer_state(
             layer_tensors[0],
@@ -1753,16 +1709,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 continue
             new_size = per_slot * self._layerwise_staging_pool_slots()
             self._assign_group_gpu_allocator(new_size, layout, kv_group)
-            _agent_debug_log(
-                "npu_connectors:set_layerwise_staging_concurrency",
-                "grew staging pool",
-                {
-                    "kv_group": kv_group,
-                    "new_concurrency": n,
-                    "new_pool_bytes": new_size,
-                },
-                hypothesis_id="B",
-            )
 
     def _layerwise_staging_pool_slots(self) -> int:
         if not self.dsa_two_groups:
@@ -1900,34 +1846,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else buffer_shape[0] * self.element_size
         )
         pool_stats = self._staging_pool_stats(layout)
-        _agent_debug_log(
-            "npu_connectors:_allocate_layerwise_staging_buffer",
-            "staging alloc attempt",
-            {
-                "kv_group": kv_group,
-                "num_tokens": num_tokens,
-                "request_bytes": request_bytes,
-                "pool_slots": self._layerwise_staging_pool_slots(),
-                "staging_concurrency": self._layerwise_staging_concurrency,
-                **pool_stats,
-            },
-            hypothesis_id="A",
-        )
         tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, expected_fmt
         )
-        if tmp_gpu_buffer_obj is None:
-            _agent_debug_log(
-                "npu_connectors:_allocate_layerwise_staging_buffer",
-                "staging alloc failed",
-                {
-                    "kv_group": kv_group,
-                    "num_tokens": num_tokens,
-                    "request_bytes": request_bytes,
-                    **pool_stats,
-                },
-                hypothesis_id="A",
-            )
         assert tmp_gpu_buffer_obj is not None, (
             "Failed to allocate NPU buffer in NPUConnector"
         )
@@ -2169,19 +2090,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
             self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
-            _agent_debug_log(
-                "npu_connectors:_lazy_initialize_buffer",
-                "staging pool created",
-                {
-                    "kv_group": kv_group,
-                    "staging_tokens": staging_tokens,
-                    "pool_slots": pool_slots,
-                    "staging_concurrency": self._layerwise_staging_concurrency,
-                    "gpu_buffer_size_bytes": gpu_buffer_size,
-                    "per_slot_bytes": per_slot_bytes,
-                },
-                hypothesis_id="B",
-            )
             if self.dsa_two_groups:
                 logger.info(
                     "dsa_two_groups: per-group NPU staging pool "
@@ -2277,44 +2185,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kvcaches_ref=self.kvcaches,
         )
 
-        # #region agent log
-        if kv_group in (0, 1):
-            try:
-                import json as _j
-                import time as _t
-
-                _kc0 = self.kvcaches[0] if self.kvcaches else None
-                if isinstance(_kc0, (list, tuple)):
-                    _kc0 = _kc0[0] if _kc0 else None
-                _shape = list(_kc0.shape) if _kc0 is not None else []
-                _cap = _shape[0] * _shape[1] if len(_shape) >= 2 else 0
-                _smax = int(slot_mapping_full.max().item())
-                with open("debug-792df4.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        _j.dumps(
-                            {
-                                "sessionId": "792df4",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H_TP6",
-                                "location": "npu_connectors:batched_to_gpu",
-                                "message": "retrieve slot bounds",
-                                "data": {
-                                    "kv_group": kv_group,
-                                    "num_tokens": num_tokens,
-                                    "slot_max": _smax,
-                                    "kvcaches_shape": _shape,
-                                    "kvcaches_capacity": _cap,
-                                    "oob": _smax >= _cap,
-                                    "num_layers": self.num_layers,
-                                },
-                                "timestamp": int(_t.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except OSError:
-                pass
-        # #endregion
 
         chunk_offsets = []
         chunk_sizes = []
@@ -2619,58 +2489,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kvcaches_ref=self.kvcaches,
         )
 
-        # #region agent log
-        if kv_group in (0, 1):
-            try:
-                import json as _j
-                import time as _t
-
-                _kc0 = self.kvcaches[0] if self.kvcaches else None
-                if isinstance(_kc0, (list, tuple)):
-                    _kc0 = _kc0[0] if _kc0 else None
-                _shape = list(_kc0.shape) if _kc0 is not None else []
-                _cap = _shape[0] * _shape[1] if len(_shape) >= 2 else 0
-                _smax = int(slot_mapping_full.max().item())
-                _tp_rank = None
-                try:
-                    from vllm.distributed.parallel_state import (
-                        get_tensor_model_parallel_rank,
-                    )
-
-                    _tp_rank = get_tensor_model_parallel_rank()
-                except Exception:
-                    pass
-                with open("debug-792df4.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        _j.dumps(
-                            {
-                                "sessionId": "792df4",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H_TP5",
-                                "location": "npu_connectors:batched_from_gpu",
-                                "message": "store slot bounds",
-                                "data": {
-                                    "kv_group": kv_group,
-                                    "num_tokens": num_tokens,
-                                    "slot_max": _smax,
-                                    "kvcaches_shape": _shape,
-                                    "kvcaches_capacity": _cap,
-                                    "oob": _smax >= _cap,
-                                    "connector_num_layers": self.num_layers,
-                                    "kvcaches_len": len(self.kvcaches)
-                                    if self.kvcaches
-                                    else 0,
-                                    "kv_format": layout.kv_format.name,
-                                    "tp_rank": _tp_rank,
-                                },
-                                "timestamp": int(_t.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except OSError:
-                pass
-        # #endregion
 
         chunk_offsets = []
         chunk_sizes = []
@@ -2722,77 +2540,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         assert memory_obj.tensor is not None
                         cpu_tensors.append(memory_obj.tensor)
 
-                    # #region agent log
-                    if (
-                        kv_group == 0
-                        and layer_id == 0
-                        and len(starts) > 0
-                        and (starts[0] == 0 or len(starts) == 1)
-                    ):
-                        try:
-                            import json as _j
-                            import time as _t
-
-                            _tp_rank = None
-                            try:
-                                from vllm.distributed.parallel_state import (
-                                    get_tensor_model_parallel_rank,
-                                )
-
-                                _tp_rank = get_tensor_model_parallel_rank()
-                            except Exception:
-                                pass
-                            _layer_kv = kvcaches_snapshot[layer_id]
-                            _k0 = (
-                                _layer_kv[0]
-                                if isinstance(_layer_kv, (list, tuple))
-                                else _layer_kv
-                            )
-                            _v0 = (
-                                _layer_kv[1]
-                                if isinstance(_layer_kv, (list, tuple))
-                                and len(_layer_kv) > 1
-                                else None
-                            )
-                            with open("debug-792df4.log", "a", encoding="utf-8") as _f:
-                                _f.write(
-                                    _j.dumps(
-                                        {
-                                            "sessionId": "792df4",
-                                            "runId": "post-fix",
-                                            "hypothesisId": "H_KERNEL",
-                                            "location": "npu_connectors:batched_from_gpu",
-                                            "message": "latent transfer params",
-                                            "data": {
-                                                "kv_group": kv_group,
-                                                "layer_id": layer_id,
-                                                "tp_rank": _tp_rank,
-                                                "starts": starts,
-                                                "ends": ends,
-                                                "slot_min": int(
-                                                    slot_mapping_full.min().item()
-                                                ),
-                                                "slot_max": int(
-                                                    slot_mapping_full.max().item()
-                                                ),
-                                                "k_hidden_dims": k_hidden_dims,
-                                                "v_hidden_dims": v_hidden_dims,
-                                                "k_shape": list(_k0.shape),
-                                                "v_shape": (
-                                                    list(_v0.shape)
-                                                    if _v0 is not None
-                                                    else None
-                                                ),
-                                                "kv_format": layout.kv_format.name,
-                                            },
-                                            "timestamp": int(_t.time() * 1000),
-                                        }
-                                    )
-                                    + "\n"
-                                )
-                        except OSError:
-                            pass
-                    # #endregion
 
                     # Fused transfer: 1 scatter kernel + N D2H memcpy
                     lmc_ops.batched_fused_single_layer_kv_transfer(

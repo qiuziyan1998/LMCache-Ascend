@@ -850,36 +850,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger.debug(
                 "Passive rank (save_only_first_rank), skipping store_layer"
             )
-            # #region agent log
-            try:
-                import json as _j
-                import time as _t
-
-                with open("debug-792df4.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        _j.dumps(
-                            {
-                                "sessionId": "792df4",
-                                "runId": "pre-fix",
-                                "hypothesisId": "H_META",
-                                "location": "cache_engine:store_layer",
-                                "message": "passive rank skip store_layer",
-                                "data": {
-                                    "req_id": kwargs.get("req_id"),
-                                    "kv_group": kwargs.get("kv_group", 0),
-                                    "worker_id": self.metadata.worker_id,
-                                    "world_size": self.metadata.world_size,
-                                    "engine_num_layers": self.num_layers,
-                                    "kvcaches_len": len(kwargs.get("kvcaches") or []),
-                                },
-                                "timestamp": int(_t.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except OSError:
-                pass
-            # #endregion
             for layer_id in range(self.num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
