@@ -287,14 +287,8 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
       static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
 
   torch::Tensor &vllm_k_cache = vllm_kv_caches[0];
-  torch::Tensor *vllm_v_cache =
-      (config.kvcache_format == kvcache_ops::KVCacheFormat::MERGED_KV)
-          ? nullptr
-          : &vllm_kv_caches[1];
-  torch::Tensor *vllm_dsa_cache =
-      (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV)
-          ? &vllm_kv_caches[2]
-          : nullptr;
+  torch::Tensor *vllm_v_cache = nullptr;
+  torch::Tensor *vllm_dsa_cache = nullptr;
 
   // For DSA_INDEX (two-group indexer-only), the single tensor is the indexer.
   // Map it onto the MLA_KV kernel with k_hidden=dsa_hidden, v_hidden=0.
@@ -302,6 +296,11 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
   // as a dummy for V (the V copy is a no-op because v_hidden_dims=0).
   if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
     vllm_v_cache = &vllm_kv_caches[0]; // dummy; V copy is 0-element
+  } else if (config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV) {
+    vllm_v_cache = &vllm_kv_caches[1];
+    if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+      vllm_dsa_cache = &vllm_kv_caches[2];
+    }
   }
 
   if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||

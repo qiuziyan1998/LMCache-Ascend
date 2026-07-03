@@ -23,6 +23,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
+    batched_fused_sparse_single_layer_kv_transfer,
     batched_fused_single_layer_kv_transfer,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
@@ -37,15 +38,25 @@ logger = init_logger(__name__)
 
 _IS_310P = None
 DENSE_PREFIX_DIAG_ENV = "LMCACHE_DENSE_PREFIX_DIAG"
+SPARSE_STAGED_FALLBACK_ENV = "LMCACHE_ASCEND_SPARSE_STAGED_FALLBACK"
+SPARSE_DIRECT_INPUT_DIAG_ENV = "LMCACHE_DIAG_SPARSE_DIRECT_INPUTS"
 
 
-def _dense_prefix_diag_enabled() -> bool:
-    return os.environ.get(DENSE_PREFIX_DIAG_ENV, "").strip().lower() in {
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
     }
+
+
+def _dense_prefix_diag_enabled() -> bool:
+    return _env_flag(DENSE_PREFIX_DIAG_ENV)
+
+
+def _sparse_direct_input_diag_enabled() -> bool:
+    return _env_flag(SPARSE_DIRECT_INPUT_DIAG_ENV)
 
 
 def _diag_tensor_summary(name: str, tensor, sample: int = 4) -> str:
@@ -76,6 +87,31 @@ def _diag_tensor_summary(name: str, tensor, sample: int = 4) -> str:
         return " ".join(pieces)
     except Exception as exc:  # pragma: no cover - diagnostics must not fail path
         return f"{name}=unavailable({type(exc).__name__})"
+
+
+def _diag_selected_chunk_summary(
+    selected_token_idx: torch.Tensor,
+    chunk_size: int,
+    sample: int = 8,
+) -> str:
+    try:
+        selected = (
+            selected_token_idx.detach().reshape(-1)[:sample].to(device="cpu")
+        )
+        values = []
+        chunk_size_int = int(chunk_size)
+        for token in selected.tolist():
+            token_int = int(token)
+            values.append(
+                (
+                    token_int,
+                    token_int // chunk_size_int,
+                    token_int % chunk_size_int,
+                )
+            )
+        return f"selected_chunk_local.head={values}"
+    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
+        return f"selected_chunk_local=unavailable({type(exc).__name__})"
 
 
 def _diag_span_summary(starts: List[int], ends: List[int], sample: int = 4) -> str:
@@ -1553,14 +1589,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping: torch.Tensor,
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         token_start_index: int,
+        target_slot_mapping: Optional[Union[torch.Tensor, list]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Align slot_mapping and selected_token_idx to equal length for kernel."""
+        """Build parallel destination/source arrays for the sparse copy kernel."""
         if selected_token_idx is not None and not isinstance(
             selected_token_idx, torch.Tensor
         ):
             selected_token_idx = torch.tensor(
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
+
+        if target_slot_mapping is not None:
+            if not isinstance(target_slot_mapping, torch.Tensor):
+                target_slot_mapping = torch.tensor(
+                    target_slot_mapping, dtype=torch.long, device=self.kv_device
+                )
+            slot_mapping_packed = target_slot_mapping.reshape(-1).to(
+                device=self.kv_device, dtype=torch.long
+            )
+            selected_token_idx = self._sparse_selected_token_idx(
+                selected_token_idx, slot_mapping_packed.shape[0]
+            )
+            if selected_token_idx.numel() != slot_mapping_packed.numel():
+                raise ValueError(
+                    "Sparse target_slot_mapping must match selected_token_idx "
+                    f"length: target_slots={slot_mapping_packed.numel()} "
+                    f"selected_tokens={selected_token_idx.numel()}"
+                )
+            return slot_mapping_packed, selected_token_idx
 
         if selected_token_idx is not None and selected_token_idx.numel() > 0:
             num_sparse = int(selected_token_idx.numel())
@@ -1644,6 +1700,37 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             logger.error(message)
             raise ValueError(message)
+
+        if _sparse_direct_input_diag_enabled() and layer_id == 0:
+            logger.info(
+                "SPARSE_DIRECT_INPUT_DIAG kv_group=%s layer_id=%s "
+                "num_sparse=%s chunk_count=%s chunk_size=%s total_tokens=%s "
+                "kv_format=%s token_major=%s vllm_two_major=%s "
+                "host_interleaved=%s k_hidden_dims=%s v_hidden_dims=%s "
+                "dsa_hidden_dims=%s %s %s %s",
+                kv_group,
+                layer_id,
+                num_sparse,
+                chunk_count,
+                chunk_size_int,
+                int(total_tokens),
+                sparse_kv_format,
+                sparse_token_major,
+                sparse_vllm_two_major,
+                sparse_host_interleaved,
+                sparse_k_hidden_dims,
+                sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims,
+                _diag_tensor_summary(
+                    "slot_mapping_packed", slot_mapping_packed, sample=8
+                ),
+                _diag_tensor_summary(
+                    "selected_token_idx", selected_token_idx, sample=8
+                ),
+                _diag_selected_chunk_summary(
+                    selected_token_idx, chunk_size_int, sample=8
+                ),
+            )
 
         resolve_tensors = (
             layer_tensors
@@ -2563,16 +2650,54 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         sparse_vllm_two_major = layout.vllm_two_major
+        expected_fmt = self._expected_memory_format(kv_group)
+        use_staged_sparse_fallback = _env_flag(SPARSE_STAGED_FALLBACK_ENV)
         # Snapshot so interleaved latent/indexer sparse generators do not
         # race on the shared connector self.kvcaches pointer.
         kvcaches_snapshot = self.kvcaches
+        staging_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
+        staging_capacity_tokens = 0
+
+        if use_staged_sparse_fallback:
+            if not self.use_gpu:
+                raise ValueError(
+                    "Sparse staged fallback requires use_gpu=True with a "
+                    "layerwise staging buffer."
+                )
+            logger.warning(
+                "Using sparse staged fallback for LMCache selected-token "
+                "retrieve: kv_group=%s env=%s",
+                kv_group,
+                SPARSE_STAGED_FALLBACK_ENV,
+            )
 
         for layer_id in range(self.num_layers):
-            memory_objs_layer, selected_token_idx, token_start_index = yield
+            sparse_request = yield
+            target_slot_mapping = None
+            if isinstance(sparse_request, tuple):
+                if len(sparse_request) == 4:
+                    (
+                        memory_objs_layer,
+                        selected_token_idx,
+                        token_start_index,
+                        target_slot_mapping,
+                    ) = sparse_request
+                else:
+                    (
+                        memory_objs_layer,
+                        selected_token_idx,
+                        token_start_index,
+                    ) = sparse_request
+            else:
+                memory_objs_layer = sparse_request
+                selected_token_idx = None
+                token_start_index = 0
             slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
                 slot_mapping,
                 selected_token_idx,
                 token_start_index,
+                target_slot_mapping=target_slot_mapping,
             )
 
             layer_cached_tensors = (
@@ -2617,30 +2742,86 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else:
                 total_tokens = chunk_total_tokens
 
-            self._run_sparse_direct_kv_transfer_layer(
-                kvcaches_ref=kvcaches_snapshot,
-                kv_group=kv_group,
-                layer_id=layer_id,
-                load_stream=self.load_stream_list[load_stream_idx],
-                current_stream=current_stream,
-                slot_mapping_packed=slot_mapping_packed,
-                selected_token_idx=selected_token_idx,
-                chunk_size=chunk_size,
-                total_tokens=total_tokens,
-                chunk_ptrs_npu=chunk_ptrs_npu,
-                sparse_kv_format=sparse_kv_format,
-                sparse_token_major=sparse_token_major,
-                sparse_vllm_two_major=sparse_vllm_two_major,
-                sparse_k_hidden_dims=sparse_k_hidden_dims,
-                sparse_v_hidden_dims=sparse_v_hidden_dims,
-                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-                sparse_host_interleaved=sparse_host_interleaved,
-                layer_tensors=cpu_tensors,
-                slot_mapping_ref=slot_mapping,
-                cpu_tensors=cpu_tensors,
-            )
+            if use_staged_sparse_fallback:
+                if (
+                    staging_tensor is None
+                    or staging_capacity_tokens < int(total_tokens)
+                ):
+                    if staging_obj is not None:
+                        staging_obj.ref_count_down()
+                    staging_obj, staging_tensor = (
+                        self._allocate_layerwise_staging_buffer(
+                            num_tokens=int(total_tokens),
+                            kv_group=kv_group,
+                            layout=layout,
+                            k_hidden_dims=sparse_k_hidden_dims,
+                            v_hidden_dims=sparse_v_hidden_dims,
+                            dsa_hidden_dims=sparse_dsa_hidden_dims,
+                            expected_fmt=expected_fmt,
+                        )
+                    )
+                    staging_capacity_tokens = int(total_tokens)
+
+                chunk_offsets = []
+                chunk_sizes = []
+                current_offset = 0
+                for cpu_tensor in cpu_tensors:
+                    tensor_tokens = self._lmc_plane_num_tokens(
+                        cpu_tensor, kv_group
+                    )
+                    chunk_offsets.append(current_offset)
+                    chunk_sizes.append(tensor_tokens)
+                    current_offset += tensor_tokens
+
+                assert staging_tensor is not None
+                with torch.cuda.stream(self.load_stream_list[load_stream_idx]):
+                    self.load_stream_list[load_stream_idx].wait_stream(
+                        current_stream
+                    )
+                    batched_fused_sparse_single_layer_kv_transfer(
+                        cpu_tensors,
+                        staging_tensor,
+                        kvcaches_snapshot[layer_id],
+                        slot_mapping_packed,
+                        selected_token_idx,
+                        chunk_offsets,
+                        chunk_sizes,
+                        sparse_kv_format,
+                        sparse_token_major,
+                        sparse_vllm_two_major,
+                        sparse_k_hidden_dims,
+                        sparse_v_hidden_dims,
+                        sparse_dsa_hidden_dims,
+                    )
+                current_stream.wait_stream(self.load_stream_list[load_stream_idx])
+            else:
+                self._run_sparse_direct_kv_transfer_layer(
+                    kvcaches_ref=kvcaches_snapshot,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    load_stream=self.load_stream_list[load_stream_idx],
+                    current_stream=current_stream,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    sparse_kv_format=sparse_kv_format,
+                    sparse_token_major=sparse_token_major,
+                    sparse_vllm_two_major=sparse_vllm_two_major,
+                    sparse_k_hidden_dims=sparse_k_hidden_dims,
+                    sparse_v_hidden_dims=sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    layer_tensors=cpu_tensors,
+                    slot_mapping_ref=slot_mapping,
+                    cpu_tensors=cpu_tensors,
+                )
 
         yield
+
+        if staging_obj is not None:
+            staging_obj.ref_count_down()
 
         yield
 
