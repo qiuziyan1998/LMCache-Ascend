@@ -240,6 +240,8 @@ def _patch_ops():
             NL_X_NB_BS_HS = 3
             TWO_X_NL_X_NBBS_NH_HS = 4
             NL_X_NBBS_ONE_HS = 5
+            NL_X_TWO_NB_NH_BS_HS = 6
+            NL_X_NB_TWO_NH_BS_HS = 7
 
         ascend_c_ops.GPUKVFormat = GPUKVFormat
 
@@ -399,6 +401,7 @@ def _patch_vllm_v1_adapter():
         if callable(method):
             method(preempted_req_ids)
 
+    vllm_lmcache_connector.LMCacheConnectorV1.supports_dsa_index_lmcache = True
     vllm_lmcache_connector.LMCacheConnectorV1.handle_preemptions = handle_preemptions
 
 

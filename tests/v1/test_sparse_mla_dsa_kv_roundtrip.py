@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 # Standard
+import random
 import sys
 import traceback
 from pathlib import Path
@@ -28,11 +29,24 @@ from kv_cache_fixtures import (  # noqa: E402
 )
 from load_benchmark_utils import (  # noqa: E402
     KV_FORMAT_DSA,
+    KV_FORMAT_DSA_INDEX,
     KV_FORMAT_MLA,
+    KV_FORMAT_MLA_LATENT,
+    MlaDsaDims,
+    allocate_stacked_cpu_chunks,
     build_load_benchmark_harness,
+    build_chunk_ptrs_npu,
     compute_chunk_partition,
+    create_pin_memory_allocator,
+    release_pin_memory_objects,
     run_all_direct_fast_layers,
     run_all_direct_layers,
+    run_direct_fast_load_layer,
+    run_direct_load_layer,
+)
+from lmcache_ascend.v1.npu_connector.utils import (  # noqa: E402
+    batched_fused_sparse_single_layer_kv_transfer,
+    prepare_sparse_direct_layer_state,
 )
 
 
@@ -52,6 +66,135 @@ def _sample_layer_ids(num_layers: int, max_samples: int = 4) -> list[int]:
         return list(range(num_layers))
     step = max(1, num_layers // max_samples)
     return list(range(0, num_layers, step))[:max_samples]
+
+
+def _tail_heavy_selected_tokens(total_tokens: int, num_selected: int) -> list[int]:
+    """Unsorted selected ids shaped like indexer top-k output near prompt tail."""
+    seed_values = [
+        total_tokens - 48,
+        total_tokens - 65,
+        total_tokens - 69,
+        total_tokens - 228,
+        total_tokens - 240,
+        total_tokens - 424,
+        total_tokens - 237,
+        total_tokens - 434,
+        3,
+        257,
+        511,
+        4096,
+        total_tokens - 1,
+    ]
+    selected: list[int] = []
+    seen: set[int] = set()
+    for value in seed_values:
+        if 0 <= value < total_tokens and value not in seen:
+            selected.append(value)
+            seen.add(value)
+
+    rng = random.Random(1234)
+    while len(selected) < num_selected:
+        value = rng.randrange(total_tokens)
+        if value not in seen:
+            selected.append(value)
+            seen.add(value)
+    return selected
+
+
+def _fill_stacked_chunks_with_token_pattern(
+    chunks: list[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+) -> None:
+    for chunk_id, chunk in enumerate(chunks):
+        values = (
+            torch.arange(chunk.numel(), dtype=torch.float32)
+            .remainder(97)
+            .div(16.0)
+            .add(float(chunk_id * 8))
+        )
+        chunk.copy_(values.to(dtype=dtype))
+
+
+def _check_compact_scratch_from_cpu_chunks(
+    *,
+    chunks: list[torch.Tensor],
+    selected: list[int],
+    dst_slots: list[int],
+    dst_layer: tuple[torch.Tensor, torch.Tensor],
+    chunk_size: int,
+    dims: MlaDsaDims,
+    label: str,
+) -> None:
+    dst_k = dst_layer[0].reshape(-1, dims.k_hidden_dims).detach().cpu()
+    dst_v = dst_layer[1].reshape(-1, dims.v_hidden_dims).detach().cpu()
+    mismatches: list[str] = []
+    for packed_idx, token_idx in enumerate(selected):
+        chunk_id = token_idx // chunk_size
+        local_idx = token_idx % chunk_size
+        chunk = chunks[chunk_id].detach().cpu()
+        chunk_tokens = chunk.numel() // dims.plane_elems
+        k_start = local_idx * dims.k_hidden_dims
+        k_end = k_start + dims.k_hidden_dims
+        v_start = chunk_tokens * dims.k_hidden_dims + local_idx * dims.v_hidden_dims
+        v_end = v_start + dims.v_hidden_dims
+        dst_slot = int(dst_slots[packed_idx])
+        expected_k = chunk[k_start:k_end]
+        expected_v = chunk[v_start:v_end]
+        if not torch.equal(dst_k[dst_slot], expected_k):
+            mismatches.append(
+                f"{label} packed{packed_idx} token{token_idx} "
+                f"chunk{chunk_id} local{local_idx} dst{dst_slot} K mismatch "
+                f"got_head={dst_k[dst_slot, :4].tolist()} "
+                f"expected_head={expected_k[:4].tolist()}"
+            )
+        if not torch.equal(dst_v[dst_slot], expected_v):
+            mismatches.append(
+                f"{label} packed{packed_idx} token{token_idx} "
+                f"chunk{chunk_id} local{local_idx} dst{dst_slot} V mismatch "
+                f"got_head={dst_v[dst_slot, :4].tolist()} "
+                f"expected_head={expected_v[:4].tolist()}"
+            )
+        if len(mismatches) >= 8:
+            break
+    assert not mismatches, (
+        f"compact scratch direct sparse load mismatch: {mismatches}"
+    )
+
+
+def _check_compact_index_from_cpu_chunks(
+    *,
+    chunks: list[torch.Tensor],
+    selected: list[int],
+    dst_slots: list[int],
+    dst_layer: tuple[torch.Tensor],
+    chunk_size: int,
+    dims: MlaDsaDims,
+    label: str,
+) -> None:
+    dst_index = dst_layer[0].reshape(-1, dims.dsa_hidden_dims).detach().cpu()
+    mismatches: list[str] = []
+    for packed_idx, token_idx in enumerate(selected):
+        chunk_id = token_idx // chunk_size
+        local_idx = token_idx % chunk_size
+        chunk = chunks[chunk_id].detach().cpu()
+        start = local_idx * dims.dsa_hidden_dims
+        end = start + dims.dsa_hidden_dims
+        dst_slot = int(dst_slots[packed_idx])
+        expected = chunk[start:end]
+        if not torch.equal(dst_index[dst_slot], expected):
+            mismatches.append(
+                f"{label} packed{packed_idx} token{token_idx} "
+                f"chunk{chunk_id} local{local_idx} dst{dst_slot} "
+                f"DSA_INDEX mismatch got_head="
+                f"{dst_index[dst_slot, :4].tolist()} "
+                f"expected_head={expected[:4].tolist()}"
+            )
+        if len(mismatches) >= 8:
+            break
+    assert not mismatches, (
+        f"compact scratch DSA_INDEX sparse load mismatch: {mismatches}"
+    )
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU required")
@@ -186,6 +329,446 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             raise AssertionError(
                 f"test failed fmt={fmt} num_selected={num_selected}: "
                 f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            ) from None
+        finally:
+            if harness is not None:
+                try:
+                    harness.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def test_sparse_direct_mla_compact_scratch_reads_selected_chunks(self) -> None:
+        """Direct multi-chunk MLA sparse load must write selected tokens tightly.
+
+        This mirrors the vLLM sparse decode path:
+        selected_token_idx contains absolute prompt positions in top-k order,
+        while slot_mapping_packed is the compact scratch window's physical
+        slot list in the same order.
+        """
+        total_tokens = 18879
+        chunk_size = 256
+        num_selected = 2048
+        block_size = 128
+        dtype = torch.bfloat16
+        device = "npu"
+        dims = MlaDsaDims(
+            k_hidden_dims=512,
+            v_hidden_dims=64,
+            dsa_hidden_dims=0,
+            plane_elems=576,
+        )
+        partition = compute_chunk_partition(total_tokens, chunk_size)
+        mem_allocator = None
+        mem_objs = []
+        try:
+            mem_allocator = create_pin_memory_allocator(partition, dims, dtype)
+            chunks, mem_objs = allocate_stacked_cpu_chunks(
+                mem_allocator, partition, dims, dtype
+            )
+            _fill_stacked_chunks_with_token_pattern(chunks, dtype=dtype)
+
+            selected = _tail_heavy_selected_tokens(total_tokens, num_selected)
+            selected_npu = torch.tensor(
+                selected, dtype=torch.int32, device=device
+            )
+            scratch_base_block = 5
+            scratch_base_slot = scratch_base_block * block_size
+            scratch_slots_cpu = list(
+                range(scratch_base_slot, scratch_base_slot + num_selected)
+            )
+            scratch_slots = torch.tensor(
+                scratch_slots_cpu, dtype=torch.long, device=device
+            )
+            num_scratch_blocks = scratch_base_block + (
+                (num_selected + block_size - 1) // block_size
+            )
+            dst_direct = (
+                torch.empty(
+                    (num_scratch_blocks, block_size, 1, dims.k_hidden_dims),
+                    dtype=dtype,
+                    device=device,
+                ),
+                torch.empty(
+                    (num_scratch_blocks, block_size, 1, dims.v_hidden_dims),
+                    dtype=dtype,
+                    device=device,
+                ),
+            )
+            dst_fast = (
+                torch.empty_like(dst_direct[0]),
+                torch.empty_like(dst_direct[1]),
+            )
+            dst_staged = (
+                torch.empty_like(dst_direct[0]),
+                torch.empty_like(dst_direct[1]),
+            )
+            for tensor in (*dst_direct, *dst_fast, *dst_staged):
+                tensor.zero_()
+
+            chunk_ptrs_npu = build_chunk_ptrs_npu(chunks, torch.device(device))
+            staging = torch.empty(
+                total_tokens * dims.plane_elems,
+                dtype=dtype,
+                device=device,
+            )
+
+            batched_fused_sparse_single_layer_kv_transfer(
+                chunks,
+                staging,
+                list(dst_staged),
+                scratch_slots,
+                selected_npu,
+                partition.chunk_offsets,
+                partition.chunk_sizes,
+                KV_FORMAT_MLA_LATENT,
+                False,
+                False,
+                dims.k_hidden_dims,
+                dims.v_hidden_dims,
+                dims.dsa_hidden_dims,
+            )
+
+            run_direct_load_layer(
+                stacked_cpu_chunks=chunks,
+                dst_layer=dst_direct,
+                slot_mapping_packed=scratch_slots,
+                selected_token_idx=selected_npu,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+                dims=dims,
+                kv_format=KV_FORMAT_MLA_LATENT,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+            )
+            layer_state = prepare_sparse_direct_layer_state(
+                chunks[0],
+                list(dst_fast),
+                scratch_slots,
+                False,
+                False,
+                KV_FORMAT_MLA_LATENT,
+                dims.k_hidden_dims,
+                dims.v_hidden_dims,
+                dims.dsa_hidden_dims,
+                total_tokens,
+            )
+            run_direct_fast_load_layer(
+                layer_state=layer_state,
+                slot_mapping_packed=scratch_slots,
+                selected_token_idx=selected_npu,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+                kv_format=KV_FORMAT_MLA_LATENT,
+            )
+            torch.npu.synchronize()
+
+            _check_compact_scratch_from_cpu_chunks(
+                chunks=chunks,
+                selected=selected,
+                dst_slots=scratch_slots_cpu,
+                dst_layer=dst_staged,
+                chunk_size=chunk_size,
+                dims=dims,
+                label="staged",
+            )
+            _check_compact_scratch_from_cpu_chunks(
+                chunks=chunks,
+                selected=selected,
+                dst_slots=scratch_slots_cpu,
+                dst_layer=dst_direct,
+                chunk_size=chunk_size,
+                dims=dims,
+                label="direct",
+            )
+            _check_compact_scratch_from_cpu_chunks(
+                chunks=chunks,
+                selected=selected,
+                dst_slots=scratch_slots_cpu,
+                dst_layer=dst_fast,
+                chunk_size=chunk_size,
+                dims=dims,
+                label="fast",
+            )
+        finally:
+            if mem_objs:
+                release_pin_memory_objects(mem_objs)
+
+    def test_sparse_direct_dsa_index_compact_scratch_reads_selected_chunks(
+        self,
+    ) -> None:
+        """DSA_INDEX sparse load must support a one-tensor indexer group."""
+        total_tokens = 18879
+        chunk_size = 256
+        num_selected = 2048
+        block_size = 128
+        dtype = torch.bfloat16
+        device = "npu"
+        dims = MlaDsaDims(
+            k_hidden_dims=128,
+            v_hidden_dims=0,
+            dsa_hidden_dims=128,
+            plane_elems=128,
+        )
+        partition = compute_chunk_partition(total_tokens, chunk_size)
+        mem_allocator = None
+        mem_objs = []
+        try:
+            mem_allocator = create_pin_memory_allocator(partition, dims, dtype)
+            chunks, mem_objs = allocate_stacked_cpu_chunks(
+                mem_allocator, partition, dims, dtype
+            )
+            _fill_stacked_chunks_with_token_pattern(chunks, dtype=dtype)
+
+            selected = _tail_heavy_selected_tokens(total_tokens, num_selected)
+            selected_npu = torch.tensor(
+                selected, dtype=torch.int32, device=device
+            )
+            scratch_base_block = 5
+            scratch_base_slot = scratch_base_block * block_size
+            scratch_slots_cpu = list(
+                range(scratch_base_slot, scratch_base_slot + num_selected)
+            )
+            scratch_slots = torch.tensor(
+                scratch_slots_cpu, dtype=torch.long, device=device
+            )
+            num_scratch_blocks = scratch_base_block + (
+                (num_selected + block_size - 1) // block_size
+            )
+            dst_direct = (
+                torch.empty(
+                    (num_scratch_blocks, block_size, 1, dims.dsa_hidden_dims),
+                    dtype=dtype,
+                    device=device,
+                ),
+            )
+            dst_fast = (torch.empty_like(dst_direct[0]),)
+            dst_staged = (torch.empty_like(dst_direct[0]),)
+            for tensor in (*dst_direct, *dst_fast, *dst_staged):
+                tensor.zero_()
+
+            chunk_ptrs_npu = build_chunk_ptrs_npu(chunks, torch.device(device))
+            staging = torch.empty(
+                total_tokens * dims.plane_elems,
+                dtype=dtype,
+                device=device,
+            )
+
+            batched_fused_sparse_single_layer_kv_transfer(
+                chunks,
+                staging,
+                list(dst_staged),
+                scratch_slots,
+                selected_npu,
+                partition.chunk_offsets,
+                partition.chunk_sizes,
+                KV_FORMAT_DSA_INDEX,
+                False,
+                False,
+                dims.k_hidden_dims,
+                dims.v_hidden_dims,
+                dims.dsa_hidden_dims,
+            )
+            run_direct_load_layer(
+                stacked_cpu_chunks=chunks,
+                dst_layer=dst_direct,
+                slot_mapping_packed=scratch_slots,
+                selected_token_idx=selected_npu,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+                dims=dims,
+                kv_format=KV_FORMAT_DSA_INDEX,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+            )
+            layer_state = prepare_sparse_direct_layer_state(
+                chunks[0],
+                list(dst_fast),
+                scratch_slots,
+                False,
+                False,
+                KV_FORMAT_DSA_INDEX,
+                dims.k_hidden_dims,
+                dims.v_hidden_dims,
+                dims.dsa_hidden_dims,
+                total_tokens,
+            )
+            run_direct_fast_load_layer(
+                layer_state=layer_state,
+                slot_mapping_packed=scratch_slots,
+                selected_token_idx=selected_npu,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+                kv_format=KV_FORMAT_DSA_INDEX,
+            )
+            torch.npu.synchronize()
+
+            _check_compact_index_from_cpu_chunks(
+                chunks=chunks,
+                selected=selected,
+                dst_slots=scratch_slots_cpu,
+                dst_layer=dst_staged,
+                chunk_size=chunk_size,
+                dims=dims,
+                label="staged",
+            )
+            _check_compact_index_from_cpu_chunks(
+                chunks=chunks,
+                selected=selected,
+                dst_slots=scratch_slots_cpu,
+                dst_layer=dst_direct,
+                chunk_size=chunk_size,
+                dims=dims,
+                label="direct",
+            )
+            _check_compact_index_from_cpu_chunks(
+                chunks=chunks,
+                selected=selected,
+                dst_slots=scratch_slots_cpu,
+                dst_layer=dst_fast,
+                chunk_size=chunk_size,
+                dims=dims,
+                label="fast",
+            )
+        finally:
+            if mem_objs:
+                release_pin_memory_objects(mem_objs)
+
+    @pytest.mark.parametrize("fmt", ["mla", "dsa"])
+    def test_sparse_direct_compact_scratch_slots_match_selected_source(
+        self, fmt: str
+    ) -> None:
+        num_tokens = 4096
+        num_selected = 2048
+        num_layers = 1
+        num_blocks = 64
+        block_size = 128
+        num_kv_heads = 8
+        kv_lora_rank = 512
+        qk_rope_head_dim = 128
+        dsa_head_dim = 128
+        kv_format = KV_FORMAT_MLA if fmt == "mla" else KV_FORMAT_DSA
+        common = dict(
+            num_blocks=num_blocks,
+            device="npu",
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_size=block_size,
+            dtype=torch.bfloat16,
+        )
+        harness = None
+        try:
+            src = (
+                generate_mla_kv_cache(**common)
+                if fmt == "mla"
+                else generate_dsa_kv_cache(dsa_head_dim=dsa_head_dim, **common)
+            )
+            harness = build_load_benchmark_harness(
+                fmt=fmt,
+                src_kv_cache=src,
+                num_tokens=num_tokens,
+                chunk_size=256,
+                num_layers=num_layers,
+                num_selected=num_selected,
+                seed=123,
+            )
+            selected_values = _tail_heavy_selected_tokens(
+                num_tokens, num_selected
+            )
+            harness.selected_token_idx = torch.tensor(
+                selected_values,
+                device=harness.selected_token_idx.device,
+                dtype=torch.int32,
+            )
+            compact_base_slot = 5 * block_size
+            harness.slot_mapping_packed = torch.arange(
+                compact_base_slot,
+                compact_base_slot + num_selected,
+                device=harness.selected_token_idx.device,
+                dtype=torch.long,
+            )
+
+            run_all_direct_layers(harness)
+            run_all_direct_fast_layers(harness)
+            torch.npu.synchronize()
+
+            selected = harness.selected_token_idx.detach().cpu().tolist()
+            full_slots = harness.slot_mapping_full.detach().cpu().tolist()
+            compact_slots = harness.slot_mapping_packed.detach().cpu().tolist()
+            packed_idx_to_check = sorted(
+                set([0, 1, 2, 3, 4, 127, 255, 256, 511, 1023, 2047])
+            )
+
+            src_layer = harness.src_kv_cache[0]
+            dst_dir = harness.dst_direct[0]
+            dst_fast = harness.dst_direct_fast[0]
+            src_k = src_layer[0].reshape(
+                -1, num_kv_heads, kv_lora_rank
+            ).detach().cpu()
+            src_v = src_layer[1].reshape(
+                -1, num_kv_heads, qk_rope_head_dim
+            ).detach().cpu()
+            dst_dir_k = dst_dir[0].reshape(
+                -1, num_kv_heads, kv_lora_rank
+            ).detach().cpu()
+            dst_dir_v = dst_dir[1].reshape(
+                -1, num_kv_heads, qk_rope_head_dim
+            ).detach().cpu()
+            dst_fast_k = dst_fast[0].reshape(
+                -1, num_kv_heads, kv_lora_rank
+            ).detach().cpu()
+            dst_fast_v = dst_fast[1].reshape(
+                -1, num_kv_heads, qk_rope_head_dim
+            ).detach().cpu()
+
+            src_dsa = dst_dir_dsa = dst_fast_dsa = None
+            if kv_format == KV_FORMAT_DSA:
+                src_dsa = src_layer[2].reshape(-1, dsa_head_dim).detach().cpu()
+                dst_dir_dsa = dst_dir[2].reshape(-1, dsa_head_dim).detach().cpu()
+                dst_fast_dsa = dst_fast[2].reshape(-1, dsa_head_dim).detach().cpu()
+
+            mismatches: list[str] = []
+            for pi in packed_idx_to_check:
+                src_slot = int(full_slots[int(selected[pi])])
+                dst_slot = int(compact_slots[pi])
+                if not torch.equal(dst_dir_k[dst_slot], src_k[src_slot]):
+                    mismatches.append(
+                        f"direct P{pi}src{src_slot}->dst{dst_slot} K mismatch"
+                    )
+                if not torch.equal(dst_dir_v[dst_slot], src_v[src_slot]):
+                    mismatches.append(
+                        f"direct P{pi}src{src_slot}->dst{dst_slot} V mismatch"
+                    )
+                if not torch.equal(dst_fast_k[dst_slot], src_k[src_slot]):
+                    mismatches.append(
+                        f"fast P{pi}src{src_slot}->dst{dst_slot} K mismatch"
+                    )
+                if not torch.equal(dst_fast_v[dst_slot], src_v[src_slot]):
+                    mismatches.append(
+                        f"fast P{pi}src{src_slot}->dst{dst_slot} V mismatch"
+                    )
+                if src_dsa is not None:
+                    assert dst_dir_dsa is not None
+                    assert dst_fast_dsa is not None
+                    if not torch.equal(dst_dir_dsa[dst_slot], src_dsa[src_slot]):
+                        mismatches.append(
+                            f"direct P{pi}src{src_slot}->dst{dst_slot} DSA mismatch"
+                        )
+                    if not torch.equal(dst_fast_dsa[dst_slot], src_dsa[src_slot]):
+                        mismatches.append(
+                            f"fast P{pi}src{src_slot}->dst{dst_slot} DSA mismatch"
+                        )
+            assert not mismatches, (
+                f"compact sparse scratch mismatch fmt={fmt} "
+                f"(showing first 8 of {len(mismatches)}): {mismatches[:8]}"
+            )
+        except AssertionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(
+                f"test failed fmt={fmt}: {type(exc).__name__}: "
+                f"{exc}\n{traceback.format_exc()}"
             ) from None
         finally:
             if harness is not None:

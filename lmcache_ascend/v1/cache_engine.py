@@ -226,6 +226,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        kv_group = kwargs.get("kv_group", 0)
+
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
 
         with store_stats.profile_process_tokens():
@@ -236,6 +238,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 offsets,
                 mask,
                 request_configs=request_configs,
+                kv_group=kv_group,
             ):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
@@ -250,7 +253,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     busy_loop=self.config.get_extra_config_value(
                         "force_store_wait", False
                     ),
-                    fmt=self.fmt,
+                    fmt=self._memory_format_for_kv_group(kv_group),
                 )
                 if memory_obj is None:
                     logger.warning(
@@ -333,10 +336,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         tot_time = store_stats.time_to_store()
 
         logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
+            "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
             "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
             "offload_time: %.4f ms, put_time: %.4f ms",
             req_id,
+            kv_group,
             tot_token_num,
             num_to_store_tokens,
             tot_kv_size / 1024**3,
@@ -570,13 +574,45 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs: Optional[List],
         num_layers: int,
     ) -> bool:
-        return (
-            cached_tensors is not None
-            and len(cached_tensors) == num_layers
-        ) or (
-            cached_memory_objs is not None
-            and len(cached_memory_objs) == num_layers
-        )
+        if cached_tensors is not None and len(cached_tensors) == num_layers:
+            return any(cached_tensors)
+        if cached_memory_objs is not None and len(cached_memory_objs) == num_layers:
+            return any(cached_memory_objs)
+        return False
+
+    @staticmethod
+    def _retrieve_data_cache_covers(
+        cache_by_layer: Optional[List],
+        num_layers: int,
+        required_chunks: int,
+    ) -> bool:
+        if required_chunks <= 0:
+            return False
+        if cache_by_layer is None or len(cache_by_layer) != num_layers:
+            return False
+        for layer_id in range(num_layers):
+            layer_cache = cache_by_layer[layer_id]
+            if layer_cache is None or len(layer_cache) < required_chunks:
+                return False
+        return True
+
+    @staticmethod
+    def _min_layer_cache_chunks(
+        cache_by_layer: Optional[List],
+        num_layers: int,
+    ) -> int:
+        if cache_by_layer is None or len(cache_by_layer) != num_layers:
+            return 0
+        min_chunks: Optional[int] = None
+        for layer_id in range(num_layers):
+            layer_cache = cache_by_layer[layer_id]
+            layer_chunks = 0 if layer_cache is None else len(layer_cache)
+            min_chunks = (
+                layer_chunks
+                if min_chunks is None
+                else min(min_chunks, layer_chunks)
+            )
+        return 0 if min_chunks is None else min_chunks
 
     def _ensure_layerwise_connector_layout(self, **kwargs) -> None:
         """Initialize connector KV layout before allocating layerwise chunks.
@@ -601,7 +637,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             init_kvcaches(**kwargs)
         kvcaches = getattr(self.gpu_connector, "kvcaches", None)
         if kvcaches is not None:
-            lazy_init(kvcaches)
+            kv_group = kwargs.get("kv_group", 0)
+            # The layerwise NPU connector detects format per kv_group; other
+            # connectors (e.g. the blending buffer connector) may not accept
+            # the kwarg, so fall back to the positional call for them.
+            try:
+                lazy_init(kvcaches, kv_group=kv_group)
+            except TypeError:
+                lazy_init(kvcaches)
 
     def _resolve_local_cpu_retrieve_location(
         self,
@@ -614,6 +657,24 @@ class AscendLMCacheEngine(LMCacheEngine):
         ):
             return LOCAL_CPU_BACKEND_NAME
         return fallback
+
+    def _layerwise_chunk_location(
+        self,
+        keys_multi_layer: List[CacheEngineKey],
+    ) -> Optional[str]:
+        """Return storage location only if every layer key for a chunk exists."""
+        location: Optional[str] = None
+        for layer_key in keys_multi_layer:
+            current_location = self.storage_manager.contains(
+                layer_key, self.retrieve_locations
+            )
+            if current_location is None:
+                return None
+            if location is None:
+                location = current_location
+            elif location != current_location:
+                return None
+        return location
 
     def _ensure_retrieve_chunk_metadata(
         self,
@@ -639,6 +700,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             if retrieve_kwargs is not None:
                 retrieve_kwargs.pop("_retrieve_metadata_warm", None)
 
+            kv_group = 0
+            if retrieve_kwargs is not None:
+                kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+
             location: Optional[str] = None
             new_starts: List[int] = []
             new_ends: List[int] = []
@@ -648,12 +713,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tokens=tokens,
                 mask=mask,
                 request_configs=request_configs,
+                kv_group=kv_group,
             ):
                 assert isinstance(key, CacheEngineKey)
 
                 keys_multi_layer = key.split_layers(self.num_layers)
-                if current_location := self.storage_manager.contains(
-                    keys_multi_layer[0], self.retrieve_locations
+                if current_location := self._layerwise_chunk_location(
+                    keys_multi_layer
                 ):
                     if location is None:
                         location = current_location
@@ -778,6 +844,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             return
 
+        # Passive rank guard: when save_only_first_rank is enabled, only rank 0
+        # stores. Closes the known TODO — store_layer had no _is_passive() check,
+        # causing duplicate stores on non-rank-0 workers under MLA + layerwise.
+        if self._is_passive():
+            logger.debug(
+                "Passive rank (save_only_first_rank), skipping store_layer"
+            )
+            for layer_id in range(self.num_layers):
+                yield
+            # Extra yield consumed by wait_for_save() after the last layer.
+            yield
+            return
+
         assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store_layer operation"
@@ -844,8 +923,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._ensure_layerwise_connector_layout(**kwargs)
 
         prev_key = 0
+        kv_group = kwargs.get("kv_group", 0)
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs
+            tokens=tokens, mask=mask, request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -858,13 +939,25 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             # Allocate the memory object
             num_tokens = end - start
-            kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+            if num_tokens <= 0:
+                logger.warning(
+                    "Skipping zero-token layerwise store chunk for req_id=%s "
+                    "(kv_group=%s, start=%d, end=%d)",
+                    req_id,
+                    kv_group,
+                    start,
+                    end,
+                )
+                continue
+            kv_shape_single_layer = self.gpu_connector.get_shape(
+                num_tokens, kv_group=kv_group
+            )
 
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
                 batch_size=self.num_layers,
-                fmt=self.fmt,
+                fmt=self._memory_format_for_kv_group(kv_group),
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
 
@@ -949,9 +1042,10 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             tot_time = time.perf_counter() - t_start
             logger.info(
-                "[req_id=%s] Stored %d out of total %d tokens. "
+                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
                 "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
                 req_id,
+                kv_group,
                 tot_token_num,
                 len(tokens),
                 tot_kv_size / 1024**3,
@@ -1041,13 +1135,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
 
-        use_cached_retrieve = self._has_retrieve_data_cache(
+        has_cached_retrieve_data = self._has_retrieve_data_cache(
             cached_tensors,
             cached_memory_objs,
             self.num_layers,
         )
-        if use_cached_retrieve:
-            kwargs["_use_cached_retrieve"] = True
 
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
@@ -1061,21 +1153,39 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         kwargs.pop("_use_cached_retrieve", None)
 
+        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        cached_tensors_cover = self._retrieve_data_cache_covers(
+            cached_tensors,
+            self.num_layers,
+            required_chunks,
+        )
+        cached_memory_objs_cover = self._retrieve_data_cache_covers(
+            cached_memory_objs,
+            self.num_layers,
+            required_chunks,
+        )
+        use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
+        if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
+            logger.warning(
+                "Layerwise sparse retrieve cache is incomplete; falling back to "
+                "storage get. required_chunks=%d cached_tensor_chunks=%d "
+                "cached_memory_obj_chunks=%d",
+                required_chunks,
+                self._min_layer_cache_chunks(cached_tensors, self.num_layers),
+                self._min_layer_cache_chunks(cached_memory_objs, self.num_layers),
+            )
+
         if use_cached_retrieve:
             location = self._resolve_local_cpu_retrieve_location(location)
             if location is not None:
                 kwargs["cached_retrieve_location"] = location
 
         if not retrieve_keys:
-            # If no cache are found, we still need to yield to avoid `StopIteration`
-            for layer_id in range(self.num_layers):
-                yield None
-            # synchronize the last layer
-            if not mem_obj_consumer:
-                mem_obj_consumer = (x for x in range(self.num_layers))  
-            next(mem_obj_consumer)
-            yield ret_mask
-            return
+            retrieve_keys = [[] for _ in range(self.num_layers)]
+        elif len(retrieve_keys) < self.num_layers:
+            retrieve_keys.extend(
+                [] for _ in range(self.num_layers - len(retrieve_keys))
+            )
 
         assert_layerwise_gpu_connector(self.gpu_connector)
 
@@ -1085,7 +1195,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 retrieve_keys, location=location
             )
 
-        if use_cached_retrieve and cached_tensors is not None:
+        if cached_tensors_cover and cached_tensors is not None:
             kwargs["cached_tensors"] = cached_tensors
             if cached_chunk_dev_ptrs is not None:
                 kwargs["cached_chunk_dev_ptrs"] = cached_chunk_dev_ptrs
@@ -1094,7 +1204,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         cached_mem_layers = (
             cached_memory_objs
-            if use_cached_retrieve
+            if cached_memory_objs_cover
             and cached_memory_objs is not None
             and len(cached_memory_objs) == self.num_layers
             else None
@@ -1107,12 +1217,25 @@ class AscendLMCacheEngine(LMCacheEngine):
         next(mem_obj_consumer)
 
         for layer_id in range(self.num_layers):
-            sparse_payload = yield ret_mask
-            if isinstance(sparse_payload, dict):
+            sparse_request = yield ret_mask
+            sparse_payload = None
+            target_slot_mapping = None
+            if isinstance(sparse_request, dict):
+                sparse_payload = dict(sparse_request)
                 selected_tokens = sparse_payload.get("selected_token_ids")
-                token_start_index = None
+                token_start_index = sparse_payload.get("token_start_index")
+            elif isinstance(sparse_request, tuple):
+                if len(sparse_request) == 3:
+                    (
+                        selected_tokens,
+                        token_start_index,
+                        target_slot_mapping,
+                    ) = sparse_request
+                else:
+                    selected_tokens, token_start_index = sparse_request
             else:
-                selected_tokens, token_start_index = sparse_payload
+                selected_tokens = sparse_request
+                token_start_index = 0
 
             if cached_mem_layers is not None:
                 mem_obj_source = "cached_memory_objs"
@@ -1145,13 +1268,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     mem_objs_layer = []
 
-            if isinstance(sparse_payload, dict):
-                payload = dict(sparse_payload)
-                payload["memory_objs_layer"] = mem_objs_layer
-                mem_obj_consumer.send(payload)
+            if sparse_payload is not None:
+                sparse_payload["memory_objs_layer"] = mem_objs_layer
+                mem_obj_consumer.send(sparse_payload)
             else:
                 mem_obj_consumer.send(
-                    (mem_objs_layer, selected_tokens, token_start_index)
+                    (
+                        mem_objs_layer,
+                        selected_tokens,
+                        token_start_index,
+                        target_slot_mapping,
+                    )
                 )
 
         next(mem_obj_consumer)

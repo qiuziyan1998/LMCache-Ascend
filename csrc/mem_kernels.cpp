@@ -12,14 +12,28 @@ namespace py = pybind11;
 
 static bool is_mla_dsa_format(kvcache_ops::KVCacheFormat format) {
   return format == kvcache_ops::KVCacheFormat::MLA_KV ||
-         format == kvcache_ops::KVCacheFormat::DSA_KV;
+         format == kvcache_ops::KVCacheFormat::DSA_KV ||
+         format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+         format == kvcache_ops::KVCacheFormat::DSA_INDEX;
+}
+
+// Map two-group formats to the kernel template they reuse.
+// MLA_LATENT has the same 2-plane (k_nope, k_pe) structure as MLA_KV.
+// DSA_INDEX is a single plane; mapped to MLA_KV with v_hidden_dims=0
+// (V-plane copy becomes a no-op).
+static kvcache_ops::KVCacheFormat
+kernel_format(kvcache_ops::KVCacheFormat format) {
+  if (format == kvcache_ops::KVCacheFormat::DSA_KV)
+    return kvcache_ops::KVCacheFormat::DSA_KV;
+  // MLA_KV, MLA_LATENT, DSA_INDEX all use the MLA_KV kernel template.
+  return kvcache_ops::KVCacheFormat::MLA_KV;
 }
 
 static void launch_single_layer_mla_dsa_kernel(const SingleLayerKVConfig &config,
                                                bool page2L) {
   kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa(
       config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
-      config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
+      kernel_format(config.kvcache_format), config.ub_params.aiv_num, config.ub_params.stream,
       config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
       config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
       config.strides.lmc_bytes, config.strides.vllm_k_bytes,
@@ -121,6 +135,7 @@ void fused_multi_layer_kv_transfer(
   size_t required_size = 0;
   switch (config.kvcache_format) {
   case kvcache_ops::KVCacheFormat::MLA_KV:
+  case kvcache_ops::KVCacheFormat::MLA_LATENT:
     required_size = static_cast<size_t>(config.num_layers) * config.num_tokens *
                     (config.k_hidden_dims + config.v_hidden_dims) *
                     key_value.element_size();
@@ -130,6 +145,10 @@ void fused_multi_layer_kv_transfer(
         static_cast<size_t>(config.num_layers) * config.num_tokens *
         (config.k_hidden_dims + config.v_hidden_dims + config.dsa_hidden_dims) *
         key_value.element_size();
+    break;
+  case kvcache_ops::KVCacheFormat::DSA_INDEX:
+    required_size = static_cast<size_t>(config.num_layers) * config.num_tokens *
+                    config.dsa_hidden_dims * key_value.element_size();
     break;
   default:
     required_size = static_cast<size_t>(config.kv_size) * config.num_layers *
@@ -394,7 +413,7 @@ static void launch_sparse_single_layer_kernel(const SingleLayerKVConfig &config,
   if (is_mla_dsa_format(config.kvcache_format)) {
     kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse(
         config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
-        config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
+        kernel_format(config.kvcache_format), config.ub_params.aiv_num, config.ub_params.stream,
         config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
         config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
         selected_token_idx_ptr, config.strides.lmc_bytes,
@@ -479,7 +498,7 @@ static void launch_sparse_multi_chunk_direct_kernel(
   if (is_mla_dsa_format(config.kvcache_format)) {
     kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
         config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
-        config.kvcache_format, config.ub_params.aiv_num, config.ub_params.stream,
+        kernel_format(config.kvcache_format), config.ub_params.aiv_num, config.ub_params.stream,
         chunk_ptrs_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
         config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
         selected_token_idx_ptr, config.strides.vllm_k_bytes,

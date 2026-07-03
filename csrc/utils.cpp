@@ -66,12 +66,17 @@ MultiLayerKVConfig prepare_multi_layer_kv_config(
     config.hidden_dims = key_value.size(-1);
     break;
   case kvcache_ops::KVCacheFormat::MLA_KV:
+  case kvcache_ops::KVCacheFormat::MLA_LATENT:
     config.kv_size = 2;
     config.hidden_dims = config.k_hidden_dims;
     break;
   case kvcache_ops::KVCacheFormat::DSA_KV:
     config.kv_size = 3;
     config.hidden_dims = config.k_hidden_dims;
+    break;
+  case kvcache_ops::KVCacheFormat::DSA_INDEX:
+    config.kv_size = 1;
+    config.hidden_dims = config.dsa_hidden_dims;
     break;
   default:
     TORCH_CHECK(false, "Unsupported KVCacheFormat: ", kvcache_format_raw);
@@ -101,7 +106,9 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
   // step 1. use per tokens buff size to derive how many tokens can be allocated
   // per loop
   int64_t max_hidden_dims = config.hidden_dims;
-  if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV) {
+  if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
     max_hidden_dims = std::max(config.k_hidden_dims, config.v_hidden_dims);
   } else if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
     max_hidden_dims = std::max(
@@ -167,7 +174,9 @@ void compute_single_layer_ub_params(const KVTransferDims &dims,
 
   uint32_t numBuffsOnDev = 2;
   int64_t perTokenBufferElems = dims.kv_size * dims.num_heads * dims.head_dims;
-  if (format == kvcache_ops::KVCacheFormat::MLA_KV) {
+  if (format == kvcache_ops::KVCacheFormat::MLA_KV ||
+      format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
     perTokenBufferElems = std::max(k_hidden_dims, v_hidden_dims);
   } else if (format == kvcache_ops::KVCacheFormat::DSA_KV) {
     perTokenBufferElems =
@@ -203,7 +212,9 @@ void compute_single_layer_strides(
 
   const bool is_mla_dsa =
       format == kvcache_ops::KVCacheFormat::MLA_KV ||
-      format == kvcache_ops::KVCacheFormat::DSA_KV;
+      format == kvcache_ops::KVCacheFormat::DSA_KV ||
+      format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      format == kvcache_ops::KVCacheFormat::DSA_INDEX;
   const bool is_separate =
       format == kvcache_ops::KVCacheFormat::SEPARATE_KV || is_mla_dsa;
 
@@ -276,25 +287,41 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
       static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
 
   torch::Tensor &vllm_k_cache = vllm_kv_caches[0];
-  torch::Tensor *vllm_v_cache =
-      (config.kvcache_format == kvcache_ops::KVCacheFormat::MERGED_KV)
-          ? nullptr
-          : &vllm_kv_caches[1];
-  torch::Tensor *vllm_dsa_cache =
-      (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV)
-          ? &vllm_kv_caches[2]
-          : nullptr;
+  torch::Tensor *vllm_v_cache = nullptr;
+  torch::Tensor *vllm_dsa_cache = nullptr;
+
+  // For DSA_INDEX (two-group indexer-only), the single tensor is the indexer.
+  // Map it onto the MLA_KV kernel with k_hidden=dsa_hidden, v_hidden=0.
+  // vllm_kv_caches[0] is the indexer tensor; [1] may be absent so reuse [0]
+  // as a dummy for V (the V copy is a no-op because v_hidden_dims=0).
+  if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
+    vllm_v_cache = &vllm_kv_caches[0]; // dummy; V copy is 0-element
+  } else if (config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV) {
+    vllm_v_cache = &vllm_kv_caches[1];
+    if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+      vllm_dsa_cache = &vllm_kv_caches[2];
+    }
+  }
 
   if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
-      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
     if (k_hidden_dims <= 0) {
       k_hidden_dims = vllm_k_cache.size(-2) * vllm_k_cache.size(-1);
     }
-    if (v_hidden_dims <= 0 && vllm_v_cache != nullptr) {
+    if (v_hidden_dims <= 0 && vllm_v_cache != nullptr &&
+        config.kvcache_format != kvcache_ops::KVCacheFormat::DSA_INDEX) {
       v_hidden_dims = vllm_v_cache->size(-2) * vllm_v_cache->size(-1);
     }
     if (dsa_hidden_dims <= 0 && vllm_dsa_cache != nullptr) {
       dsa_hidden_dims = vllm_dsa_cache->size(-2) * vllm_dsa_cache->size(-1);
+    }
+    // DSA_INDEX: k_hidden_dims = dsa_hidden_dims, v_hidden_dims = 0
+    if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
+      k_hidden_dims = dsa_hidden_dims > 0 ? dsa_hidden_dims
+                        : vllm_k_cache.size(-2) * vllm_k_cache.size(-1);
+      v_hidden_dims = 0;
     }
   }
 
@@ -309,7 +336,9 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
   config.dims.head_dims = vllm_k_cache.size(-1);
   config.dims.block_size = vllm_k_cache.size(-3);
   if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
-      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
     int64_t plane_elems = config.k_hidden_dims + config.v_hidden_dims;
     if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
       plane_elems += config.dsa_hidden_dims;
@@ -404,7 +433,9 @@ prepare_host_chunk_metadata(const std::vector<torch::Tensor> &lmc_tensors,
 
   const bool is_mla_dsa =
       format == kvcache_ops::KVCacheFormat::MLA_KV ||
-      format == kvcache_ops::KVCacheFormat::DSA_KV;
+      format == kvcache_ops::KVCacheFormat::DSA_KV ||
+      format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      format == kvcache_ops::KVCacheFormat::DSA_INDEX;
 
   if (is_mla_dsa) {
     meta.bytes_per_token = k_hidden_dims * element_size;
@@ -445,7 +476,9 @@ void execute_batched_memcpy(
   aclrtStream stream = config.ub_params.stream;
   const bool is_mla_dsa =
       config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
-      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV;
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX;
 
   if (is_mla_dsa) {
     int64_t k_bytes_per_token = config.k_hidden_dims * meta.element_size;
@@ -480,11 +513,13 @@ void execute_batched_memcpy(
                                    k_bytes_per_token, kind, stream);
             TORCH_CHECK(ret == ACL_ERROR_NONE,
                         "Memcpy (MLA/DSA interleaved K) failed chunk ", i);
-            ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
-                                   host_token + k_bytes_per_token,
-                                   v_bytes_per_token, kind, stream);
-            TORCH_CHECK(ret == ACL_ERROR_NONE,
-                        "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            if (v_bytes_per_token > 0) {
+              ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
+                                     host_token + k_bytes_per_token,
+                                     v_bytes_per_token, kind, stream);
+              TORCH_CHECK(ret == ACL_ERROR_NONE,
+                          "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            }
             if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
               uint8_t *staging_dsa =
                   config.ptrs.lmc_ptr + staging_dsa_plane_offset +
@@ -501,11 +536,13 @@ void execute_batched_memcpy(
                                    k_bytes_per_token, kind, stream);
             TORCH_CHECK(ret == ACL_ERROR_NONE,
                         "Memcpy (MLA/DSA interleaved K) failed chunk ", i);
-            ret = aclrtMemcpyAsync(host_token + k_bytes_per_token,
-                                   v_bytes_per_token, staging_v,
-                                   v_bytes_per_token, kind, stream);
-            TORCH_CHECK(ret == ACL_ERROR_NONE,
-                        "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            if (v_bytes_per_token > 0) {
+              ret = aclrtMemcpyAsync(host_token + k_bytes_per_token,
+                                     v_bytes_per_token, staging_v,
+                                     v_bytes_per_token, kind, stream);
+              TORCH_CHECK(ret == ACL_ERROR_NONE,
+                          "Memcpy (MLA/DSA interleaved V) failed chunk ", i);
+            }
             if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
               uint8_t *staging_dsa =
                   config.ptrs.lmc_ptr + staging_dsa_plane_offset +
@@ -542,8 +579,10 @@ void execute_batched_memcpy(
       if (!is_d2h) {
         ret = aclrtMemcpyAsync(staging_k, k_size, host_k, k_size, kind, stream);
         TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA K) failed chunk ", i);
-        ret = aclrtMemcpyAsync(staging_v, v_size, host_v, v_size, kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        if (v_size > 0) {
+          ret = aclrtMemcpyAsync(staging_v, v_size, host_v, v_size, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa = config.ptrs.lmc_ptr + staging_dsa_plane_offset +
                                  token_offset * dsa_bytes_per_token;
@@ -554,8 +593,10 @@ void execute_batched_memcpy(
       } else {
         ret = aclrtMemcpyAsync(host_k, k_size, staging_k, k_size, kind, stream);
         TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA K) failed chunk ", i);
-        ret = aclrtMemcpyAsync(host_v, v_size, staging_v, v_size, kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        if (v_size > 0) {
+          ret = aclrtMemcpyAsync(host_v, v_size, staging_v, v_size, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE, "Memcpy (MLA/DSA V) failed chunk ", i);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa = config.ptrs.lmc_ptr + staging_dsa_plane_offset +
                                  token_offset * dsa_bytes_per_token;
@@ -649,7 +690,9 @@ void execute_batched_sparse_memcpy(
   aclrtStream stream = config.ub_params.stream;
   const bool is_mla_dsa =
       config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
-      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV;
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+      config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX;
 
   if (is_mla_dsa) {
     int64_t k_bytes_per_token = config.k_hidden_dims * meta.element_size;
@@ -684,11 +727,13 @@ void execute_batched_sparse_memcpy(
                                k_bytes_per_token, kind, stream);
         TORCH_CHECK(ret == ACL_ERROR_NONE,
                     "Sparse memcpy (MLA/DSA K) failed at index ", staging_token_idx);
-        ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
-                               host_token + k_bytes_per_token, v_bytes_per_token,
-                               kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE,
-                    "Sparse memcpy (MLA/DSA V) failed at index ", staging_token_idx);
+        if (v_bytes_per_token > 0) {
+          ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token,
+                                 host_token + k_bytes_per_token, v_bytes_per_token,
+                                 kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE,
+                      "Sparse memcpy (MLA/DSA V) failed at index ", staging_token_idx);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa =
               config.ptrs.lmc_ptr + staging_dsa_plane_offset +
@@ -715,11 +760,13 @@ void execute_batched_sparse_memcpy(
         TORCH_CHECK(ret == ACL_ERROR_NONE,
                     "Sparse memcpy (MLA/DSA stacked K) failed at index ",
                     staging_token_idx);
-        ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token, host_v,
-                               v_bytes_per_token, kind, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE,
-                    "Sparse memcpy (MLA/DSA stacked V) failed at index ",
-                    staging_token_idx);
+        if (v_bytes_per_token > 0) {
+          ret = aclrtMemcpyAsync(staging_v, v_bytes_per_token, host_v,
+                                 v_bytes_per_token, kind, stream);
+          TORCH_CHECK(ret == ACL_ERROR_NONE,
+                      "Sparse memcpy (MLA/DSA stacked V) failed at index ",
+                      staging_token_idx);
+        }
         if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
           uint8_t *staging_dsa =
               config.ptrs.lmc_ptr + staging_dsa_plane_offset +
@@ -779,10 +826,13 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
   if (format != kvcache_ops::KVCacheFormat::MERGED_KV &&
       format != kvcache_ops::KVCacheFormat::SEPARATE_KV &&
       format != kvcache_ops::KVCacheFormat::MLA_KV &&
-      format != kvcache_ops::KVCacheFormat::DSA_KV) {
+      format != kvcache_ops::KVCacheFormat::DSA_KV &&
+      format != kvcache_ops::KVCacheFormat::MLA_LATENT &&
+      format != kvcache_ops::KVCacheFormat::DSA_INDEX) {
     std::string err =
         "Invalid KV cache format: " + std::to_string(kvcache_format_raw) +
-        ". Expected 1 (MERGED_KV), 2 (SEPARATE_KV), 3 (MLA_KV), or 4 (DSA_KV)";
+        ". Expected 1 (MERGED_KV), 2 (SEPARATE_KV), 3 (MLA_KV), 4 (DSA_KV), "
+        "5 (MLA_LATENT), or 6 (DSA_INDEX)";
     PyErr_SetString(PyExc_ValueError, err.c_str());
     throw py::error_already_set();
   }
@@ -798,14 +848,21 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
                       "DSA_KV expects 3 tensors (K, V, and DSA_K).");
       throw py::error_already_set();
     }
-  } else if (format == kvcache_ops::KVCacheFormat::MLA_KV) {
-    if (vllm_kv_caches.size() != 2) {
-      PyErr_SetString(PyExc_ValueError, "MLA_KV expects 2 tensors (K and V).");
+  } else if (format == kvcache_ops::KVCacheFormat::MLA_KV ||
+             format == kvcache_ops::KVCacheFormat::MLA_LATENT) {
+    if (vllm_kv_caches.size() < 2) {
+      PyErr_SetString(PyExc_ValueError, "MLA_KV/MLA_LATENT expects 2 tensors (K and V).");
       throw py::error_already_set();
     }
     if (vllm_kv_caches[0].sizes() == vllm_kv_caches[1].sizes()) {
       throw py::value_error(
-          "MLA_KV expects K and V caches to have different shapes.");
+          "MLA_KV/MLA_LATENT expects K and V caches to have different shapes.");
+    }
+  } else if (format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
+    if (vllm_kv_caches.size() < 1) {
+      PyErr_SetString(PyExc_ValueError,
+                      "DSA_INDEX expects at least 1 tensor (indexer_k).");
+      throw py::error_already_set();
     }
   } else if (format == kvcache_ops::KVCacheFormat::SEPARATE_KV) {
     if (vllm_kv_caches.size() != 2) {

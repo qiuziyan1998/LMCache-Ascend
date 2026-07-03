@@ -45,6 +45,8 @@ from lmcache_ascend.v1.npu_connector.utils import (
 
 KV_FORMAT_MLA = 3
 KV_FORMAT_DSA = 4
+KV_FORMAT_MLA_LATENT = 5
+KV_FORMAT_DSA_INDEX = 6
 ALIGN_BYTES = 4096
 
 
@@ -304,7 +306,12 @@ def build_chunk_ptrs_npu(
 
 
 def lmc_host_interleaved_for_kv_format(kv_format: int) -> bool:
-    return kv_format not in (KV_FORMAT_MLA, KV_FORMAT_DSA)
+    return kv_format not in (
+        KV_FORMAT_MLA,
+        KV_FORMAT_DSA,
+        KV_FORMAT_MLA_LATENT,
+        KV_FORMAT_DSA_INDEX,
+    )
 
 
 def build_selected_token_idx(

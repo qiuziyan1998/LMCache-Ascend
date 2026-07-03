@@ -11,6 +11,31 @@ import lmcache_ascend.c_ops as lmc_ops
 
 _KVTupleTwoOrMore = Tuple[torch.Tensor, ...]
 _KVLayer = Union[torch.Tensor, _KVTupleTwoOrMore]
+_KVCacheArg = Union[torch.Tensor, Sequence[torch.Tensor]]
+
+
+def _normalize_vllm_kv_caches(
+    vllm_kv_caches: _KVCacheArg,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    if isinstance(vllm_kv_caches, torch.Tensor):
+        return vllm_kv_caches
+    if isinstance(vllm_kv_caches, tuple):
+        normalized = vllm_kv_caches
+    elif isinstance(vllm_kv_caches, list):
+        normalized = tuple(vllm_kv_caches)
+    else:
+        raise ValueError(
+            f"Unsupported vLLM KV cache type: {type(vllm_kv_caches)} "
+            "(expected Tensor or list/tuple of Tensors)"
+        )
+    if len(normalized) == 0:
+        raise ValueError("vLLM KV cache tuple/list must not be empty")
+    for tensor in normalized:
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(
+                f"Expected torch.Tensor inside vLLM KV cache, got {type(tensor)}"
+            )
+    return normalized
 
 
 def permute_kv_caches_to_contiguous(
@@ -29,11 +54,17 @@ def permute_kv_caches_to_contiguous(
         if isinstance(layer, torch.Tensor):
             results.append(permute_to_contiguous(layer))
         elif isinstance(layer, tuple):
-            if len(layer) < 2:
-                raise ValueError(
-                    "Tuple KV entries must contain at least two tensors; "
-                    f"got len={len(layer)}"
-                )
+            if len(layer) == 0:
+                raise ValueError("Tuple KV entries must not be empty")
+            if len(layer) == 1:
+                t = layer[0]
+                if not isinstance(t, torch.Tensor):
+                    raise ValueError(
+                        f"Expected torch.Tensor inside KV tuple, got {type(t)}"
+                    )
+                # DSA_INDEX: (indexer_k,) single-plane tuple
+                results.append((permute_to_contiguous(t),))
+                continue
             permuted: List[torch.Tensor] = []
             for t in layer:
                 if not isinstance(t, torch.Tensor):
@@ -66,7 +97,7 @@ def _call_dense_extended(fn, kwargs: dict) -> None:
     fn(
         kwargs["lmc_tensors"],
         kwargs["staging_cache"],
-        kwargs["vllm_kv_caches"],
+        _normalize_vllm_kv_caches(kwargs["vllm_kv_caches"]),
         kwargs["slot_mapping"],
         kwargs["chunk_offsets"],
         kwargs["chunk_sizes"],
@@ -84,7 +115,7 @@ def _call_dense_legacy(fn, kwargs: dict) -> None:
     fn(
         kwargs["lmc_tensors"],
         kwargs["staging_cache"],
-        kwargs["vllm_kv_caches"],
+        _normalize_vllm_kv_caches(kwargs["vllm_kv_caches"]),
         kwargs["slot_mapping"],
         kwargs["chunk_offsets"],
         kwargs["chunk_sizes"],
@@ -99,7 +130,7 @@ def _call_sparse_extended(fn, kwargs: dict) -> None:
     fn(
         kwargs["lmc_tensors"],
         kwargs["staging_cache"],
-        kwargs["vllm_kv_caches"],
+        _normalize_vllm_kv_caches(kwargs["vllm_kv_caches"]),
         kwargs["slot_mapping"],
         kwargs["selected_token_idx"],
         kwargs["chunk_offsets"],
@@ -118,7 +149,7 @@ def _call_sparse_legacy(fn, kwargs: dict) -> None:
     fn(
         kwargs["lmc_tensors"],
         kwargs["staging_cache"],
-        kwargs["vllm_kv_caches"],
+        _normalize_vllm_kv_caches(kwargs["vllm_kv_caches"]),
         kwargs["slot_mapping"],
         kwargs["selected_token_idx"],
         kwargs["chunk_offsets"],
@@ -157,7 +188,7 @@ def _call_fused_op(op_name: str, kwargs: dict) -> None:
 def batched_fused_single_layer_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     staging_cache: torch.Tensor,
-    vllm_kv_caches: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    vllm_kv_caches: _KVCacheArg,
     slot_mapping_full: torch.Tensor,
     chunk_offsets: Sequence[int],
     chunk_sizes: Sequence[int],
@@ -169,6 +200,7 @@ def batched_fused_single_layer_kv_transfer(
     v_hidden_dims: int = 0,
     dsa_hidden_dims: int = 0,
 ) -> None:
+    vllm_kv_caches = _normalize_vllm_kv_caches(vllm_kv_caches)
     _call_fused_op(
         "batched_fused_single_layer_kv_transfer",
         {
@@ -191,7 +223,7 @@ def batched_fused_single_layer_kv_transfer(
 
 def sparse_mla_dsa_batched_direct_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
-    vllm_kv_caches: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    vllm_kv_caches: _KVCacheArg,
     slot_mapping_packed: torch.Tensor,
     selected_token_idx: torch.Tensor,
     chunk_size: int,
@@ -205,6 +237,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
     lmc_host_interleaved: bool = False,
     chunk_ptrs_npu: Optional[torch.Tensor] = None,
 ) -> None:
+    vllm_kv_caches = _normalize_vllm_kv_caches(vllm_kv_caches)
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer(
         lmc_tensors,
         vllm_kv_caches,
@@ -225,7 +258,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
 
 def prepare_sparse_direct_layer_state(
     lmc_layout_sample: torch.Tensor,
-    vllm_kv_caches: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    vllm_kv_caches: _KVCacheArg,
     slot_mapping_ref: torch.Tensor,
     token_major: bool,
     vllm_two_major: bool,
@@ -235,6 +268,7 @@ def prepare_sparse_direct_layer_state(
     dsa_hidden_dims: int,
     lmc_num_tokens: int,
 ):
+    vllm_kv_caches = _normalize_vllm_kv_caches(vllm_kv_caches)
     return lmc_ops.prepare_sparse_direct_layer_state(
         lmc_layout_sample,
         vllm_kv_caches,
@@ -274,7 +308,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_fast(
 def batched_fused_sparse_single_layer_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     staging_cache: torch.Tensor,
-    vllm_kv_caches: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    vllm_kv_caches: _KVCacheArg,
     slot_mapping_packed: torch.Tensor,
     selected_token_idx: torch.Tensor,
     chunk_offsets: Sequence[int],
@@ -287,6 +321,7 @@ def batched_fused_sparse_single_layer_kv_transfer(
     dsa_hidden_dims: int = 0,
     sparse_indices_cpu: Optional[torch.Tensor] = None,
 ) -> None:
+    vllm_kv_caches = _normalize_vllm_kv_caches(vllm_kv_caches)
     mode = _FUSED_OP_MODES["batched_fused_sparse_single_layer_kv_transfer"]
     if mode == "extended":
         lmc_ops.batched_fused_sparse_single_layer_kv_transfer(
