@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Any, List, Optional, Set, Union
-import os
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -23,7 +22,6 @@ import torch
 # First Party
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
-    batched_fused_sparse_single_layer_kv_transfer,
     batched_fused_single_layer_kv_transfer,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
@@ -37,227 +35,6 @@ import lmcache_ascend.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 _IS_310P = None
-DENSE_PREFIX_DIAG_ENV = "LMCACHE_DENSE_PREFIX_DIAG"
-SPARSE_STAGED_FALLBACK_ENV = "LMCACHE_ASCEND_SPARSE_STAGED_FALLBACK"
-SPARSE_DIRECT_INPUT_DIAG_ENV = "LMCACHE_DIAG_SPARSE_DIRECT_INPUTS"
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _dense_prefix_diag_enabled() -> bool:
-    return _env_flag(DENSE_PREFIX_DIAG_ENV)
-
-
-def _sparse_direct_input_diag_enabled() -> bool:
-    return _env_flag(SPARSE_DIRECT_INPUT_DIAG_ENV)
-
-
-def _diag_tensor_summary(name: str, tensor, sample: int = 4) -> str:
-    if tensor is None:
-        return f"{name}=None"
-    if not isinstance(tensor, torch.Tensor):
-        return f"{name}=type({type(tensor).__name__})"
-    try:
-        flat = tensor.detach().reshape(-1)
-        numel = flat.numel()
-        pieces = [
-            f"{name}.len={numel}",
-            f"{name}.shape={tuple(tensor.shape)}",
-            f"{name}.device={tensor.device}",
-            f"{name}.dtype={tensor.dtype}",
-        ]
-        if numel:
-            head = flat[:sample].cpu().tolist()
-            tail = flat[-sample:].cpu().tolist() if numel > sample else head
-            pieces.extend(
-                [
-                    f"{name}.min={flat.min().cpu().item()}",
-                    f"{name}.max={flat.max().cpu().item()}",
-                    f"{name}.head={head}",
-                    f"{name}.tail={tail}",
-                ]
-            )
-        return " ".join(pieces)
-    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
-        return f"{name}=unavailable({type(exc).__name__})"
-
-
-def _diag_selected_chunk_summary(
-    selected_token_idx: torch.Tensor,
-    chunk_size: int,
-    sample: int = 8,
-) -> str:
-    try:
-        selected = (
-            selected_token_idx.detach().reshape(-1)[:sample].to(device="cpu")
-        )
-        values = []
-        chunk_size_int = int(chunk_size)
-        for token in selected.tolist():
-            token_int = int(token)
-            values.append(
-                (
-                    token_int,
-                    token_int // chunk_size_int,
-                    token_int % chunk_size_int,
-                )
-            )
-        return f"selected_chunk_local.head={values}"
-    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
-        return f"selected_chunk_local=unavailable({type(exc).__name__})"
-
-
-def _diag_span_summary(starts: List[int], ends: List[int], sample: int = 4) -> str:
-    sizes = [end - start for start, end in zip(starts, ends, strict=False)]
-    head = list(zip(starts, ends, sizes, strict=False))[:sample]
-    tail = list(zip(starts, ends, sizes, strict=False))[-sample:]
-    return (
-        f"chunks={len(sizes)} total_span_tokens={sum(sizes)} "
-        f"spans.head={head} spans.tail={tail}"
-    )
-
-
-def _diag_kvcache_shapes(kvcaches_ref) -> str:
-    try:
-        if not kvcaches_ref:
-            return "kvcaches=[]"
-        first_layer = kvcaches_ref[0]
-        if isinstance(first_layer, (list, tuple)):
-            shapes = [
-                tuple(tensor.shape)
-                for tensor in first_layer
-                if isinstance(tensor, torch.Tensor)
-            ]
-        elif isinstance(first_layer, torch.Tensor):
-            shapes = [tuple(first_layer.shape)]
-        else:
-            shapes = [type(first_layer).__name__]
-        return f"kvcache_layer0_shapes={shapes}"
-    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
-        return f"kvcache_layer0_shapes=unavailable({type(exc).__name__})"
-
-
-def _layerwise_transfer_diag_message(
-    *,
-    operation: str,
-    req_id: Optional[str],
-    kv_group: int,
-    starts: List[int],
-    ends: List[int],
-    slot_mapping_full: torch.Tensor,
-    layout,
-    token_major: bool,
-    expected_fmt: MemoryFormat,
-    kvcaches_ref,
-) -> str:
-    fmt_name = getattr(getattr(layout, "kv_format", None), "name", None)
-    pieces = [
-        f"operation={operation}",
-        f"req_id={req_id}",
-        f"kv_group={kv_group}",
-        f"group={'mla_latent' if kv_group == 0 else 'dsa_index'}",
-        f"kv_format={fmt_name}",
-        f"expected_fmt={expected_fmt}",
-        f"token_major={token_major}",
-        f"vllm_two_major={getattr(layout, 'vllm_two_major', None)}",
-        f"k_hidden_dims={getattr(layout, 'k_hidden_dims', None)}",
-        f"v_hidden_dims={getattr(layout, 'v_hidden_dims', None)}",
-        f"dsa_hidden_dims={getattr(layout, 'dsa_hidden_dims', None)}",
-        _diag_span_summary(starts, ends),
-        _diag_tensor_summary("slot_mapping_full", slot_mapping_full),
-        _diag_kvcache_shapes(kvcaches_ref),
-    ]
-    return " ".join(pieces)
-
-
-def _new_kvcache_fingerprint() -> dict[str, Any]:
-    return {
-        "layers": 0,
-        "numel": 0,
-        "sum": 0.0,
-        "abs_sum": 0.0,
-        "sq_sum": 0.0,
-        "min": None,
-        "max": None,
-        "errors": [],
-    }
-
-
-def _iter_layer_tensors(layer_cache) -> List[torch.Tensor]:
-    if isinstance(layer_cache, torch.Tensor):
-        return [layer_cache]
-    if isinstance(layer_cache, (list, tuple)):
-        return [tensor for tensor in layer_cache if isinstance(tensor, torch.Tensor)]
-    return []
-
-
-def _accumulate_kvcache_fingerprint(
-    acc: dict[str, Any],
-    layer_cache,
-    slot_mapping_full: torch.Tensor,
-) -> None:
-    acc["layers"] += 1
-    for tensor in _iter_layer_tensors(layer_cache):
-        try:
-            if tensor.ndim < 2 or slot_mapping_full.numel() == 0:
-                continue
-            slot_idx = slot_mapping_full.to(device=tensor.device, dtype=torch.long)
-            flat = tensor.reshape(tensor.shape[0] * tensor.shape[1], -1)
-            selected = flat.index_select(0, slot_idx).float().reshape(-1)
-            if selected.numel() == 0:
-                continue
-            acc["numel"] += int(selected.numel())
-            acc["sum"] += float(selected.sum().cpu().item())
-            acc["abs_sum"] += float(selected.abs().sum().cpu().item())
-            acc["sq_sum"] += float((selected * selected).sum().cpu().item())
-            selected_min = float(selected.min().cpu().item())
-            selected_max = float(selected.max().cpu().item())
-            acc["min"] = (
-                selected_min
-                if acc["min"] is None
-                else min(float(acc["min"]), selected_min)
-            )
-            acc["max"] = (
-                selected_max
-                if acc["max"] is None
-                else max(float(acc["max"]), selected_max)
-            )
-        except Exception as exc:  # pragma: no cover - diagnostics must not fail path
-            acc["errors"].append(type(exc).__name__)
-
-
-def _kvcache_fingerprint_message(
-    *,
-    operation: str,
-    req_id: Optional[str],
-    kv_group: int,
-    fingerprint: dict[str, Any],
-) -> str:
-    pieces = [
-        f"operation={operation}",
-        f"req_id={req_id}",
-        f"kv_group={kv_group}",
-        f"group={'mla_latent' if kv_group == 0 else 'dsa_index'}",
-        f"layers={fingerprint['layers']}",
-        f"numel={fingerprint['numel']}",
-        f"sum={fingerprint['sum']:.6e}",
-        f"abs_sum={fingerprint['abs_sum']:.6e}",
-        f"sq_sum={fingerprint['sq_sum']:.6e}",
-        f"min={fingerprint['min']}",
-        f"max={fingerprint['max']}",
-    ]
-    if fingerprint["errors"]:
-        pieces.append(f"errors={fingerprint['errors']}")
-    return " ".join(pieces)
-
-
 def is_310p():
     global _IS_310P
     if _IS_310P is None:
@@ -1258,7 +1035,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
                     proxies = [item[0] for item in batch]
 
-                    # Submit RDMA read for current batch → transport_stream.
+                    # Submit RDMA read for current batch 鈫?transport_stream.
                     cur_read_event = ProxyMemoryObj.submit_resolve_batch(proxies)
 
                     # While the current batch is being read on
@@ -1700,37 +1477,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             logger.error(message)
             raise ValueError(message)
-
-        if _sparse_direct_input_diag_enabled() and layer_id == 0:
-            logger.info(
-                "SPARSE_DIRECT_INPUT_DIAG kv_group=%s layer_id=%s "
-                "num_sparse=%s chunk_count=%s chunk_size=%s total_tokens=%s "
-                "kv_format=%s token_major=%s vllm_two_major=%s "
-                "host_interleaved=%s k_hidden_dims=%s v_hidden_dims=%s "
-                "dsa_hidden_dims=%s %s %s %s",
-                kv_group,
-                layer_id,
-                num_sparse,
-                chunk_count,
-                chunk_size_int,
-                int(total_tokens),
-                sparse_kv_format,
-                sparse_token_major,
-                sparse_vllm_two_major,
-                sparse_host_interleaved,
-                sparse_k_hidden_dims,
-                sparse_v_hidden_dims,
-                sparse_dsa_hidden_dims,
-                _diag_tensor_summary(
-                    "slot_mapping_packed", slot_mapping_packed, sample=8
-                ),
-                _diag_tensor_summary(
-                    "selected_token_idx", selected_token_idx, sample=8
-                ),
-                _diag_selected_chunk_summary(
-                    selected_token_idx, chunk_size_int, sample=8
-                ),
-            )
 
         resolve_tensors = (
             layer_tensors
@@ -2225,7 +1971,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
                 layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
             elif layout.kv_format == KVCacheFormat.MLA_LATENT:
-                # Two-group latent: (k_nope, k_pe) — same dim structure as MLA_KV
+                # Two-group latent: (k_nope, k_pe) 鈥?same dim structure as MLA_KV
                 key_tensor, value_tensor = first_layer_cache
                 layout.kv_device = key_tensor.device
                 layout.vllm_two_major = False
@@ -2234,7 +1980,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
                 layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
             elif layout.kv_format == KVCacheFormat.DSA_INDEX:
-                # Two-group indexer: (indexer_k,) — single tensor, single plane
+                # Two-group indexer: (indexer_k,) 鈥?single tensor, single plane
                 indexer_tensor = first_layer_cache[0]
                 layout.kv_device = indexer_tensor.device
                 layout.vllm_two_major = False
@@ -2480,26 +2226,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
-        diag_enabled = _dense_prefix_diag_enabled()
-        kvcache_fingerprint = (
-            _new_kvcache_fingerprint() if diag_enabled else None
-        )
-        if diag_enabled:
-            logger.info(
-                "DENSE_PREFIX_DIAG %s",
-                _layerwise_transfer_diag_message(
-                    operation="npu_dense_prefix_load",
-                    req_id=kwargs.get("req_id"),
-                    kv_group=kv_group,
-                    starts=starts,
-                    ends=ends,
-                    slot_mapping_full=slot_mapping_full,
-                    layout=layout,
-                    token_major=token_major,
-                    expected_fmt=expected_fmt,
-                    kvcaches_ref=kvcaches_snapshot,
-                ),
-            )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
@@ -2570,29 +2296,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             v_hidden_dims,
                             dsa_hidden_dims,
                         )
-                if kvcache_fingerprint is not None:
-                    _accumulate_kvcache_fingerprint(
-                        kvcache_fingerprint,
-                        kvcaches_snapshot[layer_id],
-                        slot_mapping_full,
-                    )
                 logger.debug(f"Finished loading layer {layer_id}")
         yield
 
         # synchronize the last layer
         if sync:
             current_stream.wait_stream(self.load_stream)
-
-        if kvcache_fingerprint is not None:
-            logger.info(
-                "DENSE_PREFIX_DIAG %s",
-                _kvcache_fingerprint_message(
-                    operation="npu_dense_prefix_load_kvcache_fingerprint",
-                    req_id=kwargs.get("req_id"),
-                    kv_group=kv_group,
-                    fingerprint=kvcache_fingerprint,
-                ),
-            )
 
         # free the buffer memory
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
@@ -2650,27 +2359,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         sparse_vllm_two_major = layout.vllm_two_major
-        expected_fmt = self._expected_memory_format(kv_group)
-        use_staged_sparse_fallback = _env_flag(SPARSE_STAGED_FALLBACK_ENV)
         # Snapshot so interleaved latent/indexer sparse generators do not
         # race on the shared connector self.kvcaches pointer.
         kvcaches_snapshot = self.kvcaches
-        staging_obj: Optional[MemoryObj] = None
-        staging_tensor: Optional[torch.Tensor] = None
-        staging_capacity_tokens = 0
-
-        if use_staged_sparse_fallback:
-            if not self.use_gpu:
-                raise ValueError(
-                    "Sparse staged fallback requires use_gpu=True with a "
-                    "layerwise staging buffer."
-                )
-            logger.warning(
-                "Using sparse staged fallback for LMCache selected-token "
-                "retrieve: kv_group=%s env=%s",
-                kv_group,
-                SPARSE_STAGED_FALLBACK_ENV,
-            )
 
         for layer_id in range(self.num_layers):
             sparse_request = yield
@@ -2742,86 +2433,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else:
                 total_tokens = chunk_total_tokens
 
-            if use_staged_sparse_fallback:
-                if (
-                    staging_tensor is None
-                    or staging_capacity_tokens < int(total_tokens)
-                ):
-                    if staging_obj is not None:
-                        staging_obj.ref_count_down()
-                    staging_obj, staging_tensor = (
-                        self._allocate_layerwise_staging_buffer(
-                            num_tokens=int(total_tokens),
-                            kv_group=kv_group,
-                            layout=layout,
-                            k_hidden_dims=sparse_k_hidden_dims,
-                            v_hidden_dims=sparse_v_hidden_dims,
-                            dsa_hidden_dims=sparse_dsa_hidden_dims,
-                            expected_fmt=expected_fmt,
-                        )
-                    )
-                    staging_capacity_tokens = int(total_tokens)
-
-                chunk_offsets = []
-                chunk_sizes = []
-                current_offset = 0
-                for cpu_tensor in cpu_tensors:
-                    tensor_tokens = self._lmc_plane_num_tokens(
-                        cpu_tensor, kv_group
-                    )
-                    chunk_offsets.append(current_offset)
-                    chunk_sizes.append(tensor_tokens)
-                    current_offset += tensor_tokens
-
-                assert staging_tensor is not None
-                with torch.cuda.stream(self.load_stream_list[load_stream_idx]):
-                    self.load_stream_list[load_stream_idx].wait_stream(
-                        current_stream
-                    )
-                    batched_fused_sparse_single_layer_kv_transfer(
-                        cpu_tensors,
-                        staging_tensor,
-                        kvcaches_snapshot[layer_id],
-                        slot_mapping_packed,
-                        selected_token_idx,
-                        chunk_offsets,
-                        chunk_sizes,
-                        sparse_kv_format,
-                        sparse_token_major,
-                        sparse_vllm_two_major,
-                        sparse_k_hidden_dims,
-                        sparse_v_hidden_dims,
-                        sparse_dsa_hidden_dims,
-                    )
-                current_stream.wait_stream(self.load_stream_list[load_stream_idx])
-            else:
-                self._run_sparse_direct_kv_transfer_layer(
-                    kvcaches_ref=kvcaches_snapshot,
-                    kv_group=kv_group,
-                    layer_id=layer_id,
-                    load_stream=self.load_stream_list[load_stream_idx],
-                    current_stream=current_stream,
-                    slot_mapping_packed=slot_mapping_packed,
-                    selected_token_idx=selected_token_idx,
-                    chunk_size=chunk_size,
-                    total_tokens=total_tokens,
-                    chunk_ptrs_npu=chunk_ptrs_npu,
-                    sparse_kv_format=sparse_kv_format,
-                    sparse_token_major=sparse_token_major,
-                    sparse_vllm_two_major=sparse_vllm_two_major,
-                    sparse_k_hidden_dims=sparse_k_hidden_dims,
-                    sparse_v_hidden_dims=sparse_v_hidden_dims,
-                    sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-                    sparse_host_interleaved=sparse_host_interleaved,
-                    layer_tensors=cpu_tensors,
-                    slot_mapping_ref=slot_mapping,
-                    cpu_tensors=cpu_tensors,
-                )
+            self._run_sparse_direct_kv_transfer_layer(
+                kvcaches_ref=kvcaches_snapshot,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                load_stream=self.load_stream_list[load_stream_idx],
+                current_stream=current_stream,
+                slot_mapping_packed=slot_mapping_packed,
+                selected_token_idx=selected_token_idx,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                sparse_kv_format=sparse_kv_format,
+                sparse_token_major=sparse_token_major,
+                sparse_vllm_two_major=sparse_vllm_two_major,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                sparse_host_interleaved=sparse_host_interleaved,
+                layer_tensors=cpu_tensors,
+                slot_mapping_ref=slot_mapping,
+                cpu_tensors=cpu_tensors,
+            )
 
         yield
-
-        if staging_obj is not None:
-            staging_obj.ref_count_down()
 
         yield
 
@@ -2915,26 +2550,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
-        diag_enabled = _dense_prefix_diag_enabled()
-        kvcache_fingerprint = (
-            _new_kvcache_fingerprint() if diag_enabled else None
-        )
-        if diag_enabled:
-            logger.info(
-                "DENSE_PREFIX_DIAG %s",
-                _layerwise_transfer_diag_message(
-                    operation="npu_dense_prefix_store",
-                    req_id=kwargs.get("req_id"),
-                    kv_group=kv_group,
-                    starts=starts,
-                    ends=ends,
-                    slot_mapping_full=slot_mapping_full,
-                    layout=layout,
-                    token_major=token_major,
-                    expected_fmt=expected_fmt,
-                    kvcaches_ref=kvcaches_snapshot,
-                ),
-            )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
@@ -2956,13 +2571,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # kvcaches -> gpu_buffer -> memobj
             with torch.npu.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
-                if kvcache_fingerprint is not None:
-                    _accumulate_kvcache_fingerprint(
-                        kvcache_fingerprint,
-                        kvcaches_snapshot[layer_id],
-                        slot_mapping_full,
-                    )
-
                 if self.use_gpu:
                     cpu_tensors = []
                     for memory_obj in memory_objs_layer:
@@ -3008,17 +2616,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             if sync:
                 self.store_stream.synchronize()
-
-        if kvcache_fingerprint is not None:
-            logger.info(
-                "DENSE_PREFIX_DIAG %s",
-                _kvcache_fingerprint_message(
-                    operation="npu_dense_prefix_store_kvcache_fingerprint",
-                    req_id=kwargs.get("req_id"),
-                    kv_group=kv_group,
-                    fingerprint=kvcache_fingerprint,
-                ),
-            )
 
         # free the buffer memory
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
