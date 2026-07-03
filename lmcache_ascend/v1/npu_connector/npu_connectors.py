@@ -1412,6 +1412,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping: torch.Tensor,
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         token_start_index: int,
+        target_slot_mapping: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Align slot_mapping and selected_token_idx to equal length for kernel."""
         if selected_token_idx is not None and not isinstance(
@@ -1420,6 +1421,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_idx = torch.tensor(
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
+
+        if target_slot_mapping is not None:
+            if not isinstance(target_slot_mapping, torch.Tensor):
+                target_slot_mapping = torch.tensor(
+                    target_slot_mapping, dtype=torch.long, device=self.kv_device
+                )
+            else:
+                target_slot_mapping = target_slot_mapping.to(
+                    device=self.kv_device, dtype=torch.long
+                )
+            slot_mapping_packed = target_slot_mapping.reshape(-1)
+            selected_token_idx = self._sparse_selected_token_idx(
+                selected_token_idx, slot_mapping_packed.shape[0]
+            )
+            if selected_token_idx.numel() != slot_mapping_packed.numel():
+                common_len = min(
+                    int(selected_token_idx.numel()),
+                    int(slot_mapping_packed.numel()),
+                )
+                selected_token_idx = selected_token_idx[:common_len]
+                slot_mapping_packed = slot_mapping_packed[:common_len]
+            return slot_mapping_packed, selected_token_idx
 
         if selected_token_idx is not None and selected_token_idx.numel() > 0:
             num_sparse = int(selected_token_idx.numel())
@@ -2350,11 +2373,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kvcaches_snapshot = self.kvcaches
 
         for layer_id in range(self.num_layers):
-            memory_objs_layer, selected_token_idx, token_start_index = yield
+            sparse_payload = yield
+            if (
+                isinstance(sparse_payload, tuple)
+                and len(sparse_payload) == 4
+            ):
+                (
+                    memory_objs_layer,
+                    selected_token_idx,
+                    token_start_index,
+                    target_slot_mapping,
+                ) = sparse_payload
+            else:
+                memory_objs_layer, selected_token_idx, token_start_index = (
+                    sparse_payload
+                )
+                target_slot_mapping = None
             slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
                 slot_mapping,
                 selected_token_idx,
                 token_start_index,
+                target_slot_mapping=target_slot_mapping,
             )
 
             layer_cached_tensors = (

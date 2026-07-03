@@ -1159,7 +1159,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         next(mem_obj_consumer)
 
         for layer_id in range(self.num_layers):
-            selected_tokens, token_start_index = yield ret_mask
+            sparse_payload = yield ret_mask
+            if (
+                isinstance(sparse_payload, tuple)
+                and len(sparse_payload) == 3
+            ):
+                selected_tokens, token_start_index, target_slot_mapping = (
+                    sparse_payload
+                )
+            else:
+                selected_tokens, token_start_index = sparse_payload
+                target_slot_mapping = None
 
             if cached_mem_layers is not None:
                 mem_objs_layer = cached_mem_layers[layer_id]
@@ -1190,7 +1200,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                     mem_objs_layer = []
 
             mem_obj_consumer.send(
-                (mem_objs_layer, selected_tokens, token_start_index)
+                (
+                    mem_objs_layer,
+                    selected_tokens,
+                    token_start_index,
+                    target_slot_mapping,
+                )
             )
 
         next(mem_obj_consumer)
