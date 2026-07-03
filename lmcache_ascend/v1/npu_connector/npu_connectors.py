@@ -2969,9 +2969,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         assert memory_obj.tensor is not None
                         cpu_tensors.append(memory_obj.tensor)
 
-
                     # Fused transfer: 1 scatter kernel + N D2H memcpy
-                    lmc_ops.batched_fused_single_layer_kv_transfer(
+                    batched_fused_single_layer_kv_transfer(
                         cpu_tensors,
                         staging_tensor,
                         kvcaches_snapshot[layer_id],
