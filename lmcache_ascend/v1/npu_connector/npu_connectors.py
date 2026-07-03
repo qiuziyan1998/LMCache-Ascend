@@ -3052,6 +3052,9 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
 
+    def _expected_memory_format(self) -> MemoryFormat:
+        return MemoryFormat.KV_T2D
+
     def _lazy_initialize_buffer(self, kv_caches):
         """
         Lazily initialize the GPU buffer allocator if it is not initialized yet.

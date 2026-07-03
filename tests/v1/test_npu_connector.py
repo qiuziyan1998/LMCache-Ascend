@@ -36,6 +36,13 @@ from tests.v1.utils import check_sglang_npu_kv_cache_equal, generate_sglang_npu_
 import lmcache_ascend.c_ops as lmc_ops
 
 
+def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.kv_device = torch.device("cpu")
+    connector._layerwise_sparse_idx_cache = None
+    return connector
+
+
 def test_dense_prefix_layerwise_transfer_diag_message() -> None:
     layout = SimpleNamespace(
         kv_format=SimpleNamespace(name="DSA_INDEX"),
@@ -117,10 +124,7 @@ def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
     If the caller passes a full-prefix mapping, LMCache writes to the first N
     full-prefix slots instead of the compact scratch rows consumed by SFA.
     """
-    fake = SimpleNamespace(
-        kv_device=torch.device("cpu"),
-        _layerwise_sparse_idx_cache=None,
-    )
+    connector = _make_sparse_pack_connector()
     selected = torch.tensor(
         [18831, 18814, 18810, 18651, 18639, 18455, 18642, 18445],
         dtype=torch.int32,
@@ -128,7 +132,7 @@ def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
     full_prefix_slots = torch.arange(256, 256 + 18879, dtype=torch.long)
     packed, selected_out = (
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
-            fake,
+            connector,
             full_prefix_slots,
             selected,
             0,
@@ -142,7 +146,7 @@ def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
     compact_scratch_slots = torch.arange(selected.numel(), dtype=torch.long)
     packed_compact, selected_compact = (
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
-            fake,
+            connector,
             compact_scratch_slots,
             selected,
             0,
@@ -153,10 +157,7 @@ def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
 
 
 def test_sparse_pack_uses_target_slot_mapping_when_provided() -> None:
-    fake = SimpleNamespace(
-        kv_device=torch.device("cpu"),
-        _layerwise_sparse_idx_cache=None,
-    )
+    connector = _make_sparse_pack_connector()
     selected = torch.tensor(
         [18831, 18814, 18810, 18651],
         dtype=torch.int32,
@@ -166,7 +167,7 @@ def test_sparse_pack_uses_target_slot_mapping_when_provided() -> None:
 
     packed, selected_out = (
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
-            fake,
+            connector,
             full_prefix_slots,
             selected,
             0,
@@ -179,10 +180,7 @@ def test_sparse_pack_uses_target_slot_mapping_when_provided() -> None:
 
 
 def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
-    fake = SimpleNamespace(
-        kv_device=torch.device("cpu"),
-        _layerwise_sparse_idx_cache=None,
-    )
+    connector = _make_sparse_pack_connector()
     selected = torch.tensor(
         [18831, 18814, 18810, 18651],
         dtype=torch.int32,
@@ -192,7 +190,7 @@ def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
 
     legacy_slots, selected_out = (
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
-            fake,
+            connector,
             full_prefix_slots,
             selected,
             0,
@@ -213,7 +211,7 @@ def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
 
     fixed_slots, selected_fixed = (
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
-            fake,
+            connector,
             full_prefix_slots,
             selected,
             0,
@@ -228,17 +226,14 @@ def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
 
 
 def test_sparse_pack_rejects_target_slot_mapping_length_mismatch() -> None:
-    fake = SimpleNamespace(
-        kv_device=torch.device("cpu"),
-        _layerwise_sparse_idx_cache=None,
-    )
+    connector = _make_sparse_pack_connector()
     selected = torch.tensor([18831, 18814, 18810, 18651], dtype=torch.int32)
     full_prefix_slots = torch.arange(256, 256 + 18879, dtype=torch.long)
     target_slots = torch.tensor([901, 902, 903], dtype=torch.long)
 
     with pytest.raises(ValueError, match="target_slot_mapping"):
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
-            fake,
+            connector,
             full_prefix_slots,
             selected,
             0,
