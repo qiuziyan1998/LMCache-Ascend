@@ -1276,6 +1276,46 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
         if selected_token_idx is not None and selected_token_idx.numel() > 0:
+            if selected_token_idx.dim() > 1:
+                rows = selected_token_idx.reshape(selected_token_idx.shape[0], -1)
+                starts = token_start_index
+                if not isinstance(starts, torch.Tensor):
+                    starts = torch.tensor(starts, dtype=torch.long, device=slot_mapping.device)
+                starts = starts.reshape(-1).to(device=slot_mapping.device, dtype=torch.long)
+                if starts.numel() == 1 and rows.shape[0] != 1:
+                    starts = starts.expand(rows.shape[0])
+                if int(starts.numel()) != int(rows.shape[0]):
+                    raise ValueError(
+                        "token_start_index rows must match selected_token_idx rows: "
+                        f"{starts.numel()} vs {rows.shape[0]}"
+                    )
+                slot_chunks = []
+                selected_chunks = []
+                for row_idx in range(rows.shape[0]):
+                    row = rows[row_idx]
+                    start = int(starts[row_idx].detach().to(device="cpu").item())
+                    end = start + int(row.numel())
+                    if end > int(slot_mapping.numel()):
+                        raise ValueError(
+                            "sparse slot_mapping too short for multi-row selected "
+                            f"tokens: start={start} end={end} "
+                            f"slot_mapping={slot_mapping.numel()}"
+                        )
+                    slot_chunks.append(slot_mapping[start:end])
+                    selected_chunks.append(row)
+                slot_mapping_packed = (
+                    torch.cat(slot_chunks, dim=0)
+                    if slot_chunks else slot_mapping[:0]
+                )
+                selected_token_idx = (
+                    torch.cat(selected_chunks, dim=0)
+                    if selected_chunks else selected_token_idx.reshape(-1)[:0]
+                )
+                selected_token_idx = self._sparse_selected_token_idx(
+                    selected_token_idx, slot_mapping_packed.shape[0]
+                )
+                return slot_mapping_packed, selected_token_idx
+
             num_sparse = int(selected_token_idx.numel())
             start = int(token_start_index)
             end = start + num_sparse
@@ -1304,6 +1344,160 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         return slot_mapping_packed, selected_token_idx
 
+    def _pack_sparse_explicit_slot_inputs(
+        self,
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        target_slot_mapping: Union[torch.Tensor, list],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use caller-provided target slots for row-wise MTP sparse loads."""
+        if selected_token_idx is None:
+            selected_token_idx = []
+        if not isinstance(selected_token_idx, torch.Tensor):
+            selected_token_idx = torch.tensor(
+                selected_token_idx, dtype=torch.int32, device=self.kv_device
+            )
+        selected_token_idx = selected_token_idx.reshape(-1)
+
+        if not isinstance(target_slot_mapping, torch.Tensor):
+            target_slot_mapping = torch.tensor(
+                target_slot_mapping, dtype=torch.long, device=self.kv_device
+            )
+        target_slot_mapping = target_slot_mapping.reshape(-1).to(
+            device=self.kv_device, dtype=torch.long
+        )
+        if int(target_slot_mapping.numel()) != int(selected_token_idx.numel()):
+            raise ValueError(
+                "target_slot_mapping and selected_token_idx must have the same "
+                f"length: {target_slot_mapping.numel()} vs {selected_token_idx.numel()}"
+            )
+        selected_token_idx = self._sparse_selected_token_idx(
+            selected_token_idx, target_slot_mapping.shape[0]
+        )
+        return target_slot_mapping, selected_token_idx
+
+    def _kv_cache_token_capacity(self, layer_id: int) -> Optional[int]:
+        if self.kvcaches is None or layer_id >= len(self.kvcaches):
+            return None
+        layer_cache = self.kvcaches[layer_id]
+        if isinstance(layer_cache, (list, tuple)):
+            if not layer_cache:
+                return None
+            ref_tensor = layer_cache[0]
+        else:
+            ref_tensor = layer_cache[0] if self.vllm_two_major else layer_cache[:, 0]
+        if not isinstance(ref_tensor, torch.Tensor) or ref_tensor.dim() < 2:
+            return None
+        return int(ref_tensor.shape[0]) * int(ref_tensor.shape[1])
+
+    def _int_tensor_summary(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        sample_size: int = 8,
+    ) -> tuple[str, Optional[int], Optional[int], list[int]]:
+        flat = tensor.detach().reshape(-1)
+        numel = int(flat.numel())
+        if numel == 0:
+            return f"{name}_shape={tuple(tensor.shape)} {name}_numel=0", None, None, []
+        try:
+            min_value = int(flat.min().to(device="cpu").item())
+            max_value = int(flat.max().to(device="cpu").item())
+            sample = [
+                int(value)
+                for value in flat[: min(sample_size, numel)].to(device="cpu").tolist()
+            ]
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to read DSA sparse explicit transfer tensor for "
+                f"validation: name={name} shape={tuple(tensor.shape)} "
+                f"dtype={tensor.dtype} device={tensor.device}"
+            ) from exc
+        summary = (
+            f"{name}_shape={tuple(tensor.shape)} {name}_numel={numel} "
+            f"{name}_min={min_value} {name}_max={max_value} "
+            f"{name}_sample={sample}"
+        )
+        return summary, min_value, max_value, sample
+
+    def _validate_sparse_direct_explicit_inputs(
+        self,
+        *,
+        layer_id: int,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        chunk_size: int,
+        total_tokens: int,
+        chunk_ptrs_npu: torch.Tensor,
+    ) -> None:
+        selected_summary, selected_min, selected_max, _ = self._int_tensor_summary(
+            selected_token_idx,
+            "selected_token_idx",
+        )
+        slot_summary, slot_min, slot_max, _ = self._int_tensor_summary(
+            slot_mapping_packed,
+            "target_slot_mapping",
+        )
+
+        selected_numel = int(selected_token_idx.numel())
+        slot_numel = int(slot_mapping_packed.numel())
+        chunk_count = int(chunk_ptrs_npu.numel())
+        kv_capacity = self._kv_cache_token_capacity(layer_id)
+        issues = []
+
+        if selected_numel != slot_numel:
+            issues.append(
+                f"length_mismatch selected={selected_numel} target={slot_numel}"
+            )
+        if chunk_size <= 0:
+            issues.append(f"invalid_chunk_size={chunk_size}")
+        if total_tokens <= 0:
+            issues.append(f"invalid_total_tokens={total_tokens}")
+        if chunk_count <= 0:
+            issues.append(f"invalid_chunk_ptr_count={chunk_count}")
+
+        if selected_min is not None and selected_min < 0:
+            issues.append(f"selected_min_negative={selected_min}")
+        if (
+            selected_max is not None
+            and total_tokens > 0
+            and selected_max >= total_tokens
+        ):
+            issues.append(
+                f"selected_max_oob selected_max={selected_max} "
+                f"total_tokens={total_tokens}"
+            )
+        if (
+            selected_max is not None
+            and chunk_size > 0
+            and chunk_count > 0
+            and selected_max // chunk_size >= chunk_count
+        ):
+            issues.append(
+                f"selected_chunk_oob selected_max={selected_max} "
+                f"chunk_size={chunk_size} chunk_ptr_count={chunk_count}"
+            )
+
+        if slot_min is not None and slot_min < 0:
+            issues.append(f"target_slot_min_negative={slot_min}")
+        if (
+            slot_max is not None
+            and kv_capacity is not None
+            and slot_max >= kv_capacity
+        ):
+            issues.append(
+                f"target_slot_max_oob target_slot_max={slot_max} "
+                f"kv_capacity={kv_capacity}"
+            )
+
+        if issues:
+            raise RuntimeError(
+                "DSA sparse explicit transfer input invalid: "
+                f"layer_id={layer_id} total_tokens={total_tokens} "
+                f"chunk_size={chunk_size} chunk_ptr_count={chunk_count} "
+                f"kv_capacity={kv_capacity} {'; '.join(issues)} "
+                f"{selected_summary} {slot_summary}"
+            )
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -1325,10 +1519,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer_tensors: Optional[List[torch.Tensor]] = None,
         slot_mapping_ref: Optional[torch.Tensor] = None,
         cpu_tensors: Optional[List[torch.Tensor]] = None,
+        payload_event: Optional[Any] = None,
+        explicit_sparse_payload: bool = False,
     ) -> None:
         num_sparse = int(selected_token_idx.numel())
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
+
+        for tensor in (slot_mapping_packed, selected_token_idx, chunk_ptrs_npu):
+            try:
+                tensor.record_stream(load_stream)
+            except RuntimeError:
+                # Some backends/tensor types may not support record_stream.
+                # The transfer still has explicit stream ordering below.
+                pass
 
         resolve_tensors = (
             layer_tensors
@@ -1341,21 +1545,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else slot_mapping_packed
         )
 
-        layer_state = self._get_or_create_sparse_direct_layer_state(
-            layer_id=layer_id,
-            layer_tensors=resolve_tensors,
-            slot_mapping_ref=resolve_slot_mapping,
-            total_tokens=total_tokens,
-            sparse_kv_format=sparse_kv_format,
-            sparse_token_major=sparse_token_major,
-            sparse_vllm_two_major=sparse_vllm_two_major,
-            sparse_k_hidden_dims=sparse_k_hidden_dims,
-            sparse_v_hidden_dims=sparse_v_hidden_dims,
-            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-        )
+        layer_state = None
+        if not explicit_sparse_payload:
+            layer_state = self._get_or_create_sparse_direct_layer_state(
+                layer_id=layer_id,
+                layer_tensors=resolve_tensors,
+                slot_mapping_ref=resolve_slot_mapping,
+                total_tokens=total_tokens,
+                sparse_kv_format=sparse_kv_format,
+                sparse_token_major=sparse_token_major,
+                sparse_vllm_two_major=sparse_vllm_two_major,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            )
 
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
+            if payload_event is not None:
+                load_stream.wait_event(payload_event)
+            if explicit_sparse_payload:
+                self._validate_sparse_direct_explicit_inputs(
+                    layer_id=layer_id,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                )
             if layer_state is not None:
                 validate_inputs = layer_id not in self._sparse_direct_validated_layers
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
@@ -1812,12 +2029,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_vllm_two_major = self.vllm_two_major
 
         for layer_id in range(self.num_layers):
-            memory_objs_layer, selected_token_idx, token_start_index = yield
-            slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
-                slot_mapping,
-                selected_token_idx,
-                token_start_index,
-            )
+            payload = yield
+            explicit_sparse_payload = isinstance(payload, dict)
+            if explicit_sparse_payload:
+                memory_objs_layer = payload["memory_objs_layer"]
+                selected_token_idx = payload.get("selected_token_ids")
+                target_slot_mapping = payload.get("target_slot_mapping")
+                payload_event = payload.get("payload_event")
+                if target_slot_mapping is None:
+                    raise ValueError(
+                        "target_slot_mapping is required for explicit sparse payload"
+                    )
+                slot_mapping_packed, selected_token_idx = (
+                    self._pack_sparse_explicit_slot_inputs(
+                        selected_token_idx,
+                        target_slot_mapping,
+                    )
+                )
+            else:
+                memory_objs_layer, selected_token_idx, token_start_index = payload
+                payload_event = None
+                slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
+                    slot_mapping,
+                    selected_token_idx,
+                    token_start_index,
+                )
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
@@ -1843,6 +2079,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
             )
+            if explicit_sparse_payload and chunk_ptrs_npu.numel() > 0:
+                chunk_ptrs_npu = chunk_ptrs_npu.clone()
             if (
                 use_cached_retrieve
                 and lmcache_cached_tokens > 0
@@ -1868,8 +2106,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
                 sparse_host_interleaved=sparse_host_interleaved,
                 layer_tensors=cpu_tensors,
-                slot_mapping_ref=slot_mapping,
+                slot_mapping_ref=(
+                    slot_mapping_packed
+                    if explicit_sparse_payload else slot_mapping
+                ),
                 cpu_tensors=cpu_tensors,
+                payload_event=payload_event,
+                explicit_sparse_payload=explicit_sparse_payload,
             )
 
         yield
