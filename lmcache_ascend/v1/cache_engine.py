@@ -1221,7 +1221,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             sparse_payload = None
             target_slot_mapping = None
             if isinstance(sparse_request, dict):
-                sparse_payload = dict(sparse_request)
+                sparse_payload = sparse_request
                 selected_tokens = sparse_payload.get("selected_token_ids")
                 token_start_index = sparse_payload.get("token_start_index")
             elif isinstance(sparse_request, tuple):
@@ -1238,13 +1238,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 token_start_index = 0
 
             if cached_mem_layers is not None:
-                mem_obj_source = "cached_memory_objs"
                 mem_objs_layer = cached_mem_layers[layer_id]
             elif use_cached_retrieve:
-                mem_obj_source = "cached_tensors"
                 mem_objs_layer = []
             else:
-                mem_obj_source = "storage_get"
                 assert get_generator is not None
                 task = next(get_generator)
                 assert task is not None
@@ -1324,7 +1321,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         if self._is_passive():
-            logger.debug(f"rank={self.metadata.worker_id} ignore store")
+            logger.debug("rank=%s ignore store", self.metadata.worker_id)
             return
 
         assert self.storage_manager is not None

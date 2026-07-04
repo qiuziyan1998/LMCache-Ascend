@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -33,6 +34,16 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+_SPARSE_DIRECT_GUARD = os.getenv("LMCACHE_ASCEND_SPARSE_DIRECT_GUARD", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_SPARSE_DIRECT_RECORD_STREAM = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_RECORD_STREAM", "0"
+).lower() in ("1", "true", "yes", "on")
 
 _IS_310P = None
 def is_310p():
@@ -259,7 +270,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                 )
                 del self.buffer_mapping[layer_id - 2]
 
-                logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
+                logger.debug(
+                    "Finished loading layer %d into paged memory",
+                    layer_id - 2,
+                )
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
@@ -286,7 +300,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
-                logger.debug(f"Finished loading layer {layer_id - 1} into buffer")
+                logger.debug(
+                    "Finished loading layer %d into buffer",
+                    layer_id - 1,
+                )
 
             if layer_id < self.num_layers:
                 memory_objs_layer = yield
@@ -418,7 +435,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
             yield
             self.store_stream.synchronize()
-            logger.debug(f"Finished offloading layer {layer_id}")
+            logger.debug("Finished offloading layer %d", layer_id)
 
         # free the buffer memory
         tmp_gpu_buffer_obj.ref_count_down()
@@ -1680,27 +1697,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             logger.error(message)
             raise ValueError(message)
-        selected_min = int(selected_token_idx.min().to(device="cpu").item())
-        selected_max = int(selected_token_idx.max().to(device="cpu").item())
-        if selected_min < 0 or selected_max >= int(total_tokens):
-            message = (
-                "Sparse direct retrieve selected token is outside source chunks: "
-                f"kv_group={kv_group} layer_id={layer_id} "
-                f"num_sparse={num_sparse} selected_min={selected_min} "
-                f"selected_max={selected_max} chunk_count={chunk_count} "
-                f"chunk_size={chunk_size_int} covered_tokens={covered_tokens} "
-                f"total_tokens={int(total_tokens)}"
-            )
-            logger.error(message)
-            raise ValueError(message)
+        if _SPARSE_DIRECT_GUARD:
+            selected_min = int(selected_token_idx.min().to(device="cpu").item())
+            selected_max = int(selected_token_idx.max().to(device="cpu").item())
+            if selected_min < 0 or selected_max >= int(total_tokens):
+                message = (
+                    "Sparse direct retrieve selected token is outside source chunks: "
+                    f"kv_group={kv_group} layer_id={layer_id} "
+                    f"num_sparse={num_sparse} selected_min={selected_min} "
+                    f"selected_max={selected_max} chunk_count={chunk_count} "
+                    f"chunk_size={chunk_size_int} covered_tokens={covered_tokens} "
+                    f"total_tokens={int(total_tokens)}"
+                )
+                logger.error(message)
+                raise ValueError(message)
 
-        for tensor in (slot_mapping_packed, selected_token_idx, chunk_ptrs_npu):
-            try:
-                tensor.record_stream(load_stream)
-            except RuntimeError:
-                # Some backends/tensor types may not support record_stream.
-                # The transfer still has explicit stream ordering below.
-                pass
+        if _SPARSE_DIRECT_RECORD_STREAM:
+            for tensor in (slot_mapping_packed, selected_token_idx, chunk_ptrs_npu):
+                try:
+                    tensor.record_stream(load_stream)
+                except RuntimeError:
+                    # Some backends/tensor types may not support record_stream.
+                    # The transfer still has explicit stream ordering below.
+                    pass
 
         resolve_tensors = (
             layer_tensors
@@ -1713,29 +1732,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else slot_mapping_packed
         )
 
-        layer_state = None
-        if not explicit_sparse_payload:
-            layer_state = self._get_or_create_sparse_direct_layer_state(
-                kvcaches_ref=kvcaches_ref,
-                kv_group=kv_group,
-                layer_id=layer_id,
-                layer_tensors=resolve_tensors,
-                slot_mapping_ref=resolve_slot_mapping,
-                total_tokens=total_tokens,
-                sparse_kv_format=sparse_kv_format,
-                sparse_token_major=sparse_token_major,
-                sparse_vllm_two_major=sparse_vllm_two_major,
-                sparse_k_hidden_dims=sparse_k_hidden_dims,
-                sparse_v_hidden_dims=sparse_v_hidden_dims,
-                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-            )
+        layer_state = self._get_or_create_sparse_direct_layer_state(
+            kvcaches_ref=kvcaches_ref,
+            kv_group=kv_group,
+            layer_id=layer_id,
+            layer_tensors=resolve_tensors,
+            slot_mapping_ref=resolve_slot_mapping,
+            total_tokens=total_tokens,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+        )
 
         validate_key = (kv_group, layer_id)
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if payload_event is not None:
                 load_stream.wait_event(payload_event)
-            if explicit_sparse_payload:
+            if explicit_sparse_payload and _SPARSE_DIRECT_GUARD:
                 self._validate_sparse_direct_explicit_inputs(
                     kvcaches_ref=kvcaches_ref,
                     kv_group=kv_group,
@@ -2485,8 +2502,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             memory_objs_layer = yield
             if sync:
                 current_stream.wait_stream(self.load_stream)
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id - 1}")
+            if layer_id > 0 and logger.isEnabledFor(10):
+                logger.debug("Finished loading layer %d", layer_id - 1)
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
                 if self.use_gpu:
@@ -2535,7 +2552,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             v_hidden_dims,
                             dsa_hidden_dims,
                         )
-                logger.debug(f"Finished loading layer {layer_id}")
+                if logger.isEnabledFor(10):
+                    logger.debug("Finished loading layer %d", layer_id)
         yield
 
         # synchronize the last layer
@@ -2674,25 +2692,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
             )
-            if explicit_sparse_payload and chunk_ptrs_npu.numel() > 0:
-                chunk_ptrs_npu = chunk_ptrs_npu.clone()
-            chunk_total_tokens = self._sparse_total_tokens_from_layer_chunks(
-                cpu_tensors, kv_group
-            )
             if lmcache_cached_tokens > 0:
-                total_tokens = min(lmcache_cached_tokens, chunk_total_tokens)
-                if layer_id == 0 and lmcache_cached_tokens > chunk_total_tokens:
-                    logger.warning(
-                        "Sparse direct retrieve chunk coverage is smaller than "
-                        "LMCache lookup hit: kv_group=%s chunk_tokens=%s "
-                        "lmcache_cached_tokens=%s num_chunks=%s",
-                        kv_group,
-                        chunk_total_tokens,
-                        lmcache_cached_tokens,
-                        len(cpu_tensors),
-                    )
+                total_tokens = lmcache_cached_tokens
             else:
-                total_tokens = chunk_total_tokens
+                total_tokens = self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group
+                )
 
             self._run_sparse_direct_kv_transfer_layer(
                 kvcaches_ref=kvcaches_snapshot,
@@ -2877,7 +2882,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             v_hidden_dims,
                             dsa_hidden_dims,
                         )
-                logger.debug(f"Finished offloading layer {layer_id}")
+                logger.debug("Finished offloading layer %d", layer_id)
             yield
 
             if sync:
@@ -3010,8 +3015,8 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id - 1}")
+            if layer_id > 0 and logger.isEnabledFor(10):
+                logger.debug("Finished loading layer %d", layer_id - 1)
 
             current_layer_kv = (self.kvcaches[0][layer_id], self.kvcaches[1][layer_id])
 
@@ -3050,7 +3055,8 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
         if self.use_gpu:
             tmp_gpu_buffer_obj.ref_count_down()
 
-        logger.debug(f"Finished loading layer {layer_id}")
+        if logger.isEnabledFor(10):
+            logger.debug("Finished loading layer %d", layer_id)
         yield
 
     @_lmcache_nvtx_annotate
@@ -3163,7 +3169,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
                     )
 
             yield
-            logger.debug(f"Finished offloading layer {layer_id}")
+            logger.debug("Finished offloading layer %d", layer_id)
 
         # free the buffer memory
         if self.use_gpu:
