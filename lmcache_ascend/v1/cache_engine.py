@@ -52,6 +52,15 @@ def _dsa_debug_summary_enabled() -> bool:
     ).lower() in ("summary", "trace", "verbose", "all")
 
 
+def _decode_window_save_debug_enabled() -> bool:
+    return os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _dsa_validate_kv_enabled() -> bool:
     return os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_KV", "0").lower() in (
         "1",
@@ -1221,11 +1230,35 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        decode_window_save = bool(kwargs.get("decode_window_save", False))
+        decode_window_start = kwargs.get("decode_window_start")
+        decode_window_end = kwargs.get("decode_window_end")
+        decode_window_size = kwargs.get("decode_window_size")
+        decode_window_debug = (
+            decode_window_save and _decode_window_save_debug_enabled()
+        )
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
         else:
             num_to_store_tokens = len(tokens)
+
+        if decode_window_debug:
+            logger.warning(
+                "[DECODE_WINDOW_SAVE] ascend_store_layer_enter "
+                "req=%s window=[%s,%s) window_size=%s token_len=%d "
+                "mask_true=%s store_location=%s retrieve_locations=%s "
+                "num_layers=%d",
+                req_id,
+                decode_window_start,
+                decode_window_end,
+                decode_window_size,
+                len(tokens),
+                num_to_store_tokens,
+                self.store_location,
+                self.retrieve_locations,
+                self.num_layers,
+            )
 
         # KVCache Check logging
         self._log_kvcache_for_check(
@@ -1276,6 +1309,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        skipped_existing_chunks = 0
+        allocation_failed = False
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -1286,6 +1321,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             if self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
             ):
+                skipped_existing_chunks += 1
                 continue
 
             # Allocate the memory object
@@ -1305,6 +1341,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "Local cpu memory under pressure so"
                     " choosing to not store the KV cache."
                 )
+                allocation_failed = True
                 break
 
             starts.append(start)
@@ -1338,6 +1375,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
+        if decode_window_debug:
+            logger.warning(
+                "[DECODE_WINDOW_SAVE] ascend_store_layer_chunks "
+                "req=%s window=[%s,%s) chunks=%d skipped_existing=%d "
+                "allocation_failed=%s starts=%s ends=%s",
+                req_id,
+                decode_window_start,
+                decode_window_end,
+                len(keys),
+                skipped_existing_chunks,
+                allocation_failed,
+                starts[:4],
+                ends[:4],
+            )
+
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -1367,7 +1419,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                 memory_objs, starts, ends, **kwargs
             )
 
+            if decode_window_debug:
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] ascend_store_from_gpu_begin "
+                    "req=%s window=[%s,%s) chunks=%d layers=%d",
+                    req_id,
+                    decode_window_start,
+                    decode_window_end,
+                    len(starts),
+                    len(keys),
+                )
             next(mem_obj_generator)
+            if decode_window_debug:
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] ascend_store_from_gpu_primed "
+                    "req=%s window=[%s,%s)",
+                    req_id,
+                    decode_window_start,
+                    decode_window_end,
+                )
 
             for layer_id in range(self.num_layers):
                 yield
@@ -1384,6 +1454,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
+                if decode_window_debug:
+                    logger.warning(
+                        "[DECODE_WINDOW_SAVE] ascend_store_put "
+                        "req=%s window=[%s,%s) layer=%d chunks=%d",
+                        req_id,
+                        decode_window_start,
+                        decode_window_end,
+                        layer_id,
+                        len(keys[layer_id]),
+                    )
 
             tot_time = time.perf_counter() - t_start
             logger.info(
@@ -1396,7 +1476,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tot_time * 1000,
                 tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
             )
+            if decode_window_debug:
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] ascend_store_layer_done "
+                    "req=%s window=[%s,%s) stored_tokens=%d chunks=%d",
+                    req_id,
+                    decode_window_start,
+                    decode_window_end,
+                    tot_token_num,
+                    len(starts),
+                )
         else:
+            if decode_window_debug:
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] ascend_store_layer_no_keys "
+                    "req=%s window=[%s,%s) skipped_existing=%d "
+                    "allocation_failed=%s",
+                    req_id,
+                    decode_window_start,
+                    decode_window_end,
+                    skipped_existing_chunks,
+                    allocation_failed,
+                )
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):
