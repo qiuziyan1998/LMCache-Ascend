@@ -72,14 +72,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 layerwise_storer = self._layerwise_save_storers.pop(
                     storer_key, None
                 )
-                if self._is_decode_window_save_request(request):
-                    self._log_decode_window_save_state(
-                        "ascend_wait_for_save",
-                        request,
-                        storer_key=storer_key,
-                        storer_present=layerwise_storer is not None,
-                        remaining_storers=len(self._layerwise_save_storers),
-                    )
                 if layerwise_storer is not None:
                     try:
                         next(layerwise_storer)
