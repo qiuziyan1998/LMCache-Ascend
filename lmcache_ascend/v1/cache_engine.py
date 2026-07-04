@@ -1389,6 +1389,36 @@ class AscendLMCacheEngine(LMCacheEngine):
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
 
+            if kwargs.get("decode_window_save"):
+                window_start = kwargs.get("decode_window_start")
+                window_end = kwargs.get("decode_window_end")
+                logger.info(
+                    "[DECODE_WINDOW_STORE_SYNC] begin req=%s window=[%s,%s) "
+                    "stored_tokens=%d total_tokens=%d chunks=%d",
+                    req_id,
+                    window_start,
+                    window_end,
+                    tot_token_num,
+                    len(tokens),
+                    len(starts),
+                )
+                try:
+                    torch.npu.synchronize()
+                except Exception:
+                    logger.exception(
+                        "[DECODE_WINDOW_STORE_SYNC] failed req=%s window=[%s,%s)",
+                        req_id,
+                        window_start,
+                        window_end,
+                    )
+                    raise
+                logger.info(
+                    "[DECODE_WINDOW_STORE_SYNC] done req=%s window=[%s,%s)",
+                    req_id,
+                    window_start,
+                    window_end,
+                )
+
             tot_time = time.perf_counter() - t_start
             logger.info(
                 "[req_id=%s] Stored %d out of total %d tokens. "
