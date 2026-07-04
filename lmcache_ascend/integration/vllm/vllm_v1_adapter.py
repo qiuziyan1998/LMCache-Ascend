@@ -68,11 +68,32 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "Layerwise storing is not supported with async store"
             )
             for request in connector_metadata.requests:
+                storer_key = self._layerwise_save_storer_key(request)
                 layerwise_storer = self._layerwise_save_storers.pop(
-                    request.req_id, None
+                    storer_key, None
                 )
+                if self._is_decode_window_save_request(request):
+                    self._log_decode_window_save_state(
+                        "ascend_wait_for_save",
+                        request,
+                        storer_key=storer_key,
+                        storer_present=layerwise_storer is not None,
+                        remaining_storers=len(self._layerwise_save_storers),
+                    )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    try:
+                        next(layerwise_storer)
+                    except Exception:
+                        if self._is_decode_window_save_request(request):
+                            logger.exception(
+                                "[DECODE_WINDOW_SAVE] ascend wait_for_save "
+                                "failed: req=%s window=[%s,%s)",
+                                request.req_id,
+                                getattr(request, "decode_window_start", None),
+                                getattr(request, "decode_window_end", None),
+                            )
+                        raise
+                    self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()
