@@ -1052,7 +1052,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
                     proxies = [item[0] for item in batch]
 
-                    # Submit RDMA read for current batch 鈫?transport_stream.
+                    # Submit RDMA read for current batch -> transport_stream.
                     cur_read_event = ProxyMemoryObj.submit_resolve_batch(proxies)
 
                     # While the current batch is being read on
@@ -1286,6 +1286,32 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if not new_tensors:
             return
 
+        new_dev_ptrs = [
+            self._resolve_registered_cpu_tensor_device_ptr(
+                tensor,
+                layer_id=layer_id,
+                chunk_index=chunk_index,
+                source="append_sparse_chunk_ptr_cache_for_layer",
+            )
+            for chunk_index, tensor in enumerate(new_tensors)
+        ]
+
+        updated_ptrs_npu = None
+        if cached_chunk_ptrs_npu is not None:
+            new_ptrs_npu = torch.tensor(
+                new_dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
+            existing = (
+                cached_chunk_ptrs_npu[layer_id]
+                if layer_id < len(cached_chunk_ptrs_npu)
+                else None
+            )
+            updated_ptrs_npu = (
+                new_ptrs_npu
+                if existing is None
+                else torch.cat((existing, new_ptrs_npu), dim=0)
+            )
+
         num_layers = self.num_layers
         if not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
@@ -1300,25 +1326,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ):
             cached_chunk_ptrs_npu.append(None)
 
-        new_dev_ptrs = [
-            int(lmc_ops.get_device_ptr(int(tensor.data_ptr())))
-            for tensor in new_tensors
-        ]
         cached_chunk_dev_ptrs[layer_id].extend(new_dev_ptrs)
 
         if cached_chunk_ptrs_npu is None:
             return
 
-        new_ptrs_npu = torch.tensor(
-            new_dev_ptrs, dtype=torch.long, device=self.kv_device
-        )
-        existing = cached_chunk_ptrs_npu[layer_id]
-        if existing is None:
-            cached_chunk_ptrs_npu[layer_id] = new_ptrs_npu
-        else:
-            cached_chunk_ptrs_npu[layer_id] = torch.cat(
-                (existing, new_ptrs_npu), dim=0
+        cached_chunk_ptrs_npu[layer_id] = updated_ptrs_npu
+
+    def _resolve_registered_cpu_tensor_device_ptr(
+        self,
+        tensor: torch.Tensor,
+        *,
+        layer_id: int,
+        chunk_index: int,
+        source: str,
+    ) -> int:
+        host_ptr = int(tensor.data_ptr())
+        dev_ptr = lmc_ops.get_device_ptr(host_ptr)
+        if dev_ptr is None or int(dev_ptr) == 0:
+            raise RuntimeError(
+                "Ascend sparse pointer-cache install failed: CPU tensor is not "
+                "registered or get_device_ptr returned null. "
+                f"source={source}, layer_id={layer_id}, "
+                f"chunk_index={chunk_index}, host_ptr={host_ptr}"
             )
+        return int(dev_ptr)
 
     def _get_or_create_sparse_direct_layer_state(
         self,
@@ -1863,11 +1895,36 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ):
             cached = cached_chunk_ptrs_npu[layer_id]
             if cached is not None and cached.numel() == num_chunks:
+                if cached.dtype != torch.long:
+                    raise RuntimeError(
+                        "Ascend sparse pointer-cache reuse failed: cached NPU "
+                        "pointer tensor has invalid dtype before direct kernel "
+                        f"launch at layer {layer_id}: dtype={cached.dtype}, "
+                        "expected=torch.int64."
+                    )
+                expected_device = torch.device(self.kv_device)
+                if cached.device != expected_device:
+                    raise RuntimeError(
+                        "Ascend sparse pointer-cache reuse failed: cached NPU "
+                        "pointer tensor is on the wrong device before direct "
+                        f"kernel launch at layer {layer_id}: "
+                        f"device={cached.device}, expected={expected_device}."
+                    )
+                if bool(torch.any(cached == 0).item()):
+                    raise RuntimeError(
+                        "Ascend sparse pointer-cache reuse failed: cached NPU "
+                        f"pointer tensor contains a null pointer at layer {layer_id}."
+                    )
                 return cached
 
         dev_ptrs = [
-            int(lmc_ops.get_device_ptr(int(tensor.data_ptr())))
-            for tensor in cpu_tensors
+            self._resolve_registered_cpu_tensor_device_ptr(
+                tensor,
+                layer_id=layer_id,
+                chunk_index=chunk_index,
+                source="_resolve_sparse_chunk_ptrs_npu",
+            )
+            for chunk_index, tensor in enumerate(cpu_tensors)
         ]
         chunk_ptrs_npu = torch.tensor(dev_ptrs, dtype=torch.long, device=self.kv_device)
         if cached_chunk_ptrs_npu is not None:
@@ -2227,7 +2284,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
                 layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
             elif layout.kv_format == KVCacheFormat.MLA_LATENT:
-                # Two-group latent: (k_nope, k_pe) 鈥?same dim structure as MLA_KV
+                # Two-group latent: (k_nope, k_pe) -> same dim structure as MLA_KV
                 key_tensor, value_tensor = first_layer_cache
                 layout.kv_device = key_tensor.device
                 layout.vllm_two_major = False
@@ -2236,7 +2293,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
                 layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
             elif layout.kv_format == KVCacheFormat.DSA_INDEX:
-                # Two-group indexer: (indexer_k,) 鈥?single tensor, single plane
+                # Two-group indexer: (indexer_k,) -> single tensor, single plane
                 indexer_tensor = first_layer_cache[0]
                 layout.kv_device = indexer_tensor.device
                 layout.vllm_two_major = False

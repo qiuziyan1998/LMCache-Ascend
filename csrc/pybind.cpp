@@ -133,6 +133,22 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("unregister_ptr", [](uintptr_t ptr_addr) {
     return unregister_ptr(reinterpret_cast<void *>(ptr_addr));
   });
+  m.def("alloc_pinned_ptr", &alloc_pinned_ptr,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("free_pinned_ptr", &free_pinned_ptr);
+  m.def("alloc_pinned_numa_ptr", &alloc_pinned_numa_ptr,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("free_pinned_numa_ptr", &free_pinned_numa_ptr);
+  m.def("alloc_shm_pinned_ptr", &alloc_shm_pinned_ptr,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("attach_shm_pinned_ptr", &attach_shm_pinned_ptr,
+        py::arg("size"), py::arg("shm_name"), py::arg("writable") = true,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("free_shm_pinned_ptr", &free_shm_pinned_ptr,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("detach_shm_pinned_ptr", &detach_shm_pinned_ptr,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("unlink_shm", &unlink_shm, py::call_guard<py::gil_scoped_release>());
   m.def("multi_layer_kv_transfer", &multi_layer_kv_transfer);
   m.def("fused_multi_layer_kv_transfer", &fused_multi_layer_kv_transfer);
   m.def("multi_layer_kv_transfer_310p", &multi_layer_kv_transfer_310p);
@@ -199,9 +215,5 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("decode_fast_prefsum", &decode_ascend_prefsum);
   m.def("calculate_cdf", &calculate_cdf);
   m.def("rotary_embedding_k_fused", &rotary_embedding_k_fused);
-  m.def("alloc_pinned_ptr", &alloc_pinned_ptr);
-  m.def("free_pinned_ptr", &free_pinned_ptr);
-  m.def("alloc_pinned_numa_ptr", &alloc_pinned_numa_ptr);
-  m.def("free_pinned_numa_ptr", &free_pinned_numa_ptr);
   m.def("get_gpu_pci_bus_id", &get_npu_pci_bus_id);
 }

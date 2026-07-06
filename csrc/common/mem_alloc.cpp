@@ -4,9 +4,12 @@
 #include <cstdlib> // for std::getenv
 #include <cstring> // for strerror
 #include <errno.h>
+#include <fcntl.h>
 #include <numaif.h>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h>
+#include <unistd.h>
 
 uintptr_t alloc_pinned_ptr(std::size_t size, unsigned int flags) {
   void *ptr = nullptr;
@@ -94,5 +97,147 @@ void free_pinned_numa_ptr(uintptr_t p, std::size_t size) {
   }
   if (unMapErr) {
     throw std::runtime_error("munmap failed: " + std::to_string(unMapErr));
+  }
+}
+
+static void first_touch(void *p, size_t size) {
+  const long ps = sysconf(_SC_PAGESIZE);
+  for (size_t off = 0; off < size; off += ps) {
+    volatile char *c = reinterpret_cast<volatile char *>(p) + off;
+    *c = 0;
+  }
+}
+
+uintptr_t alloc_shm_pinned_ptr(std::size_t size, const std::string &shm_name) {
+  if (size == 0) {
+    throw std::runtime_error("alloc_shm_pinned_ptr requires size > 0 for " +
+                             shm_name);
+  }
+  if (shm_name.empty()) {
+    throw std::runtime_error("alloc_shm_pinned_ptr requires a shm_name");
+  }
+
+  int fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+  if (fd < 0) {
+    throw std::runtime_error(
+        std::string("shm_open create failed for ") + shm_name +
+        " (shared CPU cache segment already exists or cannot be created; "
+        "this usually means a live name collision or stale segment from an "
+        "unclean shutdown, so choose a unique shared_cpu_cache_name or unlink "
+        "the stale segment before restart): " + strerror(errno));
+  }
+
+  if (ftruncate(fd, size) != 0) {
+    int err = errno;
+    close(fd);
+    shm_unlink(shm_name.c_str());
+    throw std::runtime_error(std::string("ftruncate failed for ") + shm_name +
+                             ": " + strerror(err));
+  }
+
+  void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (ptr == MAP_FAILED) {
+    shm_unlink(shm_name.c_str());
+    throw std::runtime_error(std::string("mmap failed for ") + shm_name + ": " +
+                             strerror(errno));
+  }
+
+  first_touch(ptr, size);
+  auto devPtr = register_ptr(ptr, size);
+  if (devPtr == nullptr) {
+    munmap(ptr, size);
+    shm_unlink(shm_name.c_str());
+    throw std::runtime_error(std::string("register_ptr failed for ") +
+                             shm_name);
+  }
+
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+uintptr_t attach_shm_pinned_ptr(std::size_t size, const std::string &shm_name,
+                                bool writable) {
+  if (size == 0) {
+    throw std::runtime_error("attach_shm_pinned_ptr requires size > 0 for " +
+                             shm_name);
+  }
+  if (shm_name.empty()) {
+    throw std::runtime_error("attach_shm_pinned_ptr requires a shm_name");
+  }
+
+  int fd = shm_open(shm_name.c_str(), writable ? O_RDWR : O_RDONLY, 0600);
+  if (fd < 0) {
+    throw std::runtime_error(std::string("shm_open attach failed for ") +
+                             shm_name + ": " + strerror(errno));
+  }
+
+  int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+  void *ptr = mmap(nullptr, size, prot, MAP_SHARED, fd, 0);
+  close(fd);
+  if (ptr == MAP_FAILED) {
+    throw std::runtime_error(std::string("mmap attach failed for ") + shm_name +
+                             ": " + strerror(errno));
+  }
+
+  auto devPtr = register_ptr(ptr, size);
+  if (devPtr == nullptr) {
+    munmap(ptr, size);
+    throw std::runtime_error(std::string("register_ptr attach failed for ") +
+                             shm_name);
+  }
+
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+void free_shm_pinned_ptr(uintptr_t p, std::size_t size,
+                         const std::string &shm_name) {
+  if (p == 0) {
+    throw std::runtime_error("free_shm_pinned_ptr requires non-null ptr");
+  }
+  if (size == 0) {
+    throw std::runtime_error("free_shm_pinned_ptr requires size > 0 for " +
+                             shm_name);
+  }
+
+  void *ptr = reinterpret_cast<void *>(p);
+
+  auto unRegErr = unregister_ptr(ptr);
+  auto unMapErr = munmap(ptr, size);
+  shm_unlink(shm_name.c_str());
+  if (unRegErr) {
+    throw std::runtime_error("unregister_ptr failed: " +
+                             std::to_string(unRegErr));
+  }
+  if (unMapErr) {
+    throw std::runtime_error("munmap failed: " + std::to_string(unMapErr));
+  }
+}
+
+void detach_shm_pinned_ptr(uintptr_t p, std::size_t size) {
+  if (p == 0) {
+    throw std::runtime_error("detach_shm_pinned_ptr requires non-null ptr");
+  }
+  if (size == 0) {
+    throw std::runtime_error("detach_shm_pinned_ptr requires size > 0");
+  }
+
+  void *ptr = reinterpret_cast<void *>(p);
+
+  auto unRegErr = unregister_ptr(ptr);
+  auto unMapErr = munmap(ptr, size);
+  if (unRegErr) {
+    throw std::runtime_error("unregister_ptr detach failed: " +
+                             std::to_string(unRegErr));
+  }
+  if (unMapErr) {
+    throw std::runtime_error("munmap detach failed: " +
+                             std::to_string(unMapErr));
+  }
+}
+
+void unlink_shm(const std::string &shm_name) {
+  if (shm_unlink(shm_name.c_str()) != 0 && errno != ENOENT) {
+    throw std::runtime_error(std::string("shm_unlink failed for ") + shm_name +
+                             ": " + strerror(errno));
   }
 }
