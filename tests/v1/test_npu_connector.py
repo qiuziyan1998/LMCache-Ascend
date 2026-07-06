@@ -411,6 +411,97 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
     assert calls[0]["total_tokens"] == 18879
 
 
+def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kvcaches = [(object(), object())]
+    connector.load_stream_idx = 0
+    connector.load_stream_num = 1
+    connector.load_stream_list = [object()]
+    connector.lmcache_chunk_size = 256
+
+    class _Stream:
+        pass
+
+    class _Layout:
+        k_hidden_dims = 1
+        v_hidden_dims = 1
+        dsa_hidden_dims = 0
+        kv_format = type("_Fmt", (), {"value": 0})()
+        vllm_two_major = False
+
+    class _MemoryObj:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(
+        connector,
+        "initialize_kvcaches_ptr",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer",
+        lambda kvcaches, kv_group=0: _Layout(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_layerwise_token_major",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_sparse_lmc_host_interleaved",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_pack_sparse_layer_inputs",
+        lambda slot_mapping, selected_token_idx, token_start_index: (
+            slot_mapping,
+            selected_token_idx,
+        ),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu: torch.tensor(
+            [123], dtype=torch.long
+        ),
+    )
+
+    calls = []
+
+    def _run_sparse_direct(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        connector,
+        "_run_sparse_direct_kv_transfer_layer",
+        _run_sparse_direct,
+    )
+
+    cached_tensors = []
+    gen = connector.batched_to_gpu_head_token_wise(
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=True,
+        cached_tensors=cached_tensors,
+        lmcache_cached_tokens=4,
+        kv_group=0,
+    )
+    next(gen)
+
+    cached_tensor = torch.zeros(4)
+    fallback_tensor = torch.ones(4)
+    cached_tensors.extend([[cached_tensor]])
+    gen.send(([_MemoryObj(fallback_tensor)], torch.arange(4, dtype=torch.int32), 0))
+
+    assert len(calls) == 1
+    assert calls[0]["cpu_tensors"][0] is cached_tensor
+    assert calls[0]["layer_tensors"][0] is cached_tensor
+
+
 @pytest.mark.parametrize("use_npu", [True])
 @pytest.mark.parametrize(
     "gpu_kv_format",

@@ -2760,10 +2760,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "cached_chunk_ptrs_npu"
         )
         lmcache_cached_tokens: int = int(kwargs.get("lmcache_cached_tokens", 0) or 0)
-        use_cached_retrieve = (
-            cached_tensors_by_layer is not None
-            and len(cached_tensors_by_layer) == self.num_layers
-        )
 
         current_stream = torch.cuda.current_stream()
 
@@ -2837,7 +2833,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
-                if use_cached_retrieve
+                if cached_tensors_by_layer is not None
                 and layer_id < len(cached_tensors_by_layer)
                 and cached_tensors_by_layer[layer_id]
                 else None
