@@ -1276,8 +1276,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(request_configs, dict)
 
         prev_key = 0
-        skipped_existing_chunks = 0
-        allocation_failed = False
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -1288,7 +1286,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             if self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
             ):
-                skipped_existing_chunks += 1
                 continue
 
             # Allocate the memory object
@@ -1308,7 +1305,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "Local cpu memory under pressure so"
                     " choosing to not store the KV cache."
                 )
-                allocation_failed = True
                 break
 
             starts.append(start)
@@ -1390,34 +1386,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
 
             if kwargs.get("decode_window_save"):
-                window_start = kwargs.get("decode_window_start")
-                window_end = kwargs.get("decode_window_end")
-                logger.info(
-                    "[DECODE_WINDOW_STORE_SYNC] begin req=%s window=[%s,%s) "
-                    "stored_tokens=%d total_tokens=%d chunks=%d",
-                    req_id,
-                    window_start,
-                    window_end,
-                    tot_token_num,
-                    len(tokens),
-                    len(starts),
-                )
-                try:
-                    torch.npu.synchronize()
-                except Exception:
-                    logger.exception(
-                        "[DECODE_WINDOW_STORE_SYNC] failed req=%s window=[%s,%s)",
-                        req_id,
-                        window_start,
-                        window_end,
-                    )
-                    raise
-                logger.info(
-                    "[DECODE_WINDOW_STORE_SYNC] done req=%s window=[%s,%s)",
-                    req_id,
-                    window_start,
-                    window_end,
-                )
+                torch.npu.synchronize()
 
             tot_time = time.perf_counter() - t_start
             logger.info(

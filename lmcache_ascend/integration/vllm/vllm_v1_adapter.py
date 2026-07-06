@@ -73,18 +73,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     storer_key, None
                 )
                 if layerwise_storer is not None:
-                    try:
-                        next(layerwise_storer)
-                    except Exception:
-                        if self._is_decode_window_save_request(request):
-                            logger.exception(
-                                "[DECODE_WINDOW_SAVE] ascend wait_for_save "
-                                "failed: req=%s window=[%s,%s)",
-                                request.req_id,
-                                getattr(request, "decode_window_start", None),
-                                getattr(request, "decode_window_end", None),
-                            )
-                        raise
+                    next(layerwise_storer)
                     self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
