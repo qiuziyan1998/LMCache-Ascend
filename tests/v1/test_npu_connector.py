@@ -33,46 +33,37 @@ def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
     return connector
 
 
-def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
-    """Sparse selected-token load uses slot_mapping as destination rows.
-
-    The connector does not derive compact scratch slots from selected token ids.
-    If the caller passes a full-prefix mapping, LMCache writes to the first N
-    full-prefix slots instead of the compact scratch rows consumed by SFA.
-    """
+def test_sparse_pack_rejects_compact_without_target_slot_mapping(
+    monkeypatch,
+) -> None:
+    """Compact selected-token loads must use explicit destination slots."""
     connector = _make_sparse_pack_connector()
     selected = torch.tensor(
         [18831, 18814, 18810, 18651, 18639, 18455, 18642, 18445],
         dtype=torch.int32,
     )
     full_prefix_slots = torch.arange(256, 256 + 18879, dtype=torch.long)
-    packed, selected_out = (
+
+    with pytest.raises(ValueError, match="Compact sparse load"):
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
             connector,
             full_prefix_slots,
             selected,
             0,
         )
-    )
 
-    assert torch.equal(selected_out, selected)
-    assert packed.tolist() == list(range(256, 256 + selected.numel()))
-    assert packed.tolist() != list(range(selected.numel()))
-
-    compact_scratch_slots = torch.arange(selected.numel(), dtype=torch.long)
-    packed_compact, selected_compact = (
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
+    with pytest.raises(ValueError, match="target_slot_mapping"):
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
             connector,
-            compact_scratch_slots,
+            full_prefix_slots,
             selected,
             0,
         )
-    )
-    assert torch.equal(selected_compact, selected)
-    assert packed_compact.tolist() == list(range(selected.numel()))
 
 
-def test_sparse_pack_uses_target_slot_mapping_when_provided() -> None:
+def test_sparse_pack_uses_target_slot_mapping_when_provided(monkeypatch) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
     connector = _make_sparse_pack_connector()
     selected = torch.tensor(
         [18831, 18814, 18810, 18651],
@@ -95,7 +86,10 @@ def test_sparse_pack_uses_target_slot_mapping_when_provided() -> None:
     assert torch.equal(packed, target_slots)
 
 
-def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
+def test_sparse_pack_compact_target_slot_mapping_writes_scratch_window(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
     connector = _make_sparse_pack_connector()
     selected = torch.tensor(
         [18831, 18814, 18810, 18651],
@@ -104,27 +98,10 @@ def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
     full_prefix_slots = torch.arange(256, 256 + 18879, dtype=torch.long)
     compact_scratch_slots = torch.tensor([900, 901, 902, 903], dtype=torch.long)
 
-    legacy_slots, selected_out = (
-        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
-            connector,
-            full_prefix_slots,
-            selected,
-            0,
-        )
-    )
-    assert torch.equal(selected_out, selected)
-    assert not torch.equal(legacy_slots, compact_scratch_slots)
-
     source_by_token = {
         int(token): float(idx + 1) for idx, token in enumerate(selected.tolist())
     }
     scratch = torch.zeros(1024, dtype=torch.float32)
-    for token, dst_slot in zip(selected_out.tolist(), legacy_slots.tolist()):
-        scratch[int(dst_slot)] = source_by_token[int(token)]
-
-    expected = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    assert not torch.equal(scratch[compact_scratch_slots], expected)
-
     fixed_slots, selected_fixed = (
         VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
             connector,
@@ -134,14 +111,17 @@ def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
             target_slot_mapping=compact_scratch_slots,
         )
     )
-    scratch.zero_()
     for token, dst_slot in zip(selected_fixed.tolist(), fixed_slots.tolist()):
         scratch[int(dst_slot)] = source_by_token[int(token)]
 
+    expected = torch.tensor([1.0, 2.0, 3.0, 4.0])
     assert torch.equal(scratch[compact_scratch_slots], expected)
 
 
-def test_sparse_pack_rejects_target_slot_mapping_length_mismatch() -> None:
+def test_sparse_pack_rejects_target_slot_mapping_length_mismatch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
     connector = _make_sparse_pack_connector()
     selected = torch.tensor([18831, 18814, 18810, 18651], dtype=torch.int32)
     full_prefix_slots = torch.arange(256, 256 + 18879, dtype=torch.long)
@@ -154,6 +134,109 @@ def test_sparse_pack_rejects_target_slot_mapping_length_mismatch() -> None:
             selected,
             0,
             target_slot_mapping=target_slots,
+        )
+
+
+def test_sparse_pack_full_width_uses_legacy_path_when_compact_disabled() -> None:
+    connector = _make_sparse_pack_connector()
+    selected = torch.arange(2048, dtype=torch.int32)
+    full_width_slots = torch.arange(256, 256 + 2048, dtype=torch.long)
+
+    packed, selected_out = (
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_layer_inputs(
+            connector,
+            full_width_slots,
+            selected,
+            0,
+        )
+    )
+
+    assert torch.equal(selected_out, selected)
+    assert torch.equal(packed, full_width_slots)
+
+
+def test_sparse_pack_rejects_compact_explicit_when_disabled() -> None:
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor([18831, 18814, 18810, 18651], dtype=torch.int32)
+    target_slots = torch.tensor([900, 901, 902, 903], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="compact_load_enabled=False"):
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            selected,
+            target_slots,
+            kv_group=0,
+        )
+
+
+def test_sparse_pack_rejects_compact_for_dsa_index_group(monkeypatch) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor([18831, 18814, 18810, 18651], dtype=torch.int32)
+    target_slots = torch.tensor([900, 901, 902, 903], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="kv_group=0"):
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            selected,
+            target_slots,
+            kv_group=1,
+        )
+
+
+def test_sparse_pack_rejects_compact_python_lists(monkeypatch) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
+    connector = _make_sparse_pack_connector()
+
+    with pytest.raises(ValueError, match="torch.Tensor payloads"):
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            [18831, 18814, 18810, 18651],
+            [900, 901, 902, 903],
+            kv_group=0,
+        )
+
+
+def test_sparse_pack_compact_2d_flattens_row_major(monkeypatch) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor(
+        [[18831, 18814, 18810], [18651, 18639, 18455]],
+        dtype=torch.int32,
+    )
+    target_slots = torch.tensor(
+        [[900, 901, 902], [2948, 2949, 2950]],
+        dtype=torch.long,
+    )
+
+    packed, selected_out = (
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            selected.t().t(),
+            target_slots.t().t(),
+            kv_group=0,
+        )
+    )
+
+    assert torch.equal(selected_out, selected.reshape(-1))
+    assert torch.equal(packed, target_slots.reshape(-1))
+
+
+def test_sparse_pack_rejects_compact_shape_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_COMPACT_LOAD", True)
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor(
+        [[18831, 18814, 18810], [18651, 18639, 18455]],
+        dtype=torch.int32,
+    )
+    target_slots = torch.tensor([[900, 901, 902]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="shape must match"):
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            selected,
+            target_slots,
+            kv_group=0,
         )
 
 

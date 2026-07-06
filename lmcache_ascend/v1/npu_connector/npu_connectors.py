@@ -44,6 +44,10 @@ _SPARSE_DIRECT_GUARD = os.getenv("LMCACHE_ASCEND_SPARSE_DIRECT_GUARD", "0").lowe
 _SPARSE_DIRECT_RECORD_STREAM = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_RECORD_STREAM", "0"
 ).lower() in ("1", "true", "yes", "on")
+_SPARSE_COMPACT_LOAD = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_COMPACT_LOAD", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_INDEX_TOPK = 2048
 
 _IS_310P = None
 def is_310p():
@@ -54,6 +58,43 @@ def is_310p():
 
         _IS_310P = _build_info.__soc_version__.lower().startswith("ascend310p")
     return _IS_310P
+
+
+def _sparse_payload_rank_width(value: Any, name: str) -> tuple[int, int]:
+    if isinstance(value, torch.Tensor):
+        if value.dim() == 0 or value.dim() > 2:
+            raise ValueError(
+                f"{name} must be a 1D or 2D sparse payload tensor, "
+                f"got shape={tuple(value.shape)}"
+            )
+        if value.dim() == 1:
+            return 1, int(value.numel())
+        return 2, int(value.shape[1])
+
+    if isinstance(value, list):
+        if not value:
+            return 1, 0
+        first = value[0]
+        if isinstance(first, (list, tuple)):
+            width = len(first)
+            for row in value:
+                if not isinstance(row, (list, tuple)) or len(row) != width:
+                    raise ValueError(f"{name} ragged sparse rows are not supported")
+            return 2, width
+        return 1, len(value)
+
+    raise TypeError(f"{name} must be a torch.Tensor or list, got {type(value)!r}")
+
+
+def _sparse_payload_shape(value: Any) -> Optional[tuple[int, ...]]:
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    if isinstance(value, list):
+        rank, width = _sparse_payload_rank_width(value, "sparse payload")
+        if rank == 1:
+            return (width,)
+        return (len(value), width)
+    return None
 
 
 class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
@@ -1378,14 +1419,114 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_layer_states[state_key] = state
         return state
 
+    def _validate_sparse_load_shape_contract(
+        self,
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        target_slot_mapping: Optional[Union[torch.Tensor, list]],
+        *,
+        kv_group: int,
+        explicit_target_mapping: bool,
+    ) -> bool:
+        """Return True when the request is compact-width sparse load."""
+        if selected_token_idx is None:
+            if target_slot_mapping is not None:
+                _, target_width = _sparse_payload_rank_width(
+                    target_slot_mapping, "target_slot_mapping"
+                )
+                if target_width != _SPARSE_INDEX_TOPK:
+                    raise ValueError(
+                        "Compact sparse load requires selected_token_idx as "
+                        "a torch.Tensor when target_slot_mapping is compact: "
+                        f"target_width={target_width} "
+                        f"expected_width={_SPARSE_INDEX_TOPK}"
+                    )
+            return False
+
+        _, width = _sparse_payload_rank_width(
+            selected_token_idx, "selected_token_idx"
+        )
+        if width <= 0:
+            raise ValueError(
+                "Sparse selected_token_idx width must be positive: "
+                f"selected_shape={_sparse_payload_shape(selected_token_idx)}"
+            )
+        if width > _SPARSE_INDEX_TOPK:
+            raise ValueError(
+                "Sparse selected_token_idx width exceeds index_topk: "
+                f"selected_width={width} expected_width={_SPARSE_INDEX_TOPK}"
+            )
+
+        if target_slot_mapping is not None:
+            _, target_width = _sparse_payload_rank_width(
+                target_slot_mapping, "target_slot_mapping"
+            )
+            if target_width != width:
+                raise ValueError(
+                    "target_slot_mapping width must match selected_token_idx "
+                    "width: "
+                    f"target_width={target_width} selected_width={width} "
+                    f"target_shape={_sparse_payload_shape(target_slot_mapping)} "
+                    f"selected_shape={_sparse_payload_shape(selected_token_idx)}"
+                )
+            selected_shape = _sparse_payload_shape(selected_token_idx)
+            target_shape = _sparse_payload_shape(target_slot_mapping)
+            if selected_shape != target_shape:
+                raise ValueError(
+                    "target_slot_mapping shape must match selected_token_idx "
+                    "shape: "
+                    f"target_shape={target_shape} selected_shape={selected_shape}"
+                )
+
+        compact = width < _SPARSE_INDEX_TOPK
+        if not compact:
+            return False
+
+        if not _SPARSE_COMPACT_LOAD:
+            raise ValueError(
+                "Compact sparse load is disabled: "
+                "compact_load_enabled=False "
+                f"kv_group={kv_group} selected_shape="
+                f"{_sparse_payload_shape(selected_token_idx)} "
+                f"target_shape={_sparse_payload_shape(target_slot_mapping)} "
+                f"expected_width={_SPARSE_INDEX_TOPK} actual_width={width}"
+            )
+        if kv_group != 0:
+            raise ValueError(
+                "Compact sparse load is only supported for MLA latent "
+                f"kv_group=0, got kv_group={kv_group}"
+            )
+        if not explicit_target_mapping or target_slot_mapping is None:
+            raise ValueError(
+                "Compact sparse load requires explicit target_slot_mapping "
+                f"with the same shape as selected_token_idx: "
+                f"selected_shape={_sparse_payload_shape(selected_token_idx)}"
+            )
+        if not isinstance(selected_token_idx, torch.Tensor) or not isinstance(
+            target_slot_mapping, torch.Tensor
+        ):
+            raise ValueError(
+                "Compact sparse load requires torch.Tensor payloads: "
+                f"selected_type={type(selected_token_idx)!r} "
+                f"target_type={type(target_slot_mapping)!r}"
+            )
+        return True
+
     def _pack_sparse_layer_inputs(
         self,
         slot_mapping: torch.Tensor,
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         token_start_index: int,
         target_slot_mapping: Optional[Union[torch.Tensor, list]] = None,
+        kv_group: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build parallel destination/source arrays for the sparse copy kernel."""
+        self._validate_sparse_load_shape_contract(
+            selected_token_idx,
+            target_slot_mapping,
+            kv_group=kv_group,
+            explicit_target_mapping=target_slot_mapping is not None,
+        )
+
         if selected_token_idx is not None and not isinstance(
             selected_token_idx, torch.Tensor
         ):
@@ -1398,9 +1539,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 target_slot_mapping = torch.tensor(
                     target_slot_mapping, dtype=torch.long, device=self.kv_device
                 )
-            slot_mapping_packed = target_slot_mapping.reshape(-1).to(
+            slot_mapping_packed = target_slot_mapping.contiguous().reshape(-1).to(
                 device=self.kv_device, dtype=torch.long
             )
+            if selected_token_idx is not None:
+                selected_token_idx = selected_token_idx.contiguous().reshape(-1)
             selected_token_idx = self._sparse_selected_token_idx(
                 selected_token_idx, slot_mapping_packed.shape[0]
             )
@@ -1485,21 +1628,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         target_slot_mapping: Union[torch.Tensor, list],
+        kv_group: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Use caller-provided target slots for row-wise MTP sparse loads."""
+        self._validate_sparse_load_shape_contract(
+            selected_token_idx,
+            target_slot_mapping,
+            kv_group=kv_group,
+            explicit_target_mapping=True,
+        )
         if selected_token_idx is None:
             selected_token_idx = []
         if not isinstance(selected_token_idx, torch.Tensor):
             selected_token_idx = torch.tensor(
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
-        selected_token_idx = selected_token_idx.reshape(-1)
+        selected_token_idx = selected_token_idx.contiguous().reshape(-1)
 
         if not isinstance(target_slot_mapping, torch.Tensor):
             target_slot_mapping = torch.tensor(
                 target_slot_mapping, dtype=torch.long, device=self.kv_device
             )
-        target_slot_mapping = target_slot_mapping.reshape(-1).to(
+        target_slot_mapping = target_slot_mapping.contiguous().reshape(-1).to(
             device=self.kv_device, dtype=torch.long
         )
         if int(target_slot_mapping.numel()) != int(selected_token_idx.numel()):
@@ -2659,6 +2809,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._pack_sparse_explicit_slot_inputs(
                         selected_token_idx,
                         target_slot_mapping,
+                        kv_group=kv_group,
                     )
                 )
             else:
