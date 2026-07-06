@@ -52,6 +52,15 @@ def _dsa_debug_summary_enabled() -> bool:
     ).lower() in ("summary", "trace", "verbose", "all")
 
 
+def _decode_window_debug_enabled() -> bool:
+    return os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _dsa_validate_kv_enabled() -> bool:
     return os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_KV", "0").lower() in (
         "1",
