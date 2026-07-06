@@ -75,8 +75,14 @@ def test_sparse_pointer_cache_reuse_debug_rejects_stale_ptrs(monkeypatch) -> Non
 def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector._sparse_direct_layer_states = None
-    kvcaches_ref = [(object(), object())]
+    kvcaches_ref = [
+        (
+            torch.zeros((1, 4), dtype=torch.bfloat16),
+            torch.zeros((1, 4), dtype=torch.bfloat16),
+        )
+    ]
     slot_mapping = torch.arange(4, dtype=torch.long)
+    source = torch.zeros(8, dtype=torch.bfloat16)
     prepared = []
 
     def _prepare_state(*args, **kwargs):
@@ -94,7 +100,7 @@ def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
         kvcaches_ref=kvcaches_ref,
         kv_group=0,
         layer_id=0,
-        layer_tensors=[torch.zeros(8, dtype=torch.bfloat16)],
+        layer_tensors=[source],
         slot_mapping_ref=slot_mapping,
         total_tokens=4,
         sparse_kv_format=0,
@@ -105,6 +111,20 @@ def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
         sparse_dsa_hidden_dims=0,
     )
     same = connector._get_or_create_sparse_direct_layer_state(
+        kvcaches_ref=kvcaches_ref,
+        kv_group=0,
+        layer_id=0,
+        layer_tensors=[source],
+        slot_mapping_ref=slot_mapping,
+        total_tokens=4,
+        sparse_kv_format=0,
+        sparse_token_major=False,
+        sparse_vllm_two_major=False,
+        sparse_k_hidden_dims=1,
+        sparse_v_hidden_dims=1,
+        sparse_dsa_hidden_dims=0,
+    )
+    same_shape_new_source = connector._get_or_create_sparse_direct_layer_state(
         kvcaches_ref=kvcaches_ref,
         kv_group=0,
         layer_id=0,
@@ -134,8 +154,9 @@ def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
     )
 
     assert first is same
+    assert same_shape_new_source is not first
     assert changed is not first
-    assert len(prepared) == 2
+    assert len(prepared) == 3
 
 
 def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:

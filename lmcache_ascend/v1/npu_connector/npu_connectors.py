@@ -1377,11 +1377,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_dsa_hidden_dims: int,
     ) -> tuple:
         """Metadata that must match to reuse SparseDirectLayerState."""
-        first_tensor = layer_tensors[0]
         return (
-            tuple(int(dim) for dim in first_tensor.shape),
-            tuple(int(stride) for stride in first_tensor.stride()),
-            first_tensor.dtype,
+            tuple(
+                VLLMPagedMemLayerwiseNPUConnector._tensor_identity_signature(
+                    tensor
+                )
+                for tensor in layer_tensors
+            ),
             int(slot_mapping_ref.numel()),
             slot_mapping_ref.dtype,
             str(slot_mapping_ref.device),
@@ -1392,6 +1394,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int(sparse_k_hidden_dims),
             int(sparse_v_hidden_dims),
             int(sparse_dsa_hidden_dims),
+        )
+
+    @staticmethod
+    def _tensor_identity_signature(tensor) -> tuple:
+        if isinstance(tensor, torch.Tensor):
+            return (
+                int(tensor.data_ptr()),
+                tuple(int(dim) for dim in tensor.shape),
+                tuple(int(stride) for stride in tensor.stride()),
+                tensor.dtype,
+                str(tensor.device),
+            )
+        return (type(tensor).__name__, id(tensor))
+
+    @staticmethod
+    def _tensor_collection_identity_signature(value) -> tuple:
+        if isinstance(value, (tuple, list)):
+            return tuple(
+                VLLMPagedMemLayerwiseNPUConnector._tensor_identity_signature(
+                    tensor
+                )
+                for tensor in value
+            )
+        return (
+            VLLMPagedMemLayerwiseNPUConnector._tensor_identity_signature(value),
         )
 
     def _sparse_direct_state_key(
@@ -1427,7 +1454,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
-        return (id(kvcaches_ref), kv_group, layer_id, source_signature)
+        vllm_signature = self._tensor_collection_identity_signature(
+            kvcaches_ref[layer_id]
+        )
+        return (
+            id(kvcaches_ref),
+            kv_group,
+            layer_id,
+            vllm_signature,
+            source_signature,
+        )
 
     def _get_or_create_sparse_direct_layer_state(
         self,
