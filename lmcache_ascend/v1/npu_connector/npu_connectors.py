@@ -3214,8 +3214,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 logger.debug("Finished offloading layer %d", layer_id)
             yield
 
-            if sync:
-                self.store_stream.synchronize()
+            # store_layer publishes the CPU MemoryObjs immediately after the
+            # generator advances, so the layer's D2H copy must be complete
+            # before returning control regardless of the caller's sync hint.
+            self.store_stream.synchronize()
 
         # free the buffer memory
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
