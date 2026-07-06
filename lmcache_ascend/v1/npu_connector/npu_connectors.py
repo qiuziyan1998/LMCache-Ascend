@@ -137,6 +137,41 @@ def _dsa_debug_minmax_count(value: Any) -> Any:
         return f"{type(value).__name__}:minmax_failed:{exc}"
 
 
+def _decode_window_debug_enabled() -> bool:
+    return os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _decode_window_debug_sample(value: Any) -> Any:
+    return _dsa_debug_sample(value, limit=8)
+
+
+def _decode_window_slot_capacity(kvcache: Any) -> Optional[int]:
+    shape = getattr(kvcache, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    try:
+        return int(shape[0]) * int(shape[1])
+    except Exception:
+        return None
+
+
+def _decode_window_slot_oob(slot_mapping: Any, capacity: Optional[int]) -> Any:
+    if capacity is None:
+        return None
+    minmax_count = _dsa_debug_minmax_count(slot_mapping)
+    if not isinstance(minmax_count, tuple) or len(minmax_count) < 2:
+        return None
+    try:
+        return minmax_count[0] < 0 or minmax_count[1] >= capacity
+    except Exception:
+        return None
+
+
 def is_310p():
     global _IS_310P
     if _IS_310P is None:
@@ -1504,6 +1539,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cpu_tensors: Optional[List[torch.Tensor]] = None,
     ) -> None:
         num_sparse = int(selected_token_idx.numel())
+        decode_window_debug = _decode_window_debug_enabled()
         debug_run = _dsa_debug_should_log(self, "run_sparse_direct_layer")
         if debug_run:
             logger.warning(
@@ -1527,7 +1563,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 len(layer_tensors) if layer_tensors is not None else None,
                 len(cpu_tensors) if cpu_tensors is not None else None,
             )
-        if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
+        skip_direct_transfer = (
+            num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0
+        )
+        if decode_window_debug and skip_direct_transfer:
+            logger.warning(
+                "[DECODE_WINDOW_LMC_LOAD] skip layer=%s num_sparse=%s "
+                "total_tokens=%s chunk_ptrs_shape=%s slot_shape=%s "
+                "selected_shape=%s",
+                layer_id,
+                num_sparse,
+                total_tokens,
+                _dsa_debug_shape(chunk_ptrs_npu),
+                _dsa_debug_shape(slot_mapping_packed),
+                _dsa_debug_shape(selected_token_idx),
+            )
+        if skip_direct_transfer:
             return
 
         resolve_tensors = (
@@ -1554,6 +1605,63 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
 
+        decode_window_path = "fast" if layer_state is not None else "direct"
+        target_kvcache = None
+        try:
+            target_kvcache = self.kvcaches[layer_id]
+        except Exception:
+            target_kvcache = None
+        target_capacity = _decode_window_slot_capacity(target_kvcache)
+        if decode_window_debug:
+            logger.warning(
+                "[DECODE_WINDOW_LMC_LOAD] call layer=%s path=%s "
+                "num_sparse=%s total_tokens=%s chunk_size=%s "
+                "chunk_ptrs_shape=%s chunk_ptrs_sample=%s "
+                "slot_shape=%s slot_sample=%s slot_minmax_count=%s "
+                "selected_shape=%s selected_sample=%s selected_minmax_count=%s "
+                "resolve_slot_shape=%s resolve_slot_sample=%s "
+                "resolve_slot_minmax_count=%s kvcache_shape=%s "
+                "kvcache_slot_capacity=%s slot_oob=%s resolve_slot_oob=%s "
+                "layer_tensors=%s cpu_tensors=%s kv_format=%s token_major=%s "
+                "two_major=%s k_hidden=%s v_hidden=%s dsa_hidden=%s "
+                "host_interleaved=%s state_cached_layers=%s",
+                layer_id,
+                decode_window_path,
+                num_sparse,
+                total_tokens,
+                chunk_size,
+                _dsa_debug_shape(chunk_ptrs_npu),
+                _decode_window_debug_sample(chunk_ptrs_npu),
+                _dsa_debug_shape(slot_mapping_packed),
+                _decode_window_debug_sample(slot_mapping_packed),
+                _dsa_debug_minmax_count(slot_mapping_packed),
+                _dsa_debug_shape(selected_token_idx),
+                _decode_window_debug_sample(selected_token_idx),
+                _dsa_debug_minmax_count(selected_token_idx),
+                _dsa_debug_shape(resolve_slot_mapping),
+                _decode_window_debug_sample(resolve_slot_mapping),
+                _dsa_debug_minmax_count(resolve_slot_mapping),
+                _dsa_debug_shape(target_kvcache),
+                target_capacity,
+                _decode_window_slot_oob(slot_mapping_packed, target_capacity),
+                _decode_window_slot_oob(resolve_slot_mapping, target_capacity),
+                len(layer_tensors) if layer_tensors is not None else None,
+                len(cpu_tensors) if cpu_tensors is not None else None,
+                sparse_kv_format,
+                sparse_token_major,
+                sparse_vllm_two_major,
+                sparse_k_hidden_dims,
+                sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims,
+                sparse_host_interleaved,
+                sum(
+                    1
+                    for state in self._sparse_direct_layer_states
+                    if state is not None
+                )
+                if self._sparse_direct_layer_states is not None else None,
+            )
+
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
@@ -1571,6 +1679,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             if state is not None
                         )
                         if self._sparse_direct_layer_states is not None else None,
+                    )
+                if decode_window_debug:
+                    logger.warning(
+                        "[DECODE_WINDOW_LMC_LOAD] op_begin layer=%s path=fast "
+                        "validate_inputs=%s",
+                        layer_id,
+                        validate_inputs,
                     )
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
@@ -1592,6 +1707,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "layer=%s path=direct validate_inputs=None",
                         layer_id,
                     )
+                if decode_window_debug:
+                    logger.warning(
+                        "[DECODE_WINDOW_LMC_LOAD] op_begin layer=%s path=direct "
+                        "validate_inputs=None",
+                        layer_id,
+                    )
                 sparse_mla_dsa_batched_direct_kv_transfer(
                     cpu_tensors,
                     self.kvcaches[layer_id],
@@ -1607,6 +1728,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_dsa_hidden_dims,
                     sparse_host_interleaved,
                     chunk_ptrs_npu,
+                )
+            if decode_window_debug:
+                logger.warning(
+                    "[DECODE_WINDOW_LMC_LOAD] sync_begin layer=%s path=%s",
+                    layer_id,
+                    decode_window_path,
+                )
+                try:
+                    load_stream.synchronize()
+                except Exception:
+                    logger.exception(
+                        "[DECODE_WINDOW_LMC_LOAD] sync_failed layer=%s path=%s",
+                        layer_id,
+                        decode_window_path,
+                    )
+                    raise
+                logger.warning(
+                    "[DECODE_WINDOW_LMC_LOAD] sync_done layer=%s path=%s",
+                    layer_id,
+                    decode_window_path,
                 )
 
         current_stream.wait_stream(load_stream)
