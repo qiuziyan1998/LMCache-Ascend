@@ -1880,10 +1880,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return self._layerwise_token_major(kv_group)
 
     def notify_sparse_memory_objs_updated(self) -> None:
-        """No-op: sparse chunk device ptrs live in ReqMeta and update incrementally."""
+        """Reset fast-path state after sparse source MemoryObjs change.
+
+        Chunk device pointers live in ReqMeta and update incrementally, but
+        SparseDirectLayerState also caches layout derived from a sample source
+        tensor. A new retrieve request can switch from Mooncake materialization
+        to rank0 hot-cache shared views while keeping the same vLLM KV cache,
+        so the state key alone is not enough to prove the source layout is
+        still current.
+        """
+        self._reset_sparse_direct_layer_states()
 
     def invalidate_sparse_chunk_ptr_cache(self) -> None:
-        """No-op: sparse chunk device ptrs live in ReqMeta and update incrementally."""
+        """Reset fast-path state when sparse pointer cache is invalidated."""
+        self._reset_sparse_direct_layer_states()
 
     def _resolve_sparse_chunk_ptrs_npu(
         self,

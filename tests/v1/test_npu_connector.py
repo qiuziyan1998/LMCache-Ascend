@@ -33,6 +33,19 @@ def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
     return connector
 
 
+def test_sparse_memory_update_resets_fast_direct_state() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_direct_layer_states = {(123, 0, 0): object()}
+    connector._sparse_direct_kvcaches_id = 123
+    connector._sparse_direct_validated_layers = {(0, 0)}
+
+    connector.notify_sparse_memory_objs_updated()
+
+    assert connector._sparse_direct_layer_states is None
+    assert connector._sparse_direct_kvcaches_id is None
+    assert connector._sparse_direct_validated_layers == set()
+
+
 def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
     """Sparse selected-token load uses slot_mapping as destination rows.
 
