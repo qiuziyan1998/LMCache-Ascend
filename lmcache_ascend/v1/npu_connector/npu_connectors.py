@@ -23,6 +23,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
+    batched_fused_sparse_single_layer_kv_transfer,
     batched_fused_single_layer_kv_transfer,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
@@ -46,6 +47,12 @@ _SPARSE_DIRECT_RECORD_STREAM = os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 _SPARSE_POINTER_CACHE_REUSE_VALIDATE_NULLS = os.getenv(
     "LMCACHE_ASCEND_SPARSE_PTR_REUSE_VALIDATE_NULLS", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_PTR_REUSE_VALIDATE_PTRS", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_DIRECT_DISABLE = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
 
 _IS_310P = None
@@ -1770,6 +1777,109 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"{selected_summary} {slot_summary}"
             )
 
+    def _run_sparse_staging_kv_transfer_layer(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        load_stream: torch.cuda.Stream,
+        current_stream: torch.cuda.Stream,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        layer_tensors: List[torch.Tensor],
+        payload_event: Optional[Any] = None,
+        explicit_sparse_payload: bool = False,
+    ) -> None:
+        """Diagnostic fallback: CPU chunks -> NPU staging -> paged KV.
+
+        This keeps the same sparse source rows and target slots as the direct
+        registered-host path, but routes data through the older staging kernel.
+        It is intentionally behind LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE because
+        it is slower and uses a full retrieved-token staging buffer.
+        """
+        num_sparse = int(selected_token_idx.numel())
+        if num_sparse == 0 or not layer_tensors:
+            return
+
+        chunk_offsets: list[int] = []
+        chunk_sizes: list[int] = []
+        covered_tokens = 0
+        for tensor in layer_tensors:
+            chunk_tokens = self._lmc_plane_num_tokens(tensor, kv_group)
+            chunk_offsets.append(covered_tokens)
+            chunk_sizes.append(chunk_tokens)
+            covered_tokens += chunk_tokens
+
+        if total_tokens <= 0:
+            total_tokens = covered_tokens
+        if covered_tokens < int(total_tokens):
+            raise ValueError(
+                "Sparse staging fallback has insufficient CPU chunk tokens: "
+                f"kv_group={kv_group} layer_id={layer_id} "
+                f"covered_tokens={covered_tokens} total_tokens={int(total_tokens)}"
+            )
+        if _SPARSE_DIRECT_GUARD:
+            self._validate_sparse_direct_explicit_inputs(
+                kvcaches_ref=kvcaches_ref,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                slot_mapping_packed=slot_mapping_packed,
+                selected_token_idx=selected_token_idx,
+                chunk_size=max(chunk_sizes) if chunk_sizes else 0,
+                total_tokens=covered_tokens,
+                chunk_ptrs_npu=torch.ones(
+                    len(chunk_sizes), dtype=torch.long, device=self.kv_device
+                ),
+            )
+
+        expected_fmt = self._expected_memory_format(kv_group)
+        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
+        try:
+            tmp_gpu_buffer_obj, staging_tensor = (
+                self._allocate_layerwise_staging_buffer(
+                    num_tokens=covered_tokens,
+                    kv_group=kv_group,
+                    layout=self._group_layout(kv_group),
+                    k_hidden_dims=sparse_k_hidden_dims,
+                    v_hidden_dims=sparse_v_hidden_dims,
+                    dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    expected_fmt=expected_fmt,
+                )
+            )
+            with torch.cuda.stream(load_stream):
+                load_stream.wait_stream(current_stream)
+                if payload_event is not None:
+                    load_stream.wait_event(payload_event)
+                assert staging_tensor is not None
+                batched_fused_sparse_single_layer_kv_transfer(
+                    layer_tensors,
+                    staging_tensor,
+                    kvcaches_ref[layer_id],
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    chunk_offsets,
+                    chunk_sizes,
+                    sparse_kv_format,
+                    sparse_token_major,
+                    sparse_vllm_two_major,
+                    sparse_k_hidden_dims,
+                    sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims,
+                )
+        finally:
+            current_stream.wait_stream(load_stream)
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -1995,6 +2105,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer_id: int,
         cpu_tensors: List[torch.Tensor],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
+        cached_chunk_dev_ptrs: Optional[List[List[int]]] = None,
     ) -> torch.Tensor:
         num_chunks = len(cpu_tensors)
         if (
@@ -2025,6 +2136,36 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "Ascend sparse pointer-cache reuse failed: cached NPU "
                         f"pointer tensor contains a null pointer at layer {layer_id}."
                     )
+                if _SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS:
+                    expected_dev_ptrs = [
+                        self._resolve_registered_cpu_tensor_device_ptr(
+                            tensor,
+                            layer_id=layer_id,
+                            chunk_index=chunk_index,
+                            source="_resolve_sparse_chunk_ptrs_npu_validate",
+                        )
+                        for chunk_index, tensor in enumerate(cpu_tensors)
+                    ]
+                    cached_dev_ptrs = None
+                    if (
+                        cached_chunk_dev_ptrs is not None
+                        and layer_id < len(cached_chunk_dev_ptrs)
+                    ):
+                        cached_dev_ptrs = cached_chunk_dev_ptrs[layer_id]
+                    if cached_dev_ptrs != expected_dev_ptrs:
+                        cached_values = [
+                            int(value)
+                            for value in cached.detach().to(device="cpu").tolist()
+                        ]
+                        raise RuntimeError(
+                            "Ascend sparse pointer-cache reuse failed: cached "
+                            "device pointers do not match current CPU tensors "
+                            "before direct kernel launch. "
+                            f"layer_id={layer_id}, "
+                            f"cached_chunk_dev_ptrs={cached_dev_ptrs}, "
+                            f"expected_dev_ptrs={expected_dev_ptrs}, "
+                            f"cached_npu_values={cached_values}"
+                        )
                 return cached
 
         dev_ptrs = [
@@ -2756,6 +2897,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
             "cached_tensors"
         )
+        cached_chunk_dev_ptrs: Optional[List[List[int]]] = kwargs.get(
+            "cached_chunk_dev_ptrs"
+        )
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = kwargs.get(
             "cached_chunk_ptrs_npu"
         )
@@ -2854,6 +2998,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layer_id,
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
+                cached_chunk_dev_ptrs,
             )
             if lmcache_cached_tokens > 0:
                 total_tokens = lmcache_cached_tokens
@@ -2862,33 +3007,54 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors, kv_group
                 )
 
-            self._run_sparse_direct_kv_transfer_layer(
-                kvcaches_ref=kvcaches_snapshot,
-                kv_group=kv_group,
-                layer_id=layer_id,
-                load_stream=self.load_stream_list[load_stream_idx],
-                current_stream=current_stream,
-                slot_mapping_packed=slot_mapping_packed,
-                selected_token_idx=selected_token_idx,
-                chunk_size=chunk_size,
-                total_tokens=total_tokens,
-                chunk_ptrs_npu=chunk_ptrs_npu,
-                sparse_kv_format=sparse_kv_format,
-                sparse_token_major=sparse_token_major,
-                sparse_vllm_two_major=sparse_vllm_two_major,
-                sparse_k_hidden_dims=sparse_k_hidden_dims,
-                sparse_v_hidden_dims=sparse_v_hidden_dims,
-                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-                sparse_host_interleaved=sparse_host_interleaved,
-                layer_tensors=cpu_tensors,
-                slot_mapping_ref=(
-                    slot_mapping_packed
-                    if explicit_sparse_payload else slot_mapping
-                ),
-                cpu_tensors=cpu_tensors,
-                payload_event=payload_event,
-                explicit_sparse_payload=explicit_sparse_payload,
-            )
+            if _SPARSE_DIRECT_DISABLE:
+                self._run_sparse_staging_kv_transfer_layer(
+                    kvcaches_ref=kvcaches_snapshot,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    load_stream=self.load_stream_list[load_stream_idx],
+                    current_stream=current_stream,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    total_tokens=total_tokens,
+                    sparse_kv_format=sparse_kv_format,
+                    sparse_token_major=sparse_token_major,
+                    sparse_vllm_two_major=sparse_vllm_two_major,
+                    sparse_k_hidden_dims=sparse_k_hidden_dims,
+                    sparse_v_hidden_dims=sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    layer_tensors=cpu_tensors,
+                    payload_event=payload_event,
+                    explicit_sparse_payload=explicit_sparse_payload,
+                )
+            else:
+                self._run_sparse_direct_kv_transfer_layer(
+                    kvcaches_ref=kvcaches_snapshot,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    load_stream=self.load_stream_list[load_stream_idx],
+                    current_stream=current_stream,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    sparse_kv_format=sparse_kv_format,
+                    sparse_token_major=sparse_token_major,
+                    sparse_vllm_two_major=sparse_vllm_two_major,
+                    sparse_k_hidden_dims=sparse_k_hidden_dims,
+                    sparse_v_hidden_dims=sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    layer_tensors=cpu_tensors,
+                    slot_mapping_ref=(
+                        slot_mapping_packed
+                        if explicit_sparse_payload else slot_mapping
+                    ),
+                    cpu_tensors=cpu_tensors,
+                    payload_event=payload_event,
+                    explicit_sparse_payload=explicit_sparse_payload,
+                )
 
         yield
 
