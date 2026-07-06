@@ -1129,6 +1129,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         req_id = kwargs.get("req_id", "unspecified")
         phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        cached_keys = kwargs.get("cached_keys")
+        cached_starts = kwargs.get("cached_starts")
+        cached_ends = kwargs.get("cached_ends")
         cached_memory_objs = kwargs.get("cached_memory_objs")
         cached_tensors = kwargs.get("cached_tensors")
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
@@ -1161,7 +1164,26 @@ class AscendLMCacheEngine(LMCacheEngine):
         next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
+        passive_views_handed_off = False
+        passive_metadata_cached = False
         expected_handle_count: Optional[int] = None
+
+        def append_passive_chunk_metadata() -> None:
+            nonlocal passive_metadata_cached
+            if passive_metadata_cached or expected_handle_count is None:
+                return
+            passive_metadata_cached = True
+            if cached_starts is not None and not cached_starts:
+                cached_starts.extend(starts[:expected_handle_count])
+            if cached_ends is not None and not cached_ends:
+                cached_ends.extend(ends[:expected_handle_count])
+            if cached_keys is not None and not cached_keys:
+                cached_keys.extend([] for _ in range(self.num_layers))
+                for cache_layer_id, layer_keys in enumerate(keys_layer_major):
+                    cached_keys[cache_layer_id].extend(
+                        layer_keys[:expected_handle_count]
+                    )
+
         try:
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
@@ -1204,6 +1226,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             strict=False,
                         ):
                             ret_mask[start:end] = True
+                        append_passive_chunk_metadata()
                     elif len(envelope.handles) != expected_handle_count:
                         raise ValueError(
                             "Sparse shared CPU passive received inconsistent "
@@ -1254,8 +1277,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             if mem_obj.is_valid():
                                 mem_obj.ref_count_down()
                         raise
-                    if cached_memory_objs is None:
-                        to_release.extend(mem_objs_layer)
+                    to_release.extend(mem_objs_layer)
                     self._append_shared_handle_cache(
                         layer_id,
                         envelope.handles,
@@ -1276,11 +1298,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
 
             next(mem_obj_consumer)
+            passive_views_handed_off = (
+                cached_memory_objs is not None and cached_keys is not None
+            )
             yield ret_mask
         finally:
-            for mem_obj in to_release:
-                if mem_obj.is_valid():
-                    mem_obj.ref_count_down()
+            if not passive_views_handed_off:
+                for mem_obj in to_release:
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
 
     def retrieve_layer_head_token_wise(
         self,

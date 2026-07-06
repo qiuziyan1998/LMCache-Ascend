@@ -318,6 +318,7 @@ def test_sparse_passive_public_path_accepts_ret_mask_kwarg(monkeypatch):
 
     key = _make_key()
     mem_obj = _FakeTensorMemObj(torch.empty(1))
+    handle = object()
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     engine.gpu_connector = _FakeSparseConsumer()
@@ -343,7 +344,7 @@ def test_sparse_passive_public_path_accepts_ret_mask_kwarg(monkeypatch):
         kv_group=0,
         status="ok",
         generation=7,
-        handles=[object()],
+        handles=[handle],
     )
     ret_mask = torch.ones(1, dtype=torch.bool)
 
@@ -363,6 +364,132 @@ def test_sparse_passive_public_path_accepts_ret_mask_kwarg(monkeypatch):
 
     assert yielded is ret_mask
     assert ret_mask.tolist() == [False]
+
+
+def test_sparse_passive_populates_metadata_and_hands_off_views(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key = _make_key()
+    mem_obj = _FakeTensorMemObj(torch.empty(1))
+    handle = object()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+        request_id="req-1",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="ok",
+        generation=7,
+        handles=[handle],
+    )
+    cached_keys = []
+    cached_starts = []
+    cached_ends = []
+    cached_memory_objs = []
+    cached_tensors = []
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
+    cached_shared_handles = []
+
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_keys=cached_keys,
+        cached_starts=cached_starts,
+        cached_ends=cached_ends,
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=cached_tensors,
+        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+        cached_shared_handles=cached_shared_handles,
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert cached_keys == [[key.get_first_layer()]]
+    assert cached_starts == [0]
+    assert cached_ends == [1]
+    assert cached_memory_objs == [[mem_obj]]
+    assert cached_shared_handles == [[handle]]
+    assert mem_obj.release_count == 0
+    assert mem_obj.is_valid()
+
+
+def test_sparse_passive_close_before_handoff_releases_views(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key = _make_key()
+    mem_obj = _FakeTensorMemObj(torch.empty(1))
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+        request_id="req-1",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="ok",
+        generation=7,
+        handles=[object()],
+    )
+
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=[],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert mem_obj.release_count == 1
+    assert not mem_obj.is_valid()
 
 
 def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
