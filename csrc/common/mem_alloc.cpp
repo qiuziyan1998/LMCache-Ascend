@@ -5,6 +5,7 @@
 #include <cstring> // for strerror
 #include <errno.h>
 #include <fcntl.h>
+#include <limits>
 #include <numaif.h>
 #include <stdexcept>
 #include <string>
@@ -108,6 +109,22 @@ static void first_touch(void *p, size_t size) {
   }
 }
 
+static void reserve_shm_storage(int fd, std::size_t size,
+                                const std::string &shm_name) {
+  if (size > static_cast<std::size_t>(std::numeric_limits<off_t>::max())) {
+    throw std::runtime_error("shm size exceeds off_t max for " + shm_name);
+  }
+  int err = posix_fallocate(fd, 0, static_cast<off_t>(size));
+  if (err != 0) {
+    throw std::runtime_error(
+        std::string("posix_fallocate failed for ") + shm_name +
+        " before first_touch (not enough /dev/shm space or quota for shared "
+        "CPU cache slab; reduce max_local_cpu_size/shared_cpu_cache_size_gb "
+        "or increase /dev/shm): " +
+        strerror(err));
+  }
+}
+
 uintptr_t alloc_shm_pinned_ptr(std::size_t size, const std::string &shm_name) {
   if (size == 0) {
     throw std::runtime_error("alloc_shm_pinned_ptr requires size > 0 for " +
@@ -133,6 +150,14 @@ uintptr_t alloc_shm_pinned_ptr(std::size_t size, const std::string &shm_name) {
     shm_unlink(shm_name.c_str());
     throw std::runtime_error(std::string("ftruncate failed for ") + shm_name +
                              ": " + strerror(err));
+  }
+
+  try {
+    reserve_shm_storage(fd, size, shm_name);
+  } catch (...) {
+    close(fd);
+    shm_unlink(shm_name.c_str());
+    throw;
   }
 
   void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
