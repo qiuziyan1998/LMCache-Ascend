@@ -1676,12 +1676,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert preflight_error is not None
             raise preflight_error
 
-        mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
-        notify_fn = getattr(self.gpu_connector, "notify_sparse_memory_objs_updated", None)
-        if notify_fn is not None and not use_cached_retrieve:
-            notify_fn()
-        next(mem_obj_consumer)
-
         pending_pre_resolved_release: List[MemoryObj] = []
         if (
             shared_sparse_retrieve
@@ -1713,6 +1707,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if mem_obj.is_valid():
                     mem_obj.ref_count_down()
             pending_pre_resolved_release = []
+
+        sparse_memory_objs_notified = False
+
+        def ensure_mem_obj_consumer():
+            nonlocal mem_obj_consumer, sparse_memory_objs_notified
+            if mem_obj_consumer is not None:
+                return mem_obj_consumer
+            mem_obj_consumer = (
+                self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+            )
+            notify_fn = getattr(
+                self.gpu_connector,
+                "notify_sparse_memory_objs_updated",
+                None,
+            )
+            if (
+                notify_fn is not None
+                and not use_cached_retrieve
+                and not sparse_memory_objs_notified
+            ):
+                notify_fn()
+                sparse_memory_objs_notified = True
+            next(mem_obj_consumer)
+            return mem_obj_consumer
 
         try:
             for layer_id in range(self.num_layers):
@@ -1844,9 +1862,9 @@ class AscendLMCacheEngine(LMCacheEngine):
 
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
-                    mem_obj_consumer.send(sparse_payload)
+                    ensure_mem_obj_consumer().send(sparse_payload)
                 else:
-                    mem_obj_consumer.send(
+                    ensure_mem_obj_consumer().send(
                         (
                             mem_objs_layer,
                             selected_tokens,
@@ -1855,7 +1873,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     )
 
-            next(mem_obj_consumer)
+            if mem_obj_consumer is not None:
+                next(mem_obj_consumer)
             release_pending_pre_resolved()
 
             yield ret_mask
