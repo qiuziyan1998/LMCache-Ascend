@@ -44,6 +44,9 @@ _SPARSE_DIRECT_GUARD = os.getenv("LMCACHE_ASCEND_SPARSE_DIRECT_GUARD", "0").lowe
 _SPARSE_DIRECT_RECORD_STREAM = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_RECORD_STREAM", "0"
 ).lower() in ("1", "true", "yes", "on")
+_SPARSE_POINTER_CACHE_REUSE_VALIDATE_NULLS = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_PTR_REUSE_VALIDATE_NULLS", "0"
+).lower() in ("1", "true", "yes", "on")
 
 _IS_310P = None
 def is_310p():
@@ -1910,7 +1913,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         f"kernel launch at layer {layer_id}: "
                         f"device={cached.device}, expected={expected_device}."
                     )
-                if bool(torch.any(cached == 0).item()):
+                if _SPARSE_POINTER_CACHE_REUSE_VALIDATE_NULLS and bool(
+                    torch.any(cached == 0).item()
+                ):
                     raise RuntimeError(
                         "Ascend sparse pointer-cache reuse failed: cached NPU "
                         f"pointer tensor contains a null pointer at layer {layer_id}."
