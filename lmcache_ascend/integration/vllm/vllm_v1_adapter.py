@@ -76,7 +76,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     try:
                         next(layerwise_storer)
                     except Exception:
-                        if self._is_decode_window_save_request(request):
+                        if self._has_decode_window_save(request):
                             logger.exception(
                                 "[DECODE_WINDOW_SAVE] ascend wait_for_save "
                                 "failed: req=%s window=[%s,%s)",
