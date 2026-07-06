@@ -35,6 +35,35 @@ class _FakePinnedMemObj:
         self.release_count += 1
 
 
+class _FakeClaimableMemObj:
+    def __init__(self):
+        self.is_pinned = False
+        self.valid = True
+        self.ref_up_count = 0
+        self.ref_down_count = 0
+        self.pin_count = 0
+        self.unpin_count = 0
+
+    def ref_count_up(self):
+        self.ref_up_count += 1
+
+    def ref_count_down(self):
+        self.ref_down_count += 1
+
+    def pin(self):
+        self.is_pinned = True
+        self.pin_count += 1
+        return True
+
+    def unpin(self):
+        self.is_pinned = False
+        self.unpin_count += 1
+        return True
+
+    def is_valid(self):
+        return self.valid
+
+
 class _FakeSparseConsumer:
     def batched_to_gpu_head_token_wise(self, **_kwargs):
         yield
@@ -346,7 +375,8 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
     )
 
     key = _make_key()
-    cached_memory_objs = [[object()]]
+    mem_obj = _FakeClaimableMemObj()
+    cached_memory_objs = [[mem_obj]]
     cached_shared_handles = []
     broadcasts = []
     engine = object.__new__(AscendLMCacheEngine)
@@ -370,7 +400,15 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
         [1],
         [[key]],
     )
-    engine._make_shared_handles_for_layer = lambda **_kwargs: ["handle"]
+
+    def make_handles(**kwargs):
+        assert kwargs["mem_objs_layer"] == [mem_obj]
+        assert mem_obj.ref_up_count == 1
+        assert mem_obj.pin_count == 1
+        assert mem_obj.is_pinned
+        return ["handle"]
+
+    engine._make_shared_handles_for_layer = make_handles
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
 
     retriever = engine.retrieve_layer_head_token_wise(
@@ -389,11 +427,81 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
 
     next(retriever)
     retriever.send(([0], 0))
+    retriever.close()
 
     assert len(broadcasts) == 1
     assert broadcasts[0].status == "ok"
     assert broadcasts[0].handles == ["handle"]
     assert cached_shared_handles == [["handle"]]
+    assert mem_obj.ref_up_count == 1
+    assert mem_obj.pin_count == 1
+    assert mem_obj.ref_down_count == 0
+    assert mem_obj.unpin_count == 0
+
+
+def test_sparse_rank0_cached_publication_failure_releases_claim(monkeypatch):
+    """Failed cached-object publication must release its request pin/ref."""
+
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key = _make_key()
+    mem_obj = _FakeClaimableMemObj()
+    broadcasts = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.storage_manager = object()
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = AscendLMCacheEngine._has_retrieve_data_cache
+    engine._retrieve_data_cache_covers = (
+        AscendLMCacheEngine._retrieve_data_cache_covers
+    )
+    engine._min_layer_cache_chunks = AscendLMCacheEngine._min_layer_cache_chunks
+    engine._resolve_local_cpu_retrieve_location = lambda location: location
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0],
+        [1],
+        [[key]],
+    )
+    engine._make_shared_handles_for_layer = lambda **_kwargs: (_ for _ in ()).throw(
+        ValueError("publish failed")
+    )
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[[key]],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=[[mem_obj]],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    with pytest.raises(ValueError, match="publish failed"):
+        retriever.send(([0], 0))
+
+    assert mem_obj.ref_up_count == 1
+    assert mem_obj.pin_count == 1
+    assert mem_obj.unpin_count == 1
+    assert mem_obj.ref_down_count == 1
+    assert broadcasts
+    assert broadcasts[-1].status == "error"
+    assert "handle publication failed" in broadcasts[-1].message
 
 
 def test_sparse_rank0_hot_shared_handles_do_not_republish(monkeypatch):

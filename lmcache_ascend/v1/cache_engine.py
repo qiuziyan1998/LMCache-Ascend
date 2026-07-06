@@ -1721,6 +1721,53 @@ class AscendLMCacheEngine(LMCacheEngine):
                     mem_obj.ref_count_down()
             pending_pre_resolved_release = []
 
+        published_cached_shared_mem_objs: List[MemoryObj] = []
+        cached_publication_handed_off = False
+
+        def claim_cached_shared_mem_objs_for_publication(
+            mem_objs_layer: List[MemoryObj],
+        ) -> None:
+            """Take the request pin/ref needed by rank0 handle publication."""
+            for mem_obj in mem_objs_layer:
+                try:
+                    mem_obj.ref_count_up()
+                except Exception as exc:
+                    raise ValueError(
+                        "Shared CPU sparse decode cached MemoryObj cannot be "
+                        "retained before handle publication."
+                    ) from exc
+                try:
+                    pinned = mem_obj.pin()
+                    if pinned is False:
+                        raise ValueError("MemoryObj.pin() returned False")
+                except Exception:
+                    try:
+                        if getattr(mem_obj, "is_valid", lambda: True)():
+                            mem_obj.ref_count_down()
+                    except Exception:
+                        logger.exception(
+                            "Failed to release cached shared MemoryObj after "
+                            "publication pin failure"
+                        )
+                    raise
+                published_cached_shared_mem_objs.append(mem_obj)
+
+        def release_unowned_cached_publication_objs() -> None:
+            if cached_publication_handed_off:
+                return
+            for mem_obj in reversed(published_cached_shared_mem_objs):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if getattr(mem_obj, "is_valid", lambda: True)():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release cached shared MemoryObj after "
+                        "handle publication failure"
+                    )
+            published_cached_shared_mem_objs.clear()
+
         sparse_memory_objs_notified = False
 
         def ensure_mem_obj_consumer():
@@ -1840,23 +1887,27 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         )
                         raise ValueError(message)
-                    handles = self._make_shared_handles_for_layer(
-                        req_id=kwargs.get("req_id", "unspecified"),
-                        phase=kwargs.get(
-                            "shared_cpu_phase", "sparse_decode_bootstrap"
-                        ),
-                        keys_layer=retrieve_keys[layer_id],
-                        mem_objs_layer=mem_objs_layer,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                    )
-                    self._append_shared_handle_cache(
-                        layer_id,
-                        handles,
-                        cached_shared_handles,
-                    )
-                    self._broadcast_shared_envelope(
-                        SharedHandleEnvelope(
+                    try:
+                        if cached_mem_layers is not None:
+                            claim_cached_shared_mem_objs_for_publication(
+                                mem_objs_layer
+                            )
+                        handles = self._make_shared_handles_for_layer(
+                            req_id=kwargs.get("req_id", "unspecified"),
+                            phase=kwargs.get(
+                                "shared_cpu_phase", "sparse_decode_bootstrap"
+                            ),
+                            keys_layer=retrieve_keys[layer_id],
+                            mem_objs_layer=mem_objs_layer,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                        )
+                        self._append_shared_handle_cache(
+                            layer_id,
+                            handles,
+                            cached_shared_handles,
+                        )
+                        envelope = SharedHandleEnvelope(
                             request_id=kwargs.get("req_id", "unspecified"),
                             phase=kwargs.get(
                                 "shared_cpu_phase", "sparse_decode_bootstrap"
@@ -1867,11 +1918,42 @@ class AscendLMCacheEngine(LMCacheEngine):
                             status="ok" if handles else "skipped",
                             generation=self.shared_cpu_cache_generation,
                             handles=handles,
-                            message=None
-                            if handles
-                            else "no sparse decode shared CPU cache chunks selected",
+                            message=(
+                                None
+                                if handles
+                                else "no sparse decode shared CPU cache chunks selected"
+                            ),
                         )
-                    )
+                    except Exception as exc:
+                        message = (
+                            "Shared CPU sparse decode rank0 handle publication "
+                            "failed."
+                        )
+                        try:
+                            self._broadcast_shared_envelope(
+                                self._shared_layerwise_error_envelope(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    request_ordinal=request_ordinal,
+                                    layer_id=layer_id,
+                                    kv_group=kv_group,
+                                    message=message,
+                                    details={
+                                        "error": str(exc),
+                                        "required_chunks": required_chunks,
+                                    },
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to broadcast shared CPU sparse decode "
+                                "handle-publication error envelope"
+                            )
+                        raise
+                    self._broadcast_shared_envelope(envelope)
 
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
@@ -1889,9 +1971,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
             release_pending_pre_resolved()
+            # The LMCache vLLM adapter records request state after this final
+            # yield and drains sparse retrievers with close(), so ownership must
+            # be handed off before yielding.
+            cached_publication_handed_off = True
 
             yield ret_mask
         finally:
+            release_unowned_cached_publication_objs()
             release_pending_pre_resolved()
 
 
