@@ -278,6 +278,64 @@ def test_sparse_rank0_close_after_prime_releases_pre_resolved_memobjs(
     assert all(obj.ref_count == 0 for obj in allocated)
 
 
+def test_sparse_passive_public_path_accepts_ret_mask_kwarg(monkeypatch):
+    """Passive sparse retrieve receives ret_mask once, not both ways."""
+
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key = _make_key()
+    mem_obj = _FakeTensorMemObj(torch.empty(1))
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: True
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+        request_id="req-1",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="ok",
+        generation=7,
+        handles=[object()],
+    )
+    ret_mask = torch.ones(1, dtype=torch.bool)
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        ret_mask=ret_mask,
+        cached_memory_objs=[],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    yielded = next(retriever)
+
+    assert yielded is ret_mask
+    assert ret_mask.tolist() == [False]
+
+
 def test_sparse_pointer_cache_reuse_rejects_invalid_dtype():
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")

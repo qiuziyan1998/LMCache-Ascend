@@ -1361,11 +1361,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             and self._is_passive()
             and not has_shared_cached_retrieve
         ):
+            passive_kwargs = dict(kwargs)
+            passive_kwargs.pop("ret_mask", None)
             yield from self._retrieve_layer_head_token_wise_shared_passive(
                 tokens,
                 mask,
                 ret_mask,
-                **kwargs,
+                **passive_kwargs,
             )
             return
 
