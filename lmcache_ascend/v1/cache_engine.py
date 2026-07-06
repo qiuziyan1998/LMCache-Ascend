@@ -1431,6 +1431,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._min_layer_cache_chunks(cached_memory_objs, self.num_layers),
             )
 
+        cached_shared_handles_cover = self._retrieve_data_cache_covers(
+            cached_shared_handles,
+            self.num_layers,
+            required_chunks,
+        )
+        publish_shared_handles = (
+            shared_sparse_retrieve
+            and not self._is_passive()
+            and not cached_shared_handles_cover
+        )
+
         if use_cached_retrieve:
             location = self._resolve_local_cpu_retrieve_location(location)
             if location is not None:
@@ -1758,7 +1769,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
                 if (
                     shared_sparse_retrieve
-                    and not use_cached_retrieve
+                    and (not use_cached_retrieve or publish_shared_handles)
                     and request_preflight_failed_elsewhere()
                 ):
                     release_pending_pre_resolved()
@@ -1809,11 +1820,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     else:
                         mem_objs_layer = []
 
-                if shared_sparse_retrieve and not use_cached_retrieve:
+                if publish_shared_handles:
                     if required_chunks and not mem_objs_layer:
                         message = (
-                            "Shared CPU sparse decode materialization produced no "
-                            "MemoryObjs for required chunks."
+                            "Shared CPU sparse decode has no MemoryObjs to "
+                            "publish for required chunks."
                         )
                         self._broadcast_shared_envelope(
                             self._shared_layerwise_error_envelope(
