@@ -844,12 +844,42 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             return
 
+        # Get request/rank context before any early return so passive ranks are
+        # visible in diagnostics.
+        req_id = self._get_req_id(kwargs)
+        kv_group = kwargs.get("kv_group", 0)
+        if mask is not None:
+            num_to_store_tokens = torch.sum(mask).item()
+        else:
+            num_to_store_tokens = len(tokens)
+
+        logger.info(
+            "[RANK_STORE_DIAG][store_layer_entry] worker_id=%s req_id=%s "
+            "kv_group=%s num_to_store_tokens=%d total_tokens=%d "
+            "save_only_first_rank=%s save_indexer_only_first_rank=%s "
+            "is_passive=%s is_indexer_passive=%s",
+            self.metadata.worker_id,
+            req_id,
+            kv_group,
+            num_to_store_tokens,
+            len(tokens),
+            getattr(self, "save_only_first_rank", None),
+            getattr(self, "save_indexer_only_first_rank", None),
+            self._is_passive(),
+            self._is_indexer_passive(),
+        )
+
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
         # stores. Closes the known TODO — store_layer had no _is_passive() check,
         # causing duplicate stores on non-rank-0 workers under MLA + layerwise.
         if self._is_passive():
-            logger.debug(
-                "Passive rank (save_only_first_rank), skipping store_layer"
+            logger.info(
+                "[RANK_STORE_DIAG][store_layer_skip_passive] worker_id=%s "
+                "req_id=%s kv_group=%s num_to_store_tokens=%d",
+                self.metadata.worker_id,
+                req_id,
+                kv_group,
+                num_to_store_tokens,
             )
             for layer_id in range(self.num_layers):
                 yield
@@ -861,14 +891,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store_layer operation"
         )
-
-        # Get req_id for logging
-        req_id = self._get_req_id(kwargs)
-
-        if mask is not None:
-            num_to_store_tokens = torch.sum(mask).item()
-        else:
-            num_to_store_tokens = len(tokens)
 
         # KVCache Check logging
         self._log_kvcache_for_check(
@@ -923,18 +945,37 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._ensure_layerwise_connector_layout(**kwargs)
 
         prev_key = 0
-        kv_group = kwargs.get("kv_group", 0)
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs,
-            kv_group=kv_group,
+        for chunk_idx, (start, end, key) in enumerate(
+            self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            )
         ):
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
             # Only check the first layer
-            if self.storage_manager.contains(
+            existing_location = self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
-            ):
+            )
+            logger.info(
+                "[RANK_STORE_DIAG][store_layer_key] worker_id=%s req_id=%s "
+                "kv_group=%s chunk_idx=%d range=%d:%d chunk_hash=%s "
+                "key0=%s exists=%s location=%s",
+                self.metadata.worker_id,
+                req_id,
+                kv_group,
+                chunk_idx,
+                start,
+                end,
+                key.chunk_hash,
+                keys_multi_layer[0],
+                existing_location is not None,
+                existing_location,
+            )
+            if existing_location is not None:
                 continue
 
             # Allocate the memory object
@@ -1052,7 +1093,26 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tot_time * 1000,
                 tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
             )
+            logger.info(
+                "[RANK_STORE_DIAG][store_layer_done] worker_id=%s req_id=%s "
+                "kv_group=%s chunks=%d stored_tokens=%d total_tokens=%d",
+                self.metadata.worker_id,
+                req_id,
+                kv_group,
+                len(keys[0]) if keys else 0,
+                tot_token_num,
+                len(tokens),
+            )
         else:
+            logger.info(
+                "[RANK_STORE_DIAG][store_layer_no_keys] worker_id=%s "
+                "req_id=%s kv_group=%s num_to_store_tokens=%d total_tokens=%d",
+                self.metadata.worker_id,
+                req_id,
+                kv_group,
+                num_to_store_tokens,
+                len(tokens),
+            )
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):

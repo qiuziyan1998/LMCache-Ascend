@@ -72,6 +72,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             assert not self.store_async, (
                 "Layerwise storing is not supported with async store"
             )
+            worker_id = getattr(
+                getattr(self.lmcache_engine, "metadata", None), "worker_id", None
+            )
+            logger.info(
+                "[RANK_STORE_DIAG][wait_for_save_begin] worker_id=%s "
+                "requests=%s storer_keys=%s kv_role=%s",
+                worker_id,
+                [request.req_id for request in connector_metadata.requests],
+                list(self._layerwise_save_storers.keys()),
+                self.kv_role,
+            )
             should_defer_latent = getattr(
                 self, "_should_defer_latent_save_under_tp", None
             )
@@ -79,6 +90,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 pending = getattr(self, "_deferred_latent_pending", set())
                 for request in connector_metadata.requests:
                     if request.req_id in pending:
+                        logger.info(
+                            "[RANK_STORE_DIAG][wait_for_save_flush_deferred] "
+                            "worker_id=%s req_id=%s pending=%s",
+                            worker_id,
+                            request.req_id,
+                            sorted(pending),
+                        )
                         logger.warning(
                             "Flushing deferred MLA latent store in "
                             "wait_for_save fallback: req_id=%s",
@@ -96,11 +114,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     layerwise_storer = self._layerwise_save_storers.pop(
                         storer_key, None
                     )
+                    found_storer = layerwise_storer is not None
                     if layerwise_storer is None and _kv_group == 0:
                         layerwise_storer = self._layerwise_save_storers.pop(
                             request.req_id, None
                         )
                         if layerwise_storer is not None:
+                            found_storer = True
                             logger.warning(
                                 "Draining legacy MLA latent storer key for "
                                 "request %s; expected key=%s. A stale latent "
@@ -108,6 +128,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                 request.req_id,
                                 storer_key,
                             )
+                    logger.info(
+                        "[RANK_STORE_DIAG][wait_for_save_storer] worker_id=%s "
+                        "req_id=%s kv_group=%s storer_key=%s found=%s "
+                        "remaining_keys=%s",
+                        worker_id,
+                        request.req_id,
+                        _kv_group,
+                        storer_key,
+                        found_storer,
+                        list(self._layerwise_save_storers.keys()),
+                    )
                     if layerwise_storer is not None:
                         drain_storer = getattr(
                             self, "_drain_layerwise_storer_fully", None
@@ -119,6 +150,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                 next(layerwise_storer)
                             except StopIteration:
                                 pass
+                        logger.info(
+                            "[RANK_STORE_DIAG][wait_for_save_drain_done] "
+                            "worker_id=%s req_id=%s kv_group=%s",
+                            worker_id,
+                            request.req_id,
+                            _kv_group,
+                        )
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
