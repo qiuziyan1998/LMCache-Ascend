@@ -242,8 +242,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
                 num_tokens = end - start
-                kv_shapes = self.metadata.get_shapes(num_tokens)
-                kv_dtypes = self.metadata.get_dtypes()
+                kv_shapes, kv_dtypes = self._metadata_shapes_dtypes_for_kv_group(
+                    kv_group=kv_group,
+                    num_tokens=num_tokens,
+                )
 
                 # TODO (Jiayi): should be batched in the future
                 memory_obj = self.storage_manager.allocate(
@@ -960,7 +962,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         keys = []
         memory_objs = []
         tot_token_num = 0
-        kv_dtype = self.metadata.kv_dtype
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -971,6 +972,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         prev_key = 0
         kv_group = kwargs.get("kv_group", 0)
+        kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
             kv_group=kv_group,
