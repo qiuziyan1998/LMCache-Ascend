@@ -2069,13 +2069,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
             )
+            total_tokens = self._sparse_total_tokens_from_layer_chunks(cpu_tensors)
             if (
                 use_cached_retrieve
                 and lmcache_cached_tokens > 0
+                and lmcache_cached_tokens != total_tokens
             ):
-                total_tokens = lmcache_cached_tokens
-            else:
-                total_tokens = self._sparse_total_tokens_from_layer_chunks(cpu_tensors)
+                logger.warning(
+                    "[DBG_TOTAL_TOKENS] mismatch lmcache_cached=%d actual=%d "
+                    "cpu_tensors=%d chunk_size=%s",
+                    lmcache_cached_tokens,
+                    total_tokens,
+                    len(cpu_tensors),
+                    chunk_size,
+                )
 
             selected_max = None
             selected_oob = False
