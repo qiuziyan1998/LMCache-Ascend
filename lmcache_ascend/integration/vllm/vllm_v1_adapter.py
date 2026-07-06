@@ -74,7 +74,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
                 if layerwise_storer is not None:
                     try:
-                        next(layerwise_storer)
+                        self._drain_layerwise_storer(layerwise_storer)
                     except Exception:
                         if self._has_decode_window_save(request):
                             logger.exception(

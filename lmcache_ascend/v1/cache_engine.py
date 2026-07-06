@@ -965,16 +965,32 @@ class AscendLMCacheEngine(LMCacheEngine):
         layer_id: int,
         memory_objs: List[List[MemoryObj]],
         cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
     ) -> None:
         if cached_tensors is None:
             return
         while len(cached_tensors) <= layer_id:
             cached_tensors.append([])
-        cached_tensors[layer_id].extend(
+        new_tensors = [
             mem_obj.tensor
             for mem_obj in memory_objs[layer_id]
             if mem_obj.tensor is not None
-        )
+        ]
+        cached_tensors[layer_id].extend(new_tensors)
+        if new_tensors and cached_chunk_dev_ptrs is not None:
+            append_ptrs_fn = getattr(
+                self.gpu_connector,
+                "append_sparse_chunk_ptr_cache_for_layer",
+                None,
+            )
+            if append_ptrs_fn is not None:
+                append_ptrs_fn(
+                    layer_id,
+                    new_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
 
     def _append_retrieve_layer_cache(
         self,
@@ -1377,8 +1393,36 @@ class AscendLMCacheEngine(LMCacheEngine):
                 yield
                 next(mem_obj_generator)
                 self._append_layer_store_tensors(
-                    layer_id, memory_objs, cached_tensors
+                    layer_id,
+                    memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
                 )
+                if kwargs.get("decode_window_save") and _decode_window_debug_enabled():
+                    tensor_chunks = (
+                        len(cached_tensors[layer_id])
+                        if cached_tensors is not None
+                        and layer_id < len(cached_tensors)
+                        else None
+                    )
+                    ptr_chunks = None
+                    if (
+                        cached_chunk_ptrs_npu is not None
+                        and layer_id < len(cached_chunk_ptrs_npu)
+                        and cached_chunk_ptrs_npu[layer_id] is not None
+                    ):
+                        ptr_chunks = int(cached_chunk_ptrs_npu[layer_id].numel())
+                    logger.warning(
+                        "[DECODE_WINDOW_SAVE] cached layer=%s req=%s "
+                        "window=[%s,%s) tensor_chunks=%s ptr_chunks=%s",
+                        layer_id,
+                        req_id,
+                        kwargs.get("decode_window_start"),
+                        kwargs.get("decode_window_end"),
+                        tensor_chunks,
+                        ptr_chunks,
+                    )
                 self._dsa_record_store_digests(
                     req_id=req_id,
                     layer_id=layer_id,
