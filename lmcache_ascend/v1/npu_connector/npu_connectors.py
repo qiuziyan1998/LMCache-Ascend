@@ -1231,8 +1231,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.kv_device: Optional[torch.device] = None
 
         self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
-        # Sparse direct state is keyed by (kv_group, layer_id) so the two
-        # groups never collide even if their layer_id ranges overlap.
+        # Sparse direct state is keyed by kvcaches/group/layer plus source
+        # layout metadata so the two groups never collide and a new source
+        # layout cannot reuse stale host-side kernel config.
         self._sparse_direct_layer_states: Optional[dict] = None
         self._sparse_direct_kvcaches_id: Optional[int] = None
         self._sparse_direct_validated_layers: set = set()
@@ -1355,6 +1356,72 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         return int(dev_ptr)
 
+    @staticmethod
+    def _sparse_direct_source_signature(
+        *,
+        layer_tensors: List[torch.Tensor],
+        slot_mapping_ref: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+    ) -> tuple:
+        """Metadata that must match to reuse SparseDirectLayerState."""
+        first_tensor = layer_tensors[0]
+        return (
+            tuple(int(dim) for dim in first_tensor.shape),
+            tuple(int(stride) for stride in first_tensor.stride()),
+            first_tensor.dtype,
+            int(slot_mapping_ref.numel()),
+            slot_mapping_ref.dtype,
+            str(slot_mapping_ref.device),
+            int(total_tokens),
+            int(sparse_kv_format),
+            bool(sparse_token_major),
+            bool(sparse_vllm_two_major),
+            int(sparse_k_hidden_dims),
+            int(sparse_v_hidden_dims),
+            int(sparse_dsa_hidden_dims),
+        )
+
+    def _sparse_direct_state_key(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        layer_tensors: List[torch.Tensor],
+        slot_mapping_ref: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+    ) -> Optional[tuple]:
+        if kvcaches_ref is None or not layer_tensors:
+            return None
+        if total_tokens <= 0:
+            total_tokens = self._sparse_total_tokens_from_layer_chunks(
+                layer_tensors, kv_group
+            )
+        source_signature = self._sparse_direct_source_signature(
+            layer_tensors=layer_tensors,
+            slot_mapping_ref=slot_mapping_ref,
+            total_tokens=total_tokens,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+        )
+        return (id(kvcaches_ref), kv_group, layer_id, source_signature)
+
     def _get_or_create_sparse_direct_layer_state(
         self,
         *,
@@ -1374,14 +1441,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if kvcaches_ref is None:
             return None
 
-        kvcaches_id = id(kvcaches_ref)
         if self._sparse_direct_layer_states is None:
             self._sparse_direct_layer_states = {}
-
-        state_key = (kvcaches_id, kv_group, layer_id)
-        state = self._sparse_direct_layer_states.get(state_key)
-        if state is not None:
-            return state
 
         if not layer_tensors:
             return None
@@ -1390,6 +1451,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             total_tokens = self._sparse_total_tokens_from_layer_chunks(
                 layer_tensors, kv_group
             )
+
+        state_key = self._sparse_direct_state_key(
+            kvcaches_ref=kvcaches_ref,
+            kv_group=kv_group,
+            layer_id=layer_id,
+            layer_tensors=layer_tensors,
+            slot_mapping_ref=slot_mapping_ref,
+            total_tokens=total_tokens,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+        )
+        assert state_key is not None
+        state = self._sparse_direct_layer_states.get(state_key)
+        if state is not None:
+            return state
 
         vllm_layer_cache = kvcaches_ref[layer_id]
         vllm_tensor_count = (
@@ -1782,7 +1862,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
 
-        validate_key = (kv_group, layer_id)
+        validate_key = self._sparse_direct_state_key(
+            kvcaches_ref=kvcaches_ref,
+            kv_group=kv_group,
+            layer_id=layer_id,
+            layer_tensors=resolve_tensors,
+            slot_mapping_ref=resolve_slot_mapping,
+            total_tokens=total_tokens,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+        )
+        if validate_key is None:
+            validate_key = (kv_group, layer_id)
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if payload_event is not None:

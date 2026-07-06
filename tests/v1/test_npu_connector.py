@@ -46,6 +46,72 @@ def test_sparse_memory_update_resets_fast_direct_state() -> None:
     assert connector._sparse_direct_validated_layers == set()
 
 
+def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_direct_layer_states = None
+    kvcaches_ref = [(object(), object())]
+    slot_mapping = torch.arange(4, dtype=torch.long)
+    prepared = []
+
+    def _prepare_state(*args, **kwargs):
+        state = object()
+        prepared.append(state)
+        return state
+
+    monkeypatch.setattr(
+        npu_connectors,
+        "prepare_sparse_direct_layer_state",
+        _prepare_state,
+    )
+
+    first = connector._get_or_create_sparse_direct_layer_state(
+        kvcaches_ref=kvcaches_ref,
+        kv_group=0,
+        layer_id=0,
+        layer_tensors=[torch.zeros(8, dtype=torch.bfloat16)],
+        slot_mapping_ref=slot_mapping,
+        total_tokens=4,
+        sparse_kv_format=0,
+        sparse_token_major=False,
+        sparse_vllm_two_major=False,
+        sparse_k_hidden_dims=1,
+        sparse_v_hidden_dims=1,
+        sparse_dsa_hidden_dims=0,
+    )
+    same = connector._get_or_create_sparse_direct_layer_state(
+        kvcaches_ref=kvcaches_ref,
+        kv_group=0,
+        layer_id=0,
+        layer_tensors=[torch.zeros(8, dtype=torch.bfloat16)],
+        slot_mapping_ref=slot_mapping,
+        total_tokens=4,
+        sparse_kv_format=0,
+        sparse_token_major=False,
+        sparse_vllm_two_major=False,
+        sparse_k_hidden_dims=1,
+        sparse_v_hidden_dims=1,
+        sparse_dsa_hidden_dims=0,
+    )
+    changed = connector._get_or_create_sparse_direct_layer_state(
+        kvcaches_ref=kvcaches_ref,
+        kv_group=0,
+        layer_id=0,
+        layer_tensors=[torch.zeros(10, dtype=torch.bfloat16)],
+        slot_mapping_ref=slot_mapping,
+        total_tokens=5,
+        sparse_kv_format=0,
+        sparse_token_major=False,
+        sparse_vllm_two_major=False,
+        sparse_k_hidden_dims=1,
+        sparse_v_hidden_dims=1,
+        sparse_dsa_hidden_dims=0,
+    )
+
+    assert first is same
+    assert changed is not first
+    assert len(prepared) == 2
+
+
 def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
     """Sparse selected-token load uses slot_mapping as destination rows.
 
@@ -189,6 +255,8 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     class _TensorLike:
         def __init__(self, numel: int):
             self._numel = numel
+            self.dtype = torch.long
+            self.device = torch.device("cpu")
 
         def numel(self):
             return self._numel
@@ -219,7 +287,7 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         npu_connectors, "sparse_mla_dsa_batched_direct_kv_transfer", _slow
     )
 
-    lmc_chunk = object()
+    lmc_chunk = torch.zeros(8, dtype=torch.bfloat16)
     slot_mapping = _TensorLike(2)
     selected = _TensorLike(2)
     chunk_ptrs = _TensorLike(1)
