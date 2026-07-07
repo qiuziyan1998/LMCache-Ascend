@@ -3280,44 +3280,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         current_stream = torch.npu.current_stream()
 
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = memory_objs[layer_id]
-            # kvcaches -> gpu_buffer -> memobj
-            with torch.npu.stream(self.store_stream):
-                self.store_stream.wait_stream(current_stream)
-                if self.use_gpu:
-                    cpu_tensors = []
-                    for memory_obj in memory_objs_layer:
-                        assert memory_obj.tensor is not None
-                        cpu_tensors.append(memory_obj.tensor)
+        try:
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = memory_objs[layer_id]
+                # kvcaches -> gpu_buffer -> memobj
+                with torch.npu.stream(self.store_stream):
+                    self.store_stream.wait_stream(current_stream)
+                    if self.use_gpu:
+                        cpu_tensors = []
+                        for memory_obj in memory_objs_layer:
+                            assert memory_obj.tensor is not None
+                            cpu_tensors.append(memory_obj.tensor)
 
-                    # Fused transfer: 1 scatter kernel + N D2H memcpy
-                    batched_fused_single_layer_kv_transfer(
-                        cpu_tensors,
-                        staging_tensor,
-                        kvcaches_snapshot[layer_id],
-                        slot_mapping_full,
-                        chunk_offsets,
-                        chunk_sizes,
-                        True,  # from_gpu
-                        kv_format_value,
-                        token_major,
-                        vllm_two_major,
-                        k_hidden_dims,
-                        v_hidden_dims,
-                        dsa_hidden_dims,
-                    )
-                else:
-                    for start, end, memory_obj in zip(
-                        starts, ends, memory_objs_layer, strict=False
-                    ):
-                        assert memory_obj.tensor is not None
-
-                        lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
+                        # Fused transfer: 1 scatter kernel + N D2H memcpy
+                        batched_fused_single_layer_kv_transfer(
+                            cpu_tensors,
+                            staging_tensor,
                             kvcaches_snapshot[layer_id],
-                            slot_mapping[start:end],
-                            True,
+                            slot_mapping_full,
+                            chunk_offsets,
+                            chunk_sizes,
+                            True,  # from_gpu
                             kv_format_value,
                             token_major,
                             vllm_two_major,
@@ -3325,18 +3308,45 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             v_hidden_dims,
                             dsa_hidden_dims,
                         )
-                logger.debug("Finished offloading layer %d", layer_id)
+                    else:
+                        for start, end, memory_obj in zip(
+                            starts, ends, memory_objs_layer, strict=False
+                        ):
+                            assert memory_obj.tensor is not None
+
+                            lmc_ops.single_layer_kv_transfer(
+                                memory_obj.tensor,
+                                kvcaches_snapshot[layer_id],
+                                slot_mapping[start:end],
+                                True,
+                                kv_format_value,
+                                token_major,
+                                vllm_two_major,
+                                k_hidden_dims,
+                                v_hidden_dims,
+                                dsa_hidden_dims,
+                            )
+                    logger.debug("Finished offloading layer %d", layer_id)
+                yield
+
+                # store_layer publishes the CPU MemoryObjs immediately after the
+                # generator advances, so the layer's D2H copy must be complete
+                # before returning control regardless of the caller's sync hint.
+                self.store_stream.synchronize()
+
+            # free the buffer memory
+            if self.use_gpu and tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+                tmp_gpu_buffer_obj = None
             yield
-
-            # store_layer publishes the CPU MemoryObjs immediately after the
-            # generator advances, so the layer's D2H copy must be complete
-            # before returning control regardless of the caller's sync hint.
-            self.store_stream.synchronize()
-
-        # free the buffer memory
-        if self.use_gpu and tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
-        yield
+        finally:
+            if (
+                self.use_gpu
+                and tmp_gpu_buffer_obj is not None
+                and tmp_gpu_buffer_obj.is_valid()
+            ):
+                self.store_stream.synchronize()
+                tmp_gpu_buffer_obj.ref_count_down()
 
 
 class SGLangNPUConnector(SGLangGPUConnector):
