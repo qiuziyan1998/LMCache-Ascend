@@ -504,6 +504,23 @@ class AscendLMCacheEngine(LMCacheEngine):
         if cached_tensors is not None and not cached_tensors:
             cached_tensors.extend([] for _ in range(num_layers))
 
+    @staticmethod
+    def _remove_pending_layerwise_store_objs(
+        cached_memory_objs: Optional[List],
+        pending_store_release: dict[int, MemoryObj],
+    ) -> None:
+        if cached_memory_objs is None or not pending_store_release:
+            return
+        pending_ids = set(pending_store_release)
+        for layer_cache in cached_memory_objs:
+            if not layer_cache:
+                continue
+            layer_cache[:] = [
+                mem_obj
+                for mem_obj in layer_cache
+                if id(mem_obj) not in pending_ids
+            ]
+
     def _append_layer_store_tensors(
         self,
         layer_id: int,
@@ -1223,9 +1240,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for layer_id in range(self.num_layers):
                     yield
                     next(mem_obj_generator)
-                    self._append_layer_store_tensors(
-                        layer_id, memory_objs, cached_tensors
-                    )
                     self.storage_manager.batched_put(
                         keys[layer_id],
                         memory_objs[layer_id],
@@ -1233,6 +1247,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     for mem_obj in memory_objs[layer_id]:
                         pending_store_release.pop(id(mem_obj), None)
+                    self._append_layer_store_tensors(
+                        layer_id, memory_objs, cached_tensors
+                    )
 
                 tot_time = time.perf_counter() - t_start
                 logger.info(
@@ -1254,6 +1271,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                             close_fn()
                         except (GeneratorExit, RuntimeError, ValueError):
                             pass
+                self._remove_pending_layerwise_store_objs(
+                    cached_memory_objs,
+                    pending_store_release,
+                )
                 for mem_obj in list(pending_store_release.values()):
                     if mem_obj.is_valid():
                         mem_obj.ref_count_down()
