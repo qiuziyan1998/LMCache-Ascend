@@ -588,15 +588,30 @@ class AscendLMCacheEngine(LMCacheEngine):
         return len(tokens) > cached_ends[-1]
 
     @staticmethod
+    def _cache_layer_has_entries(layer_cache: Any) -> bool:
+        if layer_cache is None:
+            return False
+        try:
+            return len(layer_cache) > 0
+        except TypeError:
+            return True
+
+    @staticmethod
     def _has_retrieve_data_cache(
         cached_tensors: Optional[List],
         cached_memory_objs: Optional[List],
         num_layers: int,
     ) -> bool:
         if cached_tensors is not None and len(cached_tensors) == num_layers:
-            return any(cached_tensors)
+            return any(
+                AscendLMCacheEngine._cache_layer_has_entries(layer_cache)
+                for layer_cache in cached_tensors
+            )
         if cached_memory_objs is not None and len(cached_memory_objs) == num_layers:
-            return any(cached_memory_objs)
+            return any(
+                AscendLMCacheEngine._cache_layer_has_entries(layer_cache)
+                for layer_cache in cached_memory_objs
+            )
         return False
 
     @staticmethod
