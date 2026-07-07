@@ -1456,6 +1456,7 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         _kvcaches_list=[],
         # storer / retriever state
         _layerwise_save_storers={},
+        _deferred_latent_pending=set(),
         layerwise_retrievers=[],
         _layerwise_retriever_is_sparse=[],
         _worker_retrieve_state={},
@@ -1479,6 +1480,15 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         "_kvcaches_for_group",
         "_num_layers_for_group",
         "_is_dsa_two_groups",
+        "_is_decode_window_save_request",
+        "_layerwise_save_range",
+        "_layerwise_save_storer_key",
+        "_save_storer_key",
+        "_should_defer_latent_save_under_tp",
+        "_drain_layerwise_storer_fully",
+        "_latent_slot_mapping_from_attn_metadata",
+        "_indexer_slot_mapping_from_attn_metadata",
+        "_pad_chunk_local_slot_mapping",
         "_indexer_retrieve_slot_mapping",
         "_request_has_retrieve_tensor_cache",
         "_resolve_store_retrieve_location",
@@ -1539,8 +1549,11 @@ class TestVLLMCallSequence:
                 assert call["kvcaches"] is fake._indexer_kvcaches
             assert call["req_id"] == "r1"
 
-        # Two storers keyed by (req_id, kv_group).
-        assert set(fake._layerwise_save_storers.keys()) == {("r1", 0), ("r1", 1)}
+        # Two storers keyed by request, save range, and kv_group.
+        assert set(fake._layerwise_save_storers.keys()) == {
+            ("r1", "normal_save", 0, 0, 64),
+            ("r1", "normal_save", 1, 0, 64),
+        }
 
         # wait_for_save drains both.
         fake.wait_for_save()
@@ -1646,8 +1659,12 @@ class TestVLLMCallSequence:
         req.cached_ends = [128]
         req.cached_tensors = [[torch.zeros(1)], [torch.zeros(1)]]
 
-        fake._layerwise_save_storers[("r1", 0)] = _long_generator(n=1)
-        fake._layerwise_save_storers[("r1", 1)] = _long_generator(n=1)
+        fake._layerwise_save_storers[
+            ("r1", "normal_save", 0, 0, 128)
+        ] = _long_generator(n=1)
+        fake._layerwise_save_storers[
+            ("r1", "normal_save", 1, 0, 128)
+        ] = _long_generator(n=1)
         meta = LMCacheConnectorMetadata(requests=[req])
         fake._parent = SimpleNamespace(
             _connector_metadata=meta,
@@ -1684,7 +1701,9 @@ class TestVLLMCallSequence:
         # Only one storer (latent), kv_group=0.
         assert len(engine.store_calls) == 1
         assert engine.store_calls[0]["kv_group"] == 0
-        assert set(fake._layerwise_save_storers.keys()) == {("r1", 0)}
+        assert set(fake._layerwise_save_storers.keys()) == {
+            ("r1", "normal_save", 0, 0, 64)
+        }
         fake.wait_for_save()
         assert fake._layerwise_save_storers == {}
 

@@ -78,7 +78,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if callable(should_defer_latent) and should_defer_latent():
                 pending = getattr(self, "_deferred_latent_pending", set())
                 for request in connector_metadata.requests:
-                    if request.req_id in pending:
+                    pending_key = self._layerwise_save_storer_key(request, 0)
+                    if pending_key in pending:
                         logger.warning(
                             "Flushing deferred MLA latent store in "
                             "wait_for_save fallback: req_id=%s",
@@ -89,21 +90,24 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         )
 
             for request in connector_metadata.requests:
-                if self._is_decode_window_save_request(request):
-                    storer_keys = [self._layerwise_save_storer_key(request)]
-                else:
-                    storer_keys = [
-                        self._save_storer_key(request.req_id, _kv_group)
-                        for _kv_group in (0, 1)
-                    ]
+                storer_items = [
+                    (_kv_group, self._layerwise_save_storer_key(request, _kv_group))
+                    for _kv_group in (0, 1)
+                ]
 
-                for storer_key in storer_keys:
+                for _kv_group, storer_key in storer_items:
                     layerwise_storer = self._layerwise_save_storers.pop(
                         storer_key, None
                     )
-                    if layerwise_storer is None and storer_key == self._save_storer_key(
-                        request.req_id, 0
-                    ):
+                    if layerwise_storer is None:
+                        legacy_key = self._save_storer_key(
+                            request.req_id, _kv_group
+                        )
+                        if legacy_key != storer_key:
+                            layerwise_storer = self._layerwise_save_storers.pop(
+                                legacy_key, None
+                            )
+                    if layerwise_storer is None and _kv_group == 0:
                         layerwise_storer = self._layerwise_save_storers.pop(
                             request.req_id, None
                         )
