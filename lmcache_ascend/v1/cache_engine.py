@@ -5,7 +5,10 @@ LMCacheEngine for Ascend NPU.
 """
 
 # Standard
+import hashlib
+import json
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
+import os
 import queue
 import threading
 import time
@@ -32,6 +35,124 @@ logger = init_logger(__name__)
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_debug_summary_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
+    ).lower() in ("summary", "trace", "verbose", "all")
+
+
+def _dsa_validate_kv_enabled() -> bool:
+    return os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_KV", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_validate_dump_dir() -> Optional[str]:
+    value = os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_DUMP_DIR", "").strip()
+    return value or None
+
+
+def _dsa_validate_dump_tensors() -> bool:
+    return os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_DUMP_TENSORS", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_validate_max_records() -> int:
+    try:
+        return max(
+            1,
+            int(os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_MAX_RECORDS", "200000")),
+        )
+    except ValueError:
+        return 200000
+
+
+def _dsa_debug_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
+    except ValueError:
+        return 8
+
+
+def _dsa_debug_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_debug_enabled():
+        return False
+    if not _dsa_debug_summary_enabled():
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_shrink_debug_counts", counts)
+    count = counts.get(site, 0)
+    if count >= _dsa_debug_limit():
+        return False
+    counts[site] = count + 1
+    return True
+
+
+def _dsa_debug_shape(value: Any) -> Any:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
+    if value is None:
+        return None
+    limit = _dsa_debug_limit() if limit is None else limit
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+        return list(value[:limit])
+    except Exception as exc:
+        return f"{type(value).__name__}:sample_failed:{exc}"
+
+
+def _dsa_debug_minmax_count(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            flat = value.detach().reshape(-1)
+            return (
+                flat.min().to(device="cpu").item(),
+                flat.max().to(device="cpu").item(),
+                int(flat.numel()),
+            )
+        seq = list(value)
+        if not seq:
+            return None
+        return (min(seq), max(seq), len(seq))
+    except Exception as exc:
+        return f"{type(value).__name__}:minmax_failed:{exc}"
 
 
 class ThreadSafeEventList:
@@ -112,9 +233,236 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._engine_state_lock = threading.RLock()
 
         self._device_id: Optional[int] = None
+        self._dsa_validate_kv_digests: Dict[str, Dict[str, Any]] = {}
+        self._dsa_validate_kv_order: List[str] = []
 
         if self.kv_events_enabled and self.is_store_async:
             self.kv_events = ThreadSafeEventList()
+
+    def _dsa_validate_key(self, layer_id: int, key: Any) -> str:
+        return f"layer={layer_id}|key={repr(key)}"
+
+    def _dsa_validate_tensor_digest(self, tensor: torch.Tensor) -> Dict[str, Any]:
+        cpu_tensor = tensor.detach()
+        if cpu_tensor.device.type != "cpu":
+            cpu_tensor = cpu_tensor.to(device="cpu")
+        cpu_tensor = cpu_tensor.contiguous()
+        raw = cpu_tensor.view(torch.uint8).numpy().tobytes()
+        return {
+            "shape": tuple(cpu_tensor.shape),
+            "dtype": str(cpu_tensor.dtype),
+            "numel": int(cpu_tensor.numel()),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "sample": cpu_tensor.reshape(-1)[:8].tolist()
+            if cpu_tensor.numel() > 0
+            else [],
+        }
+
+    def _dsa_validate_event(self, event: str, payload: Dict[str, Any]) -> None:
+        dump_dir = _dsa_validate_dump_dir()
+        if not dump_dir:
+            return
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            path = os.path.join(
+                dump_dir,
+                f"dsa_kv_validate_worker_{self.metadata.worker_id}.jsonl",
+            )
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"event": event, **payload}, default=str) + "\n")
+        except Exception:
+            logger.exception("Failed to write DSA KV validation event")
+
+    def _dsa_validate_tensor_dump(
+        self,
+        *,
+        req_id: str,
+        layer_id: int,
+        key: Any,
+        tensor: torch.Tensor,
+        phase: str,
+    ) -> None:
+        if not _dsa_validate_dump_tensors():
+            return
+        dump_dir = _dsa_validate_dump_dir()
+        if not dump_dir:
+            return
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            key_hash = hashlib.sha1(
+                self._dsa_validate_key(layer_id, key).encode("utf-8")
+            ).hexdigest()
+            path = os.path.join(
+                dump_dir,
+                (
+                    f"dsa_kv_{phase}_worker_{self.metadata.worker_id}_"
+                    f"layer_{layer_id}_{key_hash}.pt"
+                ),
+            )
+            cpu_tensor = tensor.detach()
+            if cpu_tensor.device.type != "cpu":
+                cpu_tensor = cpu_tensor.to(device="cpu")
+            torch.save(
+                {
+                    "req_id": req_id,
+                    "layer_id": layer_id,
+                    "key": repr(key),
+                    "tensor": cpu_tensor.contiguous(),
+                },
+                path,
+            )
+        except Exception:
+            logger.exception("Failed to dump DSA KV validation tensor")
+
+    def _dsa_record_store_digests(
+        self,
+        *,
+        req_id: str,
+        layer_id: int,
+        keys: List[Any],
+        memory_objs: List[MemoryObj],
+    ) -> None:
+        if not _dsa_validate_kv_enabled():
+            return
+        max_records = _dsa_validate_max_records()
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            tensor = memory_obj.tensor
+            if tensor is None:
+                self._dsa_validate_event(
+                    "store_missing_tensor",
+                    {
+                        "req_id": req_id,
+                        "layer_id": layer_id,
+                        "key": repr(key),
+                    },
+                )
+                logger.error(
+                    "[DSA_SHRINK_VALIDATE_FAIL] store_missing_tensor "
+                    "req=%s layer=%s key=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                )
+                continue
+            try:
+                digest = self._dsa_validate_tensor_digest(tensor)
+            except Exception as exc:
+                logger.exception(
+                    "[DSA_SHRINK_VALIDATE_FAIL] store_digest_failed "
+                    "req=%s layer=%s key=%s error=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                    exc,
+                )
+                continue
+            record_key = self._dsa_validate_key(layer_id, key)
+            old = self._dsa_validate_kv_digests.get(record_key)
+            payload = {
+                "req_id": req_id,
+                "layer_id": layer_id,
+                "key": repr(key),
+                "digest": digest,
+                "old_digest": old,
+            }
+            if old is not None and old["digest"]["sha256"] != digest["sha256"]:
+                self._dsa_validate_event("store_digest_changed", payload)
+                logger.error(
+                    "[DSA_SHRINK_VALIDATE_FAIL] store_digest_changed "
+                    "req=%s layer=%s key=%s old_sha=%s new_sha=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                    old["digest"]["sha256"],
+                    digest["sha256"],
+                )
+            self._dsa_validate_kv_digests[record_key] = {
+                "req_id": req_id,
+                "layer_id": layer_id,
+                "key": repr(key),
+                "digest": digest,
+            }
+            self._dsa_validate_kv_order.append(record_key)
+            while len(self._dsa_validate_kv_order) > max_records:
+                stale = self._dsa_validate_kv_order.pop(0)
+                self._dsa_validate_kv_digests.pop(stale, None)
+            self._dsa_validate_event("store_digest", payload)
+            self._dsa_validate_tensor_dump(
+                req_id=req_id,
+                layer_id=layer_id,
+                key=key,
+                tensor=tensor,
+                phase="store",
+            )
+
+    def _dsa_check_retrieve_digests(
+        self,
+        *,
+        req_id: str,
+        layer_id: int,
+        keys: List[Any],
+        tensors: List[torch.Tensor],
+    ) -> None:
+        if not _dsa_validate_kv_enabled():
+            return
+        for key, tensor in zip(keys, tensors, strict=False):
+            record_key = self._dsa_validate_key(layer_id, key)
+            expected = self._dsa_validate_kv_digests.get(record_key)
+            if expected is None:
+                payload = {
+                    "req_id": req_id,
+                    "layer_id": layer_id,
+                    "key": repr(key),
+                }
+                self._dsa_validate_event("retrieve_digest_missing", payload)
+                logger.error(
+                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_missing "
+                    "req=%s layer=%s key=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                )
+                continue
+            try:
+                actual = self._dsa_validate_tensor_digest(tensor)
+            except Exception as exc:
+                logger.exception(
+                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_failed "
+                    "req=%s layer=%s key=%s error=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                    exc,
+                )
+                continue
+            if actual["sha256"] != expected["digest"]["sha256"]:
+                payload = {
+                    "req_id": req_id,
+                    "layer_id": layer_id,
+                    "key": repr(key),
+                    "expected": expected,
+                    "actual": actual,
+                }
+                self._dsa_validate_event("retrieve_digest_mismatch", payload)
+                logger.error(
+                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_mismatch "
+                    "req=%s layer=%s key=%s expected_sha=%s actual_sha=%s "
+                    "expected_sample=%s actual_sample=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                    expected["digest"]["sha256"],
+                    actual["sha256"],
+                    expected["digest"].get("sample"),
+                    actual.get("sample"),
+                )
+                self._dsa_validate_tensor_dump(
+                    req_id=req_id,
+                    layer_id=layer_id,
+                    key=key,
+                    tensor=tensor,
+                    phase="retrieve",
+                )
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
@@ -1036,9 +1384,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._append_layer_store_tensors(
                     layer_id, memory_objs, cached_tensors
                 )
+                self._dsa_record_store_digests(
+                    req_id=req_id,
+                    layer_id=layer_id,
+                    keys=keys[layer_id],
+                    memory_objs=memory_objs[layer_id],
+                )
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
+
+            if kwargs.get("decode_window_save"):
+                torch.npu.synchronize()
 
             tot_time = time.perf_counter() - t_start
             logger.info(
@@ -1152,6 +1509,41 @@ class AscendLMCacheEngine(LMCacheEngine):
             retrieve_kwargs=kwargs,
         )
         kwargs.pop("_use_cached_retrieve", None)
+        if _dsa_debug_should_log(self, "head_retrieve_metadata"):
+            slot_mapping = kwargs.get("slot_mapping")
+            logger.warning(
+                "[DSA_SHRINK_CHECK] lmcache_ascend_head_retrieve "
+                "req=%s num_tokens=%s mask_shape=%s mask_minmax_count=%s "
+                "ret_mask_shape=%s ret_mask_minmax_count=%s slot_mapping_shape=%s "
+                "slot_mapping_sample=%s slot_mapping_minmax_count=%s "
+                "vllm_cached=%s lmcache_cached=%s metadata_warm=%s "
+                "use_cached_retrieve=%s cached_tensors_layers=%s "
+                "cached_mem_layers=%s cached_chunk_ptr_layers=%s "
+                "retrieve_key_groups=%s first_layer_chunks=%s starts_sample=%s "
+                "ends_sample=%s location=%s",
+                kwargs.get("req_id"),
+                num_tokens,
+                _dsa_debug_shape(mask),
+                _dsa_debug_minmax_count(mask),
+                _dsa_debug_shape(ret_mask),
+                _dsa_debug_minmax_count(ret_mask),
+                _dsa_debug_shape(slot_mapping),
+                _dsa_debug_sample(slot_mapping),
+                _dsa_debug_minmax_count(slot_mapping),
+                kwargs.get("vllm_cached_tokens"),
+                kwargs.get("lmcache_cached_tokens"),
+                metadata_warm,
+                use_cached_retrieve,
+                len(cached_tensors) if cached_tensors is not None else None,
+                len(cached_memory_objs) if cached_memory_objs is not None else None,
+                len(cached_chunk_ptrs_npu)
+                if cached_chunk_ptrs_npu is not None else None,
+                len(retrieve_keys) if retrieve_keys is not None else None,
+                len(retrieve_keys[0]) if retrieve_keys else 0,
+                _dsa_debug_sample(starts),
+                _dsa_debug_sample(ends),
+                location,
+            )
 
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
         cached_tensors_cover = self._retrieve_data_cache_covers(
