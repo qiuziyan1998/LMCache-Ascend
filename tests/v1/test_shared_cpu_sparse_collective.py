@@ -687,6 +687,45 @@ def test_sparse_rank0_hot_shared_handles_do_not_republish(monkeypatch):
     assert cached_shared_handles == [["existing-handle"]]
 
 
+def test_sparse_retrieve_incomplete_request_cache_fails_loudly():
+    key_layers = _make_key().split_layers(2)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.storage_manager = object()
+    engine.gpu_connector = object()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+    engine._has_retrieve_data_cache = AscendLMCacheEngine._has_retrieve_data_cache
+    engine._retrieve_data_cache_covers = (
+        AscendLMCacheEngine._retrieve_data_cache_covers
+    )
+    engine._min_layer_cache_chunks = AscendLMCacheEngine._min_layer_cache_chunks
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0],
+        [1],
+        [[key_layers[0]], [key_layers[1]]],
+    )
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[[key_layers[0]], [key_layers[1]]],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=[],
+        cached_tensors=[[torch.empty(1)], []],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    with pytest.raises(ValueError, match="retrieve cache is incomplete"):
+        next(retriever)
+
+
 def test_sparse_pointer_cache_reuse_rejects_invalid_dtype():
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")

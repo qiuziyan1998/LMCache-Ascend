@@ -710,6 +710,65 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return None
         return location
 
+    def _cached_layerwise_location_or_raise(
+        self,
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        retrieve_kwargs: Optional[dict],
+    ) -> Optional[str]:
+        if not cached_keys or len(cached_keys) < self.num_layers:
+            return None
+        if not cached_starts or not cached_ends or not cached_keys[0]:
+            return None
+
+        chunk_count = min(
+            len(cached_starts),
+            len(cached_ends),
+            *(len(cached_keys[layer_id]) for layer_id in range(self.num_layers)),
+        )
+        if chunk_count <= 0:
+            return None
+
+        kwargs = retrieve_kwargs or {}
+        req_id = self._get_req_id(kwargs)
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        location: Optional[str] = None
+        for chunk_index in range(chunk_count):
+            keys_multi_layer = [
+                cached_keys[layer_id][chunk_index]
+                for layer_id in range(self.num_layers)
+            ]
+            current_location = self._layerwise_chunk_location_if_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=int(cached_starts[chunk_index]),
+                end=int(cached_ends[chunk_index]),
+            )
+            if current_location is None:
+                raise ValueError(
+                    "Layerwise sparse retrieve metadata is warm but the "
+                    "cached chunk is no longer complete in storage: "
+                    f"req_id={req_id}, kv_group={kv_group}, "
+                    f"chunk_index={chunk_index}, "
+                    f"start={cached_starts[chunk_index]}, "
+                    f"end={cached_ends[chunk_index]}"
+                )
+            if location is None:
+                location = current_location
+            elif location != current_location:
+                raise ValueError(
+                    "Layerwise sparse retrieve metadata is warm but cached "
+                    "chunks span multiple storage locations, which non-shared "
+                    "layerwise retrieve cannot consume safely: "
+                    f"req_id={req_id}, kv_group={kv_group}, "
+                    f"first_location={location}, "
+                    f"current_location={current_location}, "
+                    f"chunk_index={chunk_index}"
+                )
+        return location
+
     def _ensure_retrieve_chunk_metadata(
         self,
         *,
@@ -847,12 +906,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return location, cached_starts, cached_ends, cached_keys
 
             location = retrieve_kwargs.get("cached_retrieve_location")
-            if cached_keys and cached_keys[0]:
+            kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+            shared_rank0_retrieve = (
+                self._should_use_shared_layerwise_retrieve(kv_group)
+                and not self._is_passive()
+            )
+            if cached_keys and cached_keys[0] and not shared_rank0_retrieve:
                 # Prefer the hottest tier (LocalCPUBackend is checked first).
                 # After Mooncake write-back, stale cached_retrieve_location may
                 # still point at RemoteBackend and force slow remote reads.
-                preferred_location = self.storage_manager.contains(
-                    cached_keys[0][0], self.retrieve_locations
+                preferred_location = self._cached_layerwise_location_or_raise(
+                    cached_keys,
+                    cached_starts,
+                    cached_ends,
+                    retrieve_kwargs,
                 )
                 if preferred_location is not None:
                     location = preferred_location
@@ -865,9 +932,23 @@ class AscendLMCacheEngine(LMCacheEngine):
         location = None
         if retrieve_kwargs is not None:
             location = retrieve_kwargs.get("cached_retrieve_location")
-        if location is None and cached_keys and cached_keys[0]:
-            location = self.storage_manager.contains(
-                cached_keys[0][0], self.retrieve_locations
+        kv_group = int((retrieve_kwargs or {}).get("kv_group", 0) or 0)
+        shared_rank0_retrieve = (
+            retrieve_kwargs is not None
+            and self._should_use_shared_layerwise_retrieve(kv_group)
+            and not self._is_passive()
+        )
+        if (
+            location is None
+            and cached_keys
+            and cached_keys[0]
+            and not shared_rank0_retrieve
+        ):
+            location = self._cached_layerwise_location_or_raise(
+                cached_keys,
+                cached_starts,
+                cached_ends,
+                retrieve_kwargs,
             )
             if retrieve_kwargs is not None and location is not None:
                 retrieve_kwargs["cached_retrieve_location"] = location
@@ -995,9 +1076,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
+            if self._layerwise_chunk_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
             ):
                 continue
 
@@ -1465,13 +1549,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
         if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
-            logger.warning(
-                "Layerwise sparse retrieve cache is incomplete; falling back to "
-                "storage get. required_chunks=%d cached_tensor_chunks=%d "
-                "cached_memory_obj_chunks=%d",
-                required_chunks,
-                self._min_layer_cache_chunks(cached_tensors, self.num_layers),
-                self._min_layer_cache_chunks(cached_memory_objs, self.num_layers),
+            raise ValueError(
+                "Layerwise sparse retrieve cache is incomplete; refusing to "
+                "append a duplicate prefix or launch with partial pointer "
+                "state. Drop the request retrieve state and retry from "
+                "storage/shared CPU: "
+                f"req_id={kwargs.get('req_id', 'unspecified')}, "
+                f"kv_group={kv_group}, required_chunks={required_chunks}, "
+                f"cached_tensor_chunks="
+                f"{self._min_layer_cache_chunks(cached_tensors, self.num_layers)}, "
+                f"cached_memory_obj_chunks="
+                f"{self._min_layer_cache_chunks(cached_memory_objs, self.num_layers)}"
             )
 
         cached_shared_handles_cover = self._retrieve_data_cache_covers(
