@@ -1190,6 +1190,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
+            for layer_id in range(self.num_layers):
+                yield
+            # Extra yield consumed by wait_for_save() after the last layer.
+            yield
             return
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0

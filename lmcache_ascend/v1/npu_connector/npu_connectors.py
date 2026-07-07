@@ -2266,14 +2266,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
         kvcaches_len = len(kvcaches_ref) if kvcaches_ref is not None else 0
         if kvcaches_len != self.num_layers:
-            logger.warning(
-                "%s layerwise transfer has mismatched layer counts: "
-                "kv_group=%s connector_num_layers=%s kvcaches_len=%s",
-                operation,
-                kv_group,
-                self.num_layers,
-                kvcaches_len,
+            message = (
+                f"{operation} layerwise transfer has mismatched layer counts: "
+                f"kv_group={kv_group} connector_num_layers={self.num_layers} "
+                f"kvcaches_len={kvcaches_len}"
             )
+            logger.error(
+                "%s. Refusing to continue before memory_objs[layer_id] access.",
+                message,
+            )
+            raise RuntimeError(message)
         if slot_mapping_full is None or slot_mapping_full.numel() == 0:
             return
         if kvcaches_len == 0:
