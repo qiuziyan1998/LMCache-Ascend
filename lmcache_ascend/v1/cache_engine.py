@@ -852,12 +852,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             num_to_store_tokens = torch.sum(mask).item()
         else:
             num_to_store_tokens = len(tokens)
+        kvcaches_len = len(kwargs.get("kvcaches") or [])
 
         logger.info(
             "[RANK_STORE_DIAG][store_layer_entry] worker_id=%s req_id=%s "
             "kv_group=%s num_to_store_tokens=%d total_tokens=%d "
             "save_only_first_rank=%s save_indexer_only_first_rank=%s "
-            "is_passive=%s is_indexer_passive=%s",
+            "is_passive=%s is_indexer_passive=%s engine_num_layers=%s "
+            "kvcaches_len=%s",
             self.metadata.worker_id,
             req_id,
             kv_group,
@@ -867,6 +869,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             getattr(self, "save_indexer_only_first_rank", None),
             self._is_passive(),
             self._is_indexer_passive(),
+            self.num_layers,
+            kvcaches_len,
         )
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
