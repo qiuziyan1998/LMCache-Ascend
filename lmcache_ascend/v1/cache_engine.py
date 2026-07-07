@@ -839,11 +839,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             storage backends. In the last iteration, it puts the memory objects
             of the last layer to the storage backends.
         """
-        # Health check: block operation if LMCache is unhealthy
-        if not self.is_healthy():
-            logger.warning("LMCache is unhealthy, skipping store_layer operation")
-            return
-
         # Get request/rank context before any early return so passive ranks are
         # visible in diagnostics.
         req_id = self._get_req_id(kwargs)
@@ -853,6 +848,23 @@ class AscendLMCacheEngine(LMCacheEngine):
         else:
             num_to_store_tokens = len(tokens)
         kvcaches_len = len(kwargs.get("kvcaches") or [])
+
+        # Health check: block operation if LMCache is unhealthy. Keep the
+        # layerwise generator contract so callers do not hit StopIteration.
+        if not self.is_healthy():
+            logger.warning(
+                "[RANK_STORE_DIAG][store_layer_skip_unhealthy] worker_id=%s "
+                "req_id=%s kv_group=%s num_to_store_tokens=%d total_tokens=%d",
+                self.metadata.worker_id,
+                req_id,
+                kv_group,
+                num_to_store_tokens,
+                len(tokens),
+            )
+            for layer_id in range(self.num_layers):
+                yield
+            yield
+            return
 
         logger.info(
             "[RANK_STORE_DIAG][store_layer_entry] worker_id=%s req_id=%s "
