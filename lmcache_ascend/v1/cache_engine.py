@@ -680,6 +680,41 @@ class AscendLMCacheEngine(LMCacheEngine):
             except TypeError:
                 lazy_init(kvcaches)
 
+    def _expected_shared_cpu_chunk_metadata(
+        self,
+        *,
+        kv_group: int,
+        num_tokens: int,
+    ):
+        """Use Ascend's group-aware connector shape for shared view checks.
+
+        DSA index chunks are allocated with ``gpu_connector.get_shape(...,
+        kv_group=1)``.  Generic LMCache metadata can still describe only the
+        latent group in some startup/passive paths, so using it first makes
+        passive ranks reject valid index handles as latent-shaped objects.
+        """
+        get_shape = getattr(self.gpu_connector, "get_shape", None)
+        if callable(get_shape):
+            try:
+                shape = torch.Size(get_shape(num_tokens, kv_group=kv_group))
+                return (
+                    shape,
+                    self._shared_cpu_dtype_for_kv_group(kv_group),
+                    self._memory_format_for_kv_group(kv_group),
+                )
+            except TypeError:
+                if kv_group == 0:
+                    shape = torch.Size(get_shape(num_tokens))
+                    return (
+                        shape,
+                        self._shared_cpu_dtype_for_kv_group(kv_group),
+                        self._memory_format_for_kv_group(kv_group),
+                    )
+        return super()._expected_shared_cpu_chunk_metadata(
+            kv_group=kv_group,
+            num_tokens=num_tokens,
+        )
+
     def _resolve_local_cpu_retrieve_location(
         self,
         fallback: Optional[str] = None,
