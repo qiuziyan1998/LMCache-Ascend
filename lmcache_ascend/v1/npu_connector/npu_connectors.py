@@ -1495,6 +1495,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
 
+        debug_pack = _dsa_debug_should_log(self, "pack_sparse_layer_inputs")
+        input_selected_shape = _dsa_debug_shape(selected_token_idx)
+        input_selected_sample = _dsa_debug_sample(selected_token_idx)
+        input_selected_minmax = _dsa_debug_minmax_count(selected_token_idx)
+
         if target_slot_mapping is not None:
             if not isinstance(target_slot_mapping, torch.Tensor):
                 target_slot_mapping = torch.tensor(
