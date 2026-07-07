@@ -1397,6 +1397,44 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
 
     @staticmethod
+    def _sparse_direct_pointer_cache_signature(
+        *,
+        chunk_ptrs_npu: torch.Tensor,
+        slot_mapping_ref: torch.Tensor,
+        total_tokens: int,
+        chunk_size: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+    ) -> tuple:
+        """Cheap runtime source identity for the decode hot path.
+
+        The expensive per-CPU-chunk signature is still available for preflight
+        and tests. During decode, chunk_ptrs_npu has already been constructed
+        from the resolved CPU MemoryObjs, so its tensor identity is enough to
+        distinguish the installed source pointer table without walking every
+        chunk again.
+        """
+        return (
+            1,
+            int(chunk_ptrs_npu.data_ptr()),
+            int(chunk_ptrs_npu.numel()),
+            int(slot_mapping_ref.data_ptr()),
+            int(slot_mapping_ref.numel()),
+            int(total_tokens),
+            int(chunk_size),
+            int(sparse_kv_format),
+            int(sparse_token_major),
+            int(sparse_vllm_two_major),
+            int(sparse_k_hidden_dims),
+            int(sparse_v_hidden_dims),
+            int(sparse_dsa_hidden_dims),
+        )
+
+    @staticmethod
     def _tensor_identity_signature(tensor) -> tuple:
         if isinstance(tensor, torch.Tensor):
             return (
@@ -1421,6 +1459,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             VLLMPagedMemLayerwiseNPUConnector._tensor_identity_signature(value),
         )
 
+    @staticmethod
+    def _vllm_layer_cache_identity_signature(value) -> tuple:
+        if isinstance(value, (tuple, list)):
+            return (id(value), len(value))
+        return (id(value),)
+
     def _sparse_direct_state_key(
         self,
         *,
@@ -1436,6 +1480,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_k_hidden_dims: int,
         sparse_v_hidden_dims: int,
         sparse_dsa_hidden_dims: int,
+        source_signature: Optional[tuple] = None,
     ) -> Optional[tuple]:
         if kvcaches_ref is None or not layer_tensors:
             return None
@@ -1443,18 +1488,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             total_tokens = self._sparse_total_tokens_from_layer_chunks(
                 layer_tensors, kv_group
             )
-        source_signature = self._sparse_direct_source_signature(
-            layer_tensors=layer_tensors,
-            slot_mapping_ref=slot_mapping_ref,
-            total_tokens=total_tokens,
-            sparse_kv_format=sparse_kv_format,
-            sparse_token_major=sparse_token_major,
-            sparse_vllm_two_major=sparse_vllm_two_major,
-            sparse_k_hidden_dims=sparse_k_hidden_dims,
-            sparse_v_hidden_dims=sparse_v_hidden_dims,
-            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-        )
-        vllm_signature = self._tensor_collection_identity_signature(
+        if source_signature is None:
+            source_signature = self._sparse_direct_source_signature(
+                layer_tensors=layer_tensors,
+                slot_mapping_ref=slot_mapping_ref,
+                total_tokens=total_tokens,
+                sparse_kv_format=sparse_kv_format,
+                sparse_token_major=sparse_token_major,
+                sparse_vllm_two_major=sparse_vllm_two_major,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            )
+        vllm_signature = self._vllm_layer_cache_identity_signature(
             kvcaches_ref[layer_id]
         )
         return (
@@ -1480,15 +1526,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_k_hidden_dims: int,
         sparse_v_hidden_dims: int,
         sparse_dsa_hidden_dims: int,
+        source_signature: Optional[tuple] = None,
+        return_key: bool = False,
     ):
         if kvcaches_ref is None:
-            return None
+            return (None, None) if return_key else None
 
         if self._sparse_direct_layer_states is None:
             self._sparse_direct_layer_states = {}
 
         if not layer_tensors:
-            return None
+            return (None, None) if return_key else None
 
         if total_tokens <= 0:
             total_tokens = self._sparse_total_tokens_from_layer_chunks(
@@ -1508,11 +1556,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_k_hidden_dims=sparse_k_hidden_dims,
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            source_signature=source_signature,
         )
         assert state_key is not None
         state = self._sparse_direct_layer_states.get(state_key)
         if state is not None:
-            return state
+            return (state, state_key) if return_key else state
 
         vllm_layer_cache = kvcaches_ref[layer_id]
         vllm_tensor_count = (
@@ -1534,7 +1583,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             total_tokens,
         )
         self._sparse_direct_layer_states[state_key] = state
-        return state
+        return (state, state_key) if return_key else state
 
     def _pack_sparse_layer_inputs(
         self,
@@ -1574,21 +1623,51 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if selected_token_idx.dim() > 1:
                 rows = selected_token_idx.reshape(selected_token_idx.shape[0], -1)
                 starts = token_start_index
-                if not isinstance(starts, torch.Tensor):
-                    starts = torch.tensor(starts, dtype=torch.long, device=slot_mapping.device)
-                starts = starts.reshape(-1).to(device=slot_mapping.device, dtype=torch.long)
-                if starts.numel() == 1 and rows.shape[0] != 1:
-                    starts = starts.expand(rows.shape[0])
-                if int(starts.numel()) != int(rows.shape[0]):
+                start_values = None
+                if isinstance(starts, int):
+                    start_values = [int(starts)] * int(rows.shape[0])
+                elif isinstance(starts, (list, tuple)):
+                    if len(starts) == 1 and rows.shape[0] != 1:
+                        start_values = [int(starts[0])] * int(rows.shape[0])
+                    else:
+                        start_values = [int(start) for start in starts]
+                elif isinstance(starts, torch.Tensor) and starts.device.type == "cpu":
+                    starts = starts.reshape(-1).to(dtype=torch.long)
+                    if starts.numel() == 1 and rows.shape[0] != 1:
+                        starts = starts.expand(rows.shape[0])
+                    start_values = [int(start) for start in starts.tolist()]
+                else:
+                    if not isinstance(starts, torch.Tensor):
+                        starts = torch.tensor(
+                            starts,
+                            dtype=torch.long,
+                            device=slot_mapping.device,
+                        )
+                    starts = starts.reshape(-1).to(
+                        device=slot_mapping.device, dtype=torch.long
+                    )
+                    if starts.numel() == 1 and rows.shape[0] != 1:
+                        starts = starts.expand(rows.shape[0])
+                num_starts = (
+                    len(start_values)
+                    if start_values is not None
+                    else int(starts.numel())
+                )
+                if num_starts != int(rows.shape[0]):
                     raise ValueError(
                         "token_start_index rows must match selected_token_idx rows: "
-                        f"{starts.numel()} vs {rows.shape[0]}"
+                        f"{num_starts} vs {rows.shape[0]}"
                     )
                 slot_chunks = []
                 selected_chunks = []
                 for row_idx in range(rows.shape[0]):
                     row = rows[row_idx]
-                    start = int(starts[row_idx].detach().to(device="cpu").item())
+                    if start_values is not None:
+                        start = start_values[row_idx]
+                    else:
+                        start = int(
+                            starts[row_idx].detach().to(device="cpu").item()
+                        )
                     end = start + int(row.numel())
                     if end > int(slot_mapping.numel()):
                         raise ValueError(
@@ -1992,14 +2071,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if slot_mapping_ref is not None
             else slot_mapping_packed
         )
-
-        layer_state = self._get_or_create_sparse_direct_layer_state(
-            kvcaches_ref=kvcaches_ref,
-            kv_group=kv_group,
-            layer_id=layer_id,
-            layer_tensors=resolve_tensors,
+        runtime_source_signature = self._sparse_direct_pointer_cache_signature(
+            chunk_ptrs_npu=chunk_ptrs_npu,
             slot_mapping_ref=resolve_slot_mapping,
             total_tokens=total_tokens,
+            chunk_size=chunk_size,
             sparse_kv_format=sparse_kv_format,
             sparse_token_major=sparse_token_major,
             sparse_vllm_two_major=sparse_vllm_two_major,
@@ -2008,7 +2084,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
 
-        validate_key = self._sparse_direct_state_key(
+        layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
             kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
             layer_id=layer_id,
@@ -2021,6 +2097,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_k_hidden_dims=sparse_k_hidden_dims,
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            source_signature=runtime_source_signature,
+            return_key=True,
         )
         if validate_key is None:
             validate_key = (kv_group, layer_id)
