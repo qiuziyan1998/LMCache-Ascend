@@ -1300,12 +1300,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_shape_single_layer = self.gpu_connector.get_shape(
                 num_tokens, kv_group=kv_group
             )
+            memory_format = self._memory_format_for_kv_group(kv_group)
 
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
                 batch_size=self.num_layers,
-                fmt=self._memory_format_for_kv_group(kv_group),
+                fmt=memory_format,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
 
@@ -1315,6 +1316,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                     " choosing to not store the KV cache."
                 )
                 break
+
+            if len(memory_objs_multi_layer) != self.num_layers:
+                logger.error(
+                    "Layerwise store allocation returned wrong layer count: "
+                    "req_id=%s kv_group=%s chunk=[%d,%d) shape=%s dtype=%s "
+                    "fmt=%s got=%d expected=%d decode_window=%s",
+                    req_id,
+                    kv_group,
+                    start,
+                    end,
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    memory_format,
+                    len(memory_objs_multi_layer),
+                    self.num_layers,
+                    kwargs.get("decode_window_save"),
+                )
+                raise RuntimeError(
+                    "Layerwise store allocation layer count mismatch: "
+                    f"got {len(memory_objs_multi_layer)}, "
+                    f"expected {self.num_layers}"
+                )
 
             starts.append(start)
             ends.append(end)
@@ -1351,6 +1374,27 @@ class AscendLMCacheEngine(LMCacheEngine):
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
             keys = [list(row) for row in zip(*keys, strict=False)]
+            if len(memory_objs) != self.num_layers or len(keys) != self.num_layers:
+                logger.error(
+                    "Layerwise store transpose produced wrong layer count: "
+                    "req_id=%s kv_group=%s memory_layers=%d key_layers=%d "
+                    "expected=%d chunk_count=%d starts=%s ends=%s "
+                    "decode_window=%s",
+                    req_id,
+                    kv_group,
+                    len(memory_objs),
+                    len(keys),
+                    self.num_layers,
+                    len(starts),
+                    starts,
+                    ends,
+                    kwargs.get("decode_window_save"),
+                )
+                raise RuntimeError(
+                    "Layerwise store transpose layer count mismatch: "
+                    f"memory_layers={len(memory_objs)}, key_layers={len(keys)}, "
+                    f"expected={self.num_layers}"
+                )
 
             # Calculate total KV size for logging
             tot_kv_size = sum(

@@ -3036,6 +3036,37 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
+        if len(memory_objs) != self.num_layers:
+            logger.error(
+                "NPU layerwise store received wrong memory object layer count: "
+                "kv_group=%s memory_layers=%d expected=%d chunk_count=%d "
+                "starts=%s ends=%s fmt=%s kvcaches_layers=%d",
+                kv_group,
+                len(memory_objs),
+                self.num_layers,
+                len(starts),
+                starts,
+                ends,
+                expected_fmt,
+                len(kvcaches_snapshot),
+            )
+            raise RuntimeError(
+                "NPU layerwise store memory object layer count mismatch: "
+                f"got {len(memory_objs)}, expected {self.num_layers}"
+            )
+        if len(kvcaches_snapshot) < self.num_layers:
+            logger.error(
+                "NPU layerwise store has fewer kv cache layers than expected: "
+                "kv_group=%s kvcaches_layers=%d expected=%d fmt=%s",
+                kv_group,
+                len(kvcaches_snapshot),
+                self.num_layers,
+                expected_fmt,
+            )
+            raise RuntimeError(
+                "NPU layerwise store kv cache layer count mismatch: "
+                f"got {len(kvcaches_snapshot)}, expected {self.num_layers}"
+            )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
