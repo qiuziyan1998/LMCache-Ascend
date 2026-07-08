@@ -54,10 +54,6 @@ _SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS = os.getenv(
 _SPARSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
-_DSA_TORCH_NPU_MODULE: Any = None
-_DSA_PUBLISH_STREAM_WARNING_LOGGED = False
-
-
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
@@ -65,27 +61,6 @@ def _payload_event_list(payload_event: Any) -> list[Any]:
         return [event for event in payload_event if event is not None]
     return [payload_event]
 
-
-def _publish_current_npu_stream() -> bool:
-    global _DSA_TORCH_NPU_MODULE, _DSA_PUBLISH_STREAM_WARNING_LOGGED
-    try:
-        if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_device")):
-            return False
-        if _DSA_TORCH_NPU_MODULE is None:
-            _DSA_TORCH_NPU_MODULE = __import__("torch_npu")
-        _DSA_TORCH_NPU_MODULE._C._npu_getCurrentRawStream(
-            int(torch.npu.current_device())
-        )
-        return True
-    except Exception:
-        if not _DSA_PUBLISH_STREAM_WARNING_LOGGED:
-            logger.warning(
-                "Failed to publish current NPU stream for DSA payload event "
-                "ordering.",
-                exc_info=True,
-            )
-            _DSA_PUBLISH_STREAM_WARNING_LOGGED = True
-        return False
 
 _IS_310P = None
 def is_310p():
@@ -1690,16 +1665,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "token_start_index rows must match selected_token_idx rows: "
                         f"{num_starts} vs {rows.shape[0]}"
                     )
+                if start_values is None:
+                    row_width = int(rows.shape[1])
+                    row_offsets = torch.arange(
+                        row_width,
+                        dtype=torch.long,
+                        device=slot_mapping.device,
+                    )
+                    gather_indices = (
+                        starts.reshape(-1, 1)
+                        + row_offsets.reshape(1, -1)
+                    ).reshape(-1)
+                    slot_mapping_packed = slot_mapping[gather_indices]
+                    selected_token_idx = rows.reshape(-1)
+                    selected_token_idx = self._sparse_selected_token_idx(
+                        selected_token_idx, slot_mapping_packed.shape[0]
+                    )
+                    return slot_mapping_packed, selected_token_idx
+
                 slot_chunks = []
                 selected_chunks = []
                 for row_idx in range(rows.shape[0]):
                     row = rows[row_idx]
-                    if start_values is not None:
-                        start = start_values[row_idx]
-                    else:
-                        start = int(
-                            starts[row_idx].detach().to(device="cpu").item()
-                        )
+                    start = start_values[row_idx]
                     end = start + int(row.numel())
                     if end > int(slot_mapping.numel()):
                         raise ValueError(
@@ -2008,11 +1996,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if payload_events:
                     for event in payload_events:
                         load_stream.wait_event(event)
-                    if not _publish_current_npu_stream():
-                        raise RuntimeError(
-                            "Failed to publish load stream after waiting on "
-                            "DSA sparse payload event before staging transfer."
-                        )
                 assert staging_tensor is not None
                 batched_fused_sparse_single_layer_kv_transfer(
                     layer_tensors,
@@ -2147,11 +2130,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if payload_events:
                 for event in payload_events:
                     load_stream.wait_event(event)
-                if not _publish_current_npu_stream():
-                    raise RuntimeError(
-                        "Failed to publish load stream after waiting on DSA "
-                        "sparse payload event before direct transfer."
-                    )
             if explicit_sparse_payload and _SPARSE_DIRECT_GUARD:
                 self._validate_sparse_direct_explicit_inputs(
                     kvcaches_ref=kvcaches_ref,
@@ -2535,6 +2513,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 kvcaches_len,
             )
         if slot_mapping_full is None or slot_mapping_full.numel() == 0:
+            return
+        if slot_mapping_full.device.type != "cpu":
+            # Avoid a host/device sync in the layerwise hot path. Device-side
+            # slot bounds are still protected by the transfer kernels.
             return
         if kvcaches_len == 0:
             return
@@ -3133,11 +3115,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if payload_events:
                     for event in payload_events:
                         current_stream.wait_event(event)
-                    if not _publish_current_npu_stream():
-                        raise RuntimeError(
-                            "Failed to publish current stream after waiting on DSA "
-                            "sparse payload event before packing sparse inputs."
-                        )
 
                 if explicit_sparse_payload:
                     slot_mapping_packed, selected_token_idx = (
