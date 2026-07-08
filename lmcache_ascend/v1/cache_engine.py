@@ -27,12 +27,11 @@ from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
 from lmcache.v1.token_database import TokenDatabase
 import torch
 
 logger = init_logger(__name__)
-
-LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
@@ -162,7 +161,7 @@ class ThreadSafeEventList:
     Upstream ``LMCacheEngine`` treats ``self.kv_events`` as a list that
     callers ``.append(...)`` to and ``get_kv_events`` snapshots-and-resets.
     When ``store_async`` is active, appends happen on the background
-    worker thread while drains happen on the main thread — a data race
+    worker thread while drains happen on the main thread - a data race
     on a plain ``list``.  This wrapper funnels all appends through a
     ``queue.Queue`` so we inherit its producer/consumer thread safety,
     while preserving ``.append(...)`` / truthiness semantics that
@@ -591,8 +590,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
                 num_tokens = end - start
-                kv_shapes = self.metadata.get_shapes(num_tokens)
-                kv_dtypes = self.metadata.get_dtypes()
+                kv_shapes, kv_dtypes = self._metadata_shapes_dtypes_for_kv_group(
+                    kv_group=kv_group,
+                    num_tokens=num_tokens,
+                )
 
                 # TODO (Jiayi): should be batched in the future
                 memory_obj = self.storage_manager.allocate(
@@ -714,7 +715,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             for req_id in finished_req_ids:
                 if req_id in self._reported_finished_store_ids:
-                    # Already reported — skip to avoid scheduler seeing
+                    # Already reported - skip to avoid scheduler seeing
                     # a duplicate finished_sending for blocks it has
                     # already freed.
                     continue
@@ -851,6 +852,23 @@ class AscendLMCacheEngine(LMCacheEngine):
         if cached_tensors is not None and not cached_tensors:
             cached_tensors.extend([] for _ in range(num_layers))
 
+    @staticmethod
+    def _remove_pending_layerwise_store_objs(
+        cached_memory_objs: Optional[List],
+        pending_store_release: dict[int, MemoryObj],
+    ) -> None:
+        if cached_memory_objs is None or not pending_store_release:
+            return
+        pending_ids = set(pending_store_release)
+        for layer_cache in cached_memory_objs:
+            if not layer_cache:
+                continue
+            layer_cache[:] = [
+                mem_obj
+                for mem_obj in layer_cache
+                if id(mem_obj) not in pending_ids
+            ]
+
     def _append_layer_store_tensors(
         self,
         layer_id: int,
@@ -877,20 +895,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_ptrs_npu: Optional[List],
     ) -> None:
         """Retain storage-get results in ReqMeta for later retrieve calls (same request)."""
-        if cached_memory_objs is not None:
-            if not cached_memory_objs:
-                cached_memory_objs.extend(
-                    [] for _ in range(self.num_layers)
-                )
-            cached_memory_objs[layer_id].extend(mem_objs_layer)
-        new_tensors: List[torch.Tensor] = []
-        if cached_tensors is not None:
-            if not cached_tensors:
-                cached_tensors.extend([] for _ in range(self.num_layers))
-            for mem_obj in mem_objs_layer:
-                if mem_obj.tensor is not None:
-                    cached_tensors[layer_id].append(mem_obj.tensor)
-                    new_tensors.append(mem_obj.tensor)
+        new_tensors: List[torch.Tensor] = [
+            tensor
+            for mem_obj in mem_objs_layer
+            if (tensor := mem_obj.tensor) is not None
+        ]
         if new_tensors and cached_chunk_dev_ptrs is not None:
             append_ptrs_fn = getattr(
                 self.gpu_connector,
@@ -898,12 +907,39 @@ class AscendLMCacheEngine(LMCacheEngine):
                 None,
             )
             if append_ptrs_fn is not None:
+                # Resolve pointer tables before publishing the MemoryObjs/tensors
+                # into ReqMeta so failures cannot leave a hot-reusable partial
+                # state without NPU pointer-cache coverage.
                 append_ptrs_fn(
                     layer_id,
                     new_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                 )
+
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend(
+                    [] for _ in range(self.num_layers)
+                )
+            cached_memory_objs[layer_id].extend(mem_objs_layer)
+        if cached_tensors is not None:
+            if not cached_tensors:
+                cached_tensors.extend([] for _ in range(self.num_layers))
+            cached_tensors[layer_id].extend(new_tensors)
+
+    def _append_shared_handle_cache(
+        self,
+        layer_id: int,
+        handles: List,
+        cached_shared_handles: Optional[List],
+    ) -> None:
+        """Retain shared CPU cache handles with the request-scoped cache."""
+        if cached_shared_handles is None:
+            return
+        if not cached_shared_handles:
+            cached_shared_handles.extend([] for _ in range(self.num_layers))
+        cached_shared_handles[layer_id].extend(handles)
 
     @staticmethod
     def _needs_retrieve_metadata_refresh(
@@ -917,15 +953,30 @@ class AscendLMCacheEngine(LMCacheEngine):
         return len(tokens) > cached_ends[-1]
 
     @staticmethod
+    def _cache_layer_has_entries(layer_cache: Any) -> bool:
+        if layer_cache is None:
+            return False
+        try:
+            return len(layer_cache) > 0
+        except TypeError:
+            return True
+
+    @staticmethod
     def _has_retrieve_data_cache(
         cached_tensors: Optional[List],
         cached_memory_objs: Optional[List],
         num_layers: int,
     ) -> bool:
         if cached_tensors is not None and len(cached_tensors) == num_layers:
-            return any(cached_tensors)
+            return any(
+                AscendLMCacheEngine._cache_layer_has_entries(layer_cache)
+                for layer_cache in cached_tensors
+            )
         if cached_memory_objs is not None and len(cached_memory_objs) == num_layers:
-            return any(cached_memory_objs)
+            return any(
+                AscendLMCacheEngine._cache_layer_has_entries(layer_cache)
+                for layer_cache in cached_memory_objs
+            )
         return False
 
     @staticmethod
@@ -994,6 +1045,41 @@ class AscendLMCacheEngine(LMCacheEngine):
             except TypeError:
                 lazy_init(kvcaches)
 
+    def _expected_shared_cpu_chunk_metadata(
+        self,
+        *,
+        kv_group: int,
+        num_tokens: int,
+    ):
+        """Use Ascend's group-aware connector shape for shared view checks.
+
+        DSA index chunks are allocated with ``gpu_connector.get_shape(...,
+        kv_group=1)``.  Generic LMCache metadata can still describe only the
+        latent group in some startup/passive paths, so using it first makes
+        passive ranks reject valid index handles as latent-shaped objects.
+        """
+        get_shape = getattr(self.gpu_connector, "get_shape", None)
+        if callable(get_shape):
+            try:
+                shape = torch.Size(get_shape(num_tokens, kv_group=kv_group))
+                return (
+                    shape,
+                    self._shared_cpu_dtype_for_kv_group(kv_group),
+                    self._memory_format_for_kv_group(kv_group),
+                )
+            except TypeError:
+                if kv_group == 0:
+                    shape = torch.Size(get_shape(num_tokens))
+                    return (
+                        shape,
+                        self._shared_cpu_dtype_for_kv_group(kv_group),
+                        self._memory_format_for_kv_group(kv_group),
+                    )
+        return super()._expected_shared_cpu_chunk_metadata(
+            kv_group=kv_group,
+            num_tokens=num_tokens,
+        )
+
     def _resolve_local_cpu_retrieve_location(
         self,
         fallback: Optional[str] = None,
@@ -1024,6 +1110,65 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return None
         return location
 
+    def _cached_layerwise_location_or_raise(
+        self,
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        retrieve_kwargs: Optional[dict],
+    ) -> Optional[str]:
+        if not cached_keys or len(cached_keys) < self.num_layers:
+            return None
+        if not cached_starts or not cached_ends or not cached_keys[0]:
+            return None
+
+        chunk_count = min(
+            len(cached_starts),
+            len(cached_ends),
+            *(len(cached_keys[layer_id]) for layer_id in range(self.num_layers)),
+        )
+        if chunk_count <= 0:
+            return None
+
+        kwargs = retrieve_kwargs or {}
+        req_id = self._get_req_id(kwargs)
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        location: Optional[str] = None
+        for chunk_index in range(chunk_count):
+            keys_multi_layer = [
+                cached_keys[layer_id][chunk_index]
+                for layer_id in range(self.num_layers)
+            ]
+            current_location = self._layerwise_chunk_location_if_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=int(cached_starts[chunk_index]),
+                end=int(cached_ends[chunk_index]),
+            )
+            if current_location is None:
+                raise ValueError(
+                    "Layerwise sparse retrieve metadata is warm but the "
+                    "cached chunk is no longer complete in storage: "
+                    f"req_id={req_id}, kv_group={kv_group}, "
+                    f"chunk_index={chunk_index}, "
+                    f"start={cached_starts[chunk_index]}, "
+                    f"end={cached_ends[chunk_index]}"
+                )
+            if location is None:
+                location = current_location
+            elif location != current_location:
+                raise ValueError(
+                    "Layerwise sparse retrieve metadata is warm but cached "
+                    "chunks span multiple storage locations, which non-shared "
+                    "layerwise retrieve cannot consume safely: "
+                    f"req_id={req_id}, kv_group={kv_group}, "
+                    f"first_location={location}, "
+                    f"current_location={current_location}, "
+                    f"chunk_index={chunk_index}"
+                )
+        return location
+
     def _ensure_retrieve_chunk_metadata(
         self,
         *,
@@ -1051,6 +1196,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group = 0
             if retrieve_kwargs is not None:
                 kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+            shared_rank0_retrieve = (
+                retrieve_kwargs is not None
+                and self._should_use_shared_layerwise_retrieve(kv_group)
+                and not self._is_passive()
+            )
 
             location: Optional[str] = None
             new_starts: List[int] = []
@@ -1066,11 +1216,36 @@ class AscendLMCacheEngine(LMCacheEngine):
                 assert isinstance(key, CacheEngineKey)
 
                 keys_multi_layer = key.split_layers(self.num_layers)
-                if current_location := self._layerwise_chunk_location(
-                    keys_multi_layer
-                ):
+                if shared_rank0_retrieve:
+                    locations_multi_layer: list[str] = []
+                    for layer_key in keys_multi_layer:
+                        layer_location = self._find_shared_rank0_chunk_location(
+                            layer_key
+                        )
+                        if layer_location is None:
+                            locations_multi_layer = []
+                            break
+                        locations_multi_layer.append(layer_location)
+                    current_location = (
+                        locations_multi_layer[0]
+                        if len(set(locations_multi_layer)) == 1
+                        else "mixed"
+                        if locations_multi_layer
+                        else None
+                    )
+                else:
+                    current_location = self._layerwise_chunk_location(
+                        keys_multi_layer
+                    )
+                if current_location:
                     if location is None:
                         location = current_location
+                    elif shared_rank0_retrieve:
+                        location = (
+                            location
+                            if location == current_location
+                            else "mixed"
+                        )
                     else:
                         assert location == current_location, (
                             "All retrieved keys should be from the same location "
@@ -1131,12 +1306,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return location, cached_starts, cached_ends, cached_keys
 
             location = retrieve_kwargs.get("cached_retrieve_location")
-            if cached_keys and cached_keys[0]:
+            kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+            shared_rank0_retrieve = (
+                self._should_use_shared_layerwise_retrieve(kv_group)
+                and not self._is_passive()
+            )
+            if cached_keys and cached_keys[0] and not shared_rank0_retrieve:
                 # Prefer the hottest tier (LocalCPUBackend is checked first).
                 # After Mooncake write-back, stale cached_retrieve_location may
                 # still point at RemoteBackend and force slow remote reads.
-                preferred_location = self.storage_manager.contains(
-                    cached_keys[0][0], self.retrieve_locations
+                preferred_location = self._cached_layerwise_location_or_raise(
+                    cached_keys,
+                    cached_starts,
+                    cached_ends,
+                    retrieve_kwargs,
                 )
                 if preferred_location is not None:
                     location = preferred_location
@@ -1149,9 +1332,23 @@ class AscendLMCacheEngine(LMCacheEngine):
         location = None
         if retrieve_kwargs is not None:
             location = retrieve_kwargs.get("cached_retrieve_location")
-        if location is None and cached_keys and cached_keys[0]:
-            location = self.storage_manager.contains(
-                cached_keys[0][0], self.retrieve_locations
+        kv_group = int((retrieve_kwargs or {}).get("kv_group", 0) or 0)
+        shared_rank0_retrieve = (
+            retrieve_kwargs is not None
+            and self._should_use_shared_layerwise_retrieve(kv_group)
+            and not self._is_passive()
+        )
+        if (
+            location is None
+            and cached_keys
+            and cached_keys[0]
+            and not shared_rank0_retrieve
+        ):
+            location = self._cached_layerwise_location_or_raise(
+                cached_keys,
+                cached_starts,
+                cached_ends,
+                retrieve_kwargs,
             )
             if retrieve_kwargs is not None and location is not None:
                 retrieve_kwargs["cached_retrieve_location"] = location
@@ -1197,7 +1394,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
-        # stores. Closes the known TODO — store_layer had no _is_passive() check,
+        # stores. Closes the known TODO - store_layer had no _is_passive() check,
         # causing duplicate stores on non-rank-0 workers under MLA + layerwise.
         if self._is_passive():
             logger.debug(
@@ -1265,7 +1462,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         keys = []
         memory_objs = []
         tot_token_num = 0
-        kv_dtype = self.metadata.kv_dtype
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -1276,6 +1472,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         prev_key = 0
         kv_group = kwargs.get("kv_group", 0)
+        kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
             kv_group=kv_group,
@@ -1283,9 +1480,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
+            if self._layerwise_chunk_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
             ):
                 continue
 
@@ -1399,6 +1599,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                     f"memory_layers={len(memory_objs)}, key_layers={len(keys)}, "
                     f"expected={self.num_layers}"
                 )
+            pending_store_release = {
+                id(mem_obj): mem_obj
+                for layer_objs in memory_objs
+                for mem_obj in layer_objs
+            }
+            mem_obj_generator = None
 
             # Calculate total KV size for logging
             tot_kv_size = sum(
@@ -1419,44 +1625,62 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_tensors=cached_tensors,
             )
 
-            t_start = time.perf_counter()
-            mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **kwargs
-            )
+            try:
+                t_start = time.perf_counter()
+                mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                    memory_objs, starts, ends, **kwargs
+                )
 
-            next(mem_obj_generator)
-
-            for layer_id in range(self.num_layers):
-                yield
                 next(mem_obj_generator)
-                self._append_layer_store_tensors(
-                    layer_id, memory_objs, cached_tensors
-                )
-                self._dsa_record_store_digests(
-                    req_id=req_id,
-                    layer_id=layer_id,
-                    keys=keys[layer_id],
-                    memory_objs=memory_objs[layer_id],
-                )
-                self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
-                )
 
-            if kwargs.get("decode_window_save"):
-                torch.npu.synchronize()
+                for layer_id in range(self.num_layers):
+                    yield
+                    next(mem_obj_generator)
+                    self._append_layer_store_tensors(
+                        layer_id, memory_objs, cached_tensors
+                    )
+                    self._dsa_record_store_digests(
+                        req_id=req_id,
+                        layer_id=layer_id,
+                        keys=keys[layer_id],
+                        memory_objs=memory_objs[layer_id],
+                    )
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        location=self.store_location,
+                    )
+                    for mem_obj in memory_objs[layer_id]:
+                        pending_store_release.pop(id(mem_obj), None)
 
-            tot_time = time.perf_counter() - t_start
-            logger.info(
-                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
-                "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
-                req_id,
-                kv_group,
-                tot_token_num,
-                len(tokens),
-                tot_kv_size / 1024**3,
-                tot_time * 1000,
-                tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-            )
+                tot_time = time.perf_counter() - t_start
+                logger.info(
+                    "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
+                    "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
+                    req_id,
+                    kv_group,
+                    tot_token_num,
+                    len(tokens),
+                    tot_kv_size / 1024**3,
+                    tot_time * 1000,
+                    tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                )
+            finally:
+                if mem_obj_generator is not None:
+                    close_fn = getattr(mem_obj_generator, "close", None)
+                    if close_fn is not None:
+                        try:
+                            close_fn()
+                        except (GeneratorExit, RuntimeError, ValueError):
+                            pass
+                self._remove_pending_layerwise_store_objs(
+                    cached_memory_objs,
+                    pending_store_release,
+                )
+                for mem_obj in list(pending_store_release.values()):
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
+                pending_store_release.clear()
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -1465,6 +1689,206 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         yield
+
+    def _retrieve_layer_head_token_wise_shared_passive(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        ret_mask: torch.Tensor,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for sparse shared retrieve"
+        )
+        if self.shared_cpu_cache_passive_allocator is None:
+            raise ValueError(
+                "Shared CPU cache passive allocator is not initialized for "
+                "sparse decode. Startup preflight did not complete."
+            )
+
+        request_configs = kwargs.get("request_configs")
+        kv_group = kwargs.get("kv_group", 0)
+        req_id = kwargs.get("req_id", "unspecified")
+        phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
+        request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        cached_keys = kwargs.get("cached_keys")
+        cached_starts = kwargs.get("cached_starts")
+        cached_ends = kwargs.get("cached_ends")
+        cached_memory_objs = kwargs.get("cached_memory_objs")
+        cached_tensors = kwargs.get("cached_tensors")
+        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_shared_handles = kwargs.get("cached_shared_handles")
+
+        starts: list[int] = []
+        ends: list[int] = []
+        keys: list[list[CacheEngineKey]] = []
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+            kv_group=kv_group,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            starts.append(start)
+            ends.append(end)
+            keys.append(key.split_layers(self.num_layers))
+        keys_layer_major = (
+            [list(row) for row in zip(*keys, strict=False)]
+            if keys
+            else []
+        )
+
+        assert_layerwise_gpu_connector(self.gpu_connector)
+        mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
+            **kwargs
+        )
+        next(mem_obj_consumer)
+
+        to_release: list[MemoryObj] = []
+        passive_views_handed_off = False
+        passive_metadata_cached = False
+        expected_handle_count: Optional[int] = None
+
+        def append_passive_chunk_metadata() -> None:
+            nonlocal passive_metadata_cached
+            if passive_metadata_cached or expected_handle_count is None:
+                return
+            passive_metadata_cached = True
+            if cached_starts is not None and not cached_starts:
+                cached_starts.extend(starts[:expected_handle_count])
+            if cached_ends is not None and not cached_ends:
+                cached_ends.extend(ends[:expected_handle_count])
+            if cached_keys is not None and not cached_keys:
+                cached_keys.extend([] for _ in range(self.num_layers))
+                for cache_layer_id, layer_keys in enumerate(keys_layer_major):
+                    cached_keys[cache_layer_id].extend(
+                        layer_keys[:expected_handle_count]
+                    )
+
+        try:
+            for layer_id in range(self.num_layers):
+                sparse_request = yield ret_mask
+                sparse_payload = None
+                target_slot_mapping = None
+                if isinstance(sparse_request, dict):
+                    sparse_payload = sparse_request
+                    selected_tokens = sparse_payload.get("selected_token_ids")
+                    token_start_index = sparse_payload.get("token_start_index")
+                elif isinstance(sparse_request, tuple):
+                    if len(sparse_request) == 3:
+                        (
+                            selected_tokens,
+                            token_start_index,
+                            target_slot_mapping,
+                        ) = sparse_request
+                    else:
+                        selected_tokens, token_start_index = sparse_request
+                else:
+                    selected_tokens = sparse_request
+                    token_start_index = 0
+
+                envelope = self._receive_shared_envelope()
+                self._validate_shared_layerwise_envelope(
+                    envelope,
+                    req_id=req_id,
+                    phase=phase,
+                    request_ordinal=request_ordinal,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                )
+                if envelope.status in ("miss", "skipped"):
+                    mem_objs_layer = []
+                else:
+                    if expected_handle_count is None:
+                        expected_handle_count = len(envelope.handles)
+                        for start, end in zip(
+                            starts[:expected_handle_count],
+                            ends[:expected_handle_count],
+                            strict=False,
+                        ):
+                            ret_mask[start:end] = True
+                        append_passive_chunk_metadata()
+                    elif len(envelope.handles) != expected_handle_count:
+                        raise ValueError(
+                            "Sparse shared CPU passive received inconsistent "
+                            f"handle count at layer {layer_id}: "
+                            f"{len(envelope.handles)} != {expected_handle_count}"
+                        )
+                    mem_objs_layer: list[MemoryObj] = []
+                    for chunk_index, handle in enumerate(envelope.handles):
+                        expected_shape, expected_dtype, expected_fmt = (
+                            self._expected_shared_cpu_chunk_metadata(
+                                kv_group=kv_group,
+                                num_tokens=int(
+                                    ends[chunk_index] - starts[chunk_index]
+                                ),
+                            )
+                        )
+                        mem_obj = self.shared_cpu_cache_passive_allocator.create_view(
+                            handle,
+                            expected_request_id=req_id,
+                            expected_phase=phase,
+                            expected_layer_id=layer_id,
+                            expected_kv_group=kv_group,
+                            expected_chunk_index=chunk_index,
+                            expected_key=keys_layer_major[layer_id][chunk_index],
+                            expected_shape=expected_shape,
+                            expected_dtype=expected_dtype,
+                            expected_fmt=expected_fmt,
+                            expected_cached_positions=list(
+                                range(
+                                    int(starts[chunk_index]),
+                                    int(ends[chunk_index]),
+                                )
+                            ),
+                            expected_producer_rank=self.metadata.first_rank,
+                        )
+                        mem_objs_layer.append(mem_obj)
+                    try:
+                        self._append_retrieve_layer_cache(
+                            layer_id,
+                            mem_objs_layer,
+                            cached_memory_objs,
+                            cached_tensors,
+                            cached_chunk_dev_ptrs,
+                            cached_chunk_ptrs_npu,
+                        )
+                    except Exception:
+                        for mem_obj in mem_objs_layer:
+                            if mem_obj.is_valid():
+                                mem_obj.ref_count_down()
+                        raise
+                    to_release.extend(mem_objs_layer)
+                    self._append_shared_handle_cache(
+                        layer_id,
+                        envelope.handles,
+                        cached_shared_handles,
+                    )
+
+                if sparse_payload is not None:
+                    sparse_payload["memory_objs_layer"] = mem_objs_layer
+                    mem_obj_consumer.send(sparse_payload)
+                else:
+                    mem_obj_consumer.send(
+                        (
+                            mem_objs_layer,
+                            selected_tokens,
+                            token_start_index,
+                            target_slot_mapping,
+                        )
+                    )
+
+            next(mem_obj_consumer)
+            passive_views_handed_off = (
+                cached_memory_objs is not None and cached_keys is not None
+            )
+            yield ret_mask
+        finally:
+            if not passive_views_handed_off:
+                for mem_obj in to_release:
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
 
     def retrieve_layer_head_token_wise(
         self,
@@ -1501,10 +1925,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             yield torch.zeros(len(tokens), dtype=torch.bool)
             return
 
-        assert self.storage_manager is not None
+        kv_group = kwargs.get("kv_group", 0)
+        kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
+        shared_sparse_retrieve = self._should_use_shared_layerwise_retrieve(kv_group)
+        if not (shared_sparse_retrieve and self._is_passive()):
+            assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve_layer operation"
         )
+        if shared_sparse_retrieve:
+            self._ensure_layerwise_connector_layout(**kwargs)
 
         mem_obj_consumer = None
         num_tokens = len(tokens)
@@ -1520,6 +1950,34 @@ class AscendLMCacheEngine(LMCacheEngine):
             metadata_warm = False
         elif not metadata_warm:
             ret_mask.zero_()
+
+        initial_cached_memory_objs = kwargs.get("cached_memory_objs")
+        initial_cached_tensors = kwargs.get("cached_tensors")
+        has_shared_cached_retrieve = (
+            shared_sparse_retrieve
+            and self._has_retrieve_data_cache(
+                initial_cached_tensors,
+                initial_cached_memory_objs,
+                self.num_layers,
+            )
+        )
+        if has_shared_cached_retrieve:
+            kwargs["_use_cached_retrieve"] = True
+
+        if (
+            shared_sparse_retrieve
+            and self._is_passive()
+            and not has_shared_cached_retrieve
+        ):
+            passive_kwargs = dict(kwargs)
+            passive_kwargs.pop("ret_mask", None)
+            yield from self._retrieve_layer_head_token_wise_shared_passive(
+                tokens,
+                mask,
+                ret_mask,
+                **passive_kwargs,
+            )
+            return
 
         request_configs = kwargs.get("request_configs")
 
@@ -1539,6 +1997,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors = kwargs.get("cached_tensors")
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_shared_handles = kwargs.get("cached_shared_handles")
 
         has_cached_retrieve_data = self._has_retrieve_data_cache(
             cached_tensors,
@@ -1606,14 +2065,29 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
         if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
-            logger.warning(
-                "Layerwise sparse retrieve cache is incomplete; falling back to "
-                "storage get. required_chunks=%d cached_tensor_chunks=%d "
-                "cached_memory_obj_chunks=%d",
-                required_chunks,
-                self._min_layer_cache_chunks(cached_tensors, self.num_layers),
-                self._min_layer_cache_chunks(cached_memory_objs, self.num_layers),
+            raise ValueError(
+                "Layerwise sparse retrieve cache is incomplete; refusing to "
+                "append a duplicate prefix or launch with partial pointer "
+                "state. Drop the request retrieve state and retry from "
+                "storage/shared CPU: "
+                f"req_id={kwargs.get('req_id', 'unspecified')}, "
+                f"kv_group={kv_group}, required_chunks={required_chunks}, "
+                f"cached_tensor_chunks="
+                f"{self._min_layer_cache_chunks(cached_tensors, self.num_layers)}, "
+                f"cached_memory_obj_chunks="
+                f"{self._min_layer_cache_chunks(cached_memory_objs, self.num_layers)}"
             )
+
+        cached_shared_handles_cover = self._retrieve_data_cache_covers(
+            cached_shared_handles,
+            self.num_layers,
+            required_chunks,
+        )
+        publish_shared_handles = (
+            shared_sparse_retrieve
+            and not self._is_passive()
+            and not cached_shared_handles_cover
+        )
 
         if use_cached_retrieve:
             location = self._resolve_local_cpu_retrieve_location(location)
@@ -1630,7 +2104,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert_layerwise_gpu_connector(self.gpu_connector)
 
         get_generator = None
-        if not use_cached_retrieve:
+        if not use_cached_retrieve and not shared_sparse_retrieve:
             get_generator = self.storage_manager.layerwise_batched_get(
                 retrieve_keys, location=location
             )
@@ -1649,78 +2123,514 @@ class AscendLMCacheEngine(LMCacheEngine):
             and len(cached_memory_objs) == self.num_layers
             else None
         )
+        shared_chunk_locations_layer_major: list[list[str]] = []
+        pre_resolved_shared_mem_layers: Optional[List[List[MemoryObj]]] = None
+        request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        preflight_error_envelope: Optional[SharedHandleEnvelope] = None
+        preflight_error: Optional[BaseException] = None
+        request_preflight_state = kwargs.get("shared_cpu_request_preflight_state")
 
-        mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
-        notify_fn = getattr(self.gpu_connector, "notify_sparse_memory_objs_updated", None)
-        if notify_fn is not None and not use_cached_retrieve:
-            notify_fn()
-        next(mem_obj_consumer)
-
-        for layer_id in range(self.num_layers):
-            sparse_request = yield ret_mask
-            sparse_payload = None
-            target_slot_mapping = None
-            if isinstance(sparse_request, dict):
-                sparse_payload = sparse_request
-                selected_tokens = sparse_payload.get("selected_token_ids")
-                token_start_index = sparse_payload.get("token_start_index")
-            elif isinstance(sparse_request, tuple):
-                if len(sparse_request) == 3:
-                    (
-                        selected_tokens,
-                        token_start_index,
-                        target_slot_mapping,
-                    ) = sparse_request
-                else:
-                    selected_tokens, token_start_index = sparse_request
-            else:
-                selected_tokens = sparse_request
-                token_start_index = 0
-
-            if cached_mem_layers is not None:
-                mem_objs_layer = cached_mem_layers[layer_id]
-            elif use_cached_retrieve:
-                mem_objs_layer = []
-            else:
-                assert get_generator is not None
-                task = next(get_generator)
-                assert task is not None
-                mem_objs_layer = task.result()
-                if mem_objs_layer is not None:
-                    layer_cached_chunks = (
-                        len(cached_tensors[layer_id])
-                        if cached_tensors is not None
-                        and len(cached_tensors) > layer_id
-                        else 0
-                    )
-                    if layer_cached_chunks < len(retrieve_keys[0]):
-                        self._append_retrieve_layer_cache(
-                            layer_id,
-                            mem_objs_layer,
-                            cached_memory_objs,
-                            cached_tensors,
-                            cached_chunk_dev_ptrs,
-                            cached_chunk_ptrs_npu,
+        def release_pre_resolved_shared_mem_layers() -> None:
+            nonlocal pre_resolved_shared_mem_layers
+            if pre_resolved_shared_mem_layers is None:
+                return
+            for mem_objs_layer in reversed(pre_resolved_shared_mem_layers):
+                for mem_obj in reversed(mem_objs_layer):
+                    try:
+                        if getattr(mem_obj, "is_pinned", False):
+                            mem_obj.unpin()
+                        if getattr(mem_obj, "is_valid", lambda: True)():
+                            mem_obj.ref_count_down()
+                    except Exception:
+                        logger.exception(
+                            "Failed to release pre-resolved shared sparse "
+                            "MemoryObj after request-level preflight failure"
                         )
-                else:
-                    mem_objs_layer = []
+            pre_resolved_shared_mem_layers = None
 
-            if sparse_payload is not None:
-                sparse_payload["memory_objs_layer"] = mem_objs_layer
-                mem_obj_consumer.send(sparse_payload)
-            else:
-                mem_obj_consumer.send(
-                    (
-                        mem_objs_layer,
-                        selected_tokens,
-                        token_start_index,
-                        target_slot_mapping,
-                    )
+        def record_request_preflight_error() -> None:
+            if (
+                not isinstance(request_preflight_state, dict)
+                or preflight_error_envelope is None
+                or preflight_error is None
+            ):
+                return
+            request_preflight_state.setdefault(
+                "source_kv_group",
+                kv_group,
+            )
+            request_preflight_state.setdefault(
+                "source_layer_id",
+                preflight_error_envelope.layer_id,
+            )
+            request_preflight_state.setdefault(
+                "message",
+                preflight_error_envelope.message,
+            )
+            request_preflight_state.setdefault(
+                "details",
+                preflight_error_envelope.error_details,
+            )
+            request_preflight_state.setdefault("error", preflight_error)
+
+        def request_preflight_failed_elsewhere() -> bool:
+            return (
+                isinstance(request_preflight_state, dict)
+                and "error" in request_preflight_state
+                and request_preflight_state.get("source_kv_group") != kv_group
+            )
+
+        def make_request_preflight_error_envelope() -> SharedHandleEnvelope:
+            assert isinstance(request_preflight_state, dict)
+            source_kv_group = request_preflight_state.get("source_kv_group")
+            message = (
+                "Shared CPU sparse decode request preflight failed before "
+                "any handle publication."
+            )
+            return self._shared_layerwise_error_envelope(
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                request_ordinal=request_ordinal,
+                layer_id=0,
+                kv_group=kv_group,
+                message=message,
+                details={
+                    "source_kv_group": source_kv_group,
+                    "source_layer_id": request_preflight_state.get(
+                        "source_layer_id"
+                    ),
+                    "source_message": request_preflight_state.get("message"),
+                    "source_details": request_preflight_state.get("details"),
+                },
+            )
+
+        if shared_sparse_retrieve and not use_cached_retrieve and retrieve_keys:
+            missing_locations: list[tuple[int, int]] = []
+            for layer_id, layer_keys in enumerate(retrieve_keys):
+                layer_locations: list[str] = []
+                for chunk_index, key in enumerate(layer_keys):
+                    key_location = self._find_shared_rank0_chunk_location(key)
+                    if key_location is None:
+                        missing_locations.append((layer_id, chunk_index))
+                        key_location = ""
+                    layer_locations.append(key_location)
+                shared_chunk_locations_layer_major.append(layer_locations)
+            if missing_locations:
+                message = (
+                    "Shared CPU sparse decode missing required chunks before "
+                    "rank0 materialization."
                 )
+                preflight_error_envelope = self._shared_layerwise_error_envelope(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                    request_ordinal=request_ordinal,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    message=message,
+                    details={
+                        "missing_locations": missing_locations,
+                        "failed_layer_id": missing_locations[0][0],
+                    },
+                )
+                preflight_error = ValueError(
+                    f"{message} missing={missing_locations}"
+                )
+                record_request_preflight_error()
+            else:
+                capacity_details = self._shared_cpu_runtime_capacity_details(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                    kv_group=kv_group,
+                    keys_layer_major=retrieve_keys,
+                    chunk_locations_layer_major=shared_chunk_locations_layer_major,
+                    token_count=len(tokens),
+                    chunk_token_lengths=[
+                        int(end - start)
+                        for start, end in zip(starts, ends, strict=False)
+                    ],
+                )
+                if not capacity_details.get("fits", False):
+                    message = (
+                        "Shared CPU sparse decode capacity check failed before "
+                        "rank0 materialization."
+                    )
+                    preflight_error_envelope = self._shared_layerwise_error_envelope(
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase", "sparse_decode_bootstrap"
+                        ),
+                        request_ordinal=request_ordinal,
+                        layer_id=0,
+                        kv_group=kv_group,
+                        message=message,
+                        details=capacity_details,
+                    )
+                    preflight_error = ValueError(
+                        f"{message} details={capacity_details}"
+                    )
+                    record_request_preflight_error()
+                else:
+                    pre_resolved_shared_mem_layers = []
+                    try:
+                        for layer_id, layer_keys in enumerate(retrieve_keys):
+                            pre_resolved_shared_mem_layers.append(
+                                self._resolve_shared_rank0_layer_mem_objs(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    layer_id=layer_id,
+                                    kv_group=kv_group,
+                                    keys_layer=layer_keys,
+                                    chunk_locations=(
+                                        shared_chunk_locations_layer_major[layer_id]
+                                    ),
+                                )
+                            )
+                    except Exception as exc:
+                        release_pre_resolved_shared_mem_layers()
+                        message = (
+                            "Shared CPU sparse decode rank0 materialization failed "
+                            "before any handle publication."
+                        )
+                        preflight_error_envelope = (
+                            self._shared_layerwise_error_envelope(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase",
+                                    "sparse_decode_bootstrap",
+                                ),
+                                request_ordinal=request_ordinal,
+                                layer_id=0,
+                                kv_group=kv_group,
+                                message=message,
+                                details={
+                                    "error": str(exc),
+                                    "location": location,
+                                    "failed_layer_id": len(
+                                        pre_resolved_shared_mem_layers
+                                    ),
+                                },
+                            )
+                        )
+                        preflight_error = ValueError(
+                            f"{message} error={exc}"
+                        )
+                        record_request_preflight_error()
 
-        next(mem_obj_consumer)
+        if preflight_error_envelope is None and request_preflight_failed_elsewhere():
+            release_pre_resolved_shared_mem_layers()
+            preflight_error_envelope = make_request_preflight_error_envelope()
+            preflight_error = ValueError(
+                "Shared CPU sparse decode request preflight failed before "
+                "handle publication: "
+                f"source_kv_group="
+                f"{request_preflight_state.get('source_kv_group')}, "
+                f"message={request_preflight_state.get('message')}"
+            )
 
-        yield ret_mask
+        if preflight_error_envelope is not None:
+            yield ret_mask
+            self._broadcast_shared_envelope(preflight_error_envelope)
+            assert preflight_error is not None
+            raise preflight_error
+
+        pending_pre_resolved_release: List[MemoryObj] = []
+        if (
+            shared_sparse_retrieve
+            and pre_resolved_shared_mem_layers is not None
+            and not use_cached_retrieve
+        ):
+            pending_pre_resolved_release = [
+                mem_obj
+                for mem_objs_layer in pre_resolved_shared_mem_layers
+                for mem_obj in mem_objs_layer
+            ]
+
+        def mark_pre_resolved_layer_handed_off(
+            mem_objs_layer: List[MemoryObj],
+        ) -> None:
+            if cached_memory_objs is None or not pending_pre_resolved_release:
+                return
+            for mem_obj in mem_objs_layer:
+                try:
+                    pending_pre_resolved_release.remove(mem_obj)
+                except ValueError:
+                    pass
+
+        def release_pending_pre_resolved() -> None:
+            nonlocal pending_pre_resolved_release
+            for mem_obj in pending_pre_resolved_release:
+                if getattr(mem_obj, "is_pinned", False):
+                    mem_obj.unpin()
+                if mem_obj.is_valid():
+                    mem_obj.ref_count_down()
+            pending_pre_resolved_release = []
+
+        published_cached_shared_mem_objs: List[MemoryObj] = []
+        cached_publication_handed_off = False
+
+        def claim_cached_shared_mem_objs_for_publication(
+            mem_objs_layer: List[MemoryObj],
+        ) -> None:
+            """Take the request pin/ref needed by rank0 handle publication."""
+            for mem_obj in mem_objs_layer:
+                try:
+                    mem_obj.ref_count_up()
+                except Exception as exc:
+                    raise ValueError(
+                        "Shared CPU sparse decode cached MemoryObj cannot be "
+                        "retained before handle publication."
+                    ) from exc
+                try:
+                    pinned = mem_obj.pin()
+                    if pinned is False:
+                        raise ValueError("MemoryObj.pin() returned False")
+                except Exception:
+                    try:
+                        if getattr(mem_obj, "is_valid", lambda: True)():
+                            mem_obj.ref_count_down()
+                    except Exception:
+                        logger.exception(
+                            "Failed to release cached shared MemoryObj after "
+                            "publication pin failure"
+                        )
+                    raise
+                published_cached_shared_mem_objs.append(mem_obj)
+
+        def release_unowned_cached_publication_objs() -> None:
+            if cached_publication_handed_off:
+                return
+            for mem_obj in reversed(published_cached_shared_mem_objs):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if getattr(mem_obj, "is_valid", lambda: True)():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release cached shared MemoryObj after "
+                        "handle publication failure"
+                    )
+            published_cached_shared_mem_objs.clear()
+
+        sparse_memory_objs_notified = False
+
+        def ensure_mem_obj_consumer():
+            nonlocal mem_obj_consumer, sparse_memory_objs_notified
+            if mem_obj_consumer is not None:
+                return mem_obj_consumer
+            mem_obj_consumer = (
+                self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+            )
+            notify_fn = getattr(
+                self.gpu_connector,
+                "notify_sparse_memory_objs_updated",
+                None,
+            )
+            if (
+                notify_fn is not None
+                and not use_cached_retrieve
+                and not sparse_memory_objs_notified
+            ):
+                notify_fn()
+                sparse_memory_objs_notified = True
+            next(mem_obj_consumer)
+            return mem_obj_consumer
+
+        try:
+            for layer_id in range(self.num_layers):
+                sparse_request = yield ret_mask
+                sparse_payload = None
+                target_slot_mapping = None
+                if isinstance(sparse_request, dict):
+                    sparse_payload = sparse_request
+                    selected_tokens = sparse_payload.get("selected_token_ids")
+                    token_start_index = sparse_payload.get("token_start_index")
+                elif isinstance(sparse_request, tuple):
+                    if len(sparse_request) == 3:
+                        (
+                            selected_tokens,
+                            token_start_index,
+                            target_slot_mapping,
+                        ) = sparse_request
+                    else:
+                        selected_tokens, token_start_index = sparse_request
+                else:
+                    selected_tokens = sparse_request
+                    token_start_index = 0
+
+                if (
+                    shared_sparse_retrieve
+                    and (not use_cached_retrieve or publish_shared_handles)
+                    and request_preflight_failed_elsewhere()
+                ):
+                    release_pending_pre_resolved()
+                    pre_resolved_shared_mem_layers = None
+                    error_envelope = make_request_preflight_error_envelope()
+                    self._broadcast_shared_envelope(error_envelope)
+                    raise ValueError(
+                        "Shared CPU sparse decode request preflight failed "
+                        "before handle publication: "
+                        f"source_kv_group="
+                        f"{request_preflight_state.get('source_kv_group')}, "
+                        f"message={request_preflight_state.get('message')}"
+                    )
+
+                if cached_mem_layers is not None:
+                    mem_objs_layer = cached_mem_layers[layer_id]
+                    diag_source = "cached_memory_objs"
+                elif use_cached_retrieve:
+                    mem_objs_layer = []
+                    diag_source = "cached_tensors"
+                else:
+                    if shared_sparse_retrieve:
+                        assert pre_resolved_shared_mem_layers is not None
+                        mem_objs_layer = pre_resolved_shared_mem_layers[layer_id]
+                        diag_source = "shared_pre_resolved"
+                    else:
+                        assert get_generator is not None
+                        task = next(get_generator)
+                        assert task is not None
+                        mem_objs_layer = task.result()
+                        diag_source = f"storage:{location}"
+                    if mem_objs_layer is not None:
+                        layer_cached_chunks = (
+                            len(cached_tensors[layer_id])
+                            if cached_tensors is not None
+                            and len(cached_tensors) > layer_id
+                            else 0
+                        )
+                        if layer_cached_chunks < len(retrieve_keys[0]):
+                            self._append_retrieve_layer_cache(
+                                layer_id,
+                                mem_objs_layer,
+                                cached_memory_objs,
+                                cached_tensors,
+                                cached_chunk_dev_ptrs,
+                                cached_chunk_ptrs_npu,
+                            )
+                            if shared_sparse_retrieve:
+                                mark_pre_resolved_layer_handed_off(
+                                    mem_objs_layer
+                                )
+                    else:
+                        mem_objs_layer = []
+
+                if publish_shared_handles:
+                    if required_chunks and not mem_objs_layer:
+                        message = (
+                            "Shared CPU sparse decode has no MemoryObjs to "
+                            "publish for required chunks."
+                        )
+                        self._broadcast_shared_envelope(
+                            self._shared_layerwise_error_envelope(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase", "sparse_decode_bootstrap"
+                                ),
+                                request_ordinal=request_ordinal,
+                                layer_id=layer_id,
+                                kv_group=kv_group,
+                                message=message,
+                                details={"required_chunks": required_chunks},
+                            )
+                        )
+                        raise ValueError(message)
+                    try:
+                        if cached_mem_layers is not None:
+                            claim_cached_shared_mem_objs_for_publication(
+                                mem_objs_layer
+                            )
+                        handles = self._make_shared_handles_for_layer(
+                            req_id=kwargs.get("req_id", "unspecified"),
+                            phase=kwargs.get(
+                                "shared_cpu_phase", "sparse_decode_bootstrap"
+                            ),
+                            keys_layer=retrieve_keys[layer_id],
+                            mem_objs_layer=mem_objs_layer,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                        )
+                        self._append_shared_handle_cache(
+                            layer_id,
+                            handles,
+                            cached_shared_handles,
+                        )
+                        envelope = SharedHandleEnvelope(
+                            request_id=kwargs.get("req_id", "unspecified"),
+                            phase=kwargs.get(
+                                "shared_cpu_phase", "sparse_decode_bootstrap"
+                            ),
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            status="ok" if handles else "skipped",
+                            generation=self.shared_cpu_cache_generation,
+                            handles=handles,
+                            message=(
+                                None
+                                if handles
+                                else "no sparse decode shared CPU cache chunks selected"
+                            ),
+                        )
+                    except Exception as exc:
+                        message = (
+                            "Shared CPU sparse decode rank0 handle publication "
+                            "failed."
+                        )
+                        try:
+                            self._broadcast_shared_envelope(
+                                self._shared_layerwise_error_envelope(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    request_ordinal=request_ordinal,
+                                    layer_id=layer_id,
+                                    kv_group=kv_group,
+                                    message=message,
+                                    details={
+                                        "error": str(exc),
+                                        "required_chunks": required_chunks,
+                                    },
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to broadcast shared CPU sparse decode "
+                                "handle-publication error envelope"
+                            )
+                        raise
+                    self._broadcast_shared_envelope(envelope)
+
+                if sparse_payload is not None:
+                    sparse_payload["memory_objs_layer"] = mem_objs_layer
+                    ensure_mem_obj_consumer().send(sparse_payload)
+                else:
+                    ensure_mem_obj_consumer().send(
+                        (
+                            mem_objs_layer,
+                            selected_tokens,
+                            token_start_index,
+                            target_slot_mapping,
+                        )
+                    )
+
+            if mem_obj_consumer is not None:
+                next(mem_obj_consumer)
+            release_pending_pre_resolved()
+            # The LMCache vLLM adapter records request state after this final
+            # yield and drains sparse retrievers with close(), so ownership must
+            # be handed off before yielding.
+            cached_publication_handed_off = True
+
+            yield ret_mask
+        finally:
+            release_unowned_cached_publication_objs()
+            release_pending_pre_resolved()
 
 
     @torch.inference_mode()

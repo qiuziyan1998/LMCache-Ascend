@@ -742,7 +742,7 @@ class TestPerGroupLazyInit:
         conn._lazy_initialize_buffer(self._latent_kvcaches(), kv_group=0)
         conn._lazy_initialize_buffer(self._indexer_kvcaches(), kv_group=1)
         # After init for both groups, the sparse-direct state container is a
-        # dict keyed by (kvcaches_id, kv_group, layer_id).
+        # dict keyed by kvcaches/group/layer plus source layout metadata.
         assert isinstance(conn._sparse_direct_layer_states, dict) or (
             conn._sparse_direct_layer_states is None
         )

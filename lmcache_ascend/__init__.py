@@ -7,6 +7,7 @@ from ._version import __version_tuple__ as __version_tuple__  # noqa: F401  # is
 
 # Standard
 import sys
+from typing import Optional
 
 # First Party
 from lmcache_ascend import _build_info
@@ -29,6 +30,59 @@ def _patch_config():
     # Third Party
     from lmcache.v1.config_base import _to_bool, _to_int_list, create_config_class
     import lmcache.v1.config
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["enable_shared_cpu_cache"] = {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Enable decode-node-local shared CPU cache handle "
+        "publication for rank0-only LMCache storage.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_strict"] = {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Fail fast on invalid shared CPU cache config, missing "
+        "chunks, or unsafe handle/pointer validation.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_name"] = {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+        "description": "Optional debug override for the POSIX shm name. "
+        "Unset means rank0 derives a unique engine-local name.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_size_gb"] = {
+        "type": Optional[float],
+        "default": None,
+        "env_converter": float,
+        "description": "Optional shared CPU slab size override in GB. "
+        "Unset means use effective max_local_cpu_size.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS[
+        "shared_cpu_materialize_index_on_decode_cold"
+    ] = {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Materialize DSA index during sparse decode cold "
+        "bootstrap when dsa_two_groups=true.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS[
+        "shared_cpu_cache_passive_writable"
+    ] = {
+        "type": Optional[bool],
+        "default": None,
+        "env_converter": _to_bool,
+        "description": "Optional passive-rank shm mmap mode override. "
+        "Unset means try read-only first and retry read-write if host "
+        "registration requires it.",
+    }
 
     # Add new config item for p2p npu usage
     lmcache.v1.config._CONFIG_DEFINITIONS["p2p_use_npu"] = {
@@ -214,7 +268,7 @@ def _patch_config():
     # patch ran, its module-level ``LMCacheEngineConfig`` still points to
     # the OLD class whose ``_from_file`` closure now iterates the mutated
     # _CONFIG_DEFINITIONS dict (with keys like ``p2p_use_npu``), while the
-    # OLD ``__init__`` doesn't accept them → TypeError.  Fix by updating
+    # OLD ``__init__`` doesn't accept them -> TypeError. Fix by updating
     # the stale reference.
     _utils_mod = sys.modules.get("lmcache.integration.vllm.utils")
     if _utils_mod is not None:
