@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import hashlib
 import os
 from typing import Any, List, Optional, Set, Union
 
@@ -54,6 +55,158 @@ _SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS = os.getenv(
 _SPARSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
+_DSA_DIAG = os.getenv("LMCACHE_DSA_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_DSA_DIAG_TENSOR_STATS = os.getenv(
+    "LMCACHE_DSA_DIAG_TENSOR_STATS", "0"
+).lower() in ("1", "true", "yes", "on")
+_DSA_DIAG_FIRST_TOKEN_COMPARE = _DSA_DIAG and os.getenv(
+    "LMCACHE_DSA_DIAG_FIRST_TOKEN_COMPARE", "0"
+).lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning(
+            "Invalid integer env %s=%r; using %s",
+            name,
+            os.getenv(name),
+            default,
+        )
+        return default
+
+
+_DSA_DIAG_FIRST_TOKEN_COMPARE_LAYERS = _env_int(
+    "LMCACHE_DSA_DIAG_FIRST_TOKEN_LAYERS", 8
+)
+_DSA_DIAG_FIRST_TOKEN_COMPARE_SELECTED = _env_int(
+    "LMCACHE_DSA_DIAG_FIRST_TOKEN_SELECTED", 16
+)
+_DSA_DIAG_FIRST_TOKEN_COMPARE_HASH_SELECTED = _env_int(
+    "LMCACHE_DSA_DIAG_FIRST_TOKEN_HASH_SELECTED", 2048
+)
+_DSA_DIAG_FIRST_TOKEN_COMPARE_VALUES = _env_int(
+    "LMCACHE_DSA_DIAG_FIRST_TOKEN_VALUES", 8
+)
+
+
+def _diag_tensor_summary(value: Any, max_items: int = 4) -> Any:
+    if isinstance(value, torch.Tensor):
+        summary: dict[str, Any] = {
+            "type": "Tensor",
+            "shape": tuple(int(dim) for dim in value.shape),
+            "stride": tuple(int(stride) for stride in value.stride()),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "numel": int(value.numel()),
+            "data_ptr": int(value.data_ptr()),
+        }
+        if _DSA_DIAG_TENSOR_STATS and value.numel() > 0:
+            try:
+                sample = value.detach().reshape(-1)
+                if sample.device.type != "cpu":
+                    sample = sample.to(device="cpu")
+                sample = sample[: min(max_items, int(sample.numel()))]
+                summary["head"] = sample.tolist()
+                if value.dtype.is_floating_point:
+                    sample_f = sample.float()
+                    summary["sum_head"] = float(sample_f.sum().item())
+                    summary["min_head"] = float(sample_f.min().item())
+                    summary["max_head"] = float(sample_f.max().item())
+            except Exception as exc:
+                summary["stats_error"] = str(exc)
+        return summary
+    if isinstance(value, (list, tuple)):
+        return {
+            "type": type(value).__name__,
+            "len": len(value),
+            "head": [
+                _diag_tensor_summary(item, max_items=max_items)
+                for item in list(value)[:2]
+            ],
+        }
+    return value
+
+
+def _diag_tensor_list_summary(tensors: List[torch.Tensor]) -> dict[str, Any]:
+    return {
+        "count": len(tensors),
+        "head": [
+            _diag_tensor_summary(tensor)
+            for tensor in tensors[:2]
+        ],
+    }
+
+
+def _diag_tensor_digest(tensor: torch.Tensor) -> str:
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(tensor.dtype).encode("utf-8"))
+    h.update(str(tuple(int(dim) for dim in tensor.shape)).encode("utf-8"))
+    try:
+        payload = tensor.contiguous().view(torch.uint8).numpy().tobytes()
+    except Exception:
+        payload = repr(tensor.tolist()).encode("utf-8")
+    h.update(payload)
+    return h.hexdigest()
+
+
+def _diag_tensor_fingerprint(
+    value: Any,
+    max_items: int = 16,
+) -> dict[str, Any]:
+    if not isinstance(value, torch.Tensor):
+        return {"type": type(value).__name__, "value": repr(value)}
+    summary: dict[str, Any] = {
+        "type": "Tensor",
+        "shape": tuple(int(dim) for dim in value.shape),
+        "dtype": str(value.dtype),
+        "device": str(value.device),
+        "numel": int(value.numel()),
+    }
+    if value.numel() == 0:
+        summary["digest"] = "empty"
+        return summary
+    flat = value.detach().reshape(-1)
+    if flat.device.type != "cpu":
+        flat = flat.to(device="cpu")
+    flat = flat.contiguous()
+    summary["digest"] = _diag_tensor_digest(flat)
+    head = flat[: min(max_items, int(flat.numel()))]
+    tail = flat[-min(max_items, int(flat.numel())) :]
+    try:
+        summary["head"] = head.tolist()
+        summary["tail"] = tail.tolist()
+    except Exception as exc:
+        summary["values_error"] = str(exc)
+    if value.dtype in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.bool,
+    ):
+        try:
+            summary["min"] = int(flat.min().item())
+            summary["max"] = int(flat.max().item())
+        except Exception as exc:
+            summary["range_error"] = str(exc)
+    return summary
+
+
+def _diag_int_tensor_values(value: Any) -> list[int]:
+    if not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return []
+    flat = value.detach().reshape(-1)
+    if flat.device.type != "cpu":
+        flat = flat.to(device="cpu")
+    return [int(item) for item in flat.tolist()]
 
 _IS_310P = None
 def is_310p():
@@ -1244,6 +1397,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_layer_states: Optional[dict] = None
         self._sparse_direct_kvcaches_id: Optional[int] = None
         self._sparse_direct_validated_layers: set = set()
+        self._dsa_diag_first_token_compare_seen: Set[tuple] = set()
 
     def _reset_sparse_direct_layer_states(self) -> None:
         self._sparse_direct_layer_states = None
@@ -1806,6 +1960,294 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         return summary, min_value, max_value, sample
 
+    def _dsa_diag_source_planes(
+        self,
+        kv_group: int,
+    ) -> tuple[str, list[tuple[str, int]]]:
+        layout = self._layout_for(kv_group)
+        if layout is None:
+            return "uninitialized", []
+        fmt = layout.kv_format
+        if fmt == KVCacheFormat.DSA_INDEX:
+            return fmt.name, [
+                ("index", int(layout.dsa_hidden_dims or layout.k_hidden_dims))
+            ]
+        if fmt in (KVCacheFormat.MLA_LATENT, KVCacheFormat.MLA_KV):
+            return fmt.name, [
+                ("latent_k", int(layout.k_hidden_dims)),
+                ("latent_v", int(layout.v_hidden_dims)),
+            ]
+        if fmt == KVCacheFormat.DSA_KV:
+            return fmt.name, [
+                ("latent_k", int(layout.k_hidden_dims)),
+                ("latent_v", int(layout.v_hidden_dims)),
+                ("index", int(layout.dsa_hidden_dims)),
+            ]
+        return fmt.name, []
+
+    def _dsa_diag_selected_source_fingerprint(
+        self,
+        *,
+        cpu_tensors: List[torch.Tensor],
+        selected_token_idx: torch.Tensor,
+        kv_group: int,
+        chunk_size: int,
+    ) -> dict[str, Any]:
+        selected_values = _diag_int_tensor_values(selected_token_idx)
+        kv_format, planes = self._dsa_diag_source_planes(kv_group)
+        summary: dict[str, Any] = {
+            "kv_format": kv_format,
+            "chunk_size": int(chunk_size),
+            "tensor_count": len(cpu_tensors),
+            "selected_count": len(selected_values),
+            "selected_head": selected_values[:_DSA_DIAG_FIRST_TOKEN_COMPARE_SELECTED],
+            "source_tensors": [
+                {
+                    "shape": tuple(int(dim) for dim in tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "device": str(tensor.device),
+                    "data_ptr": int(tensor.data_ptr()),
+                    "numel": int(tensor.numel()),
+                }
+                for tensor in cpu_tensors[:4]
+            ],
+        }
+        if not cpu_tensors:
+            summary["digest"] = "no_source_tensors"
+            return summary
+        if not selected_values:
+            summary["digest"] = "no_selected_tokens"
+            return summary
+        if chunk_size <= 0:
+            summary["digest"] = "invalid_chunk_size"
+            return summary
+        if not planes:
+            summary["digest"] = "unsupported_format"
+            return summary
+
+        digest = hashlib.blake2b(digest_size=16)
+        samples: list[dict[str, Any]] = []
+        errors: list[str] = []
+        max_hash_selected = max(0, _DSA_DIAG_FIRST_TOKEN_COMPARE_HASH_SELECTED)
+        max_sample_selected = max(0, _DSA_DIAG_FIRST_TOKEN_COMPARE_SELECTED)
+        summary["hashed_selected_count"] = min(
+            len(selected_values),
+            max_hash_selected,
+        )
+        for token_id in selected_values[:max_hash_selected]:
+            chunk_index = int(token_id) // int(chunk_size)
+            token_offset = int(token_id) % int(chunk_size)
+            record_sample = len(samples) < max_sample_selected
+            token_sample: dict[str, Any] = {
+                "token": int(token_id),
+                "chunk": chunk_index,
+                "offset": token_offset,
+                "planes": [],
+            }
+            if chunk_index < 0 or chunk_index >= len(cpu_tensors):
+                errors.append(
+                    f"token={token_id} chunk={chunk_index} outside "
+                    f"tensor_count={len(cpu_tensors)}"
+                )
+                if record_sample:
+                    samples.append(token_sample)
+                continue
+
+            tensor = cpu_tensors[chunk_index]
+            token_count = self._lmc_plane_num_tokens(tensor, kv_group)
+            if token_offset < 0 or token_offset >= token_count:
+                errors.append(
+                    f"token={token_id} offset={token_offset} outside "
+                    f"chunk_tokens={token_count}"
+                )
+                if record_sample:
+                    samples.append(token_sample)
+                continue
+
+            flat = tensor.detach().reshape(-1)
+            plane_base = 0
+            for plane_name, plane_dim in planes:
+                if plane_dim <= 0:
+                    continue
+                start = plane_base + token_offset * plane_dim
+                end = start + plane_dim
+                plane_base += token_count * plane_dim
+                if start < 0 or end > int(flat.numel()):
+                    errors.append(
+                        f"token={token_id} plane={plane_name} slice=({start},{end}) "
+                        f"outside numel={int(flat.numel())}"
+                    )
+                    continue
+                row = flat[start:end]
+                if row.device.type != "cpu":
+                    row = row.to(device="cpu")
+                row = row.contiguous()
+                row_digest = _diag_tensor_digest(row)
+                digest.update(str(int(token_id)).encode("utf-8"))
+                digest.update(plane_name.encode("utf-8"))
+                digest.update(row_digest.encode("utf-8"))
+                if record_sample:
+                    head_values = row[: min(
+                        max(0, _DSA_DIAG_FIRST_TOKEN_COMPARE_VALUES),
+                        int(row.numel()),
+                    )]
+                    try:
+                        head = head_values.tolist()
+                    except Exception as exc:
+                        head = [f"head_error={exc}"]
+                    token_sample["planes"].append(
+                        {
+                            "plane": plane_name,
+                            "dim": plane_dim,
+                            "digest": row_digest,
+                            "head": head,
+                        }
+                    )
+            if record_sample:
+                samples.append(token_sample)
+
+        summary["digest"] = digest.hexdigest()
+        summary["sampled_count"] = len(samples)
+        summary["samples"] = samples
+        if errors:
+            summary["errors"] = errors[:8]
+        return summary
+
+    def _dsa_diag_gather_rank_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[list[Any], int, int]:
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            tp_rank = int(getattr(tp_group, "rank_in_group", 0))
+            tp_world_size = int(getattr(tp_group, "world_size", 1))
+            payload["tp_rank"] = tp_rank
+            payload["global_rank"] = int(getattr(tp_group, "rank", -1))
+            if (
+                tp_world_size <= 1
+                or not torch.distributed.is_available()
+                or not torch.distributed.is_initialized()
+            ):
+                return [payload], tp_rank, tp_world_size
+            gathered: list[Any] = [None for _ in range(tp_world_size)]
+            torch.distributed.all_gather_object(
+                gathered,
+                payload,
+                group=getattr(tp_group, "cpu_group", None),
+            )
+            return gathered, tp_rank, tp_world_size
+        except Exception as exc:
+            payload["tp_gather_error"] = str(exc)
+            return [payload], int(payload.get("tp_rank", -1)), 1
+
+    def _dsa_diag_log_first_token_rank_compare(
+        self,
+        *,
+        diag_context: Optional[dict[str, Any]],
+        kv_group: int,
+        layer_id: int,
+        cpu_tensors: List[torch.Tensor],
+        selected_token_idx: torch.Tensor,
+        slot_mapping_packed: torch.Tensor,
+        chunk_size: int,
+        total_tokens: int,
+        source: str,
+        ptr_cache_reused: bool,
+    ) -> None:
+        if not _DSA_DIAG_FIRST_TOKEN_COMPARE:
+            return
+        if (
+            _DSA_DIAG_FIRST_TOKEN_COMPARE_LAYERS >= 0
+            and layer_id >= _DSA_DIAG_FIRST_TOKEN_COMPARE_LAYERS
+        ):
+            return
+        if selected_token_idx is None or int(selected_token_idx.numel()) == 0:
+            return
+        diag_context = diag_context or {}
+        req_id = diag_context.get("req_id", "unspecified")
+        prompt_digest = diag_context.get("prompt_digest")
+        prompt_run = diag_context.get("prompt_run")
+        seen_key = (req_id, prompt_digest, prompt_run, int(kv_group), int(layer_id))
+        if seen_key in self._dsa_diag_first_token_compare_seen:
+            return
+        self._dsa_diag_first_token_compare_seen.add(seen_key)
+
+        local_error = None
+        try:
+            selected_fp = _diag_tensor_fingerprint(
+                selected_token_idx,
+                max_items=max(1, _DSA_DIAG_FIRST_TOKEN_COMPARE_SELECTED),
+            )
+            slot_fp = _diag_tensor_fingerprint(
+                slot_mapping_packed,
+                max_items=max(1, _DSA_DIAG_FIRST_TOKEN_COMPARE_SELECTED),
+            )
+            source_fp = self._dsa_diag_selected_source_fingerprint(
+                cpu_tensors=cpu_tensors,
+                selected_token_idx=selected_token_idx,
+                kv_group=kv_group,
+                chunk_size=chunk_size,
+            )
+        except Exception as exc:
+            local_error = str(exc)
+            selected_fp = {"digest": "local_fingerprint_error"}
+            slot_fp = {"digest": "local_fingerprint_error"}
+            source_fp = {
+                "digest": "local_fingerprint_error",
+                "kv_format": "unknown",
+                "error": local_error,
+            }
+        payload = {
+            "req_id": req_id,
+            "prompt_digest": prompt_digest,
+            "prompt_run": prompt_run,
+            "kv_group": int(kv_group),
+            "kv_format": source_fp.get("kv_format"),
+            "layer": int(layer_id),
+            "source": source,
+            "ptr_cache_reused": bool(ptr_cache_reused),
+            "total_tokens": int(total_tokens),
+            "chunk_size": int(chunk_size),
+            "selected_digest": selected_fp.get("digest"),
+            "slot_digest": slot_fp.get("digest"),
+            "source_digest": source_fp.get("digest"),
+            "selected": selected_fp,
+            "slot": slot_fp,
+            "source_rows": source_fp,
+        }
+        if local_error is not None:
+            payload["local_fingerprint_error"] = local_error
+        gathered, tp_rank, tp_world_size = self._dsa_diag_gather_rank_payload(payload)
+        if tp_rank not in (0, -1):
+            return
+
+        fields = ("selected_digest", "slot_digest", "source_digest")
+        distinct = {
+            field: sorted({repr(item.get(field)) for item in gathered if item})
+            for field in fields
+        }
+        mismatched = [
+            field for field, values in distinct.items() if len(values) > 1
+        ]
+        logger.warning(
+            "[DSA_DIAG_RANK_COMPARE] first_token_input req_id=%s "
+            "prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
+            "tp_world_size=%s mismatch=%s mismatch_fields=%s distinct=%s "
+            "ranks=%s",
+            req_id,
+            prompt_digest,
+            prompt_run,
+            kv_group,
+            layer_id,
+            tp_world_size,
+            bool(mismatched),
+            mismatched,
+            distinct,
+            gathered,
+        )
+
     def _validate_sparse_direct_explicit_inputs(
         self,
         *,
@@ -2020,6 +2462,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cpu_tensors: Optional[List[torch.Tensor]] = None,
         payload_event: Optional[Any] = None,
         explicit_sparse_payload: bool = False,
+        diag_context: Optional[dict[str, Any]] = None,
     ) -> None:
         num_sparse = int(selected_token_idx.numel())
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
@@ -2102,6 +2545,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         if validate_key is None:
             validate_key = (kv_group, layer_id)
+        if _DSA_DIAG:
+            logger.warning(
+                "[DSA_DIAG] sparse_direct_temp context=%s layer_state=%s "
+                "validate_key=%s runtime_signature=%s",
+                diag_context,
+                layer_state is not None,
+                validate_key,
+                runtime_source_signature,
+            )
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if payload_event is not None:
@@ -2153,6 +2605,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
 
         current_stream.wait_stream(load_stream)
+        if _DSA_DIAG:
+            logger.warning(
+                "[DSA_DIAG] sparse_direct_output context=%s kvcache=%s",
+                diag_context,
+                _diag_tensor_summary(kvcaches_ref[layer_id]),
+            )
 
     def _sparse_selected_token_idx(
         self,
@@ -3108,6 +3566,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if not cpu_tensors:
                 continue
 
+            ptr_cache_reused = (
+                cached_chunk_ptrs_npu is not None
+                and layer_id < len(cached_chunk_ptrs_npu)
+                and cached_chunk_ptrs_npu[layer_id] is not None
+                and cached_chunk_ptrs_npu[layer_id].numel() == len(cpu_tensors)
+            )
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                 layer_id,
                 cpu_tensors,
@@ -3120,6 +3584,61 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens = self._sparse_total_tokens_from_layer_chunks(
                     cpu_tensors, kv_group
                 )
+
+            diag_context = None
+            if _DSA_DIAG:
+                diag_context = {
+                    "req_id": kwargs.get("req_id", "unspecified"),
+                    "prompt_digest": kwargs.get("_dsa_diag_prompt_digest"),
+                    "prompt_run": kwargs.get("_dsa_diag_prompt_run"),
+                    "kv_group": kv_group,
+                    "layer": layer_id,
+                    "source": (
+                        "cached_tensors"
+                        if layer_cached_tensors is not None
+                        else "memory_objs"
+                    ),
+                }
+                logger.warning(
+                    "[DSA_DIAG] connector_sparse_input context=%s explicit=%s "
+                    "ptr_reused=%s total_tokens=%s chunk_size=%s "
+                    "cpu_tensors=%s chunk_ptrs=%s selected=%s slot=%s "
+                    "layout=%s",
+                    diag_context,
+                    explicit_sparse_payload,
+                    ptr_cache_reused,
+                    total_tokens,
+                    chunk_size,
+                    _diag_tensor_list_summary(cpu_tensors),
+                    _diag_tensor_summary(chunk_ptrs_npu),
+                    _diag_tensor_summary(selected_token_idx),
+                    _diag_tensor_summary(slot_mapping_packed),
+                    {
+                        "format": sparse_kv_format,
+                        "token_major": sparse_token_major,
+                        "host_interleaved": sparse_host_interleaved,
+                        "k": sparse_k_hidden_dims,
+                        "v": sparse_v_hidden_dims,
+                        "dsa": sparse_dsa_hidden_dims,
+                    },
+                )
+
+            self._dsa_diag_log_first_token_rank_compare(
+                diag_context=diag_context,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                cpu_tensors=cpu_tensors,
+                selected_token_idx=selected_token_idx,
+                slot_mapping_packed=slot_mapping_packed,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+                source=(
+                    "cached_tensors"
+                    if layer_cached_tensors is not None
+                    else "memory_objs"
+                ),
+                ptr_cache_reused=ptr_cache_reused,
+            )
 
             if _SPARSE_DIRECT_DISABLE:
                 self._run_sparse_staging_kv_transfer_layer(
@@ -3168,6 +3687,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors=cpu_tensors,
                     payload_event=payload_event,
                     explicit_sparse_payload=explicit_sparse_payload,
+                    diag_context=diag_context,
                 )
 
         yield
