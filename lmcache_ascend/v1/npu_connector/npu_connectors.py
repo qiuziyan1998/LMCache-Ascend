@@ -4001,10 +4001,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 expected_fmt=expected_fmt,
             )
 
-        current_stream = torch.cuda.current_stream()
-
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
+            # The generator is resumed from vLLM's attention path; refresh the
+            # active compute stream per layer before ordering load -> compute.
+            current_stream = torch.cuda.current_stream()
             if sync:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0 and logger.isEnabledFor(10):
@@ -4102,8 +4103,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         lmcache_cached_tokens: int = int(kwargs.get("lmcache_cached_tokens", 0) or 0)
 
-        current_stream = torch.cuda.current_stream()
-
         load_stream_idx = self.load_stream_idx
         self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
 
@@ -4126,6 +4125,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         for layer_id in range(self.num_layers):
             sparse_request = yield
+            # The generator is resumed from vLLM's attention path; refresh the
+            # active compute stream per layer before ordering load -> compute.
+            current_stream = torch.cuda.current_stream()
             explicit_sparse_payload = isinstance(sparse_request, dict)
             target_slot_mapping = None
             payload_event = None
