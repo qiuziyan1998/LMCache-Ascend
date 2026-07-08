@@ -6,7 +6,6 @@ LMCacheEngine for Ascend NPU.
 
 # Standard
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
-import os
 import queue
 import threading
 import time
@@ -32,63 +31,6 @@ import torch
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
-_DSA_DIAG = os.environ.get("LMCACHE_DSA_DIAG", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
-
-def _diag_layer_counts(cache: Optional[List], max_layers: int = 8) -> list[Any]:
-    if not cache:
-        return []
-    counts: list[Any] = []
-    for layer_cache in cache[:max_layers]:
-        try:
-            counts.append(len(layer_cache))
-        except TypeError:
-            counts.append(type(layer_cache).__name__)
-    if len(cache) > max_layers:
-        counts.append("...")
-    return counts
-
-
-def _diag_tensor_summary(value: Any, max_items: int = 6) -> Any:
-    if isinstance(value, torch.Tensor):
-        summary: dict[str, Any] = {
-            "type": "Tensor",
-            "shape": tuple(int(dim) for dim in value.shape),
-            "dtype": str(value.dtype),
-            "device": str(value.device),
-            "numel": int(value.numel()),
-        }
-        if value.device.type == "cpu" and value.numel() > 0:
-            summary["head"] = value.detach().reshape(-1)[:max_items].tolist()
-        return summary
-    return value
-
-
-def _diag_mem_obj_summary(mem_objs: Optional[List[MemoryObj]]) -> dict[str, Any]:
-    if not mem_objs:
-        return {"count": 0}
-    valid = 0
-    pinned = 0
-    addresses = []
-    for mem_obj in mem_objs:
-        if getattr(mem_obj, "is_valid", lambda: False)():
-            valid += 1
-        if getattr(mem_obj, "is_pinned", False):
-            pinned += 1
-        meta = getattr(mem_obj, "meta", None)
-        if meta is not None and len(addresses) < 4:
-            addresses.append(getattr(meta, "address", None))
-    return {
-        "count": len(mem_objs),
-        "valid": valid,
-        "pinned": pinned,
-        "addr_head": addresses,
-    }
 
 
 class ThreadSafeEventList:
@@ -1620,30 +1562,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         if has_shared_cached_retrieve:
             kwargs["_use_cached_retrieve"] = True
 
-        if _DSA_DIAG:
-            logger.warning(
-                "[DSA_DIAG] retrieve_start req_id=%s prompt_digest=%s "
-                "prompt_run=%s kv_group=%s num_tokens=%s shared=%s passive=%s "
-                "metadata_warm=%s has_shared_cached=%s ret_mask=%s "
-                "mem_counts=%s tensor_counts=%s ptr_ready=%s",
-                kwargs.get("req_id", "unspecified"),
-                kwargs.get("_dsa_diag_prompt_digest"),
-                kwargs.get("_dsa_diag_prompt_run"),
-                kv_group,
-                num_tokens,
-                shared_sparse_retrieve,
-                self._is_passive(),
-                metadata_warm,
-                has_shared_cached_retrieve,
-                _diag_tensor_summary(ret_mask),
-                _diag_layer_counts(initial_cached_memory_objs),
-                _diag_layer_counts(initial_cached_tensors),
-                [
-                    ptr is not None
-                    for ptr in (kwargs.get("cached_chunk_ptrs_npu") or [])[:8]
-                ],
-            )
-
         if (
             shared_sparse_retrieve
             and self._is_passive()
@@ -1733,27 +1651,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             and not self._is_passive()
             and not cached_shared_handles_cover
         )
-
-        if _DSA_DIAG:
-            logger.warning(
-                "[DSA_DIAG] retrieve_plan req_id=%s prompt_digest=%s "
-                "prompt_run=%s kv_group=%s location=%s starts_head=%s "
-                "ends_head=%s required_chunks=%s cached_tensors_cover=%s "
-                "cached_mem_cover=%s use_cached=%s shared=%s publish_handles=%s",
-                kwargs.get("req_id", "unspecified"),
-                kwargs.get("_dsa_diag_prompt_digest"),
-                kwargs.get("_dsa_diag_prompt_run"),
-                kv_group,
-                location,
-                starts[:4],
-                ends[:4],
-                required_chunks,
-                cached_tensors_cover,
-                cached_memory_objs_cover,
-                use_cached_retrieve,
-                shared_sparse_retrieve,
-                publish_shared_handles,
-            )
 
         if use_cached_retrieve:
             location = self._resolve_local_cpu_retrieve_location(location)
@@ -2184,25 +2081,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     else:
                         mem_objs_layer = []
 
-                if _DSA_DIAG:
-                    logger.warning(
-                        "[DSA_DIAG] retrieve_layer_input req_id=%s "
-                        "prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
-                        "source=%s mem_objs=%s selected=%s token_start=%s "
-                        "target_slot=%s ret_mask=%s",
-                        kwargs.get("req_id", "unspecified"),
-                        kwargs.get("_dsa_diag_prompt_digest"),
-                        kwargs.get("_dsa_diag_prompt_run"),
-                        kv_group,
-                        layer_id,
-                        diag_source,
-                        _diag_mem_obj_summary(mem_objs_layer),
-                        _diag_tensor_summary(selected_tokens),
-                        _diag_tensor_summary(token_start_index),
-                        _diag_tensor_summary(target_slot_mapping),
-                        _diag_tensor_summary(ret_mask),
-                    )
-
                 if publish_shared_handles:
                     if required_chunks and not mem_objs_layer:
                         message = (
@@ -2302,26 +2180,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                             token_start_index,
                             target_slot_mapping,
                         )
-                    )
-                if _DSA_DIAG:
-                    logger.warning(
-                        "[DSA_DIAG] retrieve_layer_sent req_id=%s "
-                        "prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
-                        "source=%s ret_mask=%s cached_tensor_counts=%s "
-                        "cached_mem_counts=%s ptr_ready=%s",
-                        kwargs.get("req_id", "unspecified"),
-                        kwargs.get("_dsa_diag_prompt_digest"),
-                        kwargs.get("_dsa_diag_prompt_run"),
-                        kv_group,
-                        layer_id,
-                        diag_source,
-                        _diag_tensor_summary(ret_mask),
-                        _diag_layer_counts(cached_tensors),
-                        _diag_layer_counts(cached_memory_objs),
-                        [
-                            ptr is not None
-                            for ptr in (cached_chunk_ptrs_npu or [])[:8]
-                        ],
                     )
 
             if mem_obj_consumer is not None:
