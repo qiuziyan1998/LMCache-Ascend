@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+from contextlib import contextmanager
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -193,6 +194,16 @@ def _payload_stream_list(payload_stream: Any) -> list[Any]:
     if isinstance(payload_stream, (list, tuple)):
         return [stream for stream in payload_stream if stream is not None]
     return [payload_stream]
+
+
+@contextmanager
+def _sparse_stream_context(stream: Any, *, use_npu_stream: bool = False):
+    if use_npu_stream:
+        with torch.npu.stream(stream):
+            yield
+    else:
+        with torch.cuda.stream(stream):
+            yield
 
 
 def _probe_enabled(probes: Set[str], name: str) -> bool:
@@ -3204,7 +3215,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     expected_fmt=expected_fmt,
                 )
             )
-            with torch.cuda.stream(load_stream):
+            with _sparse_stream_context(
+                load_stream,
+                use_npu_stream=_SPARSE_LOAD_ON_CURRENT_STREAM,
+            ):
                 load_stream.wait_stream(current_stream)
                 _wait_stream_probe("before_transfer", payload_stream, load_stream)
                 payload_events = _payload_event_list(payload_event)
@@ -3366,7 +3380,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             explicit_sparse_payload=explicit_sparse_payload,
             layer_state=layer_state is not None,
         )
-        with torch.cuda.stream(load_stream):
+        with _sparse_stream_context(
+            load_stream,
+            use_npu_stream=_SPARSE_LOAD_ON_CURRENT_STREAM,
+        ):
             load_stream.wait_stream(current_stream)
             _wait_stream_probe("before_transfer", payload_stream, load_stream)
             payload_events = _payload_event_list(payload_event)
@@ -4331,7 +4348,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_request = yield
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
-            current_stream = torch.cuda.current_stream()
+            current_stream = (
+                torch.npu.current_stream()
+                if _SPARSE_LOAD_ON_CURRENT_STREAM
+                else torch.cuda.current_stream()
+            )
             load_stream = (
                 current_stream
                 if _SPARSE_LOAD_ON_CURRENT_STREAM
@@ -4384,7 +4405,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 explicit_sparse_payload=explicit_sparse_payload,
             )
             payload_events = _payload_event_list(payload_event)
-            with torch.cuda.stream(current_stream):
+            with _sparse_stream_context(
+                current_stream,
+                use_npu_stream=_SPARSE_LOAD_ON_CURRENT_STREAM,
+            ):
                 # selected_token_idx/target_slot_mapping may be device tensors
                 # produced by vLLM's remap path. Packing below is their first
                 # connector-side consumer, so wait before packing, not only
@@ -4450,12 +4474,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 and cached_chunk_ptrs_npu[layer_id] is not None
                 and cached_chunk_ptrs_npu[layer_id].numel() == len(cpu_tensors)
             )
-            chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
-                layer_id,
-                cpu_tensors,
-                cached_chunk_ptrs_npu,
-                cached_chunk_dev_ptrs,
-            )
+            with _sparse_stream_context(
+                current_stream,
+                use_npu_stream=_SPARSE_LOAD_ON_CURRENT_STREAM,
+            ):
+                chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                    layer_id,
+                    cpu_tensors,
+                    cached_chunk_ptrs_npu,
+                    cached_chunk_dev_ptrs,
+                )
             if lmcache_cached_tokens > 0:
                 total_tokens = lmcache_cached_tokens
             else:
