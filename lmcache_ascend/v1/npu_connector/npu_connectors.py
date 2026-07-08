@@ -57,6 +57,16 @@ _SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS = os.getenv(
 _SPARSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
+_SPARSE_LOAD_ON_CURRENT_STREAM = os.getenv(
+    "LMCACHE_DSA_USE_CURRENT_STREAM_FOR_LOAD", "0"
+).lower() in ("1", "true", "yes", "on") or os.getenv(
+    "LMCACHE_ASCEND_DSA_USE_CURRENT_STREAM_FOR_LOAD", "0"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 _DSA_DIAG = os.getenv("LMCACHE_DSA_DIAG", "0").lower() in (
     "1",
     "true",
@@ -86,6 +96,7 @@ _DSA_WAIT_STREAM_PROBES = {
 }
 _DSA_SYNC_PROBE_LOGGED: Set[str] = set()
 _DSA_WAIT_STREAM_PROBE_LOGGED: Set[str] = set()
+_DSA_CURRENT_STREAM_LOAD_LOGGED = False
 _DSA_DIAG_TENSOR_STATS = os.getenv(
     "LMCACHE_DSA_DIAG_TENSOR_STATS", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -4263,10 +4274,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         Sparse layerwise retrieve: scatter selected KV tokens from CPU pinned
         memory objects into paged NPU KV via direct NPU read (no staging).
         """
+        global _DSA_CURRENT_STREAM_LOAD_LOGGED
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
+        if _SPARSE_LOAD_ON_CURRENT_STREAM and not _DSA_CURRENT_STREAM_LOAD_LOGGED:
+            _DSA_CURRENT_STREAM_LOAD_LOGGED = True
+            logger.warning(
+                "[DSA_STREAM_PROBE] Sparse LMCache load uses current/vLLM "
+                "stream instead of dedicated load_stream."
+            )
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer(self.kvcaches, kv_group=kv_group)
 
@@ -4289,7 +4307,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         lmcache_cached_tokens: int = int(kwargs.get("lmcache_cached_tokens", 0) or 0)
 
         load_stream_idx = self.load_stream_idx
-        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
+        if not _SPARSE_LOAD_ON_CURRENT_STREAM:
+            self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
 
         chunk_size = self.lmcache_chunk_size
 
@@ -4313,7 +4332,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
             current_stream = torch.cuda.current_stream()
-            load_stream = self.load_stream_list[load_stream_idx]
+            load_stream = (
+                current_stream
+                if _SPARSE_LOAD_ON_CURRENT_STREAM
+                else self.load_stream_list[load_stream_idx]
+            )
             explicit_sparse_payload = isinstance(sparse_request, dict)
             target_slot_mapping = None
             payload_event = None
@@ -4501,7 +4524,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kvcaches_ref=kvcaches_snapshot,
                     kv_group=kv_group,
                     layer_id=layer_id,
-                    load_stream=self.load_stream_list[load_stream_idx],
+                    load_stream=load_stream,
                     current_stream=current_stream,
                     slot_mapping_packed=slot_mapping_packed,
                     selected_token_idx=selected_token_idx,
@@ -4522,7 +4545,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kvcaches_ref=kvcaches_snapshot,
                     kv_group=kv_group,
                     layer_id=layer_id,
-                    load_stream=self.load_stream_list[load_stream_idx],
+                    load_stream=load_stream,
                     current_stream=current_stream,
                     slot_mapping_packed=slot_mapping_packed,
                     selected_token_idx=selected_token_idx,
