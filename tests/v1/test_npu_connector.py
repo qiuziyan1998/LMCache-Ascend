@@ -2,6 +2,7 @@
 # ruff: noqa: E501
 # Standard
 from contextlib import nullcontext
+import os
 from unittest.mock import patch
 
 # Third Party
@@ -31,6 +32,82 @@ def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
     connector.kv_device = torch.device("cpu")
     connector._layerwise_sparse_idx_cache = None
     return connector
+
+
+def test_dsa_diag_run_compare_skips_same_request(
+    monkeypatch, tmp_path
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    monkeypatch.setattr(
+        npu_connectors, "_DSA_DIAG_FIRST_TOKEN_DUMP_DIR", str(tmp_path)
+    )
+    logs: list[str] = []
+
+    def _capture_warning(message, *args, **kwargs):
+        logs.append(message % args)
+
+    monkeypatch.setattr(npu_connectors.logger, "warning", _capture_warning)
+
+    prev_path = connector._dsa_diag_summary_path(
+        diag_session="session",
+        prompt_digest="digest",
+        prompt_run=1,
+        layer_id=0,
+        kv_group=0,
+    )
+    connector._dsa_diag_write_json(
+        prev_path,
+        {
+            "req_id": "req-a",
+            "ranks": [
+                {
+                    "tp_rank": 0,
+                    "req_id": "req-a",
+                    "selected_digest": "old-selected",
+                    "slot_digest": "same-slot",
+                    "source_value_digest": "old-source",
+                    "dest_value_digest": "old-dest",
+                }
+            ],
+        },
+    )
+
+    connector._dsa_diag_log_run_file_compare(
+        current_summary={
+            "summary_path": str(tmp_path / "current.json"),
+            "req_id": "req-a",
+            "ranks": [
+                {
+                    "tp_rank": 0,
+                    "req_id": "req-a",
+                    "selected_digest": "new-selected",
+                    "slot_digest": "same-slot",
+                    "source_value_digest": "new-source",
+                    "dest_value_digest": "new-dest",
+                }
+            ],
+        },
+        diag_session="session",
+        prompt_digest="digest",
+        prompt_run=2,
+        layer_id=0,
+        kv_group=0,
+    )
+
+    assert any("compare_skipped=same_req_ids" in line for line in logs)
+    assert not any("mismatch=True" in line for line in logs)
+
+
+def test_dsa_diag_tensor_dump_path_does_not_overwrite(tmp_path) -> None:
+    path = tmp_path / "dump.pt"
+    path.write_text("old", encoding="utf-8")
+
+    next_path = VLLMPagedMemLayerwiseNPUConnector._dsa_diag_noncolliding_path(
+        str(path)
+    )
+
+    assert next_path != str(path)
+    assert not os.path.exists(next_path)
 
 
 def test_sparse_memory_update_resets_fast_direct_state() -> None:

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -2494,6 +2495,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ),
         )
 
+    @staticmethod
+    def _dsa_diag_summary_req_ids(summary: dict[str, Any]) -> list[str]:
+        req_ids = {
+            str(item.get("req_id"))
+            for item in summary.get("ranks", [])
+            if item and item.get("req_id") is not None
+        }
+        if summary.get("req_id") is not None:
+            req_ids.add(str(summary["req_id"]))
+        return sorted(req_ids)
+
+    @staticmethod
+    def _dsa_diag_noncolliding_path(path: str) -> str:
+        if not os.path.exists(path):
+            return path
+        root, ext = os.path.splitext(path)
+        return f"{root}_dup{os.getpid()}_{time.time_ns()}{ext}"
+
     def _dsa_diag_write_json(self, path: str, payload: dict[str, Any]) -> None:
         tmp_path = f"{path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2542,6 +2561,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         with open(prev_path, "r", encoding="utf-8") as f:
             previous_summary = json.load(f)
 
+        prev_req_ids = self._dsa_diag_summary_req_ids(previous_summary)
+        curr_req_ids = self._dsa_diag_summary_req_ids(current_summary)
+        shared_req_ids = sorted(set(prev_req_ids) & set(curr_req_ids))
+        if shared_req_ids:
+            logger.warning(
+                "[DSA_DIAG_RUN_COMPARE] first_token_dump diag_session=%s "
+                "prompt_digest=%s "
+                "prev_run=%s prompt_run=%s kv_group=%s layer=%s "
+                "compare_skipped=same_req_ids same_req_ids=%s "
+                "prev_req_ids=%s curr_req_ids=%s prev_summary=%s "
+                "current_summary=%s",
+                diag_session,
+                prompt_digest,
+                run_int - 1,
+                prompt_run,
+                kv_group,
+                layer_id,
+                shared_req_ids,
+                prev_req_ids,
+                curr_req_ids,
+                prev_path,
+                current_summary.get("summary_path"),
+            )
+            return
+
         fields = (
             "selected_digest",
             "slot_digest",
@@ -2575,17 +2619,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ]
             if changed:
                 mismatches[rank] = changed
-
-        prev_req_ids = sorted({
-            str(item.get("req_id"))
-            for item in previous_summary.get("ranks", [])
-            if item and item.get("req_id") is not None
-        })
-        curr_req_ids = sorted({
-            str(item.get("req_id"))
-            for item in current_summary.get("ranks", [])
-            if item and item.get("req_id") is not None
-        })
 
         logger.warning(
             "[DSA_DIAG_RUN_COMPARE] first_token_dump diag_session=%s "
@@ -2678,6 +2711,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"_layer{layer_id}_group{kv_group}_rank{tp_rank_value}.pt"
             )
             dump_path = os.path.join(_DSA_DIAG_FIRST_TOKEN_DUMP_DIR, dump_name)
+            dump_path = self._dsa_diag_noncolliding_path(dump_path)
             torch.save(
                 {
                     "meta": {
@@ -2776,6 +2810,38 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "distinct": distinct,
             "ranks": gathered,
         }
+        current_req_ids = self._dsa_diag_summary_req_ids(summary)
+        try:
+            if os.path.exists(summary_path):
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    existing_summary = json.load(f)
+                existing_req_ids = self._dsa_diag_summary_req_ids(
+                    existing_summary
+                )
+                shared_req_ids = sorted(
+                    set(existing_req_ids) & set(current_req_ids)
+                )
+                if shared_req_ids:
+                    logger.warning(
+                        "[DSA_DIAG_TENSOR_DUMP] first_token_dump_duplicate_skipped "
+                        "req_id=%s diag_session=%s prompt_digest=%s "
+                        "prompt_run=%s kv_group=%s layer=%s same_req_ids=%s "
+                        "existing_summary=%s existing_req_ids=%s "
+                        "current_req_ids=%s",
+                        req_id,
+                        diag_session,
+                        prompt_digest,
+                        prompt_run,
+                        kv_group,
+                        layer_id,
+                        shared_req_ids,
+                        summary_path,
+                        existing_req_ids,
+                        current_req_ids,
+                    )
+                    return
+        except Exception as exc:
+            summary["summary_collision_check_error"] = str(exc)
         try:
             self._dsa_diag_write_json(summary_path, summary)
         except Exception as exc:
