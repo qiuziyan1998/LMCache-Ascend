@@ -4134,8 +4134,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if explicit_sparse_payload:
                 memory_objs_layer = sparse_request["memory_objs_layer"]
                 selected_token_idx = sparse_request.get("selected_token_ids")
+                token_start_index = sparse_request.get("token_start_index", 0)
                 target_slot_mapping = sparse_request.get("target_slot_mapping")
                 payload_event = sparse_request.get("payload_event")
+                explicit_sparse_payload = target_slot_mapping is not None
             elif isinstance(sparse_request, tuple):
                 if len(sparse_request) == 4:
                     (
@@ -4157,10 +4159,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 token_start_index = 0
 
             if explicit_sparse_payload:
-                if target_slot_mapping is None:
-                    raise ValueError(
-                        "target_slot_mapping is required for explicit sparse payload"
-                    )
                 slot_mapping_packed, selected_token_idx = (
                     self._pack_sparse_explicit_slot_inputs(
                         selected_token_idx,
