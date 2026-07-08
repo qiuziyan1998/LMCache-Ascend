@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import hashlib
+import json
 import os
 from typing import Any, List, Optional, Set, Union
 
@@ -93,6 +94,13 @@ _DSA_DIAG_FIRST_TOKEN_COMPARE_HASH_SELECTED = _env_int(
 )
 _DSA_DIAG_FIRST_TOKEN_COMPARE_VALUES = _env_int(
     "LMCACHE_DSA_DIAG_FIRST_TOKEN_VALUES", 8
+)
+_DSA_DIAG_FIRST_TOKEN_DUMP = _DSA_DIAG and os.getenv(
+    "LMCACHE_DSA_DIAG_FIRST_TOKEN_DUMP", "0"
+).lower() in ("1", "true", "yes", "on")
+_DSA_DIAG_FIRST_TOKEN_DUMP_DIR = os.getenv(
+    "LMCACHE_DSA_DIAG_FIRST_TOKEN_DUMP_DIR",
+    "/tmp/lmcache_dsa_diag",
 )
 
 
@@ -1398,6 +1406,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_kvcaches_id: Optional[int] = None
         self._sparse_direct_validated_layers: set = set()
         self._dsa_diag_first_token_compare_seen: Set[tuple] = set()
+        self._dsa_diag_first_token_dump_seen: Set[tuple] = set()
 
     def _reset_sparse_direct_layer_states(self) -> None:
         self._sparse_direct_layer_states = None
@@ -2113,22 +2122,33 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             summary["errors"] = errors[:8]
         return summary
 
-    def _dsa_diag_gather_rank_payload(
-        self,
-        payload: dict[str, Any],
-    ) -> tuple[list[Any], int, int]:
+    def _dsa_diag_rank_info(self) -> tuple[int, int, int, Any]:
         try:
             from vllm.distributed.parallel_state import get_tp_group
 
             tp_group = get_tp_group()
             tp_rank = int(getattr(tp_group, "rank_in_group", 0))
             tp_world_size = int(getattr(tp_group, "world_size", 1))
+            global_rank = int(getattr(tp_group, "rank", -1))
+            return tp_rank, tp_world_size, global_rank, tp_group
+        except Exception:
+            return -1, 1, -1, None
+
+    def _dsa_diag_gather_rank_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[list[Any], int, int]:
+        try:
+            tp_rank, tp_world_size, global_rank, tp_group = (
+                self._dsa_diag_rank_info()
+            )
             payload["tp_rank"] = tp_rank
-            payload["global_rank"] = int(getattr(tp_group, "rank", -1))
+            payload["global_rank"] = global_rank
             if (
                 tp_world_size <= 1
                 or not torch.distributed.is_available()
                 or not torch.distributed.is_initialized()
+                or tp_group is None
             ):
                 return [payload], tp_rank, tp_world_size
             gathered: list[Any] = [None for _ in range(tp_world_size)]
@@ -2246,6 +2266,511 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             mismatched,
             distinct,
             gathered,
+        )
+
+    def _dsa_diag_safe_name(self, value: Any) -> str:
+        raw = str(value if value is not None else "none")
+        return "".join(
+            ch if ch.isalnum() or ch in ("-", "_", ".") else "_"
+            for ch in raw
+        )[:160]
+
+    def _dsa_diag_tensor_map_summary(
+        self,
+        tensors: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, Any], str]:
+        combined = hashlib.blake2b(digest_size=16)
+        summary: dict[str, Any] = {}
+        for name in sorted(tensors):
+            tensor = tensors[name]
+            flat = tensor.detach().reshape(-1).contiguous()
+            digest = _diag_tensor_digest(flat)
+            combined.update(name.encode("utf-8"))
+            combined.update(digest.encode("utf-8"))
+            summary[name] = {
+                "shape": tuple(int(dim) for dim in tensor.shape),
+                "dtype": str(tensor.dtype),
+                "digest": digest,
+            }
+        return summary, combined.hexdigest()
+
+    def _dsa_diag_selected_source_rows(
+        self,
+        *,
+        cpu_tensors: List[torch.Tensor],
+        selected_token_idx: torch.Tensor,
+        kv_group: int,
+        chunk_size: int,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        selected_values = _diag_int_tensor_values(selected_token_idx)
+        kv_format, planes = self._dsa_diag_source_planes(kv_group)
+        max_selected = max(0, _DSA_DIAG_FIRST_TOKEN_COMPARE_HASH_SELECTED)
+        rows_by_plane: dict[str, list[torch.Tensor]] = {
+            plane_name: [] for plane_name, plane_dim in planes if plane_dim > 0
+        }
+        token_records: list[dict[str, int]] = []
+        errors: list[str] = []
+        if chunk_size <= 0:
+            errors.append(f"invalid_chunk_size={chunk_size}")
+        for token_id in selected_values[:max_selected]:
+            if chunk_size <= 0:
+                break
+            chunk_index = int(token_id) // int(chunk_size)
+            token_offset = int(token_id) % int(chunk_size)
+            token_records.append(
+                {
+                    "token": int(token_id),
+                    "chunk": int(chunk_index),
+                    "offset": int(token_offset),
+                }
+            )
+            if chunk_index < 0 or chunk_index >= len(cpu_tensors):
+                errors.append(
+                    f"token={token_id} chunk={chunk_index} outside "
+                    f"tensor_count={len(cpu_tensors)}"
+                )
+                continue
+            tensor = cpu_tensors[chunk_index]
+            token_count = self._lmc_plane_num_tokens(tensor, kv_group)
+            if token_offset < 0 or token_offset >= token_count:
+                errors.append(
+                    f"token={token_id} offset={token_offset} outside "
+                    f"chunk_tokens={token_count}"
+                )
+                continue
+            flat = tensor.detach().reshape(-1)
+            plane_base = 0
+            for plane_name, plane_dim in planes:
+                if plane_dim <= 0:
+                    continue
+                start = plane_base + token_offset * plane_dim
+                end = start + plane_dim
+                plane_base += token_count * plane_dim
+                if start < 0 or end > int(flat.numel()):
+                    errors.append(
+                        f"token={token_id} plane={plane_name} "
+                        f"slice=({start},{end}) outside numel={int(flat.numel())}"
+                    )
+                    continue
+                row = flat[start:end]
+                if row.device.type != "cpu":
+                    row = row.to(device="cpu")
+                rows_by_plane.setdefault(plane_name, []).append(row.contiguous())
+
+        row_tensors: dict[str, torch.Tensor] = {}
+        for plane_name, rows in rows_by_plane.items():
+            if rows:
+                row_tensors[plane_name] = torch.stack(rows, dim=0).contiguous()
+            else:
+                row_tensors[plane_name] = torch.empty(0)
+
+        meta = {
+            "kv_format": kv_format,
+            "selected_count": len(selected_values),
+            "dumped_selected_count": min(len(selected_values), max_selected),
+            "token_records_head": token_records[
+                : max(0, _DSA_DIAG_FIRST_TOKEN_COMPARE_SELECTED)
+            ],
+        }
+        if errors:
+            meta["errors"] = errors[:16]
+        return row_tensors, meta
+
+    def _dsa_diag_kv_cache_planes(
+        self,
+        *,
+        kvcaches_ref: list,
+        layer_id: int,
+        kv_group: int,
+    ) -> tuple[str, dict[str, torch.Tensor]]:
+        if kvcaches_ref is None or layer_id >= len(kvcaches_ref):
+            return "missing", {}
+        layer_cache = kvcaches_ref[layer_id]
+        layout = self._layout_for(kv_group)
+        fmt = layout.kv_format if layout is not None else self.kv_format
+        if isinstance(layer_cache, (list, tuple)):
+            if fmt == KVCacheFormat.DSA_INDEX and len(layer_cache) >= 1:
+                return fmt.name, {"index": layer_cache[0]}
+            if len(layer_cache) >= 3:
+                return fmt.name, {
+                    "latent_k": layer_cache[0],
+                    "latent_v": layer_cache[1],
+                    "index": layer_cache[2],
+                }
+            if len(layer_cache) >= 2:
+                return fmt.name, {
+                    "latent_k": layer_cache[0],
+                    "latent_v": layer_cache[1],
+                }
+            if len(layer_cache) == 1:
+                return fmt.name, {"value": layer_cache[0]}
+            return fmt.name, {}
+        if isinstance(layer_cache, torch.Tensor):
+            vllm_two_major = (
+                layout.vllm_two_major if layout is not None else self.vllm_two_major
+            )
+            if layer_cache.dim() >= 5 and vllm_two_major:
+                return fmt.name, {
+                    "latent_k": layer_cache[0],
+                    "latent_v": layer_cache[1],
+                }
+            if layer_cache.dim() >= 5:
+                return fmt.name, {
+                    "latent_k": layer_cache[:, 0],
+                    "latent_v": layer_cache[:, 1],
+                }
+            return fmt.name, {"value": layer_cache}
+        return fmt.name, {}
+
+    def _dsa_diag_destination_rows(
+        self,
+        *,
+        kvcaches_ref: list,
+        layer_id: int,
+        kv_group: int,
+        slot_mapping_packed: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        slot_values = _diag_int_tensor_values(slot_mapping_packed)
+        max_selected = max(0, _DSA_DIAG_FIRST_TOKEN_COMPARE_HASH_SELECTED)
+        slot_values = slot_values[:max_selected]
+        kv_format, planes = self._dsa_diag_kv_cache_planes(
+            kvcaches_ref=kvcaches_ref,
+            layer_id=layer_id,
+            kv_group=kv_group,
+        )
+        rows: dict[str, torch.Tensor] = {}
+        errors: list[str] = []
+        for plane_name, tensor in planes.items():
+            if not isinstance(tensor, torch.Tensor):
+                errors.append(f"plane={plane_name} is not tensor: {type(tensor)!r}")
+                continue
+            if tensor.dim() < 2:
+                errors.append(
+                    f"plane={plane_name} tensor dim too small: shape={tuple(tensor.shape)}"
+                )
+                continue
+            flat = tensor.reshape(-1, *tensor.shape[2:])
+            if not slot_values:
+                rows[plane_name] = torch.empty(0)
+                continue
+            slot_tensor = torch.tensor(
+                slot_values,
+                dtype=torch.long,
+                device=tensor.device,
+            )
+            selected = flat.index_select(0, slot_tensor)
+            rows[plane_name] = selected.detach().to(device="cpu").reshape(
+                len(slot_values), -1
+            ).contiguous()
+        meta = {
+            "kv_format": kv_format,
+            "slot_count": int(slot_mapping_packed.numel()),
+            "dumped_slot_count": len(slot_values),
+            "slot_head": slot_values[: max(0, _DSA_DIAG_FIRST_TOKEN_COMPARE_SELECTED)],
+        }
+        if errors:
+            meta["errors"] = errors[:16]
+        return rows, meta
+
+    def _dsa_diag_summary_path(
+        self,
+        *,
+        prompt_digest: Any,
+        prompt_run: Any,
+        layer_id: int,
+        kv_group: int,
+    ) -> str:
+        return os.path.join(
+            _DSA_DIAG_FIRST_TOKEN_DUMP_DIR,
+            (
+                f"{self._dsa_diag_safe_name(prompt_digest)}"
+                f"_run{self._dsa_diag_safe_name(prompt_run)}"
+                f"_layer{layer_id}_group{kv_group}_summary.json"
+            ),
+        )
+
+    def _dsa_diag_write_json(self, path: str, payload: dict[str, Any]) -> None:
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True, indent=2)
+        os.replace(tmp_path, path)
+
+    def _dsa_diag_log_run_file_compare(
+        self,
+        *,
+        current_summary: dict[str, Any],
+        prompt_digest: Any,
+        prompt_run: Any,
+        layer_id: int,
+        kv_group: int,
+    ) -> None:
+        try:
+            run_int = int(prompt_run)
+        except (TypeError, ValueError):
+            return
+        if run_int <= 1:
+            return
+        prev_path = self._dsa_diag_summary_path(
+            prompt_digest=prompt_digest,
+            prompt_run=run_int - 1,
+            layer_id=layer_id,
+            kv_group=kv_group,
+        )
+        if not os.path.exists(prev_path):
+            logger.warning(
+                "[DSA_DIAG_RUN_COMPARE] first_token_dump prompt_digest=%s "
+                "prompt_run=%s prev_run=%s kv_group=%s layer=%s "
+                "prev_summary_missing=%s current_summary=%s",
+                prompt_digest,
+                prompt_run,
+                run_int - 1,
+                kv_group,
+                layer_id,
+                prev_path,
+                current_summary.get("summary_path"),
+            )
+            return
+        with open(prev_path, "r", encoding="utf-8") as f:
+            previous_summary = json.load(f)
+
+        fields = (
+            "selected_digest",
+            "slot_digest",
+            "source_value_digest",
+            "dest_value_digest",
+        )
+        previous_by_rank = {
+            str(item.get("tp_rank")): item
+            for item in previous_summary.get("ranks", [])
+            if item
+        }
+        current_by_rank = {
+            str(item.get("tp_rank")): item
+            for item in current_summary.get("ranks", [])
+            if item
+        }
+        mismatches: dict[str, list[str]] = {}
+        missing: dict[str, list[str]] = {}
+        for rank in sorted(set(previous_by_rank) | set(current_by_rank)):
+            prev = previous_by_rank.get(rank)
+            curr = current_by_rank.get(rank)
+            if prev is None or curr is None:
+                missing[rank] = []
+                if prev is None:
+                    missing[rank].append("previous")
+                if curr is None:
+                    missing[rank].append("current")
+                continue
+            changed = [
+                field for field in fields if prev.get(field) != curr.get(field)
+            ]
+            if changed:
+                mismatches[rank] = changed
+
+        logger.warning(
+            "[DSA_DIAG_RUN_COMPARE] first_token_dump prompt_digest=%s "
+            "prev_run=%s prompt_run=%s kv_group=%s layer=%s mismatch=%s "
+            "mismatches=%s missing=%s prev_summary=%s current_summary=%s",
+            prompt_digest,
+            run_int - 1,
+            prompt_run,
+            kv_group,
+            layer_id,
+            bool(mismatches or missing),
+            mismatches,
+            missing,
+            prev_path,
+            current_summary.get("summary_path"),
+        )
+
+    def _dsa_diag_dump_first_token_tensors(
+        self,
+        *,
+        diag_context: Optional[dict[str, Any]],
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        cpu_tensors: List[torch.Tensor],
+        selected_token_idx: torch.Tensor,
+        slot_mapping_packed: torch.Tensor,
+        chunk_size: int,
+        total_tokens: int,
+        source: str,
+        ptr_cache_reused: bool,
+    ) -> None:
+        if not _DSA_DIAG_FIRST_TOKEN_DUMP:
+            return
+        if (
+            _DSA_DIAG_FIRST_TOKEN_COMPARE_LAYERS >= 0
+            and layer_id >= _DSA_DIAG_FIRST_TOKEN_COMPARE_LAYERS
+        ):
+            return
+        if selected_token_idx is None or int(selected_token_idx.numel()) == 0:
+            return
+        diag_context = diag_context or {}
+        req_id = diag_context.get("req_id", "unspecified")
+        prompt_digest = diag_context.get("prompt_digest")
+        prompt_run = diag_context.get("prompt_run")
+        seen_key = (req_id, prompt_digest, prompt_run, int(kv_group), int(layer_id))
+        if seen_key in self._dsa_diag_first_token_dump_seen:
+            return
+        self._dsa_diag_first_token_dump_seen.add(seen_key)
+
+        local_payload: dict[str, Any] = {}
+        dump_path = None
+        try:
+            os.makedirs(_DSA_DIAG_FIRST_TOKEN_DUMP_DIR, exist_ok=True)
+            selected_cpu = selected_token_idx.detach().to(device="cpu").contiguous()
+            slot_cpu = slot_mapping_packed.detach().to(device="cpu").contiguous()
+            source_rows, source_meta = self._dsa_diag_selected_source_rows(
+                cpu_tensors=cpu_tensors,
+                selected_token_idx=selected_token_idx,
+                kv_group=kv_group,
+                chunk_size=chunk_size,
+            )
+            dest_rows, dest_meta = self._dsa_diag_destination_rows(
+                kvcaches_ref=kvcaches_ref,
+                layer_id=layer_id,
+                kv_group=kv_group,
+                slot_mapping_packed=slot_mapping_packed,
+            )
+            selected_digest = _diag_tensor_digest(selected_cpu.reshape(-1))
+            slot_digest = _diag_tensor_digest(slot_cpu.reshape(-1))
+            source_summary, source_value_digest = self._dsa_diag_tensor_map_summary(
+                source_rows
+            )
+            dest_summary, dest_value_digest = self._dsa_diag_tensor_map_summary(
+                dest_rows
+            )
+
+            tp_rank_value, _, global_rank_value, _ = self._dsa_diag_rank_info()
+            dump_name = (
+                f"{self._dsa_diag_safe_name(prompt_digest)}"
+                f"_run{self._dsa_diag_safe_name(prompt_run)}"
+                f"_req{self._dsa_diag_safe_name(req_id)}"
+                f"_layer{layer_id}_group{kv_group}_rank{tp_rank_value}.pt"
+            )
+            dump_path = os.path.join(_DSA_DIAG_FIRST_TOKEN_DUMP_DIR, dump_name)
+            torch.save(
+                {
+                    "meta": {
+                        "req_id": req_id,
+                        "prompt_digest": prompt_digest,
+                        "prompt_run": prompt_run,
+                        "kv_group": int(kv_group),
+                        "layer": int(layer_id),
+                        "source": source,
+                        "ptr_cache_reused": bool(ptr_cache_reused),
+                        "total_tokens": int(total_tokens),
+                        "chunk_size": int(chunk_size),
+                        "tp_rank": tp_rank_value,
+                        "global_rank": int(global_rank_value),
+                        "source_meta": source_meta,
+                        "dest_meta": dest_meta,
+                    },
+                    "selected_token_idx": selected_cpu,
+                    "slot_mapping": slot_cpu,
+                    "source_rows": source_rows,
+                    "dest_rows": dest_rows,
+                },
+                dump_path,
+            )
+            local_payload = {
+                "req_id": req_id,
+                "prompt_digest": prompt_digest,
+                "prompt_run": prompt_run,
+                "kv_group": int(kv_group),
+                "layer": int(layer_id),
+                "source": source,
+                "ptr_cache_reused": bool(ptr_cache_reused),
+                "total_tokens": int(total_tokens),
+                "chunk_size": int(chunk_size),
+                "dump_path": dump_path,
+                "selected_digest": selected_digest,
+                "slot_digest": slot_digest,
+                "source_value_digest": source_value_digest,
+                "dest_value_digest": dest_value_digest,
+                "source_summary": source_summary,
+                "dest_summary": dest_summary,
+                "source_meta": source_meta,
+                "dest_meta": dest_meta,
+            }
+        except Exception as exc:
+            local_payload = {
+                "req_id": req_id,
+                "prompt_digest": prompt_digest,
+                "prompt_run": prompt_run,
+                "kv_group": int(kv_group),
+                "layer": int(layer_id),
+                "dump_path": dump_path,
+                "dump_error": str(exc),
+            }
+
+        gathered, tp_rank, tp_world_size = self._dsa_diag_gather_rank_payload(
+            local_payload
+        )
+        if tp_rank not in (0, -1):
+            return
+
+        fields = (
+            "selected_digest",
+            "slot_digest",
+            "source_value_digest",
+            "dest_value_digest",
+        )
+        distinct = {
+            field: sorted({repr(item.get(field)) for item in gathered if item})
+            for field in fields
+        }
+        mismatched = [
+            field for field, values in distinct.items() if len(values) > 1
+        ]
+        summary_path = self._dsa_diag_summary_path(
+            prompt_digest=prompt_digest,
+            prompt_run=prompt_run,
+            layer_id=layer_id,
+            kv_group=kv_group,
+        )
+        summary = {
+            "summary_path": summary_path,
+            "req_id": req_id,
+            "prompt_digest": prompt_digest,
+            "prompt_run": prompt_run,
+            "kv_group": int(kv_group),
+            "layer": int(layer_id),
+            "tp_world_size": int(tp_world_size),
+            "mismatch": bool(mismatched),
+            "mismatch_fields": mismatched,
+            "distinct": distinct,
+            "ranks": gathered,
+        }
+        try:
+            self._dsa_diag_write_json(summary_path, summary)
+        except Exception as exc:
+            summary["summary_write_error"] = str(exc)
+
+        logger.warning(
+            "[DSA_DIAG_TENSOR_DUMP] first_token_dump req_id=%s "
+            "prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
+            "tp_world_size=%s mismatch=%s mismatch_fields=%s summary=%s "
+            "ranks=%s",
+            req_id,
+            prompt_digest,
+            prompt_run,
+            kv_group,
+            layer_id,
+            tp_world_size,
+            bool(mismatched),
+            mismatched,
+            summary_path,
+            gathered,
+        )
+        self._dsa_diag_log_run_file_compare(
+            current_summary=summary,
+            prompt_digest=prompt_digest,
+            prompt_run=prompt_run,
+            layer_id=layer_id,
+            kv_group=kv_group,
         )
 
     def _validate_sparse_direct_explicit_inputs(
@@ -3689,6 +4214,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     explicit_sparse_payload=explicit_sparse_payload,
                     diag_context=diag_context,
                 )
+
+            self._dsa_diag_dump_first_token_tensors(
+                diag_context=diag_context,
+                kvcaches_ref=kvcaches_snapshot,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                cpu_tensors=cpu_tensors,
+                selected_token_idx=selected_token_idx,
+                slot_mapping_packed=slot_mapping_packed,
+                chunk_size=chunk_size,
+                total_tokens=total_tokens,
+                source=(
+                    "cached_tensors"
+                    if layer_cached_tensors is not None
+                    else "memory_objs"
+                ),
+                ptr_cache_reused=ptr_cache_reused,
+            )
 
         yield
 
