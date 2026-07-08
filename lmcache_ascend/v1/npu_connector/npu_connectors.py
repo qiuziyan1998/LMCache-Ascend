@@ -63,6 +63,17 @@ _DSA_DIAG = os.getenv("LMCACHE_DSA_DIAG", "0").lower() in (
     "yes",
     "on",
 )
+_DSA_STREAM_DIAG = os.getenv("LMCACHE_DSA_STREAM_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+) or os.getenv("LMCACHE_ASCEND_DSA_STREAM_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 _DSA_DIAG_TENSOR_STATS = os.getenv(
     "LMCACHE_DSA_DIAG_TENSOR_STATS", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -103,6 +114,68 @@ _DSA_DIAG_FIRST_TOKEN_DUMP_DIR = os.getenv(
     "LMCACHE_DSA_DIAG_FIRST_TOKEN_DUMP_DIR",
     "/tmp/lmcache_dsa_diag",
 )
+_DSA_TORCH_NPU_MODULE: Any = None
+_DSA_PUBLISH_STREAM_WARNING_LOGGED = False
+
+
+def _describe_stream(stream: Any) -> Any:
+    if stream is None:
+        return None
+    try:
+        return {
+            "type": type(stream).__name__,
+            "npu_stream": getattr(stream, "npu_stream", None),
+            "cuda_stream": getattr(stream, "cuda_stream", None),
+            "device": str(getattr(stream, "device", None)),
+        }
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _current_stream_summary() -> Any:
+    summary: dict[str, Any] = {}
+    try:
+        summary["npu"] = _describe_stream(torch.npu.current_stream())
+    except Exception as exc:
+        summary["npu"] = f"{type(exc).__name__}: {exc}"
+    try:
+        summary["cuda"] = _describe_stream(torch.cuda.current_stream())
+    except Exception as exc:
+        summary["cuda"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
+def _stream_diag(label: str, **kwargs) -> None:
+    if not _DSA_STREAM_DIAG:
+        return
+    logger.warning(
+        "[DSA_STREAM_DIAG] label=%s current_streams=%s extra=%s",
+        label,
+        _current_stream_summary(),
+        kwargs,
+    )
+
+
+def _publish_current_npu_stream() -> bool:
+    global _DSA_TORCH_NPU_MODULE, _DSA_PUBLISH_STREAM_WARNING_LOGGED
+    try:
+        if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_device")):
+            return False
+        if _DSA_TORCH_NPU_MODULE is None:
+            _DSA_TORCH_NPU_MODULE = __import__("torch_npu")
+        _DSA_TORCH_NPU_MODULE._C._npu_getCurrentRawStream(
+            int(torch.npu.current_device())
+        )
+        return True
+    except Exception:
+        if not _DSA_PUBLISH_STREAM_WARNING_LOGGED:
+            logger.warning(
+                "Failed to publish current NPU stream for DSA payload event "
+                "ordering.",
+                exc_info=True,
+            )
+            _DSA_PUBLISH_STREAM_WARNING_LOGGED = True
+        return False
 
 
 def _diag_tensor_summary(value: Any, max_items: int = 4) -> Any:
@@ -3041,6 +3114,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 load_stream.wait_stream(current_stream)
                 if payload_event is not None:
                     load_stream.wait_event(payload_event)
+                    if not _publish_current_npu_stream():
+                        raise RuntimeError(
+                            "Failed to publish load stream after waiting on "
+                            "DSA sparse payload event before staging transfer."
+                        )
                 assert staging_tensor is not None
                 batched_fused_sparse_single_layer_kv_transfer(
                     layer_tensors,
@@ -3179,10 +3257,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 validate_key,
                 runtime_source_signature,
             )
+        _stream_diag(
+            "connector_sparse_direct_before_launch",
+            layer_id=layer_id,
+            kv_group=kv_group,
+            current_stream=_describe_stream(current_stream),
+            load_stream=_describe_stream(load_stream),
+            has_payload_event=payload_event is not None,
+            explicit_sparse_payload=explicit_sparse_payload,
+            layer_state=layer_state is not None,
+        )
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if payload_event is not None:
                 load_stream.wait_event(payload_event)
+                if not _publish_current_npu_stream():
+                    raise RuntimeError(
+                        "Failed to publish load stream after waiting on DSA "
+                        "sparse payload event before direct transfer."
+                    )
             if explicit_sparse_payload and _SPARSE_DIRECT_GUARD:
                 self._validate_sparse_direct_explicit_inputs(
                     kvcaches_ref=kvcaches_ref,
@@ -4128,6 +4221,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
             current_stream = torch.cuda.current_stream()
+            load_stream = self.load_stream_list[load_stream_idx]
             explicit_sparse_payload = isinstance(sparse_request, dict)
             target_slot_mapping = None
             payload_event = None
@@ -4158,12 +4252,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx = None
                 token_start_index = 0
 
+            _stream_diag(
+                "connector_before_payload_wait",
+                layer_id=layer_id,
+                kv_group=kv_group,
+                current_stream=_describe_stream(current_stream),
+                load_stream=_describe_stream(load_stream),
+                has_payload_event=payload_event is not None,
+                explicit_sparse_payload=explicit_sparse_payload,
+            )
             if payload_event is not None:
                 # selected_token_idx/target_slot_mapping may be device tensors
                 # produced by vLLM's remap path. Packing below is their first
                 # connector-side consumer, so wait before packing, not only
                 # later inside the load-stream transfer.
-                current_stream.wait_event(payload_event)
+                with torch.cuda.stream(current_stream):
+                    current_stream.wait_event(payload_event)
+                    if not _publish_current_npu_stream():
+                        raise RuntimeError(
+                            "Failed to publish current stream after waiting on DSA "
+                            "sparse payload event before packing sparse inputs."
+                        )
+                _stream_diag(
+                    "connector_after_payload_wait",
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                    current_stream=_describe_stream(current_stream),
+                    load_stream=_describe_stream(load_stream),
+                )
 
             if explicit_sparse_payload:
                 slot_mapping_packed, selected_token_idx = (
