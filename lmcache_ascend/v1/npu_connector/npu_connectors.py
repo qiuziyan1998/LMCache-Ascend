@@ -2187,9 +2187,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
         diag_context = diag_context or {}
         req_id = diag_context.get("req_id", "unspecified")
+        diag_session = diag_context.get("diag_session")
         prompt_digest = diag_context.get("prompt_digest")
         prompt_run = diag_context.get("prompt_run")
-        seen_key = (req_id, prompt_digest, prompt_run, int(kv_group), int(layer_id))
+        seen_key = (diag_session, req_id, int(kv_group), int(layer_id))
         if seen_key in self._dsa_diag_first_token_compare_seen:
             return
         self._dsa_diag_first_token_compare_seen.add(seen_key)
@@ -2221,6 +2222,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             }
         payload = {
             "req_id": req_id,
+            "diag_session": diag_session,
             "prompt_digest": prompt_digest,
             "prompt_run": prompt_run,
             "kv_group": int(kv_group),
@@ -2253,10 +2255,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ]
         logger.warning(
             "[DSA_DIAG_RANK_COMPARE] first_token_input req_id=%s "
-            "prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
+            "diag_session=%s prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
             "tp_world_size=%s mismatch=%s mismatch_fields=%s distinct=%s "
             "ranks=%s",
             req_id,
+            diag_session,
             prompt_digest,
             prompt_run,
             kv_group,
@@ -2475,6 +2478,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _dsa_diag_summary_path(
         self,
         *,
+        diag_session: Any,
         prompt_digest: Any,
         prompt_run: Any,
         layer_id: int,
@@ -2483,7 +2487,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return os.path.join(
             _DSA_DIAG_FIRST_TOKEN_DUMP_DIR,
             (
-                f"{self._dsa_diag_safe_name(prompt_digest)}"
+                f"{self._dsa_diag_safe_name(diag_session)}"
+                f"_{self._dsa_diag_safe_name(prompt_digest)}"
                 f"_run{self._dsa_diag_safe_name(prompt_run)}"
                 f"_layer{layer_id}_group{kv_group}_summary.json"
             ),
@@ -2499,6 +2504,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         *,
         current_summary: dict[str, Any],
+        diag_session: Any,
         prompt_digest: Any,
         prompt_run: Any,
         layer_id: int,
@@ -2511,6 +2517,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if run_int <= 1:
             return
         prev_path = self._dsa_diag_summary_path(
+            diag_session=diag_session,
             prompt_digest=prompt_digest,
             prompt_run=run_int - 1,
             layer_id=layer_id,
@@ -2518,9 +2525,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         if not os.path.exists(prev_path):
             logger.warning(
-                "[DSA_DIAG_RUN_COMPARE] first_token_dump prompt_digest=%s "
+                "[DSA_DIAG_RUN_COMPARE] first_token_dump diag_session=%s "
+                "prompt_digest=%s "
                 "prompt_run=%s prev_run=%s kv_group=%s layer=%s "
                 "prev_summary_missing=%s current_summary=%s",
+                diag_session,
                 prompt_digest,
                 prompt_run,
                 run_int - 1,
@@ -2567,10 +2576,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if changed:
                 mismatches[rank] = changed
 
+        prev_req_ids = sorted({
+            str(item.get("req_id"))
+            for item in previous_summary.get("ranks", [])
+            if item and item.get("req_id") is not None
+        })
+        curr_req_ids = sorted({
+            str(item.get("req_id"))
+            for item in current_summary.get("ranks", [])
+            if item and item.get("req_id") is not None
+        })
+
         logger.warning(
-            "[DSA_DIAG_RUN_COMPARE] first_token_dump prompt_digest=%s "
+            "[DSA_DIAG_RUN_COMPARE] first_token_dump diag_session=%s "
+            "prompt_digest=%s "
             "prev_run=%s prompt_run=%s kv_group=%s layer=%s mismatch=%s "
-            "mismatches=%s missing=%s prev_summary=%s current_summary=%s",
+            "mismatches=%s missing=%s prev_req_ids=%s curr_req_ids=%s "
+            "prev_summary=%s current_summary=%s",
+            diag_session,
             prompt_digest,
             run_int - 1,
             prompt_run,
@@ -2579,6 +2602,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             bool(mismatches or missing),
             mismatches,
             missing,
+            prev_req_ids,
+            curr_req_ids,
             prev_path,
             current_summary.get("summary_path"),
         )
@@ -2609,9 +2634,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
         diag_context = diag_context or {}
         req_id = diag_context.get("req_id", "unspecified")
+        diag_session = diag_context.get("diag_session")
         prompt_digest = diag_context.get("prompt_digest")
         prompt_run = diag_context.get("prompt_run")
-        seen_key = (req_id, prompt_digest, prompt_run, int(kv_group), int(layer_id))
+        seen_key = (diag_session, req_id, int(kv_group), int(layer_id))
         if seen_key in self._dsa_diag_first_token_dump_seen:
             return
         self._dsa_diag_first_token_dump_seen.add(seen_key)
@@ -2645,7 +2671,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             tp_rank_value, _, global_rank_value, _ = self._dsa_diag_rank_info()
             dump_name = (
-                f"{self._dsa_diag_safe_name(prompt_digest)}"
+                f"{self._dsa_diag_safe_name(diag_session)}"
+                f"_{self._dsa_diag_safe_name(prompt_digest)}"
                 f"_run{self._dsa_diag_safe_name(prompt_run)}"
                 f"_req{self._dsa_diag_safe_name(req_id)}"
                 f"_layer{layer_id}_group{kv_group}_rank{tp_rank_value}.pt"
@@ -2655,6 +2682,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 {
                     "meta": {
                         "req_id": req_id,
+                        "diag_session": diag_session,
                         "prompt_digest": prompt_digest,
                         "prompt_run": prompt_run,
                         "kv_group": int(kv_group),
@@ -2677,6 +2705,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             local_payload = {
                 "req_id": req_id,
+                "diag_session": diag_session,
                 "prompt_digest": prompt_digest,
                 "prompt_run": prompt_run,
                 "kv_group": int(kv_group),
@@ -2698,6 +2727,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         except Exception as exc:
             local_payload = {
                 "req_id": req_id,
+                "diag_session": diag_session,
                 "prompt_digest": prompt_digest,
                 "prompt_run": prompt_run,
                 "kv_group": int(kv_group),
@@ -2726,6 +2756,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             field for field, values in distinct.items() if len(values) > 1
         ]
         summary_path = self._dsa_diag_summary_path(
+            diag_session=diag_session,
             prompt_digest=prompt_digest,
             prompt_run=prompt_run,
             layer_id=layer_id,
@@ -2734,6 +2765,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         summary = {
             "summary_path": summary_path,
             "req_id": req_id,
+            "diag_session": diag_session,
             "prompt_digest": prompt_digest,
             "prompt_run": prompt_run,
             "kv_group": int(kv_group),
@@ -2751,10 +2783,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         logger.warning(
             "[DSA_DIAG_TENSOR_DUMP] first_token_dump req_id=%s "
-            "prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
+            "diag_session=%s prompt_digest=%s prompt_run=%s kv_group=%s layer=%s "
             "tp_world_size=%s mismatch=%s mismatch_fields=%s summary=%s "
             "ranks=%s",
             req_id,
+            diag_session,
             prompt_digest,
             prompt_run,
             kv_group,
@@ -2767,6 +2800,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         self._dsa_diag_log_run_file_compare(
             current_summary=summary,
+            diag_session=diag_session,
             prompt_digest=prompt_digest,
             prompt_run=prompt_run,
             layer_id=layer_id,
@@ -4114,6 +4148,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if _DSA_DIAG:
                 diag_context = {
                     "req_id": kwargs.get("req_id", "unspecified"),
+                    "diag_session": kwargs.get("_dsa_diag_session_id"),
                     "prompt_digest": kwargs.get("_dsa_diag_prompt_digest"),
                     "prompt_run": kwargs.get("_dsa_diag_prompt_run"),
                     "kv_group": kv_group,
