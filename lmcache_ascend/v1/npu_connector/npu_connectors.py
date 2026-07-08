@@ -4158,6 +4158,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx = None
                 token_start_index = 0
 
+            if payload_event is not None:
+                # selected_token_idx/target_slot_mapping may be device tensors
+                # produced by vLLM's remap path. Packing below is their first
+                # connector-side consumer, so wait before packing, not only
+                # later inside the load-stream transfer.
+                current_stream.wait_event(payload_event)
+
             if explicit_sparse_payload:
                 slot_mapping_packed, selected_token_idx = (
                     self._pack_sparse_explicit_slot_inputs(
