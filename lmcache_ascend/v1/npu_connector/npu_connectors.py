@@ -4276,12 +4276,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 explicit_sparse_payload=explicit_sparse_payload,
             )
             payload_events = _payload_event_list(payload_event)
-            if payload_events:
+            with torch.cuda.stream(current_stream):
                 # selected_token_idx/target_slot_mapping may be device tensors
                 # produced by vLLM's remap path. Packing below is their first
                 # connector-side consumer, so wait before packing, not only
                 # later inside the load-stream transfer.
-                with torch.cuda.stream(current_stream):
+                if payload_events:
                     for event in payload_events:
                         current_stream.wait_event(event)
                     if not _publish_current_npu_stream():
@@ -4289,28 +4289,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             "Failed to publish current stream after waiting on DSA "
                             "sparse payload event before packing sparse inputs."
                         )
-                _stream_diag(
-                    "connector_after_payload_wait",
-                    layer_id=layer_id,
-                    kv_group=kv_group,
-                    current_stream=_describe_stream(current_stream),
-                    load_stream=_describe_stream(load_stream),
-                    payload_event_count=len(payload_events),
-                )
-
-            if explicit_sparse_payload:
-                slot_mapping_packed, selected_token_idx = (
-                    self._pack_sparse_explicit_slot_inputs(
-                        selected_token_idx,
-                        target_slot_mapping,
+                    _stream_diag(
+                        "connector_after_payload_wait",
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        current_stream=_describe_stream(current_stream),
+                        load_stream=_describe_stream(load_stream),
+                        payload_event_count=len(payload_events),
                     )
-                )
-            else:
-                slot_mapping_packed, selected_token_idx = self._pack_sparse_layer_inputs(
-                    slot_mapping,
-                    selected_token_idx,
-                    token_start_index,
-                )
+
+                if explicit_sparse_payload:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_explicit_slot_inputs(
+                            selected_token_idx,
+                            target_slot_mapping,
+                        )
+                    )
+                else:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_layer_inputs(
+                            slot_mapping,
+                            selected_token_idx,
+                            token_start_index,
+                        )
+                    )
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
