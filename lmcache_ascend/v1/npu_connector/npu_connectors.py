@@ -156,6 +156,14 @@ def _stream_diag(label: str, **kwargs) -> None:
     )
 
 
+def _payload_event_list(payload_event: Any) -> list[Any]:
+    if payload_event is None:
+        return []
+    if isinstance(payload_event, (list, tuple)):
+        return [event for event in payload_event if event is not None]
+    return [payload_event]
+
+
 def _publish_current_npu_stream() -> bool:
     global _DSA_TORCH_NPU_MODULE, _DSA_PUBLISH_STREAM_WARNING_LOGGED
     try:
@@ -3112,8 +3120,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             with torch.cuda.stream(load_stream):
                 load_stream.wait_stream(current_stream)
-                if payload_event is not None:
-                    load_stream.wait_event(payload_event)
+                payload_events = _payload_event_list(payload_event)
+                if payload_events:
+                    for event in payload_events:
+                        load_stream.wait_event(event)
                     if not _publish_current_npu_stream():
                         raise RuntimeError(
                             "Failed to publish load stream after waiting on "
@@ -3263,14 +3273,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group=kv_group,
             current_stream=_describe_stream(current_stream),
             load_stream=_describe_stream(load_stream),
-            has_payload_event=payload_event is not None,
+            payload_event_count=len(_payload_event_list(payload_event)),
             explicit_sparse_payload=explicit_sparse_payload,
             layer_state=layer_state is not None,
         )
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
-            if payload_event is not None:
-                load_stream.wait_event(payload_event)
+            payload_events = _payload_event_list(payload_event)
+            if payload_events:
+                for event in payload_events:
+                    load_stream.wait_event(event)
                 if not _publish_current_npu_stream():
                     raise RuntimeError(
                         "Failed to publish load stream after waiting on DSA "
@@ -4230,7 +4242,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx = sparse_request.get("selected_token_ids")
                 token_start_index = sparse_request.get("token_start_index", 0)
                 target_slot_mapping = sparse_request.get("target_slot_mapping")
-                payload_event = sparse_request.get("payload_event")
+                payload_event = sparse_request.get(
+                    "payload_events", sparse_request.get("payload_event")
+                )
                 explicit_sparse_payload = target_slot_mapping is not None
             elif isinstance(sparse_request, tuple):
                 if len(sparse_request) == 4:
@@ -4258,16 +4272,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 kv_group=kv_group,
                 current_stream=_describe_stream(current_stream),
                 load_stream=_describe_stream(load_stream),
-                has_payload_event=payload_event is not None,
+                payload_event_count=len(_payload_event_list(payload_event)),
                 explicit_sparse_payload=explicit_sparse_payload,
             )
-            if payload_event is not None:
+            payload_events = _payload_event_list(payload_event)
+            if payload_events:
                 # selected_token_idx/target_slot_mapping may be device tensors
                 # produced by vLLM's remap path. Packing below is their first
                 # connector-side consumer, so wait before packing, not only
                 # later inside the load-stream transfer.
                 with torch.cuda.stream(current_stream):
-                    current_stream.wait_event(payload_event)
+                    for event in payload_events:
+                        current_stream.wait_event(event)
                     if not _publish_current_npu_stream():
                         raise RuntimeError(
                             "Failed to publish current stream after waiting on DSA "
@@ -4279,6 +4295,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kv_group=kv_group,
                     current_stream=_describe_stream(current_stream),
                     load_stream=_describe_stream(load_stream),
+                    payload_event_count=len(payload_events),
                 )
 
             if explicit_sparse_payload:
