@@ -74,6 +74,18 @@ _DSA_STREAM_DIAG = os.getenv("LMCACHE_DSA_STREAM_DIAG", "0").lower() in (
     "yes",
     "on",
 )
+_DSA_SYNC_PROBES = {
+    probe.strip().lower()
+    for probe in os.getenv("LMCACHE_DSA_SYNC_PROBE", "").split(",")
+    if probe.strip()
+}
+_DSA_WAIT_STREAM_PROBES = {
+    probe.strip().lower()
+    for probe in os.getenv("LMCACHE_DSA_WAIT_STREAM_PROBE", "").split(",")
+    if probe.strip()
+}
+_DSA_SYNC_PROBE_LOGGED: Set[str] = set()
+_DSA_WAIT_STREAM_PROBE_LOGGED: Set[str] = set()
 _DSA_DIAG_TENSOR_STATS = os.getenv(
     "LMCACHE_DSA_DIAG_TENSOR_STATS", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -164,6 +176,18 @@ def _payload_event_list(payload_event: Any) -> list[Any]:
     return [payload_event]
 
 
+def _payload_stream_list(payload_stream: Any) -> list[Any]:
+    if payload_stream is None:
+        return []
+    if isinstance(payload_stream, (list, tuple)):
+        return [stream for stream in payload_stream if stream is not None]
+    return [payload_stream]
+
+
+def _probe_enabled(probes: Set[str], name: str) -> bool:
+    return name in probes or "all" in probes
+
+
 def _publish_current_npu_stream() -> bool:
     global _DSA_TORCH_NPU_MODULE, _DSA_PUBLISH_STREAM_WARNING_LOGGED
     try:
@@ -184,6 +208,56 @@ def _publish_current_npu_stream() -> bool:
             )
             _DSA_PUBLISH_STREAM_WARNING_LOGGED = True
         return False
+
+
+def _sync_probe(name: str, stream: Any = None) -> None:
+    if not _probe_enabled(_DSA_SYNC_PROBES, name):
+        return
+    try:
+        if stream is None:
+            stream = torch.npu.current_stream()
+        stream.synchronize()
+    except Exception:
+        logger.warning(
+            "[LMCACHE_DSA_SYNC_PROBE_ERROR] probe=%s failed",
+            name,
+            exc_info=True,
+        )
+    else:
+        if name not in _DSA_SYNC_PROBE_LOGGED:
+            _DSA_SYNC_PROBE_LOGGED.add(name)
+            logger.warning("[LMCACHE_DSA_SYNC_PROBE] probe=%s", name)
+
+
+def _wait_stream_probe(
+    name: str,
+    payload_stream: Any,
+    consumer_stream: Any = None,
+) -> None:
+    payload_streams = _payload_stream_list(payload_stream)
+    if not payload_streams or not _probe_enabled(_DSA_WAIT_STREAM_PROBES, name):
+        return
+    try:
+        if consumer_stream is None:
+            consumer_stream = torch.npu.current_stream()
+        for stream in payload_streams:
+            consumer_stream.wait_stream(stream)
+        if not _publish_current_npu_stream():
+            raise RuntimeError("failed to publish stream after wait_stream")
+    except Exception:
+        logger.warning(
+            "[LMCACHE_DSA_WAIT_STREAM_PROBE_ERROR] probe=%s failed",
+            name,
+            exc_info=True,
+        )
+    else:
+        if name not in _DSA_WAIT_STREAM_PROBE_LOGGED:
+            _DSA_WAIT_STREAM_PROBE_LOGGED.add(name)
+            logger.warning(
+                "[LMCACHE_DSA_WAIT_STREAM_PROBE] probe=%s stream_count=%d",
+                name,
+                len(payload_streams),
+            )
 
 
 def _diag_tensor_summary(value: Any, max_items: int = 4) -> Any:
@@ -3059,6 +3133,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_dsa_hidden_dims: int,
         layer_tensors: List[torch.Tensor],
         payload_event: Optional[Any] = None,
+        payload_stream: Optional[Any] = None,
         explicit_sparse_payload: bool = False,
     ) -> None:
         """Diagnostic fallback: CPU chunks -> NPU staging -> paged KV.
@@ -3120,6 +3195,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             with torch.cuda.stream(load_stream):
                 load_stream.wait_stream(current_stream)
+                _wait_stream_probe("before_transfer", payload_stream, load_stream)
                 payload_events = _payload_event_list(payload_event)
                 if payload_events:
                     for event in payload_events:
@@ -3129,6 +3205,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             "Failed to publish load stream after waiting on "
                             "DSA sparse payload event before staging transfer."
                         )
+                _sync_probe("before_transfer", load_stream)
                 assert staging_tensor is not None
                 batched_fused_sparse_single_layer_kv_transfer(
                     layer_tensors,
@@ -3174,6 +3251,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping_ref: Optional[torch.Tensor] = None,
         cpu_tensors: Optional[List[torch.Tensor]] = None,
         payload_event: Optional[Any] = None,
+        payload_stream: Optional[Any] = None,
         explicit_sparse_payload: bool = False,
         diag_context: Optional[dict[str, Any]] = None,
     ) -> None:
@@ -3279,6 +3357,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
+            _wait_stream_probe("before_transfer", payload_stream, load_stream)
             payload_events = _payload_event_list(payload_event)
             if payload_events:
                 for event in payload_events:
@@ -3288,6 +3367,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "Failed to publish load stream after waiting on DSA "
                         "sparse payload event before direct transfer."
                     )
+            _sync_probe("before_transfer", load_stream)
             if explicit_sparse_payload and _SPARSE_DIRECT_GUARD:
                 self._validate_sparse_direct_explicit_inputs(
                     kvcaches_ref=kvcaches_ref,
@@ -4237,6 +4317,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             explicit_sparse_payload = isinstance(sparse_request, dict)
             target_slot_mapping = None
             payload_event = None
+            payload_stream = None
             if explicit_sparse_payload:
                 memory_objs_layer = sparse_request["memory_objs_layer"]
                 selected_token_idx = sparse_request.get("selected_token_ids")
@@ -4244,6 +4325,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 target_slot_mapping = sparse_request.get("target_slot_mapping")
                 payload_event = sparse_request.get(
                     "payload_events", sparse_request.get("payload_event")
+                )
+                payload_stream = sparse_request.get(
+                    "payload_streams", sparse_request.get("payload_stream")
                 )
                 explicit_sparse_payload = target_slot_mapping is not None
             elif isinstance(sparse_request, tuple):
@@ -4273,6 +4357,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 current_stream=_describe_stream(current_stream),
                 load_stream=_describe_stream(load_stream),
                 payload_event_count=len(_payload_event_list(payload_event)),
+                payload_stream_count=len(_payload_stream_list(payload_stream)),
                 explicit_sparse_payload=explicit_sparse_payload,
             )
             payload_events = _payload_event_list(payload_event)
@@ -4297,6 +4382,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         load_stream=_describe_stream(load_stream),
                         payload_event_count=len(payload_events),
                     )
+                _wait_stream_probe("before_pack", payload_stream, current_stream)
+                _sync_probe("before_pack", current_stream)
 
                 if explicit_sparse_payload:
                     slot_mapping_packed, selected_token_idx = (
@@ -4313,6 +4400,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             token_start_index,
                         )
                     )
+                _sync_probe("after_pack", current_stream)
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
@@ -4426,6 +4514,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
                     layer_tensors=cpu_tensors,
                     payload_event=payload_event,
+                    payload_stream=payload_stream,
                     explicit_sparse_payload=explicit_sparse_payload,
                 )
             else:
@@ -4454,6 +4543,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     ),
                     cpu_tensors=cpu_tensors,
                     payload_event=payload_event,
+                    payload_stream=payload_stream,
                     explicit_sparse_payload=explicit_sparse_payload,
                     diag_context=diag_context,
                 )
