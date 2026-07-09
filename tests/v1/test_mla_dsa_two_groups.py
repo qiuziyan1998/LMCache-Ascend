@@ -1006,6 +1006,15 @@ def _adapter_method(name):
     return getattr(LMCacheConnectorV1Impl, name)
 
 
+def _ascend_adapter_method(name):
+    """Return the unbound Ascend adapter method for calling on a fake instance."""
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        LMCacheAscendConnectorV1Impl,
+    )
+
+    return getattr(LMCacheAscendConnectorV1Impl, name)
+
+
 class TestAdapterGroupSplit:
     """_refresh_kvcaches_list partitions registered kv_caches into latent and
     indexer groups by 'indexer' in layer_name, and _kvcaches_for_group
@@ -1207,6 +1216,85 @@ class TestStorerDualPop:
         )
         _adapter_method("wait_for_save")(fake)
         assert storers == {}
+
+
+class TestAscendDecodeWindowWaitForSaveCompletion:
+    """Ascend wait_for_save must not treat legacy storer keys as a completed
+    range-scoped decode-window save."""
+
+    def _make_request(self):
+        return SimpleNamespace(
+            req_id="r-window",
+            decode_window_start=256,
+            decode_window_end=512,
+        )
+
+    def _make_fake(self, request, storers, completed_groups):
+        from lmcache.integration.vllm.vllm_v1_adapter import (
+            LMCacheConnectorMetadata,
+        )
+
+        meta = LMCacheConnectorMetadata(requests=[request])
+
+        def _range_key(req, kv_group):
+            return (
+                req.req_id,
+                "decode_window_save",
+                kv_group,
+                req.decode_window_start,
+                req.decode_window_end,
+            )
+
+        return SimpleNamespace(
+            kv_role="kv_producer",
+            use_layerwise=True,
+            store_async=False,
+            _layerwise_save_storers=storers,
+            _layerwise_save_storer_key=_range_key,
+            _save_storer_key=_ascend_adapter_method("_save_storer_key"),
+            _should_defer_latent_save_under_tp=lambda: False,
+            _drain_layerwise_storer_fully=lambda storer: True,
+            _close_layerwise_storer=lambda storer: None,
+            _record_decode_window_save_group_completed=(
+                lambda req, kv_group: completed_groups.append(kv_group)
+            ),
+            _maybe_seed_worker_retrieve_state_from_store=lambda req: None,
+            _mark_decode_window_save_completed=lambda req: None,
+            _maybe_lookup_unpin_for_request=lambda req: None,
+            _parent=SimpleNamespace(
+                _connector_metadata=meta,
+                _get_connector_metadata=lambda: meta,
+            ),
+        )
+
+    def test_exact_range_key_records_decode_window_group_completion(self):
+        request = self._make_request()
+        completed_groups = []
+        exact_key = (
+            "r-window",
+            "decode_window_save",
+            0,
+            256,
+            512,
+        )
+        storers = {exact_key: iter(())}
+        fake = self._make_fake(request, storers, completed_groups)
+
+        _ascend_adapter_method("wait_for_save")(fake)
+
+        assert storers == {}
+        assert completed_groups == [0]
+
+    def test_legacy_key_drains_but_does_not_record_decode_window_completion(self):
+        request = self._make_request()
+        completed_groups = []
+        storers = {("r-window", 0): iter(())}
+        fake = self._make_fake(request, storers, completed_groups)
+
+        _ascend_adapter_method("wait_for_save")(fake)
+
+        assert storers == {}
+        assert completed_groups == []
 
 
 class TestRetrieverPairAdvancement:

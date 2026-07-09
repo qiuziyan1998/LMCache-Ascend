@@ -96,10 +96,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 ]
 
                 for _kv_group, storer_key in storer_items:
+                    matched_current_storer_key = True
                     layerwise_storer = self._layerwise_save_storers.pop(
                         storer_key, None
                     )
                     if layerwise_storer is None:
+                        matched_current_storer_key = False
                         legacy_key = self._save_storer_key(
                             request.req_id, _kv_group
                         )
@@ -111,6 +113,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         layerwise_storer = self._layerwise_save_storers.pop(
                             request.req_id, None
                         )
+                        matched_current_storer_key = False
                         if layerwise_storer is not None:
                             logger.warning(
                                 "Draining legacy MLA latent storer key for "
@@ -120,12 +123,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                 storer_key,
                             )
                     if layerwise_storer is not None:
+                        save_completed = True
                         try:
                             drain_storer = getattr(
                                 self, "_drain_layerwise_storer_fully", None
                             )
                             if callable(drain_storer):
-                                drain_storer(layerwise_storer)
+                                save_completed = (
+                                    drain_storer(layerwise_storer) is not False
+                                )
                             else:
                                 try:
                                     next(layerwise_storer)
@@ -144,6 +150,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                         close_fn()
                                     except (GeneratorExit, RuntimeError, ValueError):
                                         pass
+                        if save_completed and matched_current_storer_key:
+                            record_completed = getattr(
+                                self,
+                                "_record_decode_window_save_group_completed",
+                                None,
+                            )
+                            if callable(record_completed):
+                                record_completed(request, _kv_group)
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
