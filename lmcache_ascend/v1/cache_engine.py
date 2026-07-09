@@ -1348,11 +1348,20 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             location = retrieve_kwargs.get("cached_retrieve_location")
             kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+            shared_passive_retrieve = (
+                self._should_use_shared_layerwise_retrieve(kv_group)
+                and self._is_shared_retrieve_passive(kv_group)
+            )
             shared_rank0_retrieve = (
                 self._should_use_shared_layerwise_retrieve(kv_group)
                 and not self._is_shared_retrieve_passive(kv_group)
             )
-            if cached_keys and cached_keys[0] and not shared_rank0_retrieve:
+            if (
+                cached_keys
+                and cached_keys[0]
+                and not shared_rank0_retrieve
+                and not shared_passive_retrieve
+            ):
                 # Prefer the hottest tier (LocalCPUBackend is checked first).
                 # After Mooncake write-back, stale cached_retrieve_location may
                 # still point at RemoteBackend and force slow remote reads.
@@ -1374,6 +1383,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         if retrieve_kwargs is not None:
             location = retrieve_kwargs.get("cached_retrieve_location")
         kv_group = int((retrieve_kwargs or {}).get("kv_group", 0) or 0)
+        shared_passive_retrieve = (
+            retrieve_kwargs is not None
+            and self._should_use_shared_layerwise_retrieve(kv_group)
+            and self._is_shared_retrieve_passive(kv_group)
+        )
         shared_rank0_retrieve = (
             retrieve_kwargs is not None
             and self._should_use_shared_layerwise_retrieve(kv_group)
@@ -1384,6 +1398,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             and cached_keys
             and cached_keys[0]
             and not shared_rank0_retrieve
+            and not shared_passive_retrieve
         ):
             location = self._cached_layerwise_location_or_raise(
                 cached_keys,

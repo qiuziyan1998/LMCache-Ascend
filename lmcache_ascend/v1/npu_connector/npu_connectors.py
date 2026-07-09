@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from contextlib import nullcontext
 import os
 from typing import Any, List, Optional, Set, Union
 
@@ -1488,7 +1489,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Metadata that must match to reuse SparseDirectLayerState."""
         return (
             tuple(
-                VLLMPagedMemLayerwiseNPUConnector._tensor_identity_signature(
+                VLLMPagedMemLayerwiseNPUConnector._tensor_layout_signature(
                     tensor
                 )
                 for tensor in layer_tensors
@@ -1504,6 +1505,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int(sparse_v_hidden_dims),
             int(sparse_dsa_hidden_dims),
         )
+
+    @staticmethod
+    def _stream_context_or_null(stream):
+        if stream is None or not hasattr(stream, "device"):
+            return nullcontext()
+        return torch.cuda.stream(stream)
 
     @staticmethod
     def _sparse_direct_pointer_cache_signature(
@@ -3337,7 +3344,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 token_start_index = 0
 
             payload_events = _payload_event_list(payload_event)
-            with torch.cuda.stream(current_stream):
+            with self._stream_context_or_null(current_stream):
                 # selected_token_idx/target_slot_mapping may be device tensors
                 # produced by vLLM's remap path. Packing below is their first
                 # connector-side consumer, so wait before packing, not only
@@ -3407,8 +3414,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cached_chunk_ptrs_npu,
                 cached_chunk_dev_ptrs,
             )
-            total_tokens = self._sparse_total_tokens_from_layer_chunks(
-                cpu_tensors, kv_group
+            total_tokens = (
+                lmcache_cached_tokens
+                if lmcache_cached_tokens > 0
+                else self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group
+                )
             )
 
             if _SPARSE_DIRECT_DISABLE:
