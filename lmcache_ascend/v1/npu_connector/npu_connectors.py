@@ -1510,6 +1510,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         *,
         chunk_ptrs_npu: torch.Tensor,
         slot_mapping_ref: torch.Tensor,
+        source_layout_ref: Optional[torch.Tensor],
         total_tokens: int,
         chunk_size: int,
         sparse_kv_format: int,
@@ -1521,17 +1522,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> tuple:
         """Cheap runtime source identity for the decode hot path.
 
-        The expensive per-CPU-chunk signature is still available for preflight
-        and tests. During decode, chunk_ptrs_npu has already been constructed
-        from the resolved CPU MemoryObjs, so its tensor identity is enough to
-        distinguish the installed source pointer table without walking every
-        chunk again.
+        The native fast path overwrites slot_mapping_ptr and consumes
+        chunk_ptrs_npu at launch time, so the cached layer state only needs the
+        stable source layout and scalar metadata. Avoid keying on per-request
+        tensor addresses that would force prepare_sparse_direct_layer_state()
+        to run again on every decode step.
         """
         return (
-            1,
-            int(chunk_ptrs_npu.data_ptr()),
+            2,
+            VLLMPagedMemLayerwiseNPUConnector._tensor_layout_signature(
+                source_layout_ref
+            ),
+            chunk_ptrs_npu.dtype,
+            str(chunk_ptrs_npu.device),
             int(chunk_ptrs_npu.numel()),
-            int(slot_mapping_ref.data_ptr()),
+            slot_mapping_ref.dtype,
+            str(slot_mapping_ref.device),
             int(slot_mapping_ref.numel()),
             int(total_tokens),
             int(chunk_size),
@@ -1542,6 +1548,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int(sparse_v_hidden_dims),
             int(sparse_dsa_hidden_dims),
         )
+
+    @staticmethod
+    def _tensor_layout_signature(tensor) -> tuple:
+        if isinstance(tensor, torch.Tensor):
+            return (
+                tuple(int(dim) for dim in tensor.shape),
+                tuple(int(stride) for stride in tensor.stride()),
+                tensor.dtype,
+                str(tensor.device),
+                int(tensor.element_size()),
+                int(tensor.numel() * tensor.element_size()),
+            )
+        return (type(tensor).__name__,)
 
     @staticmethod
     def _tensor_identity_signature(tensor) -> tuple:
@@ -2298,6 +2317,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         runtime_source_signature = self._sparse_direct_pointer_cache_signature(
             chunk_ptrs_npu=chunk_ptrs_npu,
             slot_mapping_ref=resolve_slot_mapping,
+            source_layout_ref=resolve_tensors[0] if resolve_tensors else None,
             total_tokens=total_tokens,
             chunk_size=chunk_size,
             sparse_kv_format=sparse_kv_format,
@@ -3342,6 +3362,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                     )
 
+            # Payload producer events are consumed before packing on
+            # current_stream. The transfer stream waits on current_stream below,
+            # so re-waiting on the same payload events is redundant here.
+            transfer_payload_event = None
+
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
                 if cached_tensors_by_layer is not None
@@ -3403,7 +3428,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_v_hidden_dims=sparse_v_hidden_dims,
                     sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
                     layer_tensors=cpu_tensors,
-                    payload_event=payload_event,
+                    payload_event=transfer_payload_event,
                     explicit_sparse_payload=explicit_sparse_payload,
                 )
             else:
@@ -3431,7 +3456,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         if explicit_sparse_payload else slot_mapping
                     ),
                     cpu_tensors=cpu_tensors,
-                    payload_event=payload_event,
+                    payload_event=transfer_payload_event,
                     explicit_sparse_payload=explicit_sparse_payload,
                 )
 

@@ -138,6 +138,20 @@ def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
         sparse_v_hidden_dims=1,
         sparse_dsa_hidden_dims=0,
     )
+    same_shape_new_slot_mapping = connector._get_or_create_sparse_direct_layer_state(
+        kvcaches_ref=kvcaches_ref,
+        kv_group=0,
+        layer_id=0,
+        layer_tensors=[source],
+        slot_mapping_ref=torch.arange(4, dtype=torch.long),
+        total_tokens=4,
+        sparse_kv_format=0,
+        sparse_token_major=False,
+        sparse_vllm_two_major=False,
+        sparse_k_hidden_dims=1,
+        sparse_v_hidden_dims=1,
+        sparse_dsa_hidden_dims=0,
+    )
     changed = connector._get_or_create_sparse_direct_layer_state(
         kvcaches_ref=kvcaches_ref,
         kv_group=0,
@@ -154,9 +168,10 @@ def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
     )
 
     assert first is same
-    assert same_shape_new_source is not first
+    assert same_shape_new_source is first
+    assert same_shape_new_slot_mapping is first
     assert changed is not first
-    assert len(prepared) == 3
+    assert len(prepared) == 2
 
 
 def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:

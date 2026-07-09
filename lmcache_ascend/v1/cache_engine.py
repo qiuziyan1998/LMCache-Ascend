@@ -874,16 +874,37 @@ class AscendLMCacheEngine(LMCacheEngine):
         layer_id: int,
         memory_objs: List[List[MemoryObj]],
         cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List] = None,
+        cached_chunk_ptrs_npu: Optional[List] = None,
     ) -> None:
+        new_tensors: List[torch.Tensor] = [
+            mem_obj.tensor
+            for mem_obj in memory_objs[layer_id]
+            if mem_obj.tensor is not None
+        ]
+        if (
+            new_tensors
+            and cached_chunk_dev_ptrs is not None
+            and getattr(self, "enable_shared_cpu_cache", False)
+        ):
+            append_ptrs_fn = getattr(
+                self.gpu_connector,
+                "append_sparse_chunk_ptr_cache_for_layer",
+                None,
+            )
+            if append_ptrs_fn is not None:
+                append_ptrs_fn(
+                    layer_id,
+                    new_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
+
         if cached_tensors is None:
             return
         while len(cached_tensors) <= layer_id:
             cached_tensors.append([])
-        cached_tensors[layer_id].extend(
-            mem_obj.tensor
-            for mem_obj in memory_objs[layer_id]
-            if mem_obj.tensor is not None
-        )
+        cached_tensors[layer_id].extend(new_tensors)
 
     def _append_retrieve_layer_cache(
         self,
@@ -934,12 +955,20 @@ class AscendLMCacheEngine(LMCacheEngine):
         handles: List,
         cached_shared_handles: Optional[List],
     ) -> None:
-        """Retain shared CPU cache handles with the request-scoped cache."""
+        """Retain the current ordered shared handle set for a layer.
+
+        Sparse retrieve publishes handles for the whole active prefix, not only
+        newly appended chunks. Treating this as an append-only log can make a
+        later coverage check pass by length even though the newest chunk has no
+        handle, causing passive ranks to wait for an envelope rank0 skips.
+        """
         if cached_shared_handles is None:
             return
         if not cached_shared_handles:
             cached_shared_handles.extend([] for _ in range(self.num_layers))
-        cached_shared_handles[layer_id].extend(handles)
+        while len(cached_shared_handles) <= layer_id:
+            cached_shared_handles.append([])
+        cached_shared_handles[layer_id] = list(handles)
 
     @staticmethod
     def _needs_retrieve_metadata_refresh(
@@ -1305,6 +1334,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     retrieve_kwargs["cached_retrieve_location"] = location
                 return location, cached_starts, cached_ends, cached_keys
 
+            ret_mask.zero_()
+            for start, end in zip(cached_starts, cached_ends, strict=False):
+                ret_mask[start:end] = True
+
             location = retrieve_kwargs.get("cached_retrieve_location")
             kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
             shared_rank0_retrieve = (
@@ -1637,7 +1670,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     yield
                     next(mem_obj_generator)
                     self._append_layer_store_tensors(
-                        layer_id, memory_objs, cached_tensors
+                        layer_id,
+                        memory_objs,
+                        cached_tensors,
+                        cached_chunk_dev_ptrs,
+                        cached_chunk_ptrs_npu,
                     )
                     self._dsa_record_store_digests(
                         req_id=req_id,
@@ -1836,11 +1873,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             expected_shape=expected_shape,
                             expected_dtype=expected_dtype,
                             expected_fmt=expected_fmt,
-                            expected_cached_positions=list(
-                                range(
-                                    int(starts[chunk_index]),
-                                    int(ends[chunk_index]),
-                                )
+                            expected_cached_positions=range(
+                                int(starts[chunk_index]),
+                                int(ends[chunk_index]),
                             ),
                             expected_producer_rank=self.metadata.first_rank,
                         )
@@ -1948,6 +1983,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
             kwargs["ret_mask"] = ret_mask
             metadata_warm = False
+            kwargs.pop("_retrieve_metadata_warm", None)
         elif not metadata_warm:
             ret_mask.zero_()
 
@@ -2370,12 +2406,30 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
+        existing_rank0_backing_layers = kwargs.get(
+            "shared_cpu_existing_rank0_backing_layers"
+        )
+        existing_rank0_backing_ids: Optional[set[int]] = None
+
+        def is_existing_rank0_backing(mem_obj: MemoryObj) -> bool:
+            nonlocal existing_rank0_backing_ids
+            if not existing_rank0_backing_layers:
+                return False
+            if existing_rank0_backing_ids is None:
+                existing_rank0_backing_ids = {
+                    id(obj)
+                    for layer_objs in existing_rank0_backing_layers
+                    for obj in (layer_objs or [])
+                }
+            return id(mem_obj) in existing_rank0_backing_ids
 
         def claim_cached_shared_mem_objs_for_publication(
             mem_objs_layer: List[MemoryObj],
         ) -> None:
             """Take the request pin/ref needed by rank0 handle publication."""
             for mem_obj in mem_objs_layer:
+                if is_existing_rank0_backing(mem_obj):
+                    continue
                 try:
                     mem_obj.ref_count_up()
                 except Exception as exc:
