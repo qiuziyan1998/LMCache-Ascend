@@ -120,16 +120,30 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                 storer_key,
                             )
                     if layerwise_storer is not None:
-                        drain_storer = getattr(
-                            self, "_drain_layerwise_storer_fully", None
-                        )
-                        if callable(drain_storer):
-                            drain_storer(layerwise_storer)
-                        else:
-                            try:
-                                next(layerwise_storer)
-                            except StopIteration:
-                                pass
+                        try:
+                            drain_storer = getattr(
+                                self, "_drain_layerwise_storer_fully", None
+                            )
+                            if callable(drain_storer):
+                                drain_storer(layerwise_storer)
+                            else:
+                                try:
+                                    next(layerwise_storer)
+                                except StopIteration:
+                                    pass
+                        finally:
+                            close_storer = getattr(
+                                self, "_close_layerwise_storer", None
+                            )
+                            if callable(close_storer):
+                                close_storer(layerwise_storer)
+                            else:
+                                close_fn = getattr(layerwise_storer, "close", None)
+                                if callable(close_fn):
+                                    try:
+                                        close_fn()
+                                    except (GeneratorExit, RuntimeError, ValueError):
+                                        pass
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
@@ -332,7 +346,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if getattr(self, "use_layerwise", False) and hasattr(
             self, "_layerwise_save_storers"
         ):
-            self._layerwise_save_storers.pop(request.request_id, None)
+            legacy_storer = self._layerwise_save_storers.pop(
+                request.request_id, None
+            )
+            close_storer = getattr(self, "_close_layerwise_storer", None)
+            if callable(close_storer):
+                close_storer(legacy_storer)
+            elif legacy_storer is not None:
+                close_fn = getattr(legacy_storer, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except (GeneratorExit, RuntimeError, ValueError):
+                        pass
 
         if (
             request.status == RequestStatus.FINISHED_ABORTED
