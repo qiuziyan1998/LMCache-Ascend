@@ -119,6 +119,36 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast_wrapper(
       chunk_size, total_tokens, lmc_host_interleaved, validate_inputs);
 }
 
+void dense_mla_dsa_batched_direct_kv_transfer_wrapper(
+    std::vector<torch::Tensor> &lmc_tensors, const py::object &vllm_kv_caches_obj,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, int64_t total_tokens,
+    int kvcache_format_raw, bool token_major, bool vllm_two_major,
+    int64_t k_hidden_dims = 0, int64_t v_hidden_dims = 0,
+    int64_t dsa_hidden_dims = 0, bool lmc_host_interleaved = false,
+    bool direction = false,
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu = c10::nullopt,
+    int64_t fixed_chunk_size = 0) {
+  auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
+  dense_mla_dsa_batched_direct_kv_transfer(
+      lmc_tensors, vllm_kv_caches, slot_mapping_full, chunk_offsets_npu,
+      chunk_sizes_npu, total_tokens, kvcache_format_raw, token_major,
+      vllm_two_major, k_hidden_dims, v_hidden_dims, dsa_hidden_dims,
+      lmc_host_interleaved, direction, chunk_ptrs_npu, fixed_chunk_size);
+}
+
+void dense_mla_dsa_batched_direct_kv_transfer_fast_wrapper(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_full,
+    torch::Tensor &chunk_ptrs_npu, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, int64_t total_tokens,
+    bool lmc_host_interleaved, bool direction, bool validate_inputs,
+    int64_t fixed_chunk_size = 0) {
+  dense_mla_dsa_batched_direct_kv_transfer_fast(
+      layer_state, slot_mapping_full, chunk_ptrs_npu, chunk_offsets_npu,
+      chunk_sizes_npu, total_tokens, lmc_host_interleaved, direction,
+      validate_inputs, fixed_chunk_size);
+}
+
 PYBIND11_MODULE(c_ops, m) {
   m.def("get_device_ptr", [](uintptr_t ptr_addr) {
     return reinterpret_cast<uintptr_t>(
@@ -206,6 +236,24 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("selected_token_idx"), py::arg("chunk_ptrs_npu"),
         py::arg("chunk_size"), py::arg("total_tokens"),
         py::arg("lmc_host_interleaved"), py::arg("validate_inputs") = false);
+  m.def("dense_mla_dsa_batched_direct_kv_transfer",
+        &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
+        py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),
+        py::arg("slot_mapping_full"), py::arg("chunk_offsets_npu"),
+        py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
+        py::arg("kvcache_format_raw"), py::arg("token_major") = false,
+        py::arg("vllm_two_major") = false, py::arg("k_hidden_dims") = 0,
+        py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0,
+        py::arg("lmc_host_interleaved") = false,
+        py::arg("direction") = false, py::arg("chunk_ptrs_npu") = py::none(),
+        py::arg("fixed_chunk_size") = 0);
+  m.def("dense_mla_dsa_batched_direct_kv_transfer_fast",
+        &dense_mla_dsa_batched_direct_kv_transfer_fast_wrapper,
+        py::arg("layer_state"), py::arg("slot_mapping_full"),
+        py::arg("chunk_ptrs_npu"), py::arg("chunk_offsets_npu"),
+        py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
+        py::arg("lmc_host_interleaved"), py::arg("direction"),
+        py::arg("validate_inputs") = false, py::arg("fixed_chunk_size") = 0);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
   m.def("load_and_reshape_flash", &load_and_reshape_flash);

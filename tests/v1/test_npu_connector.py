@@ -14,6 +14,7 @@ from lmcache_tests.v1.test_gpu_connector import (
 from lmcache_tests.v1.test_gpu_connector import (
     test_vllm_paged_connector_v2_to_gpu_bench as original_test_vllm_paged_connector_v2_to_gpu_bench,
 )
+from lmcache.v1.memory_management import MemoryFormat
 import pytest
 import torch
 
@@ -31,6 +32,29 @@ def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
     connector.kv_device = torch.device("cpu")
     connector._layerwise_sparse_idx_cache = None
     return connector
+
+
+class _NoopStream:
+    def wait_stream(self, stream):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+class _DenseLayout:
+    k_hidden_dims = 1
+    v_hidden_dims = 1
+    dsa_hidden_dims = 0
+    kv_format = type("_Fmt", (), {"value": 0})()
+    vllm_two_major = False
+    gpu_buffer_allocator = None
+
+
+class _MemoryObj:
+    def __init__(self, tensor, fmt=MemoryFormat.KV_MLA_LATENT_FMT):
+        self.tensor = tensor
+        self.metadata = type("_Metadata", (), {"fmt": fmt})()
 
 
 def test_sparse_memory_update_resets_fast_direct_state() -> None:
@@ -649,6 +673,281 @@ def test_sparse_head_token_wise_can_disable_direct_path(monkeypatch) -> None:
 
     assert len(staging_calls) == 1
     assert staging_calls[0]["total_tokens"] == 4
+
+
+def test_dense_direct_fixed_chunk_size_detects_sparse_like_layout() -> None:
+    assert (
+        VLLMPagedMemLayerwiseNPUConnector._dense_direct_fixed_chunk_size(
+            [0, 256, 512],
+            [256, 256, 17],
+        )
+        == 256
+    )
+    assert (
+        VLLMPagedMemLayerwiseNPUConnector._dense_direct_fixed_chunk_size(
+            [0, 128, 384],
+            [128, 256, 17],
+        )
+        == 0
+    )
+
+
+def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kvcaches = [(object(), object())]
+    connector.use_gpu = True
+    connector.kv_device = torch.device("cpu")
+    connector.load_stream = _NoopStream()
+
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _NoopStream())
+    monkeypatch.setattr(
+        connector,
+        "initialize_kvcaches_ptr",
+        lambda **kwargs: None,
+    )
+    init_staging_values = []
+
+    def _lazy_initialize_buffer_with_staging(kvcaches, *, kv_group, init_staging):
+        init_staging_values.append(init_staging)
+        return _DenseLayout()
+
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        _lazy_initialize_buffer_with_staging,
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda kv_group=0: True)
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda kv_group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda kv_group=0: False)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda kv_group=0: False
+    )
+    monkeypatch.setattr(
+        connector,
+        "_check_layerwise_transfer_invariants",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_check_staging_transfer_tokens",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dense direct retrieve should not check staging tokens")
+        ),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_allocate_layerwise_staging_buffer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dense direct retrieve should not allocate staging")
+        ),
+    )
+
+    metadata_calls = []
+
+    def _metadata(chunk_offsets, chunk_sizes, *, total_tokens, kv_group):
+        metadata_calls.append(
+            (list(chunk_offsets), list(chunk_sizes), total_tokens, kv_group)
+        )
+        return (
+            torch.tensor(chunk_offsets, dtype=torch.int32),
+            torch.tensor(chunk_sizes, dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(connector, "_dense_direct_chunk_metadata_tensors", _metadata)
+
+    pointer_calls = []
+
+    def _resolve_chunk_ptrs(
+        layer_id,
+        cpu_tensors,
+        cached_chunk_ptrs_arg=None,
+        cached_chunk_dev_ptrs_arg=None,
+    ):
+        pointer_calls.append(
+            (
+                layer_id,
+                list(cpu_tensors),
+                cached_chunk_ptrs_arg,
+                cached_chunk_dev_ptrs_arg,
+            )
+        )
+        return torch.tensor([123, 456], dtype=torch.long)
+
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        _resolve_chunk_ptrs,
+    )
+
+    direct_calls = []
+    monkeypatch.setattr(
+        connector,
+        "_run_dense_direct_kv_transfer_layer",
+        lambda **kwargs: direct_calls.append(kwargs),
+    )
+
+    gen = connector.batched_to_gpu(
+        [0, 256],
+        [256, 273],
+        slot_mapping=torch.arange(273, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+    )
+    next(gen)
+    gen.send(
+        [
+            _MemoryObj(torch.zeros(256, dtype=torch.bfloat16)),
+            _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
+        ]
+    )
+    gen.close()
+
+    assert init_staging_values == [False]
+    assert metadata_calls == []
+    assert len(pointer_calls) == 1
+    assert pointer_calls[0][2] is None
+    assert pointer_calls[0][3] is None
+    assert len(direct_calls) == 1
+    assert direct_calls[0]["direction"] is False
+    assert direct_calls[0]["total_tokens"] == 273
+    assert direct_calls[0]["fixed_chunk_size"] == 256
+
+
+def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kvcaches = [(object(), object())]
+    connector.use_gpu = True
+    connector.kv_device = torch.device("cpu")
+    connector.store_stream = _NoopStream()
+
+    class _Npu:
+        def current_stream(self):
+            return _NoopStream()
+
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_STORE_DISABLE", False)
+    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
+    monkeypatch.setattr(
+        connector,
+        "initialize_kvcaches_ptr",
+        lambda **kwargs: None,
+    )
+    init_staging_values = []
+
+    def _lazy_initialize_buffer_with_staging(kvcaches, *, kv_group, init_staging):
+        init_staging_values.append(init_staging)
+        return _DenseLayout()
+
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        _lazy_initialize_buffer_with_staging,
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda kv_group=0: True)
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda kv_group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda kv_group=0: False)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda kv_group=0: False
+    )
+    monkeypatch.setattr(
+        connector,
+        "_check_layerwise_transfer_invariants",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_check_staging_transfer_tokens",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dense direct store should not check staging tokens")
+        ),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_allocate_layerwise_staging_buffer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dense direct store should not allocate staging")
+        ),
+    )
+
+    metadata_calls = []
+
+    def _metadata(chunk_offsets, chunk_sizes, *, total_tokens, kv_group):
+        metadata_calls.append(
+            (list(chunk_offsets), list(chunk_sizes), total_tokens, kv_group)
+        )
+        return (
+            torch.tensor(chunk_offsets, dtype=torch.int32),
+            torch.tensor(chunk_sizes, dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(connector, "_dense_direct_chunk_metadata_tensors", _metadata)
+
+    pointer_calls = []
+
+    def _resolve_chunk_ptrs(
+        layer_id,
+        cpu_tensors,
+        cached_chunk_ptrs_arg=None,
+        cached_chunk_dev_ptrs_arg=None,
+    ):
+        pointer_calls.append(
+            (
+                layer_id,
+                list(cpu_tensors),
+                cached_chunk_ptrs_arg,
+                cached_chunk_dev_ptrs_arg,
+            )
+        )
+        return torch.tensor([123, 456], dtype=torch.long)
+
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        _resolve_chunk_ptrs,
+    )
+
+    direct_calls = []
+    monkeypatch.setattr(
+        connector,
+        "_run_dense_direct_kv_transfer_layer",
+        lambda **kwargs: direct_calls.append(kwargs),
+    )
+
+    gen = connector.batched_from_gpu(
+        [
+            [
+                _MemoryObj(torch.zeros(256, dtype=torch.bfloat16)),
+                _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
+            ]
+        ],
+        [0, 256],
+        [256, 273],
+        slot_mapping=torch.arange(273, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+    )
+    next(gen)
+    gen.close()
+
+    assert init_staging_values == [False]
+    assert metadata_calls == []
+    assert len(pointer_calls) == 1
+    assert pointer_calls[0][2] is None
+    assert pointer_calls[0][3] is None
+    assert len(direct_calls) == 1
+    assert direct_calls[0]["direction"] is True
+    assert direct_calls[0]["total_tokens"] == 273
+    assert direct_calls[0]["fixed_chunk_size"] == 256
 
 
 @pytest.mark.parametrize("use_npu", [True])

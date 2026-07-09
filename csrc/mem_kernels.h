@@ -137,6 +137,20 @@ void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
     const int32_t totalTokens, const int32_t blockSize,
     const bool lmcHostInterleaved = false);
 
+void single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
+    kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
+    kvcache_ops::KVCacheFormat format, uint32_t blockDim, void *stream,
+    uint8_t *chunkPtrsPtr, uint8_t *chunkOffsetsPtr, uint8_t *chunkSizesPtr,
+    uint8_t *vllmKeyPtr, uint8_t *vllmValuePtr, uint8_t *vllmDsaPtr,
+    uint8_t *slotMappingPtr, const int64_t vllmKeyBufferSize,
+    const int64_t vllmValueBufferSize, const int64_t vllmDsaBufferSize,
+    const int32_t maxTokensPerLoop, const int64_t kHiddenDims,
+    const int64_t vHiddenDims, const int64_t dsaHiddenDims,
+    const int32_t numTokens, const int32_t numChunks,
+    const int32_t fixedChunkSize, const int32_t totalTokens,
+    const int32_t blockSize, const bool page2L,
+    const bool lmcHostInterleaved = false);
+
 void load_and_reshape_flash_kernel(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     uint32_t blockDim, void *stream, uint8_t *dstCacheTensor,
@@ -236,6 +250,28 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
     torch::Tensor &selected_token_idx, torch::Tensor &chunk_ptrs_npu,
     const int64_t chunk_size, const int64_t total_tokens,
     const bool lmc_host_interleaved, const bool validate_inputs = false);
+
+// Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
+// direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.
+void dense_mla_dsa_batched_direct_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, const int64_t total_tokens,
+    const int kvcache_format_raw, const bool token_major = false,
+    const bool vllm_two_major = false, const int64_t k_hidden_dims = 0,
+    const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0,
+    const bool lmc_host_interleaved = false, const bool direction = false,
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu = c10::nullopt,
+    const int64_t fixed_chunk_size = 0);
+
+// Hot path: reuse cached per-layer config; no CPU chunk tensors required.
+void dense_mla_dsa_batched_direct_kv_transfer_fast(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_full,
+    torch::Tensor &chunk_ptrs_npu, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, const int64_t total_tokens,
+    const bool lmc_host_interleaved, const bool direction,
+    const bool validate_inputs = false, const int64_t fixed_chunk_size = 0);
 
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,

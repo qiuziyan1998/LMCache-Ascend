@@ -4,6 +4,7 @@
 #include <ATen/ATen.h>
 #include <Python.h>
 #include <pybind11/pybind11.h>
+#include <limits>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/npu/Module.h>
@@ -335,10 +336,10 @@ void batched_fused_single_layer_kv_transfer(
                                   // token_major=true:  [num_tokens, 2,
                                   // num_heads*head_size] token_major=false: [2,
                                   // num_tokens, num_heads*head_size]
-    std::vector<torch::Tensor>    // separate format： list[k_tensor, v_tensor]
-        &vllm_kv_caches, // k_tensor/v_tensor = [num_blocks，block_size,
+    std::vector<torch::Tensor>    // separate format: list[k_tensor, v_tensor]
+        &vllm_kv_caches, // k_tensor/v_tensor = [num_blocks, block_size,
                          // num_heads, head_size]
-                         //  Mergeed format：
+                         //  Merged format:
                          //  vllm_two_major=true:  [2, num_blocks, block_size,
                          //  num_heads, head_size] vllm_two_major=false:
                          //  [num_blocks, 2, block_size, num_heads, head_size]
@@ -538,6 +539,39 @@ static void launch_sparse_multi_chunk_direct_kernel(
   }
 }
 
+static void launch_dense_multi_chunk_direct_kernel(
+    const SingleLayerKVConfig &config, uint8_t *chunk_ptrs_ptr,
+    uint8_t *chunk_offsets_ptr, uint8_t *chunk_sizes_ptr, int32_t num_chunks,
+    int32_t fixed_chunk_size, int32_t total_tokens, bool lmc_host_interleaved,
+    bool page2l) {
+  TORCH_CHECK(is_mla_dsa_format(config.kvcache_format),
+              "Dense direct multi-chunk transfer only supports MLA/DSA formats.");
+
+  kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
+      config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+      kernel_format(config.kvcache_format), config.ub_params.aiv_num,
+      config.ub_params.stream, chunk_ptrs_ptr, chunk_offsets_ptr,
+      chunk_sizes_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+      config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+      config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+      config.strides.vllm_dsa_bytes, config.ub_params.max_tokens_per_loop,
+      config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims,
+      config.dims.num_tokens, num_chunks, fixed_chunk_size, total_tokens,
+      config.dims.block_size, page2l, lmc_host_interleaved);
+}
+
+static uint32_t dense_direct_aiv_num(int32_t num_tokens) {
+  const uint32_t token_cores =
+      num_tokens > 0 ? static_cast<uint32_t>(num_tokens) : 1U;
+  auto ascendcPlatform =
+      platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
+  const uint32_t hardware_cores = ascendcPlatform->GetCoreNumAiv();
+  if (hardware_cores == 0) {
+    return 1U;
+  }
+  return std::min(hardware_cores, token_cores);
+}
+
 } // namespace
 
 void sparse_mla_dsa_batched_direct_kv_transfer(
@@ -661,6 +695,195 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
     launch_sparse_multi_chunk_direct_kernel(
         config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
         total_tokens_i, lmc_host_interleaved);
+    return 0;
+  });
+  cmd.Run();
+}
+
+static void validate_dense_direct_inputs(torch::Tensor &slot_mapping_full,
+                                         torch::Tensor &chunk_ptrs_npu,
+                                         torch::Tensor &chunk_offsets_npu,
+                                         torch::Tensor &chunk_sizes_npu,
+                                         int64_t total_tokens,
+                                         int64_t fixed_chunk_size) {
+  TORCH_CHECK(slot_mapping_full.dim() == 1,
+              "slot_mapping_full must be 1D.");
+  TORCH_CHECK(chunk_ptrs_npu.dim() == 1, "chunk_ptrs_npu must be 1D.");
+  TORCH_CHECK(chunk_offsets_npu.dim() == 1, "chunk_offsets_npu must be 1D.");
+  TORCH_CHECK(chunk_sizes_npu.dim() == 1, "chunk_sizes_npu must be 1D.");
+  TORCH_CHECK(slot_mapping_full.scalar_type() == at::ScalarType::Int ||
+                  slot_mapping_full.scalar_type() == at::ScalarType::Long,
+              "slot_mapping_full must be torch.int32 or torch.int64.");
+  TORCH_CHECK(chunk_offsets_npu.scalar_type() == at::ScalarType::Int,
+              "chunk_offsets_npu must be torch.int32.");
+  TORCH_CHECK(chunk_sizes_npu.scalar_type() == at::ScalarType::Int,
+              "chunk_sizes_npu must be torch.int32.");
+  TORCH_CHECK(chunk_ptrs_npu.scalar_type() == at::ScalarType::Long,
+              "chunk_ptrs_npu must be torch.int64.");
+  if (fixed_chunk_size > 0) {
+    TORCH_CHECK(chunk_offsets_npu.numel() > 0 && chunk_sizes_npu.numel() > 0,
+                "fixed dense direct metadata tensors must not be empty.");
+  } else {
+    TORCH_CHECK(chunk_ptrs_npu.numel() == chunk_offsets_npu.numel() &&
+                    chunk_ptrs_npu.numel() == chunk_sizes_npu.numel(),
+                "chunk pointer, offset and size tensors must have the same length.");
+  }
+  TORCH_CHECK(chunk_ptrs_npu.numel() > 0, "chunk_ptrs_npu must not be empty.");
+  TORCH_CHECK(total_tokens > 0, "total_tokens must be positive.");
+  TORCH_CHECK(fixed_chunk_size >= 0,
+              "fixed_chunk_size must be non-negative.");
+  TORCH_CHECK(slot_mapping_full.size(0) <= total_tokens,
+              "slot_mapping_full length cannot exceed total_tokens.");
+  TORCH_CHECK(total_tokens <= std::numeric_limits<int32_t>::max(),
+              "total_tokens exceeds dense direct int32 kernel limit.");
+  TORCH_CHECK(fixed_chunk_size <= std::numeric_limits<int32_t>::max(),
+              "fixed_chunk_size exceeds dense direct int32 kernel limit.");
+  TORCH_CHECK(slot_mapping_full.size(0) <= std::numeric_limits<int32_t>::max(),
+              "slot_mapping_full length exceeds dense direct int32 kernel limit.");
+  TORCH_CHECK(chunk_ptrs_npu.numel() <= std::numeric_limits<int32_t>::max(),
+              "chunk count exceeds dense direct int32 kernel limit.");
+  if (fixed_chunk_size > 0) {
+    const int64_t num_chunks = chunk_ptrs_npu.numel();
+    TORCH_CHECK((num_chunks - 1) * fixed_chunk_size < total_tokens &&
+                    num_chunks * fixed_chunk_size >= total_tokens,
+                "fixed_chunk_size does not cover total_tokens.");
+  }
+  TORCH_CHECK(slot_mapping_full.device().is_privateuseone(),
+              "slot_mapping_full must be on NPU.");
+  TORCH_CHECK(chunk_ptrs_npu.device().is_privateuseone(),
+              "chunk_ptrs_npu must be on NPU.");
+  TORCH_CHECK(chunk_offsets_npu.device().is_privateuseone(),
+              "chunk_offsets_npu must be on NPU.");
+  TORCH_CHECK(chunk_sizes_npu.device().is_privateuseone(),
+              "chunk_sizes_npu must be on NPU.");
+}
+
+void dense_mla_dsa_batched_direct_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, const int64_t total_tokens,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
+    const bool lmc_host_interleaved, const bool direction,
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu,
+    const int64_t fixed_chunk_size) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  TORCH_CHECK(is_mla_dsa_format(
+                  static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw)),
+              "Dense direct transfer only supports MLA/DSA formats.");
+  TORCH_CHECK(!lmc_tensors.empty(), "lmc_tensors must not be empty.");
+
+  for (const auto &chunk : lmc_tensors) {
+    TORCH_CHECK(chunk.device().is_cpu(),
+                "Dense direct transfer requires CPU pinned memory objects.");
+  }
+
+  const int64_t num_chunks_i64 = static_cast<int64_t>(lmc_tensors.size());
+  torch::Tensor chunk_ptrs_tensor;
+  if (chunk_ptrs_npu.has_value() && chunk_ptrs_npu->defined() &&
+      chunk_ptrs_npu->numel() == num_chunks_i64) {
+    chunk_ptrs_tensor = *chunk_ptrs_npu;
+  } else {
+    std::vector<int64_t> chunk_ptrs_host(num_chunks_i64);
+    for (int64_t chunk_i = 0; chunk_i < num_chunks_i64; ++chunk_i) {
+      chunk_ptrs_host[chunk_i] = reinterpret_cast<int64_t>(
+          get_kernel_ptr<uint8_t, torch::Tensor>(lmc_tensors[chunk_i]));
+    }
+    auto npu_options = slot_mapping_full.options();
+    chunk_ptrs_tensor =
+        torch::tensor(chunk_ptrs_host, npu_options.dtype(at::ScalarType::Long));
+  }
+
+  validate_dense_direct_inputs(slot_mapping_full, chunk_ptrs_tensor,
+                               chunk_offsets_npu, chunk_sizes_npu,
+                               total_tokens, fixed_chunk_size);
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      lmc_tensors[0], vllm_kv_caches, slot_mapping_full, direction,
+      token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
+      v_hidden_dims, dsa_hidden_dims);
+  config.dims.num_tokens = num_tokens;
+  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
+
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+  const int32_t num_chunks = static_cast<int32_t>(num_chunks_i64);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, chunk_ptrs_ptr, chunk_offsets_ptr,
+                        chunk_sizes_ptr, num_chunks, fixed_chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved, direction]() -> int {
+    launch_dense_multi_chunk_direct_kernel(
+        config, chunk_ptrs_ptr, chunk_offsets_ptr, chunk_sizes_ptr,
+        num_chunks, fixed_chunk_size_i, total_tokens_i, lmc_host_interleaved,
+        direction);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void dense_mla_dsa_batched_direct_kv_transfer_fast(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_full,
+    torch::Tensor &chunk_ptrs_npu, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, const int64_t total_tokens,
+    const bool lmc_host_interleaved, const bool direction,
+    const bool validate_inputs,
+    const int64_t fixed_chunk_size) {
+  if (validate_inputs) {
+    validate_dense_direct_inputs(slot_mapping_full, chunk_ptrs_npu,
+                                 chunk_offsets_npu, chunk_sizes_npu,
+                                 total_tokens, fixed_chunk_size);
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+
+  SingleLayerKVConfig config = layer_state.config;
+  config.dims.num_tokens = num_tokens;
+  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
+  config.ptrs.slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
+
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, chunk_ptrs_ptr, chunk_offsets_ptr,
+                        chunk_sizes_ptr, num_chunks, fixed_chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved, direction]() -> int {
+    launch_dense_multi_chunk_direct_kernel(
+        config, chunk_ptrs_ptr, chunk_offsets_ptr, chunk_sizes_ptr,
+        num_chunks, fixed_chunk_size_i, total_tokens_i, lmc_host_interleaved,
+        direction);
     return 0;
   });
   cmd.Run();

@@ -26,6 +26,8 @@ from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_sparse_single_layer_kv_transfer,
     batched_fused_single_layer_kv_transfer,
+    dense_mla_dsa_batched_direct_kv_transfer,
+    dense_mla_dsa_batched_direct_kv_transfer_fast,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
     sparse_mla_dsa_batched_direct_kv_transfer_fast,
@@ -55,6 +57,19 @@ _SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS = os.getenv(
 _SPARSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_DISABLE = os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_LOAD_DISABLE = (
+    _DENSE_DIRECT_DISABLE
+    or os.getenv("LMCACHE_ASCEND_DENSE_DIRECT_LOAD_DISABLE", "0").lower()
+    in ("1", "true", "yes", "on")
+)
+_DENSE_DIRECT_STORE_DISABLE = (
+    _DENSE_DIRECT_DISABLE
+    or os.getenv("LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0").lower()
+    in ("1", "true", "yes", "on")
+)
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
@@ -1383,6 +1398,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.kv_device = layout.kv_device
         self.gpu_buffer_allocator = layout.gpu_buffer_allocator
 
+    def _lazy_initialize_buffer_with_staging(
+        self,
+        kv_caches,
+        *,
+        kv_group: int,
+        init_staging: bool,
+    ) -> _GroupLayout:
+        try:
+            return self._lazy_initialize_buffer(
+                kv_caches,
+                kv_group=kv_group,
+                init_staging=init_staging,
+            )
+        except TypeError as exc:
+            if "init_staging" not in str(exc):
+                raise
+            return self._lazy_initialize_buffer(kv_caches, kv_group=kv_group)
+
     def _sparse_total_tokens_from_layer_chunks(
         self,
         layer_tensors: List[torch.Tensor],
@@ -1510,6 +1543,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _stream_context_or_null(stream):
         if stream is None or not hasattr(stream, "device"):
             return nullcontext()
+        stream_device = getattr(stream, "device", None)
+        if getattr(stream_device, "type", None) == "npu" and hasattr(torch, "npu"):
+            return torch.npu.stream(stream)
         return torch.cuda.stream(stream)
 
     @staticmethod
@@ -2557,6 +2593,267 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             cached_chunk_ptrs_npu[layer_id] = chunk_ptrs_npu
         return chunk_ptrs_npu
 
+    def _validate_dense_direct_chunk_metadata(
+        self,
+        chunk_offsets: List[int],
+        chunk_sizes: List[int],
+        *,
+        total_tokens: int,
+        kv_group: int,
+    ) -> None:
+        if not chunk_offsets or not chunk_sizes:
+            raise ValueError(
+                "Dense direct layerwise transfer requires at least one CPU chunk."
+            )
+        if len(chunk_offsets) != len(chunk_sizes):
+            raise ValueError(
+                "Dense direct layerwise transfer chunk metadata mismatch: "
+                f"offsets={len(chunk_offsets)} sizes={len(chunk_sizes)}"
+            )
+        if chunk_offsets[0] != 0:
+            raise ValueError(
+                "Dense direct layerwise transfer chunk offsets must start at 0: "
+                f"kv_group={kv_group} first_offset={chunk_offsets[0]}"
+            )
+        expected_offset = 0
+        for chunk_idx, (offset, size) in enumerate(
+            zip(chunk_offsets, chunk_sizes, strict=False)
+        ):
+            if size <= 0:
+                raise ValueError(
+                    "Dense direct layerwise transfer chunk size must be positive: "
+                    f"kv_group={kv_group} chunk_idx={chunk_idx} size={size}"
+                )
+            if offset != expected_offset:
+                raise ValueError(
+                    "Dense direct layerwise transfer chunks must be contiguous: "
+                    f"kv_group={kv_group} chunk_idx={chunk_idx} "
+                    f"offset={offset} expected={expected_offset}"
+                )
+            expected_offset += size
+        if expected_offset != int(total_tokens):
+            raise ValueError(
+                "Dense direct layerwise transfer chunk metadata does not cover "
+                f"the slot mapping: kv_group={kv_group} "
+                f"covered_tokens={expected_offset} total_tokens={total_tokens}"
+            )
+
+    def _dense_direct_chunk_metadata_tensors(
+        self,
+        chunk_offsets: List[int],
+        chunk_sizes: List[int],
+        *,
+        total_tokens: int,
+        kv_group: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_dense_direct_chunk_metadata(
+            chunk_offsets,
+            chunk_sizes,
+            total_tokens=total_tokens,
+            kv_group=kv_group,
+        )
+        return (
+            torch.tensor(chunk_offsets, dtype=torch.int32, device=self.kv_device),
+            torch.tensor(chunk_sizes, dtype=torch.int32, device=self.kv_device),
+        )
+
+    def _dense_direct_dummy_metadata_tensor(self) -> torch.Tensor:
+        dummy = getattr(self, "_dense_direct_dummy_metadata_npu", None)
+        if (
+            dummy is None
+            or dummy.dtype != torch.int32
+            or dummy.device != torch.device(self.kv_device)
+        ):
+            dummy = torch.empty(1, dtype=torch.int32, device=self.kv_device)
+            self._dense_direct_dummy_metadata_npu = dummy
+        return dummy
+
+    @staticmethod
+    def _dense_direct_fixed_chunk_size(
+        chunk_offsets: List[int],
+        chunk_sizes: List[int],
+    ) -> int:
+        if (
+            not chunk_offsets
+            or not chunk_sizes
+            or len(chunk_offsets) != len(chunk_sizes)
+        ):
+            return 0
+        fixed_chunk_size = int(chunk_sizes[0])
+        if fixed_chunk_size <= 0:
+            return 0
+        for chunk_idx, (offset, size) in enumerate(
+            zip(chunk_offsets, chunk_sizes, strict=False)
+        ):
+            if int(offset) != chunk_idx * fixed_chunk_size:
+                return 0
+            if chunk_idx + 1 < len(chunk_sizes):
+                if int(size) != fixed_chunk_size:
+                    return 0
+            elif int(size) <= 0 or int(size) > fixed_chunk_size:
+                return 0
+        return fixed_chunk_size
+
+    @staticmethod
+    def _dense_direct_pointer_cache_signature(
+        *,
+        chunk_ptrs_npu: torch.Tensor,
+        chunk_offsets_npu: torch.Tensor,
+        chunk_sizes_npu: torch.Tensor,
+        slot_mapping_ref: torch.Tensor,
+        source_layout_ref: Optional[torch.Tensor],
+        total_tokens: int,
+        fixed_chunk_size: int,
+        dense_kv_format: int,
+        dense_token_major: bool,
+        dense_vllm_two_major: bool,
+        dense_k_hidden_dims: int,
+        dense_v_hidden_dims: int,
+        dense_dsa_hidden_dims: int,
+    ) -> tuple:
+        return (
+            3,
+            VLLMPagedMemLayerwiseNPUConnector._tensor_layout_signature(
+                source_layout_ref
+            ),
+            chunk_ptrs_npu.dtype,
+            str(chunk_ptrs_npu.device),
+            int(chunk_ptrs_npu.numel()),
+            chunk_offsets_npu.dtype,
+            str(chunk_offsets_npu.device),
+            int(chunk_offsets_npu.numel()),
+            chunk_sizes_npu.dtype,
+            str(chunk_sizes_npu.device),
+            int(chunk_sizes_npu.numel()),
+            slot_mapping_ref.dtype,
+            str(slot_mapping_ref.device),
+            int(slot_mapping_ref.numel()),
+            int(total_tokens),
+            int(fixed_chunk_size),
+            int(dense_kv_format),
+            int(dense_token_major),
+            int(dense_vllm_two_major),
+            int(dense_k_hidden_dims),
+            int(dense_v_hidden_dims),
+            int(dense_dsa_hidden_dims),
+        )
+
+    def _run_dense_direct_kv_transfer_layer(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        transfer_stream,
+        current_stream,
+        slot_mapping_full: torch.Tensor,
+        chunk_ptrs_npu: torch.Tensor,
+        chunk_offsets_npu: torch.Tensor,
+        chunk_sizes_npu: torch.Tensor,
+        total_tokens: int,
+        fixed_chunk_size: int,
+        dense_kv_format: int,
+        dense_token_major: bool,
+        dense_vllm_two_major: bool,
+        dense_k_hidden_dims: int,
+        dense_v_hidden_dims: int,
+        dense_dsa_hidden_dims: int,
+        dense_host_interleaved: bool,
+        layer_tensors: List[torch.Tensor],
+        direction: bool,
+    ) -> None:
+        num_tokens = int(slot_mapping_full.numel())
+        if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
+            return
+
+        if _SPARSE_DIRECT_RECORD_STREAM:
+            for tensor in (
+                slot_mapping_full,
+                chunk_ptrs_npu,
+                chunk_offsets_npu,
+                chunk_sizes_npu,
+            ):
+                try:
+                    tensor.record_stream(transfer_stream)
+                except RuntimeError:
+                    pass
+
+        source_signature = self._dense_direct_pointer_cache_signature(
+            chunk_ptrs_npu=chunk_ptrs_npu,
+            chunk_offsets_npu=chunk_offsets_npu,
+            chunk_sizes_npu=chunk_sizes_npu,
+            slot_mapping_ref=slot_mapping_full,
+            source_layout_ref=layer_tensors[0] if layer_tensors else None,
+            total_tokens=total_tokens,
+            fixed_chunk_size=fixed_chunk_size,
+            dense_kv_format=dense_kv_format,
+            dense_token_major=dense_token_major,
+            dense_vllm_two_major=dense_vllm_two_major,
+            dense_k_hidden_dims=dense_k_hidden_dims,
+            dense_v_hidden_dims=dense_v_hidden_dims,
+            dense_dsa_hidden_dims=dense_dsa_hidden_dims,
+        )
+        layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
+            kvcaches_ref=kvcaches_ref,
+            kv_group=kv_group,
+            layer_id=layer_id,
+            layer_tensors=layer_tensors,
+            slot_mapping_ref=slot_mapping_full,
+            total_tokens=total_tokens,
+            sparse_kv_format=dense_kv_format,
+            sparse_token_major=dense_token_major,
+            sparse_vllm_two_major=dense_vllm_two_major,
+            sparse_k_hidden_dims=dense_k_hidden_dims,
+            sparse_v_hidden_dims=dense_v_hidden_dims,
+            sparse_dsa_hidden_dims=dense_dsa_hidden_dims,
+            source_signature=source_signature,
+            return_key=True,
+        )
+        if validate_key is None:
+            validate_key = ("dense", kv_group, layer_id)
+
+        with self._stream_context_or_null(transfer_stream):
+            transfer_stream.wait_stream(current_stream)
+            if layer_state is not None:
+                validate_inputs = (
+                    validate_key not in self._sparse_direct_validated_layers
+                )
+                dense_mla_dsa_batched_direct_kv_transfer_fast(
+                    layer_state,
+                    slot_mapping_full,
+                    chunk_ptrs_npu,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    total_tokens,
+                    dense_host_interleaved,
+                    direction,
+                    validate_inputs=validate_inputs,
+                    fixed_chunk_size=fixed_chunk_size,
+                )
+                if validate_inputs:
+                    self._sparse_direct_validated_layers.add(validate_key)
+            else:
+                dense_mla_dsa_batched_direct_kv_transfer(
+                    layer_tensors,
+                    kvcaches_ref[layer_id],
+                    slot_mapping_full,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    total_tokens,
+                    dense_kv_format,
+                    dense_token_major,
+                    dense_vllm_two_major,
+                    dense_k_hidden_dims,
+                    dense_v_hidden_dims,
+                    dense_dsa_hidden_dims,
+                    dense_host_interleaved,
+                    direction,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    fixed_chunk_size=fixed_chunk_size,
+                )
+
+        current_stream.wait_stream(transfer_stream)
+
     def _single_layer_hidden_dim_args(
         self, kv_group: Optional[int] = None
     ) -> tuple[int, int, int]:
@@ -2857,7 +3154,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.gpu_buffer_allocator = layout.gpu_buffer_allocator
 
     def _lazy_initialize_buffer(
-        self, kv_caches, kv_group: int = 0
+        self,
+        kv_caches,
+        kv_group: int = 0,
+        init_staging: Optional[bool] = None,
     ) -> _GroupLayout:
         """
         Lazily initialize per-kv_group format metadata and GPU buffer allocator.
@@ -2867,6 +3167,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         and allocated independently on its first call instead of the first
         group pinning a single ``self.kv_format`` for both.
         """
+        if init_staging is None:
+            init_staging = self.use_gpu
+
         self._current_kv_group = kv_group
         layout = self._group_layouts.get(kv_group)
         if layout is None:
@@ -2972,7 +3275,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # Mirror into instance attributes for backward-compatible readers.
         self._mirror_layout(layout)
 
-        if self.use_gpu and layout.gpu_buffer_allocator is None:
+        if init_staging and layout.gpu_buffer_allocator is None:
             logger.info(
                 f"Lazily initializing GPU buffer (kv_group={kv_group})."
             )
@@ -3123,12 +3426,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sync: bool = kwargs["sync"]
 
         kv_group = kwargs.get("kv_group", 0)
-        layout = self._lazy_initialize_buffer(self.kvcaches, kv_group=kv_group)
+        layout = self._lazy_initialize_buffer_with_staging(
+            self.kvcaches,
+            kv_group=kv_group,
+            init_staging=False,
+        )
+        dense_direct = (
+            self._is_mla_dsa_format(kv_group)
+            and not _DENSE_DIRECT_LOAD_DISABLE
+        )
 
-        if self._is_mla_dsa_format(kv_group) and not self.use_gpu:
-            raise ValueError(
-                "MLA/DSA layerwise transfer requires use_gpu=True with a staging buffer."
-            )
+        if not dense_direct:
+            if self._is_mla_dsa_format(kv_group) and not self.use_gpu:
+                raise ValueError(
+                    "MLA/DSA layerwise transfer requires use_gpu=True with a "
+                    "staging buffer when dense direct load is disabled."
+                )
+            if self.use_gpu and layout.gpu_buffer_allocator is None:
+                layout = self._lazy_initialize_buffer_with_staging(
+                    self.kvcaches,
+                    kv_group=kv_group,
+                    init_staging=True,
+                )
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -3138,7 +3457,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
-        self._check_staging_transfer_tokens(num_tokens, kv_group)
+        if not dense_direct:
+            self._check_staging_transfer_tokens(num_tokens, kv_group)
         self._check_layerwise_transfer_invariants(
             operation="retrieve",
             kv_group=kv_group,
@@ -3169,10 +3489,38 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
+        dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        chunk_offsets_npu: Optional[torch.Tensor] = None
+        chunk_sizes_npu: Optional[torch.Tensor] = None
+        dense_fixed_chunk_size = 0
+        if dense_direct:
+            self._validate_dense_direct_chunk_metadata(
+                chunk_offsets,
+                chunk_sizes,
+                total_tokens=num_tokens,
+                kv_group=kv_group,
+            )
+            dense_fixed_chunk_size = self._dense_direct_fixed_chunk_size(
+                chunk_offsets,
+                chunk_sizes,
+            )
+            if dense_fixed_chunk_size > 0:
+                dummy_metadata_npu = self._dense_direct_dummy_metadata_tensor()
+                chunk_offsets_npu = dummy_metadata_npu
+                chunk_sizes_npu = dummy_metadata_npu
+            else:
+                chunk_offsets_npu, chunk_sizes_npu = (
+                    self._dense_direct_chunk_metadata_tensors(
+                        chunk_offsets,
+                        chunk_sizes,
+                        total_tokens=num_tokens,
+                        kv_group=kv_group,
+                    )
+                )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
-        if self.use_gpu:
+        if self.use_gpu and not dense_direct:
             tmp_gpu_buffer_obj, staging_tensor = self._allocate_layerwise_staging_buffer(
                 num_tokens=num_tokens,
                 kv_group=kv_group,
@@ -3193,46 +3541,66 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if layer_id > 0 and logger.isEnabledFor(10):
                 logger.debug("Finished loading layer %d", layer_id - 1)
             # memobj -> gpu_buffer -> kvcaches
-            with torch.cuda.stream(self.load_stream):
-                if self.use_gpu:
-                    cpu_tensors = []
-                    for memory_obj in memory_objs_layer:
-                        assert memory_obj.tensor is not None
-                        if memory_obj.metadata.fmt != expected_fmt:
-                            raise ValueError(
-                                f"Expected memory format {expected_fmt}, "
-                                f"got {memory_obj.metadata.fmt}."
-                            )
-                        cpu_tensors.append(memory_obj.tensor)
+            if dense_direct:
+                cpu_tensors = []
+                for memory_obj in memory_objs_layer:
+                    assert memory_obj.tensor is not None
+                    if memory_obj.metadata.fmt != expected_fmt:
+                        raise ValueError(
+                            f"Expected memory format {expected_fmt}, "
+                            f"got {memory_obj.metadata.fmt}."
+                        )
+                    cpu_tensors.append(memory_obj.tensor)
+                chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                    layer_id,
+                    cpu_tensors,
+                )
+                assert chunk_offsets_npu is not None
+                assert chunk_sizes_npu is not None
+                self._run_dense_direct_kv_transfer_layer(
+                    kvcaches_ref=kvcaches_snapshot,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    transfer_stream=self.load_stream,
+                    current_stream=current_stream,
+                    slot_mapping_full=slot_mapping_full,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    chunk_offsets_npu=chunk_offsets_npu,
+                    chunk_sizes_npu=chunk_sizes_npu,
+                    total_tokens=num_tokens,
+                    fixed_chunk_size=dense_fixed_chunk_size,
+                    dense_kv_format=kv_format_value,
+                    dense_token_major=token_major,
+                    dense_vllm_two_major=vllm_two_major,
+                    dense_k_hidden_dims=k_hidden_dims,
+                    dense_v_hidden_dims=v_hidden_dims,
+                    dense_dsa_hidden_dims=dsa_hidden_dims,
+                    dense_host_interleaved=dense_host_interleaved,
+                    layer_tensors=cpu_tensors,
+                    direction=False,
+                )
+            else:
+                with torch.cuda.stream(self.load_stream):
+                    if self.use_gpu:
+                        cpu_tensors = []
+                        for memory_obj in memory_objs_layer:
+                            assert memory_obj.tensor is not None
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                            cpu_tensors.append(memory_obj.tensor)
 
-                    # Fused transfer: N H2D memcpy + 1 scatter kernel
-                    batched_fused_single_layer_kv_transfer(
-                        cpu_tensors,  # CPU memory objects
-                        staging_tensor,  # GPU staging buffer
-                        kvcaches_snapshot[layer_id],
-                        slot_mapping_full,
-                        chunk_offsets,  # offset for each chunk
-                        chunk_sizes,  # size for each chunk
-                        False,  # to_gpu
-                        kv_format_value,
-                        token_major,
-                        vllm_two_major,
-                        k_hidden_dims,
-                        v_hidden_dims,
-                        dsa_hidden_dims,
-                    )
-
-                else:
-                    for start, end, memory_obj in zip(
-                        starts, ends, memory_objs_layer, strict=False
-                    ):
-                        assert memory_obj.tensor is not None
-
-                        lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
+                        # Fused transfer: N H2D memcpy + 1 scatter kernel
+                        batched_fused_single_layer_kv_transfer(
+                            cpu_tensors,  # CPU memory objects
+                            staging_tensor,  # GPU staging buffer
                             kvcaches_snapshot[layer_id],
-                            slot_mapping[start:end],
-                            False,
+                            slot_mapping_full,
+                            chunk_offsets,  # offset for each chunk
+                            chunk_sizes,  # size for each chunk
+                            False,  # to_gpu
                             kv_format_value,
                             token_major,
                             vllm_two_major,
@@ -3240,8 +3608,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             v_hidden_dims,
                             dsa_hidden_dims,
                         )
-                if logger.isEnabledFor(10):
-                    logger.debug("Finished loading layer %d", layer_id)
+
+                    else:
+                        for start, end, memory_obj in zip(
+                            starts, ends, memory_objs_layer, strict=False
+                        ):
+                            assert memory_obj.tensor is not None
+
+                            lmc_ops.single_layer_kv_transfer(
+                                memory_obj.tensor,
+                                kvcaches_snapshot[layer_id],
+                                slot_mapping[start:end],
+                                False,
+                                kv_format_value,
+                                token_major,
+                                vllm_two_major,
+                                k_hidden_dims,
+                                v_hidden_dims,
+                                dsa_hidden_dims,
+                            )
+                    if logger.isEnabledFor(10):
+                        logger.debug("Finished loading layer %d", layer_id)
+                continue
+            if logger.isEnabledFor(10):
+                logger.debug("Finished loading layer %d", layer_id)
         yield
 
         # synchronize the last layer
@@ -3265,7 +3655,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
         kv_group = kwargs.get("kv_group", 0)
-        layout = self._lazy_initialize_buffer(self.kvcaches, kv_group=kv_group)
+        layout = self._lazy_initialize_buffer_with_staging(
+            self.kvcaches,
+            kv_group=kv_group,
+            init_staging=_SPARSE_DIRECT_DISABLE,
+        )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -3520,12 +3914,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sync: bool = kwargs["sync"]
 
         kv_group = kwargs.get("kv_group", 0)
-        layout = self._lazy_initialize_buffer(self.kvcaches, kv_group=kv_group)
+        layout = self._lazy_initialize_buffer_with_staging(
+            self.kvcaches,
+            kv_group=kv_group,
+            init_staging=False,
+        )
+        dense_direct = (
+            self._is_mla_dsa_format(kv_group)
+            and not _DENSE_DIRECT_STORE_DISABLE
+        )
 
-        if self._is_mla_dsa_format(kv_group) and not self.use_gpu:
-            raise ValueError(
-                "MLA/DSA layerwise transfer requires use_gpu=True with a staging buffer."
-            )
+        if not dense_direct:
+            if self._is_mla_dsa_format(kv_group) and not self.use_gpu:
+                raise ValueError(
+                    "MLA/DSA layerwise transfer requires use_gpu=True with a "
+                    "staging buffer when dense direct store is disabled."
+                )
+            if self.use_gpu and layout.gpu_buffer_allocator is None:
+                layout = self._lazy_initialize_buffer_with_staging(
+                    self.kvcaches,
+                    kv_group=kv_group,
+                    init_staging=True,
+                )
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -3534,7 +3944,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
-        self._check_staging_transfer_tokens(num_tokens, kv_group)
+        if not dense_direct:
+            self._check_staging_transfer_tokens(num_tokens, kv_group)
         self._check_layerwise_transfer_invariants(
             operation="store",
             kv_group=kv_group,
@@ -3565,6 +3976,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
+        dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        chunk_offsets_npu: Optional[torch.Tensor] = None
+        chunk_sizes_npu: Optional[torch.Tensor] = None
+        dense_fixed_chunk_size = 0
+        if dense_direct:
+            self._validate_dense_direct_chunk_metadata(
+                chunk_offsets,
+                chunk_sizes,
+                total_tokens=num_tokens,
+                kv_group=kv_group,
+            )
+            dense_fixed_chunk_size = self._dense_direct_fixed_chunk_size(
+                chunk_offsets,
+                chunk_sizes,
+            )
+            if dense_fixed_chunk_size > 0:
+                dummy_metadata_npu = self._dense_direct_dummy_metadata_tensor()
+                chunk_offsets_npu = dummy_metadata_npu
+                chunk_sizes_npu = dummy_metadata_npu
+            else:
+                chunk_offsets_npu, chunk_sizes_npu = (
+                    self._dense_direct_chunk_metadata_tensors(
+                        chunk_offsets,
+                        chunk_sizes,
+                        total_tokens=num_tokens,
+                        kv_group=kv_group,
+                    )
+                )
         if len(memory_objs) != self.num_layers:
             logger.error(
                 "NPU layerwise store received wrong memory object layer count: "
@@ -3599,7 +4038,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
-        if self.use_gpu:
+        if self.use_gpu and not dense_direct:
             tmp_gpu_buffer_obj, staging_tensor = self._allocate_layerwise_staging_buffer(
                 num_tokens=num_tokens,
                 kv_group=kv_group,
@@ -3616,41 +4055,63 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for layer_id in range(self.num_layers):
                 memory_objs_layer = memory_objs[layer_id]
                 # kvcaches -> gpu_buffer -> memobj
-                with torch.npu.stream(self.store_stream):
-                    self.store_stream.wait_stream(current_stream)
-                    if self.use_gpu:
-                        cpu_tensors = []
-                        for memory_obj in memory_objs_layer:
-                            assert memory_obj.tensor is not None
-                            cpu_tensors.append(memory_obj.tensor)
+                if dense_direct:
+                    cpu_tensors = []
+                    for memory_obj in memory_objs_layer:
+                        assert memory_obj.tensor is not None
+                        if memory_obj.metadata.fmt != expected_fmt:
+                            raise ValueError(
+                                f"Expected memory format {expected_fmt}, "
+                                f"got {memory_obj.metadata.fmt}."
+                            )
+                        cpu_tensors.append(memory_obj.tensor)
+                    chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                        layer_id,
+                        cpu_tensors,
+                    )
+                    assert chunk_offsets_npu is not None
+                    assert chunk_sizes_npu is not None
+                    self._run_dense_direct_kv_transfer_layer(
+                        kvcaches_ref=kvcaches_snapshot,
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        transfer_stream=self.store_stream,
+                        current_stream=current_stream,
+                        slot_mapping_full=slot_mapping_full,
+                        chunk_ptrs_npu=chunk_ptrs_npu,
+                        chunk_offsets_npu=chunk_offsets_npu,
+                        chunk_sizes_npu=chunk_sizes_npu,
+                        total_tokens=num_tokens,
+                        fixed_chunk_size=dense_fixed_chunk_size,
+                        dense_kv_format=kv_format_value,
+                        dense_token_major=token_major,
+                        dense_vllm_two_major=vllm_two_major,
+                        dense_k_hidden_dims=k_hidden_dims,
+                        dense_v_hidden_dims=v_hidden_dims,
+                        dense_dsa_hidden_dims=dsa_hidden_dims,
+                        dense_host_interleaved=dense_host_interleaved,
+                        layer_tensors=cpu_tensors,
+                        direction=True,
+                    )
+                    logger.debug("Finished offloading layer %d", layer_id)
+                else:
+                    with torch.npu.stream(self.store_stream):
+                        self.store_stream.wait_stream(current_stream)
+                        if self.use_gpu:
+                            cpu_tensors = []
+                            for memory_obj in memory_objs_layer:
+                                assert memory_obj.tensor is not None
+                                cpu_tensors.append(memory_obj.tensor)
 
-                        # Fused transfer: 1 scatter kernel + N D2H memcpy
-                        batched_fused_single_layer_kv_transfer(
-                            cpu_tensors,
-                            staging_tensor,
-                            kvcaches_snapshot[layer_id],
-                            slot_mapping_full,
-                            chunk_offsets,
-                            chunk_sizes,
-                            True,  # from_gpu
-                            kv_format_value,
-                            token_major,
-                            vllm_two_major,
-                            k_hidden_dims,
-                            v_hidden_dims,
-                            dsa_hidden_dims,
-                        )
-                    else:
-                        for start, end, memory_obj in zip(
-                            starts, ends, memory_objs_layer, strict=False
-                        ):
-                            assert memory_obj.tensor is not None
-
-                            lmc_ops.single_layer_kv_transfer(
-                                memory_obj.tensor,
+                            # Fused transfer: 1 scatter kernel + N D2H memcpy
+                            batched_fused_single_layer_kv_transfer(
+                                cpu_tensors,
+                                staging_tensor,
                                 kvcaches_snapshot[layer_id],
-                                slot_mapping[start:end],
-                                True,
+                                slot_mapping_full,
+                                chunk_offsets,
+                                chunk_sizes,
+                                True,  # from_gpu
                                 kv_format_value,
                                 token_major,
                                 vllm_two_major,
@@ -3658,7 +4119,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 v_hidden_dims,
                                 dsa_hidden_dims,
                             )
-                    logger.debug("Finished offloading layer %d", layer_id)
+                        else:
+                            for start, end, memory_obj in zip(
+                                starts, ends, memory_objs_layer, strict=False
+                            ):
+                                assert memory_obj.tensor is not None
+
+                                lmc_ops.single_layer_kv_transfer(
+                                    memory_obj.tensor,
+                                    kvcaches_snapshot[layer_id],
+                                    slot_mapping[start:end],
+                                    True,
+                                    kv_format_value,
+                                    token_major,
+                                    vllm_two_major,
+                                    k_hidden_dims,
+                                    v_hidden_dims,
+                                    dsa_hidden_dims,
+                                )
+                        logger.debug("Finished offloading layer %d", layer_id)
                 yield
 
                 # store_layer publishes the CPU MemoryObjs immediately after the

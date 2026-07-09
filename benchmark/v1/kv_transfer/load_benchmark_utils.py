@@ -38,6 +38,8 @@ import torch
 # First Party
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
+    dense_mla_dsa_batched_direct_kv_transfer,
+    dense_mla_dsa_batched_direct_kv_transfer_fast,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
     sparse_mla_dsa_batched_direct_kv_transfer_fast,
@@ -48,6 +50,12 @@ KV_FORMAT_DSA = 4
 KV_FORMAT_MLA_LATENT = 5
 KV_FORMAT_DSA_INDEX = 6
 ALIGN_BYTES = 4096
+KV_FORMAT_BY_NAME = {
+    "mla": KV_FORMAT_MLA,
+    "dsa": KV_FORMAT_DSA,
+    "mla_latent": KV_FORMAT_MLA_LATENT,
+    "dsa_index": KV_FORMAT_DSA_INDEX,
+}
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,7 @@ class TimingStats:
 
 @dataclass(frozen=True)
 class LoadBenchmarkCase:
+    direction: str
     format_name: str
     num_tokens: int
     chunk_size: int
@@ -126,8 +135,13 @@ class LoadBenchmarkHarness:
     dst_direct: List[Tuple[torch.Tensor, ...]]
     dst_direct_fast: List[Tuple[torch.Tensor, ...]]
     stacked_by_layer: List[List[torch.Tensor]]
+    expected_stacked_by_layer: List[List[torch.Tensor]]
     chunk_ptrs_by_layer: List[torch.Tensor]
+    chunk_offsets_npu: torch.Tensor
+    chunk_sizes_npu: torch.Tensor
+    fixed_chunk_size: int
     layer_states: list
+    store_layer_states: list
     slot_mapping_full: torch.Tensor
     slot_mapping_packed: torch.Tensor
     selected_token_idx: torch.Tensor
@@ -169,6 +183,13 @@ def format_bytes_short(num_bytes: int) -> str:
     return f"{num_bytes / 1e3:.3f} KB"
 
 
+def kv_format_from_name(fmt: str) -> int:
+    try:
+        return KV_FORMAT_BY_NAME[fmt]
+    except KeyError as exc:
+        raise ValueError(f"unsupported benchmark KV format: {fmt}") from exc
+
+
 def recommended_num_blocks(num_tokens: int, block_size: int, margin: int = 8) -> int:
     return (num_tokens + block_size - 1) // block_size + margin
 
@@ -186,11 +207,38 @@ def compute_chunk_partition(num_tokens: int, chunk_size: int) -> ChunkPartition:
     return ChunkPartition(chunk_sizes=chunk_sizes, chunk_offsets=offsets)
 
 
+def fixed_chunk_size_for_partition(partition: ChunkPartition) -> int:
+    if not partition.chunk_sizes:
+        return 0
+    fixed_chunk_size = int(partition.chunk_sizes[0])
+    if fixed_chunk_size <= 0:
+        return 0
+    for chunk_idx, (offset, size) in enumerate(
+        zip(partition.chunk_offsets, partition.chunk_sizes)
+    ):
+        if int(offset) != chunk_idx * fixed_chunk_size:
+            return 0
+        if chunk_idx + 1 < len(partition.chunk_sizes):
+            if int(size) != fixed_chunk_size:
+                return 0
+        elif int(size) <= 0 or int(size) > fixed_chunk_size:
+            return 0
+    return fixed_chunk_size
+
+
 def mla_dsa_dims_from_layer(
     layer: Tuple[torch.Tensor, ...],
     kv_format: int,
 ) -> MlaDsaDims:
     k_hidden = layer[0].shape[-2] * layer[0].shape[-1]
+    if kv_format == KV_FORMAT_DSA_INDEX:
+        return MlaDsaDims(
+            k_hidden_dims=k_hidden,
+            v_hidden_dims=0,
+            dsa_hidden_dims=k_hidden,
+            plane_elems=k_hidden,
+        )
+
     v_hidden = layer[1].shape[-2] * layer[1].shape[-1]
     dsa_hidden = 0
     if kv_format == KV_FORMAT_DSA:
@@ -399,6 +447,39 @@ def run_direct_load_layer(
     )
 
 
+def run_dense_direct_load_layer(
+    *,
+    stacked_cpu_chunks: Sequence[torch.Tensor],
+    dst_layer: Tuple[torch.Tensor, ...],
+    slot_mapping_full: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    dims: MlaDsaDims,
+    kv_format: int,
+    chunk_ptrs_npu: torch.Tensor,
+    fixed_chunk_size: int,
+) -> None:
+    dense_mla_dsa_batched_direct_kv_transfer(
+        list(stacked_cpu_chunks),
+        as_vllm_kv_caches(dst_layer),
+        slot_mapping_full,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        kv_format,
+        False,
+        False,
+        dims.k_hidden_dims,
+        dims.v_hidden_dims,
+        dims.dsa_hidden_dims,
+        lmc_host_interleaved_for_kv_format(kv_format),
+        False,
+        chunk_ptrs_npu,
+        fixed_chunk_size,
+    )
+
+
 def run_direct_fast_load_layer(
     *,
     layer_state,
@@ -418,6 +499,31 @@ def run_direct_fast_load_layer(
         total_tokens,
         lmc_host_interleaved_for_kv_format(kv_format),
         False,
+    )
+
+
+def run_dense_direct_fast_load_layer(
+    *,
+    layer_state,
+    slot_mapping_full: torch.Tensor,
+    chunk_ptrs_npu: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    kv_format: int,
+    fixed_chunk_size: int,
+) -> None:
+    dense_mla_dsa_batched_direct_kv_transfer_fast(
+        layer_state,
+        slot_mapping_full,
+        chunk_ptrs_npu,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        lmc_host_interleaved_for_kv_format(kv_format),
+        False,
+        False,
+        fixed_chunk_size,
     )
 
 
@@ -450,6 +556,42 @@ def time_npu_callable(
     )
 
 
+def rebuild_direct_fast_layer_states(h: LoadBenchmarkHarness) -> None:
+    h.layer_states = [
+        prepare_sparse_direct_layer_state(
+            h.stacked_by_layer[layer_id][0],
+            as_vllm_kv_caches(h.dst_direct_fast[layer_id]),
+            h.slot_mapping_full,
+            False,
+            False,
+            h.kv_format,
+            h.dims.k_hidden_dims,
+            h.dims.v_hidden_dims,
+            h.dims.dsa_hidden_dims,
+            h.num_tokens,
+        )
+        for layer_id in range(h.num_layers)
+    ]
+
+
+def rebuild_direct_fast_store_layer_states(h: LoadBenchmarkHarness) -> None:
+    h.store_layer_states = [
+        prepare_sparse_direct_layer_state(
+            h.stacked_by_layer[layer_id][0],
+            as_vllm_kv_caches(h.src_kv_cache[layer_id]),
+            h.slot_mapping_full,
+            False,
+            False,
+            h.kv_format,
+            h.dims.k_hidden_dims,
+            h.dims.v_hidden_dims,
+            h.dims.dsa_hidden_dims,
+            h.num_tokens,
+        )
+        for layer_id in range(h.num_layers)
+    ]
+
+
 def build_load_benchmark_harness(
     *,
     fmt: str,
@@ -462,9 +604,10 @@ def build_load_benchmark_harness(
 ) -> LoadBenchmarkHarness:
     device = src_kv_cache[0][0].device
     dtype = src_kv_cache[0][0].dtype
-    kv_format = KV_FORMAT_MLA if fmt == "mla" else KV_FORMAT_DSA
+    kv_format = kv_format_from_name(fmt)
     partition = compute_chunk_partition(num_tokens, chunk_size)
     dims = mla_dsa_dims_from_layer(src_kv_cache[0], kv_format)
+    fixed_chunk_size = fixed_chunk_size_for_partition(partition)
 
     page_buffer_size = src_kv_cache[0][0].shape[0] * src_kv_cache[0][0].shape[1]
     slot_mapping_full = torch.tensor(
@@ -481,13 +624,25 @@ def build_load_benchmark_harness(
     )
 
     staging_cache = torch.empty(num_tokens * dims.plane_elems, dtype=dtype, device=device)
+    if fixed_chunk_size > 0:
+        chunk_offsets_npu = torch.empty(1, dtype=torch.int32, device=device)
+        chunk_sizes_npu = torch.empty(1, dtype=torch.int32, device=device)
+    else:
+        chunk_offsets_npu = torch.tensor(
+            partition.chunk_offsets, dtype=torch.int32, device=device
+        )
+        chunk_sizes_npu = torch.tensor(
+            partition.chunk_sizes, dtype=torch.int32, device=device
+        )
     dst_staging = empty_paged_kv_cache_like(src_kv_cache)
     dst_direct = empty_paged_kv_cache_like(src_kv_cache)
     dst_direct_fast = empty_paged_kv_cache_like(src_kv_cache)
 
     stacked_by_layer: List[List[torch.Tensor]] = []
+    expected_stacked_by_layer: List[List[torch.Tensor]] = []
     chunk_ptrs_by_layer: List[torch.Tensor] = []
     layer_states = []
+    store_layer_states = []
     stacked_cpu_mem_objs: List[MemoryObj] = []
     pin_allocators: List[PinMemoryAllocator] = []
 
@@ -509,12 +664,27 @@ def build_load_benchmark_harness(
         )
         torch.npu.synchronize()
         stacked_by_layer.append(stacked)
+        expected_stacked_by_layer.append([chunk.detach().clone() for chunk in stacked])
         chunk_ptrs = build_chunk_ptrs_npu(stacked, device)
         chunk_ptrs_by_layer.append(chunk_ptrs)
         layer_states.append(
             prepare_sparse_direct_layer_state(
                 stacked[0],
                 as_vllm_kv_caches(dst_direct_fast[layer_id]),
+                slot_mapping_full,
+                False,
+                False,
+                kv_format,
+                dims.k_hidden_dims,
+                dims.v_hidden_dims,
+                dims.dsa_hidden_dims,
+                num_tokens,
+            )
+        )
+        store_layer_states.append(
+            prepare_sparse_direct_layer_state(
+                stacked[0],
+                as_vllm_kv_caches(src_kv_cache[layer_id]),
                 slot_mapping_full,
                 False,
                 False,
@@ -542,8 +712,13 @@ def build_load_benchmark_harness(
         dst_direct=dst_direct,
         dst_direct_fast=dst_direct_fast,
         stacked_by_layer=stacked_by_layer,
+        expected_stacked_by_layer=expected_stacked_by_layer,
         chunk_ptrs_by_layer=chunk_ptrs_by_layer,
+        chunk_offsets_npu=chunk_offsets_npu,
+        chunk_sizes_npu=chunk_sizes_npu,
+        fixed_chunk_size=fixed_chunk_size,
         layer_states=layer_states,
+        store_layer_states=store_layer_states,
         slot_mapping_full=slot_mapping_full,
         slot_mapping_packed=slot_mapping_packed,
         selected_token_idx=selected_token_idx,
@@ -567,30 +742,210 @@ def run_all_staging_layers(h: LoadBenchmarkHarness) -> None:
 
 def run_all_direct_layers(h: LoadBenchmarkHarness) -> None:
     for layer_id in range(h.num_layers):
-        run_direct_load_layer(
-            stacked_cpu_chunks=h.stacked_by_layer[layer_id],
-            dst_layer=h.dst_direct[layer_id],
-            slot_mapping_packed=h.slot_mapping_packed,
-            selected_token_idx=h.selected_token_idx,
-            chunk_size=h.chunk_size,
-            total_tokens=h.num_tokens,
-            dims=h.dims,
-            kv_format=h.kv_format,
-            chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
-        )
+        if h.dense_load:
+            run_dense_direct_load_layer(
+                stacked_cpu_chunks=h.stacked_by_layer[layer_id],
+                dst_layer=h.dst_direct[layer_id],
+                slot_mapping_full=h.slot_mapping_full,
+                chunk_offsets_npu=h.chunk_offsets_npu,
+                chunk_sizes_npu=h.chunk_sizes_npu,
+                total_tokens=h.num_tokens,
+                dims=h.dims,
+                kv_format=h.kv_format,
+                chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
+                fixed_chunk_size=h.fixed_chunk_size,
+            )
+        else:
+            run_direct_load_layer(
+                stacked_cpu_chunks=h.stacked_by_layer[layer_id],
+                dst_layer=h.dst_direct[layer_id],
+                slot_mapping_packed=h.slot_mapping_packed,
+                selected_token_idx=h.selected_token_idx,
+                chunk_size=h.chunk_size,
+                total_tokens=h.num_tokens,
+                dims=h.dims,
+                kv_format=h.kv_format,
+                chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
+            )
 
 
 def run_all_direct_fast_layers(h: LoadBenchmarkHarness) -> None:
     for layer_id in range(h.num_layers):
-        run_direct_fast_load_layer(
-            layer_state=h.layer_states[layer_id],
-            slot_mapping_packed=h.slot_mapping_packed,
-            selected_token_idx=h.selected_token_idx,
-            chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
-            chunk_size=h.chunk_size,
-            total_tokens=h.num_tokens,
+        if h.dense_load:
+            run_dense_direct_fast_load_layer(
+                layer_state=h.layer_states[layer_id],
+                slot_mapping_full=h.slot_mapping_full,
+                chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
+                chunk_offsets_npu=h.chunk_offsets_npu,
+                chunk_sizes_npu=h.chunk_sizes_npu,
+                total_tokens=h.num_tokens,
+                kv_format=h.kv_format,
+                fixed_chunk_size=h.fixed_chunk_size,
+            )
+        else:
+            run_direct_fast_load_layer(
+                layer_state=h.layer_states[layer_id],
+                slot_mapping_packed=h.slot_mapping_packed,
+                selected_token_idx=h.selected_token_idx,
+                chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
+                chunk_size=h.chunk_size,
+                total_tokens=h.num_tokens,
+                kv_format=h.kv_format,
+            )
+
+
+def run_staging_store_layer(
+    *,
+    stacked_cpu_chunks: Sequence[torch.Tensor],
+    src_layer: Tuple[torch.Tensor, ...],
+    staging_cache: torch.Tensor,
+    slot_mapping_full: torch.Tensor,
+    partition: ChunkPartition,
+    dims: MlaDsaDims,
+    kv_format: int,
+) -> None:
+    batched_fused_single_layer_kv_transfer(
+        list(stacked_cpu_chunks),
+        staging_cache,
+        as_vllm_kv_caches(src_layer),
+        slot_mapping_full,
+        partition.chunk_offsets,
+        partition.chunk_sizes,
+        True,
+        kv_format,
+        False,
+        False,
+        dims.k_hidden_dims,
+        dims.v_hidden_dims,
+        dims.dsa_hidden_dims,
+    )
+
+
+def run_dense_direct_store_layer(
+    *,
+    stacked_cpu_chunks: Sequence[torch.Tensor],
+    src_layer: Tuple[torch.Tensor, ...],
+    slot_mapping_full: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    dims: MlaDsaDims,
+    kv_format: int,
+    chunk_ptrs_npu: torch.Tensor,
+    fixed_chunk_size: int,
+) -> None:
+    dense_mla_dsa_batched_direct_kv_transfer(
+        list(stacked_cpu_chunks),
+        as_vllm_kv_caches(src_layer),
+        slot_mapping_full,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        kv_format,
+        False,
+        False,
+        dims.k_hidden_dims,
+        dims.v_hidden_dims,
+        dims.dsa_hidden_dims,
+        lmc_host_interleaved_for_kv_format(kv_format),
+        True,
+        chunk_ptrs_npu,
+        fixed_chunk_size,
+    )
+
+
+def run_dense_direct_fast_store_layer(
+    *,
+    layer_state,
+    slot_mapping_full: torch.Tensor,
+    chunk_ptrs_npu: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    kv_format: int,
+    fixed_chunk_size: int,
+) -> None:
+    dense_mla_dsa_batched_direct_kv_transfer_fast(
+        layer_state,
+        slot_mapping_full,
+        chunk_ptrs_npu,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        lmc_host_interleaved_for_kv_format(kv_format),
+        True,
+        False,
+        fixed_chunk_size,
+    )
+
+
+def run_all_staging_store_layers(h: LoadBenchmarkHarness) -> None:
+    for layer_id in range(h.num_layers):
+        run_staging_store_layer(
+            stacked_cpu_chunks=h.stacked_by_layer[layer_id],
+            src_layer=h.src_kv_cache[layer_id],
+            staging_cache=h.staging_cache,
+            slot_mapping_full=h.slot_mapping_full,
+            partition=h.partition,
+            dims=h.dims,
             kv_format=h.kv_format,
         )
+
+
+def run_all_direct_store_layers(h: LoadBenchmarkHarness) -> None:
+    for layer_id in range(h.num_layers):
+        run_dense_direct_store_layer(
+            stacked_cpu_chunks=h.stacked_by_layer[layer_id],
+            src_layer=h.src_kv_cache[layer_id],
+            slot_mapping_full=h.slot_mapping_full,
+            chunk_offsets_npu=h.chunk_offsets_npu,
+            chunk_sizes_npu=h.chunk_sizes_npu,
+            total_tokens=h.num_tokens,
+            dims=h.dims,
+            kv_format=h.kv_format,
+            chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
+            fixed_chunk_size=h.fixed_chunk_size,
+        )
+
+
+def run_all_direct_fast_store_layers(h: LoadBenchmarkHarness) -> None:
+    for layer_id in range(h.num_layers):
+        run_dense_direct_fast_store_layer(
+            layer_state=h.store_layer_states[layer_id],
+            slot_mapping_full=h.slot_mapping_full,
+            chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
+            chunk_offsets_npu=h.chunk_offsets_npu,
+            chunk_sizes_npu=h.chunk_sizes_npu,
+            total_tokens=h.num_tokens,
+            kv_format=h.kv_format,
+            fixed_chunk_size=h.fixed_chunk_size,
+        )
+
+
+def _fill_stacked_cpu_chunks(
+    h: LoadBenchmarkHarness,
+    value: float,
+) -> None:
+    for layer_chunks in h.stacked_by_layer:
+        for chunk in layer_chunks:
+            chunk.fill_(value)
+
+
+def _assert_stacked_cpu_chunks_equal(
+    h: LoadBenchmarkHarness,
+    *,
+    label: str,
+) -> None:
+    for layer_id, (actual_layer, expected_layer) in enumerate(
+        zip(h.stacked_by_layer, h.expected_stacked_by_layer, strict=False)
+    ):
+        for chunk_id, (actual, expected) in enumerate(
+            zip(actual_layer, expected_layer, strict=False)
+        ):
+            assert torch.equal(actual, expected), (
+                f"{label}: CPU chunk mismatch layer={layer_id} "
+                f"chunk={chunk_id}"
+            )
 
 
 def verify_load_benchmark_harness(
@@ -615,17 +970,32 @@ def verify_load_benchmark_harness(
     check_fn(
         h.src_kv_cache,
         h.dst_direct,
-        h.slot_mapping_packed,
+        h.slot_mapping_full if h.dense_load else h.slot_mapping_packed,
         label="direct",
         **check_kwargs,
     )
     check_fn(
         h.src_kv_cache,
         h.dst_direct_fast,
-        h.slot_mapping_packed,
+        h.slot_mapping_full if h.dense_load else h.slot_mapping_packed,
         label="direct_fast",
         **check_kwargs,
     )
+
+
+def verify_store_benchmark_harness(h: LoadBenchmarkHarness) -> None:
+    if not h.dense_load:
+        raise ValueError("store benchmark verification only supports dense transfer")
+
+    for label, fn in (
+        ("staging_store", run_all_staging_store_layers),
+        ("direct_store", run_all_direct_store_layers),
+        ("direct_fast_store", run_all_direct_fast_store_layers),
+    ):
+        _fill_stacked_cpu_chunks(h, -17.0)
+        fn(h)
+        torch.npu.synchronize()
+        _assert_stacked_cpu_chunks_equal(h, label=label)
 
 
 def benchmark_load_harness(
@@ -638,6 +1008,7 @@ def benchmark_load_harness(
     h.dst_staging = empty_paged_kv_cache_like(h.src_kv_cache)
     h.dst_direct = empty_paged_kv_cache_like(h.src_kv_cache)
     h.dst_direct_fast = empty_paged_kv_cache_like(h.src_kv_cache)
+    rebuild_direct_fast_layer_states(h)
 
     staging_stats = time_npu_callable(
         lambda: run_all_staging_layers(h), warmup=warmup, iters=iters
@@ -656,12 +1027,55 @@ def benchmark_load_harness(
         element_size=h.dtype.itemsize,
     )
     return LoadBenchmarkCase(
+        direction="load",
         format_name=h.fmt,
         num_tokens=h.num_tokens,
         chunk_size=h.chunk_size,
         num_layers=h.num_layers,
         num_chunks=h.partition.num_chunks,
         num_selected=h.num_selected,
+        host_bytes_moved=host_bytes,
+        staging_median_ms=staging_stats.median_ms,
+        direct_median_ms=direct_stats.median_ms,
+        direct_min_ms=direct_stats.min_ms,
+        direct_fast_median_ms=direct_fast_stats.median_ms,
+    )
+
+
+def benchmark_store_harness(
+    h: LoadBenchmarkHarness,
+    *,
+    warmup: int,
+    iters: int,
+) -> LoadBenchmarkCase:
+    if not h.dense_load:
+        raise ValueError("store benchmark only supports dense transfer")
+
+    rebuild_direct_fast_store_layer_states(h)
+    staging_stats = time_npu_callable(
+        lambda: run_all_staging_store_layers(h), warmup=warmup, iters=iters
+    )
+    direct_stats = time_npu_callable(
+        lambda: run_all_direct_store_layers(h), warmup=warmup, iters=iters
+    )
+    direct_fast_stats = time_npu_callable(
+        lambda: run_all_direct_fast_store_layers(h), warmup=warmup, iters=iters
+    )
+
+    host_bytes = compute_direct_host_bytes(
+        num_selected=h.num_tokens,
+        num_layers=h.num_layers,
+        plane_elems=h.dims.plane_elems,
+        element_size=h.dtype.itemsize,
+    )
+    return LoadBenchmarkCase(
+        direction="store",
+        format_name=h.fmt,
+        num_tokens=h.num_tokens,
+        chunk_size=h.chunk_size,
+        num_layers=h.num_layers,
+        num_chunks=h.partition.num_chunks,
+        num_selected=h.num_tokens,
         host_bytes_moved=host_bytes,
         staging_median_ms=staging_stats.median_ms,
         direct_median_ms=direct_stats.median_ms,

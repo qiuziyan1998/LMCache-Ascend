@@ -33,7 +33,18 @@ def check_paged_kv_cache_equal(
             left_kv = left_kv.transpose(0, 1)
             right_kv = right_kv.transpose(0, 1)
 
-        if kv_format in (3, 4):
+        if kv_format == 6:
+            left_index = left_kv[0].reshape(-1, dsa_head_dim)
+            right_index = right_kv[0].reshape(-1, dsa_head_dim)
+            assert left_index.shape[0] >= num_tokens, (
+                f"{prefix}layer {layer_id} indexer too small"
+            )
+            assert (left_index[slots] == right_index[slots]).all(), (
+                f"{prefix}layer {layer_id} DSA_INDEX mismatch"
+            )
+            continue
+
+        if kv_format in (3, 4, 5):
             left_k = left_kv[0].reshape(-1, num_heads, kv_lora_rank)
             left_v = left_kv[1].reshape(-1, num_heads, qk_rope_head_dim)
             right_k = right_kv[0].reshape(-1, num_heads, kv_lora_rank)
@@ -102,5 +113,20 @@ def generate_dsa_kv_cache(
             torch.rand(v_shape, dtype=dtype, device=device),
             torch.rand(dsa_k_shape, dtype=dtype, device=device),
         )
+        for _ in range(num_layers)
+    ]
+
+
+def generate_dsa_index_kv_cache(
+    num_blocks: int,
+    device: str,
+    num_layers: int,
+    dsa_head_dim: int = 128,
+    block_size: int = 16,
+    dtype: torch.dtype = torch.bfloat16,
+) -> List[Tuple[torch.Tensor]]:
+    index_shape = [num_blocks, block_size, 1, dsa_head_dim]
+    return [
+        (torch.rand(index_shape, dtype=dtype, device=device),)
         for _ in range(num_layers)
     ]

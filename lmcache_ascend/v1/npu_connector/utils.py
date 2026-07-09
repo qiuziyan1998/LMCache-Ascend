@@ -305,6 +305,71 @@ def sparse_mla_dsa_batched_direct_kv_transfer_fast(
     )
 
 
+def dense_mla_dsa_batched_direct_kv_transfer(
+    lmc_tensors: Sequence[torch.Tensor],
+    vllm_kv_caches: _KVCacheArg,
+    slot_mapping_full: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    kvcache_format_raw: int,
+    token_major: bool,
+    vllm_two_major: bool,
+    k_hidden_dims: int = 0,
+    v_hidden_dims: int = 0,
+    dsa_hidden_dims: int = 0,
+    lmc_host_interleaved: bool = False,
+    direction: bool = False,
+    chunk_ptrs_npu: Optional[torch.Tensor] = None,
+    fixed_chunk_size: int = 0,
+) -> None:
+    vllm_kv_caches = _normalize_vllm_kv_caches(vllm_kv_caches)
+    lmc_ops.dense_mla_dsa_batched_direct_kv_transfer(
+        lmc_tensors,
+        vllm_kv_caches,
+        slot_mapping_full,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        kvcache_format_raw,
+        token_major,
+        vllm_two_major,
+        k_hidden_dims,
+        v_hidden_dims,
+        dsa_hidden_dims,
+        lmc_host_interleaved,
+        direction,
+        chunk_ptrs_npu,
+        fixed_chunk_size,
+    )
+
+
+def dense_mla_dsa_batched_direct_kv_transfer_fast(
+    layer_state,
+    slot_mapping_full: torch.Tensor,
+    chunk_ptrs_npu: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    lmc_host_interleaved: bool,
+    direction: bool,
+    validate_inputs: bool = False,
+    fixed_chunk_size: int = 0,
+) -> None:
+    lmc_ops.dense_mla_dsa_batched_direct_kv_transfer_fast(
+        layer_state,
+        slot_mapping_full,
+        chunk_ptrs_npu,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        lmc_host_interleaved,
+        direction,
+        validate_inputs,
+        fixed_chunk_size,
+    )
+
+
 def batched_fused_sparse_single_layer_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     staging_cache: torch.Tensor,

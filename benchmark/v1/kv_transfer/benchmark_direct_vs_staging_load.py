@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-Micro-benchmark: sparse-direct KV load vs dense staging load (MLA/DSA).
+Micro-benchmark: direct KV load vs dense staging load (MLA/DSA).
 
 Paths timed per layer:
-  staging  — CPU stacked -> NPU staging -> paged KV (always all tokens)
-  direct   — CPU pinned GM -> paged KV (selected tokens only)
-  direct_fast — same kernel with cached per-layer state
+  dense direct cases use dense_mla_dsa_batched_direct_kv_transfer;
+  sparse direct cases use sparse_mla_dsa_batched_direct_kv_transfer.
+  staging: CPU stacked -> NPU staging -> paged KV (always all tokens)
+  direct: CPU pinned GM -> paged KV (selected tokens only)
+  direct_fast: same kernel with cached per-layer state
 
 Examples:
   python benchmark/v1/kv_transfer/benchmark_direct_vs_staging_load.py --verify
@@ -45,19 +47,22 @@ except ImportError:
 
 from kv_cache_fixtures import (  # noqa: E402
     check_paged_kv_cache_equal,
+    generate_dsa_index_kv_cache,
     generate_dsa_kv_cache,
     generate_mla_kv_cache,
 )
 from load_benchmark_utils import (  # noqa: E402
-    KV_FORMAT_DSA,
-    KV_FORMAT_MLA,
+    KV_FORMAT_BY_NAME,
     LoadBenchmarkCase,
     LoadBenchmarkHarness,
     benchmark_load_harness,
+    benchmark_store_harness,
     build_load_benchmark_harness,
     format_bytes_short,
+    kv_format_from_name,
     recommended_num_blocks,
     verify_load_benchmark_harness,
+    verify_store_benchmark_harness,
 )
 
 
@@ -67,7 +72,12 @@ def _parse_int_list(raw: str) -> List[int]:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--format", choices=("mla", "dsa"), default="mla")
+    p.add_argument(
+        "--format",
+        choices=tuple(KV_FORMAT_BY_NAME),
+        default="mla",
+        help="KV format to benchmark: mla/dsa or split two-group formats.",
+    )
     p.add_argument(
         "--num-tokens",
         type=int,
@@ -107,6 +117,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--direction",
+        choices=("load", "store"),
+        default="load",
+        help="Benchmark dense load or dense store/offload path.",
+    )
     p.add_argument("--verify", action="store_true")
     p.add_argument("--sweep", action="store_true")
     p.add_argument("--sweep-num-tokens", type=str, default="4096,16384")
@@ -127,16 +143,25 @@ def _generate_src_kv_cache(args: argparse.Namespace, num_layers: int, num_blocks
         block_size=args.block_size,
         dtype=torch.bfloat16,
     )
-    if args.format == "mla":
+    if args.format in ("mla", "mla_latent"):
         return generate_mla_kv_cache(**common)
-    return generate_dsa_kv_cache(dsa_head_dim=args.dsa_head_dim, **common)
+    if args.format == "dsa":
+        return generate_dsa_kv_cache(dsa_head_dim=args.dsa_head_dim, **common)
+    return generate_dsa_index_kv_cache(
+        num_blocks=num_blocks,
+        device="npu",
+        num_layers=num_layers,
+        dsa_head_dim=args.dsa_head_dim,
+        block_size=args.block_size,
+        dtype=torch.bfloat16,
+    )
 
 
 def _check_kwargs(args: argparse.Namespace) -> dict:
     return dict(
         num_heads=args.num_kv_heads,
         head_size=128,
-        kv_format=KV_FORMAT_MLA if args.format == "mla" else KV_FORMAT_DSA,
+        kv_format=kv_format_from_name(args.format),
         kv_lora_rank=args.kv_lora_rank,
         qk_rope_head_dim=args.qk_rope_head_dim,
         dsa_head_dim=args.dsa_head_dim,
@@ -150,6 +175,8 @@ def _run_case(
     num_layers: int,
     num_selected: int,
 ) -> LoadBenchmarkCase:
+    if args.direction == "store" and num_selected != num_tokens:
+        raise ValueError("store benchmark only supports dense all-token transfer")
     required_blocks = recommended_num_blocks(num_tokens, args.block_size)
     if args.num_blocks < required_blocks:
         raise ValueError(
@@ -170,12 +197,17 @@ def _run_case(
     )
     try:
         if args.verify:
-            verify_load_benchmark_harness(
-                harness, check_paged_kv_cache_equal, **_check_kwargs(args)
+            if args.direction == "store":
+                verify_store_benchmark_harness(harness)
+            else:
+                verify_load_benchmark_harness(
+                    harness, check_paged_kv_cache_equal, **_check_kwargs(args)
+                )
+        if args.direction == "store":
+            return benchmark_store_harness(
+                harness, warmup=args.warmup, iters=args.iters
             )
-        return benchmark_load_harness(
-            harness, warmup=args.warmup, iters=args.iters
-        )
+        return benchmark_load_harness(harness, warmup=args.warmup, iters=args.iters)
     finally:
         harness.close()
 
@@ -188,11 +220,12 @@ def _print_case(case: LoadBenchmarkCase) -> None:
         else 0.0
     )
     print(
-        f"\nformat={case.format_name} tokens={case.num_tokens} "
+        f"\ndirection={case.direction} format={case.format_name} "
+        f"tokens={case.num_tokens} "
         f"selected={case.num_selected} layers={layers} "
         f"chunks={case.num_chunks} chunk_size={case.chunk_size}"
     )
-    if case.num_selected != case.num_tokens:
+    if case.direction == "load" and case.num_selected != case.num_tokens:
         print("  note: staging loads all tokens; direct loads selected subset only")
     print(
         f"  staging:      {case.staging_median_ms:8.3f} ms "
@@ -231,6 +264,7 @@ def _write_csv(path: Path, cases: Sequence[LoadBenchmarkCase]) -> None:
         w.writerow(
             [
                 "format",
+                "direction",
                 "num_tokens",
                 "num_selected",
                 "num_layers",
@@ -250,6 +284,7 @@ def _write_csv(path: Path, cases: Sequence[LoadBenchmarkCase]) -> None:
             w.writerow(
                 [
                     c.format_name,
+                    c.direction,
                     c.num_tokens,
                     c.num_selected,
                     c.num_layers,
@@ -272,6 +307,7 @@ def _write_json(path: Path, cases: Sequence[LoadBenchmarkCase]) -> None:
     payload = [
         {
             "format": c.format_name,
+            "direction": c.direction,
             "num_tokens": c.num_tokens,
             "num_selected": c.num_selected,
             "num_layers": c.num_layers,
@@ -306,7 +342,12 @@ def main() -> None:
     cases: List[LoadBenchmarkCase] = []
     for num_tokens in token_counts:
         for num_layers in layer_counts:
-            for num_selected in _iter_selected(args, num_tokens):
+            selected_values = (
+                [num_tokens]
+                if args.direction == "store"
+                else _iter_selected(args, num_tokens)
+            )
+            for num_selected in selected_values:
                 case = _run_case(
                     args,
                     num_tokens=num_tokens,
