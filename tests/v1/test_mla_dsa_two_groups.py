@@ -823,10 +823,11 @@ class TestPerGroupLazyInit:
         k_pe = torch.zeros(2048, 128, 1, 64, dtype=torch.bfloat16)
         return [(k_nope, k_pe) for _ in range(num_layers)]
 
-    def test_dsa_two_groups_caps_staging_buffer_size(self) -> None:
+    def test_dsa_two_groups_allocates_staging_buffer_on_demand(self) -> None:
         from lmcache.v1.memory_management import MemoryFormat
 
         max_model_len = 8192
+        actual_tokens = 1024
         conn = self._make_connector(
             use_gpu=True, chunk_size=256, max_staging_tokens=max_model_len
         )
@@ -835,16 +836,10 @@ class TestPerGroupLazyInit:
         latent = [(k_nope, k_pe)]
         conn._lazy_initialize_buffer(latent, kv_group=0)
         layout = conn._group_layouts[0]
-        assert layout.gpu_buffer_allocator is not None
-
-        pool_bytes = int(layout.gpu_buffer_allocator.tensor.numel())
-        full_pool_bytes = 2048 * 128 * (512 + 64) * 2
-        per_slot_bytes = max_model_len * (512 + 64) * 2
-        assert pool_bytes == per_slot_bytes * conn._layerwise_staging_pool_slots()
-        assert pool_bytes < full_pool_bytes
+        assert layout.gpu_buffer_allocator is None
 
         pool_obj, staging_tensor = conn._allocate_layerwise_staging_buffer(
-            num_tokens=max_model_len,
+            num_tokens=actual_tokens,
             kv_group=0,
             layout=layout,
             k_hidden_dims=512,
@@ -853,7 +848,14 @@ class TestPerGroupLazyInit:
             expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
         )
         assert pool_obj is not None
-        assert staging_tensor.numel() == max_model_len * (512 + 64)
+        assert layout.gpu_buffer_allocator is not None
+        pool_bytes = int(layout.gpu_buffer_allocator.tensor.numel())
+        per_slot_bytes = actual_tokens * (512 + 64) * 2
+        max_model_len_per_slot = max_model_len * (512 + 64) * 2
+        assert pool_bytes == per_slot_bytes * conn._layerwise_staging_pool_slots()
+        assert pool_bytes < max_model_len_per_slot
+        assert staging_tensor.numel() == actual_tokens * (512 + 64)
+        pool_obj.ref_count_down()
 
     def test_from_metadata_wires_max_staging_tokens(self) -> None:
         from lmcache.v1.metadata import LMCacheMetadata
@@ -894,13 +896,8 @@ class TestPerGroupLazyInit:
 
         alloc0 = conn._group_layouts[0].gpu_buffer_allocator
         alloc1 = conn._group_layouts[1].gpu_buffer_allocator
-        assert alloc0 is not None
-        assert alloc1 is not None
-        assert alloc0 is not alloc1
-        per_slot_latent = max_model_len * (512 + 64) * 2
-        per_slot_indexer = max_model_len * 128 * 2
-        assert alloc0.tensor.numel() == per_slot_latent * conn._layerwise_staging_pool_slots()
-        assert alloc1.tensor.numel() == per_slot_indexer * conn._layerwise_staging_pool_slots()
+        assert alloc0 is None
+        assert alloc1 is None
 
         pool_obj0, staging0 = conn._allocate_layerwise_staging_buffer(
             num_tokens=256,
@@ -922,8 +919,19 @@ class TestPerGroupLazyInit:
         )
         assert pool_obj0 is not None
         assert pool_obj1 is not None
+        alloc0 = conn._group_layouts[0].gpu_buffer_allocator
+        alloc1 = conn._group_layouts[1].gpu_buffer_allocator
+        assert alloc0 is not None
+        assert alloc1 is not None
+        assert alloc0 is not alloc1
+        per_slot_latent = 256 * (512 + 64) * 2
+        per_slot_indexer = 256 * 128 * 2
+        assert alloc0.tensor.numel() == per_slot_latent * conn._layerwise_staging_pool_slots()
+        assert alloc1.tensor.numel() == per_slot_indexer * conn._layerwise_staging_pool_slots()
         assert staging0.numel() == 256 * (512 + 64)
         assert staging1.numel() == 256 * 128
+        pool_obj0.ref_count_down()
+        pool_obj1.ref_count_down()
 
     def test_dsa_two_groups_staging_pool_supports_concurrent_allocs(self) -> None:
         from lmcache.v1.memory_management import MemoryFormat

@@ -16,7 +16,12 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemLayerwiseGPUConnector,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import (
+    AddressManager,
+    GPUMemoryAllocator,
+    MemoryFormat,
+    MemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 import torch
 
@@ -1265,6 +1270,7 @@ class _GroupLayout:
         "kv_device",
         "gpu_buffer_allocator",
         "staging_bytes_per_slot",
+        "staging_on_demand_logged",
     )
 
     def __init__(self) -> None:
@@ -1279,6 +1285,7 @@ class _GroupLayout:
         self.kv_device: Optional[torch.device] = None
         self.gpu_buffer_allocator: Optional[GPUMemoryAllocator] = None
         self.staging_bytes_per_slot: int = 0
+        self.staging_on_demand_logged: bool = False
 
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
@@ -2213,6 +2220,63 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "active_allocs": int(inner.num_active_allocations),
         }
 
+    @staticmethod
+    def _align_staging_bytes(size: int) -> int:
+        align = AddressManager.ALIGN_BYTES
+        return ((int(size) + align - 1) // align) * align
+
+    def _ensure_group_gpu_allocator(
+        self,
+        required_bytes_per_slot: int,
+        layout: _GroupLayout,
+        kv_group: int,
+    ) -> None:
+        """Create or grow the per-group staging pool on actual demand."""
+        required_bytes_per_slot = self._align_staging_bytes(required_bytes_per_slot)
+        target_bytes_per_slot = max(
+            int(layout.staging_bytes_per_slot),
+            required_bytes_per_slot,
+        )
+        pool_slots = self._layerwise_staging_pool_slots()
+        target_size = target_bytes_per_slot * pool_slots
+
+        current_alloc = layout.gpu_buffer_allocator
+        current_size = (
+            int(current_alloc.tensor.numel()) if current_alloc is not None else 0
+        )
+        if current_alloc is not None and current_size >= target_size:
+            layout.staging_bytes_per_slot = target_bytes_per_slot
+            self.gpu_buffer_allocator = current_alloc
+            return
+
+        active_allocs = (
+            int(current_alloc.allocator.num_active_allocations)
+            if current_alloc is not None
+            else 0
+        )
+        if active_allocs > 0:
+            logger.warning(
+                "Growing on-demand staging pool for kv_group=%s while %d "
+                "buffers are still in use; old pool will be released after "
+                "outstanding transfers finish",
+                kv_group,
+                active_allocs,
+            )
+
+        logger.info(
+            "Allocating on-demand GPU staging pool: kv_group=%s "
+            "required_per_slot=%.2f MB capacity_per_slot=%.2f MB "
+            "slots=%d old_size=%.2f MB new_size=%.2f MB",
+            kv_group,
+            required_bytes_per_slot / (1024 * 1024),
+            target_bytes_per_slot / (1024 * 1024),
+            pool_slots,
+            current_size / (1024 * 1024),
+            target_size / (1024 * 1024),
+        )
+        layout.staging_bytes_per_slot = target_bytes_per_slot
+        self._assign_group_gpu_allocator(target_size, layout, kv_group)
+
     def _layerwise_staging_num_tokens(self, cache_max_tokens: int) -> int:
         """Token count for sizing the layerwise GPU staging pool.
 
@@ -2319,15 +2383,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Return (pool_obj_or_none, staging_tensor) for a layerwise transfer."""
         self._check_staging_transfer_tokens(num_tokens, kv_group)
 
-        gpu_buffer_allocator = layout.gpu_buffer_allocator
-        assert gpu_buffer_allocator is not None, (
-            f"GPU staging pool for kv_group={kv_group} is not initialized."
-        )
         buffer_shape = self.get_shape(num_tokens, kv_group)
         request_bytes = int(
             buffer_shape.numel() * self.element_size
             if hasattr(buffer_shape, "numel")
             else buffer_shape[0] * self.element_size
+        )
+        self._ensure_group_gpu_allocator(request_bytes, layout, kv_group)
+        gpu_buffer_allocator = layout.gpu_buffer_allocator
+        assert gpu_buffer_allocator is not None, (
+            f"GPU staging pool for kv_group={kv_group} is not initialized."
         )
         pool_stats = self._staging_pool_stats(layout)
         tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
@@ -2495,92 +2560,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # Mirror into instance attributes for backward-compatible readers.
         self._mirror_layout(layout)
 
-        if self.use_gpu and layout.gpu_buffer_allocator is None:
+        if (
+            self.use_gpu
+            and layout.gpu_buffer_allocator is None
+            and not layout.staging_on_demand_logged
+        ):
             logger.info(
-                f"Lazily initializing GPU buffer (kv_group={kv_group})."
+                "GPU staging pool will be allocated on demand: "
+                "kv_group=%s format=%s k_hidden_dims=%d v_hidden_dims=%d "
+                "dsa_hidden_dims=%d slots=%d",
+                kv_group,
+                layout.kv_format.name,
+                layout.k_hidden_dims,
+                layout.v_hidden_dims,
+                layout.dsa_hidden_dims,
+                self._layerwise_staging_pool_slots(),
             )
-            first_layer_cache = kv_caches[0]
-
-            if layout.kv_format == KVCacheFormat.SEPARATE_KV:
-                key_tensor = first_layer_cache[0]
-                k_cache_shape_per_layer = key_tensor.shape
-                v_cache_shape_per_layer = first_layer_cache[1].shape
-                num_elements = key_tensor.numel() * 2
-                max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
-            elif layout.kv_format == KVCacheFormat.MLA_KV:
-                key_tensor, value_tensor = first_layer_cache
-                k_cache_shape_per_layer = key_tensor.shape
-                v_cache_shape_per_layer = value_tensor.shape
-                max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
-                num_elements = max_tokens * (
-                    layout.k_hidden_dims + layout.v_hidden_dims
-                )
-            elif layout.kv_format == KVCacheFormat.MLA_LATENT:
-                key_tensor, value_tensor = first_layer_cache
-                k_cache_shape_per_layer = key_tensor.shape
-                v_cache_shape_per_layer = value_tensor.shape
-                max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
-                num_elements = max_tokens * (
-                    layout.k_hidden_dims + layout.v_hidden_dims
-                )
-            elif layout.kv_format == KVCacheFormat.DSA_INDEX:
-                indexer_tensor = first_layer_cache[0]
-                k_cache_shape_per_layer = indexer_tensor.shape
-                v_cache_shape_per_layer = indexer_tensor.shape
-                max_tokens = indexer_tensor.shape[0] * indexer_tensor.shape[1]
-                num_elements = max_tokens * layout.dsa_hidden_dims
-            elif layout.kv_format == KVCacheFormat.DSA_KV:
-                key_tensor, value_tensor, dsa_tensor = first_layer_cache
-                k_cache_shape_per_layer = key_tensor.shape
-                v_cache_shape_per_layer = value_tensor.shape
-                max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
-                num_elements = max_tokens * (
-                    layout.k_hidden_dims
-                    + layout.v_hidden_dims
-                    + layout.dsa_hidden_dims
-                )
-            else:
-                if layout.vllm_two_major:
-                    k_cache_shape_per_layer = first_layer_cache[0].shape
-                    v_cache_shape_per_layer = first_layer_cache[1].shape
-                else:
-                    k_cache_shape_per_layer = first_layer_cache[:, 0].shape
-                    v_cache_shape_per_layer = first_layer_cache[:, 1].shape
-                num_elements = k_cache_shape_per_layer.numel() * 2
-                max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
-
-            staging_tokens = self._layerwise_staging_num_tokens(max_tokens)
-            if staging_tokens != max_tokens:
-                plane_elems = num_elements // max_tokens
-                num_elements = staging_tokens * plane_elems
-
-            pool_slots = self._layerwise_staging_pool_slots()
-            per_slot_bytes = num_elements * self.element_size
-            layout.staging_bytes_per_slot = per_slot_bytes
-            gpu_buffer_size = per_slot_bytes * pool_slots
-
-            logger.info(
-                f"Lazily initializing GPU buffer:\n"
-                f"  - Format: {layout.kv_format.name}\n"
-                f"  - Key cache shape per layer: {k_cache_shape_per_layer}\n"
-                f"  - Value cache shape per layer: {v_cache_shape_per_layer}\n"
-                f"  - Pool max tokens: {max_tokens}\n"
-                f"  - Staging tokens: {staging_tokens}\n"
-                f"  - Staging pool slots: {pool_slots}\n"
-                f"  - k_hidden_dims={layout.k_hidden_dims} "
-                f"v_hidden_dims={layout.v_hidden_dims} "
-                f"dsa_hidden_dims={layout.dsa_hidden_dims}\n"
-                f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024):.2f} MB"
-            )
-
-            self._assign_group_gpu_allocator(gpu_buffer_size, layout, kv_group)
-            if self.dsa_two_groups:
-                logger.info(
-                    "dsa_two_groups: per-group NPU staging pool "
-                    f"(kv_group={kv_group}, cap={staging_tokens} tokens, "
-                    f"slots={pool_slots}, "
-                    f"{gpu_buffer_size / (1024 * 1024):.2f} MB)"
-                )
+            layout.staging_on_demand_logged = True
 
         return layout
 
