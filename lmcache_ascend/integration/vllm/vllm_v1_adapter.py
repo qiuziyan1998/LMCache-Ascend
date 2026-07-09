@@ -131,7 +131,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                             except StopIteration:
                                 pass
                 self._maybe_seed_worker_retrieve_state_from_store(request)
-                self._mark_decode_window_save_completed(request)
+                self._mark_lmcache_commit_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             self._wait_for_save_done = True
             replay_finished = getattr(
@@ -230,6 +230,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     ordering_event=ordering_event,
                     slot_mapping_npu=slot_mapping_npu,
                 )
+                self._mark_lmcache_commit_completed(request)
 
                 if get_pp_group().is_last_rank:
                     save_spec.skip_leading_tokens = len(token_ids)
