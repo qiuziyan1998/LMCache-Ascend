@@ -536,6 +536,83 @@ def test_sparse_passive_metadata_warm_without_data_waits_for_envelope(monkeypatc
     retriever.close()
 
 
+def test_sparse_indexer_passive_metadata_warm_waits_without_storage(monkeypatch):
+    """Indexer-only passive ranks must not probe storage with no storage manager."""
+
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key = _make_key(kv_group=1)
+    mem_obj = _FakeTensorMemObj(torch.empty(1))
+    handle = object()
+    received = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.storage_manager = None
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._is_indexer_passive = lambda: True
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = AscendLMCacheEngine._has_retrieve_data_cache
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+
+    def receive_envelope():
+        received.append(True)
+        return SharedHandleEnvelope(
+            request_id="req-1",
+            phase="sparse_decode_bootstrap",
+            request_ordinal=0,
+            layer_id=0,
+            kv_group=1,
+            status="ok",
+            generation=7,
+            handles=[handle],
+        )
+
+    engine._receive_shared_envelope = receive_envelope
+    ret_mask = torch.ones(1, dtype=torch.bool)
+    cached_memory_objs = []
+    cached_shared_handles = []
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        ret_mask=ret_mask,
+        cached_keys=[[key.get_first_layer()]],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=cached_shared_handles,
+        kv_group=1,
+        req_id="req-1",
+        _retrieve_metadata_warm=True,
+    )
+
+    next(retriever)
+    yielded = retriever.send(([0], 0))
+
+    assert received == [True]
+    assert yielded is ret_mask
+    assert cached_memory_objs == [[mem_obj]]
+    assert cached_shared_handles == [[handle]]
+    retriever.close()
+
+
 def test_sparse_passive_populates_metadata_and_hands_off_views(monkeypatch):
     monkeypatch.setattr(
         ascend_cache_engine,

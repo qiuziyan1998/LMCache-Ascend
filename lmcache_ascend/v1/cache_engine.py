@@ -970,6 +970,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_shared_handles.append([])
         cached_shared_handles[layer_id] = list(handles)
 
+    def _is_shared_retrieve_passive(self, kv_group: int) -> bool:
+        """Return whether this rank is passive for a shared retrieve group."""
+        if kv_group == 1:
+            is_indexer_passive = getattr(self, "_is_indexer_passive", None)
+            if callable(is_indexer_passive):
+                return bool(is_indexer_passive())
+        return bool(self._is_passive())
+
     @staticmethod
     def _needs_retrieve_metadata_refresh(
         cached_keys: List,
@@ -1228,7 +1236,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             shared_rank0_retrieve = (
                 retrieve_kwargs is not None
                 and self._should_use_shared_layerwise_retrieve(kv_group)
-                and not self._is_passive()
+                and not self._is_shared_retrieve_passive(kv_group)
             )
 
             location: Optional[str] = None
@@ -1342,7 +1350,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
             shared_rank0_retrieve = (
                 self._should_use_shared_layerwise_retrieve(kv_group)
-                and not self._is_passive()
+                and not self._is_shared_retrieve_passive(kv_group)
             )
             if cached_keys and cached_keys[0] and not shared_rank0_retrieve:
                 # Prefer the hottest tier (LocalCPUBackend is checked first).
@@ -1369,7 +1377,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         shared_rank0_retrieve = (
             retrieve_kwargs is not None
             and self._should_use_shared_layerwise_retrieve(kv_group)
-            and not self._is_passive()
+            and not self._is_shared_retrieve_passive(kv_group)
         )
         if (
             location is None
@@ -1963,7 +1971,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         kv_group = kwargs.get("kv_group", 0)
         kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
         shared_sparse_retrieve = self._should_use_shared_layerwise_retrieve(kv_group)
-        if not (shared_sparse_retrieve and self._is_passive()):
+        shared_retrieve_passive = self._is_shared_retrieve_passive(kv_group)
+        if not (shared_sparse_retrieve and shared_retrieve_passive):
             assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve_layer operation"
@@ -2002,7 +2011,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if (
             shared_sparse_retrieve
-            and self._is_passive()
+            and shared_retrieve_passive
             and not has_shared_cached_retrieve
         ):
             passive_kwargs = dict(kwargs)
@@ -2121,7 +2130,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         publish_shared_handles = (
             shared_sparse_retrieve
-            and not self._is_passive()
+            and not shared_retrieve_passive
             and not cached_shared_handles_cover
         )
 
