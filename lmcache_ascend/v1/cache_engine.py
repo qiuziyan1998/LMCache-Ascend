@@ -27,6 +27,7 @@ from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.multilocation_debug import record_key_event
 from lmcache.v1.token_database import TokenDatabase
 import torch
 
@@ -83,6 +84,28 @@ def _dsa_validate_max_records() -> int:
         )
     except ValueError:
         return 200000
+
+
+def _record_store_chunk_event(
+    event: str,
+    key: Any,
+    *,
+    req_id: str,
+    kv_group: int,
+    start: int,
+    end: int,
+    **fields: Any,
+) -> None:
+    record_key_event(
+        event,
+        key,
+        req_id=req_id,
+        kv_group=kv_group,
+        chunk_start=start,
+        chunk_end=end,
+        chunk_tokens=end - start,
+        **fields,
+    )
 
 
 def _dsa_debug_limit() -> int:
@@ -1284,9 +1307,21 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             keys_multi_layer = key.split_layers(self.num_layers)
             # Only check the first layer
-            if self.storage_manager.contains(
+            existing_location = self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
-            ):
+            )
+            if existing_location:
+                _record_store_chunk_event(
+                    "ascend_store_skip_existing_chunk",
+                    keys_multi_layer[0],
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    start=start,
+                    end=end,
+                    existing_location=existing_location,
+                    retrieve_locations=self.retrieve_locations,
+                    decode_window_save=kwargs.get("decode_window_save"),
+                )
                 continue
 
             # Allocate the memory object
@@ -1348,6 +1383,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             keys.append(keys_multi_layer)
             memory_objs.append(memory_objs_multi_layer)
             tot_token_num += num_tokens
+            _record_store_chunk_event(
+                "ascend_store_chunk_queued",
+                keys_multi_layer[0],
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
+                memory_format=memory_format,
+                kv_shape_single_layer=kv_shape_single_layer,
+                decode_window_save=kwargs.get("decode_window_save"),
+            )
 
             # Create KV event
             if self.kv_events_enabled and tokens is not None:
@@ -1438,6 +1484,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                     keys=keys[layer_id],
                     memory_objs=memory_objs[layer_id],
                 )
+                if layer_id == 0:
+                    for chunk_index, key in enumerate(keys[layer_id]):
+                        _record_store_chunk_event(
+                            "ascend_store_layer0_batched_put",
+                            key,
+                            req_id=req_id,
+                            kv_group=kv_group,
+                            start=starts[chunk_index],
+                            end=ends[chunk_index],
+                            layer_id=layer_id,
+                            chunk_index=chunk_index,
+                            chunk_count=len(starts),
+                            store_location=self.store_location,
+                        )
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
