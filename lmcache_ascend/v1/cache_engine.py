@@ -1064,23 +1064,38 @@ class AscendLMCacheEngine(LMCacheEngine):
         init_kvcaches = getattr(
             self.gpu_connector, "initialize_kvcaches_ptr", None
         )
+        lazy_init_with_staging = getattr(
+            self.gpu_connector, "_lazy_initialize_buffer_with_staging", None
+        )
         lazy_init = getattr(
             self.gpu_connector, "_lazy_initialize_buffer", None
         )
-        if not callable(init_kvcaches) or not callable(lazy_init):
+        if not callable(init_kvcaches) or (
+            not callable(lazy_init_with_staging) and not callable(lazy_init)
+        ):
             return
         if "kvcaches" in kwargs:
             init_kvcaches(**kwargs)
         kvcaches = getattr(self.gpu_connector, "kvcaches", None)
         if kvcaches is not None:
             kv_group = kwargs.get("kv_group", 0)
+            if callable(lazy_init_with_staging):
+                lazy_init_with_staging(
+                    kvcaches,
+                    kv_group=kv_group,
+                    init_staging=False,
+                )
+                return
             # The layerwise NPU connector detects format per kv_group; other
             # connectors (e.g. the blending buffer connector) may not accept
             # the kwarg, so fall back to the positional call for them.
             try:
-                lazy_init(kvcaches, kv_group=kv_group)
+                lazy_init(kvcaches, kv_group=kv_group, init_staging=False)
             except TypeError:
-                lazy_init(kvcaches)
+                try:
+                    lazy_init(kvcaches, kv_group=kv_group)
+                except TypeError:
+                    lazy_init(kvcaches)
 
     def _expected_shared_cpu_chunk_metadata(
         self,

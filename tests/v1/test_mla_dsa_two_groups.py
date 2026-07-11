@@ -45,6 +45,13 @@ class TestKVCacheFormatDetect:
         k_pe = torch.zeros(num_blocks, block_size, 1, 64, dtype=torch.bfloat16)
         return [(k_nope, k_pe)]
 
+    def _make_tp8_equal_width_mla_latent_tensors(
+        self, num_blocks=4, block_size=128
+    ):
+        k_nope = torch.zeros(num_blocks, block_size, 1, 128, dtype=torch.bfloat16)
+        k_pe = torch.zeros(num_blocks, block_size, 1, 128, dtype=torch.bfloat16)
+        return [(k_nope, k_pe)]
+
     def _make_dsa_index_tensors(self, num_blocks=4, block_size=128):
         indexer_k = torch.zeros(num_blocks, block_size, 1, 128, dtype=torch.bfloat16)
         return [(indexer_k,)]
@@ -69,6 +76,28 @@ class TestKVCacheFormatDetect:
         kvcaches = self._make_mla_latent_tensors()
         fmt = KVCacheFormat.detect(kvcaches, dsa_two_groups=True)
         assert fmt == KVCacheFormat.MLA_LATENT
+
+    def test_detect_mla_latent_with_tp8_equal_width_two_groups(self):
+        from lmcache_ascend.v1.kv_format import KVCacheFormat
+
+        kvcaches = self._make_tp8_equal_width_mla_latent_tensors()
+        fmt = KVCacheFormat.detect(
+            kvcaches,
+            use_mla=True,
+            dsa_two_groups=True,
+        )
+        assert fmt == KVCacheFormat.MLA_LATENT
+
+    def test_equal_width_non_mla_pair_stays_separate_kv(self):
+        from lmcache_ascend.v1.kv_format import KVCacheFormat
+
+        kvcaches = self._make_tp8_equal_width_mla_latent_tensors()
+        fmt = KVCacheFormat.detect(
+            kvcaches,
+            use_mla=False,
+            dsa_two_groups=True,
+        )
+        assert fmt == KVCacheFormat.SEPARATE_KV
 
     def test_detect_mla_latent_without_two_groups_falls_back_to_mla_kv(self):
         from lmcache_ascend.v1.kv_format import KVCacheFormat
@@ -422,6 +451,47 @@ class TestStoreLayerPassiveGuard:
         engine.token_database.process_tokens.assert_called()
 
 
+class TestLayerwiseLayoutWarmup:
+    """Layout-only warmup must not allocate dense staging buffers."""
+
+    def test_layout_warmup_uses_no_staging_connector_api(self):
+        from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
+
+        engine = SimpleNamespace()
+        connector = SimpleNamespace()
+        connector.kvcaches = [("k", "v")]
+        calls = []
+
+        def initialize_kvcaches_ptr(**kwargs):
+            calls.append(("initialize", kwargs))
+
+        def lazy_initialize_buffer_with_staging(kvcaches, *, kv_group, init_staging):
+            calls.append(("lazy_with_staging", kvcaches, kv_group, init_staging))
+
+        connector.initialize_kvcaches_ptr = initialize_kvcaches_ptr
+        connector._lazy_initialize_buffer_with_staging = (
+            lazy_initialize_buffer_with_staging
+        )
+        connector._lazy_initialize_buffer = MagicMock(
+            side_effect=AssertionError("warmup should use no-staging API")
+        )
+        engine.gpu_connector = connector
+
+        AscendLMCacheEngine._ensure_layerwise_connector_layout(
+            engine,
+            kvcaches=connector.kvcaches,
+            kv_group=1,
+        )
+
+        assert calls == [
+            (
+                "initialize",
+                {"kvcaches": connector.kvcaches, "kv_group": 1},
+            ),
+            ("lazy_with_staging", connector.kvcaches, 1, False),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Connector get_shape tests
 # ---------------------------------------------------------------------------
@@ -661,6 +731,11 @@ class TestPerGroupLazyInit:
         k_pe = torch.zeros(4, 128, 1, 64, dtype=torch.bfloat16)
         return [(k_nope, k_pe) for _ in range(num_layers)]
 
+    def _tp8_equal_width_latent_kvcaches(self, num_layers=2):
+        k_nope = torch.zeros(4, 128, 1, 128, dtype=torch.bfloat16)
+        k_pe = torch.zeros(4, 128, 1, 128, dtype=torch.bfloat16)
+        return [(k_nope, k_pe) for _ in range(num_layers)]
+
     def _indexer_kvcaches(self, num_layers=2):
         indexer = torch.zeros(4, 128, 1, 128, dtype=torch.bfloat16)
         return [(indexer,) for _ in range(num_layers)]
@@ -678,6 +753,24 @@ class TestPerGroupLazyInit:
         assert conn.get_shape(256, kv_group=0) == torch.Size([256 * 576])
         assert conn.get_shape(256, kv_group=1) == torch.Size([256 * 128])
         assert conn.get_shape(256, kv_group=0) != conn.get_shape(256, kv_group=1)
+
+    def test_tp8_equal_width_latent_still_uses_mla_direct_layout(self):
+        from lmcache_ascend.v1.kv_format import KVCacheFormat
+
+        conn = self._make_connector()
+        conn._lazy_initialize_buffer(
+            self._tp8_equal_width_latent_kvcaches(),
+            kv_group=0,
+            init_staging=False,
+        )
+
+        layout = conn._group_layouts[0]
+        assert layout.kv_format == KVCacheFormat.MLA_LATENT
+        assert conn._is_mla_dsa_format(0)
+        assert not conn._layerwise_token_major(0)
+        assert conn._expected_memory_format(0) == MemoryFormat.KV_MLA_LATENT_FMT
+        assert layout.gpu_buffer_allocator is None
+        assert conn.get_shape(256, kv_group=0) == torch.Size([256 * 256])
 
     def test_indexer_then_latent_detects_both(self):
         from lmcache_ascend.v1.kv_format import KVCacheFormat

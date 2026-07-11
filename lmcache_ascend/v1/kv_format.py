@@ -137,9 +137,10 @@ class KVCacheFormat(Enum):
         Detection logic:
         1. DSA_KV: tuple with 3 elements (k_cache, v_cache, dsa_k_cache) — legacy bundled
         2. DSA_INDEX: 1-tuple (indexer_k,) — two-group indexer (only when dsa_two_groups)
-        3. MLA_LATENT: tuple with 2 elements where K/V shapes differ (only when dsa_two_groups)
-        4. MLA_KV: tuple with 2 elements where K/V shapes differ (when not dsa_two_groups)
-        5. SEPARATE_KV: tuple with 2 elements where K/V shapes are same
+        3. MLA_LATENT: tuple with 2 elements in MLA two-group mode
+        4. MLA_KV: tuple with 2 elements in MLA mode
+        5. SEPARATE_KV: tuple with 2 elements where K/V shapes are same and
+           use_mla is false
         6. MERGED_KV: single tensor with specific shape patterns
         """
         if not kvcaches:
@@ -182,8 +183,10 @@ class KVCacheFormat(Enum):
                 if isinstance(k_cache, torch.Tensor) and isinstance(
                     v_cache, torch.Tensor
                 ):
-                    # MLA_LATENT or MLA_KV: K/V shapes differ
-                    if k_cache.shape != v_cache.shape:
+                    # MLA_LATENT or MLA_KV: the tensor pair is semantically MLA.
+                    # Shape alone is not enough: at some TP degrees the
+                    # sharded latent width can equal the PE width.
+                    if use_mla or k_cache.shape != v_cache.shape:
                         if dsa_two_groups:
                             logger.debug(
                                 f"Detected MLA_LATENT format (two-group): "

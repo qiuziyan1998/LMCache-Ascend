@@ -3174,11 +3174,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layout = self._group_layouts.get(kv_group)
         if layout is None:
             layout = _GroupLayout()
-            # Latent (kv_group=0) uses MLA_KV detection like dev-qzy; only the
-            # indexer group (kv_group=1) needs dsa_two_groups detection.
-            detect_two_groups = (
-                getattr(self, "dsa_two_groups", False) and kv_group != 0
-            )
+            # Both groups need the two-group hint: kv_group=0 is MLA_LATENT
+            # and kv_group=1 is DSA_INDEX. Without it, equal latent/PE widths
+            # can be mistaken for ordinary SEPARATE_KV at TP=8-like shapes.
+            detect_two_groups = getattr(self, "dsa_two_groups", False)
             layout.kv_format = KVCacheFormat.detect(
                 kv_caches,
                 use_mla=self.use_mla,
