@@ -677,6 +677,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
   config.dims.num_tokens = num_sparse;
   config.ub_params.aiv_num =
       static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
 
@@ -863,6 +864,7 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
   SingleLayerKVConfig config = layer_state.config;
   config.dims.num_tokens = num_tokens;
   config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
+  config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
 
