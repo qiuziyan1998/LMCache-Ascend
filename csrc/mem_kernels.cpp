@@ -3,6 +3,8 @@
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
+#include <algorithm>
+#include <cstdlib>
 #include <pybind11/pybind11.h>
 #include <limits>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -560,7 +562,21 @@ static void launch_dense_multi_chunk_direct_kernel(
       config.dims.block_size, page2l, lmc_host_interleaved);
 }
 
-static uint32_t dense_direct_aiv_num(int32_t num_tokens) {
+static uint32_t positive_env_u32(const char *name, uint32_t fallback) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+
+  char *end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if (end == raw || value <= 0) {
+    return fallback;
+  }
+  return static_cast<uint32_t>(value);
+}
+
+static uint32_t dense_direct_aiv_num(int32_t num_tokens, bool page2l) {
   const uint32_t token_cores =
       num_tokens > 0 ? static_cast<uint32_t>(num_tokens) : 1U;
   auto ascendcPlatform =
@@ -569,7 +585,16 @@ static uint32_t dense_direct_aiv_num(int32_t num_tokens) {
   if (hardware_cores == 0) {
     return 1U;
   }
-  return std::min(hardware_cores, token_cores);
+
+  const uint32_t default_cap = page2l ? 4U : hardware_cores;
+  const uint32_t global_cap =
+      positive_env_u32("LMCACHE_ASCEND_DENSE_DIRECT_AIV_NUM", default_cap);
+  const uint32_t direction_cap = positive_env_u32(
+      page2l ? "LMCACHE_ASCEND_DENSE_DIRECT_STORE_AIV_NUM"
+             : "LMCACHE_ASCEND_DENSE_DIRECT_LOAD_AIV_NUM",
+      global_cap);
+
+  return std::max(1U, std::min({hardware_cores, token_cores, direction_cap}));
 }
 
 } // namespace
@@ -813,7 +838,7 @@ void dense_mla_dsa_batched_direct_kv_transfer(
       token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
       v_hidden_dims, dsa_hidden_dims);
   config.dims.num_tokens = num_tokens;
-  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
+  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens, direction);
 
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
@@ -863,7 +888,7 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
 
   SingleLayerKVConfig config = layer_state.config;
   config.dims.num_tokens = num_tokens;
-  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
+  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens, direction);
   config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);

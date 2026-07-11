@@ -2710,9 +2710,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_k_hidden_dims: int,
         dense_v_hidden_dims: int,
         dense_dsa_hidden_dims: int,
+        direction: bool,
     ) -> tuple:
         return (
-            3,
+            4,
             VLLMPagedMemLayerwiseNPUConnector._tensor_layout_signature(
                 source_layout_ref
             ),
@@ -2736,6 +2737,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int(dense_k_hidden_dims),
             int(dense_v_hidden_dims),
             int(dense_dsa_hidden_dims),
+            int(direction),
         )
 
     def _run_dense_direct_kv_transfer_layer(
@@ -2792,6 +2794,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dense_k_hidden_dims=dense_k_hidden_dims,
             dense_v_hidden_dims=dense_v_hidden_dims,
             dense_dsa_hidden_dims=dense_dsa_hidden_dims,
+            direction=direction,
         )
         layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
             kvcaches_ref=kvcaches_ref,
