@@ -35,6 +35,29 @@ logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
+# #region agent log
+def _agent_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+) -> None:
+    payload = {
+        "sessionId": "51d8e7",
+        "runId": "baseline",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open("debug-51d8e7.log", "a", encoding="utf-8") as debug_file:
+            debug_file.write(json.dumps(payload, default=str) + "\n")
+    except OSError:
+        pass
+# #endregion
+
 
 def _dsa_debug_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
@@ -404,10 +427,15 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         if not _dsa_validate_kv_enabled():
             return
+        matched = 0
+        missing = 0
+        mismatched = 0
+        mismatch_key_hashes: List[str] = []
         for key, tensor in zip(keys, tensors, strict=False):
             record_key = self._dsa_validate_key(layer_id, key)
             expected = self._dsa_validate_kv_digests.get(record_key)
             if expected is None:
+                missing += 1
                 payload = {
                     "req_id": req_id,
                     "layer_id": layer_id,
@@ -435,6 +463,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 continue
             if actual["sha256"] != expected["digest"]["sha256"]:
+                mismatched += 1
+                mismatch_key_hashes.append(
+                    hashlib.sha1(record_key.encode("utf-8")).hexdigest()
+                )
                 payload = {
                     "req_id": req_id,
                     "layer_id": layer_id,
@@ -462,6 +494,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                     tensor=tensor,
                     phase="retrieve",
                 )
+            else:
+                matched += 1
+
+        # #region agent log
+        _agent_debug_log(
+            "H20,H21,H22,H24",
+            "cache_engine.py:_dsa_check_retrieve_digests",
+            "cache-key store-to-retrieve whole-chunk parity",
+            {
+                "pid": int(os.getpid()),
+                "rank": os.getenv("RANK", os.getenv("LOCAL_RANK", "unknown")),
+                "req_id": req_id,
+                "layer_id": int(layer_id),
+                "key_count": int(len(keys)),
+                "tensor_count": int(len(tensors)),
+                "matched": int(matched),
+                "missing": int(missing),
+                "mismatched": int(mismatched),
+                "all_ok": bool(
+                    len(keys) == len(tensors)
+                    and missing == 0
+                    and mismatched == 0
+                    and matched == len(keys)
+                ),
+                "mismatch_key_hashes": mismatch_key_hashes[:8],
+            },
+        )
+        # #endregion
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
@@ -2698,6 +2758,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         raise
                     self._broadcast_shared_envelope(envelope)
+
+                if (
+                    _dsa_validate_kv_enabled()
+                    and layer_id in (0, self.num_layers // 2, self.num_layers - 1)
+                ):
+                    validation_tensors = (
+                        cached_tensors[layer_id]
+                        if cached_tensors is not None
+                        and layer_id < len(cached_tensors)
+                        and cached_tensors[layer_id]
+                        else [
+                            memory_obj.tensor
+                            for memory_obj in mem_objs_layer
+                            if memory_obj.tensor is not None
+                        ]
+                    )
+                    self._dsa_check_retrieve_digests(
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        layer_id=layer_id,
+                        keys=retrieve_keys[layer_id],
+                        tensors=validation_tensors,
+                    )
 
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
