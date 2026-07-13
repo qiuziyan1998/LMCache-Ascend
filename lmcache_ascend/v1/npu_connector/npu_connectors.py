@@ -43,6 +43,90 @@ import lmcache_ascend.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 # #region agent log
+_DEBUG_05D10F = os.getenv("LMCACHE_DEBUG_05D10F", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def _debug_05d10f_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+) -> None:
+    if not _DEBUG_05D10F:
+        return
+    payload = {
+        "sessionId": "05d10f",
+        "runId": "baseline",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        encoded = (json.dumps(payload, default=str) + "\n").encode()
+        fd = os.open(
+            "debug-05d10f.log",
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o644,
+        )
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _debug_05d10f_tensor_sha256(tensors: List[torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        raw = (
+            tensor.detach()
+            .contiguous()
+            .view(torch.uint8)
+            .to(device="cpu")
+            .numpy()
+            .tobytes()
+        )
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _debug_05d10f_paged_slots_sha256(
+    layer_cache: Any,
+    slots: torch.Tensor,
+) -> str:
+    tensors = (
+        list(layer_cache)
+        if isinstance(layer_cache, (tuple, list))
+        else [layer_cache]
+    )
+    valid_slots = slots.detach().reshape(-1).to(dtype=torch.long)
+    valid_slots = valid_slots[valid_slots >= 0]
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        rows = tensor.detach().reshape(
+            int(tensor.shape[0]) * int(tensor.shape[1]), -1
+        )
+        selected = rows.index_select(0, valid_slots.to(device=rows.device))
+        raw = (
+            selected.contiguous()
+            .view(torch.uint8)
+            .to(device="cpu")
+            .numpy()
+            .tobytes()
+        )
+        digest.update(raw)
+    return digest.hexdigest()
+# #endregion
+
+# #region agent log
 def _agent_debug_log(
     hypothesis_id: str,
     location: str,
@@ -2561,6 +2645,77 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
 
         current_stream.wait_stream(load_stream)
+        # #region agent log
+        if _DEBUG_05D10F and layer_id in (
+            0,
+            self.num_layers // 2,
+            self.num_layers - 1,
+        ):
+            current_stream.synchronize()
+            _debug_05d10f_log(
+                "H1,H3,H4",
+                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer",
+                "sparse load full-byte source and destination checkpoint",
+                {
+                    **_agent_debug_runtime_identity(),
+                    "kv_group": int(kv_group),
+                    "layer_id": int(layer_id),
+                    "num_sparse": int(num_sparse),
+                    "total_tokens": int(total_tokens),
+                    "chunk_size": int(chunk_size),
+                    "num_chunks": int(chunk_ptrs_npu.numel()),
+                    "state_id": int(id(layer_state))
+                    if layer_state is not None
+                    else None,
+                    "source_chunks_sha256": (
+                        _debug_05d10f_tensor_sha256(resolve_tensors)
+                        if resolve_tensors
+                        else None
+                    ),
+                    "destination_rows_sha256": (
+                        _debug_05d10f_paged_slots_sha256(
+                            kvcaches_ref[layer_id],
+                            slot_mapping_packed,
+                        )
+                    ),
+                    "selected_sha256": _debug_05d10f_tensor_sha256(
+                        [selected_token_idx]
+                    ),
+                    "slots_sha256": _debug_05d10f_tensor_sha256(
+                        [slot_mapping_packed]
+                    ),
+                    "selected_min": int(
+                        selected_token_idx.min().to(device="cpu").item()
+                    ),
+                    "selected_max": int(
+                        selected_token_idx.max().to(device="cpu").item()
+                    ),
+                    "slot_min": int(
+                        slot_mapping_packed.min().to(device="cpu").item()
+                    ),
+                    "slot_max": int(
+                        slot_mapping_packed.max().to(device="cpu").item()
+                    ),
+                    "cpu_host_ptrs": [
+                        int(tensor.data_ptr()) for tensor in resolve_tensors
+                    ],
+                    "chunk_ptrs_sha256": _debug_05d10f_tensor_sha256(
+                        [chunk_ptrs_npu]
+                    ),
+                    "vllm_ptrs": [
+                        int(tensor.data_ptr())
+                        for tensor in (
+                            list(kvcaches_ref[layer_id])
+                            if isinstance(
+                                kvcaches_ref[layer_id],
+                                (tuple, list),
+                            )
+                            else [kvcaches_ref[layer_id]]
+                        )
+                    ],
+                },
+            )
+        # #endregion
         if (
             _SPARSE_DIRECT_VERIFY
             and layer_id in (0, self.num_layers - 1)
@@ -3146,6 +3301,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if validate_key is None:
             validate_key = ("dense", kv_group, layer_id)
 
+        # #region agent log
+        debug_dense_checked = _DEBUG_05D10F and layer_id in (
+            0,
+            self.num_layers // 2,
+            self.num_layers - 1,
+        )
+        debug_paged_before = None
+        if debug_dense_checked and direction:
+            current_stream.synchronize()
+            debug_paged_before = _debug_05d10f_paged_slots_sha256(
+                kvcaches_ref[layer_id],
+                slot_mapping_full,
+            )
+        # #endregion
+
         with self._stream_context_or_null(
             transfer_stream,
             switch_stream=switch_stream,
@@ -3235,6 +3405,57 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         if switch_stream:
             current_stream.wait_stream(transfer_stream)
+
+        # #region agent log
+        if debug_dense_checked and direction:
+            current_stream.synchronize()
+            debug_paged_after = _debug_05d10f_paged_slots_sha256(
+                kvcaches_ref[layer_id],
+                slot_mapping_full,
+            )
+            _debug_05d10f_log(
+                "H1,H2,H3",
+                "npu_connectors.py:_run_dense_direct_kv_transfer_layer",
+                "dense store full-byte source and destination checkpoint",
+                {
+                    **_agent_debug_runtime_identity(),
+                    "kv_group": int(kv_group),
+                    "layer_id": int(layer_id),
+                    "num_tokens": int(num_tokens),
+                    "num_chunks": int(chunk_ptrs_npu.numel()),
+                    "fixed_chunk_size": int(fixed_chunk_size),
+                    "aiv_env": os.getenv(
+                        "LMCACHE_ASCEND_DENSE_DIRECT_STORE_AIV_NUM",
+                        "default",
+                    ),
+                    "state_id": int(id(layer_state))
+                    if layer_state is not None
+                    else None,
+                    "paged_sha256_before": debug_paged_before,
+                    "paged_sha256_after": debug_paged_after,
+                    "paged_source_unchanged": (
+                        debug_paged_before == debug_paged_after
+                    ),
+                    "cpu_chunks_sha256": _debug_05d10f_tensor_sha256(
+                        layer_tensors
+                    ),
+                    "cpu_host_ptrs": [
+                        int(tensor.data_ptr()) for tensor in layer_tensors
+                    ],
+                    "vllm_ptrs": [
+                        int(tensor.data_ptr())
+                        for tensor in (
+                            list(kvcaches_ref[layer_id])
+                            if isinstance(
+                                kvcaches_ref[layer_id],
+                                (tuple, list),
+                            )
+                            else [kvcaches_ref[layer_id]]
+                        )
+                    ],
+                },
+            )
+        # #endregion
 
     def _single_layer_hidden_dim_args(
         self, kv_group: Optional[int] = None
