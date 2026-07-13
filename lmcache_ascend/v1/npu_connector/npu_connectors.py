@@ -84,6 +84,28 @@ def _agent_debug_tensor_summary(tensor: torch.Tensor) -> dict:
         "sample_abs_sum": float(sum(abs(value) for value in sample)),
         "sample_nonzero": int(sum(value != 0.0 for value in sample)),
     }
+
+
+def _agent_debug_runtime_identity() -> dict:
+    distributed_rank = None
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            distributed_rank = int(torch.distributed.get_rank())
+    except RuntimeError:
+        pass
+    npu_device = None
+    try:
+        if hasattr(torch, "npu"):
+            npu_device = int(torch.npu.current_device())
+    except RuntimeError:
+        pass
+    return {
+        "pid": int(os.getpid()),
+        "distributed_rank": distributed_rank,
+        "env_rank": os.getenv("RANK"),
+        "env_local_rank": os.getenv("LOCAL_RANK"),
+        "npu_device": npu_device,
+    }
 # #endregion
 
 _SPARSE_DIRECT_GUARD = os.getenv("LMCACHE_ASCEND_SPARSE_DIRECT_GUARD", "0").lower() in (
@@ -2964,6 +2986,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 validate_inputs = (
                     validate_key not in self._sparse_direct_validated_layers
                 )
+                if layer_id in (0, self.num_layers - 1):
+                    # #region agent log
+                    _agent_debug_log(
+                        "H6,H7,H8,H9",
+                        "npu_connectors.py:_run_dense_direct_kv_transfer_layer:state",
+                        "dense direct fast-state lifecycle",
+                        {
+                            **_agent_debug_runtime_identity(),
+                            "direction": "store" if direction else "load",
+                            "kv_group": int(kv_group),
+                            "layer_id": int(layer_id),
+                            "state_id": int(id(layer_state)),
+                            "first_validated_use": bool(validate_inputs),
+                            "sync_before_env": bool(
+                                _DENSE_DIRECT_STORE_SYNC_BEFORE
+                            ),
+                            "sync_after_env": bool(
+                                _DENSE_DIRECT_STORE_SYNC_AFTER
+                            ),
+                        },
+                    )
+                    # #endregion
                 dense_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_full,
