@@ -83,6 +83,40 @@ def _debug_05d10f_log(
         pass
 
 
+def _debug_05d10f_log_if_enabled(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    *,
+    run_id: str = "sparse-load-sync",
+) -> None:
+    if not (_DEBUG_05D10F or _SPARSE_DIRECT_LOAD_SYNC):
+        return
+    payload = {
+        "sessionId": "05d10f",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        encoded = (json.dumps(payload, default=str) + "\n").encode()
+        fd = os.open(
+            "debug-05d10f.log",
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o644,
+        )
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _debug_05d10f_tensor_sha256(tensors: List[torch.Tensor]) -> str:
     digest = hashlib.sha256()
     for tensor in tensors:
@@ -238,6 +272,9 @@ _DENSE_DIRECT_STORE_SYNC_AFTER = os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 _DENSE_DIRECT_STORE_VERIFY = os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_STORE_VERIFY", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_DIRECT_LOAD_SYNC = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_LOAD_SYNC", "0"
 ).lower() in ("1", "true", "yes", "on")
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
@@ -2645,6 +2682,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
 
         current_stream.wait_stream(load_stream)
+        if _SPARSE_DIRECT_LOAD_SYNC:
+            sync_start = time.perf_counter()
+            load_stream.synchronize()
+            _debug_05d10f_log_if_enabled(
+                "H6",
+                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer",
+                "explicit sparse load stream synchronize",
+                {
+                    **_agent_debug_runtime_identity(),
+                    "kv_group": int(kv_group),
+                    "layer_id": int(layer_id),
+                    "num_sparse": int(num_sparse),
+                    "sync_ms": (time.perf_counter() - sync_start) * 1000.0,
+                    "used_wait_stream_only": False,
+                },
+            )
         # #region agent log
         if _DEBUG_05D10F and layer_id in (
             0,
@@ -4305,7 +4358,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_request = yield
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
-            current_stream = torch.cuda.current_stream()
+            current_stream = (
+                torch.npu.current_stream()
+                if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
+                else torch.cuda.current_stream()
+            )
             load_stream = self.load_stream_list[load_stream_idx]
             explicit_sparse_payload = isinstance(sparse_request, dict)
             target_slot_mapping = None
