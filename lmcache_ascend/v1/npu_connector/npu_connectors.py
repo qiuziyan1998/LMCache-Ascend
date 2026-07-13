@@ -126,6 +126,9 @@ _SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS = os.getenv(
 _SPARSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
+_SPARSE_DIRECT_VERIFY = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_VERIFY", "0"
+).lower() in ("1", "true", "yes", "on")
 _DENSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -2554,6 +2557,114 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
 
         current_stream.wait_stream(load_stream)
+        if (
+            _SPARSE_DIRECT_VERIFY
+            and layer_id in (0, self.num_layers - 1)
+            and resolve_tensors
+        ):
+            current_stream.synchronize()
+            selected_cpu = selected_token_idx.detach().to(device="cpu").reshape(-1)
+            slots_cpu = slot_mapping_packed.detach().to(device="cpu").reshape(-1)
+            sample_positions = sorted(
+                {
+                    0,
+                    max(0, num_sparse // 2),
+                    max(0, num_sparse - 1),
+                }
+            )
+            layer_cache = kvcaches_ref[layer_id]
+            paged_tensors = (
+                list(layer_cache)
+                if isinstance(layer_cache, (tuple, list))
+                else [layer_cache]
+            )
+            if len(paged_tensors) == 1:
+                plane_dims = [int(sparse_k_hidden_dims)]
+            elif len(paged_tensors) == 2:
+                plane_dims = [
+                    int(sparse_k_hidden_dims),
+                    int(sparse_v_hidden_dims),
+                ]
+            else:
+                plane_dims = [
+                    int(sparse_k_hidden_dims),
+                    int(sparse_v_hidden_dims),
+                    int(sparse_dsa_hidden_dims),
+                ]
+
+            compared_elements = 0
+            mismatched_elements = 0
+            max_abs_diff = 0.0
+            checked_tokens = 0
+            skipped_tokens = 0
+            for sample_position in sample_positions:
+                source_token = int(selected_cpu[sample_position].item())
+                target_slot = int(slots_cpu[sample_position].item())
+                if (
+                    source_token < 0
+                    or source_token >= int(total_tokens)
+                    or target_slot < 0
+                ):
+                    skipped_tokens += 1
+                    continue
+                chunk_id = source_token // int(chunk_size)
+                local_token = source_token % int(chunk_size)
+                if chunk_id >= len(resolve_tensors):
+                    skipped_tokens += 1
+                    continue
+                chunk_tokens = min(
+                    int(chunk_size),
+                    int(total_tokens) - chunk_id * int(chunk_size),
+                )
+                chunk_flat = resolve_tensors[chunk_id].detach().reshape(-1)
+                plane_base = 0
+                checked_tokens += 1
+                for paged_tensor, plane_dim in zip(
+                    paged_tensors, plane_dims, strict=False
+                ):
+                    if plane_dim <= 0:
+                        continue
+                    compare_width = min(16, plane_dim)
+                    cpu_start = plane_base + local_token * plane_dim
+                    expected = chunk_flat[
+                        cpu_start : cpu_start + compare_width
+                    ].to(dtype=torch.float32)
+                    paged_start = target_slot * plane_dim
+                    actual = (
+                        paged_tensor.detach()
+                        .reshape(-1)[paged_start : paged_start + compare_width]
+                        .to(device="cpu", dtype=torch.float32)
+                    )
+                    difference = (actual - expected).abs()
+                    compared_elements += int(compare_width)
+                    mismatched_elements += int(
+                        torch.count_nonzero(difference).item()
+                    )
+                    if difference.numel():
+                        max_abs_diff = max(
+                            max_abs_diff, float(difference.max().item())
+                        )
+                    plane_base += chunk_tokens * plane_dim
+
+            # #region agent log
+            _agent_debug_log(
+                "H10,H11,H12",
+                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer:verify",
+                "sparse direct CPU-to-paged parity",
+                {
+                    **_agent_debug_runtime_identity(),
+                    "kv_group": int(kv_group),
+                    "layer_id": int(layer_id),
+                    "num_sparse": int(num_sparse),
+                    "checked_tokens": int(checked_tokens),
+                    "skipped_tokens": int(skipped_tokens),
+                    "compared_elements": int(compared_elements),
+                    "mismatched_elements": int(mismatched_elements),
+                    "max_abs_diff": float(max_abs_diff),
+                    "parity_ok": bool(mismatched_elements == 0),
+                },
+            )
+            # #endregion
 
     def _sparse_selected_token_idx(
         self,
@@ -4024,6 +4135,39 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors, kv_group
                 )
             )
+            if layer_id in (0, self.num_layers - 1):
+                # #region agent log
+                cached_ptr_tensor = (
+                    cached_chunk_ptrs_npu[layer_id]
+                    if cached_chunk_ptrs_npu is not None
+                    and layer_id < len(cached_chunk_ptrs_npu)
+                    else None
+                )
+                _agent_debug_log(
+                    "H10,H11,H12",
+                    "npu_connectors.py:batched_to_gpu_head_token_wise",
+                    "sparse retrieve path inputs",
+                    {
+                        **_agent_debug_runtime_identity(),
+                        "kv_group": int(kv_group),
+                        "layer_id": int(layer_id),
+                        "sparse_direct_disabled": bool(_SPARSE_DIRECT_DISABLE),
+                        "explicit_sparse_payload": bool(explicit_sparse_payload),
+                        "selected_tokens": int(selected_token_idx.numel()),
+                        "packed_slots": int(slot_mapping_packed.numel()),
+                        "total_tokens": int(total_tokens),
+                        "cpu_chunks": int(len(cpu_tensors)),
+                        "using_cached_tensors": bool(
+                            layer_cached_tensors is not None
+                        ),
+                        "using_cached_ptr_tensor": bool(
+                            cached_ptr_tensor is not None
+                            and cached_ptr_tensor is chunk_ptrs_npu
+                        ),
+                        "load_stream_idx": int(load_stream_idx),
+                    },
+                )
+                # #endregion
 
             if _SPARSE_DIRECT_DISABLE:
                 self._run_sparse_staging_kv_transfer_layer(
