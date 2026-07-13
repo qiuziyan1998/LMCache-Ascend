@@ -70,12 +70,30 @@ _DENSE_DIRECT_STORE_DISABLE = (
     or os.getenv("LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0").lower()
     in ("1", "true", "yes", "on")
 )
+_STORE_USE_CURRENT_STREAM = os.getenv(
+    "LMCACHE_ASCEND_STORE_USE_CURRENT_STREAM", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_STORE_SYNC_BEFORE = os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_STORE_SYNC_BEFORE", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_STORE_SYNC_AFTER = os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_STORE_SYNC_AFTER", "0"
+).lower() in ("1", "true", "yes", "on")
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
     if isinstance(payload_event, (list, tuple)):
         return [event for event in payload_event if event is not None]
     return [payload_event]
+
+
+def _stream_context_or_null(stream, *, switch_stream: bool = True):
+    if not switch_stream or stream is None or not hasattr(stream, "device"):
+        return nullcontext()
+    stream_device = getattr(stream, "device", None)
+    if getattr(stream_device, "type", None) == "npu" and hasattr(torch, "npu"):
+        return torch.npu.stream(stream)
+    return torch.cuda.stream(stream)
 
 
 _IS_310P = None
@@ -968,14 +986,26 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         """
         assert memory_obj.tensor is not None
 
-        with torch.npu.stream(self.store_stream):
+        current_stream = torch.npu.current_stream()
+        store_transfer_stream = (
+            current_stream if _STORE_USE_CURRENT_STREAM else self.store_stream
+        )
+        switch_store_stream = not _STORE_USE_CURRENT_STREAM
+
+        with _stream_context_or_null(
+            store_transfer_stream,
+            switch_stream=switch_store_stream,
+        ):
             self.initialize_kvcaches_ptr(**kwargs)
 
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
-        with torch.npu.stream(self.store_stream):
+        with _stream_context_or_null(
+            store_transfer_stream,
+            switch_stream=switch_store_stream,
+        ):
             self._initialize_pointers(self.kvcaches)
 
         if "slot_mapping_npu" in kwargs:
@@ -986,7 +1016,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 raise ValueError("'slot_mapping' should be a torch.Tensor.")
             # for Ascend kernels to keep test inputs backward compatible.
             if slot_mapping.device.type != "npu":
-                with torch.npu.stream(self.store_stream):
+                with _stream_context_or_null(
+                    store_transfer_stream,
+                    switch_stream=switch_store_stream,
+                ):
                     slot_mapping = slot_mapping.to(
                         self.kvcaches_device,
                         non_blocking=True,
@@ -997,7 +1030,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 "(or 'slot_mapping' for compatibility)."
             )
 
-        with torch.npu.stream(self.store_stream):
+        with _stream_context_or_null(
+            store_transfer_stream,
+            switch_stream=switch_store_stream,
+        ):
             kv_cache_pointers = self.kv_cache_pointers_on_gpu[
                 self.kvcaches_device.index
             ]
@@ -1005,7 +1041,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
 
-        with torch.npu.stream(self.store_stream):
+        with _stream_context_or_null(
+            store_transfer_stream,
+            switch_stream=switch_store_stream,
+        ):
             # No staging buffer or token count mismatch
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
@@ -1043,7 +1082,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
-            self.store_stream.synchronize()
+            store_transfer_stream.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -1540,13 +1579,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
 
     @staticmethod
-    def _stream_context_or_null(stream):
-        if stream is None or not hasattr(stream, "device"):
-            return nullcontext()
-        stream_device = getattr(stream, "device", None)
-        if getattr(stream_device, "type", None) == "npu" and hasattr(torch, "npu"):
-            return torch.npu.stream(stream)
-        return torch.cuda.stream(stream)
+    def _stream_context_or_null(stream, *, switch_stream: bool = True):
+        return _stream_context_or_null(
+            stream,
+            switch_stream=switch_stream,
+        )
 
     @staticmethod
     def _sparse_direct_pointer_cache_signature(
@@ -2763,10 +2800,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_host_interleaved: bool,
         layer_tensors: List[torch.Tensor],
         direction: bool,
+        switch_stream: bool = True,
     ) -> None:
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
+
+        if not switch_stream:
+            transfer_stream = current_stream
 
         if _SPARSE_DIRECT_RECORD_STREAM:
             for tensor in (
@@ -2815,8 +2856,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if validate_key is None:
             validate_key = ("dense", kv_group, layer_id)
 
-        with self._stream_context_or_null(transfer_stream):
-            transfer_stream.wait_stream(current_stream)
+        with self._stream_context_or_null(
+            transfer_stream,
+            switch_stream=switch_stream,
+        ):
+            if switch_stream:
+                transfer_stream.wait_stream(current_stream)
+            if direction and _DENSE_DIRECT_STORE_SYNC_BEFORE:
+                transfer_stream.synchronize()
             if layer_state is not None:
                 validate_inputs = (
                     validate_key not in self._sparse_direct_validated_layers
@@ -2854,8 +2901,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
+            if direction and _DENSE_DIRECT_STORE_SYNC_AFTER:
+                transfer_stream.synchronize()
 
-        current_stream.wait_stream(transfer_stream)
+        if switch_stream:
+            current_stream.wait_stream(transfer_stream)
 
     def _single_layer_hidden_dim_args(
         self, kv_group: Optional[int] = None
@@ -4052,6 +4102,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
         current_stream = torch.npu.current_stream()
+        store_transfer_stream = (
+            current_stream if _STORE_USE_CURRENT_STREAM else self.store_stream
+        )
+        switch_store_stream = not _STORE_USE_CURRENT_STREAM
 
         try:
             for layer_id in range(self.num_layers):
@@ -4077,7 +4131,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         kvcaches_ref=kvcaches_snapshot,
                         kv_group=kv_group,
                         layer_id=layer_id,
-                        transfer_stream=self.store_stream,
+                        transfer_stream=store_transfer_stream,
                         current_stream=current_stream,
                         slot_mapping_full=slot_mapping_full,
                         chunk_ptrs_npu=chunk_ptrs_npu,
@@ -4094,11 +4148,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         dense_host_interleaved=dense_host_interleaved,
                         layer_tensors=cpu_tensors,
                         direction=True,
+                        switch_stream=switch_store_stream,
                     )
                     logger.debug("Finished offloading layer %d", layer_id)
                 else:
-                    with torch.npu.stream(self.store_stream):
-                        self.store_stream.wait_stream(current_stream)
+                    with self._stream_context_or_null(
+                        store_transfer_stream,
+                        switch_stream=switch_store_stream,
+                    ):
+                        if switch_store_stream:
+                            store_transfer_stream.wait_stream(current_stream)
                         if self.use_gpu:
                             cpu_tensors = []
                             for memory_obj in memory_objs_layer:
@@ -4145,7 +4204,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # store_layer publishes the CPU MemoryObjs immediately after the
                 # generator advances, so the layer's D2H copy must be complete
                 # before returning control regardless of the caller's sync hint.
-                self.store_stream.synchronize()
+                store_transfer_stream.synchronize()
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
@@ -4158,7 +4217,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 and tmp_gpu_buffer_obj is not None
                 and tmp_gpu_buffer_obj.is_valid()
             ):
-                self.store_stream.synchronize()
+                store_transfer_stream.synchronize()
                 tmp_gpu_buffer_obj.ref_count_down()
 
 

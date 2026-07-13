@@ -56,6 +56,18 @@ class _RecordableTensor:
         self.recorded_streams.append(stream)
 
 
+class _TrackingStream:
+    def __init__(self, name: str):
+        self.name = name
+        self.events = []
+
+    def wait_stream(self, stream):
+        self.events.append(("wait_stream", stream.name))
+
+    def synchronize(self):
+        self.events.append("synchronize")
+
+
 class _DenseLayout:
     k_hidden_dims = 1
     v_hidden_dims = 1
@@ -564,6 +576,146 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     assert fast_calls[1][0][0] is prepared[1]
     assert fast_calls[0][0][7] is False
     assert fast_calls[1][0][7] is True
+
+
+def test_dense_direct_store_sync_knobs_fence_launch(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_direct_layer_states = None
+    connector._sparse_direct_validated_layers = set()
+
+    transfer_stream = _TrackingStream("store")
+    current_stream = _TrackingStream("current")
+    slot_mapping = _RecordableTensor(8)
+    chunk_ptrs = _RecordableTensor(2)
+    chunk_offsets = _RecordableTensor(2, dtype=torch.int32)
+    chunk_sizes = _RecordableTensor(2, dtype=torch.int32)
+    layer_state = object()
+
+    monkeypatch.setattr(
+        npu_connectors,
+        "_DENSE_DIRECT_STORE_SYNC_BEFORE",
+        True,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "_DENSE_DIRECT_STORE_SYNC_AFTER",
+        True,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "prepare_sparse_direct_layer_state",
+        lambda *args, **kwargs: layer_state,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_batched_direct_kv_transfer_fast",
+        lambda *args, **kwargs: transfer_stream.events.append("launch"),
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_batched_direct_kv_transfer",
+        lambda *args, **kwargs: pytest.fail("slow dense direct path used"),
+    )
+
+    connector._run_dense_direct_kv_transfer_layer(
+        kvcaches_ref=[(object(), object())],
+        kv_group=0,
+        layer_id=0,
+        transfer_stream=transfer_stream,
+        current_stream=current_stream,
+        slot_mapping_full=slot_mapping,
+        chunk_ptrs_npu=chunk_ptrs,
+        chunk_offsets_npu=chunk_offsets,
+        chunk_sizes_npu=chunk_sizes,
+        total_tokens=8,
+        fixed_chunk_size=256,
+        dense_kv_format=5,
+        dense_token_major=False,
+        dense_vllm_two_major=False,
+        dense_k_hidden_dims=512,
+        dense_v_hidden_dims=64,
+        dense_dsa_hidden_dims=0,
+        dense_host_interleaved=False,
+        layer_tensors=[torch.zeros(8, dtype=torch.bfloat16)],
+        direction=True,
+    )
+
+    assert transfer_stream.events == [
+        ("wait_stream", "current"),
+        "synchronize",
+        "launch",
+        "synchronize",
+    ]
+    assert current_stream.events == [("wait_stream", "store")]
+
+
+def test_dense_direct_store_can_skip_stream_switch(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_direct_layer_states = None
+    connector._sparse_direct_validated_layers = set()
+
+    current_stream = _TrackingStream("current")
+    slot_mapping = _RecordableTensor(8)
+    chunk_ptrs = _RecordableTensor(2)
+    chunk_offsets = _RecordableTensor(2, dtype=torch.int32)
+    chunk_sizes = _RecordableTensor(2, dtype=torch.int32)
+    layer_state = object()
+
+    monkeypatch.setattr(
+        npu_connectors,
+        "_DENSE_DIRECT_STORE_SYNC_BEFORE",
+        True,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "_DENSE_DIRECT_STORE_SYNC_AFTER",
+        True,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "prepare_sparse_direct_layer_state",
+        lambda *args, **kwargs: layer_state,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_batched_direct_kv_transfer_fast",
+        lambda *args, **kwargs: current_stream.events.append("launch"),
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_batched_direct_kv_transfer",
+        lambda *args, **kwargs: pytest.fail("slow dense direct path used"),
+    )
+
+    connector._run_dense_direct_kv_transfer_layer(
+        kvcaches_ref=[(object(), object())],
+        kv_group=0,
+        layer_id=0,
+        transfer_stream=current_stream,
+        current_stream=current_stream,
+        slot_mapping_full=slot_mapping,
+        chunk_ptrs_npu=chunk_ptrs,
+        chunk_offsets_npu=chunk_offsets,
+        chunk_sizes_npu=chunk_sizes,
+        total_tokens=8,
+        fixed_chunk_size=256,
+        dense_kv_format=5,
+        dense_token_major=False,
+        dense_vllm_two_major=False,
+        dense_k_hidden_dims=512,
+        dense_v_hidden_dims=64,
+        dense_dsa_hidden_dims=0,
+        dense_host_interleaved=False,
+        layer_tensors=[torch.zeros(8, dtype=torch.bfloat16)],
+        direction=True,
+        switch_stream=False,
+    )
+
+    assert current_stream.events == [
+        "synchronize",
+        "launch",
+        "synchronize",
+    ]
 
 
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
@@ -1281,6 +1433,76 @@ def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["total_tokens"] == 401
     assert direct_calls[0]["chunk_offsets_npu"].tolist() == starts
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
+
+
+def test_dense_batched_from_gpu_can_use_current_stream(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kvcaches = [(object(), object())]
+    connector.use_gpu = True
+    connector.kv_device = torch.device("cpu")
+    connector.store_stream = _TrackingStream("store")
+    current_stream = _TrackingStream("current")
+
+    class _Npu:
+        def current_stream(self):
+            return current_stream
+
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_STORE_DISABLE", False)
+    monkeypatch.setattr(npu_connectors, "_STORE_USE_CURRENT_STREAM", True)
+    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **kwargs: None)
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda kvcaches, *, kv_group, init_staging: _DenseLayout(),
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda kv_group=0: True)
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda kv_group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda kv_group=0: False)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda kv_group=0: False
+    )
+    monkeypatch.setattr(
+        connector,
+        "_check_layerwise_transfer_invariants",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        lambda layer_id, cpu_tensors: torch.tensor([111], dtype=torch.long),
+    )
+
+    direct_calls = []
+    monkeypatch.setattr(
+        connector,
+        "_run_dense_direct_kv_transfer_layer",
+        lambda **kwargs: direct_calls.append(kwargs),
+    )
+
+    gen = connector.batched_from_gpu(
+        [[_MemoryObj(torch.zeros(128, dtype=torch.bfloat16))]],
+        [0],
+        [128],
+        slot_mapping=torch.arange(128, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+    )
+    next(gen)
+    next(gen)
+    gen.close()
+
+    assert len(direct_calls) == 1
+    assert direct_calls[0]["transfer_stream"] is current_stream
+    assert direct_calls[0]["current_stream"] is current_stream
+    assert direct_calls[0]["switch_stream"] is False
+    assert current_stream.events == ["synchronize"]
+    assert connector.store_stream.events == []
 
 
 @pytest.mark.parametrize("use_npu", [True])
