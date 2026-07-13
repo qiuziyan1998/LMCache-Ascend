@@ -1611,6 +1611,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_kvcaches_id = None
         self._sparse_direct_validated_layers = set()
 
+    def synchronize_shared_cpu_store_publication(self) -> None:
+        """Complete this rank's store work before publishing shared handles."""
+        if _STORE_USE_CURRENT_STREAM:
+            stream = (
+                torch.npu.current_stream()
+                if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
+                else torch.cuda.current_stream()
+            )
+        else:
+            stream = self.store_stream
+        stream.synchronize()
+
+    @staticmethod
+    def synchronize_shared_cpu_sparse_load() -> None:
+        """Submit and complete the passive rank's load-to-compute dependency."""
+        current_stream = (
+            torch.npu.current_stream()
+            if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
+            else torch.cuda.current_stream()
+        )
+        current_stream.synchronize()
+
     def _group_layout(self, kv_group: int) -> _GroupLayout:
         """Return the layout for ``kv_group``, raising if not initialized."""
         layout = self._group_layouts.get(kv_group)

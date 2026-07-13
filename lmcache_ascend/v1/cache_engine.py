@@ -1050,6 +1050,24 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_shared_handles.append([])
         cached_shared_handles[layer_id] = list(handles)
 
+    def _fence_shared_cpu_store_publication(self) -> None:
+        fence = getattr(
+            self.gpu_connector,
+            "synchronize_shared_cpu_store_publication",
+            None,
+        )
+        if callable(fence):
+            fence()
+
+    def _fence_shared_cpu_sparse_load(self) -> None:
+        fence = getattr(
+            self.gpu_connector,
+            "synchronize_shared_cpu_sparse_load",
+            None,
+        )
+        if callable(fence):
+            fence()
+
     def _is_shared_retrieve_passive(self, kv_group: int) -> bool:
         """Return whether this rank is passive for a shared retrieve group."""
         if kv_group == 1:
@@ -2031,6 +2049,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                             target_slot_mapping,
                         )
                     )
+                if mem_objs_layer:
+                    # The handle collective is a host-side publication gate,
+                    # but it cannot order another rank's NPU task queue. Wait
+                    # on the actual compute stream after the first shared load
+                    # has installed its local pointers and enqueued load ->
+                    # compute ordering.
+                    self._fence_shared_cpu_sparse_load()
 
             next(mem_obj_consumer)
             passive_views_handed_off = (
@@ -2525,6 +2550,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
+        shared_store_publication_fenced = False
         existing_rank0_backing_layers = kwargs.get(
             "shared_cpu_existing_rank0_backing_layers"
         )
@@ -2712,6 +2738,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                         raise ValueError(message)
                     try:
+                        if not shared_store_publication_fenced:
+                            # Store generators normally synchronize each layer
+                            # before storage publication. Reassert that contract
+                            # at the cross-rank publication boundary so handles
+                            # can never outrun a direct-to-host store.
+                            self._fence_shared_cpu_store_publication()
+                            shared_store_publication_fenced = True
                         if cached_mem_layers is not None:
                             claim_cached_shared_mem_objs_for_publication(
                                 mem_objs_layer

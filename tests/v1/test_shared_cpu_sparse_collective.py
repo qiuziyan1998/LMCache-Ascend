@@ -74,6 +74,24 @@ class _FakeSparseConsumer:
             yield
 
 
+class _OrderedSparseConsumer:
+    def __init__(self, events):
+        self.events = events
+
+    def batched_to_gpu_head_token_wise(self, **_kwargs):
+        payload = yield
+        while payload is not None:
+            self.events.append("load")
+            payload = yield
+        yield
+
+    def synchronize_shared_cpu_store_publication(self):
+        self.events.append("store_fence")
+
+    def synchronize_shared_cpu_sparse_load(self):
+        self.events.append("load_fence")
+
+
 class _FakeTensorMemObj:
     def __init__(self, tensor):
         self._tensor = tensor
@@ -683,6 +701,71 @@ def test_sparse_passive_populates_metadata_and_hands_off_views(monkeypatch):
     assert mem_obj.is_valid()
 
 
+def test_sparse_passive_fences_compute_after_shared_load(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    events = []
+    key = _make_key()
+    mem_obj = _FakeTensorMemObj(torch.empty(1))
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = _OrderedSparseConsumer(events)
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+
+    def receive_envelope():
+        events.append("receive")
+        return SharedHandleEnvelope(
+            request_id="req-1",
+            phase="sparse_decode_bootstrap",
+            request_ordinal=0,
+            layer_id=0,
+            kv_group=0,
+            status="ok",
+            generation=7,
+            handles=[object()],
+        )
+
+    engine._receive_shared_envelope = receive_envelope
+    original_append = AscendLMCacheEngine._append_retrieve_layer_cache
+
+    def append_cache(*args, **kwargs):
+        events.append("pointer_install")
+        return original_append(engine, *args, **kwargs)
+
+    engine._append_retrieve_layer_cache = append_cache
+
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_memory_objs=[],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=None,
+        cached_chunk_ptrs_npu=None,
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert events == ["receive", "pointer_install", "load", "load_fence"]
+
+
 def test_sparse_passive_close_before_handoff_releases_views(monkeypatch):
     monkeypatch.setattr(
         ascend_cache_engine,
@@ -811,6 +894,66 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
     assert mem_obj.pin_count == 1
     assert mem_obj.ref_down_count == 0
     assert mem_obj.unpin_count == 0
+
+
+def test_sparse_rank0_fences_store_before_first_handle_publication(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    events = []
+    key = _make_key()
+    mem_obj = _FakeClaimableMemObj()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.storage_manager = object()
+    engine.gpu_connector = _OrderedSparseConsumer(events)
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = AscendLMCacheEngine._has_retrieve_data_cache
+    engine._retrieve_data_cache_covers = (
+        AscendLMCacheEngine._retrieve_data_cache_covers
+    )
+    engine._min_layer_cache_chunks = AscendLMCacheEngine._min_layer_cache_chunks
+    engine._resolve_local_cpu_retrieve_location = lambda location: location
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0],
+        [1],
+        [[key]],
+    )
+
+    def make_handles(**_kwargs):
+        events.append("make_handles")
+        return ["handle"]
+
+    engine._make_shared_handles_for_layer = make_handles
+    engine._broadcast_shared_envelope = lambda _envelope: events.append("broadcast")
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[[key]],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=[[mem_obj]],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert events[:3] == ["store_fence", "make_handles", "broadcast"]
 
 
 def test_sparse_rank0_cached_publication_failure_releases_claim(monkeypatch):
@@ -969,10 +1112,11 @@ def test_sparse_rank0_hot_shared_handles_do_not_republish(monkeypatch):
     key = _make_key()
     cached_shared_handles = [["existing-handle"]]
     broadcasts = []
+    events = []
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     engine.storage_manager = object()
-    engine.gpu_connector = _FakeSparseConsumer()
+    engine.gpu_connector = _OrderedSparseConsumer(events)
     engine.shared_cpu_cache_generation = 7
     engine.is_healthy = lambda: True
     engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
@@ -1010,6 +1154,7 @@ def test_sparse_rank0_hot_shared_handles_do_not_republish(monkeypatch):
     retriever.send(([0], 0))
 
     assert broadcasts == []
+    assert "store_fence" not in events
     assert cached_shared_handles == [["existing-handle"]]
 
 
