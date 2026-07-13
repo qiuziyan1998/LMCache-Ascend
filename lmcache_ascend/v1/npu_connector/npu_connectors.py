@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 import time
@@ -150,6 +151,9 @@ _DENSE_DIRECT_STORE_SYNC_BEFORE = os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 _DENSE_DIRECT_STORE_SYNC_AFTER = os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_STORE_SYNC_AFTER", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_STORE_VERIFY = os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_STORE_VERIFY", "0"
 ).lower() in ("1", "true", "yes", "on")
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
@@ -2565,6 +2569,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             current_stream.synchronize()
             selected_cpu = selected_token_idx.detach().to(device="cpu").reshape(-1)
             slots_cpu = slot_mapping_packed.detach().to(device="cpu").reshape(-1)
+            selected_contiguous = selected_cpu.contiguous()
+            slots_contiguous = slots_cpu.contiguous()
+            selected_identity = torch.arange(
+                selected_contiguous.numel(), dtype=selected_contiguous.dtype
+            )
+            selected_sha256 = hashlib.sha256(
+                selected_contiguous.numpy().tobytes()
+            ).hexdigest()
+            slots_sha256 = hashlib.sha256(
+                slots_contiguous.numpy().tobytes()
+            ).hexdigest()
+            pair_sha256 = hashlib.sha256(
+                selected_contiguous.numpy().tobytes()
+                + slots_contiguous.numpy().tobytes()
+            ).hexdigest()
             sample_positions = sorted(
                 {
                     0,
@@ -2624,7 +2643,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ):
                     if plane_dim <= 0:
                         continue
-                    compare_width = min(16, plane_dim)
+                    compare_width = plane_dim
                     cpu_start = plane_base + local_token * plane_dim
                     expected = chunk_flat[
                         cpu_start : cpu_start + compare_width
@@ -2662,6 +2681,48 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "mismatched_elements": int(mismatched_elements),
                     "max_abs_diff": float(max_abs_diff),
                     "parity_ok": bool(mismatched_elements == 0),
+                },
+            )
+            # #endregion
+
+            # #region agent log
+            _agent_debug_log(
+                "H13,H14,H15,H16",
+                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer:metadata",
+                "sparse selected-token and target-slot fingerprint",
+                {
+                    **_agent_debug_runtime_identity(),
+                    "kv_group": int(kv_group),
+                    "layer_id": int(layer_id),
+                    "num_sparse": int(num_sparse),
+                    "selected_sha256": selected_sha256,
+                    "slots_sha256": slots_sha256,
+                    "pair_sha256": pair_sha256,
+                    "selected_is_identity": bool(
+                        torch.equal(selected_contiguous, selected_identity)
+                    ),
+                    "selected_min": int(selected_contiguous.min().item()),
+                    "selected_max": int(selected_contiguous.max().item()),
+                    "selected_unique": int(
+                        torch.unique(selected_contiguous).numel()
+                    ),
+                    "slots_min": int(slots_contiguous.min().item()),
+                    "slots_max": int(slots_contiguous.max().item()),
+                    "slots_unique": int(torch.unique(slots_contiguous).numel()),
+                    "selected_head": [
+                        int(value)
+                        for value in selected_contiguous[:8].tolist()
+                    ],
+                    "selected_tail": [
+                        int(value)
+                        for value in selected_contiguous[-8:].tolist()
+                    ],
+                    "slots_head": [
+                        int(value) for value in slots_contiguous[:8].tolist()
+                    ],
+                    "slots_tail": [
+                        int(value) for value in slots_contiguous[-8:].tolist()
+                    ],
                 },
             )
             # #endregion
@@ -4506,6 +4567,126 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # generator advances, so the layer's D2H copy must be complete
                 # before returning control regardless of the caller's sync hint.
                 store_transfer_stream.synchronize()
+                if (
+                    dense_direct
+                    and _DENSE_DIRECT_STORE_VERIFY
+                    and layer_id in (0, self.num_layers - 1)
+                ):
+                    sample_positions = sorted(
+                        {
+                            0,
+                            max(0, num_tokens // 2),
+                            max(0, num_tokens - 1),
+                        }
+                    )
+                    layer_cache = kvcaches_snapshot[layer_id]
+                    paged_tensors = (
+                        list(layer_cache)
+                        if isinstance(layer_cache, (tuple, list))
+                        else [layer_cache]
+                    )
+                    if len(paged_tensors) == 1:
+                        plane_dims = [int(k_hidden_dims)]
+                    elif len(paged_tensors) == 2:
+                        plane_dims = [
+                            int(k_hidden_dims),
+                            int(v_hidden_dims),
+                        ]
+                    else:
+                        plane_dims = [
+                            int(k_hidden_dims),
+                            int(v_hidden_dims),
+                            int(dsa_hidden_dims),
+                        ]
+                    slot_mapping_cpu = (
+                        slot_mapping_full.detach().to(device="cpu").reshape(-1)
+                    )
+                    compared_elements = 0
+                    mismatched_elements = 0
+                    max_abs_diff = 0.0
+                    checked_tokens = 0
+                    for sample_position in sample_positions:
+                        source_slot = int(
+                            slot_mapping_cpu[sample_position].item()
+                        )
+                        if source_slot < 0:
+                            continue
+                        chunk_id = next(
+                            (
+                                index
+                                for index, (offset, size) in enumerate(
+                                    zip(
+                                        chunk_offsets,
+                                        chunk_sizes,
+                                        strict=False,
+                                    )
+                                )
+                                if offset
+                                <= sample_position
+                                < offset + size
+                            ),
+                            None,
+                        )
+                        if chunk_id is None:
+                            continue
+                        local_token = (
+                            sample_position - chunk_offsets[chunk_id]
+                        )
+                        chunk_tokens = chunk_sizes[chunk_id]
+                        chunk_flat = cpu_tensors[chunk_id].detach().reshape(-1)
+                        plane_base = 0
+                        checked_tokens += 1
+                        for paged_tensor, plane_dim in zip(
+                            paged_tensors, plane_dims, strict=False
+                        ):
+                            if plane_dim <= 0:
+                                continue
+                            cpu_start = (
+                                plane_base + local_token * plane_dim
+                            )
+                            actual = chunk_flat[
+                                cpu_start : cpu_start + plane_dim
+                            ].to(dtype=torch.float32)
+                            paged_start = source_slot * plane_dim
+                            expected = (
+                                paged_tensor.detach()
+                                .reshape(-1)[
+                                    paged_start : paged_start + plane_dim
+                                ]
+                                .to(device="cpu", dtype=torch.float32)
+                            )
+                            difference = (actual - expected).abs()
+                            compared_elements += int(difference.numel())
+                            mismatched_elements += int(
+                                torch.count_nonzero(difference).item()
+                            )
+                            if difference.numel():
+                                max_abs_diff = max(
+                                    max_abs_diff,
+                                    float(difference.max().item()),
+                                )
+                            plane_base += chunk_tokens * plane_dim
+
+                    # #region agent log
+                    _agent_debug_log(
+                        "H17,H18,H19",
+                        "npu_connectors.py:batched_from_gpu:dense_store_verify",
+                        "dense direct paged-to-CPU parity",
+                        {
+                            **_agent_debug_runtime_identity(),
+                            "kv_group": int(kv_group),
+                            "layer_id": int(layer_id),
+                            "num_tokens": int(num_tokens),
+                            "checked_tokens": int(checked_tokens),
+                            "compared_elements": int(compared_elements),
+                            "mismatched_elements": int(
+                                mismatched_elements
+                            ),
+                            "max_abs_diff": float(max_abs_diff),
+                            "parity_ok": bool(mismatched_elements == 0),
+                        },
+                    )
+                    # #endregion
                 if dense_direct and layer_id in (0, self.num_layers - 1):
                     # #region agent log
                     _agent_debug_log(
