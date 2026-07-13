@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
+import json
 import os
+import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -38,6 +40,51 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+# #region agent log
+def _agent_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+) -> None:
+    payload = {
+        "sessionId": "51d8e7",
+        "runId": "baseline",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open("debug-51d8e7.log", "a", encoding="utf-8") as debug_file:
+            debug_file.write(json.dumps(payload, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _agent_debug_tensor_summary(tensor: torch.Tensor) -> dict:
+    flat = tensor.detach().reshape(-1)
+    sample_count = min(32, int(flat.numel()))
+    if sample_count:
+        step = max(1, int(flat.numel()) // sample_count)
+        values = flat[::step][:sample_count].to(dtype=torch.float32)
+        sample = [float(value) for value in values.tolist()]
+    else:
+        sample = []
+    return {
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "dtype": str(tensor.dtype),
+        "numel": int(tensor.numel()),
+        "host_ptr": int(tensor.data_ptr()),
+        "sample": sample,
+        "sample_sum": float(sum(sample)),
+        "sample_abs_sum": float(sum(abs(value) for value in sample)),
+        "sample_nonzero": int(sum(value != 0.0 for value in sample)),
+    }
+# #endregion
 
 _SPARSE_DIRECT_GUARD = os.getenv("LMCACHE_ASCEND_SPARSE_DIRECT_GUARD", "0").lower() in (
     "1",
@@ -2837,6 +2884,55 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dense_dsa_hidden_dims=dense_dsa_hidden_dims,
             direction=direction,
         )
+        if layer_id in (0, self.num_layers - 1):
+            # #region agent log
+            _agent_debug_log(
+                "H1,H2,H3,H4",
+                "npu_connectors.py:_run_dense_direct_kv_transfer_layer",
+                "dense direct launch inputs",
+                {
+                    "rank": os.getenv("RANK", os.getenv("LOCAL_RANK", "unknown")),
+                    "direction": "store" if direction else "load",
+                    "kv_group": int(kv_group),
+                    "layer_id": int(layer_id),
+                    "num_tokens": num_tokens,
+                    "total_tokens": int(total_tokens),
+                    "fixed_chunk_size": int(fixed_chunk_size),
+                    "num_chunks": int(chunk_ptrs_npu.numel()),
+                    "format": int(dense_kv_format),
+                    "token_major": bool(dense_token_major),
+                    "vllm_two_major": bool(dense_vllm_two_major),
+                    "host_interleaved": bool(dense_host_interleaved),
+                    "hidden_dims": [
+                        int(dense_k_hidden_dims),
+                        int(dense_v_hidden_dims),
+                        int(dense_dsa_hidden_dims),
+                    ],
+                    "switch_stream": bool(switch_stream),
+                    "same_stream": transfer_stream is current_stream,
+                    "store_aiv_env": os.getenv(
+                        "LMCACHE_ASCEND_DENSE_DIRECT_STORE_AIV_NUM", "default"
+                    ),
+                    "cpu_host_ptrs": [
+                        int(tensor.data_ptr()) for tensor in layer_tensors
+                    ],
+                    "cpu_summaries": (
+                        [
+                            _agent_debug_tensor_summary(tensor)
+                            for tensor in layer_tensors
+                        ]
+                        if not direction
+                        else []
+                    ),
+                    "resolved_device_ptrs": [
+                        int(value)
+                        for value in chunk_ptrs_npu.detach()
+                        .to(device="cpu")
+                        .tolist()
+                    ],
+                },
+            )
+            # #endregion
         layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
             kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
@@ -2901,6 +2997,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
+            if layer_id in (0, self.num_layers - 1):
+                # #region agent log
+                _agent_debug_log(
+                    "H1,H3",
+                    "npu_connectors.py:_run_dense_direct_kv_transfer_layer:post_launch",
+                    "dense direct kernel enqueued",
+                    {
+                        "rank": os.getenv(
+                            "RANK", os.getenv("LOCAL_RANK", "unknown")
+                        ),
+                        "direction": "store" if direction else "load",
+                        "kv_group": int(kv_group),
+                        "layer_id": int(layer_id),
+                        "sync_after_env": bool(_DENSE_DIRECT_STORE_SYNC_AFTER),
+                    },
+                )
+                # #endregion
             if direction and _DENSE_DIRECT_STORE_SYNC_AFTER:
                 transfer_stream.synchronize()
 
@@ -4205,6 +4318,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # generator advances, so the layer's D2H copy must be complete
                 # before returning control regardless of the caller's sync hint.
                 store_transfer_stream.synchronize()
+                if dense_direct and layer_id in (0, self.num_layers - 1):
+                    # #region agent log
+                    _agent_debug_log(
+                        "H1,H3,H5",
+                        "npu_connectors.py:batched_from_gpu:post_sync",
+                        "store stream synchronized before layer publication",
+                        {
+                            "rank": os.getenv(
+                                "RANK", os.getenv("LOCAL_RANK", "unknown")
+                            ),
+                            "kv_group": int(kv_group),
+                            "layer_id": int(layer_id),
+                            "summaries": [
+                                _agent_debug_tensor_summary(tensor)
+                                for tensor in cpu_tensors
+                            ],
+                        },
+                    )
+                    # #endregion
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
