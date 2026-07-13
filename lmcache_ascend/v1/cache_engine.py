@@ -422,6 +422,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         *,
         req_id: str,
         layer_id: int,
+        kv_group: int,
         keys: List[Any],
         tensors: List[torch.Tensor],
     ) -> None:
@@ -430,9 +431,27 @@ class AscendLMCacheEngine(LMCacheEngine):
         matched = 0
         missing = 0
         mismatched = 0
+        digest_failed = 0
         mismatch_key_hashes: List[str] = []
+        key_manifest = hashlib.sha256()
+        actual_manifest = hashlib.sha256()
         for key, tensor in zip(keys, tensors, strict=False):
             record_key = self._dsa_validate_key(layer_id, key)
+            key_manifest.update(record_key.encode("utf-8"))
+            try:
+                actual = self._dsa_validate_tensor_digest(tensor)
+            except Exception as exc:
+                digest_failed += 1
+                logger.exception(
+                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_failed "
+                    "req=%s layer=%s key=%s error=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                    exc,
+                )
+                continue
+            actual_manifest.update(actual["sha256"].encode("ascii"))
             expected = self._dsa_validate_kv_digests.get(record_key)
             if expected is None:
                 missing += 1
@@ -448,18 +467,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     req_id,
                     layer_id,
                     key,
-                )
-                continue
-            try:
-                actual = self._dsa_validate_tensor_digest(tensor)
-            except Exception as exc:
-                logger.exception(
-                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_failed "
-                    "req=%s layer=%s key=%s error=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                    exc,
                 )
                 continue
             if actual["sha256"] != expected["digest"]["sha256"]:
@@ -497,6 +504,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             else:
                 matched += 1
 
+        distributed_rank = None
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                distributed_rank = int(torch.distributed.get_rank())
+        except RuntimeError:
+            pass
         # #region agent log
         _agent_debug_log(
             "H20,H21,H22,H24",
@@ -504,18 +517,25 @@ class AscendLMCacheEngine(LMCacheEngine):
             "cache-key store-to-retrieve whole-chunk parity",
             {
                 "pid": int(os.getpid()),
-                "rank": os.getenv("RANK", os.getenv("LOCAL_RANK", "unknown")),
+                "distributed_rank": distributed_rank,
+                "env_rank": os.getenv("RANK"),
+                "env_local_rank": os.getenv("LOCAL_RANK"),
                 "req_id": req_id,
+                "kv_group": int(kv_group),
                 "layer_id": int(layer_id),
                 "key_count": int(len(keys)),
                 "tensor_count": int(len(tensors)),
                 "matched": int(matched),
                 "missing": int(missing),
                 "mismatched": int(mismatched),
+                "digest_failed": int(digest_failed),
+                "key_manifest_sha256": key_manifest.hexdigest(),
+                "actual_manifest_sha256": actual_manifest.hexdigest(),
                 "all_ok": bool(
                     len(keys) == len(tensors)
                     and missing == 0
                     and mismatched == 0
+                    and digest_failed == 0
                     and matched == len(keys)
                 ),
                 "mismatch_key_hashes": mismatch_key_hashes[:8],
@@ -2777,6 +2797,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self._dsa_check_retrieve_digests(
                         req_id=kwargs.get("req_id", "unspecified"),
                         layer_id=layer_id,
+                        kv_group=kv_group,
                         keys=retrieve_keys[layer_id],
                         tensors=validation_tensors,
                     )
