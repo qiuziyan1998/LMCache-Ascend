@@ -1201,6 +1201,7 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
         lambda **kwargs: direct_calls.append(kwargs),
     )
 
+    local_slot_mapping = torch.arange(1000, 1273, dtype=torch.long)
     gen = connector.batched_from_gpu(
         [
             [
@@ -1208,9 +1209,10 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
                 _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
             ]
         ],
-        [0, 256],
-        [256, 273],
-        slot_mapping=torch.arange(273, dtype=torch.long),
+        [256, 512],
+        [512, 529],
+        slot_mapping=local_slot_mapping,
+        slot_mapping_base=256,
         sync=False,
         kv_group=0,
     )
@@ -1225,6 +1227,9 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert direct_calls[0]["direction"] is True
     assert direct_calls[0]["total_tokens"] == 273
     assert direct_calls[0]["fixed_chunk_size"] == 256
+    assert torch.equal(
+        direct_calls[0]["slot_mapping_full"], local_slot_mapping
+    )
 
 
 def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(

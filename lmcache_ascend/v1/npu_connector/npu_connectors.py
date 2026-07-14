@@ -3597,6 +3597,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("'sync' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping_base = int(kwargs.get("slot_mapping_base", 0))
+        if slot_mapping_base < 0:
+            raise ValueError(
+                "slot_mapping_base must be non-negative, "
+                f"got {slot_mapping_base}"
+            )
 
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
@@ -3624,7 +3630,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
+            local_start = start - slot_mapping_base
+            local_end = end - slot_mapping_base
+            if (
+                local_start < 0
+                or local_end < local_start
+                or local_end > len(slot_mapping)
+            ):
+                raise ValueError(
+                    "Layerwise store chunk is outside the provided slot-mapping "
+                    "window: "
+                    f"chunk=[{start}, {end}), base={slot_mapping_base}, "
+                    f"mapping_tokens={len(slot_mapping)}, "
+                    f"local_chunk=[{local_start}, {local_end})"
+                )
+            slot_mapping_chunks.append(slot_mapping[local_start:local_end])
 
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 

@@ -25,6 +25,7 @@ import torch
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat
+from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 # Local
 from .utils import dumb_metadata, generate_tokens
@@ -446,6 +447,88 @@ class TestStoreLayerPassiveGuard:
         )
         list(gen)
         engine.token_database.process_tokens.assert_called()
+
+
+def test_sparse_window_store_cache_publishes_only_full_chunks() -> None:
+    engine = SimpleNamespace(enable_shared_cpu_cache=False)
+    full_tensor = torch.tensor([1])
+    partial_tensor = torch.tensor([2])
+    full_obj = SimpleNamespace(tensor=full_tensor)
+    partial_obj = SimpleNamespace(tensor=partial_tensor)
+    keys = [["full-key", "partial-key"]]
+    memory_objs = [[full_obj, partial_obj]]
+    cached_keys: list[list] = []
+    cached_starts: list[int] = []
+    cached_ends: list[int] = []
+    cached_memory_objs: list[list] = []
+    cached_tensors: list[list] = []
+
+    AscendLMCacheEngine._append_layerwise_store_cache_chunks(
+        engine,
+        keys=keys,
+        starts=[0, 256],
+        ends=[256, 300],
+        memory_objs=memory_objs,
+        cached_keys=cached_keys,
+        cached_starts=cached_starts,
+        cached_ends=cached_ends,
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=cached_tensors,
+        cache_chunk_indices=[0],
+    )
+    AscendLMCacheEngine._append_layer_store_tensors(
+        engine,
+        0,
+        memory_objs,
+        cached_tensors,
+        cache_chunk_indices=[0],
+    )
+
+    assert cached_starts == [0]
+    assert cached_ends == [256]
+    assert cached_keys == [["full-key"]]
+    assert len(cached_memory_objs) == 1
+    assert len(cached_memory_objs[0]) == 1
+    assert cached_memory_objs[0][0] is full_obj
+    assert len(cached_tensors) == 1
+    assert len(cached_tensors[0]) == 1
+    assert cached_tensors[0][0] is full_tensor
+
+
+def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
+    cached_starts = [0, 256]
+    cached_ends = [256, 300]
+    cached_keys = [["full-0", "partial-1"]]
+    cached_memory_objs = [["mem-0", "partial-mem-1"]]
+    cached_tensors = [["tensor-0", "partial-tensor-1"]]
+    cached_chunk_dev_ptrs = [[11, 22]]
+    cached_chunk_ptrs_npu = [torch.tensor([11, 22], dtype=torch.long)]
+    cached_shared_handles = [["handle-0", "partial-handle-1"]]
+
+    replaced_at = (
+        AscendLMCacheEngine._truncate_store_cache_for_full_chunk_successor(
+            starts=cached_starts,
+            ends=cached_ends,
+            new_starts=[256],
+            new_ends=[512],
+            cached_keys=cached_keys,
+            cached_memory_objs=cached_memory_objs,
+            cached_tensors=cached_tensors,
+            cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+            cached_shared_handles=cached_shared_handles,
+        )
+    )
+
+    assert replaced_at == 1
+    assert cached_starts == [0]
+    assert cached_ends == [256]
+    assert cached_keys == [["full-0"]]
+    assert cached_memory_objs == [["mem-0"]]
+    assert cached_tensors == [["tensor-0"]]
+    assert cached_chunk_dev_ptrs == [[11]]
+    assert cached_chunk_ptrs_npu[0].tolist() == [11]
+    assert cached_shared_handles == [["handle-0"]]
 
 
 class TestLayerwiseLayoutWarmup:

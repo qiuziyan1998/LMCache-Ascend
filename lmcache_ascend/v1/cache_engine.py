@@ -566,13 +566,26 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_ends: Optional[List[int]],
         cached_memory_objs: Optional[List],
         cached_tensors: Optional[List],
+        cache_chunk_indices: Optional[List[int]] = None,
     ) -> None:
-        """Append a store batch; never clear across chunked prefill calls."""
+        """Append cacheable store chunks; storage still receives the full batch."""
         num_layers = len(keys)
+        chunk_indices = (
+            list(range(len(starts)))
+            if cache_chunk_indices is None
+            else cache_chunk_indices
+        )
+        if any(index < 0 or index >= len(starts) for index in chunk_indices):
+            raise ValueError(
+                "Layerwise store cache chunk selection is out of range: "
+                f"indices={chunk_indices}, chunk_count={len(starts)}"
+            )
+        selected_starts = [starts[index] for index in chunk_indices]
+        selected_ends = [ends[index] for index in chunk_indices]
         if cached_starts is not None:
-            cached_starts.extend(starts)
+            cached_starts.extend(selected_starts)
         if cached_ends is not None:
-            cached_ends.extend(ends)
+            cached_ends.extend(selected_ends)
         if cached_keys is not None:
             if not cached_keys:
                 cached_keys.extend([] for _ in range(num_layers))
@@ -580,15 +593,68 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"cached_keys has {len(cached_keys)} layers, expected {num_layers}"
             )
             for layer_id, layer_keys in enumerate(keys):
-                cached_keys[layer_id].extend(layer_keys)
+                cached_keys[layer_id].extend(
+                    layer_keys[index] for index in chunk_indices
+                )
         if cached_memory_objs is not None:
             if not cached_memory_objs:
                 cached_memory_objs.extend([] for _ in range(num_layers))
             assert len(cached_memory_objs) == num_layers
             for layer_id, layer_objs in enumerate(memory_objs):
-                cached_memory_objs[layer_id].extend(layer_objs)
+                cached_memory_objs[layer_id].extend(
+                    layer_objs[index] for index in chunk_indices
+                )
         if cached_tensors is not None and not cached_tensors:
             cached_tensors.extend([] for _ in range(num_layers))
+
+    @staticmethod
+    def _truncate_store_cache_for_full_chunk_successor(
+        *,
+        starts: List[int],
+        ends: List[int],
+        new_starts: List[int],
+        new_ends: List[int],
+        cached_keys: Optional[List],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        cached_shared_handles: Optional[List],
+    ) -> Optional[int]:
+        """Drop a cached partial tail before publishing its full successor."""
+        replace_at: Optional[int] = None
+        for new_start, new_end in zip(new_starts, new_ends, strict=False):
+            for chunk_index, (old_start, old_end) in enumerate(
+                zip(starts, ends, strict=False)
+            ):
+                if old_start == new_start and new_end > old_end:
+                    replace_at = chunk_index
+                    break
+            if replace_at is not None:
+                break
+        if replace_at is None:
+            return None
+
+        del starts[replace_at:]
+        del ends[replace_at:]
+        for layer_cache in (
+            cached_keys,
+            cached_memory_objs,
+            cached_tensors,
+            cached_chunk_dev_ptrs,
+            cached_shared_handles,
+        ):
+            if layer_cache is None:
+                continue
+            for layer_values in layer_cache:
+                if isinstance(layer_values, list):
+                    del layer_values[replace_at:]
+
+        if cached_chunk_ptrs_npu is not None:
+            for layer_id, ptrs in enumerate(cached_chunk_ptrs_npu):
+                if isinstance(ptrs, torch.Tensor):
+                    cached_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
+        return replace_at
 
     @staticmethod
     def _remove_pending_layerwise_store_objs(
@@ -614,10 +680,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List] = None,
         cached_chunk_ptrs_npu: Optional[List] = None,
+        cache_chunk_indices: Optional[List[int]] = None,
     ) -> None:
+        layer_memory_objs = memory_objs[layer_id]
+        if cache_chunk_indices is not None:
+            layer_memory_objs = [
+                layer_memory_objs[index] for index in cache_chunk_indices
+            ]
         new_tensors: List[torch.Tensor] = [
             mem_obj.tensor
-            for mem_obj in memory_objs[layer_id]
+            for mem_obj in layer_memory_objs
             if mem_obj.tensor is not None
         ]
         if (
@@ -1274,6 +1346,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors = kwargs.get("cached_tensors")
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_shared_handles = kwargs.get("cached_shared_handles")
 
         starts = []
         ends = []
@@ -1431,6 +1504,36 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
+            cache_chunk_indices: Optional[List[int]] = None
+            if bool(kwargs.get("windowed_sparse_save", False)):
+                # Partial tails are valid storage entries, but sparse direct
+                # pointer tables assume fixed-size LMCache chunks. Keep tails
+                # out of request-local pointer/cache publication until a later
+                # full successor for the same aligned chunk is committed.
+                chunk_size = int(self.config.chunk_size)
+                cache_chunk_indices = [
+                    index
+                    for index, (start, end) in enumerate(
+                        zip(starts, ends, strict=False)
+                    )
+                    if start % chunk_size == 0 and end - start == chunk_size
+                ]
+
+                selected_starts = [starts[index] for index in cache_chunk_indices]
+                selected_ends = [ends[index] for index in cache_chunk_indices]
+                self._truncate_store_cache_for_full_chunk_successor(
+                    starts=cached_starts,
+                    ends=cached_ends,
+                    new_starts=selected_starts,
+                    new_ends=selected_ends,
+                    cached_keys=cached_keys,
+                    cached_memory_objs=cached_memory_objs,
+                    cached_tensors=cached_tensors,
+                    cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+                    cached_shared_handles=cached_shared_handles,
+                )
+
             self._append_layerwise_store_cache_chunks(
                 keys=keys,
                 starts=starts,
@@ -1441,6 +1544,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_ends=cached_ends,
                 cached_memory_objs=cached_memory_objs,
                 cached_tensors=cached_tensors,
+                cache_chunk_indices=cache_chunk_indices,
             )
 
             try:
@@ -1460,6 +1564,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_tensors,
                         cached_chunk_dev_ptrs,
                         cached_chunk_ptrs_npu,
+                        cache_chunk_indices,
                     )
                     self.storage_manager.batched_put(
                         keys[layer_id],
