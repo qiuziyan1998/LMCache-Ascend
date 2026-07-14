@@ -1317,13 +1317,13 @@ class TestAdapterIndexerSlotMapping:
         attn = SimpleNamespace(slot_mapping=None, indexer_slot_mapping=None)
         assert _adapter_method("_indexer_retrieve_slot_mapping")(fake, attn, 5) is None
 
-    def test_no_slice_when_count_exceeds_length(self):
+    def test_rejects_mapping_when_count_exceeds_length(self):
         fake = self._make_fake()
         attn = SimpleNamespace(
             slot_mapping=torch.arange(4), indexer_slot_mapping=None
         )
         slot = _adapter_method("_indexer_retrieve_slot_mapping")(fake, attn, 10)
-        assert slot.tolist() == [0, 1, 2, 3]
+        assert slot is None
 
 
 class TestStorerDualPop:
@@ -1338,6 +1338,34 @@ class TestStorerDualPop:
 
         return _gen()
 
+    @staticmethod
+    def _make_fake(meta, storers):
+        return SimpleNamespace(
+            kv_role="kv_producer",
+            use_layerwise=True,
+            _layerwise_save_storers=storers,
+            _should_defer_latent_save_under_tp=lambda: False,
+            _layerwise_save_storer_key=(
+                lambda request, kv_group: (request.req_id, kv_group)
+            ),
+            _is_decode_window_save_request=_adapter_method(
+                "_is_decode_window_save_request"
+            ),
+            _advance_layerwise_storer_once=_adapter_method(
+                "_advance_layerwise_storer_once"
+            ),
+            _close_layerwise_storer=_adapter_method("_close_layerwise_storer"),
+            _record_decode_window_save_group_completed=(
+                lambda request, kv_group: None
+            ),
+            _mark_decode_window_save_completed=lambda request: None,
+            _maybe_lookup_unpin_for_request=lambda request: None,
+            _maybe_seed_worker_retrieve_state_from_store=lambda request: None,
+            _parent=SimpleNamespace(
+                _get_connector_metadata=lambda: meta,
+            ),
+        )
+
     def test_wait_for_save_pops_both_groups(self):
         from lmcache.integration.vllm.vllm_v1_adapter import (
             LMCacheConnectorMetadata,
@@ -1350,16 +1378,7 @@ class TestStorerDualPop:
         gen1 = self._make_storer_gen()
         storers = {("r1", 0): gen0, ("r1", 1): gen1}
 
-        fake = SimpleNamespace(
-            kv_role="kv_producer",
-            use_layerwise=True,
-            _layerwise_save_storers=storers,
-            _maybe_lookup_unpin_for_request=lambda req: None,
-            _maybe_seed_worker_retrieve_state_from_store=lambda req: None,
-            _parent=SimpleNamespace(
-                _get_connector_metadata=lambda: meta,
-            ),
-        )
+        fake = self._make_fake(meta, storers)
         _adapter_method("wait_for_save")(fake)
         # Both group storers are popped.
         assert ("r1", 0) not in storers
@@ -1377,16 +1396,7 @@ class TestStorerDualPop:
         gen0 = self._make_storer_gen()
         storers = {("r2", 0): gen0}  # indexer storer never created
 
-        fake = SimpleNamespace(
-            kv_role="kv_producer",
-            use_layerwise=True,
-            _layerwise_save_storers=storers,
-            _maybe_lookup_unpin_for_request=lambda req: None,
-            _maybe_seed_worker_retrieve_state_from_store=lambda req: None,
-            _parent=SimpleNamespace(
-                _get_connector_metadata=lambda: meta,
-            ),
-        )
+        fake = self._make_fake(meta, storers)
         _adapter_method("wait_for_save")(fake)
         assert storers == {}
 
@@ -1471,8 +1481,7 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
 
 
 class TestRetrieverPairAdvancement:
-    """wait_for_layer_load advances the latent retriever and, when present,
-    the indexer retriever in lockstep per layer."""
+    """Per-group waits advance a layer after all required groups arrive."""
 
     def _make_fake_retriever(self, name):
         """A generator that yields many times (the real retrieve_layer
@@ -1487,6 +1496,21 @@ class TestRetrieverPairAdvancement:
 
         gen = _gen()
         return gen, log
+
+    @staticmethod
+    def _bind_wait_protocol(fake, dsa_two_groups):
+        fake.config = SimpleNamespace(dsa_two_groups=dsa_two_groups)
+        fake._indexer_layer_names = []
+        fake._layerwise_waited_groups = set()
+        fake._layerwise_required_wait_groups_cache = None
+        return _bind_real(
+            fake,
+            "_is_dsa_two_groups",
+            "_is_indexer_layer_wait",
+            "_layerwise_wait_group",
+            "_layerwise_required_wait_groups",
+            "_layerwise_wait_should_advance",
+        )
 
     def test_prefix_advances_both_retrievers(self):
         from lmcache.integration.vllm.vllm_v1_adapter import (
@@ -1509,16 +1533,20 @@ class TestRetrieverPairAdvancement:
                 is_sparse_decode=False,
             )]
         )
-        fake = SimpleNamespace(
-            layerwise_retrievers=[(latent_gen, indexer_gen)],
-            _layerwise_retriever_is_sparse=[False],
-            current_layer=0,
-            num_layers=2,
-            _parent=SimpleNamespace(_get_connector_metadata=lambda: meta),
-            _finalize_worker_retrieve_state_from_metadata=lambda m: None,
+        fake = self._bind_wait_protocol(
+            SimpleNamespace(
+                layerwise_retrievers=[(latent_gen, indexer_gen)],
+                _layerwise_retriever_is_sparse=[False],
+                current_layer=0,
+                num_layers=2,
+                _parent=SimpleNamespace(_get_connector_metadata=lambda: meta),
+                _finalize_worker_retrieve_state_from_metadata=lambda m: None,
+            ),
+            dsa_two_groups=True,
         )
-        _adapter_method("wait_for_layer_load")(fake, layer_name="x")
-        # Both retrievers advanced one layer beyond the two priming next()s.
+        _adapter_method("wait_for_layer_load")(fake, layer_name="layer.0")
+        assert fake.current_layer == 0
+        _adapter_method("wait_for_layer_load")(fake, layer_name="indexer.0")
         assert fake.current_layer == 1
 
     def test_sparse_advances_primary_only(self):
@@ -1536,13 +1564,16 @@ class TestRetrieverPairAdvancement:
                 is_sparse_decode=True,
             )]
         )
-        fake = SimpleNamespace(
-            layerwise_retrievers=[(primary_gen, None)],
-            _layerwise_retriever_is_sparse=[True],
-            current_layer=0,
-            num_layers=2,
-            _parent=SimpleNamespace(_get_connector_metadata=lambda: meta),
-            _finalize_worker_retrieve_state_from_metadata=lambda m: None,
+        fake = self._bind_wait_protocol(
+            SimpleNamespace(
+                layerwise_retrievers=[(primary_gen, None)],
+                _layerwise_retriever_is_sparse=[True],
+                current_layer=0,
+                num_layers=2,
+                _parent=SimpleNamespace(_get_connector_metadata=lambda: meta),
+                _finalize_worker_retrieve_state_from_metadata=lambda m: None,
+            ),
+            dsa_two_groups=True,
         )
         # Sparse path uses .send(...) with selected_tokens.
         _adapter_method("wait_for_layer_load")(
@@ -1564,7 +1595,12 @@ def _bind_real(fake, *names):
     from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
     for name in names:
-        setattr(fake, name, getattr(LMCacheConnectorV1Impl, name).__get__(fake))
+        method = getattr(LMCacheConnectorV1Impl, name)
+        descriptor = vars(LMCacheConnectorV1Impl).get(name)
+        if isinstance(descriptor, (staticmethod, classmethod)):
+            setattr(fake, name, method)
+        else:
+            setattr(fake, name, method.__get__(fake))
     return fake
 
 
@@ -1587,7 +1623,7 @@ class _RecordingEngine:
     def store_layer(self, *args, **kwargs):
         self.store_calls.append({
             "kvcaches": kwargs.get("kvcaches"),
-            "kv_group": kwargs.get("kv_group"),
+            "kv_group": kwargs.get("kv_group", 0),
             "req_id": kwargs.get("req_id"),
         })
         return _long_generator()
@@ -1624,6 +1660,8 @@ def _make_save_req(req_id, num_tokens):
             skip_leading_tokens=0,
         ),
         is_sparse_decode=False,
+        request_configs=None,
+        disagg_spec=None,
         cached_keys=[],
         cached_starts=[],
         cached_ends=[],
@@ -1631,6 +1669,7 @@ def _make_save_req(req_id, num_tokens):
         cached_tensors=[],
         cached_chunk_dev_ptrs=[],
         cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
         cached_keys_indexer=[],
         cached_starts_indexer=[],
         cached_ends_indexer=[],
@@ -1638,6 +1677,7 @@ def _make_save_req(req_id, num_tokens):
         cached_tensors_indexer=[],
         cached_chunk_dev_ptrs_indexer=[],
         cached_chunk_ptrs_npu_indexer=[],
+        cached_shared_handles_indexer=[],
         resumed_from_preemption=False,
     )
 
@@ -1647,6 +1687,7 @@ def _make_load_req(req_id, num_tokens, cached_tokens):
         req_id=req_id,
         token_ids=list(range(num_tokens)),
         slot_mapping=[torch.arange(num_tokens, dtype=torch.long)],
+        indexer_slot_mapping=[],
         is_sparse_decode=False,
         request_configs=None,
         load_spec=SimpleNamespace(
@@ -1661,6 +1702,7 @@ def _make_load_req(req_id, num_tokens, cached_tokens):
         cached_tensors=[],
         cached_chunk_dev_ptrs=[],
         cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
         cached_keys_indexer=[],
         cached_starts_indexer=[],
         cached_ends_indexer=[],
@@ -1668,6 +1710,7 @@ def _make_load_req(req_id, num_tokens, cached_tokens):
         cached_tensors_indexer=[],
         cached_chunk_dev_ptrs_indexer=[],
         cached_chunk_ptrs_npu_indexer=[],
+        cached_shared_handles_indexer=[],
         decode_ret_mask=None,
         resumed_from_preemption=False,
     )
@@ -1681,6 +1724,8 @@ def _make_sparse_load_req(req_id, num_tokens, cached_tokens):
 
 def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
     """Build a fake adapter with real per-group plumbing + mocked engine."""
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
     latent = [torch.zeros(1) for _ in range(num_layers)]
     indexer = [torch.zeros(1) for _ in range(num_layers)]
     kv_caches: dict[str, torch.Tensor] = {}
@@ -1691,7 +1736,8 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
             kv_caches[f"indexer.{i}"] = indexer[i]
 
     engine = _RecordingEngine()
-    fake = SimpleNamespace(
+    fake = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    fake_state = SimpleNamespace(
         # config + caches
         kv_caches=kv_caches,
         config=SimpleNamespace(
@@ -1720,6 +1766,14 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         _deferred_latent_pending=set(),
         layerwise_retrievers=[],
         _layerwise_retriever_is_sparse=[],
+        _layerwise_requests=[],
+        _layerwise_sparse_req_ids=[],
+        _layerwise_waited_groups=set(),
+        _layerwise_sparse_indexer_sent_layers=set(),
+        _layerwise_required_wait_groups_cache=None,
+        _decode_window_save_completed_groups=set(),
+        _decode_window_save_expected_start={},
+        _completed_decode_window_saves={},
         _worker_retrieve_state={},
         # stubs
         _stats_monitor=MagicMock(),
@@ -1735,34 +1789,7 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         _finalize_worker_retrieve_state_from_metadata=lambda m: None,
         _sparse_decode_retrieve_warm_kwargs=lambda *a, **k: {},
     )
-    _bind_real(
-        fake,
-        "_refresh_kvcaches_list",
-        "_kvcaches_for_group",
-        "_num_layers_for_group",
-        "_is_dsa_two_groups",
-        "_is_decode_window_save_request",
-        "_layerwise_save_range",
-        "_layerwise_save_storer_key",
-        "_save_storer_key",
-        "_should_defer_latent_save_under_tp",
-        "_drain_layerwise_storer_fully",
-        "_indexer_slot_mapping_from_attn_metadata",
-        "_pad_chunk_local_slot_mapping",
-        "_indexer_retrieve_slot_mapping",
-        "_request_has_retrieve_tensor_cache",
-        "_resolve_store_retrieve_location",
-        "_maybe_seed_worker_retrieve_state_from_store",
-        "_save_worker_retrieve_state_from_request",
-        "_should_invalidate_worker_retrieve_state",
-        "_bind_worker_retrieve_state_to_request",
-        "_drop_worker_retrieve_state",
-        "save_kv_layer",
-        "wait_for_save",
-        "start_load_kv",
-        "wait_for_layer_load",
-        "_drain_layerwise_retrievers",
-    )
+    fake.__dict__.update(vars(fake_state))
     fake._refresh_kvcaches_list()
     return fake
 
@@ -1809,13 +1836,13 @@ class TestVLLMCallSequence:
                 assert call["kvcaches"] is fake._indexer_kvcaches
             assert call["req_id"] == "r1"
 
-        # Two storers keyed by request, save range, and kv_group.
+        # The final indexer callback drains its group immediately; latent is
+        # finalized by wait_for_save.
         assert set(fake._layerwise_save_storers.keys()) == {
             ("r1", "normal_save", 0, 0, 64),
-            ("r1", "normal_save", 1, 0, 64),
         }
 
-        # wait_for_save drains both.
+        # wait_for_save drains the remaining latent storer.
         fake.wait_for_save()
         assert fake._layerwise_save_storers == {}
 
@@ -1863,9 +1890,10 @@ class TestVLLMCallSequence:
         assert indexer_ret is not None
         assert fake._layerwise_retriever_is_sparse == [False]
 
-        # vLLM calls wait_for_layer_load once per layer.
-        for _ in range(fake.num_layers):
-            fake.wait_for_layer_load(layer_name="layer.0")
+        # vLLM calls wait_for_layer_load once per group per layer.
+        for layer_id in range(fake.num_layers):
+            fake.wait_for_layer_load(layer_name=f"layer.{layer_id}")
+            fake.wait_for_layer_load(layer_name=f"indexer.{layer_id}")
         # After num_layers layers, retrievers are drained.
         assert fake.layerwise_retrievers == []
         assert fake._layerwise_retriever_is_sparse == []
