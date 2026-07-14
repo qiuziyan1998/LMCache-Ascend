@@ -138,32 +138,6 @@ def test_sparse_pack_skips_debug_tensor_reads_when_logging_is_disabled(
     assert selected_out is selected
 
 
-def test_sparse_pointer_cache_reuse_debug_rejects_stale_ptrs(monkeypatch) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.kv_device = torch.device("cpu")
-    cpu_tensors = [torch.zeros(1), torch.ones(1)]
-    cached_npu_ptrs = torch.tensor([111, 222], dtype=torch.long)
-
-    monkeypatch.setattr(
-        npu_connectors,
-        "_SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS",
-        True,
-    )
-    monkeypatch.setattr(
-        connector,
-        "_resolve_registered_cpu_tensor_device_ptr",
-        lambda tensor, **_kwargs: int(tensor.data_ptr()),
-    )
-
-    with pytest.raises(RuntimeError, match="do not match current CPU tensors"):
-        connector._resolve_sparse_chunk_ptrs_npu(
-            0,
-            cpu_tensors,
-            [cached_npu_ptrs],
-            [[333, 444]],
-        )
-
-
 def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector._sparse_direct_layer_states = None
@@ -471,7 +445,6 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         layer_tensors=[lmc_chunk],
         slot_mapping_ref=slot_mapping,
         cpu_tensors=[lmc_chunk],
-        explicit_sparse_payload=True,
     )
     connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
     connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
@@ -680,8 +653,9 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
     monkeypatch.setattr(
         connector,
         "_resolve_sparse_chunk_ptrs_npu",
-        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu,
-        cached_chunk_dev_ptrs=None: torch.tensor([123], dtype=torch.long),
+        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu: torch.tensor(
+            [123], dtype=torch.long
+        ),
     )
 
     def _unexpected_total_tokens(*args, **kwargs):
@@ -773,8 +747,9 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
     monkeypatch.setattr(
         connector,
         "_resolve_sparse_chunk_ptrs_npu",
-        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu,
-        cached_chunk_dev_ptrs=None: torch.tensor([123], dtype=torch.long),
+        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu: torch.tensor(
+            [123], dtype=torch.long
+        ),
     )
 
     calls = []
@@ -860,8 +835,9 @@ def test_sparse_head_token_wise_can_disable_direct_path(monkeypatch) -> None:
     monkeypatch.setattr(
         connector,
         "_resolve_sparse_chunk_ptrs_npu",
-        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu,
-        cached_chunk_dev_ptrs=None: torch.tensor([123], dtype=torch.long),
+        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu: torch.tensor(
+            [123], dtype=torch.long
+        ),
     )
 
     staging_calls = []
@@ -989,14 +965,12 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         layer_id,
         cpu_tensors,
         cached_chunk_ptrs_arg=None,
-        cached_chunk_dev_ptrs_arg=None,
     ):
         pointer_calls.append(
             (
                 layer_id,
                 list(cpu_tensors),
                 cached_chunk_ptrs_arg,
-                cached_chunk_dev_ptrs_arg,
             )
         )
         return torch.tensor([123, 456], dtype=torch.long)
@@ -1034,7 +1008,6 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert metadata_calls == []
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is None
-    assert pointer_calls[0][3] is None
     assert len(direct_calls) == 1
     assert direct_calls[0]["direction"] is False
     assert direct_calls[0]["total_tokens"] == 273
@@ -1205,14 +1178,12 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
         layer_id,
         cpu_tensors,
         cached_chunk_ptrs_arg=None,
-        cached_chunk_dev_ptrs_arg=None,
     ):
         pointer_calls.append(
             (
                 layer_id,
                 list(cpu_tensors),
                 cached_chunk_ptrs_arg,
-                cached_chunk_dev_ptrs_arg,
             )
         )
         return torch.tensor([123, 456], dtype=torch.long)
@@ -1250,7 +1221,6 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert metadata_calls == []
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is None
-    assert pointer_calls[0][3] is None
     assert len(direct_calls) == 1
     assert direct_calls[0]["direction"] is True
     assert direct_calls[0]["total_tokens"] == 273

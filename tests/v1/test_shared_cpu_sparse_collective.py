@@ -1155,19 +1155,14 @@ def test_sparse_pointer_cache_reuse_rejects_wrong_device():
         )
 
 
-def test_sparse_pointer_cache_reuse_skips_null_scan_by_default(monkeypatch):
+def test_sparse_pointer_cache_reuse_does_not_read_pointer_values(monkeypatch):
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")
     cached_ptrs = [torch.tensor([0], dtype=torch.long)]
 
     def fail_any(*_args, **_kwargs):
-        raise AssertionError("hot-path null scan should be disabled by default")
+        raise AssertionError("hot path must not read cached pointer values")
 
-    monkeypatch.setattr(
-        npu_connectors,
-        "_SPARSE_POINTER_CACHE_REUSE_VALIDATE_NULLS",
-        False,
-    )
     monkeypatch.setattr(npu_connectors.torch, "any", fail_any)
 
     assert connector._resolve_sparse_chunk_ptrs_npu(
@@ -1175,24 +1170,6 @@ def test_sparse_pointer_cache_reuse_skips_null_scan_by_default(monkeypatch):
         [torch.empty(1)],
         cached_ptrs,
     ) is cached_ptrs[0]
-
-
-def test_sparse_pointer_cache_reuse_debug_rejects_null_pointer(monkeypatch):
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.kv_device = torch.device("cpu")
-    cached_ptrs = [torch.tensor([0], dtype=torch.long)]
-    monkeypatch.setattr(
-        npu_connectors,
-        "_SPARSE_POINTER_CACHE_REUSE_VALIDATE_NULLS",
-        True,
-    )
-
-    with pytest.raises(RuntimeError, match="null pointer"):
-        connector._resolve_sparse_chunk_ptrs_npu(
-            0,
-            [torch.empty(1)],
-            cached_ptrs,
-        )
 
 
 def test_append_retrieve_layer_cache_is_atomic_when_pointer_install_fails():
