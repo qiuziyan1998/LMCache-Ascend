@@ -105,6 +105,39 @@ def test_shared_cpu_store_publication_fences_store_stream() -> None:
     assert connector.store_stream.events == ["synchronize"]
 
 
+def test_sparse_pack_skips_debug_tensor_reads_when_logging_is_disabled(
+    monkeypatch,
+) -> None:
+    connector = _make_sparse_pack_connector()
+    monkeypatch.setattr(
+        npu_connectors,
+        "_dsa_debug_should_log",
+        lambda *_args, **_kwargs: False,
+    )
+
+    def fail_debug_read(*_args, **_kwargs):
+        raise AssertionError("debug tensor summary ran on the decode hot path")
+
+    monkeypatch.setattr(npu_connectors, "_dsa_debug_shape", fail_debug_read)
+    monkeypatch.setattr(npu_connectors, "_dsa_debug_sample", fail_debug_read)
+    monkeypatch.setattr(
+        npu_connectors,
+        "_dsa_debug_minmax_count",
+        fail_debug_read,
+    )
+
+    slot_mapping = torch.arange(16, dtype=torch.long)
+    selected = torch.tensor([1, 3, 5, 7], dtype=torch.int32)
+    packed, selected_out = connector._pack_sparse_layer_inputs(
+        slot_mapping,
+        selected,
+        2,
+    )
+
+    assert torch.equal(packed, slot_mapping[2:6])
+    assert selected_out is selected
+
+
 def test_sparse_pointer_cache_reuse_debug_rejects_stale_ptrs(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")
@@ -417,7 +450,7 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     selected = _TensorLike(2)
     chunk_ptrs = _TensorLike(1)
 
-    connector._run_sparse_direct_kv_transfer_layer(
+    transfer_kwargs = dict(
         kvcaches_ref=[(object(), object())],
         kv_group=0,
         layer_id=0,
@@ -440,10 +473,15 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         cpu_tensors=[lmc_chunk],
         explicit_sparse_payload=True,
     )
+    connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
+    connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
 
-    assert len(fast_calls) == 1
+    assert len(fast_calls) == 2
     assert slow_calls == []
     assert fast_calls[0][0][0] is layer_state
+    assert fast_calls[1][0][0] is layer_state
+    assert fast_calls[0][0][7] is True
+    assert fast_calls[1][0][7] is False
 
 
 def test_dense_direct_records_local_metadata_inputs_when_enabled(monkeypatch) -> None:

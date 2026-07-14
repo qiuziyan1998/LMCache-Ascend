@@ -1748,9 +1748,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
         debug_pack = _dsa_debug_should_log(self, "pack_sparse_layer_inputs")
-        input_selected_shape = _dsa_debug_shape(selected_token_idx)
-        input_selected_sample = _dsa_debug_sample(selected_token_idx)
-        input_selected_minmax = _dsa_debug_minmax_count(selected_token_idx)
+        input_selected_token_idx = selected_token_idx
 
         if target_slot_mapping is not None:
             if not isinstance(target_slot_mapping, torch.Tensor):
@@ -1897,9 +1895,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     _dsa_debug_shape(slot_mapping),
                     _dsa_debug_sample(slot_mapping),
                     _dsa_debug_minmax_count(slot_mapping),
-                    input_selected_shape,
-                    input_selected_sample,
-                    input_selected_minmax,
+                    _dsa_debug_shape(input_selected_token_idx),
+                    _dsa_debug_sample(input_selected_token_idx),
+                    _dsa_debug_minmax_count(input_selected_token_idx),
                     token_start_index,
                     start,
                     end,
@@ -1937,9 +1935,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 _dsa_debug_shape(slot_mapping),
                 _dsa_debug_sample(slot_mapping),
                 _dsa_debug_minmax_count(slot_mapping),
-                input_selected_shape,
-                input_selected_sample,
-                input_selected_minmax,
+                _dsa_debug_shape(input_selected_token_idx),
+                _dsa_debug_sample(input_selected_token_idx),
+                _dsa_debug_minmax_count(input_selected_token_idx),
                 token_start_index,
                 int(token_start_index),
                 int(token_start_index) + int(slot_mapping_packed.shape[0]),
