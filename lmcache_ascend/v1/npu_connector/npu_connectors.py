@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
-import hashlib
-import json
 import os
-import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -42,191 +39,6 @@ import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
-# #region agent log
-_DEBUG_05D10F = os.getenv("LMCACHE_DEBUG_05D10F", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
-
-def _debug_05d10f_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-) -> None:
-    if not _DEBUG_05D10F:
-        return
-    payload = {
-        "sessionId": "05d10f",
-        "runId": "baseline",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        encoded = (json.dumps(payload, default=str) + "\n").encode()
-        fd = os.open(
-            "debug-05d10f.log",
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-            0o644,
-        )
-        try:
-            os.write(fd, encoded)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-
-
-def _debug_05d10f_log_if_enabled(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-    *,
-    run_id: str = "sparse-load-sync",
-) -> None:
-    if not (_DEBUG_05D10F or _SPARSE_DIRECT_LOAD_SYNC):
-        return
-    payload = {
-        "sessionId": "05d10f",
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        encoded = (json.dumps(payload, default=str) + "\n").encode()
-        fd = os.open(
-            "debug-05d10f.log",
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-            0o644,
-        )
-        try:
-            os.write(fd, encoded)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-
-
-def _debug_05d10f_tensor_sha256(tensors: List[torch.Tensor]) -> str:
-    digest = hashlib.sha256()
-    for tensor in tensors:
-        raw = (
-            tensor.detach()
-            .contiguous()
-            .view(torch.uint8)
-            .to(device="cpu")
-            .numpy()
-            .tobytes()
-        )
-        digest.update(raw)
-    return digest.hexdigest()
-
-
-def _debug_05d10f_paged_slots_sha256(
-    layer_cache: Any,
-    slots: torch.Tensor,
-) -> str:
-    tensors = (
-        list(layer_cache)
-        if isinstance(layer_cache, (tuple, list))
-        else [layer_cache]
-    )
-    valid_slots = slots.detach().reshape(-1).to(dtype=torch.long)
-    valid_slots = valid_slots[valid_slots >= 0]
-    digest = hashlib.sha256()
-    for tensor in tensors:
-        rows = tensor.detach().reshape(
-            int(tensor.shape[0]) * int(tensor.shape[1]), -1
-        )
-        selected = rows.index_select(0, valid_slots.to(device=rows.device))
-        raw = (
-            selected.contiguous()
-            .view(torch.uint8)
-            .to(device="cpu")
-            .numpy()
-            .tobytes()
-        )
-        digest.update(raw)
-    return digest.hexdigest()
-# #endregion
-
-# #region agent log
-def _agent_debug_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-) -> None:
-    payload = {
-        "sessionId": "51d8e7",
-        "runId": "baseline",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with open("debug-51d8e7.log", "a", encoding="utf-8") as debug_file:
-            debug_file.write(json.dumps(payload, default=str) + "\n")
-    except OSError:
-        pass
-
-
-def _agent_debug_tensor_summary(tensor: torch.Tensor) -> dict:
-    flat = tensor.detach().reshape(-1)
-    sample_count = min(32, int(flat.numel()))
-    if sample_count:
-        step = max(1, int(flat.numel()) // sample_count)
-        values = flat[::step][:sample_count].to(dtype=torch.float32)
-        sample = [float(value) for value in values.tolist()]
-    else:
-        sample = []
-    return {
-        "shape": list(tensor.shape),
-        "stride": list(tensor.stride()),
-        "dtype": str(tensor.dtype),
-        "numel": int(tensor.numel()),
-        "host_ptr": int(tensor.data_ptr()),
-        "sample": sample,
-        "sample_sum": float(sum(sample)),
-        "sample_abs_sum": float(sum(abs(value) for value in sample)),
-        "sample_nonzero": int(sum(value != 0.0 for value in sample)),
-    }
-
-
-def _agent_debug_runtime_identity() -> dict:
-    distributed_rank = None
-    try:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            distributed_rank = int(torch.distributed.get_rank())
-    except RuntimeError:
-        pass
-    npu_device = None
-    try:
-        if hasattr(torch, "npu"):
-            npu_device = int(torch.npu.current_device())
-    except RuntimeError:
-        pass
-    return {
-        "pid": int(os.getpid()),
-        "distributed_rank": distributed_rank,
-        "env_rank": os.getenv("RANK"),
-        "env_local_rank": os.getenv("LOCAL_RANK"),
-        "npu_device": npu_device,
-    }
-# #endregion
-
 _SPARSE_DIRECT_GUARD = os.getenv("LMCACHE_ASCEND_SPARSE_DIRECT_GUARD", "0").lower() in (
     "1",
     "true",
@@ -245,9 +57,6 @@ _SPARSE_POINTER_CACHE_REUSE_VALIDATE_PTRS = os.getenv(
 _SPARSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
-_SPARSE_DIRECT_VERIFY = os.getenv(
-    "LMCACHE_ASCEND_SPARSE_DIRECT_VERIFY", "0"
-).lower() in ("1", "true", "yes", "on")
 _DENSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -261,36 +70,14 @@ _DENSE_DIRECT_STORE_DISABLE = (
     or os.getenv("LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0").lower()
     in ("1", "true", "yes", "on")
 )
-_STORE_USE_CURRENT_STREAM = os.getenv(
-    "LMCACHE_ASCEND_STORE_USE_CURRENT_STREAM", "0"
-).lower() in ("1", "true", "yes", "on")
-_DENSE_DIRECT_STORE_SYNC_BEFORE = os.getenv(
-    "LMCACHE_ASCEND_DENSE_DIRECT_STORE_SYNC_BEFORE", "0"
-).lower() in ("1", "true", "yes", "on")
-_DENSE_DIRECT_STORE_SYNC_AFTER = os.getenv(
-    "LMCACHE_ASCEND_DENSE_DIRECT_STORE_SYNC_AFTER", "0"
-).lower() in ("1", "true", "yes", "on")
-_DENSE_DIRECT_STORE_VERIFY = os.getenv(
-    "LMCACHE_ASCEND_DENSE_DIRECT_STORE_VERIFY", "0"
-).lower() in ("1", "true", "yes", "on")
-_SPARSE_DIRECT_LOAD_SYNC = os.getenv(
-    "LMCACHE_ASCEND_SPARSE_DIRECT_LOAD_SYNC", "0"
-).lower() in ("1", "true", "yes", "on")
+
+
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
     if isinstance(payload_event, (list, tuple)):
         return [event for event in payload_event if event is not None]
     return [payload_event]
-
-
-def _stream_context_or_null(stream, *, switch_stream: bool = True):
-    if not switch_stream or stream is None or not hasattr(stream, "device"):
-        return nullcontext()
-    stream_device = getattr(stream, "device", None)
-    if getattr(stream_device, "type", None) == "npu" and hasattr(torch, "npu"):
-        return torch.npu.stream(stream)
-    return torch.cuda.stream(stream)
 
 
 _IS_310P = None
@@ -326,7 +113,7 @@ def _dsa_debug_should_log(owner: Any, site: str) -> bool:
     counts = getattr(owner, "_dsa_shrink_debug_counts", None)
     if counts is None:
         counts = {}
-        setattr(owner, "_dsa_shrink_debug_counts", counts)
+        owner._dsa_shrink_debug_counts = counts
     count = counts.get(site, 0)
     if count >= _dsa_debug_limit():
         return False
@@ -340,7 +127,7 @@ def _dsa_debug_failure_should_log(owner: Any, site: str) -> bool:
     counts = getattr(owner, "_dsa_shrink_debug_counts", None)
     if counts is None:
         counts = {}
-        setattr(owner, "_dsa_shrink_debug_counts", counts)
+        owner._dsa_shrink_debug_counts = counts
     key = f"fail:{site}"
     count = counts.get(key, 0)
     if count >= _dsa_debug_limit():
@@ -1183,26 +970,14 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         """
         assert memory_obj.tensor is not None
 
-        current_stream = torch.npu.current_stream()
-        store_transfer_stream = (
-            current_stream if _STORE_USE_CURRENT_STREAM else self.store_stream
-        )
-        switch_store_stream = not _STORE_USE_CURRENT_STREAM
-
-        with _stream_context_or_null(
-            store_transfer_stream,
-            switch_stream=switch_store_stream,
-        ):
+        with torch.npu.stream(self.store_stream):
             self.initialize_kvcaches_ptr(**kwargs)
 
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
-        with _stream_context_or_null(
-            store_transfer_stream,
-            switch_stream=switch_store_stream,
-        ):
+        with torch.npu.stream(self.store_stream):
             self._initialize_pointers(self.kvcaches)
 
         if "slot_mapping_npu" in kwargs:
@@ -1213,10 +988,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 raise ValueError("'slot_mapping' should be a torch.Tensor.")
             # for Ascend kernels to keep test inputs backward compatible.
             if slot_mapping.device.type != "npu":
-                with _stream_context_or_null(
-                    store_transfer_stream,
-                    switch_stream=switch_store_stream,
-                ):
+                with torch.npu.stream(self.store_stream):
                     slot_mapping = slot_mapping.to(
                         self.kvcaches_device,
                         non_blocking=True,
@@ -1227,10 +999,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 "(or 'slot_mapping' for compatibility)."
             )
 
-        with _stream_context_or_null(
-            store_transfer_stream,
-            switch_stream=switch_store_stream,
-        ):
+        with torch.npu.stream(self.store_stream):
             kv_cache_pointers = self.kv_cache_pointers_on_gpu[
                 self.kvcaches_device.index
             ]
@@ -1238,10 +1007,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
 
-        with _stream_context_or_null(
-            store_transfer_stream,
-            switch_stream=switch_store_stream,
-        ):
+        with torch.npu.stream(self.store_stream):
             # No staging buffer or token count mismatch
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
@@ -1279,7 +1045,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
-            store_transfer_stream.synchronize()
+            self.store_stream.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -1561,7 +1327,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
         self.load_stream_num = 4
-        self.load_stream_list = [torch.cuda.Stream() for __ in range(self.load_stream_num)]
+        self.load_stream_list = [
+            torch.cuda.Stream() for __ in range(self.load_stream_num)
+        ]
         self.load_stream_idx = 0
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
@@ -1613,15 +1381,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
     def synchronize_shared_cpu_store_publication(self) -> None:
         """Complete this rank's store work before publishing shared handles."""
-        if _STORE_USE_CURRENT_STREAM:
-            stream = (
-                torch.npu.current_stream()
-                if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
-                else torch.cuda.current_stream()
-            )
-        else:
-            stream = self.store_stream
-        stream.synchronize()
+        self.store_stream.synchronize()
 
     @staticmethod
     def synchronize_shared_cpu_sparse_load() -> None:
@@ -1798,11 +1558,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
 
     @staticmethod
-    def _stream_context_or_null(stream, *, switch_stream: bool = True):
-        return _stream_context_or_null(
-            stream,
-            switch_stream=switch_stream,
-        )
+    def _stream_context_or_null(stream):
+        if stream is None or not hasattr(stream, "device"):
+            return nullcontext()
+        stream_device = getattr(stream, "device", None)
+        if getattr(stream_device, "type", None) == "npu" and hasattr(torch, "npu"):
+            return torch.npu.stream(stream)
+        return torch.cuda.stream(stream)
 
     @staticmethod
     def _sparse_direct_pointer_cache_signature(
@@ -1989,13 +1751,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         state = self._sparse_direct_layer_states.get(state_key)
         if state is not None:
             return (state, state_key) if return_key else state
-
-        vllm_layer_cache = kvcaches_ref[layer_id]
-        vllm_tensor_count = (
-            len(vllm_layer_cache)
-            if isinstance(vllm_layer_cache, (tuple, list))
-            else 1
-        )
 
         state = prepare_sparse_direct_layer_state(
             layer_tensors[0],
@@ -2704,258 +2459,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
 
         current_stream.wait_stream(load_stream)
-        if _SPARSE_DIRECT_LOAD_SYNC:
-            sync_start = time.perf_counter()
-            load_stream.synchronize()
-            _debug_05d10f_log_if_enabled(
-                "H6",
-                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer",
-                "explicit sparse load stream synchronize",
-                {
-                    **_agent_debug_runtime_identity(),
-                    "kv_group": int(kv_group),
-                    "layer_id": int(layer_id),
-                    "num_sparse": int(num_sparse),
-                    "sync_ms": (time.perf_counter() - sync_start) * 1000.0,
-                    "used_wait_stream_only": False,
-                },
-            )
-        # #region agent log
-        if _DEBUG_05D10F and layer_id in (
-            0,
-            self.num_layers // 2,
-            self.num_layers - 1,
-        ):
-            current_stream.synchronize()
-            _debug_05d10f_log(
-                "H1,H3,H4",
-                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer",
-                "sparse load full-byte source and destination checkpoint",
-                {
-                    **_agent_debug_runtime_identity(),
-                    "kv_group": int(kv_group),
-                    "layer_id": int(layer_id),
-                    "num_sparse": int(num_sparse),
-                    "total_tokens": int(total_tokens),
-                    "chunk_size": int(chunk_size),
-                    "num_chunks": int(chunk_ptrs_npu.numel()),
-                    "state_id": int(id(layer_state))
-                    if layer_state is not None
-                    else None,
-                    "source_chunks_sha256": (
-                        _debug_05d10f_tensor_sha256(resolve_tensors)
-                        if resolve_tensors
-                        else None
-                    ),
-                    "destination_rows_sha256": (
-                        _debug_05d10f_paged_slots_sha256(
-                            kvcaches_ref[layer_id],
-                            slot_mapping_packed,
-                        )
-                    ),
-                    "selected_sha256": _debug_05d10f_tensor_sha256(
-                        [selected_token_idx]
-                    ),
-                    "slots_sha256": _debug_05d10f_tensor_sha256(
-                        [slot_mapping_packed]
-                    ),
-                    "selected_min": int(
-                        selected_token_idx.min().to(device="cpu").item()
-                    ),
-                    "selected_max": int(
-                        selected_token_idx.max().to(device="cpu").item()
-                    ),
-                    "slot_min": int(
-                        slot_mapping_packed.min().to(device="cpu").item()
-                    ),
-                    "slot_max": int(
-                        slot_mapping_packed.max().to(device="cpu").item()
-                    ),
-                    "cpu_host_ptrs": [
-                        int(tensor.data_ptr()) for tensor in resolve_tensors
-                    ],
-                    "chunk_ptrs_sha256": _debug_05d10f_tensor_sha256(
-                        [chunk_ptrs_npu]
-                    ),
-                    "vllm_ptrs": [
-                        int(tensor.data_ptr())
-                        for tensor in (
-                            list(kvcaches_ref[layer_id])
-                            if isinstance(
-                                kvcaches_ref[layer_id],
-                                (tuple, list),
-                            )
-                            else [kvcaches_ref[layer_id]]
-                        )
-                    ],
-                },
-            )
-        # #endregion
-        if (
-            _SPARSE_DIRECT_VERIFY
-            and layer_id in (0, self.num_layers - 1)
-            and resolve_tensors
-        ):
-            current_stream.synchronize()
-            selected_cpu = selected_token_idx.detach().to(device="cpu").reshape(-1)
-            slots_cpu = slot_mapping_packed.detach().to(device="cpu").reshape(-1)
-            selected_contiguous = selected_cpu.contiguous()
-            slots_contiguous = slots_cpu.contiguous()
-            selected_identity = torch.arange(
-                selected_contiguous.numel(), dtype=selected_contiguous.dtype
-            )
-            selected_sha256 = hashlib.sha256(
-                selected_contiguous.numpy().tobytes()
-            ).hexdigest()
-            slots_sha256 = hashlib.sha256(
-                slots_contiguous.numpy().tobytes()
-            ).hexdigest()
-            pair_sha256 = hashlib.sha256(
-                selected_contiguous.numpy().tobytes()
-                + slots_contiguous.numpy().tobytes()
-            ).hexdigest()
-            sample_positions = sorted(
-                {
-                    0,
-                    max(0, num_sparse // 2),
-                    max(0, num_sparse - 1),
-                }
-            )
-            layer_cache = kvcaches_ref[layer_id]
-            paged_tensors = (
-                list(layer_cache)
-                if isinstance(layer_cache, (tuple, list))
-                else [layer_cache]
-            )
-            if len(paged_tensors) == 1:
-                plane_dims = [int(sparse_k_hidden_dims)]
-            elif len(paged_tensors) == 2:
-                plane_dims = [
-                    int(sparse_k_hidden_dims),
-                    int(sparse_v_hidden_dims),
-                ]
-            else:
-                plane_dims = [
-                    int(sparse_k_hidden_dims),
-                    int(sparse_v_hidden_dims),
-                    int(sparse_dsa_hidden_dims),
-                ]
-
-            compared_elements = 0
-            mismatched_elements = 0
-            max_abs_diff = 0.0
-            checked_tokens = 0
-            skipped_tokens = 0
-            for sample_position in sample_positions:
-                source_token = int(selected_cpu[sample_position].item())
-                target_slot = int(slots_cpu[sample_position].item())
-                if (
-                    source_token < 0
-                    or source_token >= int(total_tokens)
-                    or target_slot < 0
-                ):
-                    skipped_tokens += 1
-                    continue
-                chunk_id = source_token // int(chunk_size)
-                local_token = source_token % int(chunk_size)
-                if chunk_id >= len(resolve_tensors):
-                    skipped_tokens += 1
-                    continue
-                chunk_tokens = min(
-                    int(chunk_size),
-                    int(total_tokens) - chunk_id * int(chunk_size),
-                )
-                chunk_flat = resolve_tensors[chunk_id].detach().reshape(-1)
-                plane_base = 0
-                checked_tokens += 1
-                for paged_tensor, plane_dim in zip(
-                    paged_tensors, plane_dims, strict=False
-                ):
-                    if plane_dim <= 0:
-                        continue
-                    compare_width = plane_dim
-                    cpu_start = plane_base + local_token * plane_dim
-                    expected = chunk_flat[
-                        cpu_start : cpu_start + compare_width
-                    ].to(dtype=torch.float32)
-                    paged_start = target_slot * plane_dim
-                    actual = (
-                        paged_tensor.detach()
-                        .reshape(-1)[paged_start : paged_start + compare_width]
-                        .to(device="cpu", dtype=torch.float32)
-                    )
-                    difference = (actual - expected).abs()
-                    compared_elements += int(compare_width)
-                    mismatched_elements += int(
-                        torch.count_nonzero(difference).item()
-                    )
-                    if difference.numel():
-                        max_abs_diff = max(
-                            max_abs_diff, float(difference.max().item())
-                        )
-                    plane_base += chunk_tokens * plane_dim
-
-            # #region agent log
-            _agent_debug_log(
-                "H10,H11,H12",
-                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer:verify",
-                "sparse direct CPU-to-paged parity",
-                {
-                    **_agent_debug_runtime_identity(),
-                    "kv_group": int(kv_group),
-                    "layer_id": int(layer_id),
-                    "num_sparse": int(num_sparse),
-                    "checked_tokens": int(checked_tokens),
-                    "skipped_tokens": int(skipped_tokens),
-                    "compared_elements": int(compared_elements),
-                    "mismatched_elements": int(mismatched_elements),
-                    "max_abs_diff": float(max_abs_diff),
-                    "parity_ok": bool(mismatched_elements == 0),
-                },
-            )
-            # #endregion
-
-            # #region agent log
-            _agent_debug_log(
-                "H13,H14,H15,H16",
-                "npu_connectors.py:_run_sparse_direct_kv_transfer_layer:metadata",
-                "sparse selected-token and target-slot fingerprint",
-                {
-                    **_agent_debug_runtime_identity(),
-                    "kv_group": int(kv_group),
-                    "layer_id": int(layer_id),
-                    "num_sparse": int(num_sparse),
-                    "selected_sha256": selected_sha256,
-                    "slots_sha256": slots_sha256,
-                    "pair_sha256": pair_sha256,
-                    "selected_is_identity": bool(
-                        torch.equal(selected_contiguous, selected_identity)
-                    ),
-                    "selected_min": int(selected_contiguous.min().item()),
-                    "selected_max": int(selected_contiguous.max().item()),
-                    "selected_unique": int(
-                        torch.unique(selected_contiguous).numel()
-                    ),
-                    "slots_min": int(slots_contiguous.min().item()),
-                    "slots_max": int(slots_contiguous.max().item()),
-                    "slots_unique": int(torch.unique(slots_contiguous).numel()),
-                    "selected_head": [
-                        int(value)
-                        for value in selected_contiguous[:8].tolist()
-                    ],
-                    "selected_tail": [
-                        int(value)
-                        for value in selected_contiguous[-8:].tolist()
-                    ],
-                    "slots_head": [
-                        int(value) for value in slots_contiguous[:8].tolist()
-                    ],
-                    "slots_tail": [
-                        int(value) for value in slots_contiguous[-8:].tolist()
-                    ],
-                },
-            )
-            # #endregion
 
     def _sparse_selected_token_idx(
         self,
@@ -3271,14 +2774,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_host_interleaved: bool,
         layer_tensors: List[torch.Tensor],
         direction: bool,
-        switch_stream: bool = True,
     ) -> None:
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
-
-        if not switch_stream:
-            transfer_stream = current_stream
 
         if _SPARSE_DIRECT_RECORD_STREAM:
             for tensor in (
@@ -3308,55 +2807,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dense_dsa_hidden_dims=dense_dsa_hidden_dims,
             direction=direction,
         )
-        if layer_id in (0, self.num_layers - 1):
-            # #region agent log
-            _agent_debug_log(
-                "H1,H2,H3,H4",
-                "npu_connectors.py:_run_dense_direct_kv_transfer_layer",
-                "dense direct launch inputs",
-                {
-                    "rank": os.getenv("RANK", os.getenv("LOCAL_RANK", "unknown")),
-                    "direction": "store" if direction else "load",
-                    "kv_group": int(kv_group),
-                    "layer_id": int(layer_id),
-                    "num_tokens": num_tokens,
-                    "total_tokens": int(total_tokens),
-                    "fixed_chunk_size": int(fixed_chunk_size),
-                    "num_chunks": int(chunk_ptrs_npu.numel()),
-                    "format": int(dense_kv_format),
-                    "token_major": bool(dense_token_major),
-                    "vllm_two_major": bool(dense_vllm_two_major),
-                    "host_interleaved": bool(dense_host_interleaved),
-                    "hidden_dims": [
-                        int(dense_k_hidden_dims),
-                        int(dense_v_hidden_dims),
-                        int(dense_dsa_hidden_dims),
-                    ],
-                    "switch_stream": bool(switch_stream),
-                    "same_stream": transfer_stream is current_stream,
-                    "store_aiv_env": os.getenv(
-                        "LMCACHE_ASCEND_DENSE_DIRECT_STORE_AIV_NUM", "default"
-                    ),
-                    "cpu_host_ptrs": [
-                        int(tensor.data_ptr()) for tensor in layer_tensors
-                    ],
-                    "cpu_summaries": (
-                        [
-                            _agent_debug_tensor_summary(tensor)
-                            for tensor in layer_tensors
-                        ]
-                        if not direction
-                        else []
-                    ),
-                    "resolved_device_ptrs": [
-                        int(value)
-                        for value in chunk_ptrs_npu.detach()
-                        .to(device="cpu")
-                        .tolist()
-                    ],
-                },
-            )
-            # #endregion
         layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
             kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
@@ -3376,55 +2826,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if validate_key is None:
             validate_key = ("dense", kv_group, layer_id)
 
-        # #region agent log
-        debug_dense_checked = _DEBUG_05D10F and layer_id in (
-            0,
-            self.num_layers // 2,
-            self.num_layers - 1,
-        )
-        debug_paged_before = None
-        if debug_dense_checked and direction:
-            current_stream.synchronize()
-            debug_paged_before = _debug_05d10f_paged_slots_sha256(
-                kvcaches_ref[layer_id],
-                slot_mapping_full,
-            )
-        # #endregion
-
-        with self._stream_context_or_null(
-            transfer_stream,
-            switch_stream=switch_stream,
-        ):
-            if switch_stream:
-                transfer_stream.wait_stream(current_stream)
-            if direction and _DENSE_DIRECT_STORE_SYNC_BEFORE:
-                transfer_stream.synchronize()
+        with self._stream_context_or_null(transfer_stream):
+            transfer_stream.wait_stream(current_stream)
             if layer_state is not None:
                 validate_inputs = (
                     validate_key not in self._sparse_direct_validated_layers
                 )
-                if layer_id in (0, self.num_layers - 1):
-                    # #region agent log
-                    _agent_debug_log(
-                        "H6,H7,H8,H9",
-                        "npu_connectors.py:_run_dense_direct_kv_transfer_layer:state",
-                        "dense direct fast-state lifecycle",
-                        {
-                            **_agent_debug_runtime_identity(),
-                            "direction": "store" if direction else "load",
-                            "kv_group": int(kv_group),
-                            "layer_id": int(layer_id),
-                            "state_id": int(id(layer_state)),
-                            "first_validated_use": bool(validate_inputs),
-                            "sync_before_env": bool(
-                                _DENSE_DIRECT_STORE_SYNC_BEFORE
-                            ),
-                            "sync_after_env": bool(
-                                _DENSE_DIRECT_STORE_SYNC_AFTER
-                            ),
-                        },
-                    )
-                    # #endregion
                 dense_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_full,
@@ -3458,79 +2865,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
-            if layer_id in (0, self.num_layers - 1):
-                # #region agent log
-                _agent_debug_log(
-                    "H1,H3",
-                    "npu_connectors.py:_run_dense_direct_kv_transfer_layer:post_launch",
-                    "dense direct kernel enqueued",
-                    {
-                        "rank": os.getenv(
-                            "RANK", os.getenv("LOCAL_RANK", "unknown")
-                        ),
-                        "direction": "store" if direction else "load",
-                        "kv_group": int(kv_group),
-                        "layer_id": int(layer_id),
-                        "sync_after_env": bool(_DENSE_DIRECT_STORE_SYNC_AFTER),
-                    },
-                )
-                # #endregion
-            if direction and _DENSE_DIRECT_STORE_SYNC_AFTER:
-                transfer_stream.synchronize()
-
-        if switch_stream:
-            current_stream.wait_stream(transfer_stream)
-
-        # #region agent log
-        if debug_dense_checked and direction:
-            current_stream.synchronize()
-            debug_paged_after = _debug_05d10f_paged_slots_sha256(
-                kvcaches_ref[layer_id],
-                slot_mapping_full,
-            )
-            _debug_05d10f_log(
-                "H1,H2,H3",
-                "npu_connectors.py:_run_dense_direct_kv_transfer_layer",
-                "dense store full-byte source and destination checkpoint",
-                {
-                    **_agent_debug_runtime_identity(),
-                    "kv_group": int(kv_group),
-                    "layer_id": int(layer_id),
-                    "num_tokens": int(num_tokens),
-                    "num_chunks": int(chunk_ptrs_npu.numel()),
-                    "fixed_chunk_size": int(fixed_chunk_size),
-                    "aiv_env": os.getenv(
-                        "LMCACHE_ASCEND_DENSE_DIRECT_STORE_AIV_NUM",
-                        "default",
-                    ),
-                    "state_id": int(id(layer_state))
-                    if layer_state is not None
-                    else None,
-                    "paged_sha256_before": debug_paged_before,
-                    "paged_sha256_after": debug_paged_after,
-                    "paged_source_unchanged": (
-                        debug_paged_before == debug_paged_after
-                    ),
-                    "cpu_chunks_sha256": _debug_05d10f_tensor_sha256(
-                        layer_tensors
-                    ),
-                    "cpu_host_ptrs": [
-                        int(tensor.data_ptr()) for tensor in layer_tensors
-                    ],
-                    "vllm_ptrs": [
-                        int(tensor.data_ptr())
-                        for tensor in (
-                            list(kvcaches_ref[layer_id])
-                            if isinstance(
-                                kvcaches_ref[layer_id],
-                                (tuple, list),
-                            )
-                            else [kvcaches_ref[layer_id]]
-                        )
-                    ],
-                },
-            )
-        # #endregion
+        current_stream.wait_stream(transfer_stream)
 
     def _single_layer_hidden_dim_args(
         self, kv_group: Optional[int] = None
@@ -3644,22 +2979,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if not self.dsa_two_groups:
             return 1
         return max(1, self._layerwise_staging_concurrency)
-
-    def _staging_pool_stats(
-        self, layout: _GroupLayout
-    ) -> dict[str, int]:
-        alloc = layout.gpu_buffer_allocator
-        if alloc is None:
-            return {}
-        inner = alloc.allocator
-        return {
-            "pool_total_bytes": int(alloc.tensor.numel()),
-            "pool_free_bytes": int(inner.address_manager.get_free_size()),
-            "pool_allocated_bytes": int(
-                inner.address_manager.total_allocated_size
-            ),
-            "active_allocs": int(inner.num_active_allocations),
-        }
 
     def _layerwise_staging_num_tokens(self, cache_max_tokens: int) -> int:
         """Token count for sizing the layerwise GPU staging pool.
@@ -3776,12 +3095,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             f"GPU staging pool for kv_group={kv_group} is not initialized."
         )
         buffer_shape = self.get_shape(num_tokens, kv_group)
-        request_bytes = int(
-            buffer_shape.numel() * self.element_size
-            if hasattr(buffer_shape, "numel")
-            else buffer_shape[0] * self.element_size
-        )
-        pool_stats = self._staging_pool_stats(layout)
         tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, expected_fmt
         )
@@ -4198,14 +3511,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
         if self.use_gpu and not dense_direct:
-            tmp_gpu_buffer_obj, staging_tensor = self._allocate_layerwise_staging_buffer(
-                num_tokens=num_tokens,
-                kv_group=kv_group,
-                layout=layout,
-                k_hidden_dims=k_hidden_dims,
-                v_hidden_dims=v_hidden_dims,
-                dsa_hidden_dims=dsa_hidden_dims,
-                expected_fmt=expected_fmt,
+            tmp_gpu_buffer_obj, staging_tensor = (
+                self._allocate_layerwise_staging_buffer(
+                    num_tokens=num_tokens,
+                    kv_group=kv_group,
+                    layout=layout,
+                    k_hidden_dims=k_hidden_dims,
+                    v_hidden_dims=v_hidden_dims,
+                    dsa_hidden_dims=dsa_hidden_dims,
+                    expected_fmt=expected_fmt,
+                )
             )
 
         for layer_id in range(self.num_layers):
@@ -4344,7 +3659,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("'sync' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        sync: bool = kwargs["sync"]
         cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
             "cached_tensors"
         )
@@ -4471,12 +3785,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ):
                     logger.error(
                         "[DSA_SHRINK_CHECK] npu_sparse_direct_prepare "
-                        "layer=%s skip=no_cpu_tensors use_cached_retrieve=%s "
-                        "memory_objs=%s selected_shape=%s selected_sample=%s "
+                        "layer=%s skip=no_cpu_tensors memory_objs=%s "
+                        "selected_shape=%s selected_sample=%s "
                         "slot_mapping_packed_shape=%s",
                         layer_id,
-                        use_cached_retrieve,
-                        len(memory_objs_layer) if memory_objs_layer is not None else None,
+                        (
+                            len(memory_objs_layer)
+                            if memory_objs_layer is not None
+                            else None
+                        ),
                         _dsa_debug_shape(selected_token_idx),
                         _dsa_debug_sample(selected_token_idx),
                         _dsa_debug_shape(slot_mapping_packed),
@@ -4496,40 +3813,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors, kv_group
                 )
             )
-            if layer_id in (0, self.num_layers - 1):
-                # #region agent log
-                cached_ptr_tensor = (
-                    cached_chunk_ptrs_npu[layer_id]
-                    if cached_chunk_ptrs_npu is not None
-                    and layer_id < len(cached_chunk_ptrs_npu)
-                    else None
-                )
-                _agent_debug_log(
-                    "H10,H11,H12",
-                    "npu_connectors.py:batched_to_gpu_head_token_wise",
-                    "sparse retrieve path inputs",
-                    {
-                        **_agent_debug_runtime_identity(),
-                        "kv_group": int(kv_group),
-                        "layer_id": int(layer_id),
-                        "sparse_direct_disabled": bool(_SPARSE_DIRECT_DISABLE),
-                        "explicit_sparse_payload": bool(explicit_sparse_payload),
-                        "selected_tokens": int(selected_token_idx.numel()),
-                        "packed_slots": int(slot_mapping_packed.numel()),
-                        "total_tokens": int(total_tokens),
-                        "cpu_chunks": int(len(cpu_tensors)),
-                        "using_cached_tensors": bool(
-                            layer_cached_tensors is not None
-                        ),
-                        "using_cached_ptr_tensor": bool(
-                            cached_ptr_tensor is not None
-                            and cached_ptr_tensor is chunk_ptrs_npu
-                        ),
-                        "load_stream_idx": int(load_stream_idx),
-                    },
-                )
-                # #endregion
-
             if _SPARSE_DIRECT_DISABLE:
                 self._run_sparse_staging_kv_transfer_layer(
                     kvcaches_ref=kvcaches_snapshot,
@@ -4625,7 +3908,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("'sync' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        sync: bool = kwargs["sync"]
 
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
@@ -4753,21 +4035,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
         if self.use_gpu and not dense_direct:
-            tmp_gpu_buffer_obj, staging_tensor = self._allocate_layerwise_staging_buffer(
-                num_tokens=num_tokens,
-                kv_group=kv_group,
-                layout=layout,
-                k_hidden_dims=k_hidden_dims,
-                v_hidden_dims=v_hidden_dims,
-                dsa_hidden_dims=dsa_hidden_dims,
-                expected_fmt=expected_fmt,
+            tmp_gpu_buffer_obj, staging_tensor = (
+                self._allocate_layerwise_staging_buffer(
+                    num_tokens=num_tokens,
+                    kv_group=kv_group,
+                    layout=layout,
+                    k_hidden_dims=k_hidden_dims,
+                    v_hidden_dims=v_hidden_dims,
+                    dsa_hidden_dims=dsa_hidden_dims,
+                    expected_fmt=expected_fmt,
+                )
             )
 
         current_stream = torch.npu.current_stream()
-        store_transfer_stream = (
-            current_stream if _STORE_USE_CURRENT_STREAM else self.store_stream
-        )
-        switch_store_stream = not _STORE_USE_CURRENT_STREAM
 
         try:
             for layer_id in range(self.num_layers):
@@ -4793,7 +4073,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         kvcaches_ref=kvcaches_snapshot,
                         kv_group=kv_group,
                         layer_id=layer_id,
-                        transfer_stream=store_transfer_stream,
+                        transfer_stream=self.store_stream,
                         current_stream=current_stream,
                         slot_mapping_full=slot_mapping_full,
                         chunk_ptrs_npu=chunk_ptrs_npu,
@@ -4810,16 +4090,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         dense_host_interleaved=dense_host_interleaved,
                         layer_tensors=cpu_tensors,
                         direction=True,
-                        switch_stream=switch_store_stream,
                     )
                     logger.debug("Finished offloading layer %d", layer_id)
                 else:
-                    with self._stream_context_or_null(
-                        store_transfer_stream,
-                        switch_stream=switch_store_stream,
-                    ):
-                        if switch_store_stream:
-                            store_transfer_stream.wait_stream(current_stream)
+                    with torch.npu.stream(self.store_stream):
+                        self.store_stream.wait_stream(current_stream)
                         if self.use_gpu:
                             cpu_tensors = []
                             for memory_obj in memory_objs_layer:
@@ -4866,146 +4141,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # store_layer publishes the CPU MemoryObjs immediately after the
                 # generator advances, so the layer's D2H copy must be complete
                 # before returning control regardless of the caller's sync hint.
-                store_transfer_stream.synchronize()
-                if (
-                    dense_direct
-                    and _DENSE_DIRECT_STORE_VERIFY
-                    and layer_id in (0, self.num_layers - 1)
-                ):
-                    sample_positions = sorted(
-                        {
-                            0,
-                            max(0, num_tokens // 2),
-                            max(0, num_tokens - 1),
-                        }
-                    )
-                    layer_cache = kvcaches_snapshot[layer_id]
-                    paged_tensors = (
-                        list(layer_cache)
-                        if isinstance(layer_cache, (tuple, list))
-                        else [layer_cache]
-                    )
-                    if len(paged_tensors) == 1:
-                        plane_dims = [int(k_hidden_dims)]
-                    elif len(paged_tensors) == 2:
-                        plane_dims = [
-                            int(k_hidden_dims),
-                            int(v_hidden_dims),
-                        ]
-                    else:
-                        plane_dims = [
-                            int(k_hidden_dims),
-                            int(v_hidden_dims),
-                            int(dsa_hidden_dims),
-                        ]
-                    slot_mapping_cpu = (
-                        slot_mapping_full.detach().to(device="cpu").reshape(-1)
-                    )
-                    compared_elements = 0
-                    mismatched_elements = 0
-                    max_abs_diff = 0.0
-                    checked_tokens = 0
-                    for sample_position in sample_positions:
-                        source_slot = int(
-                            slot_mapping_cpu[sample_position].item()
-                        )
-                        if source_slot < 0:
-                            continue
-                        chunk_id = next(
-                            (
-                                index
-                                for index, (offset, size) in enumerate(
-                                    zip(
-                                        chunk_offsets,
-                                        chunk_sizes,
-                                        strict=False,
-                                    )
-                                )
-                                if offset
-                                <= sample_position
-                                < offset + size
-                            ),
-                            None,
-                        )
-                        if chunk_id is None:
-                            continue
-                        local_token = (
-                            sample_position - chunk_offsets[chunk_id]
-                        )
-                        chunk_tokens = chunk_sizes[chunk_id]
-                        chunk_flat = cpu_tensors[chunk_id].detach().reshape(-1)
-                        plane_base = 0
-                        checked_tokens += 1
-                        for paged_tensor, plane_dim in zip(
-                            paged_tensors, plane_dims, strict=False
-                        ):
-                            if plane_dim <= 0:
-                                continue
-                            cpu_start = (
-                                plane_base + local_token * plane_dim
-                            )
-                            actual = chunk_flat[
-                                cpu_start : cpu_start + plane_dim
-                            ].to(dtype=torch.float32)
-                            paged_start = source_slot * plane_dim
-                            expected = (
-                                paged_tensor.detach()
-                                .reshape(-1)[
-                                    paged_start : paged_start + plane_dim
-                                ]
-                                .to(device="cpu", dtype=torch.float32)
-                            )
-                            difference = (actual - expected).abs()
-                            compared_elements += int(difference.numel())
-                            mismatched_elements += int(
-                                torch.count_nonzero(difference).item()
-                            )
-                            if difference.numel():
-                                max_abs_diff = max(
-                                    max_abs_diff,
-                                    float(difference.max().item()),
-                                )
-                            plane_base += chunk_tokens * plane_dim
-
-                    # #region agent log
-                    _agent_debug_log(
-                        "H17,H18,H19",
-                        "npu_connectors.py:batched_from_gpu:dense_store_verify",
-                        "dense direct paged-to-CPU parity",
-                        {
-                            **_agent_debug_runtime_identity(),
-                            "kv_group": int(kv_group),
-                            "layer_id": int(layer_id),
-                            "num_tokens": int(num_tokens),
-                            "checked_tokens": int(checked_tokens),
-                            "compared_elements": int(compared_elements),
-                            "mismatched_elements": int(
-                                mismatched_elements
-                            ),
-                            "max_abs_diff": float(max_abs_diff),
-                            "parity_ok": bool(mismatched_elements == 0),
-                        },
-                    )
-                    # #endregion
-                if dense_direct and layer_id in (0, self.num_layers - 1):
-                    # #region agent log
-                    _agent_debug_log(
-                        "H1,H3,H5",
-                        "npu_connectors.py:batched_from_gpu:post_sync",
-                        "store stream synchronized before layer publication",
-                        {
-                            "rank": os.getenv(
-                                "RANK", os.getenv("LOCAL_RANK", "unknown")
-                            ),
-                            "kv_group": int(kv_group),
-                            "layer_id": int(layer_id),
-                            "summaries": [
-                                _agent_debug_tensor_summary(tensor)
-                                for tensor in cpu_tensors
-                            ],
-                        },
-                    )
-                    # #endregion
+                self.store_stream.synchronize()
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
@@ -5018,7 +4154,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 and tmp_gpu_buffer_obj is not None
                 and tmp_gpu_buffer_obj.is_valid()
             ):
-                store_transfer_stream.synchronize()
+                self.store_stream.synchronize()
                 tmp_gpu_buffer_obj.ref_count_down()
 
 

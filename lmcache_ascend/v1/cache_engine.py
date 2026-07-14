@@ -35,30 +35,6 @@ logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
-# #region agent log
-def _agent_debug_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-) -> None:
-    payload = {
-        "sessionId": "51d8e7",
-        "runId": "baseline",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with open("debug-51d8e7.log", "a", encoding="utf-8") as debug_file:
-            debug_file.write(json.dumps(payload, default=str) + "\n")
-    except OSError:
-        pass
-# #endregion
-
-
 def _dsa_debug_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
         "1",
@@ -122,7 +98,7 @@ def _dsa_debug_should_log(owner: Any, site: str) -> bool:
     counts = getattr(owner, "_dsa_shrink_debug_counts", None)
     if counts is None:
         counts = {}
-        setattr(owner, "_dsa_shrink_debug_counts", counts)
+        owner._dsa_shrink_debug_counts = counts
     count = counts.get(site, 0)
     if count >= _dsa_debug_limit():
         return False
@@ -422,39 +398,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         *,
         req_id: str,
         layer_id: int,
-        kv_group: int,
         keys: List[Any],
         tensors: List[torch.Tensor],
     ) -> None:
         if not _dsa_validate_kv_enabled():
             return
-        matched = 0
-        missing = 0
-        mismatched = 0
-        digest_failed = 0
-        mismatch_key_hashes: List[str] = []
-        key_manifest = hashlib.sha256()
-        actual_manifest = hashlib.sha256()
         for key, tensor in zip(keys, tensors, strict=False):
             record_key = self._dsa_validate_key(layer_id, key)
-            key_manifest.update(record_key.encode("utf-8"))
-            try:
-                actual = self._dsa_validate_tensor_digest(tensor)
-            except Exception as exc:
-                digest_failed += 1
-                logger.exception(
-                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_failed "
-                    "req=%s layer=%s key=%s error=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                    exc,
-                )
-                continue
-            actual_manifest.update(actual["sha256"].encode("ascii"))
             expected = self._dsa_validate_kv_digests.get(record_key)
             if expected is None:
-                missing += 1
                 payload = {
                     "req_id": req_id,
                     "layer_id": layer_id,
@@ -469,11 +421,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                     key,
                 )
                 continue
-            if actual["sha256"] != expected["digest"]["sha256"]:
-                mismatched += 1
-                mismatch_key_hashes.append(
-                    hashlib.sha1(record_key.encode("utf-8")).hexdigest()
+            try:
+                actual = self._dsa_validate_tensor_digest(tensor)
+            except Exception as exc:
+                logger.exception(
+                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_failed "
+                    "req=%s layer=%s key=%s error=%s",
+                    req_id,
+                    layer_id,
+                    key,
+                    exc,
                 )
+                continue
+            if actual["sha256"] != expected["digest"]["sha256"]:
                 payload = {
                     "req_id": req_id,
                     "layer_id": layer_id,
@@ -501,47 +461,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     tensor=tensor,
                     phase="retrieve",
                 )
-            else:
-                matched += 1
-
-        distributed_rank = None
-        try:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                distributed_rank = int(torch.distributed.get_rank())
-        except RuntimeError:
-            pass
-        # #region agent log
-        _agent_debug_log(
-            "H20,H21,H22,H24",
-            "cache_engine.py:_dsa_check_retrieve_digests",
-            "cache-key store-to-retrieve whole-chunk parity",
-            {
-                "pid": int(os.getpid()),
-                "distributed_rank": distributed_rank,
-                "env_rank": os.getenv("RANK"),
-                "env_local_rank": os.getenv("LOCAL_RANK"),
-                "req_id": req_id,
-                "kv_group": int(kv_group),
-                "layer_id": int(layer_id),
-                "key_count": int(len(keys)),
-                "tensor_count": int(len(tensors)),
-                "matched": int(matched),
-                "missing": int(missing),
-                "mismatched": int(mismatched),
-                "digest_failed": int(digest_failed),
-                "key_manifest_sha256": key_manifest.hexdigest(),
-                "actual_manifest_sha256": actual_manifest.hexdigest(),
-                "all_ok": bool(
-                    len(keys) == len(tensors)
-                    and missing == 0
-                    and mismatched == 0
-                    and digest_failed == 0
-                    and matched == len(keys)
-                ),
-                "mismatch_key_hashes": mismatch_key_hashes[:8],
-            },
-        )
-        # #endregion
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
@@ -909,7 +828,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs: Optional[List],
         cached_tensors: Optional[List],
     ) -> None:
-        """Append one store_layer batch; never clear (chunked prefill calls many times)."""
+        """Append a store batch; never clear across chunked prefill calls."""
         num_layers = len(keys)
         if cached_starts is not None:
             cached_starts.extend(starts)
@@ -995,7 +914,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
     ) -> None:
-        """Retain storage-get results in ReqMeta for later retrieve calls (same request)."""
+        """Retain storage-get results for later retrieves in the same request."""
         new_tensors: List[torch.Tensor] = [
             tensor
             for mem_obj in mem_objs_layer
@@ -1336,7 +1255,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         List[int],
         List[List[CacheEngineKey]],
     ]:
-        """Resolve retrieve chunk metadata once per request; reuse ReqMeta cache after."""
+        """Resolve retrieve chunk metadata once, then reuse the request cache."""
         if self._needs_retrieve_metadata_refresh(
             cached_keys, cached_starts, cached_ends, tokens
         ):
@@ -2196,6 +2115,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             retrieve_kwargs=kwargs,
         )
         kwargs.pop("_use_cached_retrieve", None)
+        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        cached_tensors_cover = self._retrieve_data_cache_covers(
+            cached_tensors,
+            self.num_layers,
+            required_chunks,
+        )
+        cached_memory_objs_cover = self._retrieve_data_cache_covers(
+            cached_memory_objs,
+            self.num_layers,
+            required_chunks,
+        )
+        use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
         if _dsa_debug_should_log(self, "head_retrieve_metadata"):
             slot_mapping = kwargs.get("slot_mapping")
             logger.warning(
@@ -2232,18 +2163,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 location,
             )
 
-        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
-        cached_tensors_cover = self._retrieve_data_cache_covers(
-            cached_tensors,
-            self.num_layers,
-            required_chunks,
-        )
-        cached_memory_objs_cover = self._retrieve_data_cache_covers(
-            cached_memory_objs,
-            self.num_layers,
-            required_chunks,
-        )
-        use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
         if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
             raise ValueError(
                 "Layerwise sparse retrieve cache is incomplete; refusing to "
@@ -2679,21 +2598,17 @@ class AscendLMCacheEngine(LMCacheEngine):
 
                 if cached_mem_layers is not None:
                     mem_objs_layer = cached_mem_layers[layer_id]
-                    diag_source = "cached_memory_objs"
                 elif use_cached_retrieve:
                     mem_objs_layer = []
-                    diag_source = "cached_tensors"
                 else:
                     if shared_sparse_retrieve:
                         assert pre_resolved_shared_mem_layers is not None
                         mem_objs_layer = pre_resolved_shared_mem_layers[layer_id]
-                        diag_source = "shared_pre_resolved"
                     else:
                         assert get_generator is not None
                         task = next(get_generator)
                         assert task is not None
                         mem_objs_layer = task.result()
-                        diag_source = f"storage:{location}"
                     if mem_objs_layer is not None:
                         layer_cached_chunks = (
                             len(cached_tensors[layer_id])
@@ -2811,29 +2726,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         raise
                     self._broadcast_shared_envelope(envelope)
-
-                if (
-                    _dsa_validate_kv_enabled()
-                    and layer_id in (0, self.num_layers // 2, self.num_layers - 1)
-                ):
-                    validation_tensors = (
-                        cached_tensors[layer_id]
-                        if cached_tensors is not None
-                        and layer_id < len(cached_tensors)
-                        and cached_tensors[layer_id]
-                        else [
-                            memory_obj.tensor
-                            for memory_obj in mem_objs_layer
-                            if memory_obj.tensor is not None
-                        ]
-                    )
-                    self._dsa_check_retrieve_digests(
-                        req_id=kwargs.get("req_id", "unspecified"),
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                        keys=retrieve_keys[layer_id],
-                        tensors=validation_tensors,
-                    )
 
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
