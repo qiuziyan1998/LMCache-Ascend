@@ -1074,13 +1074,21 @@ class AscendLMCacheEngine(LMCacheEngine):
         kvcaches = getattr(self.gpu_connector, "kvcaches", None)
         if kvcaches is not None:
             kv_group = kwargs.get("kv_group", 0)
-            # The layerwise NPU connector detects format per kv_group; other
-            # connectors (e.g. the blending buffer connector) may not accept
-            # the kwarg, so fall back to the positional call for them.
+            # Detect layout without allocating a staging pool. Direct MLA/DSA
+            # transfers do not use staging, and non-direct paths initialize it
+            # explicitly when needed. Older connectors may not accept either
+            # keyword, so retain compatibility fallbacks for them.
             try:
-                lazy_init(kvcaches, kv_group=kv_group)
+                lazy_init(
+                    kvcaches,
+                    kv_group=kv_group,
+                    init_staging=False,
+                )
             except TypeError:
-                lazy_init(kvcaches)
+                try:
+                    lazy_init(kvcaches, kv_group=kv_group)
+                except TypeError:
+                    lazy_init(kvcaches)
 
     def _expected_shared_cpu_chunk_metadata(
         self,
