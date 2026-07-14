@@ -105,20 +105,6 @@ def test_shared_cpu_store_publication_fences_store_stream() -> None:
     assert connector.store_stream.events == ["synchronize"]
 
 
-def test_shared_cpu_sparse_load_fences_current_stream(monkeypatch) -> None:
-    current_stream = _TrackingStream("current")
-
-    class _Npu:
-        def current_stream(self):
-            return current_stream
-
-    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
-
-    VLLMPagedMemLayerwiseNPUConnector.synchronize_shared_cpu_sparse_load()
-
-    assert current_stream.events == ["synchronize"]
-
-
 def test_sparse_pointer_cache_reuse_debug_rejects_stale_ptrs(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")

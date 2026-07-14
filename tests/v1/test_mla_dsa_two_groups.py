@@ -10,14 +10,11 @@ Covers:
 - from_request_tracker decode-full-chunk boundary rule
 - store_layer _is_passive() guard (rank-0-only store)
 - VLLMPagedMemLayerwiseNPUConnector.get_shape for MLA_LATENT and DSA_INDEX
-- _is_mla_dsa_format / _is_latent_format / _is_indexer_format helpers
+- _is_mla_dsa_format helper
 - Integration: two-group store/load roundtrip with separate latent and indexer keys
 """
 # Standard
-import os
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
 from unittest.mock import MagicMock, patch
 
 # Third Party
@@ -1667,7 +1664,6 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         "_save_storer_key",
         "_should_defer_latent_save_under_tp",
         "_drain_layerwise_storer_fully",
-        "_latent_slot_mapping_from_attn_metadata",
         "_indexer_slot_mapping_from_attn_metadata",
         "_pad_chunk_local_slot_mapping",
         "_indexer_retrieve_slot_mapping",

@@ -88,9 +88,6 @@ class _OrderedSparseConsumer:
     def synchronize_shared_cpu_store_publication(self):
         self.events.append("store_fence")
 
-    def synchronize_shared_cpu_sparse_load(self):
-        self.events.append("load_fence")
-
 
 class _FakeTensorMemObj:
     def __init__(self, tensor):
@@ -699,71 +696,6 @@ def test_sparse_passive_populates_metadata_and_hands_off_views(monkeypatch):
     assert cached_shared_handles == [[handle]]
     assert mem_obj.release_count == 0
     assert mem_obj.is_valid()
-
-
-def test_sparse_passive_fences_compute_after_shared_load(monkeypatch):
-    monkeypatch.setattr(
-        ascend_cache_engine,
-        "assert_layerwise_gpu_connector",
-        lambda _connector: None,
-    )
-
-    events = []
-    key = _make_key()
-    mem_obj = _FakeTensorMemObj(torch.empty(1))
-    engine = object.__new__(AscendLMCacheEngine)
-    engine.num_layers = 1
-    engine.gpu_connector = _OrderedSparseConsumer(events)
-    engine.token_database = _FakeTokenDatabase(key)
-    engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
-    engine.shared_cpu_cache_generation = 7
-    engine.metadata = type("Meta", (), {"first_rank": 0})()
-    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
-        torch.Size([1]),
-        torch.float16,
-        object(),
-    )
-
-    def receive_envelope():
-        events.append("receive")
-        return SharedHandleEnvelope(
-            request_id="req-1",
-            phase="sparse_decode_bootstrap",
-            request_ordinal=0,
-            layer_id=0,
-            kv_group=0,
-            status="ok",
-            generation=7,
-            handles=[object()],
-        )
-
-    engine._receive_shared_envelope = receive_envelope
-    original_append = AscendLMCacheEngine._append_retrieve_layer_cache
-
-    def append_cache(*args, **kwargs):
-        events.append("pointer_install")
-        return original_append(engine, *args, **kwargs)
-
-    engine._append_retrieve_layer_cache = append_cache
-
-    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
-        [1],
-        None,
-        torch.zeros(1, dtype=torch.bool),
-        cached_memory_objs=[],
-        cached_tensors=[],
-        cached_chunk_dev_ptrs=None,
-        cached_chunk_ptrs_npu=None,
-        cached_shared_handles=[],
-        kv_group=0,
-        req_id="req-1",
-    )
-
-    next(retriever)
-    retriever.send(([0], 0))
-    retriever.close()
-
-    assert events == ["receive", "pointer_install", "load", "load_fence"]
 
 
 def test_sparse_passive_close_before_handoff_releases_views(monkeypatch):

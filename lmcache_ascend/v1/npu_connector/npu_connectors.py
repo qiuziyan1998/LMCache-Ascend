@@ -1383,16 +1383,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Complete this rank's store work before publishing shared handles."""
         self.store_stream.synchronize()
 
-    @staticmethod
-    def synchronize_shared_cpu_sparse_load() -> None:
-        """Submit and complete the passive rank's load-to-compute dependency."""
-        current_stream = (
-            torch.npu.current_stream()
-            if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
-            else torch.cuda.current_stream()
-        )
-        current_stream.synchronize()
-
     def _group_layout(self, kv_group: int) -> _GroupLayout:
         """Return the layout for ``kv_group``, raising if not initialized."""
         layout = self._group_layouts.get(kv_group)
@@ -1622,31 +1612,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 int(tensor.numel() * tensor.element_size()),
             )
         return (type(tensor).__name__,)
-
-    @staticmethod
-    def _tensor_identity_signature(tensor) -> tuple:
-        if isinstance(tensor, torch.Tensor):
-            return (
-                int(tensor.data_ptr()),
-                tuple(int(dim) for dim in tensor.shape),
-                tuple(int(stride) for stride in tensor.stride()),
-                tensor.dtype,
-                str(tensor.device),
-            )
-        return (type(tensor).__name__, id(tensor))
-
-    @staticmethod
-    def _tensor_collection_identity_signature(value) -> tuple:
-        if isinstance(value, (tuple, list)):
-            return tuple(
-                VLLMPagedMemLayerwiseNPUConnector._tensor_identity_signature(
-                    tensor
-                )
-                for tensor in value
-            )
-        return (
-            VLLMPagedMemLayerwiseNPUConnector._tensor_identity_signature(value),
-        )
 
     @staticmethod
     def _vllm_layer_cache_identity_signature(value) -> tuple:
@@ -2489,13 +2454,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             KVCacheFormat.DSA_INDEX,
         )
 
-    def _is_latent_format(self, kv_group: Optional[int] = None) -> bool:
-        fmt = self._fmt_for(kv_group)
-        return fmt in (KVCacheFormat.MLA_KV, KVCacheFormat.MLA_LATENT)
-
-    def _is_indexer_format(self, kv_group: Optional[int] = None) -> bool:
-        return self._fmt_for(kv_group) == KVCacheFormat.DSA_INDEX
-
     def _layerwise_token_major(self, kv_group: Optional[int] = None) -> bool:
         # GQA uses token-interleaved CPU chunks; MLA/DSA use stacked K|V|DSA planes.
         return not self._is_mla_dsa_format(kv_group)
@@ -2867,18 +2825,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
         current_stream.wait_stream(transfer_stream)
 
-    def _single_layer_hidden_dim_args(
-        self, kv_group: Optional[int] = None
-    ) -> tuple[int, int, int]:
-        layout = self._layout_for(kv_group)
-        if layout is not None:
-            return (
-                layout.k_hidden_dims,
-                layout.v_hidden_dims,
-                layout.dsa_hidden_dims,
-            )
-        return (self.k_hidden_dims, self.v_hidden_dims, self.dsa_hidden_dims)
-
     def _lmc_plane_num_tokens(
         self, lmc_tensor: torch.Tensor, kv_group: Optional[int] = None
     ) -> int:
@@ -2907,20 +2853,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "hidden_dim_size must be positive for GQA sparse retrieve."
         )
         return lmc_tensor.numel() // per_token
-
-    def _sparse_retrieve_total_tokens(
-        self, lmc_tensors: List[torch.Tensor], kv_group: Optional[int] = None
-    ) -> int:
-        num_chunks = len(lmc_tensors)
-        if num_chunks == 0:
-            return 0
-        assert self.lmcache_chunk_size > 0, (
-            "chunk_size must be configured for sparse layerwise retrieve."
-        )
-        if num_chunks == 1:
-            return self._lmc_plane_num_tokens(lmc_tensors[0], kv_group)
-        last_tokens = self._lmc_plane_num_tokens(lmc_tensors[-1], kv_group)
-        return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
 
     def _expected_memory_format(
         self, kv_group: Optional[int] = None
