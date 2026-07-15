@@ -2,6 +2,7 @@
 # Standard
 from contextlib import nullcontext
 import os
+import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -58,6 +59,44 @@ _DENSE_DIRECT_STORE_DISABLE = (
     or os.getenv("LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0").lower()
     in ("1", "true", "yes", "on")
 )
+
+
+def _start_pd_stage_trace(kwargs: dict[str, Any]) -> int:
+    return (
+        time.perf_counter_ns()
+        if isinstance(kwargs.get("_pd_stage_trace"), dict)
+        else 0
+    )
+
+
+def _record_pd_stage_trace(
+    kwargs: dict[str, Any],
+    phase: str,
+    started_ns: int,
+    layer_id: Optional[int] = None,
+) -> None:
+    if not started_ns:
+        return
+    trace = kwargs.get("_pd_stage_trace")
+    if not isinstance(trace, dict):
+        return
+    if "kv_group" in kwargs:
+        phase = f"{phase}_g{kwargs['kv_group']}"
+
+    elapsed_ns = time.perf_counter_ns() - started_ns
+    totals = trace.get("internal_ns")
+    counts = trace.get("internal_counts")
+    maxima = trace.get("internal_max_ns")
+    slowest_layers = trace.get("internal_slowest_layer")
+    trace_maps = (totals, counts, maxima, slowest_layers)
+    if not all(isinstance(item, dict) for item in trace_maps):
+        return
+
+    totals[phase] = totals.get(phase, 0) + elapsed_ns
+    counts[phase] = counts.get(phase, 0) + 1
+    if elapsed_ns > maxima.get(phase, 0):
+        maxima[phase] = elapsed_ns
+        slowest_layers[phase] = layer_id if layer_id is not None else -1
 
 
 def _payload_event_list(payload_event: Any) -> list[Any]:
@@ -3337,6 +3376,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         Sparse layerwise retrieve: scatter selected KV tokens from CPU pinned
         memory objects into paged NPU KV via direct NPU read (no staging).
         """
+        setup_started_ns = _start_pd_stage_trace(kwargs)
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -3381,9 +3421,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # Snapshot so interleaved latent/indexer sparse generators do not
         # race on the shared connector self.kvcaches pointer.
         kvcaches_snapshot = self.kvcaches
+        _record_pd_stage_trace(kwargs, "npu_connector_setup", setup_started_ns)
 
         for layer_id in range(self.num_layers):
             sparse_request = yield
+            input_pack_started_ns = _start_pd_stage_trace(kwargs)
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
             current_stream = (
@@ -3449,12 +3491,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             token_start_index,
                         )
                     )
+            _record_pd_stage_trace(
+                kwargs,
+                "npu_input_pack",
+                input_pack_started_ns,
+                layer_id,
+            )
 
             # Payload producer events are consumed before packing on
             # current_stream. The transfer stream waits on current_stream below,
             # so re-waiting on the same payload events is redundant here.
             transfer_payload_event = None
 
+            pointer_resolve_started_ns = _start_pd_stage_trace(kwargs)
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
                 if cached_tensors_by_layer is not None
@@ -3490,6 +3539,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         _dsa_debug_sample(selected_token_idx),
                         _dsa_debug_shape(slot_mapping_packed),
                     )
+                _record_pd_stage_trace(
+                    kwargs,
+                    "npu_pointer_resolve",
+                    pointer_resolve_started_ns,
+                    layer_id,
+                )
                 continue
 
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
@@ -3504,6 +3559,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors, kv_group
                 )
             )
+            _record_pd_stage_trace(
+                kwargs,
+                "npu_pointer_resolve",
+                pointer_resolve_started_ns,
+                layer_id,
+            )
+            transfer_started_ns = _start_pd_stage_trace(kwargs)
             if _SPARSE_DIRECT_DISABLE:
                 self._run_sparse_staging_kv_transfer_layer(
                     kvcaches_ref=kvcaches_snapshot,
@@ -3550,6 +3612,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors=cpu_tensors,
                     payload_event=transfer_payload_event,
                 )
+            _record_pd_stage_trace(
+                kwargs,
+                "npu_transfer_submit",
+                transfer_started_ns,
+                layer_id,
+            )
 
         yield
 

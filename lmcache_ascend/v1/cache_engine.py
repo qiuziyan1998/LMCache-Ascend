@@ -34,6 +34,44 @@ logger = init_logger(__name__)
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
 
+def _start_pd_stage_trace(kwargs: dict[str, Any]) -> int:
+    return (
+        time.perf_counter_ns()
+        if isinstance(kwargs.get("_pd_stage_trace"), dict)
+        else 0
+    )
+
+
+def _record_pd_stage_trace(
+    kwargs: dict[str, Any],
+    phase: str,
+    started_ns: int,
+    layer_id: Optional[int] = None,
+) -> None:
+    if not started_ns:
+        return
+    trace = kwargs.get("_pd_stage_trace")
+    if not isinstance(trace, dict):
+        return
+    if "kv_group" in kwargs:
+        phase = f"{phase}_g{kwargs['kv_group']}"
+
+    elapsed_ns = time.perf_counter_ns() - started_ns
+    totals = trace.get("internal_ns")
+    counts = trace.get("internal_counts")
+    maxima = trace.get("internal_max_ns")
+    slowest_layers = trace.get("internal_slowest_layer")
+    trace_maps = (totals, counts, maxima, slowest_layers)
+    if not all(isinstance(item, dict) for item in trace_maps):
+        return
+
+    totals[phase] = totals.get(phase, 0) + elapsed_ns
+    counts[phase] = counts.get(phase, 0) + 1
+    if elapsed_ns > maxima.get(phase, 0):
+        maxima[phase] = elapsed_ns
+        slowest_layers[phase] = layer_id if layer_id is not None else -1
+
+
 def _dsa_debug_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
         "1",
@@ -1661,10 +1699,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         assert_layerwise_gpu_connector(self.gpu_connector)
+        connector_setup_started_ns = _start_pd_stage_trace(kwargs)
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
             **kwargs
         )
         next(mem_obj_consumer)
+        _record_pd_stage_trace(
+            kwargs, "passive_connector_setup", connector_setup_started_ns
+        )
 
         to_release: list[MemoryObj] = []
         passive_views_handed_off = False
@@ -1709,6 +1751,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     selected_tokens = sparse_request
                     token_start_index = 0
 
+                shared_receive_started_ns = _start_pd_stage_trace(kwargs)
                 envelope = self._receive_shared_envelope()
                 self._validate_shared_layerwise_envelope(
                     envelope,
@@ -1785,6 +1828,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_shared_handles,
                     )
 
+                _record_pd_stage_trace(
+                    kwargs,
+                    "passive_shared_receive",
+                    shared_receive_started_ns,
+                    layer_id,
+                )
+
+                connector_send_started_ns = _start_pd_stage_trace(kwargs)
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
                     mem_obj_consumer.send(sparse_payload)
@@ -1797,7 +1848,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                             target_slot_mapping,
                         )
                     )
+                _record_pd_stage_trace(
+                    kwargs,
+                    "passive_connector_send",
+                    connector_send_started_ns,
+                    layer_id,
+                )
+            connector_finalize_started_ns = _start_pd_stage_trace(kwargs)
             next(mem_obj_consumer)
+            _record_pd_stage_trace(
+                kwargs,
+                "passive_connector_finalize",
+                connector_finalize_started_ns,
+            )
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None
             )
@@ -1925,6 +1988,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             self.num_layers,
         )
 
+        metadata_started_ns = _start_pd_stage_trace(kwargs)
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -1935,6 +1999,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask=ret_mask,
             retrieve_kwargs=kwargs,
         )
+        _record_pd_stage_trace(kwargs, "retrieve_metadata", metadata_started_ns)
         kwargs.pop("_use_cached_retrieve", None)
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
         cached_tensors_cover = self._retrieve_data_cache_covers(
@@ -2124,6 +2189,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 },
             )
 
+        shared_preflight_started_ns = _start_pd_stage_trace(kwargs)
         if shared_sparse_retrieve and not use_cached_retrieve and retrieve_keys:
             missing_locations: list[tuple[int, int]] = []
             for layer_id, layer_keys in enumerate(retrieve_keys):
@@ -2238,6 +2304,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                             f"{message} error={exc}"
                         )
                         record_request_preflight_error()
+
+        _record_pd_stage_trace(
+            kwargs, "active_shared_preflight", shared_preflight_started_ns
+        )
 
         if preflight_error_envelope is None and request_preflight_failed_elsewhere():
             release_pre_resolved_shared_mem_layers()
@@ -2417,6 +2487,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         f"message={request_preflight_state.get('message')}"
                     )
 
+                source_resolve_started_ns = _start_pd_stage_trace(kwargs)
                 if cached_mem_layers is not None:
                     mem_objs_layer = cached_mem_layers[layer_id]
                 elif use_cached_retrieve:
@@ -2452,8 +2523,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 )
                     else:
                         mem_objs_layer = []
+                _record_pd_stage_trace(
+                    kwargs,
+                    "active_source_resolve",
+                    source_resolve_started_ns,
+                    layer_id,
+                )
 
                 if publish_shared_handles:
+                    shared_publish_started_ns = _start_pd_stage_trace(kwargs)
                     if required_chunks and not mem_objs_layer:
                         message = (
                             "Shared CPU sparse decode has no MemoryObjs to "
@@ -2547,7 +2625,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         raise
                     self._broadcast_shared_envelope(envelope)
+                    _record_pd_stage_trace(
+                        kwargs,
+                        "active_shared_publish",
+                        shared_publish_started_ns,
+                        layer_id,
+                    )
 
+                connector_send_started_ns = _start_pd_stage_trace(kwargs)
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
                     ensure_mem_obj_consumer().send(sparse_payload)
@@ -2560,9 +2645,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                             target_slot_mapping,
                         )
                     )
+                _record_pd_stage_trace(
+                    kwargs,
+                    "active_connector_send",
+                    connector_send_started_ns,
+                    layer_id,
+                )
 
             if mem_obj_consumer is not None:
+                connector_finalize_started_ns = _start_pd_stage_trace(kwargs)
                 next(mem_obj_consumer)
+                _record_pd_stage_trace(
+                    kwargs,
+                    "active_connector_finalize",
+                    connector_finalize_started_ns,
+                )
             release_pending_pre_resolved()
             # The LMCache vLLM adapter records request state after this final
             # yield and drains sparse retrievers with close(), so ownership must
