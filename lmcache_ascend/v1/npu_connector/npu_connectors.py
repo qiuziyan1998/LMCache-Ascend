@@ -39,6 +39,12 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+_PD_STAGE_TRACE_SYNC_NPU = (
+    os.environ.get("VLLM_PD_STAGE_TRACE", "0").lower()
+    in ("1", "true", "yes", "on")
+    and os.environ.get("VLLM_PD_STAGE_TRACE_SYNC_NPU", "0").lower()
+    in ("1", "true", "yes", "on")
+)
 
 _SPARSE_DIRECT_RECORD_STREAM = os.getenv(
     "LMCACHE_ASCEND_SPARSE_DIRECT_RECORD_STREAM", "0"
@@ -62,11 +68,11 @@ _DENSE_DIRECT_STORE_DISABLE = (
 
 
 def _start_pd_stage_trace(kwargs: dict[str, Any]) -> int:
-    return (
-        time.perf_counter_ns()
-        if isinstance(kwargs.get("_pd_stage_trace"), dict)
-        else 0
-    )
+    if not isinstance(kwargs.get("_pd_stage_trace"), dict):
+        return 0
+    if _PD_STAGE_TRACE_SYNC_NPU:
+        torch.npu.synchronize()
+    return time.perf_counter_ns()
 
 
 def _record_pd_stage_trace(
@@ -80,6 +86,8 @@ def _record_pd_stage_trace(
     trace = kwargs.get("_pd_stage_trace")
     if not isinstance(trace, dict):
         return
+    if _PD_STAGE_TRACE_SYNC_NPU:
+        torch.npu.synchronize()
     if "kv_group" in kwargs:
         phase = f"{phase}_g{kwargs['kv_group']}"
 

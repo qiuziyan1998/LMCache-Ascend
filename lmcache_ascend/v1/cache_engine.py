@@ -32,14 +32,20 @@ import torch
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
+_PD_STAGE_TRACE_SYNC_NPU = (
+    os.environ.get("VLLM_PD_STAGE_TRACE", "0").lower()
+    in ("1", "true", "yes", "on")
+    and os.environ.get("VLLM_PD_STAGE_TRACE_SYNC_NPU", "0").lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 def _start_pd_stage_trace(kwargs: dict[str, Any]) -> int:
-    return (
-        time.perf_counter_ns()
-        if isinstance(kwargs.get("_pd_stage_trace"), dict)
-        else 0
-    )
+    if not isinstance(kwargs.get("_pd_stage_trace"), dict):
+        return 0
+    if _PD_STAGE_TRACE_SYNC_NPU:
+        torch.npu.synchronize()
+    return time.perf_counter_ns()
 
 
 def _record_pd_stage_trace(
@@ -53,6 +59,8 @@ def _record_pd_stage_trace(
     trace = kwargs.get("_pd_stage_trace")
     if not isinstance(trace, dict):
         return
+    if _PD_STAGE_TRACE_SYNC_NPU:
+        torch.npu.synchronize()
     if "kv_group" in kwargs:
         phase = f"{phase}_g{kwargs['kv_group']}"
 
