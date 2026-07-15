@@ -153,24 +153,19 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
   config.singlePerLoopBuffer = totalPerLoopBuffer / numBuffsOnDev;
 }
 
-void compute_single_layer_ub_params(const KVTransferDims &dims,
-                                    KVTransferUBParams &ub_params,
-                                    const torch::Tensor &vllm_cache,
-                                    kvcache_ops::KVCacheFormat format,
-                                    int64_t k_hidden_dims, int64_t v_hidden_dims,
-                                    int64_t dsa_hidden_dims) {
+static int32_t compute_single_layer_max_tokens_per_loop(
+    const KVTransferDims &dims, const torch::Tensor &vllm_cache,
+    kvcache_ops::KVCacheFormat format, int64_t k_hidden_dims,
+    int64_t v_hidden_dims, int64_t dsa_hidden_dims) {
 
   const c10::OptionalDeviceGuard device_guard(device_of(vllm_cache));
 
-  ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   const char *socName = aclrtGetSocName();
 
   auto ascendcPlatform =
       platform_ascendc::PlatformAscendCManager::GetInstance(socName);
   uint64_t ubSize;
   ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-
-  ub_params.aiv_num = static_cast<uint32_t>(std::min(4, dims.num_tokens));
 
   uint32_t numBuffsOnDev = 2;
   int64_t perTokenBufferElems = dims.kv_size * dims.num_heads * dims.head_dims;
@@ -196,9 +191,22 @@ void compute_single_layer_ub_params(const KVTransferDims &dims,
   }
 
   // we are going to work out how many tokens to copy maximally per innerloop
-  ub_params.max_tokens_per_loop = static_cast<int32_t>(ubSize / baseBuffSize);
+  return static_cast<int32_t>(ubSize / baseBuffSize);
+}
+
+void compute_single_layer_ub_params(
+    const KVTransferDims &dims, KVTransferUBParams &ub_params,
+    const torch::Tensor &vllm_cache, kvcache_ops::KVCacheFormat format,
+    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims) {
+  const c10::OptionalDeviceGuard device_guard(device_of(vllm_cache));
+
+  ub_params.stream = c10_npu::getCurrentNPUStream().stream();
+  ub_params.aiv_num = static_cast<uint32_t>(std::min(4, dims.num_tokens));
   ub_params.max_tokens_per_loop =
-      std::min(ub_params.max_tokens_per_loop, dims.num_tokens);
+      std::min(compute_single_layer_max_tokens_per_loop(
+                   dims, vllm_cache, format, k_hidden_dims, v_hidden_dims,
+                   dsa_hidden_dims),
+               dims.num_tokens);
 }
 
 void compute_single_layer_strides(
@@ -411,6 +419,80 @@ SparseDirectLayerState prepare_sparse_direct_layer_state(
       vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
       dsa_hidden_dims);
   state.config.dims.lmc_num_tokens = lmc_num_tokens;
+  return state;
+}
+
+SparseDirectDestinationState prepare_sparse_direct_destination_state(
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    at::ScalarType slot_mapping_type, int kvcache_format_raw,
+    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+
+  SparseDirectDestinationState state{};
+  state.kvcache_format =
+      static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
+  TORCH_CHECK(
+      state.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
+          state.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV ||
+          state.kvcache_format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+          state.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX,
+      "Prepared sparse destination state only supports MLA/DSA formats.");
+
+  torch::Tensor &vllm_k_cache = vllm_kv_caches[0];
+  torch::Tensor *vllm_v_cache = nullptr;
+  torch::Tensor *vllm_dsa_cache = nullptr;
+  if (state.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
+    vllm_v_cache = &vllm_k_cache;
+  } else {
+    vllm_v_cache = &vllm_kv_caches[1];
+    if (state.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+      vllm_dsa_cache = &vllm_kv_caches[2];
+    }
+  }
+
+  if (k_hidden_dims <= 0) {
+    k_hidden_dims = vllm_k_cache.size(-2) * vllm_k_cache.size(-1);
+  }
+  if (state.kvcache_format == kvcache_ops::KVCacheFormat::DSA_INDEX) {
+    k_hidden_dims = dsa_hidden_dims > 0
+                        ? dsa_hidden_dims
+                        : vllm_k_cache.size(-2) * vllm_k_cache.size(-1);
+    v_hidden_dims = 0;
+  } else if (v_hidden_dims <= 0) {
+    v_hidden_dims = vllm_v_cache->size(-2) * vllm_v_cache->size(-1);
+  }
+  if (dsa_hidden_dims <= 0 && vllm_dsa_cache != nullptr) {
+    dsa_hidden_dims = vllm_dsa_cache->size(-2) * vllm_dsa_cache->size(-1);
+  }
+
+  state.vllm_k_ptr = get_kernel_ptr<uint8_t, const torch::Tensor>(vllm_k_cache);
+  state.vllm_v_ptr =
+      get_kernel_ptr<uint8_t, const torch::Tensor>(*vllm_v_cache);
+  state.vllm_dsa_ptr =
+      vllm_dsa_cache == nullptr
+          ? nullptr
+          : get_kernel_ptr<uint8_t, const torch::Tensor>(*vllm_dsa_cache);
+  state.vllm_k_bytes = static_cast<int64_t>(vllm_k_cache.nbytes());
+  state.vllm_v_bytes = static_cast<int64_t>(vllm_v_cache->nbytes());
+  state.vllm_dsa_bytes = vllm_dsa_cache == nullptr
+                             ? 0
+                             : static_cast<int64_t>(vllm_dsa_cache->nbytes());
+  state.block_size = static_cast<int32_t>(vllm_k_cache.size(-3));
+  state.scalar_type_num =
+      vllm_ascend::get_dtype_from_torch(vllm_k_cache.scalar_type());
+  state.slot_type_num = vllm_ascend::get_dtype_from_torch(slot_mapping_type);
+  state.k_hidden_dims = k_hidden_dims;
+  state.v_hidden_dims = v_hidden_dims;
+  state.dsa_hidden_dims = dsa_hidden_dims;
+
+  KVTransferDims dims{};
+  dims.num_heads = static_cast<int32_t>(vllm_k_cache.size(-2));
+  dims.head_dims = static_cast<int32_t>(vllm_k_cache.size(-1));
+  dims.kv_size =
+      state.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV ? 3 : 2;
+  state.max_tokens_per_loop = compute_single_layer_max_tokens_per_loop(
+      dims, vllm_k_cache, state.kvcache_format, state.k_hidden_dims,
+      state.v_hidden_dims, state.dsa_hidden_dims);
   return state;
 }
 

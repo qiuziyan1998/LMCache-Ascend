@@ -33,14 +33,12 @@ def _prepared_source(num_layers: int = 2) -> PreparedSparseSource:
         PreparedSparseSourceLayer(
             tensors=(torch.zeros(4),),
             chunk_ptrs_npu=torch.tensor([100 + layer_id], dtype=torch.int64),
-            layout_signature=((4,), layer_id),
         )
         for layer_id in range(num_layers)
     )
     return PreparedSparseSource(
         layers=layers,
         total_tokens=4,
-        layout_signature=tuple(layer.layout_signature for layer in layers),
     )
 
 

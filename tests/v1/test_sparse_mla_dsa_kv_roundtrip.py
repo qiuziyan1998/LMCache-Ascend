@@ -41,12 +41,12 @@ from load_benchmark_utils import (  # noqa: E402
     release_pin_memory_objects,
     run_all_direct_fast_layers,
     run_all_direct_layers,
-    run_direct_fast_load_layer,
     run_direct_load_layer,
 )
 from lmcache_ascend.v1.npu_connector.utils import (  # noqa: E402
     batched_fused_sparse_single_layer_kv_transfer,
-    prepare_sparse_direct_layer_state,
+    prepare_sparse_direct_destination_state,
+    sparse_mla_dsa_batched_direct_kv_transfer_prepared,
 )
 
 
@@ -439,26 +439,22 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
                 kv_format=KV_FORMAT_MLA_LATENT,
                 chunk_ptrs_npu=chunk_ptrs_npu,
             )
-            layer_state = prepare_sparse_direct_layer_state(
-                chunks[0],
+            destination_state = prepare_sparse_direct_destination_state(
                 list(dst_fast),
                 scratch_slots,
-                False,
-                False,
                 KV_FORMAT_MLA_LATENT,
                 dims.k_hidden_dims,
                 dims.v_hidden_dims,
                 dims.dsa_hidden_dims,
-                total_tokens,
             )
-            run_direct_fast_load_layer(
-                layer_state=layer_state,
-                slot_mapping_packed=scratch_slots,
-                selected_token_idx=selected_npu,
-                chunk_ptrs_npu=chunk_ptrs_npu,
-                chunk_size=chunk_size,
-                total_tokens=total_tokens,
-                kv_format=KV_FORMAT_MLA_LATENT,
+            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+                destination_state,
+                scratch_slots,
+                selected_npu,
+                chunk_ptrs_npu,
+                chunk_size,
+                total_tokens,
+                False,
             )
             torch.npu.synchronize()
 
@@ -579,26 +575,22 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
                 kv_format=KV_FORMAT_DSA_INDEX,
                 chunk_ptrs_npu=chunk_ptrs_npu,
             )
-            layer_state = prepare_sparse_direct_layer_state(
-                chunks[0],
+            destination_state = prepare_sparse_direct_destination_state(
                 list(dst_fast),
                 scratch_slots,
-                False,
-                False,
                 KV_FORMAT_DSA_INDEX,
                 dims.k_hidden_dims,
                 dims.v_hidden_dims,
                 dims.dsa_hidden_dims,
-                total_tokens,
             )
-            run_direct_fast_load_layer(
-                layer_state=layer_state,
-                slot_mapping_packed=scratch_slots,
-                selected_token_idx=selected_npu,
-                chunk_ptrs_npu=chunk_ptrs_npu,
-                chunk_size=chunk_size,
-                total_tokens=total_tokens,
-                kv_format=KV_FORMAT_DSA_INDEX,
+            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+                destination_state,
+                scratch_slots,
+                selected_npu,
+                chunk_ptrs_npu,
+                chunk_size,
+                total_tokens,
+                False,
             )
             torch.npu.synchronize()
 
