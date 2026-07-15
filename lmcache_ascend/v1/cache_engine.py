@@ -5,8 +5,6 @@ LMCacheEngine for Ascend NPU.
 """
 
 # Standard
-import hashlib
-import json
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 import os
 import queue
@@ -51,39 +49,6 @@ def _dsa_debug_summary_enabled() -> bool:
     ).lower() in ("summary", "trace", "verbose", "all")
 
 
-def _dsa_validate_kv_enabled() -> bool:
-    return os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_KV", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _dsa_validate_dump_dir() -> Optional[str]:
-    value = os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_DUMP_DIR", "").strip()
-    return value or None
-
-
-def _dsa_validate_dump_tensors() -> bool:
-    return os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_DUMP_TENSORS", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _dsa_validate_max_records() -> int:
-    try:
-        return max(
-            1,
-            int(os.environ.get("LMCACHE_ASCEND_DSA_VALIDATE_MAX_RECORDS", "200000")),
-        )
-    except ValueError:
-        return 200000
-
-
 def _dsa_debug_limit() -> int:
     try:
         return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
@@ -99,7 +64,7 @@ def _dsa_debug_should_log(owner: Any, site: str) -> bool:
     counts = getattr(owner, "_dsa_shrink_debug_counts", None)
     if counts is None:
         counts = {}
-        setattr(owner, "_dsa_shrink_debug_counts", counts)
+        owner._dsa_shrink_debug_counts = counts
     count = counts.get(site, 0)
     if count >= _dsa_debug_limit():
         return False
@@ -232,236 +197,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._engine_state_lock = threading.RLock()
 
         self._device_id: Optional[int] = None
-        self._dsa_validate_kv_digests: Dict[str, Dict[str, Any]] = {}
-        self._dsa_validate_kv_order: List[str] = []
 
         if self.kv_events_enabled and self.is_store_async:
             self.kv_events = ThreadSafeEventList()
-
-    def _dsa_validate_key(self, layer_id: int, key: Any) -> str:
-        return f"layer={layer_id}|key={repr(key)}"
-
-    def _dsa_validate_tensor_digest(self, tensor: torch.Tensor) -> Dict[str, Any]:
-        cpu_tensor = tensor.detach()
-        if cpu_tensor.device.type != "cpu":
-            cpu_tensor = cpu_tensor.to(device="cpu")
-        cpu_tensor = cpu_tensor.contiguous()
-        raw = cpu_tensor.view(torch.uint8).numpy().tobytes()
-        return {
-            "shape": tuple(cpu_tensor.shape),
-            "dtype": str(cpu_tensor.dtype),
-            "numel": int(cpu_tensor.numel()),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-            "sample": cpu_tensor.reshape(-1)[:8].tolist()
-            if cpu_tensor.numel() > 0
-            else [],
-        }
-
-    def _dsa_validate_event(self, event: str, payload: Dict[str, Any]) -> None:
-        dump_dir = _dsa_validate_dump_dir()
-        if not dump_dir:
-            return
-        try:
-            os.makedirs(dump_dir, exist_ok=True)
-            path = os.path.join(
-                dump_dir,
-                f"dsa_kv_validate_worker_{self.metadata.worker_id}.jsonl",
-            )
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"event": event, **payload}, default=str) + "\n")
-        except Exception:
-            logger.exception("Failed to write DSA KV validation event")
-
-    def _dsa_validate_tensor_dump(
-        self,
-        *,
-        req_id: str,
-        layer_id: int,
-        key: Any,
-        tensor: torch.Tensor,
-        phase: str,
-    ) -> None:
-        if not _dsa_validate_dump_tensors():
-            return
-        dump_dir = _dsa_validate_dump_dir()
-        if not dump_dir:
-            return
-        try:
-            os.makedirs(dump_dir, exist_ok=True)
-            key_hash = hashlib.sha1(
-                self._dsa_validate_key(layer_id, key).encode("utf-8")
-            ).hexdigest()
-            path = os.path.join(
-                dump_dir,
-                (
-                    f"dsa_kv_{phase}_worker_{self.metadata.worker_id}_"
-                    f"layer_{layer_id}_{key_hash}.pt"
-                ),
-            )
-            cpu_tensor = tensor.detach()
-            if cpu_tensor.device.type != "cpu":
-                cpu_tensor = cpu_tensor.to(device="cpu")
-            torch.save(
-                {
-                    "req_id": req_id,
-                    "layer_id": layer_id,
-                    "key": repr(key),
-                    "tensor": cpu_tensor.contiguous(),
-                },
-                path,
-            )
-        except Exception:
-            logger.exception("Failed to dump DSA KV validation tensor")
-
-    def _dsa_record_store_digests(
-        self,
-        *,
-        req_id: str,
-        layer_id: int,
-        keys: List[Any],
-        memory_objs: List[MemoryObj],
-    ) -> None:
-        if not _dsa_validate_kv_enabled():
-            return
-        max_records = _dsa_validate_max_records()
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
-            tensor = memory_obj.tensor
-            if tensor is None:
-                self._dsa_validate_event(
-                    "store_missing_tensor",
-                    {
-                        "req_id": req_id,
-                        "layer_id": layer_id,
-                        "key": repr(key),
-                    },
-                )
-                logger.error(
-                    "[DSA_SHRINK_VALIDATE_FAIL] store_missing_tensor "
-                    "req=%s layer=%s key=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                )
-                continue
-            try:
-                digest = self._dsa_validate_tensor_digest(tensor)
-            except Exception as exc:
-                logger.exception(
-                    "[DSA_SHRINK_VALIDATE_FAIL] store_digest_failed "
-                    "req=%s layer=%s key=%s error=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                    exc,
-                )
-                continue
-            record_key = self._dsa_validate_key(layer_id, key)
-            old = self._dsa_validate_kv_digests.get(record_key)
-            payload = {
-                "req_id": req_id,
-                "layer_id": layer_id,
-                "key": repr(key),
-                "digest": digest,
-                "old_digest": old,
-            }
-            if old is not None and old["digest"]["sha256"] != digest["sha256"]:
-                self._dsa_validate_event("store_digest_changed", payload)
-                logger.error(
-                    "[DSA_SHRINK_VALIDATE_FAIL] store_digest_changed "
-                    "req=%s layer=%s key=%s old_sha=%s new_sha=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                    old["digest"]["sha256"],
-                    digest["sha256"],
-                )
-            self._dsa_validate_kv_digests[record_key] = {
-                "req_id": req_id,
-                "layer_id": layer_id,
-                "key": repr(key),
-                "digest": digest,
-            }
-            self._dsa_validate_kv_order.append(record_key)
-            while len(self._dsa_validate_kv_order) > max_records:
-                stale = self._dsa_validate_kv_order.pop(0)
-                self._dsa_validate_kv_digests.pop(stale, None)
-            self._dsa_validate_event("store_digest", payload)
-            self._dsa_validate_tensor_dump(
-                req_id=req_id,
-                layer_id=layer_id,
-                key=key,
-                tensor=tensor,
-                phase="store",
-            )
-
-    def _dsa_check_retrieve_digests(
-        self,
-        *,
-        req_id: str,
-        layer_id: int,
-        keys: List[Any],
-        tensors: List[torch.Tensor],
-    ) -> None:
-        if not _dsa_validate_kv_enabled():
-            return
-        for key, tensor in zip(keys, tensors, strict=False):
-            record_key = self._dsa_validate_key(layer_id, key)
-            expected = self._dsa_validate_kv_digests.get(record_key)
-            if expected is None:
-                payload = {
-                    "req_id": req_id,
-                    "layer_id": layer_id,
-                    "key": repr(key),
-                }
-                self._dsa_validate_event("retrieve_digest_missing", payload)
-                logger.error(
-                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_missing "
-                    "req=%s layer=%s key=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                )
-                continue
-            try:
-                actual = self._dsa_validate_tensor_digest(tensor)
-            except Exception as exc:
-                logger.exception(
-                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_failed "
-                    "req=%s layer=%s key=%s error=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                    exc,
-                )
-                continue
-            if actual["sha256"] != expected["digest"]["sha256"]:
-                payload = {
-                    "req_id": req_id,
-                    "layer_id": layer_id,
-                    "key": repr(key),
-                    "expected": expected,
-                    "actual": actual,
-                }
-                self._dsa_validate_event("retrieve_digest_mismatch", payload)
-                logger.error(
-                    "[DSA_SHRINK_VALIDATE_FAIL] retrieve_digest_mismatch "
-                    "req=%s layer=%s key=%s expected_sha=%s actual_sha=%s "
-                    "expected_sample=%s actual_sample=%s",
-                    req_id,
-                    layer_id,
-                    key,
-                    expected["digest"]["sha256"],
-                    actual["sha256"],
-                    expected["digest"].get("sample"),
-                    actual.get("sample"),
-                )
-                self._dsa_validate_tensor_dump(
-                    req_id=req_id,
-                    layer_id=layer_id,
-                    key=key,
-                    tensor=tensor,
-                    phase="retrieve",
-                )
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
@@ -828,13 +566,26 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_ends: Optional[List[int]],
         cached_memory_objs: Optional[List],
         cached_tensors: Optional[List],
+        cache_chunk_indices: Optional[List[int]] = None,
     ) -> None:
-        """Append one store_layer batch; never clear (chunked prefill calls many times)."""
+        """Append cacheable store chunks; storage still receives the full batch."""
         num_layers = len(keys)
+        chunk_indices = (
+            list(range(len(starts)))
+            if cache_chunk_indices is None
+            else cache_chunk_indices
+        )
+        if any(index < 0 or index >= len(starts) for index in chunk_indices):
+            raise ValueError(
+                "Layerwise store cache chunk selection is out of range: "
+                f"indices={chunk_indices}, chunk_count={len(starts)}"
+            )
+        selected_starts = [starts[index] for index in chunk_indices]
+        selected_ends = [ends[index] for index in chunk_indices]
         if cached_starts is not None:
-            cached_starts.extend(starts)
+            cached_starts.extend(selected_starts)
         if cached_ends is not None:
-            cached_ends.extend(ends)
+            cached_ends.extend(selected_ends)
         if cached_keys is not None:
             if not cached_keys:
                 cached_keys.extend([] for _ in range(num_layers))
@@ -842,15 +593,68 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"cached_keys has {len(cached_keys)} layers, expected {num_layers}"
             )
             for layer_id, layer_keys in enumerate(keys):
-                cached_keys[layer_id].extend(layer_keys)
+                cached_keys[layer_id].extend(
+                    layer_keys[index] for index in chunk_indices
+                )
         if cached_memory_objs is not None:
             if not cached_memory_objs:
                 cached_memory_objs.extend([] for _ in range(num_layers))
             assert len(cached_memory_objs) == num_layers
             for layer_id, layer_objs in enumerate(memory_objs):
-                cached_memory_objs[layer_id].extend(layer_objs)
+                cached_memory_objs[layer_id].extend(
+                    layer_objs[index] for index in chunk_indices
+                )
         if cached_tensors is not None and not cached_tensors:
             cached_tensors.extend([] for _ in range(num_layers))
+
+    @staticmethod
+    def _truncate_store_cache_for_full_chunk_successor(
+        *,
+        starts: List[int],
+        ends: List[int],
+        new_starts: List[int],
+        new_ends: List[int],
+        cached_keys: Optional[List],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        cached_shared_handles: Optional[List],
+    ) -> Optional[int]:
+        """Drop a cached partial tail before publishing its full successor."""
+        replace_at: Optional[int] = None
+        for new_start, new_end in zip(new_starts, new_ends, strict=False):
+            for chunk_index, (old_start, old_end) in enumerate(
+                zip(starts, ends, strict=False)
+            ):
+                if old_start == new_start and new_end > old_end:
+                    replace_at = chunk_index
+                    break
+            if replace_at is not None:
+                break
+        if replace_at is None:
+            return None
+
+        del starts[replace_at:]
+        del ends[replace_at:]
+        for layer_cache in (
+            cached_keys,
+            cached_memory_objs,
+            cached_tensors,
+            cached_chunk_dev_ptrs,
+            cached_shared_handles,
+        ):
+            if layer_cache is None:
+                continue
+            for layer_values in layer_cache:
+                if isinstance(layer_values, list):
+                    del layer_values[replace_at:]
+
+        if cached_chunk_ptrs_npu is not None:
+            for layer_id, ptrs in enumerate(cached_chunk_ptrs_npu):
+                if isinstance(ptrs, torch.Tensor):
+                    cached_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
+        return replace_at
 
     @staticmethod
     def _remove_pending_layerwise_store_objs(
@@ -876,10 +680,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List] = None,
         cached_chunk_ptrs_npu: Optional[List] = None,
+        cache_chunk_indices: Optional[List[int]] = None,
     ) -> None:
+        layer_memory_objs = memory_objs[layer_id]
+        if cache_chunk_indices is not None:
+            layer_memory_objs = [
+                layer_memory_objs[index] for index in cache_chunk_indices
+            ]
         new_tensors: List[torch.Tensor] = [
             mem_obj.tensor
-            for mem_obj in memory_objs[layer_id]
+            for mem_obj in layer_memory_objs
             if mem_obj.tensor is not None
         ]
         if (
@@ -915,7 +725,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
     ) -> None:
-        """Retain storage-get results in ReqMeta for later retrieve calls (same request)."""
+        """Retain storage-get results for later retrieves in the same request."""
         new_tensors: List[torch.Tensor] = [
             tensor
             for mem_obj in mem_objs_layer
@@ -969,6 +779,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         while len(cached_shared_handles) <= layer_id:
             cached_shared_handles.append([])
         cached_shared_handles[layer_id] = list(handles)
+
+    def _fence_shared_cpu_store_publication(self) -> None:
+        fence = getattr(
+            self.gpu_connector,
+            "synchronize_shared_cpu_store_publication",
+            None,
+        )
+        if callable(fence):
+            fence()
 
     def _is_shared_retrieve_passive(self, kv_group: int) -> bool:
         """Return whether this rank is passive for a shared retrieve group."""
@@ -1064,26 +883,33 @@ class AscendLMCacheEngine(LMCacheEngine):
         init_kvcaches = getattr(
             self.gpu_connector, "initialize_kvcaches_ptr", None
         )
+        lazy_init_with_staging = getattr(
+            self.gpu_connector, "_lazy_initialize_buffer_with_staging", None
+        )
         lazy_init = getattr(
             self.gpu_connector, "_lazy_initialize_buffer", None
         )
-        if not callable(init_kvcaches) or not callable(lazy_init):
+        if not callable(init_kvcaches) or (
+            not callable(lazy_init_with_staging) and not callable(lazy_init)
+        ):
             return
         if "kvcaches" in kwargs:
             init_kvcaches(**kwargs)
         kvcaches = getattr(self.gpu_connector, "kvcaches", None)
         if kvcaches is not None:
             kv_group = kwargs.get("kv_group", 0)
-            # Detect layout without allocating a staging pool. Direct MLA/DSA
-            # transfers do not use staging, and non-direct paths initialize it
-            # explicitly when needed. Older connectors may not accept either
-            # keyword, so retain compatibility fallbacks for them.
-            try:
-                lazy_init(
+            if callable(lazy_init_with_staging):
+                lazy_init_with_staging(
                     kvcaches,
                     kv_group=kv_group,
                     init_staging=False,
                 )
+                return
+            # The layerwise NPU connector detects format per kv_group; other
+            # connectors (e.g. the blending buffer connector) may not accept
+            # the kwarg, so fall back to the positional call for them.
+            try:
+                lazy_init(kvcaches, kv_group=kv_group, init_staging=False)
             except TypeError:
                 try:
                     lazy_init(kvcaches, kv_group=kv_group)
@@ -1231,7 +1057,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         List[int],
         List[List[CacheEngineKey]],
     ]:
-        """Resolve retrieve chunk metadata once per request; reuse ReqMeta cache after."""
+        """Resolve retrieve chunk metadata once, then reuse the request cache."""
         if self._needs_retrieve_metadata_refresh(
             cached_keys, cached_starts, cached_ends, tokens
         ):
@@ -1520,6 +1346,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors = kwargs.get("cached_tensors")
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_shared_handles = kwargs.get("cached_shared_handles")
 
         starts = []
         ends = []
@@ -1677,6 +1504,36 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
+            cache_chunk_indices: Optional[List[int]] = None
+            if bool(kwargs.get("windowed_sparse_save", False)):
+                # Partial tails are valid storage entries, but sparse direct
+                # pointer tables assume fixed-size LMCache chunks. Keep tails
+                # out of request-local pointer/cache publication until a later
+                # full successor for the same aligned chunk is committed.
+                chunk_size = int(self.config.chunk_size)
+                cache_chunk_indices = [
+                    index
+                    for index, (start, end) in enumerate(
+                        zip(starts, ends, strict=False)
+                    )
+                    if start % chunk_size == 0 and end - start == chunk_size
+                ]
+
+                selected_starts = [starts[index] for index in cache_chunk_indices]
+                selected_ends = [ends[index] for index in cache_chunk_indices]
+                self._truncate_store_cache_for_full_chunk_successor(
+                    starts=cached_starts,
+                    ends=cached_ends,
+                    new_starts=selected_starts,
+                    new_ends=selected_ends,
+                    cached_keys=cached_keys,
+                    cached_memory_objs=cached_memory_objs,
+                    cached_tensors=cached_tensors,
+                    cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+                    cached_shared_handles=cached_shared_handles,
+                )
+
             self._append_layerwise_store_cache_chunks(
                 keys=keys,
                 starts=starts,
@@ -1687,6 +1544,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_ends=cached_ends,
                 cached_memory_objs=cached_memory_objs,
                 cached_tensors=cached_tensors,
+                cache_chunk_indices=cache_chunk_indices,
             )
 
             try:
@@ -1706,12 +1564,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_tensors,
                         cached_chunk_dev_ptrs,
                         cached_chunk_ptrs_npu,
-                    )
-                    self._dsa_record_store_digests(
-                        req_id=req_id,
-                        layer_id=layer_id,
-                        keys=keys[layer_id],
-                        memory_objs=memory_objs[layer_id],
+                        cache_chunk_indices,
                     )
                     self.storage_manager.batched_put(
                         keys[layer_id],
@@ -1944,7 +1797,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                             target_slot_mapping,
                         )
                     )
-
             next(mem_obj_consumer)
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None
@@ -2084,6 +1936,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             retrieve_kwargs=kwargs,
         )
         kwargs.pop("_use_cached_retrieve", None)
+        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        cached_tensors_cover = self._retrieve_data_cache_covers(
+            cached_tensors,
+            self.num_layers,
+            required_chunks,
+        )
+        cached_memory_objs_cover = self._retrieve_data_cache_covers(
+            cached_memory_objs,
+            self.num_layers,
+            required_chunks,
+        )
+        use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
         if _dsa_debug_should_log(self, "head_retrieve_metadata"):
             slot_mapping = kwargs.get("slot_mapping")
             logger.warning(
@@ -2120,18 +1984,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 location,
             )
 
-        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
-        cached_tensors_cover = self._retrieve_data_cache_covers(
-            cached_tensors,
-            self.num_layers,
-            required_chunks,
-        )
-        cached_memory_objs_cover = self._retrieve_data_cache_covers(
-            cached_memory_objs,
-            self.num_layers,
-            required_chunks,
-        )
-        use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
         if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
             raise ValueError(
                 "Layerwise sparse retrieve cache is incomplete; refusing to "
@@ -2438,6 +2290,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
+        shared_store_publication_fenced = False
         existing_rank0_backing_layers = kwargs.get(
             "shared_cpu_existing_rank0_backing_layers"
         )
@@ -2566,21 +2419,17 @@ class AscendLMCacheEngine(LMCacheEngine):
 
                 if cached_mem_layers is not None:
                     mem_objs_layer = cached_mem_layers[layer_id]
-                    diag_source = "cached_memory_objs"
                 elif use_cached_retrieve:
                     mem_objs_layer = []
-                    diag_source = "cached_tensors"
                 else:
                     if shared_sparse_retrieve:
                         assert pre_resolved_shared_mem_layers is not None
                         mem_objs_layer = pre_resolved_shared_mem_layers[layer_id]
-                        diag_source = "shared_pre_resolved"
                     else:
                         assert get_generator is not None
                         task = next(get_generator)
                         assert task is not None
                         mem_objs_layer = task.result()
-                        diag_source = f"storage:{location}"
                     if mem_objs_layer is not None:
                         layer_cached_chunks = (
                             len(cached_tensors[layer_id])
@@ -2625,6 +2474,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                         raise ValueError(message)
                     try:
+                        if not shared_store_publication_fenced:
+                            # Store generators normally synchronize each layer
+                            # before storage publication. Reassert that contract
+                            # at the cross-rank publication boundary so handles
+                            # can never outrun a direct-to-host store.
+                            self._fence_shared_cpu_store_publication()
+                            shared_store_publication_fenced = True
                         if cached_mem_layers is not None:
                             claim_cached_shared_mem_objs_for_publication(
                                 mem_objs_layer

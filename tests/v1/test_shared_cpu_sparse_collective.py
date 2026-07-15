@@ -105,6 +105,21 @@ class _FakeSparseConsumer:
             yield
 
 
+class _OrderedSparseConsumer:
+    def __init__(self, events):
+        self.events = events
+
+    def batched_to_gpu_head_token_wise(self, **_kwargs):
+        payload = yield
+        while payload is not None:
+            self.events.append("load")
+            payload = yield
+        yield
+
+    def synchronize_shared_cpu_store_publication(self):
+        self.events.append("store_fence")
+
+
 class _FakeTensorMemObj:
     def __init__(self, tensor):
         self._tensor = tensor
@@ -844,6 +859,66 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
     assert mem_obj.unpin_count == 0
 
 
+def test_sparse_rank0_fences_store_before_first_handle_publication(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    events = []
+    key = _make_key()
+    mem_obj = _FakeClaimableMemObj()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.storage_manager = object()
+    engine.gpu_connector = _OrderedSparseConsumer(events)
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = AscendLMCacheEngine._has_retrieve_data_cache
+    engine._retrieve_data_cache_covers = (
+        AscendLMCacheEngine._retrieve_data_cache_covers
+    )
+    engine._min_layer_cache_chunks = AscendLMCacheEngine._min_layer_cache_chunks
+    engine._resolve_local_cpu_retrieve_location = lambda location: location
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0],
+        [1],
+        [[key]],
+    )
+
+    def make_handles(**_kwargs):
+        events.append("make_handles")
+        return ["handle"]
+
+    engine._make_shared_handles_for_layer = make_handles
+    engine._broadcast_shared_envelope = lambda _envelope: events.append("broadcast")
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[[key]],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=[[mem_obj]],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert events[:3] == ["store_fence", "make_handles", "broadcast"]
+
+
 def test_sparse_rank0_cached_publication_failure_releases_claim(monkeypatch):
     """Failed cached-object publication must release its request pin/ref."""
 
@@ -1000,10 +1075,11 @@ def test_sparse_rank0_hot_shared_handles_do_not_republish(monkeypatch):
     key = _make_key()
     cached_shared_handles = [["existing-handle"]]
     broadcasts = []
+    events = []
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     engine.storage_manager = object()
-    engine.gpu_connector = _FakeSparseConsumer()
+    engine.gpu_connector = _OrderedSparseConsumer(events)
     engine.shared_cpu_cache_generation = 7
     engine.is_healthy = lambda: True
     engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
@@ -1041,6 +1117,7 @@ def test_sparse_rank0_hot_shared_handles_do_not_republish(monkeypatch):
     retriever.send(([0], 0))
 
     assert broadcasts == []
+    assert "store_fence" not in events
     assert cached_shared_handles == [["existing-handle"]]
 
 
@@ -1109,19 +1186,14 @@ def test_sparse_pointer_cache_reuse_rejects_wrong_device():
         )
 
 
-def test_sparse_pointer_cache_reuse_skips_null_scan_by_default(monkeypatch):
+def test_sparse_pointer_cache_reuse_does_not_read_pointer_values(monkeypatch):
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")
     cached_ptrs = [torch.tensor([0], dtype=torch.long)]
 
     def fail_any(*_args, **_kwargs):
-        raise AssertionError("hot-path null scan should be disabled by default")
+        raise AssertionError("hot path must not read cached pointer values")
 
-    monkeypatch.setattr(
-        npu_connectors,
-        "_SPARSE_POINTER_CACHE_REUSE_VALIDATE_NULLS",
-        False,
-    )
     monkeypatch.setattr(npu_connectors.torch, "any", fail_any)
 
     assert connector._resolve_sparse_chunk_ptrs_npu(
@@ -1129,24 +1201,6 @@ def test_sparse_pointer_cache_reuse_skips_null_scan_by_default(monkeypatch):
         [torch.empty(1)],
         cached_ptrs,
     ) is cached_ptrs[0]
-
-
-def test_sparse_pointer_cache_reuse_debug_rejects_null_pointer(monkeypatch):
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.kv_device = torch.device("cpu")
-    cached_ptrs = [torch.tensor([0], dtype=torch.long)]
-    monkeypatch.setattr(
-        npu_connectors,
-        "_SPARSE_POINTER_CACHE_REUSE_VALIDATE_NULLS",
-        True,
-    )
-
-    with pytest.raises(RuntimeError, match="null pointer"):
-        connector._resolve_sparse_chunk_ptrs_npu(
-            0,
-            [torch.empty(1)],
-            cached_ptrs,
-        )
 
 
 def test_append_retrieve_layer_cache_is_atomic_when_pointer_install_fails():

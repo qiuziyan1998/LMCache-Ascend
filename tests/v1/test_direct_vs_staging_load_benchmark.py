@@ -39,6 +39,10 @@ from load_benchmark_utils import (  # noqa: E402
 )
 
 
+def _npu_available() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 def _check_kwargs(fmt: str, num_kv_heads: int, kv_lora_rank: int, qk_rope_head_dim: int, dsa_head_dim: int):
     return dict(
         num_heads=num_kv_heads,
@@ -169,6 +173,127 @@ def _run_store_case(
         harness.close()
 
 
+def _make_shape_src(
+    *,
+    fmt: str,
+    num_blocks: int,
+    block_size: int,
+    num_layers: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dsa_head_dim: int,
+):
+    common = dict(
+        num_blocks=num_blocks,
+        device="npu",
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        dtype=torch.bfloat16,
+    )
+    if fmt in ("mla", "mla_latent"):
+        return generate_mla_kv_cache(**common)
+    if fmt == "dsa":
+        return generate_dsa_kv_cache(dsa_head_dim=dsa_head_dim, **common)
+    return generate_dsa_index_kv_cache(
+        num_blocks=num_blocks,
+        device="npu",
+        num_layers=num_layers,
+        dsa_head_dim=dsa_head_dim,
+        block_size=block_size,
+        dtype=torch.bfloat16,
+    )
+
+
+def _run_shape_case(
+    *,
+    fmt: str,
+    num_tokens: int,
+    chunk_size: int,
+    num_layers: int,
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dsa_head_dim: int,
+) -> None:
+    src = _make_shape_src(
+        fmt=fmt,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+    )
+    harness = build_load_benchmark_harness(
+        fmt=fmt,
+        src_kv_cache=src,
+        num_tokens=num_tokens,
+        chunk_size=chunk_size,
+        num_layers=num_layers,
+        num_selected=num_tokens,
+        seed=1,
+    )
+    try:
+        verify_load_benchmark_harness(
+            harness,
+            check_paged_kv_cache_equal,
+            **_check_kwargs(
+                fmt,
+                num_kv_heads,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                dsa_head_dim,
+            ),
+        )
+    finally:
+        harness.close()
+
+
+def _run_shape_store_case(
+    *,
+    fmt: str,
+    num_tokens: int,
+    chunk_size: int,
+    num_layers: int,
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dsa_head_dim: int,
+) -> None:
+    src = _make_shape_src(
+        fmt=fmt,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+    )
+    harness = build_load_benchmark_harness(
+        fmt=fmt,
+        src_kv_cache=src,
+        num_tokens=num_tokens,
+        chunk_size=chunk_size,
+        num_layers=num_layers,
+        num_selected=num_tokens,
+        seed=1,
+    )
+    try:
+        verify_store_benchmark_harness(harness)
+    finally:
+        harness.close()
+
+
 @pytest.mark.parametrize("fmt", ["mla", "dsa", "mla_latent", "dsa_index"])
 @pytest.mark.parametrize("num_tokens", [512, 1024])
 @pytest.mark.parametrize("num_layers", [1, 4])
@@ -231,3 +356,79 @@ def test_compute_direct_host_bytes_mla_2048() -> None:
 def test_bandwidth_gb_per_s_zero_guard() -> None:
     assert bandwidth_gb_per_s(1024, 0.0) == 0.0
     assert bandwidth_gb_per_s(0, 1.0) == 0.0
+
+
+@pytest.mark.skipif(
+    not _npu_available(),
+    reason="dense direct TP8-shape parity test requires NPU",
+)
+@pytest.mark.parametrize(
+    (
+        "fmt",
+        "num_kv_heads",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "dsa_head_dim",
+    ),
+    [
+        ("mla_latent", 1, 512, 64, 128),
+        ("dsa_index", 1, 128, 0, 128),
+    ],
+)
+def test_dense_direct_tp8_shape_long_prefix_load_matches_staging(
+    fmt: str,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dsa_head_dim: int,
+) -> None:
+    _run_shape_case(
+        fmt=fmt,
+        num_tokens=18_879,
+        chunk_size=256,
+        num_layers=2,
+        num_blocks=294,
+        block_size=128,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+    )
+
+
+@pytest.mark.skipif(
+    not _npu_available(),
+    reason="dense direct TP8-shape parity test requires NPU",
+)
+@pytest.mark.parametrize(
+    (
+        "fmt",
+        "num_kv_heads",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "dsa_head_dim",
+    ),
+    [
+        ("mla_latent", 1, 512, 64, 128),
+        ("dsa_index", 1, 128, 0, 128),
+    ],
+)
+def test_dense_direct_tp8_shape_long_prefix_store_matches_staging(
+    fmt: str,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dsa_head_dim: int,
+) -> None:
+    _run_shape_store_case(
+        fmt=fmt,
+        num_tokens=18_879,
+        chunk_size=256,
+        num_layers=2,
+        num_blocks=294,
+        block_size=128,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+    )
