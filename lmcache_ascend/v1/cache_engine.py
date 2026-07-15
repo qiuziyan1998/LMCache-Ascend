@@ -6,7 +6,6 @@ LMCacheEngine for Ascend NPU.
 
 # Standard
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
-import os
 import queue
 import threading
 import time
@@ -22,6 +21,7 @@ from lmcache.utils import (
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
@@ -32,91 +32,6 @@ import torch
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
-
-
-def _dsa_debug_enabled() -> bool:
-    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _dsa_debug_summary_enabled() -> bool:
-    return os.environ.get(
-        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
-    ).lower() in ("summary", "trace", "verbose", "all")
-
-
-def _dsa_debug_limit() -> int:
-    try:
-        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
-    except ValueError:
-        return 8
-
-
-def _dsa_debug_should_log(owner: Any, site: str) -> bool:
-    if not _dsa_debug_enabled():
-        return False
-    if not _dsa_debug_summary_enabled():
-        return False
-    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
-    if counts is None:
-        counts = {}
-        owner._dsa_shrink_debug_counts = counts
-    count = counts.get(site, 0)
-    if count >= _dsa_debug_limit():
-        return False
-    counts[site] = count + 1
-    return True
-
-
-def _dsa_debug_shape(value: Any) -> Any:
-    if value is None:
-        return None
-    shape = getattr(value, "shape", None)
-    if shape is not None:
-        return tuple(shape)
-    try:
-        return len(value)
-    except TypeError:
-        return type(value).__name__
-
-
-def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
-    if value is None:
-        return None
-    limit = _dsa_debug_limit() if limit is None else limit
-    try:
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return []
-            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
-        return list(value[:limit])
-    except Exception as exc:
-        return f"{type(value).__name__}:sample_failed:{exc}"
-
-
-def _dsa_debug_minmax_count(value: Any) -> Any:
-    if value is None:
-        return None
-    try:
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return None
-            flat = value.detach().reshape(-1)
-            return (
-                flat.min().to(device="cpu").item(),
-                flat.max().to(device="cpu").item(),
-                int(flat.numel()),
-            )
-        seq = list(value)
-        if not seq:
-            return None
-        return (min(seq), max(seq), len(seq))
-    except Exception as exc:
-        return f"{type(value).__name__}:minmax_failed:{exc}"
 
 
 class ThreadSafeEventList:
@@ -692,11 +607,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             for mem_obj in layer_memory_objs
             if mem_obj.tensor is not None
         ]
-        if (
-            new_tensors
-            and cached_chunk_dev_ptrs is not None
-            and getattr(self, "enable_shared_cpu_cache", False)
-        ):
+        if new_tensors and cached_chunk_dev_ptrs is not None:
+            # Resolve direct-load pointer tables while the dense store is on
+            # the cold path, before WorkerRetrieveState is sealed.
             append_ptrs_fn = getattr(
                 self.gpu_connector,
                 "append_sparse_chunk_ptr_cache_for_layer",
@@ -1814,6 +1727,62 @@ class AscendLMCacheEngine(LMCacheEngine):
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Retrieve sparse KV layers through the existing generator protocol.
+
+        A sealed ``prepared_sparse_source`` selects the metadata-free warm path.
+        Requests without one retain the full storage/shared-cache bootstrap path.
+        """
+        if kwargs.get("prepared_sparse_source") is not None:
+            yield from self._retrieve_prepared_sparse_layers(
+                tokens,
+                kwargs,
+            )
+            return
+        yield from self._retrieve_layer_head_token_wise_bootstrap(
+            tokens,
+            mask,
+            **kwargs,
+        )
+
+    def _retrieve_prepared_sparse_layers(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        retrieve_kwargs: dict[str, Any],
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Forward already-resolved source layers without cache-engine work."""
+        prepared_source: PreparedSparseSource = retrieve_kwargs[
+            "prepared_sparse_source"
+        ]
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping sparse retrieve")
+            yield torch.zeros(len(tokens), dtype=torch.bool)
+            return
+
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve_layer operation"
+        )
+
+        ret_mask = retrieve_kwargs.get("ret_mask")
+        if ret_mask is None:
+            ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+
+        consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**retrieve_kwargs)
+        next(consumer)
+        try:
+            for _ in prepared_source.layers:
+                sparse_request = yield ret_mask
+                consumer.send(sparse_request)
+            next(consumer)
+            yield ret_mask
+        finally:
+            consumer.close()
+
+    def _retrieve_layer_head_token_wise_bootstrap(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
         """
         Retrieve the KV cache in a layerwise manner.
 
@@ -1948,41 +1917,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             required_chunks,
         )
         use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
-        if _dsa_debug_should_log(self, "head_retrieve_metadata"):
-            slot_mapping = kwargs.get("slot_mapping")
-            logger.warning(
-                "[DSA_SHRINK_CHECK] lmcache_ascend_head_retrieve "
-                "req=%s num_tokens=%s mask_shape=%s mask_minmax_count=%s "
-                "ret_mask_shape=%s ret_mask_minmax_count=%s slot_mapping_shape=%s "
-                "slot_mapping_sample=%s slot_mapping_minmax_count=%s "
-                "vllm_cached=%s lmcache_cached=%s metadata_warm=%s "
-                "use_cached_retrieve=%s cached_tensors_layers=%s "
-                "cached_mem_layers=%s cached_chunk_ptr_layers=%s "
-                "retrieve_key_groups=%s first_layer_chunks=%s starts_sample=%s "
-                "ends_sample=%s location=%s",
-                kwargs.get("req_id"),
-                num_tokens,
-                _dsa_debug_shape(mask),
-                _dsa_debug_minmax_count(mask),
-                _dsa_debug_shape(ret_mask),
-                _dsa_debug_minmax_count(ret_mask),
-                _dsa_debug_shape(slot_mapping),
-                _dsa_debug_sample(slot_mapping),
-                _dsa_debug_minmax_count(slot_mapping),
-                kwargs.get("vllm_cached_tokens"),
-                kwargs.get("lmcache_cached_tokens"),
-                metadata_warm,
-                use_cached_retrieve,
-                len(cached_tensors) if cached_tensors is not None else None,
-                len(cached_memory_objs) if cached_memory_objs is not None else None,
-                len(cached_chunk_ptrs_npu)
-                if cached_chunk_ptrs_npu is not None else None,
-                len(retrieve_keys) if retrieve_keys is not None else None,
-                len(retrieve_keys[0]) if retrieve_keys else 0,
-                _dsa_debug_sample(starts),
-                _dsa_debug_sample(ends),
-                location,
-            )
 
         if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
             raise ValueError(
