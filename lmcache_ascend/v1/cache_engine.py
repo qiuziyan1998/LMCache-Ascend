@@ -5,6 +5,7 @@ LMCacheEngine for Ascend NPU.
 """
 
 # Standard
+from concurrent.futures import Future, wait
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 import queue
 import threading
@@ -92,6 +93,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             broadcast_object_fn,
         )
         self.is_store_async = self.config.store_async
+        self._pending_sync_store_futures: set[Future] = set()
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
         if self.is_store_async:
             self._store_queue: Optional[queue.Queue] = None
@@ -318,12 +320,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                     transfer_spec = kwargs.get("transfer_spec", None)
                     # TODO: we implicitly rely on batched_put to call ref_count_down
                     # this management should be done in a cleaner way
-                    self.storage_manager.batched_put(
+                    required_futures = self.storage_manager.batched_put(
                         keys,
                         memory_objs,
                         transfer_spec=transfer_spec,
                         location=self.store_location,
                     )
+                    self._track_sync_store_futures(required_futures)
                     put_submitted = True
 
                 self.stats_monitor.on_store_finished(
@@ -426,6 +429,29 @@ class AscendLMCacheEngine(LMCacheEngine):
             elapsed_ms,
         )
         return pending_at_start
+
+    def _track_sync_store_futures(self, futures: Iterable[Future]) -> None:
+        """Track completion-required futures during synchronous stores."""
+        if not self.is_store_async:
+            self._pending_sync_store_futures.update(futures)
+
+    def wait_for_pending_sync_stores(self) -> None:
+        """Wait for stores submitted by the current synchronous save step."""
+        if self.is_store_async or not self._pending_sync_store_futures:
+            return
+
+        futures = self._pending_sync_store_futures
+        done, pending = wait(
+            futures, timeout=self.config.blocking_timeout_secs
+        )
+        self._pending_sync_store_futures = set(pending)
+
+        for future in done:
+            future.result()
+        if pending:
+            raise TimeoutError(
+                f"Timed out waiting for {len(pending)} remote store operation(s)"
+            )
 
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
         if self.kv_events_enabled and self.kv_events:
@@ -1497,11 +1523,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_chunk_ptrs_npu,
                         cache_chunk_indices,
                     )
-                    self.storage_manager.batched_put(
+                    required_futures = self.storage_manager.batched_put(
                         keys[layer_id],
                         memory_objs[layer_id],
                         location=self.store_location,
                     )
+                    self._track_sync_store_futures(required_futures)
                     for mem_obj in memory_objs[layer_id]:
                         pending_store_release.pop(id(mem_obj), None)
 

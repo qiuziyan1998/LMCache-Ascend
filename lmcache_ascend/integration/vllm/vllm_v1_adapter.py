@@ -160,6 +160,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
+            assert self.lmcache_engine is not None
+            self.lmcache_engine.wait_for_pending_sync_stores()
             self._wait_for_save_done = True
             replay_finished = getattr(
                 self, "_replay_finished_stores_after_save", None
@@ -270,6 +272,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
                 continue
 
+        self.lmcache_engine.wait_for_pending_sync_stores()
         self._wait_for_save_done = True
         self._replay_finished_stores_after_save()
 
