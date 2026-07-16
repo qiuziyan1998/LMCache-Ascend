@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
+import json
 import os
 from typing import Any, List, Optional, Set, Union
 
@@ -44,6 +45,29 @@ import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
+
+def _mtp_dw_diag_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {
+        "schema": 1,
+        "stage": stage,
+        "owner": "lmcache_ascend_retrieve",
+    }
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+_SPARSE_DIRECT_RECORD_STREAM = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_RECORD_STREAM", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_DIRECT_DISABLE = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
 _DENSE_DIRECT_DISABLE = os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -3315,6 +3339,81 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ),
                 cpu_tensors=cpu_tensors,
             )
+            if _mtp_dw_diag_enabled() and layer_id == 0:
+                actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group
+                )
+                diag_selected = selected_token_idx.detach().cpu().reshape(-1)
+                selected_count = int(diag_selected.numel())
+                selected_min = (
+                    int(diag_selected.min()) if selected_count else None
+                )
+                selected_max = (
+                    int(diag_selected.max()) if selected_count else None
+                )
+                slot_count = int(slot_mapping_packed.numel())
+                selected_oob = bool(
+                    selected_count
+                    and (selected_min < 0 or selected_max >= actual_cpu_tokens)
+                )
+                slot_selected_match = selected_count == slot_count
+                raw_window = os.environ.get(
+                    "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
+                )
+                try:
+                    window_size = max(int(raw_window), 0)
+                except ValueError:
+                    window_size = 0
+                diag_key = (
+                    kwargs.get("req_id"),
+                    kv_group,
+                    lmcache_cached_tokens,
+                )
+                seen_retrieves = getattr(
+                    self, "_mtp_dw_diag_seen_retrieves", None
+                )
+                if seen_retrieves is None:
+                    seen_retrieves = set()
+                    self._mtp_dw_diag_seen_retrieves = seen_retrieves
+                first_for_frontier = diag_key not in seen_retrieves
+                seen_retrieves.add(diag_key)
+                if first_for_frontier or selected_oob or not slot_selected_match:
+                    _mtp_dw_event(
+                        "retrieve",
+                        req=kwargs.get("req_id"),
+                        frontier=lmcache_cached_tokens,
+                        window_start=(
+                            max(0, lmcache_cached_tokens - window_size)
+                            if window_size
+                            else None
+                        ),
+                        window_end=lmcache_cached_tokens,
+                        kv_group=kv_group,
+                        actual_cpu_tokens=actual_cpu_tokens,
+                        kernel_total_tokens=total_tokens,
+                        selected_count=selected_count,
+                        selected_min=selected_min,
+                        selected_max=selected_max,
+                        selected_sample=diag_selected[:8].tolist(),
+                        slot_count=slot_count,
+                        selected_oob=selected_oob,
+                        slot_selected_match=slot_selected_match,
+                    )
+                if selected_oob or not slot_selected_match:
+                    _mtp_dw_event(
+                        "fail",
+                        req=kwargs.get("req_id"),
+                        frontier=lmcache_cached_tokens,
+                        invariant="retrieve_bounds",
+                        kv_group=kv_group,
+                        actual_cpu_tokens=actual_cpu_tokens,
+                        selected_count=selected_count,
+                        selected_min=selected_min,
+                        selected_max=selected_max,
+                        slot_count=slot_count,
+                        selected_oob=selected_oob,
+                        slot_selected_match=slot_selected_match,
+                    )
 
         yield
 

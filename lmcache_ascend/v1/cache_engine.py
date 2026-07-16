@@ -6,10 +6,12 @@ LMCacheEngine for Ascend NPU.
 
 # Standard
 from concurrent.futures import Future, wait
-from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
+import json
+import os
 import queue
 import threading
 import time
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 
 # Third Party
 from lmcache.logging import init_logger
@@ -35,6 +37,103 @@ logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
+
+
+def _mtp_dw_diag_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "lmcache_ascend_store"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_debug_summary_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
+    ).lower() in ("summary", "trace", "verbose", "all")
+
+
+def _dsa_debug_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
+    except ValueError:
+        return 8
+
+
+def _dsa_debug_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_debug_enabled():
+        return False
+    if not _dsa_debug_summary_enabled():
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        owner._dsa_shrink_debug_counts = counts
+    count = counts.get(site, 0)
+    if count >= _dsa_debug_limit():
+        return False
+    counts[site] = count + 1
+    return True
+
+
+def _dsa_debug_shape(value: Any) -> Any:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
+    if value is None:
+        return None
+    limit = _dsa_debug_limit() if limit is None else limit
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+        return list(value[:limit])
+    except Exception as exc:
+        return f"{type(value).__name__}:sample_failed:{exc}"
+
+
+def _dsa_debug_minmax_count(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            flat = value.detach().reshape(-1)
+            return (
+                flat.min().to(device="cpu").item(),
+                flat.max().to(device="cpu").item(),
+                int(flat.numel()),
+            )
+        seq = list(value)
+        if not seq:
+            return None
+        return (min(seq), max(seq), len(seq))
+    except Exception as exc:
+        return f"{type(value).__name__}:minmax_failed:{exc}"
 
 class ThreadSafeEventList:
     """queue.Queue-backed, list-compatible thread-safe buffer for
@@ -1422,6 +1521,49 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
+        if _mtp_dw_diag_enabled() and kwargs.get("decode_window_save"):
+            diag_slots = kwargs.get("slot_mapping")
+            if isinstance(diag_slots, torch.Tensor):
+                diag_slots = diag_slots.detach().cpu().reshape(-1)
+            else:
+                diag_slots = torch.empty(0, dtype=torch.long)
+            window_start = kwargs.get("decode_window_start")
+            window_end = kwargs.get("decode_window_end")
+            requested_tokens = (
+                int(window_end) - int(window_start)
+                if window_start is not None and window_end is not None
+                else int(num_to_store_tokens)
+            )
+            _mtp_dw_event(
+                "store",
+                req=req_id,
+                event="begin",
+                frontier=len(tokens),
+                window_start=window_start,
+                window_end=window_end,
+                kv_group=kv_group,
+                requested_tokens=requested_tokens,
+                actual_tokens=tot_token_num,
+                chunk_starts=starts[:8],
+                chunk_ends=ends[:8],
+                slot_count=int(diag_slots.numel()),
+                slot_min=(int(diag_slots.min()) if diag_slots.numel() else None),
+                slot_max=(int(diag_slots.max()) if diag_slots.numel() else None),
+                slot_sample=diag_slots[:8].tolist(),
+            )
+            if tot_token_num != requested_tokens:
+                _mtp_dw_event(
+                    "fail",
+                    req=req_id,
+                    frontier=len(tokens),
+                    window_start=window_start,
+                    window_end=window_end,
+                    kv_group=kv_group,
+                    invariant="store_actual_tokens",
+                    requested_tokens=requested_tokens,
+                    actual_tokens=tot_token_num,
+                )
+
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -1567,6 +1709,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        if _mtp_dw_diag_enabled() and kwargs.get("decode_window_save"):
+            window_start = kwargs.get("decode_window_start")
+            window_end = kwargs.get("decode_window_end")
+            requested_tokens = (
+                int(window_end) - int(window_start)
+                if window_start is not None and window_end is not None
+                else int(num_to_store_tokens)
+            )
+            _mtp_dw_event(
+                "store",
+                req=req_id,
+                event="complete",
+                frontier=len(tokens),
+                window_start=window_start,
+                window_end=window_end,
+                kv_group=kv_group,
+                requested_tokens=requested_tokens,
+                actual_tokens=tot_token_num,
+            )
         yield
 
     def _retrieve_layer_head_token_wise_shared_passive(
