@@ -26,6 +26,7 @@ from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.token_database import TokenDatabase
 import torch
 
@@ -639,11 +640,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_ptrs_npu: Optional[List],
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
-        new_tensors: List[torch.Tensor] = [
-            tensor
-            for mem_obj in mem_objs_layer
-            if (tensor := mem_obj.tensor) is not None
-        ]
+        new_tensors: List[torch.Tensor] = []
+        for chunk_index, mem_obj in enumerate(mem_objs_layer):
+            tensor = mem_obj.tensor
+            if tensor is None:
+                raise ValueError(
+                    "Layerwise sparse retrieve resolved a chunk without a "
+                    "tensor; refusing to shift the direct-load pointer order: "
+                    f"layer_id={layer_id}, chunk_index={chunk_index}"
+                )
+            new_tensors.append(tensor)
         if new_tensors and cached_chunk_dev_ptrs is not None:
             append_ptrs_fn = getattr(
                 self.gpu_connector,
@@ -709,6 +715,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             if callable(is_indexer_passive):
                 return bool(is_indexer_passive())
         return bool(self._is_passive())
+
+    def _use_sampled_worker_retrieve(self, kv_group: int) -> bool:
+        """Use LocalCPU-prefix/remote-suffix resolution on the active rank."""
+        config = getattr(self, "config", None)
+        return bool(
+            getattr(config, "experimental_sampled_layerwise_lookup", False)
+            and self._should_use_shared_layerwise_retrieve(kv_group)
+            and not self._is_shared_retrieve_passive(kv_group)
+        )
 
     @staticmethod
     def _needs_retrieve_metadata_refresh(
@@ -985,6 +1000,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and self._should_use_shared_layerwise_retrieve(kv_group)
                 and not self._is_shared_retrieve_passive(kv_group)
             )
+            sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
 
             location: Optional[str] = None
             new_starts: List[int] = []
@@ -1000,7 +1016,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 assert isinstance(key, CacheEngineKey)
 
                 keys_multi_layer = key.split_layers(self.num_layers)
-                if shared_rank0_retrieve:
+                if sampled_worker_retrieve:
+                    current_location = "mixed"
+                elif shared_rank0_retrieve:
                     locations_multi_layer: list[str] = []
                     for layer_key in keys_multi_layer:
                         layer_location = self._find_shared_rank0_chunk_location(
@@ -1979,6 +1997,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         shared_chunk_locations_layer_major: list[list[str]] = []
         pre_resolved_shared_mem_layers: Optional[List[List[MemoryObj]]] = None
+        local_prefix_layers: List[Optional[LocalCPUPrefixGetResult]] = []
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         preflight_error_envelope: Optional[SharedHandleEnvelope] = None
         preflight_error: Optional[BaseException] = None
@@ -2001,6 +2020,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                             "MemoryObj after request-level preflight failure"
                         )
             pre_resolved_shared_mem_layers = None
+
+        def release_local_prefix_layers() -> None:
+            for local_prefix in reversed(local_prefix_layers):
+                if local_prefix is None:
+                    continue
+                try:
+                    local_prefix.release()
+                except Exception:
+                    logger.exception(
+                        "Failed to release LocalCPU prefix after shared sparse "
+                        "request preflight failure"
+                    )
+            local_prefix_layers.clear()
 
         def record_request_preflight_error() -> None:
             if (
@@ -2058,17 +2090,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                 },
             )
 
+        sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
         if shared_sparse_retrieve and not use_cached_retrieve and retrieve_keys:
             missing_locations: list[tuple[int, int]] = []
-            for layer_id, layer_keys in enumerate(retrieve_keys):
-                layer_locations: list[str] = []
-                for chunk_index, key in enumerate(layer_keys):
-                    key_location = self._find_shared_rank0_chunk_location(key)
-                    if key_location is None:
-                        missing_locations.append((layer_id, chunk_index))
-                        key_location = ""
-                    layer_locations.append(key_location)
-                shared_chunk_locations_layer_major.append(layer_locations)
+            if sampled_worker_retrieve:
+                local_cpu_backend = self._shared_local_cpu_backend()
+                try:
+                    for layer_keys in retrieve_keys:
+                        local_prefix = local_cpu_backend.batched_get_prefix_with_misses(
+                            layer_keys
+                        )
+                        layer_locations = [LOCAL_CPU_BACKEND_NAME] * len(
+                            local_prefix.local_memory_objs
+                        ) + ["RemoteBackend"] * len(local_prefix.remote_positions)
+                        local_prefix_layers.append(local_prefix)
+                        shared_chunk_locations_layer_major.append(layer_locations)
+                except Exception:
+                    release_local_prefix_layers()
+                    raise
+            else:
+                for layer_id, layer_keys in enumerate(retrieve_keys):
+                    layer_locations: list[str] = []
+                    for chunk_index, key in enumerate(layer_keys):
+                        key_location = self._find_shared_rank0_chunk_location(key)
+                        if key_location is None:
+                            missing_locations.append((layer_id, chunk_index))
+                            key_location = ""
+                        layer_locations.append(key_location)
+                    shared_chunk_locations_layer_major.append(layer_locations)
             if missing_locations:
                 message = (
                     "Shared CPU sparse decode missing required chunks before "
@@ -2091,18 +2140,26 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 record_request_preflight_error()
             else:
-                capacity_details = self._shared_cpu_runtime_capacity_details(
-                    req_id=kwargs.get("req_id", "unspecified"),
-                    phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
-                    kv_group=kv_group,
-                    keys_layer_major=retrieve_keys,
-                    chunk_locations_layer_major=shared_chunk_locations_layer_major,
-                    token_count=len(tokens),
-                    chunk_token_lengths=[
-                        int(end - start)
-                        for start, end in zip(starts, ends, strict=False)
-                    ],
-                )
+                try:
+                    capacity_details = self._shared_cpu_runtime_capacity_details(
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase", "sparse_decode_bootstrap"
+                        ),
+                        kv_group=kv_group,
+                        keys_layer_major=retrieve_keys,
+                        chunk_locations_layer_major=(
+                            shared_chunk_locations_layer_major
+                        ),
+                        token_count=len(tokens),
+                        chunk_token_lengths=[
+                            int(end - start)
+                            for start, end in zip(starts, ends, strict=False)
+                        ],
+                    )
+                except Exception:
+                    release_local_prefix_layers()
+                    raise
                 if not capacity_details.get("fits", False):
                     message = (
                         "Shared CPU sparse decode capacity check failed before "
@@ -2122,28 +2179,53 @@ class AscendLMCacheEngine(LMCacheEngine):
                     preflight_error = ValueError(
                         f"{message} details={capacity_details}"
                     )
+                    release_local_prefix_layers()
                     record_request_preflight_error()
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
                         for layer_id, layer_keys in enumerate(retrieve_keys):
-                            pre_resolved_shared_mem_layers.append(
-                                self._resolve_shared_rank0_layer_mem_objs(
-                                    req_id=kwargs.get("req_id", "unspecified"),
-                                    phase=kwargs.get(
-                                        "shared_cpu_phase",
-                                        "sparse_decode_bootstrap",
-                                    ),
-                                    layer_id=layer_id,
-                                    kv_group=kv_group,
-                                    keys_layer=layer_keys,
-                                    chunk_locations=(
-                                        shared_chunk_locations_layer_major[layer_id]
-                                    ),
+                            if sampled_worker_retrieve:
+                                local_prefix = local_prefix_layers[layer_id]
+                                assert local_prefix is not None
+                                # The resolver consumes every retained local
+                                # reference, whether it succeeds or raises.
+                                local_prefix_layers[layer_id] = None
+                                mem_objs_layer = (
+                                    self._resolve_shared_rank0_layer_mem_objs(
+                                        req_id=kwargs.get("req_id", "unspecified"),
+                                        phase=kwargs.get(
+                                            "shared_cpu_phase",
+                                            "sparse_decode_bootstrap",
+                                        ),
+                                        layer_id=layer_id,
+                                        kv_group=kv_group,
+                                        keys_layer=layer_keys,
+                                        local_prefix=local_prefix,
+                                    )
                                 )
-                            )
+                            else:
+                                mem_objs_layer = (
+                                    self._resolve_shared_rank0_layer_mem_objs(
+                                        req_id=kwargs.get("req_id", "unspecified"),
+                                        phase=kwargs.get(
+                                            "shared_cpu_phase",
+                                            "sparse_decode_bootstrap",
+                                        ),
+                                        layer_id=layer_id,
+                                        kv_group=kv_group,
+                                        keys_layer=layer_keys,
+                                        chunk_locations=(
+                                            shared_chunk_locations_layer_major[layer_id]
+                                        ),
+                                    )
+                                )
+                            pre_resolved_shared_mem_layers.append(mem_objs_layer)
+                        release_local_prefix_layers()
                     except Exception as exc:
+                        failed_layer_id = len(pre_resolved_shared_mem_layers)
                         release_pre_resolved_shared_mem_layers()
+                        release_local_prefix_layers()
                         message = (
                             "Shared CPU sparse decode rank0 materialization failed "
                             "before any handle publication."
@@ -2162,9 +2244,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 details={
                                     "error": str(exc),
                                     "location": location,
-                                    "failed_layer_id": len(
-                                        pre_resolved_shared_mem_layers
-                                    ),
+                                    "failed_layer_id": failed_layer_id,
                                 },
                             )
                         )
@@ -2175,6 +2255,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if preflight_error_envelope is None and request_preflight_failed_elsewhere():
             release_pre_resolved_shared_mem_layers()
+            release_local_prefix_layers()
             preflight_error_envelope = make_request_preflight_error_envelope()
             preflight_error = ValueError(
                 "Shared CPU sparse decode request preflight failed before "
@@ -2185,6 +2266,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
         if preflight_error_envelope is not None:
+            release_local_prefix_layers()
             yield ret_mask
             self._broadcast_shared_envelope(preflight_error_envelope)
             assert preflight_error is not None
