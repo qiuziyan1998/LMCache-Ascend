@@ -19,6 +19,37 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
 )
 
 
+def test_layout_probe_does_not_initialize_staging() -> None:
+    calls = []
+
+    class _LayoutOnlyConnector:
+        kvcaches = None
+
+        def initialize_kvcaches_ptr(self, **kwargs):
+            self.kvcaches = kwargs["kvcaches"]
+
+        def _lazy_initialize_buffer(
+            self,
+            kvcaches,
+            *,
+            kv_group=0,
+            init_staging=None,
+        ):
+            calls.append((kvcaches, kv_group, init_staging))
+
+    connector = _LayoutOnlyConnector()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.gpu_connector = connector
+    kvcaches = [object()]
+
+    engine._ensure_layerwise_connector_layout(
+        kvcaches=kvcaches,
+        kv_group=1,
+    )
+
+    assert calls == [(kvcaches, 1, False)]
+
+
 class _FakePinnedMemObj:
     def __init__(self, ref_count=1):
         self.is_pinned = True
