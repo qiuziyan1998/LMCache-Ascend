@@ -17,7 +17,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.v1.request import RequestStatus
 import torch
 
 if TYPE_CHECKING:
@@ -284,13 +283,32 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return False
         return save_spec.skip_leading_tokens != len(request.token_ids)
 
+    def _finalize_worker_requests_after_store(
+        self, finished_req_ids: set[str]
+    ) -> set[str]:
+        """Release worker state once its store pipeline no longer owns it."""
+        assert self.lmcache_engine is not None
+        finished_sending = set(
+            self.lmcache_engine.get_finished_stores(finished_req_ids) or ()
+        )
+        releasable_req_ids = (
+            finished_sending if self.store_async else finished_req_ids
+        )
+        if releasable_req_ids:
+            self._release_finished_worker_requests(releasable_req_ids)
+        return finished_sending
+
     def _replay_finished_stores_after_save(self) -> None:
-        if not self._finished_req_ids_waiting_for_save or self.lmcache_engine is None:
+        waiting_req_ids = self._finished_req_ids_waiting_for_save
+        if not waiting_req_ids:
             return
 
-        finished_sending = self.lmcache_engine.get_finished_stores(
-            self._finished_req_ids_waiting_for_save
-        )
+        if self.lmcache_engine is None:
+            self._release_finished_worker_requests(waiting_req_ids)
+            self._finished_req_ids_waiting_for_save = set()
+            return
+
+        finished_sending = self._finalize_worker_requests_after_store(waiting_req_ids)
         if finished_sending:
             self._late_finished_sending |= finished_sending
         self._finished_req_ids_waiting_for_save = set()
@@ -300,6 +318,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         if self.lmcache_engine is None:
+            self._release_finished_worker_requests(finished_req_ids)
             return None, None
         query_req_ids = set(finished_req_ids)
         if not self._wait_for_save_done:
@@ -319,7 +338,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 self._finished_req_ids_waiting_for_save |= waiting_for_save
                 query_req_ids -= waiting_for_save
 
-        finished_sending = self.lmcache_engine.get_finished_stores(query_req_ids)
+        finished_sending = self._finalize_worker_requests_after_store(query_req_ids)
         if self._late_finished_sending:
             finished_sending |= self._late_finished_sending
             self._late_finished_sending = set()
@@ -357,37 +376,5 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         _, return_params = super().request_finished(request, block_ids)
-        if getattr(self, "use_layerwise", False) and hasattr(
-            self, "_layerwise_save_storers"
-        ):
-            legacy_storer = self._layerwise_save_storers.pop(
-                request.request_id, None
-            )
-            close_storer = getattr(self, "_close_layerwise_storer", None)
-            if callable(close_storer):
-                close_storer(legacy_storer)
-            elif legacy_storer is not None:
-                close_fn = getattr(legacy_storer, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except (GeneratorExit, RuntimeError, ValueError):
-                        pass
-
-        if (
-            request.status == RequestStatus.FINISHED_ABORTED
-            and self.lmcache_engine is not None
-            and self.store_async
-            and self.kv_role != "kv_consumer"
-        ):
-            try:
-                self.lmcache_engine.wait_for_pending_stores({request.request_id})
-            except Exception:
-                logger.warning(
-                    "wait_for_pending_stores failed for aborted request %s",
-                    request.request_id,
-                    exc_info=True,
-                )
-
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params
