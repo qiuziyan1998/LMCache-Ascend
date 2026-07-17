@@ -122,42 +122,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                 storer_key,
                             )
                     if layerwise_storer is not None:
-                        save_completed = True
-                        try:
-                            drain_storer = getattr(
-                                self, "_drain_layerwise_storer_fully", None
+                        save_completed, store_result = (
+                            self._finalize_layerwise_storer(
+                                layerwise_storer,
+                                fully=True,
                             )
-                            if callable(drain_storer):
-                                save_completed = (
-                                    drain_storer(layerwise_storer) is not False
-                                )
-                            else:
-                                try:
-                                    next(layerwise_storer)
-                                except StopIteration:
-                                    pass
-                        finally:
-                            close_storer = getattr(
-                                self, "_close_layerwise_storer", None
-                            )
-                            if callable(close_storer):
-                                close_storer(layerwise_storer)
-                            else:
-                                close_fn = getattr(layerwise_storer, "close", None)
-                                if callable(close_fn):
-                                    try:
-                                        close_fn()
-                                    except (GeneratorExit, RuntimeError, ValueError):
-                                        pass
+                        )
                         if save_completed and matched_current_storer_key:
-                            record_completed = getattr(
-                                self,
-                                "_record_decode_window_save_group_completed",
-                                None,
+                            self._consume_completed_layerwise_store(
+                                request,
+                                _kv_group,
+                                save_completed,
+                                store_result,
                             )
-                            if callable(record_completed):
-                                record_completed(request, _kv_group)
-                self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             assert self.lmcache_engine is not None

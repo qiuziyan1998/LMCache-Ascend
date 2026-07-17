@@ -19,7 +19,7 @@ from lmcache.utils import (
     _lmcache_nvtx_annotate,
     convert_tokens_to_list,
 )
-from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
@@ -561,7 +561,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
-        cached_shared_handles: Optional[List],
     ) -> Optional[int]:
         """Drop a cached partial tail before publishing its full successor."""
         replace_at: Optional[int] = None
@@ -584,7 +583,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_memory_objs,
             cached_tensors,
             cached_chunk_dev_ptrs,
-            cached_shared_handles,
         ):
             if layer_cache is None:
                 continue
@@ -1210,7 +1208,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[None, None, None]:
+    ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
         """
         Store the KV cache in a layerwise manner.
 
@@ -1223,21 +1221,28 @@ class AscendLMCacheEngine(LMCacheEngine):
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
 
-        return: A generator that yields None. In the first iteration, the
-            generator allocates the memory objects for all layers and moves
+        return: A generator that yields None for each layer and a
+            LayerwiseStoreResult after the final layer. In the first iteration,
+            the generator allocates the memory objects for all layers and moves
             the KV cache of the first layer from GPU to CPU. In the next
             iterations, it moves the KV cache of layer i from GPU to the memory
             objects (on CPU) and puts the memory objects of layer i-1 to the
             storage backends. In the last iteration, it puts the memory objects
-            of the last layer to the storage backends.
+            of the last layer to the storage backends and yields the completed
+            store output.
         """
+        store_result = LayerwiseStoreResult(
+            request_id=str(kwargs.get("req_id", "unspecified")),
+            kv_group=int(kwargs.get("kv_group", 0) or 0),
+        )
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             for layer_id in range(self.num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
-            yield
+            yield store_result
             return
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
@@ -1250,7 +1255,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             for layer_id in range(self.num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
-            yield
+            yield store_result
             return
 
         assert self.storage_manager is not None
@@ -1260,6 +1265,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        store_result.request_id = req_id
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -1285,25 +1291,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             # Still need to yield to avoid StopIteration
             for layer_id in range(self.num_layers):
                 yield
+            yield store_result
             return
 
-        cached_keys = kwargs.get("cached_keys")
-        assert cached_keys is not None
-        assert isinstance(cached_keys, list)
-
-        cached_starts = kwargs.get("cached_starts")
-        assert cached_starts is not None
-        assert isinstance(cached_starts, list)
-
-        cached_ends = kwargs.get("cached_ends")
-        assert cached_ends is not None
-        assert isinstance(cached_ends, list)
-
-        cached_memory_objs = kwargs.get("cached_memory_objs")
-        cached_tensors = kwargs.get("cached_tensors")
-        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
-        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
-        cached_shared_handles = kwargs.get("cached_shared_handles")
+        cached_keys = store_result.keys
+        cached_starts = store_result.starts
+        cached_ends = store_result.ends
+        cached_memory_objs = store_result.memory_objs
+        cached_tensors = store_result.tensors
+        cached_chunk_dev_ptrs = store_result.chunk_dev_ptrs
+        cached_chunk_ptrs_npu = store_result.chunk_ptrs
 
         starts = []
         ends = []
@@ -1488,7 +1485,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors=cached_tensors,
                     cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
-                    cached_shared_handles=cached_shared_handles,
                 )
 
             self._append_layerwise_store_cache_chunks(
@@ -1567,7 +1563,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
-        yield
+        yield store_result
 
     def _retrieve_layer_head_token_wise_shared_passive(
         self,

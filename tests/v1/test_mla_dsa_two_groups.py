@@ -23,6 +23,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
@@ -410,6 +411,8 @@ class TestStoreLayerPassiveGuard:
         results = list(gen)
         # num_layers yields (one per save_kv_layer) + final wait_for_save yield
         assert len(results) == 5
+        assert results[:-1] == [None] * 4
+        assert isinstance(results[-1], LayerwiseStoreResult)
 
     def test_active_rank_proceeds_to_store(self):
         """An active rank (rank 0) should NOT skip — it should proceed."""
@@ -442,9 +445,7 @@ class TestStoreLayerPassiveGuard:
         tokens = [1, 2, 3, 4]
         mask = torch.tensor([True, True, True, True])
 
-        gen = LMCacheEngine.store_layer(
-            engine, tokens, mask=mask, cached_keys=[]
-        )
+        gen = LMCacheEngine.store_layer(engine, tokens, mask=mask)
         list(gen)
         engine.token_database.process_tokens.assert_called()
 
@@ -503,7 +504,6 @@ def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
     cached_tensors = [["tensor-0", "partial-tensor-1"]]
     cached_chunk_dev_ptrs = [[11, 22]]
     cached_chunk_ptrs_npu = [torch.tensor([11, 22], dtype=torch.long)]
-    cached_shared_handles = [["handle-0", "partial-handle-1"]]
 
     replaced_at = (
         AscendLMCacheEngine._truncate_store_cache_for_full_chunk_successor(
@@ -516,7 +516,6 @@ def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
             cached_tensors=cached_tensors,
             cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
-            cached_shared_handles=cached_shared_handles,
         )
     )
 
@@ -528,7 +527,6 @@ def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
     assert cached_tensors == [["tensor-0"]]
     assert cached_chunk_dev_ptrs == [[11]]
     assert cached_chunk_ptrs_npu[0].tolist() == [11]
-    assert cached_shared_handles == [["handle-0"]]
 
 
 class TestLayerwiseLayoutWarmup:
@@ -1322,6 +1320,9 @@ class TestStorerDualPop:
         return SimpleNamespace(
             kv_role="kv_producer",
             use_layerwise=True,
+            store_async=False,
+            lmcache_engine=MagicMock(),
+            _wait_for_save_done=False,
             _layerwise_save_storers=storers,
             _should_defer_latent_save_under_tp=lambda: False,
             _layerwise_save_storer_key=(
@@ -1330,16 +1331,14 @@ class TestStorerDualPop:
             _is_decode_window_save_request=_adapter_method(
                 "_is_decode_window_save_request"
             ),
-            _advance_layerwise_storer_once=_adapter_method(
-                "_advance_layerwise_storer_once"
+            _finalize_layerwise_storer=(
+                lambda storer, fully: (True, None)
             ),
-            _close_layerwise_storer=_adapter_method("_close_layerwise_storer"),
-            _record_decode_window_save_group_completed=(
-                lambda request, kv_group: None
+            _consume_completed_layerwise_store=(
+                lambda request, kv_group, completed, result: None
             ),
             _mark_decode_window_save_completed=lambda request: None,
             _maybe_lookup_unpin_for_request=lambda request: None,
-            _maybe_seed_worker_retrieve_state_from_store=lambda request: None,
             _parent=SimpleNamespace(
                 _get_connector_metadata=lambda: meta,
             ),
@@ -1358,7 +1357,7 @@ class TestStorerDualPop:
         storers = {("r1", 0): gen0, ("r1", 1): gen1}
 
         fake = self._make_fake(meta, storers)
-        _adapter_method("wait_for_save")(fake)
+        _ascend_adapter_method("wait_for_save")(fake)
         # Both group storers are popped.
         assert ("r1", 0) not in storers
         assert ("r1", 1) not in storers
@@ -1376,7 +1375,7 @@ class TestStorerDualPop:
         storers = {("r2", 0): gen0}  # indexer storer never created
 
         fake = self._make_fake(meta, storers)
-        _adapter_method("wait_for_save")(fake)
+        _ascend_adapter_method("wait_for_save")(fake)
         assert storers == {}
 
 
@@ -1418,12 +1417,14 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
             _layerwise_save_storer_key=_range_key,
             _save_storer_key=_ascend_adapter_method("_save_storer_key"),
             _should_defer_latent_save_under_tp=lambda: False,
-            _drain_layerwise_storer_fully=lambda storer: True,
-            _close_layerwise_storer=lambda storer: None,
-            _record_decode_window_save_group_completed=(
-                lambda req, kv_group: completed_groups.append(kv_group)
+            _finalize_layerwise_storer=(
+                lambda storer, fully: (True, None)
             ),
-            _maybe_seed_worker_retrieve_state_from_store=lambda req: None,
+            _consume_completed_layerwise_store=(
+                lambda req, kv_group, completed, result: (
+                    completed_groups.append(kv_group)
+                )
+            ),
             _mark_decode_window_save_completed=lambda req: None,
             _maybe_lookup_unpin_for_request=lambda req: None,
             _parent=SimpleNamespace(
@@ -1939,17 +1940,30 @@ class TestVLLMCallSequence:
 
         fake = _make_fake_adapter(num_layers=2, dsa_two_groups=True)
         req = _make_save_req("r1", 128)
-        req.cached_keys = [["k0"], ["k1"]]
-        req.cached_starts = [0]
-        req.cached_ends = [128]
-        req.cached_tensors = [[torch.zeros(1)], [torch.zeros(1)]]
+        latent_result = LayerwiseStoreResult(
+            request_id="r1",
+            starts=[0],
+            ends=[128],
+            keys=[["k0"], ["k1"]],
+            memory_objs=[["m0"], ["m1"]],
+            tensors=[[torch.zeros(1)], [torch.zeros(1)]],
+        )
+        index_result = LayerwiseStoreResult(
+            request_id="r1",
+            kv_group=1,
+            starts=[0],
+            ends=[128],
+            keys=[["ik0"], ["ik1"]],
+            memory_objs=[["im0"], ["im1"]],
+            tensors=[[torch.zeros(1)], [torch.zeros(1)]],
+        )
 
         fake._layerwise_save_storers[
             ("r1", "normal_save", 0, 0, 128)
-        ] = _long_generator(n=1)
+        ] = _long_generator(value=latent_result, n=1)
         fake._layerwise_save_storers[
             ("r1", "normal_save", 1, 0, 128)
-        ] = _long_generator(n=1)
+        ] = _long_generator(value=index_result, n=1)
         meta = LMCacheConnectorMetadata(requests=[req])
         fake._parent = SimpleNamespace(
             _connector_metadata=meta,
@@ -1961,6 +1975,10 @@ class TestVLLMCallSequence:
         assert fake._layerwise_save_storers == {}
         assert "r1" in fake._worker_retrieve_state
         assert fake._worker_retrieve_state["r1"].cached_keys == [["k0"], ["k1"]]
+        assert fake._worker_retrieve_state["r1"].cached_keys_indexer == [
+            ["ik0"],
+            ["ik1"],
+        ]
 
     def test_save_sequence_without_dsa_two_groups_is_latent_only(self):
         from lmcache.integration.vllm.vllm_v1_adapter import (
