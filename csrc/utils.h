@@ -161,6 +161,29 @@ struct SparseDirectLayerState {
   SingleLayerKVConfig config;
 };
 
+// Process-lifetime destination state for prepared MLA/DSA sparse retrieve.
+// Request source metadata and per-step launch data are deliberately excluded.
+struct SparseDirectDestinationState {
+  uint8_t *vllm_k_ptr;
+  uint8_t *vllm_v_ptr;
+  uint8_t *vllm_dsa_ptr;
+
+  int64_t vllm_k_bytes;
+  int64_t vllm_v_bytes;
+  int64_t vllm_dsa_bytes;
+
+  int32_t block_size;
+  int32_t max_tokens_per_loop;
+
+  kvcache_ops::AscendType scalar_type_num;
+  kvcache_ops::AscendType slot_type_num;
+  kvcache_ops::KVCacheFormat kvcache_format;
+
+  int64_t k_hidden_dims;
+  int64_t v_hidden_dims;
+  int64_t dsa_hidden_dims;
+};
+
 struct HostChunkMetadata {
   std::vector<uint8_t *> ptrs;
   std::vector<int64_t> copy_sizes; // Bytes to copy per chunk
@@ -198,6 +221,11 @@ SparseDirectLayerState prepare_sparse_direct_layer_state(
     bool token_major, bool vllm_two_major, int kvcache_format_raw,
     int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
     int32_t lmc_num_tokens);
+
+SparseDirectDestinationState prepare_sparse_direct_destination_state(
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    at::ScalarType slot_mapping_type, int kvcache_format_raw,
+    int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims);
 
 HostChunkMetadata
 prepare_host_chunk_metadata(const std::vector<torch::Tensor> &lmc_tensors,

@@ -701,6 +701,53 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
   cmd.Run();
 }
 
+void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
+    const int64_t total_tokens, const bool lmc_host_interleaved) {
+  const c10::OptionalDeviceGuard slot_device_guard(
+      device_of(slot_mapping_packed));
+
+  const int32_t num_sparse = static_cast<int32_t>(selected_token_idx.size(0));
+  if (num_sparse == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+  const uint32_t aiv_num =
+      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
+  uint8_t *selected_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+
+  const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const SparseDirectDestinationState state = destination_state;
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([state, stream, aiv_num, slot_mapping_ptr, selected_ptr,
+                        chunk_ptrs_ptr, num_sparse, num_chunks, chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved]() -> int {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
+        state.scalar_type_num, state.slot_type_num,
+        kernel_format(state.kvcache_format), aiv_num, stream, chunk_ptrs_ptr,
+        state.vllm_k_ptr, state.vllm_v_ptr, state.vllm_dsa_ptr,
+        slot_mapping_ptr, selected_ptr, state.vllm_k_bytes, state.vllm_v_bytes,
+        state.vllm_dsa_bytes, state.max_tokens_per_loop, state.k_hidden_dims,
+        state.v_hidden_dims, state.dsa_hidden_dims, num_sparse, num_chunks,
+        chunk_size_i, total_tokens_i, state.block_size, lmc_host_interleaved);
+    return 0;
+  });
+  cmd.Run();
+}
+
 static void validate_dense_direct_inputs(torch::Tensor &slot_mapping_full,
                                          torch::Tensor &chunk_ptrs_npu,
                                          torch::Tensor &chunk_offsets_npu,

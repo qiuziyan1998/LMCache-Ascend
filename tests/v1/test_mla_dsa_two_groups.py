@@ -1020,9 +1020,6 @@ class TestPerGroupLazyInit:
             num_tokens=max_model_len,
             kv_group=0,
             layout=layout,
-            k_hidden_dims=512,
-            v_hidden_dims=64,
-            dsa_hidden_dims=0,
             expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
         )
         assert pool_obj is not None
@@ -1079,18 +1076,12 @@ class TestPerGroupLazyInit:
             num_tokens=256,
             kv_group=0,
             layout=conn._group_layouts[0],
-            k_hidden_dims=512,
-            v_hidden_dims=64,
-            dsa_hidden_dims=0,
             expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
         )
         pool_obj1, staging1 = conn._allocate_layerwise_staging_buffer(
             num_tokens=256,
             kv_group=1,
             layout=conn._group_layouts[1],
-            k_hidden_dims=128,
-            v_hidden_dims=0,
-            dsa_hidden_dims=128,
             expected_fmt=MemoryFormat.KV_DSA_INDEX_FMT,
         )
         assert pool_obj0 is not None
@@ -1114,18 +1105,12 @@ class TestPerGroupLazyInit:
             num_tokens=max_model_len,
             kv_group=0,
             layout=layout,
-            k_hidden_dims=512,
-            v_hidden_dims=64,
-            dsa_hidden_dims=0,
             expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
         )
         pool_obj1, _ = conn._allocate_layerwise_staging_buffer(
             num_tokens=max_model_len,
             kv_group=0,
             layout=layout,
-            k_hidden_dims=512,
-            v_hidden_dims=64,
-            dsa_hidden_dims=0,
             expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
         )
         assert pool_obj0 is not None
@@ -1149,9 +1134,6 @@ class TestPerGroupLazyInit:
             num_tokens=max_model_len,
             kv_group=0,
             layout=layout,
-            k_hidden_dims=512,
-            v_hidden_dims=64,
-            dsa_hidden_dims=0,
             expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
         )
         assert pool_obj0 is not None
@@ -1160,9 +1142,6 @@ class TestPerGroupLazyInit:
                 num_tokens=max_model_len,
                 kv_group=0,
                 layout=layout,
-                k_hidden_dims=512,
-                v_hidden_dims=64,
-                dsa_hidden_dims=0,
                 expected_fmt=MemoryFormat.KV_MLA_LATENT_FMT,
             )
         pool_obj0.ref_count_down()
@@ -1418,6 +1397,7 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
         )
 
         meta = LMCacheConnectorMetadata(requests=[request])
+        engine = MagicMock()
 
         def _range_key(req, kv_group):
             return (
@@ -1432,6 +1412,8 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
             kv_role="kv_producer",
             use_layerwise=True,
             store_async=False,
+            lmcache_engine=engine,
+            _wait_for_save_done=False,
             _layerwise_save_storers=storers,
             _layerwise_save_storer_key=_range_key,
             _save_storer_key=_ascend_adapter_method("_save_storer_key"),
@@ -1478,6 +1460,21 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
 
         assert storers == {}
         assert completed_groups == []
+
+    def test_remote_store_barrier_precedes_save_completion(self):
+        request = self._make_request()
+        fake = self._make_fake(request, {}, [])
+        events = []
+        fake.lmcache_engine.wait_for_pending_sync_stores.side_effect = (
+            lambda: events.append(("barrier", fake._wait_for_save_done))
+        )
+        fake._replay_finished_stores_after_save = lambda: events.append(
+            ("replay", fake._wait_for_save_done)
+        )
+
+        _ascend_adapter_method("wait_for_save")(fake)
+
+        assert events == [("barrier", False), ("replay", True)]
 
 
 class TestRetrieverPairAdvancement:

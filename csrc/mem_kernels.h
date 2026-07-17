@@ -251,6 +251,14 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
     const int64_t chunk_size, const int64_t total_tokens,
     const bool lmc_host_interleaved, const bool validate_inputs = false);
 
+// Prepared warm path: destination state is process-owned; all request and step
+// inputs are supplied by the decode generator at launch time.
+void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
+    const int64_t total_tokens, const bool lmc_host_interleaved);
+
 // Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
 // direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.
 void dense_mla_dsa_batched_direct_kv_transfer(

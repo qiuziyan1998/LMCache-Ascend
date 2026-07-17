@@ -169,7 +169,7 @@ class TestSchedulerWorkerFinishConsistency:
         keys = mp_harness.worker_call({"op": "worker_state_keys"})
         assert req_id not in keys["keys"]
 
-    def test_request_finished_unpins_when_scheduler_signals_finish(
+    def test_worker_get_finished_unpins_when_scheduler_signals_finish(
         self, mp_harness
     ) -> None:
         pytest.importorskip("vllm")
@@ -183,7 +183,7 @@ class TestSchedulerWorkerFinishConsistency:
         )
         mp_harness.worker_call({"op": "save_worker_state", "req_id": req_id})
 
-        mp_harness.worker_call({"op": "request_finished", "req_id": req_id})
+        mp_harness.worker_call({"op": "get_finished", "req_id": req_id})
 
         pin_state = mp_harness.worker_call(
             {"op": "has_lookup_pins", "req_id": req_id}

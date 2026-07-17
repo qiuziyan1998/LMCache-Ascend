@@ -408,12 +408,8 @@ def _worker_run(
                     result_queue.put({"ok": True, "op": op})
                     continue
 
-                if op == "request_finished":
-                    req = SimpleNamespace(
-                        request_id=cmd["req_id"],
-                        status=SimpleNamespace(name="FINISHED"),
-                    )
-                    adapter.request_finished(req, [])
+                if op == "get_finished":
+                    adapter.get_finished({cmd["req_id"]})
                     result_queue.put({"ok": True, "op": op})
                     continue
 

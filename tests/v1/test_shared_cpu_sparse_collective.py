@@ -11,6 +11,7 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
@@ -308,6 +309,38 @@ def test_metadata_warm_data_cold_repopulates_stale_ret_mask():
     assert retrieve_kwargs["_retrieve_metadata_warm"] is True
 
 
+def test_sampled_metadata_build_skips_per_chunk_contains():
+    key = _make_key()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.use_layerwise = True
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.token_database = _FakeTokenDatabase(key)
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_shared_retrieve_passive = lambda _kv_group: False
+    engine._find_shared_rank0_chunk_location = lambda _key: (_ for _ in ()).throw(
+        AssertionError("sampled metadata path must not call contains")
+    )
+    ret_mask = torch.zeros(1, dtype=torch.bool)
+
+    location, starts, ends, keys = engine._ensure_retrieve_chunk_metadata(
+        tokens=[1],
+        mask=None,
+        request_configs=None,
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        ret_mask=ret_mask,
+        retrieve_kwargs={"kv_group": 0},
+    )
+
+    assert location == "mixed"
+    assert starts == [0]
+    assert ends == [1]
+    assert keys == [[key.split_layers(2)[0]], [key.split_layers(2)[1]]]
+    assert ret_mask.tolist() == [True]
+
+
 def test_sparse_request_preflight_error_prevents_partial_latent_publication(
     monkeypatch,
 ):
@@ -445,6 +478,122 @@ def test_sparse_rank0_close_after_prime_releases_pre_resolved_memobjs(
     assert all(obj.unpin_count == 1 for obj in allocated)
     assert all(obj.release_count == 1 for obj in allocated)
     assert all(obj.ref_count == 0 for obj in allocated)
+
+
+def test_sampled_sparse_preflight_batches_local_misses_without_contains(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    keys_layer_major = [
+        ["layer0-chunk0", "layer0-chunk1", "layer0-chunk2"],
+        ["layer1-chunk0", "layer1-chunk1", "layer1-chunk2"],
+    ]
+    local_objects = [
+        [_FakePinnedMemObj()],
+        [],
+    ]
+
+    class _BatchedLocalBackend:
+        def __init__(self):
+            self.calls = []
+
+        def batched_get_prefix_with_misses(self, keys):
+            layer_id = len(self.calls)
+            self.calls.append(list(keys))
+            objects = list(local_objects[layer_id])
+            positions = list(range(len(objects), len(keys)))
+            return LocalCPUPrefixGetResult(
+                objects,
+                positions,
+                [keys[position] for position in positions],
+            )
+
+    local_backend = _BatchedLocalBackend()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.use_layerwise = True
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.storage_manager = object()
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    engine._min_layer_cache_chunks = lambda *_args: 0
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "mixed",
+        [0, 2, 4],
+        [2, 4, 6],
+        keys_layer_major,
+    )
+    engine._shared_local_cpu_backend = lambda: local_backend
+    engine._find_shared_rank0_chunk_location = lambda _key: (_ for _ in ()).throw(
+        AssertionError("sampled worker preflight must not call contains")
+    )
+    capacity_calls = []
+    engine._shared_cpu_runtime_capacity_details = lambda **kwargs: (
+        capacity_calls.append(kwargs) or {"fits": True}
+    )
+    resolver_calls = []
+    remote_objects = []
+
+    def resolve_layer(**kwargs):
+        resolver_calls.append(kwargs)
+        local_prefix = kwargs["local_prefix"]
+        resolved = list(local_prefix.local_memory_objs)
+        for _ in local_prefix.remote_positions:
+            remote_obj = _FakePinnedMemObj()
+            remote_objects.append(remote_obj)
+            resolved.append(remote_obj)
+        return resolved
+
+    engine._resolve_shared_rank0_layer_mem_objs = resolve_layer
+    engine._broadcast_shared_envelope = lambda _envelope: None
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1, 2, 3, 4, 5, 6],
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=[],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+
+    assert local_backend.calls == keys_layer_major
+    assert capacity_calls[0]["chunk_locations_layer_major"] == [
+        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
+        ["RemoteBackend", "RemoteBackend", "RemoteBackend"],
+    ]
+    assert [call["local_prefix"].remote_positions for call in resolver_calls] == [
+        [1, 2],
+        [0, 1, 2],
+    ]
+    assert [call["local_prefix"].remote_keys for call in resolver_calls] == [
+        keys_layer_major[0][1:],
+        keys_layer_major[1],
+    ]
+
+    retriever.close()
+    all_objects = [
+        mem_obj for layer in local_objects for mem_obj in layer if mem_obj is not None
+    ] + remote_objects
+    assert all(obj.unpin_count == 1 for obj in all_objects)
+    assert all(obj.release_count == 1 for obj in all_objects)
 
 
 def test_sparse_passive_public_path_accepts_ret_mask_kwarg(monkeypatch):
@@ -1234,6 +1383,31 @@ def test_append_retrieve_layer_cache_is_atomic_when_pointer_install_fails():
     assert cached_tensors == []
     assert cached_chunk_dev_ptrs == []
     assert cached_chunk_ptrs_npu == []
+
+
+def test_append_retrieve_layer_cache_rejects_missing_tensor_without_shift():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = object()
+    cached_memory_objs = []
+    cached_tensors = []
+
+    with pytest.raises(ValueError, match="without a tensor"):
+        engine._append_retrieve_layer_cache(
+            0,
+            [
+                _FakeTensorMemObj(torch.empty(1)),
+                _FakeTensorMemObj(None),
+                _FakeTensorMemObj(torch.empty(1)),
+            ],
+            cached_memory_objs,
+            cached_tensors,
+            [],
+            [],
+        )
+
+    assert cached_memory_objs == []
+    assert cached_tensors == []
 
 
 def test_sparse_pointer_cache_append_failure_is_atomic(monkeypatch):
