@@ -38,6 +38,91 @@ def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
     return connector
 
 
+def test_bounded_stable_int_checksum_matches_ascend_producer() -> None:
+    values = [12, -1, 999_999_999_999]
+
+    checksum = npu_connectors._bounded_stable_int_checksum(values)
+
+    assert checksum == 12039416201095166938
+    assert npu_connectors._bounded_stable_int_checksum([]) == 14695981039346656037
+
+
+def test_bounded_stable_int_checksum_uses_first_32_aggregate_values() -> None:
+    values = list(range(40))
+
+    assert npu_connectors._bounded_stable_int_checksum(
+        values
+    ) == npu_connectors._bounded_stable_int_checksum(values[:32] + [999] * 8)
+
+
+def test_mtp_deep_diag_requires_both_gates(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.delenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", raising=False)
+    assert not npu_connectors._mtp_dw_deep_diag_enabled()
+
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    assert npu_connectors._mtp_dw_deep_diag_enabled()
+
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
+    assert not npu_connectors._mtp_dw_deep_diag_enabled()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, True),
+        ({"enabled": False}, False),
+        ({"explicit_payload": False}, False),
+        ({"committed_end": 0}, False),
+        ({"req_id": None}, False),
+        ({"seen": {("req", 0): None}}, False),
+    ],
+)
+def test_deep_payload_capture_is_first_successful_committed_payload(
+    overrides, expected
+) -> None:
+    inputs = {
+        "enabled": True,
+        "explicit_payload": True,
+        "committed_end": 256,
+        "req_id": "req",
+        "kv_group": 0,
+        "seen": {},
+    }
+    inputs.update(overrides)
+
+    assert npu_connectors._should_capture_deep_payload(**inputs) is expected
+
+
+def test_conflicting_duplicate_target_slots_is_bounded_and_precise() -> None:
+    conflicts = npu_connectors._conflicting_duplicate_target_slots(
+        [10, 10, 11, 12, 13],
+        [4, 4, 5, 5, 6],
+    )
+
+    assert conflicts == [{"slot": 5, "first_selected": 11, "selected": 12}]
+    assert npu_connectors._conflicting_duplicate_target_slots(
+        [10, 10], [4, 4]
+    ) == []
+    assert npu_connectors._conflicting_duplicate_target_slots(
+        [10, 10], [4, 5]
+    ) == []
+    assert npu_connectors._conflicting_duplicate_target_slots(
+        list(range(40)), list(range(39)) + [0]
+    ) == [{"slot": 0, "first_selected": 0, "selected": 39}]
+
+
+def test_remember_bounded_key_evicts_oldest_state(monkeypatch) -> None:
+    monkeypatch.setattr(npu_connectors, "_MTP_DW_DEEP_SEEN_LIMIT", 2)
+    seen = {}
+
+    npu_connectors._remember_bounded_key(seen, "oldest")
+    npu_connectors._remember_bounded_key(seen, "middle")
+    npu_connectors._remember_bounded_key(seen, "newest")
+
+    assert list(seen) == ["middle", "newest"]
+
+
 class _NoopStream:
     def wait_stream(self, stream):
         pass
@@ -407,9 +492,11 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         slot_mapping_ref=slot_mapping,
         cpu_tensors=[lmc_chunk],
     )
-    connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
-    connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
+    first_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
+    second_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
 
+    assert first_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
+    assert second_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
     assert len(fast_calls) == 2
     assert slow_calls == []
     assert fast_calls[0][0][0] is layer_state

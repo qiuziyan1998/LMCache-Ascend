@@ -50,6 +50,12 @@ def _mtp_dw_diag_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
 
+def _mtp_dw_deep_diag_enabled() -> bool:
+    return _mtp_dw_diag_enabled() and os.environ.get(
+        "VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"
+    ) == "1"
+
+
 def _mtp_dw_event(stage: str, **fields: Any) -> None:
     if not _mtp_dw_diag_enabled():
         return
@@ -60,6 +66,70 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     }
     payload.update(fields)
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+_MTP_DW_DEEP_SEEN_LIMIT = 256
+_MTP_DW_CHECKSUM_LIMIT = 32
+_MTP_DW_UINT64_MASK = (1 << 64) - 1
+
+
+def _bounded_stable_int_checksum(values: Any) -> int:
+    """Match vLLM Ascend's checksum over the first 32 integers."""
+    prefix = list(values[:_MTP_DW_CHECKSUM_LIMIT])
+    checksum = 0xCBF29CE484222325
+    for value in prefix:
+        checksum ^= int(value) & _MTP_DW_UINT64_MASK
+        checksum = (checksum * 0x100000001B3) & _MTP_DW_UINT64_MASK
+    checksum ^= len(prefix)
+    return checksum
+
+
+def _remember_bounded_key(seen: dict[Any, None], key: Any) -> None:
+    """Remember a diagnostic key without retaining unbounded request state."""
+    seen[key] = None
+    while len(seen) > _MTP_DW_DEEP_SEEN_LIMIT:
+        del seen[next(iter(seen))]
+
+
+def _should_capture_deep_payload(
+    *,
+    enabled: bool,
+    explicit_payload: bool,
+    committed_end: int,
+    req_id: Any,
+    kv_group: int,
+    seen: dict[Any, None],
+) -> bool:
+    """Select the first successful committed payload for a request and group."""
+    if (
+        not enabled
+        or not explicit_payload
+        or committed_end <= 0
+        or req_id is None
+    ):
+        return False
+    return (str(req_id), int(kv_group)) not in seen
+
+
+def _conflicting_duplicate_target_slots(
+    selected_values: list[int],
+    slot_values: list[int],
+    limit: int = 8,
+) -> list[dict[str, int]]:
+    """Report bounded cases where one target slot has different sources."""
+    seen: dict[int, int] = {}
+    conflicts: list[dict[str, int]] = []
+    for selected, slot in zip(selected_values, slot_values, strict=False):
+        selected = int(selected)
+        slot = int(slot)
+        previous = seen.setdefault(slot, selected)
+        if previous != selected:
+            conflicts.append(
+                {"slot": slot, "first_selected": previous, "selected": selected}
+            )
+            if len(conflicts) >= limit:
+                break
+    return conflicts
 
 
 _SPARSE_DIRECT_RECORD_STREAM = os.getenv(
@@ -1901,6 +1971,97 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         return target_slot_mapping, selected_token_idx
 
+    def _run_sparse_staging_kv_transfer_layer(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        load_stream: torch.cuda.Stream,
+        current_stream: torch.cuda.Stream,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        layer_tensors: List[torch.Tensor],
+        payload_event: Optional[Any] = None,
+    ) -> str:
+        """Diagnostic fallback: CPU chunks -> NPU staging -> paged KV.
+
+        This keeps the same sparse source rows and target slots as the direct
+        registered-host path, but routes data through the older staging kernel.
+        It is intentionally behind LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE because
+        it is slower and uses a full retrieved-token staging buffer.
+        """
+        num_sparse = int(selected_token_idx.numel())
+        if num_sparse == 0 or not layer_tensors:
+            return "none"
+
+        chunk_offsets: list[int] = []
+        chunk_sizes: list[int] = []
+        covered_tokens = 0
+        for tensor in layer_tensors:
+            chunk_tokens = self._lmc_plane_num_tokens(tensor, kv_group)
+            chunk_offsets.append(covered_tokens)
+            chunk_sizes.append(chunk_tokens)
+            covered_tokens += chunk_tokens
+
+        if total_tokens <= 0:
+            total_tokens = covered_tokens
+        if covered_tokens < int(total_tokens):
+            raise ValueError(
+                "Sparse staging fallback has insufficient CPU chunk tokens: "
+                f"kv_group={kv_group} layer_id={layer_id} "
+                f"covered_tokens={covered_tokens} total_tokens={int(total_tokens)}"
+            )
+        expected_fmt = self._expected_memory_format(kv_group)
+        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
+        try:
+            tmp_gpu_buffer_obj, staging_tensor = (
+                self._allocate_layerwise_staging_buffer(
+                    num_tokens=covered_tokens,
+                    kv_group=kv_group,
+                    layout=self._group_layout(kv_group),
+                    k_hidden_dims=sparse_k_hidden_dims,
+                    v_hidden_dims=sparse_v_hidden_dims,
+                    dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    expected_fmt=expected_fmt,
+                )
+            )
+            with torch.cuda.stream(load_stream):
+                load_stream.wait_stream(current_stream)
+                payload_events = _payload_event_list(payload_event)
+                if payload_events:
+                    for event in payload_events:
+                        load_stream.wait_event(event)
+                assert staging_tensor is not None
+                batched_fused_sparse_single_layer_kv_transfer(
+                    layer_tensors,
+                    staging_tensor,
+                    kvcaches_ref[layer_id],
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    chunk_offsets,
+                    chunk_sizes,
+                    sparse_kv_format,
+                    sparse_token_major,
+                    sparse_vllm_two_major,
+                    sparse_k_hidden_dims,
+                    sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims,
+                )
+            return "batched_fused_sparse_single_layer_kv_transfer"
+        finally:
+            current_stream.wait_stream(load_stream)
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -1924,10 +2085,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer_tensors: Optional[List[torch.Tensor]] = None,
         slot_mapping_ref: Optional[torch.Tensor] = None,
         cpu_tensors: Optional[List[torch.Tensor]] = None,
-    ) -> None:
+        payload_event: Optional[Any] = None,
+    ) -> str:
         num_sparse = int(selected_token_idx.numel())
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
-            return
+            return "none"
         chunk_count = int(chunk_ptrs_npu.numel())
         chunk_size_int = int(chunk_size)
         covered_tokens = chunk_count * chunk_size_int
@@ -1999,6 +2161,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 if validate_inputs:
                     self._sparse_direct_validated_layers.add(validate_key)
+                kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer_fast"
             else:
                 assert cpu_tensors is not None and len(cpu_tensors) > 0
                 sparse_mla_dsa_batched_direct_kv_transfer(
@@ -2017,8 +2180,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_host_interleaved,
                     chunk_ptrs_npu,
                 )
+                kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer"
 
         current_stream.wait_stream(load_stream)
+        return kernel_name
 
     def _run_prepared_sparse_direct_kv_transfer_layer(
         self,
@@ -3225,7 +3390,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 else torch.cuda.current_stream()
             )
             load_stream = self.load_stream_list[load_stream_idx]
-            if isinstance(sparse_request, dict):
+            deep_diag_enabled = _mtp_dw_deep_diag_enabled()
+            req_id = kwargs.get("req_id")
+            explicit_sparse_payload = isinstance(sparse_request, dict)
+            target_slot_mapping = None
+            payload_event = None
+            if explicit_sparse_payload:
                 memory_objs_layer = sparse_request["memory_objs_layer"]
                 dynamic_request = sparse_request
             elif isinstance(sparse_request, tuple):
@@ -3263,6 +3433,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 payload_event,
             ) = self._unpack_sparse_dynamic_request(dynamic_request)
             explicit_sparse_payload = target_slot_mapping is not None
+            deep_seen = {}
+            capture_deep_payload = False
+            if deep_diag_enabled:
+                deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
+                capture_deep_payload = _should_capture_deep_payload(
+                    enabled=True,
+                    explicit_payload=explicit_sparse_payload,
+                    committed_end=lmcache_cached_tokens,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    seen=deep_seen,
+                )
 
             # selected_token_idx/target_slot_mapping may be device tensors
             # produced by vLLM's remap path. Packing below is their first
@@ -3339,6 +3521,38 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ),
                 cpu_tensors=cpu_tensors,
             )
+            deep_diag = None
+            if capture_deep_payload:
+                deep_key = (str(req_id), int(kv_group))
+                try:
+                    selected_values = [
+                        int(value)
+                        for value in selected_token_idx.detach()
+                        .reshape(-1)[:_MTP_DW_CHECKSUM_LIMIT]
+                        .to(device="cpu")
+                        .tolist()
+                    ]
+                    slot_values = [
+                        int(value)
+                        for value in slot_mapping_packed.detach()
+                        .reshape(-1)[:_MTP_DW_CHECKSUM_LIMIT]
+                        .to(device="cpu")
+                        .tolist()
+                    ]
+                    deep_diag = {
+                        "deep_key": deep_key,
+                        "deep_seen": deep_seen,
+                        "selected_values": selected_values,
+                        "slot_values": slot_values,
+                        "conflicts": _conflicting_duplicate_target_slots(
+                            selected_values, slot_values
+                        ),
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "[MTP_DW] deep transfer diagnostic unavailable: %s",
+                        exc,
+                    )
             if _mtp_dw_diag_enabled() and layer_id == 0:
                 actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
                     cpu_tensors, kv_group
@@ -3413,6 +3627,77 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_count=slot_count,
                         selected_oob=selected_oob,
                         slot_selected_match=slot_selected_match,
+                    )
+            if deep_diag is not None:
+                selected_values = deep_diag["selected_values"]
+                slot_values = deep_diag["slot_values"]
+                conflicts = deep_diag["conflicts"]
+                actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group
+                )
+                raw_window = os.environ.get(
+                    "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
+                )
+                try:
+                    window_size = max(int(raw_window), 0)
+                except ValueError:
+                    window_size = 0
+                _mtp_dw_event(
+                    "deep",
+                    event="transfer_payload",
+                    req=str(req_id),
+                    worker_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
+                    tp_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
+                    tp_world=int(os.environ.get("WORLD_SIZE", "1") or 1),
+                    kv_group=kv_group,
+                    frontier=lmcache_cached_tokens,
+                    window_start=(
+                        max(0, lmcache_cached_tokens - window_size)
+                        if window_size
+                        else None
+                    ),
+                    window_end=lmcache_cached_tokens,
+                    layer=layer_id,
+                    kernel="sparse_direct_kv_transfer",
+                    selected_count=int(selected_token_idx.numel()),
+                    payload_count=int(selected_token_idx.numel()),
+                    selection_sample=selected_values[:8],
+                    selection_checksum=_bounded_stable_int_checksum(
+                        selected_values
+                    ),
+                    slot_count=int(slot_mapping_packed.numel()),
+                    target_physical_count=int(slot_mapping_packed.numel()),
+                    target_slot_sample=slot_values[:8],
+                    target_slot_checksum=_bounded_stable_int_checksum(slot_values),
+                    checksum_scope="first32",
+                    sample_scope="first8",
+                    conflict_check_scope="first32",
+                    chunk_size=chunk_size,
+                    chunk_count=len(cpu_tensors),
+                    actual_cpu_tokens=actual_cpu_tokens,
+                    kernel_total_tokens=total_tokens,
+                    kv_format=sparse_kv_format,
+                    token_major=sparse_token_major,
+                    host_interleaved=sparse_host_interleaved,
+                    count_match=(
+                        int(selected_token_idx.numel())
+                        == int(slot_mapping_packed.numel())
+                    ),
+                    conflicting_duplicate_slots=conflicts,
+                )
+                _remember_bounded_key(
+                    deep_diag["deep_seen"], deep_diag["deep_key"]
+                )
+                self._mtp_dw_deep_diag_seen = deep_diag["deep_seen"]
+                if conflicts:
+                    _mtp_dw_event(
+                        "fail",
+                        event="transfer_payload",
+                        req=str(req_id),
+                        kv_group=kv_group,
+                        frontier=lmcache_cached_tokens,
+                        invariant="conflicting_duplicate_target_slots",
+                        conflicting_duplicate_slots=conflicts,
                     )
 
         yield
