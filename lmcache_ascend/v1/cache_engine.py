@@ -2331,7 +2331,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_publication_handed_off = False
         shared_store_publication_fenced = False
         existing_rank0_backing_ids = self.shared_cpu_rank0_request_object_ids(
-            req_id,
+            kwargs.get("req_id"),
             int(kwargs.get("kv_group", 0) or 0),
         )
 
