@@ -1183,6 +1183,12 @@ def test_sparse_rank0_republish_claims_only_new_cached_chunks(monkeypatch):
     engine._make_shared_handles_for_layer = make_handles
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
 
+    def request_object_ids(req_id, kv_group):
+        assert (req_id, kv_group) == ("req-1", 0)
+        return {id(old_mem_obj)}
+
+    engine.shared_cpu_rank0_request_object_ids = request_object_ids
+
     retriever = engine.retrieve_layer_head_token_wise(
         [1, 2],
         cached_keys=[[key0, key1]],
@@ -1193,7 +1199,6 @@ def test_sparse_rank0_republish_claims_only_new_cached_chunks(monkeypatch):
         cached_chunk_dev_ptrs=[],
         cached_chunk_ptrs_npu=[],
         cached_shared_handles=cached_shared_handles,
-        shared_cpu_existing_rank0_backing_layers=[[old_mem_obj]],
         kv_group=0,
         req_id="req-1",
     )

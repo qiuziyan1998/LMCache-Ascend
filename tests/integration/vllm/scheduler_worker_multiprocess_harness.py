@@ -210,7 +210,11 @@ def _run_ascend_wait_for_save(
     adapter: LMCacheConnectorV1Impl, requests: list[ReqMeta]
 ) -> None:
     """Ascend NPU wait_for_save (store + pin defer/unpin)."""
-    if not hasattr(adapter, "_replay_finished_stores_after_save"):
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        LMCacheAscendConnectorV1Impl,
+    )
+
+    if not isinstance(adapter, LMCacheAscendConnectorV1Impl):
         raise RuntimeError(
             "NPU wait_for_save requires LMCacheAscendConnectorV1Impl"
         )
@@ -221,7 +225,7 @@ def _run_ascend_wait_for_save(
     mock_pp = MagicMock()
     mock_pp.is_last_rank = True
     with patch(
-        "lmcache_ascend.integration.vllm.vllm_v1_adapter.get_pp_group",
+        "lmcache.integration.vllm.vllm_v1_adapter.get_pp_group",
         return_value=mock_pp,
     ):
         adapter.wait_for_save()

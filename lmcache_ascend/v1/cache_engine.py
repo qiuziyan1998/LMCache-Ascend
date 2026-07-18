@@ -2330,29 +2330,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
         shared_store_publication_fenced = False
-        existing_rank0_backing_layers = kwargs.get(
-            "shared_cpu_existing_rank0_backing_layers"
+        existing_rank0_backing_ids = self.shared_cpu_rank0_request_object_ids(
+            req_id,
+            int(kwargs.get("kv_group", 0) or 0),
         )
-        existing_rank0_backing_ids: Optional[set[int]] = None
-
-        def is_existing_rank0_backing(mem_obj: MemoryObj) -> bool:
-            nonlocal existing_rank0_backing_ids
-            if not existing_rank0_backing_layers:
-                return False
-            if existing_rank0_backing_ids is None:
-                existing_rank0_backing_ids = {
-                    id(obj)
-                    for layer_objs in existing_rank0_backing_layers
-                    for obj in (layer_objs or [])
-                }
-            return id(mem_obj) in existing_rank0_backing_ids
 
         def claim_cached_shared_mem_objs_for_publication(
             mem_objs_layer: List[MemoryObj],
         ) -> None:
             """Take the request pin/ref needed by rank0 handle publication."""
             for mem_obj in mem_objs_layer:
-                if is_existing_rank0_backing(mem_obj):
+                if id(mem_obj) in existing_rank0_backing_ids:
                     continue
                 try:
                     mem_obj.ref_count_up()
