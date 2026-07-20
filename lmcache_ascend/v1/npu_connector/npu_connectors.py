@@ -84,6 +84,108 @@ def _bounded_stable_int_checksum(values: Any) -> int:
     return checksum
 
 
+def _bounded_tensor_fingerprint(tensor: torch.Tensor) -> int:
+    """Return a layout-preserving checksum over a bounded tensor byte prefix."""
+    raw = (
+        tensor.detach()
+        .contiguous()
+        .to(device="cpu")
+        .view(torch.uint8)
+        .reshape(-1)
+    )
+    return _bounded_stable_int_checksum(raw.tolist())
+
+
+def _sparse_content_probe(
+    *,
+    cpu_tensors: List[torch.Tensor],
+    layer_cache: Any,
+    selected_token_idx: torch.Tensor,
+    target_slots: torch.Tensor,
+    chunk_size: int,
+    token_major: bool,
+) -> dict[str, Any]:
+    """Compare sampled stacked CPU planes with their scattered NPU slots.
+
+    MLA/DSA sparse CPU chunks are stacked by plane. The probe is diagnostics
+    only and intentionally supports that production layout; token-major layouts
+    are reported as unsupported rather than interpreted heuristically.
+    """
+    if token_major:
+        return {"supported": False, "reason": "token_major"}
+    planes = (
+        tuple(layer_cache)
+        if isinstance(layer_cache, (tuple, list))
+        else (layer_cache,)
+    )
+    if not planes or not all(isinstance(plane, torch.Tensor) for plane in planes):
+        return {"supported": False, "reason": "invalid_layer_cache"}
+    if any(plane.ndim < 2 for plane in planes):
+        return {"supported": False, "reason": "unexpected_plane_rank"}
+
+    slot_capacity = int(planes[0].shape[0]) * int(planes[0].shape[1])
+    flat_planes = []
+    for plane in planes:
+        if int(plane.shape[0]) * int(plane.shape[1]) != slot_capacity:
+            return {"supported": False, "reason": "plane_slot_capacity_mismatch"}
+        flat_planes.append(plane.reshape(slot_capacity, -1))
+    plane_widths = [int(plane.shape[1]) for plane in flat_planes]
+    record_width = sum(plane_widths)
+    if record_width <= 0 or chunk_size <= 0:
+        return {"supported": False, "reason": "invalid_dimensions"}
+
+    selected = selected_token_idx.detach().reshape(-1).to(device="cpu").tolist()
+    slots = target_slots.detach().reshape(-1).to(device="cpu").tolist()
+    pairs: list[dict[str, Any]] = []
+    for source_token, target_slot in zip(selected[:2], slots[:2], strict=False):
+        source_token = int(source_token)
+        target_slot = int(target_slot)
+        chunk_index, local_token = divmod(source_token, chunk_size)
+        if chunk_index < 0 or chunk_index >= len(cpu_tensors):
+            return {"supported": False, "reason": "source_chunk_oob"}
+        cpu_chunk = cpu_tensors[chunk_index].detach().reshape(-1)
+        if int(cpu_chunk.numel()) % record_width:
+            return {"supported": False, "reason": "cpu_chunk_layout_mismatch"}
+        chunk_tokens = int(cpu_chunk.numel()) // record_width
+        if (
+            local_token >= chunk_tokens
+            or target_slot < 0
+            or target_slot >= slot_capacity
+        ):
+            return {"supported": False, "reason": "sample_index_oob"}
+        plane_offset = 0
+        plane_checksums = []
+        for plane_index, width in enumerate(plane_widths):
+            source_start = plane_offset + local_token * width
+            source = cpu_chunk[source_start : source_start + width]
+            target = flat_planes[plane_index][target_slot]
+            source_checksum = _bounded_tensor_fingerprint(source)
+            target_checksum = _bounded_tensor_fingerprint(target)
+            plane_checksums.append(
+                {
+                    "plane": plane_index,
+                    "source_checksum": source_checksum,
+                    "target_checksum": target_checksum,
+                    "match": source_checksum == target_checksum,
+                }
+            )
+            plane_offset += chunk_tokens * width
+        pairs.append(
+            {
+                "source_token": source_token,
+                "target_slot": target_slot,
+                "planes": plane_checksums,
+            }
+        )
+    return {
+        "supported": True,
+        "pairs": pairs,
+        "all_match": all(
+            plane["match"] for pair in pairs for plane in pair["planes"]
+        ),
+    }
+
+
 def _remember_bounded_key(seen: dict[Any, None], key: Any) -> None:
     """Remember a diagnostic key without retaining unbounded request state."""
     seen[key] = None
@@ -3586,6 +3688,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ),
                 cpu_tensors=cpu_tensors,
             )
+            if capture_deep_payload and layer_id == 0:
+                content_probe = _sparse_content_probe(
+                    cpu_tensors=cpu_tensors,
+                    layer_cache=kvcaches_snapshot[layer_id],
+                    selected_token_idx=selected_token_idx,
+                    target_slots=slot_mapping_packed,
+                    chunk_size=chunk_size,
+                    token_major=sparse_token_major,
+                )
+                _mtp_dw_event(
+                    "deep",
+                    event="content_transfer",
+                    req=str(req_id),
+                    kv_group=kv_group,
+                    frontier=lmcache_cached_tokens,
+                    layer=layer_id,
+                    source_chunk_fingerprints=[
+                        _bounded_tensor_fingerprint(tensor)
+                        for tensor in cpu_tensors[:2]
+                    ],
+                    content_probe=content_probe,
+                )
             deep_diag = None
             if capture_deep_payload:
                 deep_key = (str(req_id), int(kv_group))
@@ -4044,6 +4168,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # generator advances, so the layer's D2H copy must be complete
                 # before returning control regardless of the caller's sync hint.
                 self.store_stream.synchronize()
+                if _mtp_dw_deep_diag_enabled() and layer_id == 0:
+                    store_req_id = kwargs.get("req_id")
+                    if store_req_id is not None:
+                        store_tensors = [
+                            memory_obj.tensor
+                            for memory_obj in memory_objs_layer[:2]
+                            if memory_obj.tensor is not None
+                        ]
+                        _mtp_dw_event(
+                            "deep",
+                            event="content_store",
+                            req=str(store_req_id),
+                            kv_group=kv_group,
+                            layer=layer_id,
+                            window_start=kwargs.get("decode_window_start"),
+                            window_end=kwargs.get("decode_window_end"),
+                            chunk_fingerprints=[
+                                _bounded_tensor_fingerprint(tensor)
+                                for tensor in store_tensors
+                            ],
+                        )
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
