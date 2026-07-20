@@ -210,7 +210,7 @@ def _should_capture_deep_payload(
         or req_id is None
     ):
         return False
-    return (str(req_id), int(kv_group)) not in seen
+    return (str(req_id), int(kv_group), int(committed_end)) not in seen
 
 
 def _conflicting_duplicate_target_slots(
@@ -3411,6 +3411,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping = transfer_kwargs["slot_mapping"]
 
         kv_group = int(transfer_kwargs.get("kv_group", 0))
+        req_id = transfer_kwargs.get("req_id")
+        frontier = int(transfer_kwargs.get("lmcache_cached_tokens", 0) or 0)
         layout = self._group_layouts.get(kv_group)
         if layout is None:
             layout = self._lazy_initialize_buffer_with_staging(
@@ -3476,6 +3478,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 )
 
+            deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
+            capture_content = _should_capture_deep_payload(
+                enabled=_mtp_dw_deep_diag_enabled(),
+                # Prepared indexer loads use their request-owned slot mapping
+                # rather than SFA's explicit latent target mapping.
+                explicit_payload=selected_token_idx is not None,
+                committed_end=frontier,
+                req_id=req_id,
+                kv_group=kv_group,
+                seen=deep_seen,
+            )
+
             self._run_prepared_sparse_direct_kv_transfer_layer(
                 plan=destination_plan,
                 source_layer=source_layer,
@@ -3488,6 +3502,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens=source.total_tokens,
                 sparse_host_interleaved=sparse_host_interleaved,
             )
+            if capture_content and layer_id == 0:
+                content_probe = _sparse_content_probe(
+                    cpu_tensors=list(source_layer.tensors),
+                    layer_cache=kvcaches_snapshot[layer_id],
+                    selected_token_idx=selected_token_idx,
+                    target_slots=slot_mapping_packed,
+                    chunk_size=chunk_size,
+                    token_major=self._layerwise_token_major(kv_group),
+                )
+                _mtp_dw_event(
+                    "deep",
+                    event="content_transfer",
+                    req=str(req_id),
+                    kv_group=kv_group,
+                    frontier=frontier,
+                    layer=layer_id,
+                    prepared_source=True,
+                    source_chunk_fingerprints=[
+                        _bounded_tensor_fingerprint(tensor)
+                        for tensor in source_layer.tensors[:2]
+                    ],
+                    content_probe=content_probe,
+                )
+                _remember_bounded_key(
+                    deep_seen,
+                    (str(req_id), int(kv_group), int(frontier)),
+                )
+                self._mtp_dw_deep_diag_seen = deep_seen
 
         yield
         yield
@@ -3712,7 +3754,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             deep_diag = None
             if capture_deep_payload:
-                deep_key = (str(req_id), int(kv_group))
+                deep_key = (str(req_id), int(kv_group), int(lmcache_cached_tokens))
                 try:
                     selected_values = [
                         int(value)

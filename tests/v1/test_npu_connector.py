@@ -75,7 +75,7 @@ def test_mtp_deep_diag_requires_both_gates(monkeypatch) -> None:
         ({"explicit_payload": False}, False),
         ({"committed_end": 0}, False),
         ({"req_id": None}, False),
-        ({"seen": {("req", 0): None}}, False),
+        ({"seen": {("req", 0, 256): None}}, False),
     ],
 )
 def test_deep_payload_capture_is_first_successful_committed_payload(
@@ -92,6 +92,19 @@ def test_deep_payload_capture_is_first_successful_committed_payload(
     inputs.update(overrides)
 
     assert npu_connectors._should_capture_deep_payload(**inputs) is expected
+
+
+def test_deep_payload_capture_repeats_for_new_committed_frontier() -> None:
+    inputs = {
+        "enabled": True,
+        "explicit_payload": True,
+        "committed_end": 512,
+        "req_id": "req",
+        "kv_group": 0,
+        "seen": {("req", 0, 256): None},
+    }
+
+    assert npu_connectors._should_capture_deep_payload(**inputs)
 
 
 def test_conflicting_duplicate_target_slots_is_bounded_and_precise() -> None:
