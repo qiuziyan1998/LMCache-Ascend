@@ -2,6 +2,7 @@
 # Standard
 from contextlib import nullcontext
 import os
+import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -3146,16 +3147,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if kwargs.get("prepared_sparse_source") is not None:
             yield from self._batched_to_gpu_head_token_wise_prepared(kwargs)
             return
+        connector_started = time.perf_counter()
+        phase_started = time.perf_counter()
         self.initialize_kvcaches_ptr(**kwargs)
+        initialize_kvcaches_ms = (time.perf_counter() - phase_started) * 1000
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
         kv_group = kwargs.get("kv_group", 0)
+        phase_started = time.perf_counter()
         layout = self._lazy_initialize_buffer_with_staging(
             self.kvcaches,
             kv_group=kv_group,
             init_staging=False,
         )
+        layout_init_ms = (time.perf_counter() - phase_started) * 1000
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -3190,9 +3196,46 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # Snapshot so interleaved latent/indexer sparse generators do not
         # race on the shared connector self.kvcaches pointer.
         kvcaches_snapshot = self.kvcaches
+        phase_totals_ms = {
+            "request_unpack": 0.0,
+            "payload_wait": 0.0,
+            "input_pack": 0.0,
+            "tensor_resolve": 0.0,
+            "chunk_ptr_resolve": 0.0,
+            "transfer_submit": 0.0,
+        }
+        phase_max_ms = {phase: 0.0 for phase in phase_totals_ms}
+        phase_max_layer = {phase: -1 for phase in phase_totals_ms}
+        layer_total_ms = 0.0
+        max_layer_total_ms = 0.0
+        max_layer_total_id = -1
+        layers_with_data = 0
+        chunk_refs = 0
+        selected_tokens_total = 0
+
+        def record_transfer_phase(
+            phase_name: str,
+            layer_id: int,
+            started: float,
+        ) -> None:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            phase_totals_ms[phase_name] += elapsed_ms
+            if elapsed_ms > phase_max_ms[phase_name]:
+                phase_max_ms[phase_name] = elapsed_ms
+                phase_max_layer[phase_name] = layer_id
+
+        def record_layer_total(layer_id: int, started: float) -> None:
+            nonlocal layer_total_ms, max_layer_total_ms, max_layer_total_id
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            layer_total_ms += elapsed_ms
+            if elapsed_ms > max_layer_total_ms:
+                max_layer_total_ms = elapsed_ms
+                max_layer_total_id = layer_id
 
         for layer_id in range(self.num_layers):
             sparse_request = yield
+            layer_started = time.perf_counter()
+            phase_started = time.perf_counter()
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
             current_stream = (
@@ -3238,14 +3281,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 target_slot_mapping,
                 payload_event,
             ) = self._unpack_sparse_dynamic_request(dynamic_request)
+            record_transfer_phase("request_unpack", layer_id, phase_started)
             explicit_sparse_payload = target_slot_mapping is not None
 
             # selected_token_idx/target_slot_mapping may be device tensors
             # produced by vLLM's remap path. Packing below is their first
             # connector-side consumer, so wait before packing.
+            phase_started = time.perf_counter()
             if payload_event is not None:
                 _wait_payload_events(current_stream, payload_event)
+            record_transfer_phase("payload_wait", layer_id, phase_started)
 
+            phase_started = time.perf_counter()
             if explicit_sparse_payload:
                 slot_mapping_packed, selected_token_idx = (
                     self._pack_sparse_explicit_slot_inputs(
@@ -3261,7 +3308,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         token_start_index,
                     )
                 )
+            record_transfer_phase("input_pack", layer_id, phase_started)
 
+            phase_started = time.perf_counter()
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
                 if cached_tensors_by_layer is not None
@@ -3277,20 +3326,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for memory_obj in memory_objs_layer
                     if memory_obj.tensor is not None
                 ]
+            record_transfer_phase("tensor_resolve", layer_id, phase_started)
 
             if not cpu_tensors:
+                record_layer_total(layer_id, layer_started)
                 continue
 
+            layers_with_data += 1
+            chunk_refs += len(cpu_tensors)
+            selected_tokens_total += int(selected_token_idx.numel())
+            phase_started = time.perf_counter()
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                 layer_id,
                 cpu_tensors,
                 cached_chunk_ptrs_npu,
             )
+            record_transfer_phase("chunk_ptr_resolve", layer_id, phase_started)
             total_tokens = (
                 lmcache_cached_tokens
                 if lmcache_cached_tokens > 0
                 else self._sparse_total_tokens_from_layer_chunks(cpu_tensors, kv_group)
             )
+            phase_started = time.perf_counter()
             self._run_sparse_direct_kv_transfer_layer(
                 kvcaches_ref=kvcaches_snapshot,
                 kv_group=kv_group,
@@ -3315,6 +3372,50 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ),
                 cpu_tensors=cpu_tensors,
             )
+            record_transfer_phase("transfer_submit", layer_id, phase_started)
+            record_layer_total(layer_id, layer_started)
+
+        logger.info(
+            "[BOOTSTRAP_ASCEND_NPU_TRANSFER_SUMMARY] "
+            "req=%s kv_group=%s layers=%d layers_with_data=%d "
+            "chunk_refs=%d selected_tokens_total=%d "
+            "initialize_kvcaches_ms=%.3f layout_init_ms=%.3f "
+            "layer_total_ms=%.3f max_layer_total_ms=%.3f "
+            "max_layer_total_id=%d request_unpack_ms=%.3f "
+            "payload_wait_ms=%.3f payload_wait_max_ms=%.3f "
+            "payload_wait_max_layer=%d input_pack_ms=%.3f "
+            "input_pack_max_ms=%.3f input_pack_max_layer=%d "
+            "tensor_resolve_ms=%.3f chunk_ptr_resolve_ms=%.3f "
+            "chunk_ptr_resolve_max_ms=%.3f chunk_ptr_resolve_max_layer=%d "
+            "transfer_submit_host_ms=%.3f transfer_submit_host_max_ms=%.3f "
+            "transfer_submit_host_max_layer=%d function_wall_ms=%.3f",
+            kwargs.get("req_id", "unspecified"),
+            kv_group,
+            self.num_layers,
+            layers_with_data,
+            chunk_refs,
+            selected_tokens_total,
+            initialize_kvcaches_ms,
+            layout_init_ms,
+            layer_total_ms,
+            max_layer_total_ms,
+            max_layer_total_id,
+            phase_totals_ms["request_unpack"],
+            phase_totals_ms["payload_wait"],
+            phase_max_ms["payload_wait"],
+            phase_max_layer["payload_wait"],
+            phase_totals_ms["input_pack"],
+            phase_max_ms["input_pack"],
+            phase_max_layer["input_pack"],
+            phase_totals_ms["tensor_resolve"],
+            phase_totals_ms["chunk_ptr_resolve"],
+            phase_max_ms["chunk_ptr_resolve"],
+            phase_max_layer["chunk_ptr_resolve"],
+            phase_totals_ms["transfer_submit"],
+            phase_max_ms["transfer_submit"],
+            phase_max_layer["transfer_submit"],
+            (time.perf_counter() - connector_started) * 1000,
+        )
 
         yield
 
