@@ -455,7 +455,26 @@ def _patch_vllm_v1_adapter():
         if callable(method):
             method(preempted_req_ids)
 
+    def uses_layerwise_model_callbacks(self):
+        return bool(getattr(self._lmcache_engine, "use_layerwise", False))
+
+    def supports_staged_sfa_sparse_load(self):
+        engine = self._lmcache_engine
+        config = getattr(engine, "config", None)
+        return bool(
+            getattr(engine, "use_layerwise", False)
+            and getattr(engine, "kv_role", None)
+            in ("kv_both", "kv_consumer")
+            and getattr(config, "dsa_two_groups", False)
+        )
+
     vllm_lmcache_connector.LMCacheConnectorV1.supports_dsa_index_lmcache = True
+    vllm_lmcache_connector.LMCacheConnectorV1.uses_layerwise_model_callbacks = property(
+        uses_layerwise_model_callbacks
+    )
+    vllm_lmcache_connector.LMCacheConnectorV1.supports_staged_sfa_sparse_load = property(
+        supports_staged_sfa_sparse_load
+    )
     vllm_lmcache_connector.LMCacheConnectorV1.handle_preemptions = handle_preemptions
 
 
