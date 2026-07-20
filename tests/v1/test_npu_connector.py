@@ -351,6 +351,48 @@ def test_sparse_pack_uses_target_slot_mapping_when_provided() -> None:
     assert torch.equal(packed, target_slots)
 
 
+def test_sparse_pack_explicit_slots_excludes_padding_by_row_count() -> None:
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor(
+        [[3, 91, 249, 0, 0], [0, 17, 0, 0, 0]], dtype=torch.int32
+    )
+    target_slots = torch.tensor(
+        [[900, 901, 902, 1000, 1001], [1100, 1101, 1200, 1201, 1202]],
+        dtype=torch.long,
+    )
+
+    packed, selected_out = (
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            selected,
+            target_slots,
+            torch.tensor([3, 2], dtype=torch.int32),
+        )
+    )
+
+    assert selected_out.tolist() == [3, 91, 249, 0, 17]
+    assert packed.tolist() == [900, 901, 902, 1100, 1101]
+    assert not set(packed.tolist()).intersection({1000, 1001, 1200, 1201, 1202})
+
+
+def test_sparse_pack_explicit_slots_allows_empty_row_payload() -> None:
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor([0, 91, 249], dtype=torch.int32)
+    target_slots = torch.tensor([1000, 1001, 1002], dtype=torch.long)
+
+    packed, selected_out = (
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            selected,
+            target_slots,
+            torch.tensor([0], dtype=torch.int32),
+        )
+    )
+
+    assert packed.numel() == 0
+    assert selected_out.numel() == 0
+
+
 def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
     connector = _make_sparse_pack_connector()
     selected = torch.tensor(

@@ -1773,19 +1773,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     @staticmethod
     def _unpack_sparse_dynamic_request(
         sparse_request: Any,
-    ) -> tuple[Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any, Any]:
         """Normalize the vLLM-owned portion of one sparse layer payload."""
+        selected_token_counts = None
         target_slot_mapping = None
         payload_event = None
         if isinstance(sparse_request, dict):
             selected_token_idx = sparse_request.get("selected_token_ids")
             token_start_index = sparse_request.get("token_start_index", 0)
             target_slot_mapping = sparse_request.get("target_slot_mapping")
+            selected_token_counts = sparse_request.get("selected_token_counts")
             payload_event = sparse_request.get(
                 "payload_events", sparse_request.get("payload_event")
             )
         elif isinstance(sparse_request, tuple):
-            if len(sparse_request) == 3:
+            if len(sparse_request) == 4:
+                (
+                    selected_token_idx,
+                    token_start_index,
+                    target_slot_mapping,
+                    selected_token_counts,
+                ) = sparse_request
+            elif len(sparse_request) == 3:
                 (
                     selected_token_idx,
                     token_start_index,
@@ -1794,7 +1803,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             elif len(sparse_request) == 2:
                 selected_token_idx, token_start_index = sparse_request
             else:
-                raise ValueError("Sparse payload tuple must have 2 or 3 items")
+                raise ValueError("Sparse payload tuple must have 2, 3, or 4 items")
         else:
             selected_token_idx = sparse_request
             token_start_index = 0
@@ -1803,6 +1812,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             token_start_index,
             target_slot_mapping,
             payload_event,
+            selected_token_counts,
         )
 
     def _pack_sparse_layer_inputs(
@@ -1811,6 +1821,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         token_start_index: int,
         target_slot_mapping: Optional[Union[torch.Tensor, list]] = None,
+        selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build parallel destination/source arrays for the sparse copy kernel."""
         if selected_token_idx is not None and not isinstance(
@@ -1824,6 +1835,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return self._pack_sparse_explicit_slot_inputs(
                 selected_token_idx,
                 target_slot_mapping,
+                selected_token_counts,
             )
 
         if selected_token_idx is not None and selected_token_idx.numel() > 0:
@@ -1939,6 +1951,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         target_slot_mapping: Union[torch.Tensor, list],
+        selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Use caller-provided target slots for row-wise MTP sparse loads."""
         if selected_token_idx is None:
@@ -1947,13 +1960,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_idx = torch.tensor(
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
-        selected_token_idx = selected_token_idx.reshape(-1)
+        selected_token_idx = selected_token_idx.to(
+            device=self.kv_device, dtype=torch.int32
+        )
 
         if not isinstance(target_slot_mapping, torch.Tensor):
             target_slot_mapping = torch.tensor(
                 target_slot_mapping, dtype=torch.long, device=self.kv_device
             )
-        target_slot_mapping = target_slot_mapping.reshape(-1)
         if (
             target_slot_mapping.dtype != torch.long
             or target_slot_mapping.device != self.kv_device
@@ -1961,6 +1975,53 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             target_slot_mapping = target_slot_mapping.to(
                 device=self.kv_device, dtype=torch.long
             )
+        if selected_token_idx.shape != target_slot_mapping.shape:
+            raise ValueError(
+                "target_slot_mapping and selected_token_idx must have the same "
+                f"shape: {tuple(target_slot_mapping.shape)} vs "
+                f"{tuple(selected_token_idx.shape)}"
+            )
+        if selected_token_counts is not None:
+            if not isinstance(selected_token_counts, torch.Tensor):
+                selected_token_counts = torch.tensor(
+                    selected_token_counts,
+                    dtype=torch.long,
+                    device=self.kv_device,
+                )
+            selected_token_counts = selected_token_counts.to(
+                device=self.kv_device, dtype=torch.long
+            ).reshape(-1)
+            if selected_token_idx.dim() == 1:
+                if selected_token_counts.numel() != 1:
+                    raise ValueError(
+                        "single-row sparse payload requires exactly one "
+                        f"selected_token_count, got {selected_token_counts.numel()}"
+                    )
+                row_width = int(selected_token_idx.shape[0])
+                valid_mask = torch.arange(
+                    row_width, device=self.kv_device, dtype=torch.long
+                ) < selected_token_counts[0]
+            elif selected_token_idx.dim() == 2:
+                if selected_token_counts.numel() != selected_token_idx.shape[0]:
+                    raise ValueError(
+                        "selected_token_counts rows must match sparse payload rows: "
+                        f"{selected_token_counts.numel()} vs "
+                        f"{selected_token_idx.shape[0]}"
+                    )
+                row_width = int(selected_token_idx.shape[1])
+                valid_mask = torch.arange(
+                    row_width, device=self.kv_device, dtype=torch.long
+                ).reshape(1, -1) < selected_token_counts.reshape(-1, 1)
+            else:
+                raise ValueError(
+                    "selected_token_counts requires a one- or two-dimensional "
+                    f"sparse payload, got {selected_token_idx.dim()} dimensions"
+                )
+            selected_token_idx = selected_token_idx[valid_mask]
+            target_slot_mapping = target_slot_mapping[valid_mask]
+        else:
+            selected_token_idx = selected_token_idx.reshape(-1)
+            target_slot_mapping = target_slot_mapping.reshape(-1)
         if int(target_slot_mapping.numel()) != int(selected_token_idx.numel()):
             raise ValueError(
                 "target_slot_mapping and selected_token_idx must have the same "
@@ -3291,6 +3352,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 token_start_index,
                 target_slot_mapping,
                 payload_event,
+                selected_token_counts,
             ) = self._unpack_sparse_dynamic_request(sparse_request)
 
             if payload_event is not None:
@@ -3300,6 +3362,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._pack_sparse_explicit_slot_inputs(
                         selected_token_idx,
                         target_slot_mapping,
+                        selected_token_counts,
                     )
                 )
             else:
@@ -3431,6 +3494,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 token_start_index,
                 target_slot_mapping,
                 payload_event,
+                selected_token_counts,
             ) = self._unpack_sparse_dynamic_request(dynamic_request)
             explicit_sparse_payload = target_slot_mapping is not None
             deep_seen = {}
@@ -3457,6 +3521,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._pack_sparse_explicit_slot_inputs(
                         selected_token_idx,
                         target_slot_mapping,
+                        selected_token_counts,
                     )
                 )
             else:
