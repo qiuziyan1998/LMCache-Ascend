@@ -963,6 +963,40 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     ]
     assert connector._active_sparse_load_join is None
 
+    load_streams[0].events.clear()
+    load_streams[1].events.clear()
+    original_record = done_events[0].record
+
+    def fail_record(_stream) -> None:
+        raise RuntimeError("event record failed")
+
+    monkeypatch.setattr(done_events[0], "record", fail_record)
+    with pytest.raises(RuntimeError, match="event record failed"):
+        with connector.defer_sparse_load_consumer_wait():
+            launch(0)
+            launch(1)
+
+    assert load_streams[0].events[-1] == "synchronize"
+    assert load_streams[1].events[-1] == "synchronize"
+    assert connector._active_sparse_load_join is None
+
+    monkeypatch.setattr(done_events[0], "record", original_record)
+    load_streams[0].events.clear()
+    load_streams[1].events.clear()
+
+    def fail_wait(_event) -> None:
+        raise RuntimeError("event wait failed")
+
+    monkeypatch.setattr(compute_stream, "wait_event", fail_wait)
+    with pytest.raises(RuntimeError, match="event wait failed"):
+        with connector.defer_sparse_load_consumer_wait():
+            launch(0)
+            launch(1)
+
+    assert load_streams[0].events[-1] == "synchronize"
+    assert load_streams[1].events[-1] == "synchronize"
+    assert connector._active_sparse_load_join is None
+
 
 def test_sparse_destination_plan_replaces_destination_per_group(
     monkeypatch,
