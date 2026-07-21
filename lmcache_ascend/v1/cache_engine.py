@@ -2468,6 +2468,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
         sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
+        remote_layers_per_batch = max(
+            1,
+            min(
+                self.num_layers,
+                int(
+                    self._get_shared_config_value(
+                        "shared_cpu_remote_layers_per_batch",
+                        1,
+                    )
+                ),
+            ),
+        )
         if shared_sparse_retrieve and not use_cached_retrieve and any(missing_keys):
             missing_locations: list[tuple[int, int]] = []
             if sampled_worker_retrieve:
@@ -2565,43 +2577,71 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
-                        for layer_id, layer_keys in enumerate(missing_keys):
-                            if sampled_worker_retrieve:
-                                local_prefix = local_prefix_layers[layer_id]
-                                assert local_prefix is not None
-                                # The resolver consumes every retained local
-                                # reference, whether it succeeds or raises.
-                                local_prefix_layers[layer_id] = None
-                                mem_objs_layer = (
-                                    self._resolve_shared_rank0_layer_mem_objs(
-                                        req_id=kwargs.get("req_id", "unspecified"),
-                                        phase=kwargs.get(
-                                            "shared_cpu_phase",
-                                            "sparse_decode_bootstrap",
-                                        ),
-                                        layer_id=layer_id,
-                                        kv_group=kv_group,
-                                        keys_layer=layer_keys,
-                                        local_prefix=local_prefix,
-                                    )
+                        remote_only = all(
+                            location_name == "RemoteBackend"
+                            for layer_locations in shared_chunk_locations_layer_major
+                            for location_name in layer_locations
+                        )
+                        if remote_layers_per_batch > 1 and remote_only:
+                            release_local_prefix_layers()
+                            pre_resolved_shared_mem_layers = (
+                                self._resolve_shared_rank0_remote_layers_windowed(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    kv_group=kv_group,
+                                    keys_layer_major=missing_keys,
+                                    layers_per_batch=remote_layers_per_batch,
                                 )
-                            else:
-                                mem_objs_layer = (
-                                    self._resolve_shared_rank0_layer_mem_objs(
-                                        req_id=kwargs.get("req_id", "unspecified"),
-                                        phase=kwargs.get(
-                                            "shared_cpu_phase",
-                                            "sparse_decode_bootstrap",
-                                        ),
-                                        layer_id=layer_id,
-                                        kv_group=kv_group,
-                                        keys_layer=layer_keys,
-                                        chunk_locations=(
-                                            shared_chunk_locations_layer_major[layer_id]
-                                        ),
+                            )
+                        else:
+                            for layer_id, layer_keys in enumerate(missing_keys):
+                                if sampled_worker_retrieve:
+                                    local_prefix = local_prefix_layers[layer_id]
+                                    assert local_prefix is not None
+                                    # The resolver consumes every retained local
+                                    # reference, whether it succeeds or raises.
+                                    local_prefix_layers[layer_id] = None
+                                    mem_objs_layer = (
+                                        self._resolve_shared_rank0_layer_mem_objs(
+                                            req_id=kwargs.get(
+                                                "req_id", "unspecified"
+                                            ),
+                                            phase=kwargs.get(
+                                                "shared_cpu_phase",
+                                                "sparse_decode_bootstrap",
+                                            ),
+                                            layer_id=layer_id,
+                                            kv_group=kv_group,
+                                            keys_layer=layer_keys,
+                                            local_prefix=local_prefix,
+                                        )
                                     )
+                                else:
+                                    mem_objs_layer = (
+                                        self._resolve_shared_rank0_layer_mem_objs(
+                                            req_id=kwargs.get(
+                                                "req_id", "unspecified"
+                                            ),
+                                            phase=kwargs.get(
+                                                "shared_cpu_phase",
+                                                "sparse_decode_bootstrap",
+                                            ),
+                                            layer_id=layer_id,
+                                            kv_group=kv_group,
+                                            keys_layer=layer_keys,
+                                            chunk_locations=(
+                                                shared_chunk_locations_layer_major[
+                                                    layer_id
+                                                ]
+                                            ),
+                                        )
+                                    )
+                                pre_resolved_shared_mem_layers.append(
+                                    mem_objs_layer
                                 )
-                            pre_resolved_shared_mem_layers.append(mem_objs_layer)
                         release_local_prefix_layers()
                     except Exception as exc:
                         failed_layer_id = len(pre_resolved_shared_mem_layers)
