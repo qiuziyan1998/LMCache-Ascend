@@ -480,7 +480,13 @@ def test_sparse_rank0_close_after_prime_releases_pre_resolved_memobjs(
     assert all(obj.ref_count == 0 for obj in allocated)
 
 
-def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(monkeypatch):
+@pytest.mark.parametrize(
+    ("page_first", "expected_layers_per_batch"),
+    [(False, 2), (True, 5)],
+)
+def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(
+    monkeypatch, page_first, expected_layers_per_batch
+):
     monkeypatch.setattr(
         ascend_cache_engine,
         "assert_layerwise_gpu_connector",
@@ -495,6 +501,8 @@ def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(monkeypatch):
     engine.config = SimpleNamespace(
         experimental_sampled_layerwise_lookup=False,
         shared_cpu_remote_layers_per_batch=2,
+        shared_cpu_remote_max_inflight_batches=3,
+        extra_config={"mooncake_page_first_multi_buffer": page_first},
     )
     engine.storage_manager = object()
     engine.gpu_connector = _FakeSparseConsumer()
@@ -544,7 +552,8 @@ def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(monkeypatch):
 
     assert len(windowed_calls) == 1
     assert windowed_calls[0]["keys_layer_major"] == keys_layer_major
-    assert windowed_calls[0]["layers_per_batch"] == 2
+    assert windowed_calls[0]["layers_per_batch"] == expected_layers_per_batch
+    assert windowed_calls[0]["max_inflight_batches"] == 3
 
     retriever.close()
     assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)

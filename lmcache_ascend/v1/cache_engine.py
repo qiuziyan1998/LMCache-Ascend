@@ -26,6 +26,7 @@ from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
 from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.token_database import TokenDatabase
@@ -1519,6 +1520,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             try:
                 t_start = time.perf_counter()
+                page_first_store = mooncake_page_layout_enabled(self.config)
                 mem_obj_generator = self.gpu_connector.batched_from_gpu(
                     memory_objs, starts, ends, **kwargs
                 )
@@ -1536,14 +1538,38 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_chunk_ptrs_npu,
                         cache_chunk_indices,
                     )
+                    if not page_first_store:
+                        required_futures = self.storage_manager.batched_put(
+                            keys[layer_id],
+                            memory_objs[layer_id],
+                            location=self.store_location,
+                        )
+                        self._track_sync_store_futures(required_futures)
+                        for mem_obj in memory_objs[layer_id]:
+                            pending_store_release.pop(id(mem_obj), None)
+
+                if page_first_store:
+                    flattened_keys = [key for layer_keys in keys for key in layer_keys]
+                    flattened_memory_objs = [
+                        obj for layer_objs in memory_objs for obj in layer_objs
+                    ]
                     required_futures = self.storage_manager.batched_put(
-                        keys[layer_id],
-                        memory_objs[layer_id],
+                        flattened_keys,
+                        flattened_memory_objs,
                         location=self.store_location,
                     )
                     self._track_sync_store_futures(required_futures)
-                    for mem_obj in memory_objs[layer_id]:
+                    for mem_obj in flattened_memory_objs:
                         pending_store_release.pop(id(mem_obj), None)
+                    logger.info(
+                        "[P2D_MOONCAKE_PAGE_FIRST_STORE] req=%s kv_group=%s "
+                        "layers=%d chunks=%d logical_keys=%d",
+                        req_id,
+                        kv_group,
+                        self.num_layers,
+                        len(starts),
+                        len(flattened_keys),
+                    )
 
                 tot_time = time.perf_counter() - t_start
                 logger.info(
@@ -2274,6 +2300,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ),
             ),
         )
+        if mooncake_page_layout_enabled(self.config):
+            remote_layers_per_batch = self.num_layers
+        remote_max_inflight_batches = max(
+            1,
+            int(
+                self._get_shared_config_value(
+                    "shared_cpu_remote_max_inflight_batches",
+                    1,
+                )
+            ),
+        )
         materialize_mode = "layerwise"
         preflight_retrieve_keys = (
             [layer_keys[refresh_prefix_chunks:] for layer_keys in retrieve_keys]
@@ -2410,6 +2447,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     kv_group=kv_group,
                                     keys_layer_major=preflight_retrieve_keys,
                                     layers_per_batch=remote_layers_per_batch,
+                                    max_inflight_batches=(
+                                        remote_max_inflight_batches
+                                    ),
                                 )
                             )
                         else:
