@@ -1814,7 +1814,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "view_create_max_ms=%.3f view_create_max_layer=%d "
                 "cache_append_ms=%.3f consumer_send_ms=%.3f "
                 "consumer_send_max_ms=%.3f consumer_send_max_layer=%d "
-                "function_wall_ms=%.3f",
+                "function_wall_ms=%.3f rebuild_reason=%s",
                 req_id,
                 kv_group,
                 self.num_layers,
@@ -1836,6 +1836,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 phase_max_ms["consumer_send"],
                 phase_max_layer["consumer_send"],
                 (time.perf_counter() - passive_total_started) * 1000,
+                kwargs.get("shared_cpu_rebuild_reason", "unspecified"),
             )
             yield ret_mask
         finally:
@@ -2448,7 +2449,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "capacity_check_ms=%.3f materialize_ms=%.3f "
                 "materialize_max_ms=%.3f materialize_max_layer=%d "
                 "materialize_mode=%s remote_layers_per_batch=%d "
-                "preflight_wall_ms=%.3f status=%s",
+                "preflight_wall_ms=%.3f status=%s rebuild_reason=%s",
                 kwargs.get("req_id", "unspecified"),
                 kv_group,
                 self.num_layers,
@@ -2467,6 +2468,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 remote_layers_per_batch,
                 (time.perf_counter() - preflight_started) * 1000,
                 "error" if preflight_error is not None else "ok",
+                kwargs.get("shared_cpu_rebuild_reason", "unspecified"),
             )
 
         if preflight_error_envelope is None and request_preflight_failed_elsewhere():
@@ -2872,7 +2874,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "handle_build_max_ms=%.3f handle_build_max_layer=%d "
                     "envelope_broadcast_ms=%.3f envelope_broadcast_max_ms=%.3f "
                     "envelope_broadcast_max_layer=%d consumer_send_ms=%.3f "
-                    "consumer_send_max_ms=%.3f consumer_send_max_layer=%d",
+                    "consumer_send_max_ms=%.3f consumer_send_max_layer=%d "
+                    "rebuild_reason=%s",
                     kwargs.get("req_id", "unspecified"),
                     kv_group,
                     self.num_layers,
@@ -2893,6 +2896,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     layer_phase_totals_ms["consumer_send"],
                     layer_phase_max_ms["consumer_send"],
                     layer_phase_max_id["consumer_send"],
+                    kwargs.get("shared_cpu_rebuild_reason", "unspecified"),
                 )
 
             yield ret_mask
