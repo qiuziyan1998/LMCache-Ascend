@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
-from typing import Any, List, Optional, Set, Union
+from typing import Any, Generator, List, Optional, Set, Union
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -1218,6 +1218,16 @@ class _SparseDestinationPlan:
         self.states = states
 
 
+class _SparseLoadJoin:
+    """One layer/group fan-out from a compute stream to load streams."""
+
+    __slots__ = ("compute_stream", "used_stream_indices")
+
+    def __init__(self, compute_stream: Any) -> None:
+        self.compute_stream = compute_stream
+        self.used_stream_indices: set[int] = set()
+
+
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def __init__(
         self,
@@ -1233,6 +1243,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             torch.cuda.Stream() for __ in range(self.load_stream_num)
         ]
         self.load_stream_idx = 0
+        self._sparse_load_done_events = [
+            torch.npu.Event() for _ in range(self.load_stream_num)
+        ]
+        self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
@@ -1272,6 +1286,46 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_validated_layers: set = set()
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
+
+    @contextmanager
+    def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
+        """Join sparse request load streams after all layer submissions.
+
+        The producer dependency from the compute stream to each load stream is
+        preserved. Only the reverse load-to-compute waits are collected until
+        the scope exits, allowing different requests to transfer concurrently.
+        """
+        if self._active_sparse_load_join is not None:
+            raise RuntimeError("overlapping sparse load joins are unsupported")
+        compute_stream = (
+            torch.npu.current_stream()
+            if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
+            else torch.cuda.current_stream()
+        )
+        join = _SparseLoadJoin(compute_stream)
+        self._active_sparse_load_join = join
+        try:
+            yield
+        except BaseException:
+            for stream_index in sorted(join.used_stream_indices):
+                self.load_stream_list[stream_index].synchronize()
+            raise
+        else:
+            try:
+                for stream_index in sorted(join.used_stream_indices):
+                    self._sparse_load_done_events[stream_index].record(
+                        self.load_stream_list[stream_index]
+                    )
+                for stream_index in sorted(join.used_stream_indices):
+                    compute_stream.wait_event(
+                        self._sparse_load_done_events[stream_index]
+                    )
+            except BaseException:
+                for stream_index in sorted(join.used_stream_indices):
+                    self.load_stream_list[stream_index].synchronize()
+                raise
+        finally:
+            self._active_sparse_load_join = None
 
     def _reset_sparse_direct_layer_states(self) -> None:
         self._sparse_direct_layer_states = None
@@ -1884,6 +1938,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: int,
         layer_id: int,
         load_stream: torch.cuda.Stream,
+        load_stream_idx: int,
         current_stream: torch.cuda.Stream,
         slot_mapping_packed: torch.Tensor,
         selected_token_idx: torch.Tensor,
@@ -1957,6 +2012,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         if validate_key is None:
             validate_key = (kv_group, layer_id)
+        join = getattr(self, "_active_sparse_load_join", None)
+        if join is not None:
+            if self.load_stream_list[load_stream_idx] is not load_stream:
+                raise RuntimeError("sparse load stream index does not match its stream")
+            join.used_stream_indices.add(load_stream_idx)
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
@@ -1993,8 +2053,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_host_interleaved,
                     chunk_ptrs_npu,
                 )
-
-        current_stream.wait_stream(load_stream)
+        if join is None:
+            current_stream.wait_stream(load_stream)
 
     def _run_prepared_sparse_direct_kv_transfer_layer(
         self,
@@ -2003,6 +2063,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         source_layer: PreparedSparseSourceLayer,
         layer_id: int,
         load_stream: torch.cuda.Stream,
+        load_stream_idx: int,
         current_stream: torch.cuda.Stream,
         slot_mapping_packed: torch.Tensor,
         selected_token_idx: torch.Tensor,
@@ -2015,6 +2076,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
         chunk_ptrs_npu = source_layer.chunk_ptrs_npu
 
+        join = getattr(self, "_active_sparse_load_join", None)
+        if join is not None:
+            if self.load_stream_list[load_stream_idx] is not load_stream:
+                raise RuntimeError("sparse load stream index does not match its stream")
+            join.used_stream_indices.add(load_stream_idx)
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
             sparse_mla_dsa_batched_direct_kv_transfer_prepared(
@@ -2026,8 +2092,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens,
                 sparse_host_interleaved,
             )
-
-        current_stream.wait_stream(load_stream)
+        if join is None:
+            current_stream.wait_stream(load_stream)
 
     def _sparse_selected_token_idx(
         self,
@@ -3127,6 +3193,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 source_layer=source_layer,
                 layer_id=layer_id,
                 load_stream=load_stream,
+                load_stream_idx=load_stream_idx,
                 current_stream=current_stream,
                 slot_mapping_packed=slot_mapping_packed,
                 selected_token_idx=selected_token_idx,
@@ -3296,6 +3363,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 kv_group=kv_group,
                 layer_id=layer_id,
                 load_stream=load_stream,
+                load_stream_idx=load_stream_idx,
                 current_stream=current_stream,
                 slot_mapping_packed=slot_mapping_packed,
                 selected_token_idx=selected_token_idx,

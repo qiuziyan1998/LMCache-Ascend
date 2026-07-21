@@ -2,6 +2,7 @@
 # ruff: noqa: E501
 # Standard
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 # Third Party
@@ -64,8 +65,20 @@ class _TrackingStream:
     def wait_stream(self, stream):
         self.events.append(("wait_stream", stream.name))
 
+    def wait_event(self, event):
+        self.events.append(("wait_event", event.name))
+
     def synchronize(self):
         self.events.append("synchronize")
+
+
+class _TrackingEvent:
+    def __init__(self, name: str):
+        self.name = name
+        self.records = []
+
+    def record(self, stream):
+        self.records.append(stream.name)
 
 
 class _DenseLayout:
@@ -390,6 +403,7 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         kv_group=0,
         layer_id=0,
         load_stream=_Stream(),
+        load_stream_idx=0,
         current_stream=_Stream(),
         slot_mapping_packed=slot_mapping,
         selected_token_idx=selected,
@@ -851,6 +865,7 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
         source_layer=source_layer,
         layer_id=0,
         load_stream=load_stream,
+        load_stream_idx=0,
         current_stream=current_stream,
         slot_mapping_packed=slots,
         selected_token_idx=selected,
@@ -866,6 +881,87 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
     assert args[2] is selected
     assert args[3] is chunk_ptrs
     assert args[4:] == (256, 4, True)
+
+
+def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    compute_stream = _TrackingStream("compute")
+    load_streams = [_TrackingStream("load-0"), _TrackingStream("load-1")]
+    done_events = [_TrackingEvent("done-0"), _TrackingEvent("done-1")]
+    connector.load_stream_list = load_streams
+    connector._sparse_load_done_events = done_events
+    connector._active_sparse_load_join = None
+
+    plan = npu_connectors._SparseDestinationPlan(
+        [object()],
+        (torch.long, "cpu", 0, 1, 1, 0),
+        (object(),),
+    )
+    source_layer = PreparedSparseSourceLayer(
+        tensors=(torch.zeros(4),),
+        chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+    )
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(current_stream=lambda: compute_stream),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: None,
+    )
+
+    def launch(stream_index: int) -> None:
+        connector._run_prepared_sparse_direct_kv_transfer_layer(
+            plan=plan,
+            source_layer=source_layer,
+            layer_id=0,
+            load_stream=load_streams[stream_index],
+            load_stream_idx=stream_index,
+            current_stream=compute_stream,
+            slot_mapping_packed=torch.arange(2, dtype=torch.long),
+            selected_token_idx=torch.arange(2, dtype=torch.int32),
+            chunk_size=256,
+            total_tokens=4,
+            sparse_host_interleaved=True,
+        )
+
+    launch(0)
+    assert compute_stream.events == [("wait_stream", "load-0")]
+    compute_stream.events.clear()
+    load_streams[0].events.clear()
+
+    with connector.defer_sparse_load_consumer_wait():
+        launch(0)
+        launch(1)
+        assert compute_stream.events == []
+
+    assert load_streams[0].events == [("wait_stream", "compute")]
+    assert load_streams[1].events == [("wait_stream", "compute")]
+    assert done_events[0].records == ["load-0"]
+    assert done_events[1].records == ["load-1"]
+    assert compute_stream.events == [
+        ("wait_event", "done-0"),
+        ("wait_event", "done-1"),
+    ]
+    assert connector._active_sparse_load_join is None
+
+    load_streams[0].events.clear()
+    with pytest.raises(RuntimeError, match="submission failed"):
+        with connector.defer_sparse_load_consumer_wait():
+            launch(0)
+            raise RuntimeError("submission failed")
+
+    assert load_streams[0].events == [
+        ("wait_stream", "compute"),
+        "synchronize",
+    ]
+    assert connector._active_sparse_load_join is None
 
 
 def test_sparse_destination_plan_replaces_destination_per_group(
