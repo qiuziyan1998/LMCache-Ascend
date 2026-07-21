@@ -3503,6 +3503,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 sparse_host_interleaved=sparse_host_interleaved,
             )
             if capture_content and layer_id == 0:
+                source_chunk_ranges = []
+                for chunk_index, tensor in enumerate(source_layer.tensors[:2]):
+                    range_start = chunk_index * chunk_size
+                    range_end = min(
+                        range_start + chunk_size, source.total_tokens
+                    )
+                    source_chunk_ranges.append(
+                        {
+                            "start": range_start,
+                            "end": range_end,
+                            "fingerprint": _bounded_tensor_fingerprint(tensor),
+                        }
+                    )
                 content_probe = _sparse_content_probe(
                     cpu_tensors=list(source_layer.tensors),
                     layer_cache=kvcaches_snapshot[layer_id],
@@ -3518,11 +3531,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kv_group=kv_group,
                     frontier=frontier,
                     layer=layer_id,
-                    prepared_source=True,
-                    source_chunk_fingerprints=[
-                        _bounded_tensor_fingerprint(tensor)
-                        for tensor in source_layer.tensors[:2]
-                    ],
+                    content_path="prepared",
+                    source_chunk_ranges=source_chunk_ranges,
                     content_probe=content_probe,
                 )
                 _remember_bounded_key(
@@ -3643,11 +3653,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             explicit_sparse_payload = target_slot_mapping is not None
             deep_seen = {}
             capture_deep_payload = False
+            capture_content_probe = False
             if deep_diag_enabled:
                 deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
                 capture_deep_payload = _should_capture_deep_payload(
                     enabled=True,
                     explicit_payload=explicit_sparse_payload,
+                    committed_end=lmcache_cached_tokens,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    seen=deep_seen,
+                )
+                capture_content_probe = _should_capture_deep_payload(
+                    enabled=True,
+                    explicit_payload=selected_token_idx is not None,
                     committed_end=lmcache_cached_tokens,
                     req_id=req_id,
                     kv_group=kv_group,
@@ -3730,7 +3749,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ),
                 cpu_tensors=cpu_tensors,
             )
-            if capture_deep_payload and layer_id == 0:
+            if capture_content_probe and layer_id == 0:
+                source_chunk_ranges = []
+                for chunk_index, tensor in enumerate(cpu_tensors[:2]):
+                    range_start = chunk_index * chunk_size
+                    range_end = min(
+                        range_start + chunk_size, total_tokens
+                    )
+                    source_chunk_ranges.append(
+                        {
+                            "start": range_start,
+                            "end": range_end,
+                            "fingerprint": _bounded_tensor_fingerprint(tensor),
+                        }
+                    )
                 content_probe = _sparse_content_probe(
                     cpu_tensors=cpu_tensors,
                     layer_cache=kvcaches_snapshot[layer_id],
@@ -3746,12 +3778,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kv_group=kv_group,
                     frontier=lmcache_cached_tokens,
                     layer=layer_id,
-                    source_chunk_fingerprints=[
-                        _bounded_tensor_fingerprint(tensor)
-                        for tensor in cpu_tensors[:2]
-                    ],
+                    content_path="normal",
+                    source_chunk_ranges=source_chunk_ranges,
                     content_probe=content_probe,
                 )
+                _remember_bounded_key(
+                    deep_seen,
+                    (str(req_id), int(kv_group), int(lmcache_cached_tokens)),
+                )
+                self._mtp_dw_deep_diag_seen = deep_seen
             deep_diag = None
             if capture_deep_payload:
                 deep_key = (str(req_id), int(kv_group), int(lmcache_cached_tokens))
@@ -4218,6 +4253,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             for memory_obj in memory_objs_layer[:2]
                             if memory_obj.tensor is not None
                         ]
+                        store_starts = list(starts)
+                        store_ends = list(ends)
+                        chunk_ranges = []
+                        for chunk_index, tensor in enumerate(store_tensors):
+                            range_start = (
+                                int(store_starts[chunk_index])
+                                if chunk_index < len(store_starts)
+                                else None
+                            )
+                            range_end = (
+                                int(store_ends[chunk_index])
+                                if chunk_index < len(store_ends)
+                                else None
+                            )
+                            chunk_ranges.append(
+                                {
+                                    "start": range_start,
+                                    "end": range_end,
+                                    "fingerprint": _bounded_tensor_fingerprint(
+                                        tensor
+                                    ),
+                                }
+                            )
                         _mtp_dw_event(
                             "deep",
                             event="content_store",
@@ -4226,10 +4284,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             layer=layer_id,
                             window_start=kwargs.get("decode_window_start"),
                             window_end=kwargs.get("decode_window_end"),
-                            chunk_fingerprints=[
-                                _bounded_tensor_fingerprint(tensor)
-                                for tensor in store_tensors
-                            ],
+                            chunk_ranges=chunk_ranges,
                         )
 
             # free the buffer memory
