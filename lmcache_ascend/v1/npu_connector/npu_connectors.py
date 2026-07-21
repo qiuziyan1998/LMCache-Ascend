@@ -3504,7 +3504,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             if capture_content and layer_id == 0:
                 source_chunk_ranges = []
-                for chunk_index, tensor in enumerate(source_layer.tensors[:2]):
+                for chunk_index, tensor in enumerate(source_layer.tensors):
                     range_start = chunk_index * chunk_size
                     range_end = min(
                         range_start + chunk_size, source.total_tokens
@@ -3653,20 +3653,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             explicit_sparse_payload = target_slot_mapping is not None
             deep_seen = {}
             capture_deep_payload = False
-            capture_content_probe = False
             if deep_diag_enabled:
                 deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
                 capture_deep_payload = _should_capture_deep_payload(
                     enabled=True,
                     explicit_payload=explicit_sparse_payload,
-                    committed_end=lmcache_cached_tokens,
-                    req_id=req_id,
-                    kv_group=kv_group,
-                    seen=deep_seen,
-                )
-                capture_content_probe = _should_capture_deep_payload(
-                    enabled=True,
-                    explicit_payload=selected_token_idx is not None,
                     committed_end=lmcache_cached_tokens,
                     req_id=req_id,
                     kv_group=kv_group,
@@ -3749,9 +3740,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ),
                 cpu_tensors=cpu_tensors,
             )
+            capture_content_probe = (
+                deep_diag_enabled
+                and layer_id == 0
+                and selected_token_idx is not None
+                and selected_token_idx.numel() > 0
+                and _should_capture_deep_payload(
+                    enabled=True,
+                    explicit_payload=True,
+                    committed_end=lmcache_cached_tokens,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    seen=deep_seen,
+                )
+            )
             if capture_content_probe and layer_id == 0:
                 source_chunk_ranges = []
-                for chunk_index, tensor in enumerate(cpu_tensors[:2]):
+                for chunk_index, tensor in enumerate(cpu_tensors):
                     range_start = chunk_index * chunk_size
                     range_end = min(
                         range_start + chunk_size, total_tokens
@@ -3787,6 +3792,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     (str(req_id), int(kv_group), int(lmcache_cached_tokens)),
                 )
                 self._mtp_dw_deep_diag_seen = deep_seen
+            elif deep_diag_enabled and layer_id == 0:
+                _mtp_dw_event(
+                    "deep",
+                    event="content_skip",
+                    req=str(req_id),
+                    kv_group=kv_group,
+                    frontier=lmcache_cached_tokens,
+                    layer=layer_id,
+                    content_path="normal",
+                    reason=(
+                        "no_selected_tokens"
+                        if selected_token_idx is None
+                        or selected_token_idx.numel() == 0
+                        else "already_seen"
+                    ),
+                )
             deep_diag = None
             if capture_deep_payload:
                 deep_key = (str(req_id), int(kv_group), int(lmcache_cached_tokens))
@@ -4250,7 +4271,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     if store_req_id is not None:
                         store_tensors = [
                             memory_obj.tensor
-                            for memory_obj in memory_objs_layer[:2]
+                            for memory_obj in memory_objs_layer
                             if memory_obj.tensor is not None
                         ]
                         store_starts = list(starts)
