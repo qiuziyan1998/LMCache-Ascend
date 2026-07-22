@@ -1733,6 +1733,39 @@ def test_append_retrieve_layer_cache_rejects_missing_tensor_without_shift():
     assert cached_tensors == []
 
 
+def test_append_retrieve_layer_cache_reports_diagnostic_subphases():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = SimpleNamespace(
+        append_sparse_chunk_ptr_cache_for_layer=lambda *_args: {
+            "ptr_resolve": 1.0,
+            "ptr_tensor_build": 2.0,
+            "ptr_tensor_concat": 3.0,
+            "ptr_cache_commit": 4.0,
+        }
+    )
+    cached_memory_objs = []
+    cached_tensors = []
+    timings_ms = {}
+
+    engine._append_retrieve_layer_cache(
+        0,
+        [_FakeTensorMemObj(torch.empty(1))],
+        cached_memory_objs,
+        cached_tensors,
+        [],
+        [],
+        timings_ms=timings_ms,
+    )
+
+    assert timings_ms["tensor_collect"] >= 0
+    assert timings_ms["ptr_resolve"] == 1.0
+    assert timings_ms["ptr_tensor_build"] == 2.0
+    assert timings_ms["ptr_tensor_concat"] == 3.0
+    assert timings_ms["ptr_cache_commit"] == 4.0
+    assert timings_ms["request_cache_commit"] >= 0
+
+
 def test_sparse_pointer_cache_append_failure_is_atomic(monkeypatch):
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 2
@@ -1751,6 +1784,32 @@ def test_sparse_pointer_cache_append_failure_is_atomic(monkeypatch):
 
     assert cached_chunk_dev_ptrs == []
     assert cached_chunk_ptrs_npu == []
+
+
+def test_sparse_pointer_cache_append_reports_diagnostic_subphases(monkeypatch):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kv_device = torch.device("cpu")
+    monkeypatch.setattr(npu_connectors.lmc_ops, "get_device_ptr", lambda _ptr: 1234)
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
+
+    timings_ms = connector.append_sparse_chunk_ptr_cache_for_layer(
+        0,
+        [torch.empty(1)],
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+    )
+
+    assert set(timings_ms) == {
+        "ptr_resolve",
+        "ptr_tensor_build",
+        "ptr_tensor_concat",
+        "ptr_cache_commit",
+    }
+    assert all(elapsed_ms >= 0 for elapsed_ms in timings_ms.values())
+    assert cached_chunk_dev_ptrs == [[1234]]
+    assert torch.equal(cached_chunk_ptrs_npu[0], torch.tensor([1234]))
 
 
 def test_sparse_pointer_cache_tensor_build_failure_is_atomic(monkeypatch):

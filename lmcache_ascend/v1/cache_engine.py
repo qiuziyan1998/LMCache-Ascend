@@ -665,8 +665,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
+        *,
+        timings_ms: Optional[dict[str, float]] = None,
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
+        phase_started = time.perf_counter()
         new_tensors: List[torch.Tensor] = []
         for chunk_index, mem_obj in enumerate(mem_objs_layer):
             tensor = mem_obj.tensor
@@ -677,6 +680,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     f"layer_id={layer_id}, chunk_index={chunk_index}"
                 )
             new_tensors.append(tensor)
+        if timings_ms is not None:
+            timings_ms["tensor_collect"] = (
+                time.perf_counter() - phase_started
+            ) * 1000
         if new_tensors and cached_chunk_dev_ptrs is not None:
             append_ptrs_fn = getattr(
                 self.gpu_connector,
@@ -687,13 +694,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # Resolve pointer tables before publishing the MemoryObjs/tensors
                 # into ReqMeta so failures cannot leave a hot-reusable partial
                 # state without NPU pointer-cache coverage.
-                append_ptrs_fn(
+                pointer_timings = append_ptrs_fn(
                     layer_id,
                     new_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                 )
+                if timings_ms is not None and isinstance(pointer_timings, dict):
+                    for name in (
+                        "ptr_resolve",
+                        "ptr_tensor_build",
+                        "ptr_tensor_concat",
+                        "ptr_cache_commit",
+                    ):
+                        timings_ms[name] = float(pointer_timings.get(name, 0.0))
 
+        phase_started = time.perf_counter()
         if cached_memory_objs is not None:
             if not cached_memory_objs:
                 cached_memory_objs.extend(
@@ -704,6 +720,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             if not cached_tensors:
                 cached_tensors.extend([] for _ in range(self.num_layers))
             cached_tensors[layer_id].extend(new_tensors)
+        if timings_ms is not None:
+            timings_ms["request_cache_commit"] = (
+                time.perf_counter() - phase_started
+            ) * 1000
 
     def _append_shared_handle_cache(
         self,
@@ -2726,6 +2746,28 @@ class AscendLMCacheEngine(LMCacheEngine):
         }
         layer_phase_max_ms = {phase: 0.0 for phase in layer_phase_totals_ms}
         layer_phase_max_id = {phase: -1 for phase in layer_phase_totals_ms}
+        detail_phase_names = (
+            "mem_source_select",
+            "mem_tensor_collect",
+            "mem_ptr_resolve",
+            "mem_ptr_tensor_build",
+            "mem_ptr_tensor_concat",
+            "mem_ptr_cache_commit",
+            "mem_request_cache_commit",
+            "mem_handoff",
+            "handle_validate",
+            "handle_object_build",
+            "handle_cache_commit",
+            "handle_envelope_build",
+            "envelope_serialize",
+            "envelope_collective",
+        )
+        detail_phase_totals_ms = {phase: 0.0 for phase in detail_phase_names}
+        detail_phase_max_ms = {phase: 0.0 for phase in detail_phase_names}
+        detail_phase_max_id = {phase: -1 for phase in detail_phase_names}
+        detail_phase_by_layer_ms = {
+            phase: {} for phase in detail_phase_names
+        }
         rank0_layer_total_ms = 0.0
         rank0_max_layer_total_ms = 0.0
         rank0_max_layer_total_id = -1
@@ -2740,6 +2782,31 @@ class AscendLMCacheEngine(LMCacheEngine):
             if elapsed_ms > layer_phase_max_ms[phase_name]:
                 layer_phase_max_ms[phase_name] = elapsed_ms
                 layer_phase_max_id[phase_name] = layer_id
+
+        def record_rank0_detail_elapsed(
+            phase_name: str,
+            layer_id: int,
+            elapsed_ms: float,
+        ) -> None:
+            detail_phase_totals_ms[phase_name] += elapsed_ms
+            detail_phase_by_layer_ms[phase_name][layer_id] = (
+                detail_phase_by_layer_ms[phase_name].get(layer_id, 0.0)
+                + elapsed_ms
+            )
+            if elapsed_ms > detail_phase_max_ms[phase_name]:
+                detail_phase_max_ms[phase_name] = elapsed_ms
+                detail_phase_max_id[phase_name] = layer_id
+
+        def record_rank0_detail_phase(
+            phase_name: str,
+            layer_id: int,
+            started: float,
+        ) -> None:
+            record_rank0_detail_elapsed(
+                phase_name,
+                layer_id,
+                (time.perf_counter() - started) * 1000,
+            )
 
         def ensure_mem_obj_consumer():
             nonlocal mem_obj_consumer, sparse_memory_objs_notified, consumer_init_ms
@@ -2808,6 +2875,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
 
                 phase_started = time.perf_counter()
+                source_select_started = time.perf_counter()
+                append_layer_cache = False
                 if cached_mem_layers is not None:
                     mem_objs_layer = cached_mem_layers[layer_id]
                 elif use_cached_retrieve:
@@ -2828,21 +2897,44 @@ class AscendLMCacheEngine(LMCacheEngine):
                             and len(cached_tensors) > layer_id
                             else 0
                         )
-                        if layer_cached_chunks < len(retrieve_keys[0]):
-                            self._append_retrieve_layer_cache(
-                                layer_id,
-                                mem_objs_layer,
-                                cached_memory_objs,
-                                cached_tensors,
-                                cached_chunk_dev_ptrs,
-                                cached_chunk_ptrs_npu,
-                            )
-                            if shared_sparse_retrieve:
-                                mark_pre_resolved_layer_handed_off(
-                                    layer_id
-                                )
+                        append_layer_cache = layer_cached_chunks < len(
+                            retrieve_keys[0]
+                        )
                     else:
                         mem_objs_layer = []
+                record_rank0_detail_phase(
+                    "mem_source_select", layer_id, source_select_started
+                )
+                if append_layer_cache:
+                    append_timings_ms: dict[str, float] = {}
+                    self._append_retrieve_layer_cache(
+                        layer_id,
+                        mem_objs_layer,
+                        cached_memory_objs,
+                        cached_tensors,
+                        cached_chunk_dev_ptrs,
+                        cached_chunk_ptrs_npu,
+                        timings_ms=append_timings_ms,
+                    )
+                    for timing_name in (
+                        "tensor_collect",
+                        "ptr_resolve",
+                        "ptr_tensor_build",
+                        "ptr_tensor_concat",
+                        "ptr_cache_commit",
+                        "request_cache_commit",
+                    ):
+                        record_rank0_detail_elapsed(
+                            f"mem_{timing_name}",
+                            layer_id,
+                            append_timings_ms.get(timing_name, 0.0),
+                        )
+                    if shared_sparse_retrieve:
+                        handoff_started = time.perf_counter()
+                        mark_pre_resolved_layer_handed_off(layer_id)
+                        record_rank0_detail_phase(
+                            "mem_handoff", layer_id, handoff_started
+                        )
                 record_rank0_layer_phase(
                     "mem_select_cache", layer_id, phase_started
                 )
@@ -2888,6 +2980,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 "publication_claim", layer_id, phase_started
                             )
                         phase_started = time.perf_counter()
+                        handle_timings_ms: dict[str, float] = {}
                         handles = self._make_shared_handles_for_layer(
                             req_id=kwargs.get("req_id", "unspecified"),
                             phase=kwargs.get(
@@ -2904,7 +2997,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                             chunk_index_offset=(
                                 refresh_prefix_chunks if tail_refresh else 0
                             ),
+                            timings_ms=handle_timings_ms,
                         )
+                        record_rank0_detail_elapsed(
+                            "handle_validate",
+                            layer_id,
+                            handle_timings_ms.get("validate", 0.0),
+                        )
+                        record_rank0_detail_elapsed(
+                            "handle_object_build",
+                            layer_id,
+                            handle_timings_ms.get("object_build", 0.0),
+                        )
+                        handle_cache_started = time.perf_counter()
                         self._append_shared_handle_cache(
                             layer_id,
                             handles,
@@ -2913,6 +3018,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 refresh_prefix_chunks if tail_refresh else 0
                             ),
                         )
+                        record_rank0_detail_phase(
+                            "handle_cache_commit",
+                            layer_id,
+                            handle_cache_started,
+                        )
+                        envelope_build_started = time.perf_counter()
                         envelope = SharedHandleEnvelope(
                             request_id=kwargs.get("req_id", "unspecified"),
                             phase=kwargs.get(
@@ -2929,6 +3040,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 if handles
                                 else "no sparse decode shared CPU cache chunks selected"
                             ),
+                        )
+                        record_rank0_detail_phase(
+                            "handle_envelope_build",
+                            layer_id,
+                            envelope_build_started,
                         )
                         record_rank0_layer_phase(
                             "handle_build", layer_id, phase_started
@@ -2963,7 +3079,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         raise
                     phase_started = time.perf_counter()
-                    self._broadcast_shared_envelope(envelope)
+                    broadcast_timings = self._broadcast_shared_envelope(envelope)
+                    if (
+                        isinstance(broadcast_timings, tuple)
+                        and len(broadcast_timings) == 2
+                    ):
+                        record_rank0_detail_elapsed(
+                            "envelope_serialize",
+                            layer_id,
+                            float(broadcast_timings[0]),
+                        )
+                        record_rank0_detail_elapsed(
+                            "envelope_collective",
+                            layer_id,
+                            float(broadcast_timings[1]),
+                        )
                     record_rank0_layer_phase(
                         "envelope_broadcast", layer_id, phase_started
                     )
@@ -3005,7 +3135,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "req=%s kv_group=%s layers=%d chunks_per_layer=%d "
                     "consumer_init_ms=%.3f layer_total_ms=%.3f "
                     "max_layer_total_ms=%.3f max_layer_total_id=%d "
-                    "mem_select_cache_ms=%.3f store_fence_ms=%.3f "
+                    "mem_select_cache_ms=%.3f mem_select_cache_max_ms=%.3f "
+                    "mem_select_cache_max_layer=%d store_fence_ms=%.3f "
                     "publication_claim_ms=%.3f handle_build_ms=%.3f "
                     "handle_build_max_ms=%.3f handle_build_max_layer=%d "
                     "envelope_broadcast_ms=%.3f envelope_broadcast_max_ms=%.3f "
@@ -3021,6 +3152,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     rank0_max_layer_total_ms,
                     rank0_max_layer_total_id,
                     layer_phase_totals_ms["mem_select_cache"],
+                    layer_phase_max_ms["mem_select_cache"],
+                    layer_phase_max_id["mem_select_cache"],
                     layer_phase_totals_ms["store_fence"],
                     layer_phase_totals_ms["publication_claim"],
                     layer_phase_totals_ms["handle_build"],
@@ -3033,6 +3166,91 @@ class AscendLMCacheEngine(LMCacheEngine):
                     layer_phase_max_ms["consumer_send"],
                     layer_phase_max_id["consumer_send"],
                     kwargs.get("shared_cpu_rebuild_reason", "unspecified"),
+                )
+
+                def log_rank0_detail_summary(
+                    marker: str,
+                    parent_phase: str,
+                    detail_phases: tuple[str, ...],
+                ) -> None:
+                    parent_max_layer = layer_phase_max_id[parent_phase]
+                    accounted_ms = sum(
+                        detail_phase_totals_ms[name]
+                        for name in detail_phases
+                    )
+                    parent_max_accounted_ms = sum(
+                        detail_phase_by_layer_ms[name].get(
+                            parent_max_layer, 0.0
+                        )
+                        for name in detail_phases
+                    )
+
+                    def detail_at_parent_max(name: str) -> float:
+                        return detail_phase_by_layer_ms[name].get(
+                            parent_max_layer, 0.0
+                        )
+
+                    detail_fields = " ".join(
+                        f"{name}_ms={detail_phase_totals_ms[name]:.3f} "
+                        f"{name}_max_ms={detail_phase_max_ms[name]:.3f} "
+                        f"{name}_max_layer={detail_phase_max_id[name]} "
+                        f"{name}_at_parent_max_layer_ms="
+                        f"{detail_at_parent_max(name):.3f}"
+                        for name in detail_phases
+                    )
+                    logger.info(
+                        f"[{marker}] "
+                        "req=%s kv_group=%s layers=%d chunks_per_layer=%d "
+                        "parent_ms=%.3f parent_max_ms=%.3f "
+                        "parent_max_layer=%d %s accounted_ms=%.3f "
+                        "unattributed_ms=%.3f parent_max_accounted_ms=%.3f "
+                        "parent_max_unattributed_ms=%.3f rebuild_reason=%s",
+                        kwargs.get("req_id", "unspecified"),
+                        kv_group,
+                        self.num_layers,
+                        required_chunks,
+                        layer_phase_totals_ms[parent_phase],
+                        layer_phase_max_ms[parent_phase],
+                        parent_max_layer,
+                        detail_fields,
+                        accounted_ms,
+                        layer_phase_totals_ms[parent_phase] - accounted_ms,
+                        parent_max_accounted_ms,
+                        layer_phase_max_ms[parent_phase]
+                        - parent_max_accounted_ms,
+                        kwargs.get(
+                            "shared_cpu_rebuild_reason", "unspecified"
+                        ),
+                    )
+
+                log_rank0_detail_summary(
+                    "BOOTSTRAP_ASCEND_SHARED_MEM_SELECT_DETAIL",
+                    "mem_select_cache",
+                    (
+                        "mem_source_select",
+                        "mem_tensor_collect",
+                        "mem_ptr_resolve",
+                        "mem_ptr_tensor_build",
+                        "mem_ptr_tensor_concat",
+                        "mem_ptr_cache_commit",
+                        "mem_request_cache_commit",
+                        "mem_handoff",
+                    ),
+                )
+                log_rank0_detail_summary(
+                    "BOOTSTRAP_ASCEND_SHARED_HANDLE_BUILD_DETAIL",
+                    "handle_build",
+                    (
+                        "handle_validate",
+                        "handle_object_build",
+                        "handle_cache_commit",
+                        "handle_envelope_build",
+                    ),
+                )
+                log_rank0_detail_summary(
+                    "BOOTSTRAP_ASCEND_SHARED_ENVELOPE_BROADCAST_DETAIL",
+                    "envelope_broadcast",
+                    ("envelope_serialize", "envelope_collective"),
                 )
 
             yield ret_mask

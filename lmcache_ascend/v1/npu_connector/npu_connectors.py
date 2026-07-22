@@ -1327,11 +1327,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         new_tensors: List[torch.Tensor],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
-    ) -> None:
-        """Resolve and append NPU device ptrs for newly retrieved chunks only."""
-        if not new_tensors:
-            return
+    ) -> dict[str, float]:
+        """Resolve and append NPU device ptrs for newly retrieved chunks only.
 
+        Return non-overlapping diagnostic timings without changing the cache
+        installation order or its all-or-nothing behavior.
+        """
+        timings_ms = {
+            "ptr_resolve": 0.0,
+            "ptr_tensor_build": 0.0,
+            "ptr_tensor_concat": 0.0,
+            "ptr_cache_commit": 0.0,
+        }
+        if not new_tensors:
+            return timings_ms
+
+        phase_started = time.perf_counter()
         new_dev_ptrs = [
             self._resolve_registered_cpu_tensor_device_ptr(
                 tensor,
@@ -1341,23 +1352,35 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             for chunk_index, tensor in enumerate(new_tensors)
         ]
+        timings_ms["ptr_resolve"] = (
+            time.perf_counter() - phase_started
+        ) * 1000
 
         updated_ptrs_npu = None
         if cached_chunk_ptrs_npu is not None:
+            phase_started = time.perf_counter()
             new_ptrs_npu = torch.tensor(
                 new_dev_ptrs, dtype=torch.long, device=self.kv_device
             )
+            timings_ms["ptr_tensor_build"] = (
+                time.perf_counter() - phase_started
+            ) * 1000
             existing = (
                 cached_chunk_ptrs_npu[layer_id]
                 if layer_id < len(cached_chunk_ptrs_npu)
                 else None
             )
+            phase_started = time.perf_counter()
             updated_ptrs_npu = (
                 new_ptrs_npu
                 if existing is None
                 else torch.cat((existing, new_ptrs_npu), dim=0)
             )
+            timings_ms["ptr_tensor_concat"] = (
+                time.perf_counter() - phase_started
+            ) * 1000
 
+        phase_started = time.perf_counter()
         num_layers = self.num_layers
         if not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
@@ -1373,10 +1396,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         cached_chunk_dev_ptrs[layer_id].extend(new_dev_ptrs)
 
-        if cached_chunk_ptrs_npu is None:
-            return
-
-        cached_chunk_ptrs_npu[layer_id] = updated_ptrs_npu
+        if cached_chunk_ptrs_npu is not None:
+            cached_chunk_ptrs_npu[layer_id] = updated_ptrs_npu
+        timings_ms["ptr_cache_commit"] = (
+            time.perf_counter() - phase_started
+        ) * 1000
+        return timings_ms
 
     def _resolve_registered_cpu_tensor_device_ptr(
         self,
