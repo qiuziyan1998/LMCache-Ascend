@@ -667,47 +667,91 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_ptrs_npu: Optional[List],
         *,
         timings_ms: Optional[dict[str, float]] = None,
+        precollected_tensors: Optional[List[torch.Tensor]] = None,
+        precollected_tensor_collect_ms: float = 0.0,
+        prepared_pointer_batch: Optional[object] = None,
+        pointer_prepare_timings_ms: Optional[dict[str, float]] = None,
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
-        phase_started = time.perf_counter()
-        new_tensors: List[torch.Tensor] = []
-        for chunk_index, mem_obj in enumerate(mem_objs_layer):
-            tensor = mem_obj.tensor
-            if tensor is None:
-                raise ValueError(
-                    "Layerwise sparse retrieve resolved a chunk without a "
-                    "tensor; refusing to shift the direct-load pointer order: "
-                    f"layer_id={layer_id}, chunk_index={chunk_index}"
-                )
-            new_tensors.append(tensor)
-        if timings_ms is not None:
-            timings_ms["tensor_collect"] = (
+        if precollected_tensors is None:
+            phase_started = time.perf_counter()
+            new_tensors: List[torch.Tensor] = []
+            for chunk_index, mem_obj in enumerate(mem_objs_layer):
+                tensor = mem_obj.tensor
+                if tensor is None:
+                    raise ValueError(
+                        "Layerwise sparse retrieve resolved a chunk without a "
+                        "tensor; refusing to shift the direct-load pointer "
+                        f"order: layer_id={layer_id}, "
+                        f"chunk_index={chunk_index}"
+                    )
+                new_tensors.append(tensor)
+            tensor_collect_ms = (
                 time.perf_counter() - phase_started
             ) * 1000
+        else:
+            new_tensors = precollected_tensors
+            tensor_collect_ms = precollected_tensor_collect_ms
+        if timings_ms is not None:
+            timings_ms["tensor_collect"] = tensor_collect_ms
         if new_tensors and cached_chunk_dev_ptrs is not None:
-            append_ptrs_fn = getattr(
-                self.gpu_connector,
-                "append_sparse_chunk_ptr_cache_for_layer",
-                None,
+            pointer_timings: dict[str, float] = dict(
+                pointer_prepare_timings_ms or {}
             )
-            if append_ptrs_fn is not None:
-                # Resolve pointer tables before publishing the MemoryObjs/tensors
-                # into ReqMeta so failures cannot leave a hot-reusable partial
-                # state without NPU pointer-cache coverage.
-                pointer_timings = append_ptrs_fn(
+            if prepared_pointer_batch is not None:
+                commit_ptrs_fn = getattr(
+                    self.gpu_connector,
+                    "commit_sparse_chunk_ptr_cache_batch_layer",
+                    None,
+                )
+                if commit_ptrs_fn is None:
+                    raise RuntimeError(
+                        "Ascend sparse pointer batch was prepared without a "
+                        "matching layer commit API."
+                    )
+                commit_timings = commit_ptrs_fn(
+                    prepared_pointer_batch,
                     layer_id,
-                    new_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                 )
-                if timings_ms is not None and isinstance(pointer_timings, dict):
-                    for name in (
-                        "ptr_resolve",
-                        "ptr_tensor_build",
-                        "ptr_tensor_concat",
-                        "ptr_cache_commit",
-                    ):
-                        timings_ms[name] = float(pointer_timings.get(name, 0.0))
+                if isinstance(commit_timings, dict):
+                    for name, elapsed_ms in commit_timings.items():
+                        pointer_timings[name] = pointer_timings.get(name, 0.0) + float(
+                            elapsed_ms
+                        )
+            else:
+                append_ptrs_fn = getattr(
+                    self.gpu_connector,
+                    "append_sparse_chunk_ptr_cache_for_layer",
+                    None,
+                )
+                if append_ptrs_fn is not None:
+                    # Resolve pointer tables before publishing the
+                    # MemoryObjs/tensors into ReqMeta so failures cannot leave
+                    # a hot-reusable partial state without NPU pointer-cache
+                    # coverage.
+                    append_timings = append_ptrs_fn(
+                        layer_id,
+                        new_tensors,
+                        cached_chunk_dev_ptrs,
+                        cached_chunk_ptrs_npu,
+                    )
+                    if isinstance(append_timings, dict):
+                        for name, elapsed_ms in append_timings.items():
+                            pointer_timings[name] = (
+                                pointer_timings.get(name, 0.0)
+                                + float(elapsed_ms)
+                            )
+
+            if timings_ms is not None:
+                for name in (
+                    "ptr_resolve",
+                    "ptr_tensor_build",
+                    "ptr_tensor_concat",
+                    "ptr_cache_commit",
+                ):
+                    timings_ms[name] = float(pointer_timings.get(name, 0.0))
 
         phase_started = time.perf_counter()
         if cached_memory_objs is not None:
@@ -2735,6 +2779,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             published_cached_shared_mem_objs.clear()
 
         sparse_memory_objs_notified = False
+        prepared_pointer_batch: Optional[object] = None
+        prepared_pointer_tensors_by_layer: Optional[
+            List[List[torch.Tensor]]
+        ] = None
+        pointer_batch_prepare_timings_pending: Optional[
+            dict[str, float]
+        ] = None
+        pointer_batch_tensor_collect_ms_pending = 0.0
         consumer_init_ms = 0.0
         layer_phase_totals_ms = {
             "mem_select_cache": 0.0,
@@ -2906,6 +2958,102 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "mem_source_select", layer_id, source_select_started
                 )
                 if append_layer_cache:
+                    if (
+                        shared_sparse_retrieve
+                        and pre_resolved_shared_mem_layers is not None
+                        and cached_chunk_dev_ptrs is not None
+                        and prepared_pointer_tensors_by_layer is None
+                    ):
+                        prepare_ptrs_fn = getattr(
+                            self.gpu_connector,
+                            "prepare_sparse_chunk_ptr_cache_for_layers",
+                            None,
+                        )
+                        commit_ptrs_fn = getattr(
+                            self.gpu_connector,
+                            "commit_sparse_chunk_ptr_cache_batch_layer",
+                            None,
+                        )
+                        if callable(prepare_ptrs_fn) and callable(
+                            commit_ptrs_fn
+                        ):
+                            pointer_batch_started = time.perf_counter()
+                            tensor_collect_started = time.perf_counter()
+                            collected_layers: List[List[torch.Tensor]] = []
+                            for prepared_layer_id, prepared_mem_objs in enumerate(
+                                pre_resolved_shared_mem_layers
+                            ):
+                                layer_tensors: List[torch.Tensor] = []
+                                for chunk_index, mem_obj in enumerate(
+                                    prepared_mem_objs
+                                ):
+                                    tensor = mem_obj.tensor
+                                    if tensor is None:
+                                        raise ValueError(
+                                            "Layerwise sparse retrieve resolved "
+                                            "a chunk without a tensor; refusing "
+                                            "to shift the direct-load pointer "
+                                            "order: "
+                                            f"layer_id={prepared_layer_id}, "
+                                            f"chunk_index={chunk_index}"
+                                        )
+                                    layer_tensors.append(tensor)
+                                collected_layers.append(layer_tensors)
+                            pointer_batch_tensor_collect_ms_pending = (
+                                time.perf_counter() - tensor_collect_started
+                            ) * 1000
+                            (
+                                prepared_pointer_batch,
+                                pointer_batch_prepare_timings_pending,
+                            ) = prepare_ptrs_fn(
+                                collected_layers,
+                                cached_chunk_ptrs_npu,
+                            )
+                            prepared_pointer_tensors_by_layer = collected_layers
+                            pointer_batch_wall_ms = (
+                                time.perf_counter() - pointer_batch_started
+                            ) * 1000
+                            new_ptrs_total = sum(
+                                len(layer_tensors)
+                                for layer_tensors in collected_layers
+                            )
+                            logger.info(
+                                "[BOOTSTRAP_ASCEND_SHARED_POINTER_BATCH] "
+                                "req=%s kv_group=%s layers=%d "
+                                "new_ptrs_total=%d npu_tensor_build_calls=%d "
+                                "tensor_collect_ms=%.3f ptr_resolve_ms=%.3f "
+                                "ptr_tensor_build_ms=%.3f "
+                                "ptr_tensor_concat_ms=%.3f total_ms=%.3f "
+                                "rebuild_reason=%s",
+                                kwargs.get("req_id", "unspecified"),
+                                kv_group,
+                                len(collected_layers),
+                                new_ptrs_total,
+                                int(
+                                    cached_chunk_ptrs_npu is not None
+                                    and new_ptrs_total > 0
+                                ),
+                                pointer_batch_tensor_collect_ms_pending,
+                                float(
+                                    pointer_batch_prepare_timings_pending.get(
+                                        "ptr_resolve", 0.0
+                                    )
+                                ),
+                                float(
+                                    pointer_batch_prepare_timings_pending.get(
+                                        "ptr_tensor_build", 0.0
+                                    )
+                                ),
+                                float(
+                                    pointer_batch_prepare_timings_pending.get(
+                                        "ptr_tensor_concat", 0.0
+                                    )
+                                ),
+                                pointer_batch_wall_ms,
+                                kwargs.get(
+                                    "shared_cpu_rebuild_reason", "unspecified"
+                                ),
+                            )
                     append_timings_ms: dict[str, float] = {}
                     self._append_retrieve_layer_cache(
                         layer_id,
@@ -2915,7 +3063,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_chunk_dev_ptrs,
                         cached_chunk_ptrs_npu,
                         timings_ms=append_timings_ms,
+                        precollected_tensors=(
+                            prepared_pointer_tensors_by_layer[layer_id]
+                            if prepared_pointer_tensors_by_layer is not None
+                            else None
+                        ),
+                        precollected_tensor_collect_ms=(
+                            pointer_batch_tensor_collect_ms_pending
+                        ),
+                        prepared_pointer_batch=prepared_pointer_batch,
+                        pointer_prepare_timings_ms=(
+                            pointer_batch_prepare_timings_pending
+                        ),
                     )
+                    if prepared_pointer_tensors_by_layer is not None:
+                        prepared_pointer_tensors_by_layer[layer_id] = []
+                    pointer_batch_tensor_collect_ms_pending = 0.0
+                    pointer_batch_prepare_timings_pending = None
                     for timing_name in (
                         "tensor_collect",
                         "ptr_resolve",

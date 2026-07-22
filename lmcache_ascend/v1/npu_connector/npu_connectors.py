@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
+from dataclasses import dataclass
 import os
 import time
 from typing import Any, List, Optional, Set, Union
@@ -56,6 +57,14 @@ _DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 
 _SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
+
+
+@dataclass(frozen=True)
+class _SparsePointerCacheBatch:
+    """Opaque result of one cross-layer sparse pointer-table preparation."""
+
+    new_dev_ptrs_by_layer: tuple[tuple[int, ...], ...]
+    updated_ptrs_npu_by_layer: tuple[Optional[torch.Tensor], ...]
 
 
 def _wait_payload_events(stream: Any, payload_event: Any) -> None:
@@ -1402,6 +1411,182 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             time.perf_counter() - phase_started
         ) * 1000
         return timings_ms
+
+    def prepare_sparse_chunk_ptr_cache_for_layers(
+        self,
+        new_tensors_by_layer: List[List[torch.Tensor]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> tuple[object, dict[str, float]]:
+        """Prepare sparse pointer-cache additions for every model layer.
+
+        Args:
+            new_tensors_by_layer: Newly retrieved registered CPU tensors in
+                layer-major, chunk-major order.
+            cached_chunk_ptrs_npu: Existing per-layer NPU pointer tables, or
+                ``None`` when only host pointer caching is requested.
+
+        Returns:
+            An opaque batch passed to
+            :meth:`commit_sparse_chunk_ptr_cache_batch_layer`, plus aggregate
+            non-overlapping diagnostic timings.  All NPU pointer values are
+            built by one device tensor construction regardless of layer count.
+
+        Raises:
+            ValueError: The layer count does not match the connector layout.
+            RuntimeError: A CPU tensor is not registered for direct NPU access
+                or device pointer tensor construction fails.
+
+        Notes:
+            This method does not mutate either pointer cache.  Callers retain
+            the original layerwise commit order and can discard uncommitted
+            rows safely if a request generator closes early.
+        """
+        timings_ms = {
+            "ptr_resolve": 0.0,
+            "ptr_tensor_build": 0.0,
+            "ptr_tensor_concat": 0.0,
+        }
+        if len(new_tensors_by_layer) != self.num_layers:
+            raise ValueError(
+                "Ascend sparse pointer batch must cover every model layer: "
+                f"layers={len(new_tensors_by_layer)}, expected={self.num_layers}"
+            )
+
+        phase_started = time.perf_counter()
+        new_dev_ptrs_by_layer = tuple(
+            tuple(
+                self._resolve_registered_cpu_tensor_device_ptr(
+                    tensor,
+                    layer_id=layer_id,
+                    chunk_index=chunk_index,
+                    source="prepare_sparse_chunk_ptr_cache_for_layers",
+                )
+                for chunk_index, tensor in enumerate(layer_tensors)
+            )
+            for layer_id, layer_tensors in enumerate(new_tensors_by_layer)
+        )
+        timings_ms["ptr_resolve"] = (
+            time.perf_counter() - phase_started
+        ) * 1000
+
+        updated_ptrs_npu_by_layer: tuple[Optional[torch.Tensor], ...]
+        flat_dev_ptrs = [
+            ptr for layer_ptrs in new_dev_ptrs_by_layer for ptr in layer_ptrs
+        ]
+        if cached_chunk_ptrs_npu is None or not flat_dev_ptrs:
+            updated_ptrs_npu_by_layer = tuple(
+                None for _ in range(self.num_layers)
+            )
+        else:
+            phase_started = time.perf_counter()
+            flat_new_ptrs_npu = torch.tensor(
+                flat_dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
+            timings_ms["ptr_tensor_build"] = (
+                time.perf_counter() - phase_started
+            ) * 1000
+
+            phase_started = time.perf_counter()
+            updated_ptrs_npu = []
+            offset = 0
+            for layer_id, layer_ptrs in enumerate(new_dev_ptrs_by_layer):
+                num_new_ptrs = len(layer_ptrs)
+                new_ptrs_npu = flat_new_ptrs_npu.narrow(
+                    0, offset, num_new_ptrs
+                )
+                offset += num_new_ptrs
+                existing = (
+                    cached_chunk_ptrs_npu[layer_id]
+                    if layer_id < len(cached_chunk_ptrs_npu)
+                    else None
+                )
+                updated_ptrs_npu.append(
+                    new_ptrs_npu
+                    if existing is None
+                    else torch.cat((existing, new_ptrs_npu), dim=0)
+                )
+            updated_ptrs_npu_by_layer = tuple(updated_ptrs_npu)
+            timings_ms["ptr_tensor_concat"] = (
+                time.perf_counter() - phase_started
+            ) * 1000
+
+        return (
+            _SparsePointerCacheBatch(
+                new_dev_ptrs_by_layer=new_dev_ptrs_by_layer,
+                updated_ptrs_npu_by_layer=updated_ptrs_npu_by_layer,
+            ),
+            timings_ms,
+        )
+
+    def commit_sparse_chunk_ptr_cache_batch_layer(
+        self,
+        prepared_batch: object,
+        layer_id: int,
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> dict[str, float]:
+        """Commit one layer from a prepared cross-layer pointer batch.
+
+        Args:
+            prepared_batch: Opaque value returned by
+                :meth:`prepare_sparse_chunk_ptr_cache_for_layers`.
+            layer_id: Layer whose pointer additions become request-visible.
+            cached_chunk_dev_ptrs: Mutable per-layer host pointer cache.
+            cached_chunk_ptrs_npu: Mutable per-layer NPU pointer tensor cache,
+                or ``None`` when device pointer tables are not retained.
+
+        Returns:
+            A diagnostic mapping containing only ``ptr_cache_commit``.
+
+        Raises:
+            TypeError: ``prepared_batch`` was not created by this connector.
+            IndexError: ``layer_id`` is outside the prepared layer range.
+
+        Notes:
+            Preparation is all-or-nothing, while commits intentionally remain
+            layerwise so generator cancellation has the same visible cache
+            coverage as the original per-layer implementation.
+        """
+        if not isinstance(prepared_batch, _SparsePointerCacheBatch):
+            raise TypeError(
+                "Ascend sparse pointer batch commit received an invalid "
+                f"prepared object: type={type(prepared_batch).__name__}"
+            )
+        if layer_id < 0 or layer_id >= len(
+            prepared_batch.new_dev_ptrs_by_layer
+        ):
+            raise IndexError(
+                "Ascend sparse pointer batch layer is out of range: "
+                f"layer_id={layer_id}, "
+                f"layers={len(prepared_batch.new_dev_ptrs_by_layer)}"
+            )
+
+        phase_started = time.perf_counter()
+        new_dev_ptrs = prepared_batch.new_dev_ptrs_by_layer[layer_id]
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(self.num_layers))
+        while len(cached_chunk_dev_ptrs) <= layer_id:
+            cached_chunk_dev_ptrs.append([])
+
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(self.num_layers))
+        while (
+            cached_chunk_ptrs_npu is not None
+            and len(cached_chunk_ptrs_npu) <= layer_id
+        ):
+            cached_chunk_ptrs_npu.append(None)
+
+        cached_chunk_dev_ptrs[layer_id].extend(new_dev_ptrs)
+        if cached_chunk_ptrs_npu is not None:
+            cached_chunk_ptrs_npu[layer_id] = (
+                prepared_batch.updated_ptrs_npu_by_layer[layer_id]
+            )
+        return {
+            "ptr_cache_commit": (
+                time.perf_counter() - phase_started
+            )
+            * 1000
+        }
 
     def _resolve_registered_cpu_tensor_device_ptr(
         self,

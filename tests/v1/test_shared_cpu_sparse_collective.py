@@ -112,6 +112,40 @@ class _FakeSparseConsumer:
             yield
 
 
+class _FakeBatchedPointerSparseConsumer(_FakeSparseConsumer):
+    def __init__(self):
+        self.prepare_calls = []
+        self.commit_calls = []
+        self.prepared = object()
+
+    def prepare_sparse_chunk_ptr_cache_for_layers(
+        self, tensors_by_layer, cached_ptrs_npu
+    ):
+        self.prepare_calls.append((tensors_by_layer, cached_ptrs_npu))
+        return self.prepared, {
+            "ptr_resolve": 1.0,
+            "ptr_tensor_build": 2.0,
+            "ptr_tensor_concat": 3.0,
+        }
+
+    def commit_sparse_chunk_ptr_cache_batch_layer(
+        self,
+        prepared,
+        layer_id,
+        cached_dev_ptrs,
+        cached_ptrs_npu,
+    ):
+        assert prepared is self.prepared
+        self.commit_calls.append(layer_id)
+        while len(cached_dev_ptrs) <= layer_id:
+            cached_dev_ptrs.append([])
+        while len(cached_ptrs_npu) <= layer_id:
+            cached_ptrs_npu.append(None)
+        cached_dev_ptrs[layer_id].append(1000 + layer_id)
+        cached_ptrs_npu[layer_id] = torch.tensor([1000 + layer_id])
+        return {"ptr_cache_commit": 4.0}
+
+
 class _OrderedSparseConsumer:
     def __init__(self, events):
         self.events = events
@@ -557,6 +591,87 @@ def test_sparse_rank0_partial_handoff_releases_only_unowned_layers(monkeypatch):
     assert handed_off.release_count == 0
     assert unowned.unpin_count == 1
     assert unowned.release_count == 1
+
+
+def test_sparse_rank0_prepares_pointer_tensor_once_and_commits_layerwise(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    keys_layer_major = [["layer-0"], ["layer-1"]]
+    allocated = [[_FakePinnedTensorMemObj()] for _ in range(2)]
+    connector = _FakeBatchedPointerSparseConsumer()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.storage_manager = object()
+    engine.gpu_connector = connector
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    engine._min_layer_cache_chunks = lambda *_args: 0
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0],
+        [1],
+        keys_layer_major,
+    )
+    engine._find_shared_rank0_chunk_location = lambda _key: "LocalCPUBackend"
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {
+        "fits": True
+    }
+    remaining = list(allocated)
+    engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: remaining.pop(
+        0
+    )
+    engine._make_shared_handles_for_layer = lambda **_kwargs: ["handle"]
+    engine._broadcast_shared_envelope = lambda _envelope: (0.0, 0.0)
+    cached_memory_objs = []
+    cached_tensors = []
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=cached_tensors,
+        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    assert len(connector.prepare_calls) == 1
+    assert connector.commit_calls == [0]
+    assert cached_chunk_dev_ptrs == [[1000]]
+
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert len(connector.prepare_calls) == 1
+    assert connector.commit_calls == [0, 1]
+    assert cached_chunk_dev_ptrs == [[1000], [1001]]
+    assert [ptr.tolist() for ptr in cached_chunk_ptrs_npu] == [
+        [1000],
+        [1001],
+    ]
+    assert cached_tensors == [
+        [allocated[0][0].tensor],
+        [allocated[1][0].tensor],
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1810,6 +1925,138 @@ def test_sparse_pointer_cache_append_reports_diagnostic_subphases(monkeypatch):
     assert all(elapsed_ms >= 0 for elapsed_ms in timings_ms.values())
     assert cached_chunk_dev_ptrs == [[1234]]
     assert torch.equal(cached_chunk_ptrs_npu[0], torch.tensor([1234]))
+
+
+def test_sparse_pointer_cache_batch_matches_layerwise_and_builds_once(
+    monkeypatch,
+):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kv_device = torch.device("cpu")
+    monkeypatch.setattr(
+        npu_connectors.lmc_ops,
+        "get_device_ptr",
+        lambda host_ptr: int(host_ptr) + 4096,
+    )
+    new_tensors_by_layer = [
+        [torch.empty(1), torch.empty(2)],
+        [torch.empty(3), torch.empty(4)],
+    ]
+
+    layerwise_dev_ptrs = [[11], [22]]
+    layerwise_ptrs_npu = [torch.tensor([11]), torch.tensor([22])]
+    for layer_id, layer_tensors in enumerate(new_tensors_by_layer):
+        connector.append_sparse_chunk_ptr_cache_for_layer(
+            layer_id,
+            layer_tensors,
+            layerwise_dev_ptrs,
+            layerwise_ptrs_npu,
+        )
+
+    batched_dev_ptrs = [[11], [22]]
+    batched_ptrs_npu = [torch.tensor([11]), torch.tensor([22])]
+    original_tensor = npu_connectors.torch.tensor
+    tensor_build_inputs = []
+
+    def record_tensor_build(data, *args, **kwargs):
+        tensor_build_inputs.append(list(data))
+        return original_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", record_tensor_build)
+    prepared, prepare_timings = (
+        connector.prepare_sparse_chunk_ptr_cache_for_layers(
+            new_tensors_by_layer,
+            batched_ptrs_npu,
+        )
+    )
+
+    assert len(tensor_build_inputs) == 1
+    assert batched_dev_ptrs == [[11], [22]]
+    assert [ptr.tolist() for ptr in batched_ptrs_npu] == [[11], [22]]
+    assert set(prepare_timings) == {
+        "ptr_resolve",
+        "ptr_tensor_build",
+        "ptr_tensor_concat",
+    }
+
+    first_commit = connector.commit_sparse_chunk_ptr_cache_batch_layer(
+        prepared,
+        0,
+        batched_dev_ptrs,
+        batched_ptrs_npu,
+    )
+    assert first_commit["ptr_cache_commit"] >= 0
+    assert batched_dev_ptrs[0] == layerwise_dev_ptrs[0]
+    assert torch.equal(batched_ptrs_npu[0], layerwise_ptrs_npu[0])
+    assert batched_dev_ptrs[1] == [22]
+    assert batched_ptrs_npu[1].tolist() == [22]
+
+    connector.commit_sparse_chunk_ptr_cache_batch_layer(
+        prepared,
+        1,
+        batched_dev_ptrs,
+        batched_ptrs_npu,
+    )
+    assert batched_dev_ptrs == layerwise_dev_ptrs
+    assert all(
+        torch.equal(batched, layerwise)
+        for batched, layerwise in zip(
+            batched_ptrs_npu, layerwise_ptrs_npu, strict=True
+        )
+    )
+
+
+def test_append_retrieve_layer_cache_commits_prepared_pointer_batch():
+    commits = []
+    prepared = object()
+
+    def commit(batch, layer_id, cached_dev_ptrs, cached_ptrs_npu):
+        assert batch is prepared
+        commits.append(layer_id)
+        cached_dev_ptrs.append([1234])
+        cached_ptrs_npu.append(torch.tensor([1234]))
+        return {"ptr_cache_commit": 4.0}
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = SimpleNamespace(
+        commit_sparse_chunk_ptr_cache_batch_layer=commit
+    )
+    cached_memory_objs = []
+    cached_tensors = []
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
+    tensor = torch.empty(1)
+    timings_ms = {}
+
+    engine._append_retrieve_layer_cache(
+        0,
+        [_FakeTensorMemObj(tensor)],
+        cached_memory_objs,
+        cached_tensors,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+        timings_ms=timings_ms,
+        precollected_tensors=[tensor],
+        precollected_tensor_collect_ms=0.5,
+        prepared_pointer_batch=prepared,
+        pointer_prepare_timings_ms={
+            "ptr_resolve": 1.0,
+            "ptr_tensor_build": 2.0,
+            "ptr_tensor_concat": 3.0,
+        },
+    )
+
+    assert commits == [0]
+    assert cached_memory_objs[0][0].tensor is tensor
+    assert cached_tensors == [[tensor]]
+    assert cached_chunk_dev_ptrs == [[1234]]
+    assert cached_chunk_ptrs_npu[0].tolist() == [1234]
+    assert timings_ms["tensor_collect"] == 0.5
+    assert timings_ms["ptr_resolve"] == 1.0
+    assert timings_ms["ptr_tensor_build"] == 2.0
+    assert timings_ms["ptr_tensor_concat"] == 3.0
+    assert timings_ms["ptr_cache_commit"] == 4.0
 
 
 def test_sparse_pointer_cache_tensor_build_failure_is_atomic(monkeypatch):
