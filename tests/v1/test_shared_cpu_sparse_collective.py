@@ -715,6 +715,105 @@ def test_sparse_rank0_partial_handoff_releases_only_unowned_layers(monkeypatch):
     assert unowned.release_count == 1
 
 
+@pytest.mark.parametrize("prepare_ahead", [True, False])
+def test_sparse_rank0_handle_prepare_mode_preserves_publication_order(
+    monkeypatch,
+    prepare_ahead,
+):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    keys_layer_major = [["layer-0"], ["layer-1"]]
+    allocated = [[_FakePinnedTensorMemObj()] for _ in range(2)]
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(
+        experimental_sampled_layerwise_lookup=False,
+        shared_cpu_remote_layers_per_batch=2,
+        shared_cpu_remote_max_inflight_batches=1,
+        shared_cpu_prepare_handles_ahead=prepare_ahead,
+        extra_config={},
+    )
+    engine.storage_manager = object()
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    engine._min_layer_cache_chunks = lambda *_args: 0
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "RemoteBackend",
+        [0],
+        [1],
+        keys_layer_major,
+    )
+    engine._find_shared_rank0_chunk_location = lambda _key: "RemoteBackend"
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {
+        "fits": True
+    }
+    engine._resolve_shared_rank0_remote_layers_windowed = (
+        lambda **_kwargs: allocated
+    )
+    prepared = threading.Event()
+    prepare_calls = []
+    main_thread = threading.get_ident()
+
+    def make_handles(**kwargs):
+        prepare_calls.append((kwargs["layer_id"], threading.get_ident()))
+        if len(prepare_calls) == 2:
+            prepared.set()
+        return [f"handle-{kwargs['layer_id']}"]
+
+    engine._make_shared_handles_for_layer = make_handles
+    broadcasts = []
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(
+        envelope
+    )
+    cached_memory_objs = []
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    if prepare_ahead:
+        assert prepared.wait(timeout=2)
+        assert [layer_id for layer_id, _ in prepare_calls] == [0, 1]
+        assert all(thread_id != main_thread for _, thread_id in prepare_calls)
+    else:
+        assert prepare_calls == []
+
+    retriever.send(([0], 0))
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert [layer_id for layer_id, _ in prepare_calls] == [0, 1]
+    if not prepare_ahead:
+        assert all(thread_id == main_thread for _, thread_id in prepare_calls)
+    assert [envelope.layer_id for envelope in broadcasts] == [0, 1]
+    assert [envelope.handles for envelope in broadcasts] == [
+        ["handle-0"],
+        ["handle-1"],
+    ]
+    assert cached_memory_objs == allocated
+
+
 def test_sparse_rank0_prepares_pointer_tensor_once_and_commits_layerwise(
     monkeypatch,
 ):

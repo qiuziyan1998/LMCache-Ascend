@@ -5,7 +5,7 @@ LMCacheEngine for Ascend NPU.
 """
 
 # Standard
-from concurrent.futures import Future, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 import queue
 import threading
@@ -77,6 +77,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     """Ascend NPU variant of ``LMCacheEngine`` with an async store path."""
 
     supports_parallel_shared_cpu_group_preflight = True
+    shared_cpu_compact_handle_transport = True
 
     def can_run_parallel_shared_cpu_group_preflight(self) -> bool:
         """Return whether this worker may coordinate group preflights.
@@ -3067,6 +3068,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             dict[str, float]
         ] = None
         pointer_batch_tensor_collect_ms_pending = 0.0
+        handle_prepare_executor: Optional[ThreadPoolExecutor] = None
+        handle_prepare_futures: Optional[List[Future]] = None
+        handle_prepare_worker_ms = 0.0
+        handle_prepare_wait_ms = 0.0
+        handle_prepare_validate_ms = 0.0
+        handle_prepare_object_build_ms = 0.0
         consumer_init_ms = 0.0
         layer_phase_totals_ms = {
             "mem_select_cache": 0.0,
@@ -3166,6 +3173,78 @@ class AscendLMCacheEngine(LMCacheEngine):
             ) * 1000
             return mem_obj_consumer
 
+        def shutdown_handle_prepare_tasks() -> None:
+            nonlocal handle_prepare_executor
+            if handle_prepare_executor is None:
+                return
+            handle_prepare_executor.shutdown(wait=True, cancel_futures=True)
+            handle_prepare_executor = None
+
+        prepare_ahead_config = self._get_shared_config_value(
+            "shared_cpu_prepare_handles_ahead",
+            True,
+        )
+        prepare_ahead_enabled = (
+            prepare_ahead_config.strip().lower()
+            not in {"0", "false", "off"}
+            if isinstance(prepare_ahead_config, str)
+            else bool(prepare_ahead_config)
+        )
+        if (
+            prepare_ahead_enabled
+            and publish_shared_handles
+            and shared_sparse_retrieve
+            and pre_resolved_shared_mem_layers is not None
+            and not use_cached_retrieve
+            and not tail_refresh
+            and required_chunks > 0
+            and materialize_mode == "windowed_remote"
+        ):
+
+            def prepare_layer_handles(
+                prepared_layer_id: int,
+            ) -> tuple[List, dict[str, float], float]:
+                prepared_started = time.perf_counter()
+                prepared_timings_ms: dict[str, float] = {}
+                prepared_handles = self._make_shared_handles_for_layer(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    keys_layer=retrieve_keys[prepared_layer_id],
+                    mem_objs_layer=pre_resolved_shared_mem_layers[
+                        prepared_layer_id
+                    ],
+                    layer_id=prepared_layer_id,
+                    kv_group=kv_group,
+                    timings_ms=prepared_timings_ms,
+                )
+                return (
+                    prepared_handles,
+                    prepared_timings_ms,
+                    (time.perf_counter() - prepared_started) * 1000,
+                )
+
+            handle_prepare_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="lmcache-handle-prepare",
+            )
+            handle_prepare_futures = [
+                handle_prepare_executor.submit(
+                    prepare_layer_handles,
+                    prepared_layer_id,
+                )
+                for prepared_layer_id in range(self.num_layers)
+            ]
+            logger.info(
+                "[P2D_SHARED_HANDLE_PREPARE_AHEAD] req=%s kv_group=%d "
+                "layers=%d chunks_per_layer=%d action=launched",
+                kwargs.get("req_id", "unspecified"),
+                kv_group,
+                self.num_layers,
+                required_chunks,
+            )
+
         try:
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
@@ -3194,6 +3273,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     and (not use_cached_retrieve or publish_shared_handles)
                     and request_preflight_failed_elsewhere()
                 ):
+                    shutdown_handle_prepare_tasks()
                     release_pending_pre_resolved()
                     pre_resolved_shared_mem_layers = None
                     error_envelope = make_request_preflight_error_envelope()
@@ -3424,35 +3504,55 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 "publication_claim", layer_id, phase_started
                             )
                         phase_started = time.perf_counter()
-                        handle_timings_ms: dict[str, float] = {}
-                        handles = self._make_shared_handles_for_layer(
-                            req_id=kwargs.get("req_id", "unspecified"),
-                            phase=kwargs.get(
-                                "shared_cpu_phase", "sparse_decode_bootstrap"
-                            ),
-                            keys_layer=(
-                                preflight_retrieve_keys[layer_id]
-                                if tail_refresh
-                                else retrieve_keys[layer_id]
-                            ),
-                            mem_objs_layer=mem_objs_layer,
-                            layer_id=layer_id,
-                            kv_group=kv_group,
-                            chunk_index_offset=(
-                                refresh_prefix_chunks if tail_refresh else 0
-                            ),
-                            timings_ms=handle_timings_ms,
-                        )
-                        record_rank0_detail_elapsed(
-                            "handle_validate",
-                            layer_id,
-                            handle_timings_ms.get("validate", 0.0),
-                        )
-                        record_rank0_detail_elapsed(
-                            "handle_object_build",
-                            layer_id,
-                            handle_timings_ms.get("object_build", 0.0),
-                        )
+                        handle_timings_ms: dict[str, float]
+                        if handle_prepare_futures is not None:
+                            handle_wait_started = time.perf_counter()
+                            (
+                                handles,
+                                handle_timings_ms,
+                                prepared_worker_ms,
+                            ) = handle_prepare_futures[layer_id].result()
+                            handle_prepare_wait_ms += (
+                                time.perf_counter() - handle_wait_started
+                            ) * 1000
+                            handle_prepare_worker_ms += prepared_worker_ms
+                            handle_prepare_validate_ms += (
+                                handle_timings_ms.get("validate", 0.0)
+                            )
+                            handle_prepare_object_build_ms += (
+                                handle_timings_ms.get("object_build", 0.0)
+                            )
+                        else:
+                            handle_timings_ms = {}
+                            handles = self._make_shared_handles_for_layer(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase",
+                                    "sparse_decode_bootstrap",
+                                ),
+                                keys_layer=(
+                                    preflight_retrieve_keys[layer_id]
+                                    if tail_refresh
+                                    else retrieve_keys[layer_id]
+                                ),
+                                mem_objs_layer=mem_objs_layer,
+                                layer_id=layer_id,
+                                kv_group=kv_group,
+                                chunk_index_offset=(
+                                    refresh_prefix_chunks if tail_refresh else 0
+                                ),
+                                timings_ms=handle_timings_ms,
+                            )
+                            record_rank0_detail_elapsed(
+                                "handle_validate",
+                                layer_id,
+                                handle_timings_ms.get("validate", 0.0),
+                            )
+                            record_rank0_detail_elapsed(
+                                "handle_object_build",
+                                layer_id,
+                                handle_timings_ms.get("object_build", 0.0),
+                            )
                         handle_cache_started = time.perf_counter()
                         self._append_shared_handle_cache(
                             layer_id,
@@ -3567,6 +3667,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
+            shutdown_handle_prepare_tasks()
             release_pending_pre_resolved()
             # The LMCache vLLM adapter records request state after this final
             # yield and drains sparse retrievers with close(), so ownership must
@@ -3611,6 +3712,27 @@ class AscendLMCacheEngine(LMCacheEngine):
                     layer_phase_max_id["consumer_send"],
                     kwargs.get("shared_cpu_rebuild_reason", "unspecified"),
                 )
+
+                if handle_prepare_futures is not None:
+                    logger.info(
+                        "[P2D_SHARED_HANDLE_PREPARE_AHEAD] req=%s "
+                        "kv_group=%d layers=%d chunks_per_layer=%d "
+                        "worker_ms=%.3f foreground_wait_ms=%.3f "
+                        "overlapped_ms=%.3f validate_ms=%.3f "
+                        "object_build_ms=%.3f action=completed",
+                        kwargs.get("req_id", "unspecified"),
+                        kv_group,
+                        self.num_layers,
+                        required_chunks,
+                        handle_prepare_worker_ms,
+                        handle_prepare_wait_ms,
+                        max(
+                            0.0,
+                            handle_prepare_worker_ms - handle_prepare_wait_ms,
+                        ),
+                        handle_prepare_validate_ms,
+                        handle_prepare_object_build_ms,
+                    )
 
                 def log_rank0_detail_summary(
                     marker: str,
@@ -3699,6 +3821,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             yield ret_mask
         finally:
+            shutdown_handle_prepare_tasks()
             release_unowned_cached_publication_objs()
             release_pending_pre_resolved()
 
