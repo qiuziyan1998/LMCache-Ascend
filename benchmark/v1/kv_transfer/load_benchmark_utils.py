@@ -43,6 +43,7 @@ from lmcache_ascend.v1.npu_connector.utils import (
     prepare_sparse_direct_destination_state,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
+    sparse_mla_dsa_batched_direct_kv_transfer_fast,
     sparse_mla_dsa_batched_direct_kv_transfer_prepared,
 )
 
