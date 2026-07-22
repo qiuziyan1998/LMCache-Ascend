@@ -2395,6 +2395,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 strict=False,
                             )
                         ],
+                        skip_global_scan_if_no_allocation=tail_refresh,
                     )
                     capacity_check_ms = (
                         time.perf_counter() - phase_started
@@ -2604,37 +2605,42 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert preflight_error is not None
             raise preflight_error
 
-        pending_pre_resolved_release: List[MemoryObj] = []
+        pending_pre_resolved_release_layers: List[Optional[List[MemoryObj]]] = []
         if (
             shared_sparse_retrieve
             and pre_resolved_shared_mem_layers is not None
             and not use_cached_retrieve
         ):
-            pending_pre_resolved_release = [
-                mem_obj
-                for mem_objs_layer in pre_resolved_shared_mem_layers
-                for mem_obj in mem_objs_layer
-            ]
+            # Keep one ownership slot per layer.  Successful cache handoff can
+            # then clear that slot in O(1), while an early close or failure can
+            # still release every object in the remaining layers.  Flattening
+            # all objects and removing each handed-off object from a list made
+            # full sparse bootstrap quadratic in the number of chunks.
+            pending_pre_resolved_release_layers = list(
+                pre_resolved_shared_mem_layers
+            )
 
         def mark_pre_resolved_layer_handed_off(
-            mem_objs_layer: List[MemoryObj],
+            layer_id: int,
         ) -> None:
-            if cached_memory_objs is None or not pending_pre_resolved_release:
+            if (
+                cached_memory_objs is None
+                or not pending_pre_resolved_release_layers
+            ):
                 return
-            for mem_obj in mem_objs_layer:
-                try:
-                    pending_pre_resolved_release.remove(mem_obj)
-                except ValueError:
-                    pass
+            pending_pre_resolved_release_layers[layer_id] = None
 
         def release_pending_pre_resolved() -> None:
-            nonlocal pending_pre_resolved_release
-            for mem_obj in pending_pre_resolved_release:
-                if getattr(mem_obj, "is_pinned", False):
-                    mem_obj.unpin()
-                if mem_obj.is_valid():
-                    mem_obj.ref_count_down()
-            pending_pre_resolved_release = []
+            nonlocal pending_pre_resolved_release_layers
+            for mem_objs_layer in pending_pre_resolved_release_layers:
+                if mem_objs_layer is None:
+                    continue
+                for mem_obj in mem_objs_layer:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
+            pending_pre_resolved_release_layers = []
 
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
@@ -2827,7 +2833,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                             if shared_sparse_retrieve:
                                 mark_pre_resolved_layer_handed_off(
-                                    mem_objs_layer
+                                    layer_id
                                 )
                     else:
                         mem_objs_layer = []

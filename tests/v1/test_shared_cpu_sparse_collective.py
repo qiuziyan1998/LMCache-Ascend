@@ -70,6 +70,12 @@ class _FakePinnedMemObj:
         self.release_count += 1
 
 
+class _FakePinnedTensorMemObj(_FakePinnedMemObj):
+    def __init__(self, ref_count=1):
+        super().__init__(ref_count=ref_count)
+        self.tensor = torch.empty(1)
+
+
 class _FakeClaimableMemObj:
     def __init__(self):
         self.is_pinned = False
@@ -478,6 +484,79 @@ def test_sparse_rank0_close_after_prime_releases_pre_resolved_memobjs(
     assert all(obj.unpin_count == 1 for obj in allocated)
     assert all(obj.release_count == 1 for obj in allocated)
     assert all(obj.ref_count == 0 for obj in allocated)
+
+
+def test_sparse_rank0_partial_handoff_releases_only_unowned_layers(monkeypatch):
+    """Closing mid-retrieve preserves handed-off layers and releases the rest."""
+
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    keys_layer_major = [["layer-0"], ["layer-1"]]
+    allocated = [[_FakePinnedTensorMemObj()] for _ in range(2)]
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(
+        experimental_sampled_layerwise_lookup=False,
+        shared_cpu_remote_layers_per_batch=2,
+        shared_cpu_remote_max_inflight_batches=1,
+        extra_config={},
+    )
+    engine.storage_manager = object()
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    engine._min_layer_cache_chunks = lambda *_args: 0
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "RemoteBackend",
+        [0],
+        [1],
+        keys_layer_major,
+    )
+    engine._find_shared_rank0_chunk_location = lambda _key: "RemoteBackend"
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {
+        "fits": True
+    }
+    engine._resolve_shared_rank0_remote_layers_windowed = (
+        lambda **_kwargs: allocated
+    )
+    engine._make_shared_handles_for_layer = lambda **_kwargs: ["handle"]
+    engine._broadcast_shared_envelope = lambda _envelope: None
+    cached_memory_objs = []
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    retriever.close()
+
+    handed_off = allocated[0][0]
+    unowned = allocated[1][0]
+    assert cached_memory_objs == [[handed_off], []]
+    assert handed_off.unpin_count == 0
+    assert handed_off.release_count == 0
+    assert unowned.unpin_count == 1
+    assert unowned.release_count == 1
 
 
 @pytest.mark.parametrize(
