@@ -2285,6 +2285,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         preflight_started = time.perf_counter()
         location_scan_ms = 0.0
         capacity_check_ms = 0.0
+        capacity_scan_skipped = False
         materialize_ms = 0.0
         materialize_max_ms = 0.0
         materialize_max_layer = -1
@@ -2396,6 +2397,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         ],
                         skip_global_scan_if_no_allocation=tail_refresh,
+                    )
+                    capacity_scan_skipped = bool(
+                        capacity_details.get("capacity_scan_skipped", False)
                     )
                     capacity_check_ms = (
                         time.perf_counter() - phase_started
@@ -2564,6 +2568,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "capacity_check_ms=%.3f materialize_ms=%.3f "
                 "materialize_max_ms=%.3f materialize_max_layer=%d "
                 "materialize_mode=%s remote_layers_per_batch=%d "
+                "capacity_scan_skipped=%s "
                 "preflight_wall_ms=%.3f status=%s rebuild_reason=%s",
                 kwargs.get("req_id", "unspecified"),
                 kv_group,
@@ -2581,6 +2586,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 materialize_max_layer,
                 materialize_mode,
                 remote_layers_per_batch,
+                capacity_scan_skipped,
                 (time.perf_counter() - preflight_started) * 1000,
                 "error" if preflight_error is not None else "ok",
                 kwargs.get("shared_cpu_rebuild_reason", "unspecified"),
