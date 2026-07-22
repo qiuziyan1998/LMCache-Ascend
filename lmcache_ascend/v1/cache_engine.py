@@ -76,6 +76,17 @@ class ThreadSafeEventList:
 class AscendLMCacheEngine(LMCacheEngine):
     """Ascend NPU variant of ``LMCacheEngine`` with an async store path."""
 
+    supports_parallel_shared_cpu_group_preflight = True
+
+    def can_run_parallel_shared_cpu_group_preflight(self) -> bool:
+        """Return whether this worker may coordinate group preflights.
+
+        Only the active shared-cache rank performs remote materialization.
+        Passive TP ranks must retain serial generator order because their
+        layerwise receive path participates in ordered collectives.
+        """
+        return not self._is_passive() and not self._is_indexer_passive()
+
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -925,28 +936,37 @@ class AscendLMCacheEngine(LMCacheEngine):
             not callable(lazy_init_with_staging) and not callable(lazy_init)
         ):
             return
-        if "kvcaches" in kwargs:
-            init_kvcaches(**kwargs)
-        kvcaches = getattr(self.gpu_connector, "kvcaches", None)
-        if kvcaches is not None:
-            kv_group = kwargs.get("kv_group", 0)
-            if callable(lazy_init_with_staging):
-                lazy_init_with_staging(
-                    kvcaches,
-                    kv_group=kv_group,
-                    init_staging=False,
-                )
-                return
-            # The layerwise NPU connector detects format per kv_group; other
-            # connectors (e.g. the blending buffer connector) may not accept
-            # the kwarg, so fall back to the positional call for them.
-            try:
-                lazy_init(kvcaches, kv_group=kv_group, init_staging=False)
-            except TypeError:
+        # initialize_kvcaches_ptr mirrors the requested group into connector
+        # instance state. Keep that write, the following read, and first-time
+        # group layout detection atomic; remote CPU materialization happens
+        # after this short critical section and remains fully concurrent.
+        with self._engine_state_lock:
+            if "kvcaches" in kwargs:
+                init_kvcaches(**kwargs)
+            kvcaches = getattr(self.gpu_connector, "kvcaches", None)
+            if kvcaches is not None:
+                kv_group = kwargs.get("kv_group", 0)
+                if callable(lazy_init_with_staging):
+                    lazy_init_with_staging(
+                        kvcaches,
+                        kv_group=kv_group,
+                        init_staging=False,
+                    )
+                    return
+                # The layerwise NPU connector detects format per kv_group;
+                # other connectors (e.g. the blending buffer connector) may
+                # not accept the kwarg, so fall back to the positional call.
                 try:
-                    lazy_init(kvcaches, kv_group=kv_group)
+                    lazy_init(
+                        kvcaches,
+                        kv_group=kv_group,
+                        init_staging=False,
+                    )
                 except TypeError:
-                    lazy_init(kvcaches)
+                    try:
+                        lazy_init(kvcaches, kv_group=kv_group)
+                    except TypeError:
+                        lazy_init(kvcaches)
 
     def _expected_shared_cpu_chunk_metadata(
         self,
@@ -2296,34 +2316,254 @@ class AscendLMCacheEngine(LMCacheEngine):
                 or preflight_error is None
             ):
                 return
-            request_preflight_state.setdefault(
-                "source_kv_group",
+
+            def commit_error() -> None:
+                errors = request_preflight_state.setdefault("_errors", {})
+                errors.setdefault(
+                    kv_group,
+                    {
+                        "source_kv_group": kv_group,
+                        "source_layer_id": preflight_error_envelope.layer_id,
+                        "message": preflight_error_envelope.message,
+                        "details": preflight_error_envelope.error_details,
+                        "error": preflight_error,
+                    },
+                )
+                # Match the former serial group order even if concurrent
+                # materialization failures complete in the opposite order.
+                source_group = min(errors)
+                request_preflight_state.update(errors[source_group])
+
+            state_lock = request_preflight_state.get("_lock")
+            if state_lock is None:
+                commit_error()
+            else:
+                with state_lock:
+                    commit_error()
+
+        def request_preflight_state_snapshot() -> dict[str, Any]:
+            if not isinstance(request_preflight_state, dict):
+                return {}
+            state_lock = request_preflight_state.get("_lock")
+            if state_lock is None:
+                return dict(request_preflight_state)
+            with state_lock:
+                return dict(request_preflight_state)
+
+        def synchronize_request_preflight_capacity(
+            capacity: Optional[dict[str, Any]],
+            *,
+            remote_only: bool,
+        ) -> tuple[Optional[dict[str, Any]], bool]:
+            if not isinstance(request_preflight_state, dict):
+                return capacity, False
+            capacity_barrier = request_preflight_state.get(
+                "_capacity_barrier"
+            )
+            state_lock = request_preflight_state.get("_lock")
+            if capacity_barrier is None or state_lock is None:
+                return capacity, False
+
+            with state_lock:
+                capacity_by_group = request_preflight_state.setdefault(
+                    "_capacity_details_by_group", {}
+                )
+                capacity_by_group[kv_group] = (
+                    None if capacity is None else dict(capacity)
+                )
+                remote_by_group = request_preflight_state.setdefault(
+                    "_remote_only_by_group", {}
+                )
+                remote_by_group[kv_group] = remote_only
+
+            try:
+                capacity_barrier.wait()
+            except threading.BrokenBarrierError:
+                with state_lock:
+                    unexpected = dict(
+                        request_preflight_state.get(
+                            "_unexpected_errors", {}
+                        )
+                    )
+                if unexpected:
+                    raise unexpected[min(unexpected)]
+                raise
+
+            with state_lock:
+                if not request_preflight_state.get(
+                    "_capacity_decision_ready", False
+                ):
+                    capacity_by_group = request_preflight_state[
+                        "_capacity_details_by_group"
+                    ]
+                    remote_by_group = request_preflight_state[
+                        "_remote_only_by_group"
+                    ]
+                    both_remote = all(
+                        remote_by_group.get(group_id, False)
+                        for group_id in (0, 1)
+                    )
+                    request_preflight_state[
+                        "_serialize_materialization"
+                    ] = not both_remote
+
+                    latent_capacity = capacity_by_group.get(0)
+                    indexer_capacity = capacity_by_group.get(1)
+                    if (
+                        both_remote
+                        and latent_capacity is not None
+                        and indexer_capacity is not None
+                    ):
+                        required_bytes = int(
+                            latent_capacity.get("required_bytes", 0)
+                        ) + int(indexer_capacity.get("required_bytes", 0))
+                        available_bytes = int(
+                            latent_capacity.get(
+                                "available_after_eviction", 0
+                            )
+                        )
+                        failure_source = None
+                        if not latent_capacity.get("fits", False):
+                            failure_source = 0
+                        elif (
+                            not indexer_capacity.get("fits", False)
+                            or required_bytes > available_bytes
+                        ):
+                            # Serial group order materializes group 0 first;
+                            # request-level excess therefore belongs to group 1.
+                            failure_source = 1
+
+                        for group_id, group_capacity in (
+                            (0, latent_capacity),
+                            (1, indexer_capacity),
+                        ):
+                            updated = dict(group_capacity)
+                            updated.update(
+                                {
+                                    "request_required_bytes": required_bytes,
+                                    "request_available_before_materialization": (
+                                        available_bytes
+                                    ),
+                                    "request_capacity_failure_source": (
+                                        failure_source
+                                    ),
+                                }
+                            )
+                            if failure_source == group_id:
+                                updated["fits"] = False
+                            capacity_by_group[group_id] = updated
+
+                    request_preflight_state[
+                        "_capacity_decision_ready"
+                    ] = True
+
+                serialized = bool(
+                    request_preflight_state.get(
+                        "_serialize_materialization", False
+                    )
+                )
+                selected_capacity = request_preflight_state[
+                    "_capacity_details_by_group"
+                ].get(kv_group)
+
+            logger.info(
+                "[P2D_SHARED_CPU_GROUP_PREFLIGHT_COORDINATION] "
+                "req=%s kv_group=%d remote_only=%s "
+                "serialize_materialization=%s group_required_bytes=%s "
+                "request_required_bytes=%s request_available_bytes=%s "
+                "capacity_failure_source=%s",
+                kwargs.get("req_id", "unspecified"),
                 kv_group,
+                remote_only,
+                serialized,
+                (
+                    selected_capacity.get("required_bytes")
+                    if selected_capacity is not None
+                    else None
+                ),
+                (
+                    selected_capacity.get("request_required_bytes")
+                    if selected_capacity is not None
+                    else None
+                ),
+                (
+                    selected_capacity.get(
+                        "request_available_before_materialization"
+                    )
+                    if selected_capacity is not None
+                    else None
+                ),
+                (
+                    selected_capacity.get(
+                        "request_capacity_failure_source"
+                    )
+                    if selected_capacity is not None
+                    else None
+                ),
             )
-            request_preflight_state.setdefault(
-                "source_layer_id",
-                preflight_error_envelope.layer_id,
+
+            if serialized:
+                condition = request_preflight_state.get(
+                    "_materialize_condition"
+                )
+                if condition is None:
+                    raise RuntimeError(
+                        "Parallel group preflight is missing its ordered "
+                        "materialization condition."
+                    )
+                with condition:
+                    condition.wait_for(
+                        lambda: (
+                            request_preflight_state.get(
+                                "_materialize_next_group"
+                            )
+                            == kv_group
+                            or bool(
+                                request_preflight_state.get(
+                                    "_unexpected_errors"
+                                )
+                            )
+                        )
+                    )
+                    unexpected = request_preflight_state.get(
+                        "_unexpected_errors", {}
+                    )
+                    if unexpected:
+                        raise unexpected[min(unexpected)]
+            return selected_capacity, serialized
+
+        def complete_request_preflight_materialization(
+            serialized: bool,
+        ) -> None:
+            if not serialized or not isinstance(
+                request_preflight_state, dict
+            ):
+                return
+            condition = request_preflight_state.get(
+                "_materialize_condition"
             )
-            request_preflight_state.setdefault(
-                "message",
-                preflight_error_envelope.message,
-            )
-            request_preflight_state.setdefault(
-                "details",
-                preflight_error_envelope.error_details,
-            )
-            request_preflight_state.setdefault("error", preflight_error)
+            if condition is None:
+                return
+            with condition:
+                if (
+                    request_preflight_state.get("_materialize_next_group")
+                    == kv_group
+                ):
+                    request_preflight_state["_materialize_next_group"] = (
+                        kv_group + 1
+                    )
+                condition.notify_all()
 
         def request_preflight_failed_elsewhere() -> bool:
+            state = request_preflight_state_snapshot()
             return (
-                isinstance(request_preflight_state, dict)
-                and "error" in request_preflight_state
-                and request_preflight_state.get("source_kv_group") != kv_group
+                "error" in state and state.get("source_kv_group") != kv_group
             )
 
         def make_request_preflight_error_envelope() -> SharedHandleEnvelope:
             assert isinstance(request_preflight_state, dict)
-            source_kv_group = request_preflight_state.get("source_kv_group")
+            state = request_preflight_state_snapshot()
+            source_kv_group = state.get("source_kv_group")
             message = (
                 "Shared CPU sparse decode request preflight failed before "
                 "any handle publication."
@@ -2337,11 +2577,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 message=message,
                 details={
                     "source_kv_group": source_kv_group,
-                    "source_layer_id": request_preflight_state.get(
-                        "source_layer_id"
-                    ),
-                    "source_message": request_preflight_state.get("message"),
-                    "source_details": request_preflight_state.get("details"),
+                    "source_layer_id": state.get("source_layer_id"),
+                    "source_message": state.get("message"),
+                    "source_details": state.get("details"),
                 },
             )
 
@@ -2350,6 +2588,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         location_scan_ms = 0.0
         capacity_check_ms = 0.0
         capacity_scan_skipped = False
+        capacity_details: Optional[dict[str, Any]] = None
+        materialization_serialized = False
+        request_preflight_synchronized = False
         materialize_ms = 0.0
         materialize_max_ms = 0.0
         materialize_max_layer = -1
@@ -2438,6 +2679,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                     f"{message} missing={missing_locations}"
                 )
                 record_request_preflight_error()
+                _, materialization_serialized = (
+                    synchronize_request_preflight_capacity(
+                        None,
+                        remote_only=False,
+                    )
+                )
+                request_preflight_synchronized = True
+                complete_request_preflight_materialization(
+                    materialization_serialized
+                )
             else:
                 try:
                     phase_started = time.perf_counter()
@@ -2471,38 +2722,52 @@ class AscendLMCacheEngine(LMCacheEngine):
                 except Exception:
                     release_local_prefix_layers()
                     raise
+                remote_only = all(
+                    location_name == "RemoteBackend"
+                    for layer_locations in shared_chunk_locations_layer_major
+                    for location_name in layer_locations
+                )
+                capacity_details, materialization_serialized = (
+                    synchronize_request_preflight_capacity(
+                        capacity_details,
+                        remote_only=remote_only,
+                    )
+                )
+                request_preflight_synchronized = True
+                assert capacity_details is not None
                 if not capacity_details.get("fits", False):
-                    message = (
-                        "Shared CPU sparse decode capacity check failed before "
-                        "rank0 materialization."
-                    )
-                    preflight_error_envelope = self._shared_layerwise_error_envelope(
-                        req_id=kwargs.get("req_id", "unspecified"),
-                        phase=kwargs.get(
-                            "shared_cpu_phase", "sparse_decode_bootstrap"
-                        ),
-                        request_ordinal=request_ordinal,
-                        layer_id=0,
-                        kv_group=kv_group,
-                        message=message,
-                        details=capacity_details,
-                    )
-                    preflight_error = ValueError(
-                        f"{message} details={capacity_details}"
-                    )
-                    release_local_prefix_layers()
-                    record_request_preflight_error()
+                    try:
+                        message = (
+                            "Shared CPU sparse decode capacity check failed "
+                            "before rank0 materialization."
+                        )
+                        preflight_error_envelope = (
+                            self._shared_layerwise_error_envelope(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase",
+                                    "sparse_decode_bootstrap",
+                                ),
+                                request_ordinal=request_ordinal,
+                                layer_id=0,
+                                kv_group=kv_group,
+                                message=message,
+                                details=capacity_details,
+                            )
+                        )
+                        preflight_error = ValueError(
+                            f"{message} details={capacity_details}"
+                        )
+                        release_local_prefix_layers()
+                        record_request_preflight_error()
+                    finally:
+                        complete_request_preflight_materialization(
+                            materialization_serialized
+                        )
                 else:
                     pre_resolved_shared_mem_layers = []
                     materialize_started = time.perf_counter()
                     try:
-                        remote_only = all(
-                            location_name == "RemoteBackend"
-                            for layer_locations in (
-                                shared_chunk_locations_layer_major
-                            )
-                            for location_name in layer_locations
-                        )
                         if remote_layers_per_batch > 1 and remote_only:
                             materialize_mode = "windowed_remote"
                             release_local_prefix_layers()
@@ -2612,6 +2877,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                         materialize_ms = (
                             time.perf_counter() - materialize_started
                         ) * 1000
+                        complete_request_preflight_materialization(
+                            materialization_serialized
+                        )
+
+        if not request_preflight_synchronized:
+            _, materialization_serialized = (
+                synchronize_request_preflight_capacity(
+                    None,
+                    remote_only=True,
+                )
+            )
+            request_preflight_synchronized = True
+            complete_request_preflight_materialization(
+                materialization_serialized
+            )
 
         if shared_sparse_retrieve and not shared_retrieve_passive:
             local_chunks = sum(
@@ -2660,12 +2940,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             release_pre_resolved_shared_mem_layers()
             release_local_prefix_layers()
             preflight_error_envelope = make_request_preflight_error_envelope()
+            state = request_preflight_state_snapshot()
             preflight_error = ValueError(
                 "Shared CPU sparse decode request preflight failed before "
                 "handle publication: "
-                f"source_kv_group="
-                f"{request_preflight_state.get('source_kv_group')}, "
-                f"message={request_preflight_state.get('message')}"
+                f"source_kv_group={state.get('source_kv_group')}, "
+                f"message={state.get('message')}"
             )
 
         if preflight_error_envelope is not None:
@@ -2918,12 +3198,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                     pre_resolved_shared_mem_layers = None
                     error_envelope = make_request_preflight_error_envelope()
                     self._broadcast_shared_envelope(error_envelope)
+                    state = request_preflight_state_snapshot()
                     raise ValueError(
                         "Shared CPU sparse decode request preflight failed "
                         "before handle publication: "
-                        f"source_kv_group="
-                        f"{request_preflight_state.get('source_kv_group')}, "
-                        f"message={request_preflight_state.get('message')}"
+                        f"source_kv_group={state.get('source_kv_group')}, "
+                        f"message={state.get('message')}"
                     )
 
                 phase_started = time.perf_counter()

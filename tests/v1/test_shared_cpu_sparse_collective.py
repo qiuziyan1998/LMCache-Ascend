@@ -2,6 +2,8 @@
 """Shared CPU sparse decode collective-order tests."""
 
 # Standard
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 # Third Party
@@ -18,6 +20,24 @@ from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
 )
+
+
+@pytest.mark.parametrize(
+    ("latent_passive", "indexer_passive", "expected"),
+    [
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_parallel_group_preflight_is_active_rank_only(
+    latent_passive, indexer_passive, expected
+):
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._is_passive = lambda: latent_passive
+    engine._is_indexer_passive = lambda: indexer_passive
+
+    assert engine.can_run_parallel_shared_cpu_group_preflight() is expected
 
 
 def test_layout_probe_does_not_initialize_staging() -> None:
@@ -40,6 +60,7 @@ def test_layout_probe_does_not_initialize_staging() -> None:
 
     connector = _LayoutOnlyConnector()
     engine = object.__new__(AscendLMCacheEngine)
+    engine._engine_state_lock = threading.RLock()
     engine.gpu_connector = connector
     kvcaches = [object()]
 
@@ -456,6 +477,107 @@ def test_sparse_request_preflight_error_prevents_partial_latent_publication(
     assert all(obj.unpin_count == 1 for obj in allocated)
     assert all(obj.release_count == 1 for obj in allocated)
     assert all(obj.ref_count == 1 for obj in allocated)
+
+
+def test_parallel_group_preflight_checks_combined_capacity_before_materialize(
+    monkeypatch,
+):
+    """Request capacity is checked before either remote group allocates."""
+
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(
+        experimental_sampled_layerwise_lookup=False,
+        shared_cpu_remote_layers_per_batch=2,
+        shared_cpu_remote_max_inflight_batches=1,
+        extra_config={"mooncake_page_first_multi_buffer": True},
+    )
+    engine.storage_manager = object()
+    engine.gpu_connector = object()
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    engine._min_layer_cache_chunks = lambda *_args: 0
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "RemoteBackend",
+        [0],
+        [4],
+        [["layer0-key"], ["layer1-key"]],
+    )
+    engine._find_shared_rank0_chunk_location = lambda _key: "RemoteBackend"
+
+    def capacity_details(**kwargs):
+        required_bytes = 10 if kwargs["kv_group"] == 0 else 6
+        return {
+            "fits": True,
+            "required_bytes": required_bytes,
+            "available_after_eviction": 15,
+        }
+
+    engine._shared_cpu_runtime_capacity_details = capacity_details
+    allocated = [[_FakePinnedMemObj()] for _ in range(2)]
+    materialized_groups = []
+
+    def resolve_remote(**kwargs):
+        materialized_groups.append(kwargs["kv_group"])
+        if kwargs["kv_group"] != 0:
+            raise AssertionError("group 1 must fail capacity before allocation")
+        return allocated
+
+    engine._resolve_shared_rank0_remote_layers_windowed = resolve_remote
+    broadcasts = []
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+
+    state_lock = threading.Lock()
+    shared_preflight_state = {
+        "_lock": state_lock,
+        "_errors": {},
+        "_materialize_condition": threading.Condition(state_lock),
+        "_materialize_next_group": 0,
+        "_capacity_barrier": threading.Barrier(2),
+    }
+
+    def make_retriever(kv_group):
+        return engine.retrieve_layer_head_token_wise(
+            [1, 2, 3, 4],
+            cached_keys=[],
+            cached_starts=[],
+            cached_ends=[],
+            kv_group=kv_group,
+            req_id="req-1",
+            shared_cpu_request_preflight_state=shared_preflight_state,
+        )
+
+    latent = make_retriever(0)
+    indexer = make_retriever(1)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(next, latent), executor.submit(next, indexer)]
+        for future in futures:
+            future.result(timeout=2)
+
+    assert materialized_groups == [0]
+    assert shared_preflight_state["source_kv_group"] == 1
+    assert broadcasts == []
+    assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)
+    assert all(obj.release_count == 1 for layer in allocated for obj in layer)
+
+    with pytest.raises(ValueError, match="capacity check failed"):
+        next(indexer)
+    with pytest.raises(ValueError, match="request preflight failed"):
+        next(latent)
+
+    assert len(broadcasts) == 2
+    assert all(envelope.status == "error" for envelope in broadcasts)
 
 
 def test_sparse_rank0_close_after_prime_releases_pre_resolved_memobjs(

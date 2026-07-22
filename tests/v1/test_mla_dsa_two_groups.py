@@ -14,6 +14,7 @@ Covers:
 - Integration: two-group store/load roundtrip with separate latent and indexer keys
 """
 # Standard
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -557,6 +558,7 @@ class TestLayerwiseLayoutWarmup:
         )
         engine.gpu_connector = connector
 
+        engine._engine_state_lock = threading.RLock()
         AscendLMCacheEngine._ensure_layerwise_connector_layout(
             engine,
             kvcaches=connector.kvcaches,
