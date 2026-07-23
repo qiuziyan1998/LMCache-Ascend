@@ -510,7 +510,6 @@ def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(
     engine.config = SimpleNamespace(
         experimental_sampled_layerwise_lookup=False,
         shared_cpu_remote_layers_per_batch=2,
-        shared_cpu_remote_max_inflight_batches=3,
         extra_config={"mooncake_page_first_multi_buffer": page_first},
     )
     engine.storage_manager = object()
@@ -562,7 +561,6 @@ def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(
     assert len(windowed_calls) == 1
     assert windowed_calls[0]["keys_layer_major"] == keys_layer_major
     assert windowed_calls[0]["layers_per_batch"] == expected_layers_per_batch
-    assert windowed_calls[0]["max_inflight_batches"] == 3
 
     retriever.close()
     assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)
@@ -592,7 +590,6 @@ def test_page_first_windowed_preflight_reads_only_missing_suffix(monkeypatch):
     engine.config = SimpleNamespace(
         experimental_sampled_layerwise_lookup=False,
         shared_cpu_remote_layers_per_batch=1,
-        shared_cpu_remote_max_inflight_batches=1,
         extra_config={"mooncake_page_first_multi_buffer": True},
     )
     engine.storage_manager = object()
@@ -647,7 +644,6 @@ def test_page_first_windowed_preflight_reads_only_missing_suffix(monkeypatch):
     assert len(windowed_calls) == 1
     assert windowed_calls[0]["keys_layer_major"] == missing_keys
     assert windowed_calls[0]["layers_per_batch"] == num_layers
-    assert windowed_calls[0]["max_inflight_batches"] == 1
 
     retriever.close()
     assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)
