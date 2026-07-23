@@ -1781,15 +1781,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self._track_sync_store_futures(required_futures)
                     for mem_obj in flattened_memory_objs:
                         pending_store_release.pop(id(mem_obj), None)
-                    logger.info(
-                        "[P2D_MOONCAKE_PAGE_FIRST_STORE] req=%s kv_group=%s "
-                        "layers=%d chunks=%d logical_keys=%d",
-                        req_id,
-                        kv_group,
-                        self.num_layers,
-                        len(starts),
-                        len(flattened_keys),
-                    )
 
                 tot_time = time.perf_counter() - t_start
                 logger.info(
