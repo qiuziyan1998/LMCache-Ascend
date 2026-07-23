@@ -569,6 +569,91 @@ def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(
     assert all(obj.release_count == 1 for layer in allocated for obj in layer)
 
 
+def test_page_first_windowed_preflight_reads_only_missing_suffix(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    num_layers = 2
+    old_keys = [f"layer-{layer}-old" for layer in range(num_layers)]
+    new_keys = [f"layer-{layer}-new" for layer in range(num_layers)]
+    keys_layer_major = [
+        [old_keys[layer], new_keys[layer]] for layer in range(num_layers)
+    ]
+    missing_keys = [[key] for key in new_keys]
+    allocated = [[_FakePinnedMemObj()] for _ in range(num_layers)]
+    cached_memory_objs = [
+        [_FakeTensorMemObj(torch.empty(1))] for _ in range(num_layers)
+    ]
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = num_layers
+    engine.config = SimpleNamespace(
+        experimental_sampled_layerwise_lookup=False,
+        shared_cpu_remote_layers_per_batch=1,
+        shared_cpu_remote_max_inflight_batches=1,
+        extra_config={"mooncake_page_first_multi_buffer": True},
+    )
+    engine.storage_manager = object()
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.shared_cpu_cache_generation = 7
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "RemoteBackend",
+        [0, 1],
+        [1, 2],
+        keys_layer_major,
+    )
+    located_keys = []
+    engine._find_shared_rank0_chunk_location = lambda key: (
+        located_keys.append(key) or "RemoteBackend"
+    )
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {"fits": True}
+    windowed_calls = []
+
+    def resolve_windowed(**kwargs):
+        windowed_calls.append(kwargs)
+        return allocated
+
+    engine._resolve_shared_rank0_remote_layers_windowed = resolve_windowed
+    engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("layerwise resolver must be bypassed"))
+    engine._broadcast_shared_envelope = lambda _envelope: None
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1, 2],
+        cached_keys=[[key] for key in old_keys],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[["old-handle"] for _ in range(num_layers)],
+        kv_group=0,
+        req_id="req-incremental",
+    )
+
+    next(retriever)
+
+    assert located_keys == new_keys
+    assert len(windowed_calls) == 1
+    assert windowed_calls[0]["keys_layer_major"] == missing_keys
+    assert windowed_calls[0]["layers_per_batch"] == num_layers
+    assert windowed_calls[0]["max_inflight_batches"] == 1
+
+    retriever.close()
+    assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)
+    assert all(obj.release_count == 1 for layer in allocated for obj in layer)
+
+
 def test_sampled_sparse_preflight_batches_local_misses_without_contains(
     monkeypatch,
 ):
