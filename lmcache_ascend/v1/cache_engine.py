@@ -2499,15 +2499,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         if mooncake_page_layout_enabled(self.config):
             remote_layers_per_batch = self.num_layers
-        remote_max_inflight_batches = max(
-            1,
-            int(
-                self._get_shared_config_value(
-                    "shared_cpu_remote_max_inflight_batches",
-                    1,
-                )
-            ),
-        )
         if (
             shared_sparse_retrieve
             and not use_cached_retrieve
@@ -2626,9 +2617,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     kv_group=kv_group,
                                     keys_layer_major=missing_keys,
                                     layers_per_batch=remote_layers_per_batch,
-                                    max_inflight_batches=(
-                                        remote_max_inflight_batches
-                                    ),
                                 )
                             )
                         else:
