@@ -24,5 +24,23 @@ logger = init_logger(__name__)
 
 class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
     supports_dsa_index_lmcache = True
+
+    @property
+    def uses_layerwise_model_callbacks(self) -> bool:
+        """Whether model-layer Python callbacks are part of this execution."""
+        return bool(getattr(self._lmcache_engine, "use_layerwise", False))
+
+    @property
+    def supports_staged_sfa_sparse_load(self) -> bool:
+        """Advertise the exact staged-SFA selective-load contract."""
+        engine = self._lmcache_engine
+        config = getattr(engine, "config", None)
+        return bool(
+            getattr(engine, "use_layerwise", False)
+            and getattr(engine, "kv_role", None)
+            in ("kv_both", "kv_consumer")
+            and getattr(config, "dsa_two_groups", False)
+        )
+
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole) -> None:
         super().__init__(vllm_config=vllm_config, role=role)

@@ -4,24 +4,19 @@ from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
 from lmcache.integration.vllm.vllm_v1_adapter import (
-    LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
+    ReqMeta,
 )
 from lmcache.logging import init_logger
-from lmcache.utils import _lmcache_nvtx_annotate
-from vllm.config import (
-    VllmConfig,
-)
+from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
-from vllm.distributed.parallel_state import get_pp_group
 import torch
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.forward_context import ForwardContext
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -37,260 +32,78 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
         super().__init__(vllm_config, role, parent)
         self.store_async = self.config.store_async
-        self._wait_for_save_done = True
-        self._finished_req_ids_waiting_for_save: set[str] = set()
-        self._late_finished_sending: set[str] = set()
-        logger.debug("store_async: %s", self.store_async)
-
-    @staticmethod
-    def _save_storer_key(req_id: str, kv_group: int) -> tuple[str, int]:
-        """Use explicit group keys for Ascend two-group layerwise stores."""
-        return (req_id, kv_group)
-
-    @_lmcache_nvtx_annotate
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        self.current_layer = 0
-        self._wait_for_save_done = False
-        super().start_load_kv(forward_context, **kwargs)
-
-    @_lmcache_nvtx_annotate
-    def wait_for_save(self):
-        """Blocking until the KV cache is saved to the connector buffer."""
-
-        connector_metadata = self._parent._get_connector_metadata()
-        assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-
-        if self.kv_role == "kv_consumer":
-            if self.lmcache_engine is not None:
-                for request in connector_metadata.requests:
-                    self._maybe_lookup_unpin_for_request(request)
-            self._wait_for_save_done = True
-            return
-
-        if self.use_layerwise:
-            assert not self.store_async, (
+        if (
+            role != KVConnectorRole.SCHEDULER
+            and self.kv_role != "kv_consumer"
+            and self.use_layerwise
+            and self.store_async
+        ):
+            raise ValueError(
                 "Layerwise storing is not supported with async store"
             )
-            should_defer_latent = getattr(
-                self, "_should_defer_latent_save_under_tp", None
-            )
-            if callable(should_defer_latent) and should_defer_latent():
-                pending = getattr(self, "_deferred_latent_pending", set())
-                for request in connector_metadata.requests:
-                    pending_key = self._layerwise_save_storer_key(request, 0)
-                    if pending_key in pending:
-                        logger.warning(
-                            "Flushing deferred MLA latent store in "
-                            "wait_for_save fallback: req_id=%s",
-                            request.req_id,
-                        )
-                        self._flush_deferred_latent_store(
-                            request, request.save_spec
-                        )
+        logger.debug("store_async: %s", self.store_async)
 
-            for request in connector_metadata.requests:
-                storer_items = [
-                    (_kv_group, self._layerwise_save_storer_key(request, _kv_group))
-                    for _kv_group in (0, 1)
-                ]
+    def _effective_skip_leading_tokens(
+        self,
+        _request: ReqMeta,
+        save_spec: Any,
+    ) -> int:
+        # Ascend chunked prefill must not use producer transfer progress here.
+        return save_spec.skip_leading_tokens
 
-                for _kv_group, storer_key in storer_items:
-                    matched_current_storer_key = True
-                    layerwise_storer = self._layerwise_save_storers.pop(
-                        storer_key, None
-                    )
-                    if layerwise_storer is None:
-                        matched_current_storer_key = False
-                        legacy_key = self._save_storer_key(
-                            request.req_id, _kv_group
-                        )
-                        if legacy_key != storer_key:
-                            layerwise_storer = self._layerwise_save_storers.pop(
-                                legacy_key, None
-                            )
-                    if layerwise_storer is None and _kv_group == 0:
-                        layerwise_storer = self._layerwise_save_storers.pop(
-                            request.req_id, None
-                        )
-                        matched_current_storer_key = False
-                        if layerwise_storer is not None:
-                            logger.warning(
-                                "Draining legacy MLA latent storer key for "
-                                "request %s; expected key=%s. A stale latent "
-                                "store can otherwise survive across forwards.",
-                                request.req_id,
-                                storer_key,
-                            )
-                    if layerwise_storer is not None:
-                        save_completed = True
-                        try:
-                            drain_storer = getattr(
-                                self, "_drain_layerwise_storer_fully", None
-                            )
-                            if callable(drain_storer):
-                                save_completed = (
-                                    drain_storer(layerwise_storer) is not False
-                                )
-                            else:
-                                try:
-                                    next(layerwise_storer)
-                                except StopIteration:
-                                    pass
-                        finally:
-                            close_storer = getattr(
-                                self, "_close_layerwise_storer", None
-                            )
-                            if callable(close_storer):
-                                close_storer(layerwise_storer)
-                            else:
-                                close_fn = getattr(layerwise_storer, "close", None)
-                                if callable(close_fn):
-                                    try:
-                                        close_fn()
-                                    except (GeneratorExit, RuntimeError, ValueError):
-                                        pass
-                        if save_completed and matched_current_storer_key:
-                            record_completed = getattr(
-                                self,
-                                "_record_decode_window_save_group_completed",
-                                None,
-                            )
-                            if callable(record_completed):
-                                record_completed(request, _kv_group)
-                self._maybe_seed_worker_retrieve_state_from_store(request)
-                self._mark_decode_window_save_completed(request)
-                self._maybe_lookup_unpin_for_request(request)
-            assert self.lmcache_engine is not None
-            self.lmcache_engine.wait_for_pending_sync_stores()
-            self._wait_for_save_done = True
-            replay_finished = getattr(
-                self, "_replay_finished_stores_after_save", None
-            )
-            if callable(replay_finished):
-                replay_finished()
-            return
-
-        assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
-
+    def _prepare_direct_store_inputs(
+        self,
+        _request: ReqMeta,
+        slot_mapping: torch.Tensor,
+        save_context: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         assert self.lmcache_engine is not None
+        ordering_event = save_context.get("ordering_event")
+        if ordering_event is None:
+            ordering_event = torch.npu.Event()
+            ordering_event.record()
+            save_context["ordering_event"] = ordering_event
 
-        # lmcache-ascend start ---------------------
-        ordering_event = torch.npu.Event()
-        ordering_event.record()
-        # lmcache-ascend end ---------------------
-
-        for request in connector_metadata.requests:
-            self._maybe_lookup_unpin_for_request(request)
-
-            try:
-                save_spec = request.save_spec
-                if (
-                    save_spec is None or not save_spec.can_save
-                ) and self.kv_role != "kv_producer":
-                    continue
-
-                token_ids = request.token_ids
-
-                assert request.slot_mapping is not None and len(request.slot_mapping) > 0
-                slot_mapping = request.slot_mapping[0]
-                assert len(slot_mapping) == len(token_ids)
-
-                # lmcache-ascend start ---------------------
-                if slot_mapping.device.type == "npu":
-                    slot_mapping_npu = slot_mapping.to(dtype=torch.long)
-                else:
-                    slot_mapping = slot_mapping.pin_memory()
-                    with torch.npu.stream(
-                        self.lmcache_engine.gpu_connector.store_stream
-                    ):
-                        slot_mapping_npu = slot_mapping.to(
-                            device="npu", dtype=torch.long, non_blocking=True
-                        )
-                # lmcache-ascend end ---------------------
-
-                skip_leading_tokens = save_spec.skip_leading_tokens
-
-                if skip_leading_tokens == len(token_ids):
-                    continue
-                skip_leading_tokens = (
-                    skip_leading_tokens
-                    // self._lmcache_chunk_size
-                    * self._lmcache_chunk_size
+        if slot_mapping.device.type == "npu":
+            slot_mapping_npu = slot_mapping.to(dtype=torch.long)
+        else:
+            slot_mapping = slot_mapping.pin_memory()
+            with torch.npu.stream(
+                self.lmcache_engine.gpu_connector.store_stream
+            ):
+                slot_mapping_npu = slot_mapping.to(
+                    device="npu",
+                    dtype=torch.long,
+                    non_blocking=True,
                 )
+        return slot_mapping, {
+            "ordering_event": ordering_event,
+            "slot_mapping_npu": slot_mapping_npu,
+        }
 
-                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
+    def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
+            self.lmcache_engine.wait_for_pending_sync_stores()
 
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
-                    len(token_ids),
-                    skip_leading_tokens,
-                    request.req_id,
-                )
-
-                is_last_prefill = request.is_last_prefill
-                if is_last_prefill:
-                    if request.disagg_spec:
-                        request.disagg_spec.is_last_prefill = True
-                else:
-                    if not self.enable_blending:
-                        token_len = len(token_ids)
-                        aligned_token_len = (
-                            token_len
-                            // self._lmcache_chunk_size
-                            * self._lmcache_chunk_size
-                        )
-                        token_ids = token_ids[:aligned_token_len]
-                        store_mask = store_mask[:aligned_token_len]
-                        slot_mapping = slot_mapping[:aligned_token_len]
-
-                self.lmcache_engine.store(
-                    token_ids,
-                    mask=store_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens,
-                    transfer_spec=request.disagg_spec,
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                    ordering_event=ordering_event,
-                    slot_mapping_npu=slot_mapping_npu,
-                )
-
-                if get_pp_group().is_last_rank:
-                    save_spec.skip_leading_tokens = len(token_ids)
-                    if request.disagg_spec:
-                        request.disagg_spec.num_transferred_tokens = len(token_ids)
-            except Exception:
-                # Do not let one failing request abort the save loop
-                logger.exception(
-                    "wait_for_save failed for request %s; skipping save",
-                    request.req_id,
-                )
-                continue
-
-        self.lmcache_engine.wait_for_pending_sync_stores()
-        self._wait_for_save_done = True
-        self._replay_finished_stores_after_save()
-
-    def _may_register_store_after_wait_for_save(self, request: "Request") -> bool:
-        if self.kv_role == "kv_consumer":
-            return False
-        save_spec = request.save_spec
-        if save_spec is None:
-            return False
-        if not save_spec.can_save and self.kv_role != "kv_producer":
-            return False
-        return save_spec.skip_leading_tokens != len(request.token_ids)
+    def _handle_save_request_error(
+        self,
+        request: ReqMeta,
+        _error: Exception,
+    ) -> bool:
+        logger.exception(
+            "wait_for_save failed for request %s; skipping save",
+            request.req_id,
+        )
+        return True
 
     def _finalize_worker_requests_after_store(
         self, finished_req_ids: set[str]
     ) -> set[str]:
         """Release worker state once its store pipeline no longer owns it."""
-        assert self.lmcache_engine is not None
+        if self.lmcache_engine is None:
+            return super()._finalize_worker_requests_after_store(
+                finished_req_ids
+            )
         finished_sending = set(
             self.lmcache_engine.get_finished_stores(finished_req_ids) or ()
         )
@@ -300,55 +113,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if releasable_req_ids:
             self._release_finished_worker_requests(releasable_req_ids)
         return finished_sending
-
-    def _replay_finished_stores_after_save(self) -> None:
-        waiting_req_ids = self._finished_req_ids_waiting_for_save
-        if not waiting_req_ids:
-            return
-
-        if self.lmcache_engine is None:
-            self._release_finished_worker_requests(waiting_req_ids)
-            self._finished_req_ids_waiting_for_save = set()
-            return
-
-        finished_sending = self._finalize_worker_requests_after_store(waiting_req_ids)
-        if finished_sending:
-            self._late_finished_sending |= finished_sending
-        self._finished_req_ids_waiting_for_save = set()
-
-    @_lmcache_nvtx_annotate
-    def get_finished(
-        self, finished_req_ids: set[str]
-    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        if self.lmcache_engine is None:
-            self._release_finished_worker_requests(finished_req_ids)
-            return None, None
-        query_req_ids = set(finished_req_ids)
-        if not self._wait_for_save_done:
-            # NOTE (gingfung): The is a workaround logic for the case
-            # where the requests is deferred (i.e. spec_decode or MTP)
-            # and the model_runner call get_finished before wait_for_save.
-            connector_metadata = self._parent._get_connector_metadata()
-            assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-
-            waiting_for_save = {
-                request.req_id
-                for request in connector_metadata.requests
-                if request.req_id in finished_req_ids
-                and self._may_register_store_after_wait_for_save(request)
-            }
-            if waiting_for_save:
-                self._finished_req_ids_waiting_for_save |= waiting_for_save
-                query_req_ids -= waiting_for_save
-
-        finished_sending = self._finalize_worker_requests_after_store(query_req_ids)
-        if self._late_finished_sending:
-            finished_sending |= self._late_finished_sending
-            self._late_finished_sending = set()
-        return (
-            finished_sending if finished_sending else None,
-            None,
-        )
 
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
         if self.lmcache_engine is None:
@@ -366,7 +130,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if not self.store_async or self.kv_role == "kv_consumer":
             return
 
-        waited_req_ids = self.lmcache_engine.wait_for_pending_stores(preempted_req_ids)
+        waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+            preempted_req_ids
+        )
         if waited_req_ids:
             logger.info(
                 "Handled preemptions after draining async stores: req_ids=%s",

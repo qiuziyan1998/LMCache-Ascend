@@ -51,6 +51,73 @@ def test_lmcache_connector_patch_advertises_dsa_index_support():
     assert getattr(LMCacheConnectorV1, "supports_dsa_index_lmcache", False) is True
 
 
+def test_lmcache_connector_patch_reports_layerwise_callbacks():
+    LMCacheConnectorV1 = _import_and_patch_vllm_connector()
+    connector = object.__new__(LMCacheConnectorV1)
+
+    connector._lmcache_engine = SimpleNamespace(use_layerwise=True)
+    assert connector.uses_layerwise_model_callbacks is True
+
+    connector._lmcache_engine = SimpleNamespace(use_layerwise=False)
+    assert connector.uses_layerwise_model_callbacks is False
+
+
+def test_lmcache_connector_patch_advertises_staged_sfa_sparse_load():
+    LMCacheConnectorV1 = _import_and_patch_vllm_connector()
+    connector = object.__new__(LMCacheConnectorV1)
+
+    connector._lmcache_engine = SimpleNamespace(
+        use_layerwise=True,
+        kv_role="kv_both",
+        config=SimpleNamespace(dsa_two_groups=True),
+    )
+    assert connector.supports_staged_sfa_sparse_load is True
+
+    connector._lmcache_engine.kv_role = "kv_producer"
+    assert connector.supports_staged_sfa_sparse_load is False
+
+    connector._lmcache_engine.kv_role = None
+    assert connector.supports_staged_sfa_sparse_load is False
+
+    connector._lmcache_engine.kv_role = "kv_both"
+    connector._lmcache_engine.use_layerwise = False
+    assert connector.supports_staged_sfa_sparse_load is False
+
+    connector._lmcache_engine.use_layerwise = True
+    connector._lmcache_engine.config.dsa_two_groups = False
+    assert connector.supports_staged_sfa_sparse_load is False
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "expected"),
+    (
+        ("kv_both", True),
+        ("kv_consumer", True),
+        ("kv_producer", False),
+        (None, False),
+        ("unknown", False),
+    ),
+)
+def test_dynamic_connector_advertises_staged_sparse_load_by_role(
+    kv_role, expected
+):
+    pytest.importorskip("lmcache")
+    pytest.importorskip("vllm")
+    connector_mod = pytest.importorskip(
+        "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1"
+    )
+    connector = object.__new__(
+        connector_mod.LMCacheAscendConnectorV1Dynamic
+    )
+    connector._lmcache_engine = SimpleNamespace(
+        use_layerwise=True,
+        kv_role=kv_role,
+        config=SimpleNamespace(dsa_two_groups=True),
+    )
+
+    assert connector.supports_staged_sfa_sparse_load is expected
+
+
 def test_lmcache_connector_preemption_patch_handles_no_inner_impl():
     """The Ascend patch should tolerate inner implementations without a hook."""
     LMCacheConnectorV1 = _import_and_patch_vllm_connector()

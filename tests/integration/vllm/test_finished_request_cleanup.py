@@ -12,11 +12,14 @@ pytest.importorskip("lmcache")
 pytest.importorskip("vllm")
 
 adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
+base_adapter_mod = pytest.importorskip(
+    "lmcache.integration.vllm.vllm_v1_adapter"
+)
 
 
 def _make_adapter(*, store_async: bool, requests=None):
     engine = MagicMock()
-    metadata = adapter_mod.LMCacheConnectorMetadata(requests=requests or [])
+    metadata = base_adapter_mod.LMCacheConnectorMetadata(requests=requests or [])
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
     adapter.store_async = store_async
     adapter.kv_role = "kv_both"
@@ -51,7 +54,7 @@ def test_async_get_finished_releases_only_completed_stores() -> None:
     adapter._release_finished_worker_requests.assert_called_once_with({"req-1"})
 
 
-def test_finish_before_wait_releases_after_save_replay() -> None:
+def test_finish_before_wait_releases_during_save_completion() -> None:
     request = SimpleNamespace(
         req_id="req-1",
         token_ids=[1, 2, 3, 4],
@@ -65,11 +68,11 @@ def test_finish_before_wait_releases_after_save_replay() -> None:
     assert adapter._finished_req_ids_waiting_for_save == {"req-1"}
     adapter._release_finished_worker_requests.assert_not_called()
 
-    adapter._replay_finished_stores_after_save()
+    adapter._complete_worker_save_step()
 
     assert adapter._finished_req_ids_waiting_for_save == set()
     assert engine.get_finished_stores.call_args_list == [call(set()), call({"req-1"})]
     adapter._release_finished_worker_requests.assert_called_once_with({"req-1"})
 
-    adapter._replay_finished_stores_after_save()
+    adapter._complete_worker_save_step()
     adapter._release_finished_worker_requests.assert_called_once_with({"req-1"})

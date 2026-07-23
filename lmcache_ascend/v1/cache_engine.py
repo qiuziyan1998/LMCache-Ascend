@@ -21,7 +21,7 @@ from lmcache.utils import (
     _lmcache_nvtx_annotate,
     convert_tokens_to_list,
 )
-from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
@@ -169,6 +169,52 @@ class ThreadSafeEventList:
             except queue.Empty:
                 break
         return out
+
+
+class _SparseCacheAppend:
+    """Rollback guard for append-only request cache mutations."""
+
+    _LAYER_FIELDS = (
+        "cached_keys",
+        "cached_memory_objs",
+        "cached_tensors",
+        "cached_chunk_dev_ptrs",
+        "cached_shared_handles",
+    )
+
+    def __init__(self, cache: dict[str, Any]) -> None:
+        self._ranges = [
+            (values, len(values))
+            for name in ("cached_starts", "cached_ends")
+            if (values := cache.get(name)) is not None
+        ]
+        self._layers = []
+        for name in self._LAYER_FIELDS:
+            values = cache.get(name)
+            if values is not None:
+                self._layers.append(
+                    (values, len(values), [len(layer or []) for layer in values])
+                )
+        pointers = cache.get("cached_chunk_ptrs_npu")
+        self._pointers = None if pointers is None else (pointers, list(pointers))
+        self.committed = False
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def rollback(self) -> None:
+        if self.committed:
+            return
+        for values, size in self._ranges:
+            del values[size:]
+        for values, outer_size, sizes in self._layers:
+            for layer, size in zip(values[:outer_size], sizes, strict=True):
+                if isinstance(layer, list):
+                    del layer[size:]
+            del values[outer_size:]
+        if self._pointers is not None:
+            values, snapshot = self._pointers
+            values[:] = snapshot
 
 
 class AscendLMCacheEngine(LMCacheEngine):
@@ -660,7 +706,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
-        cached_shared_handles: Optional[List],
     ) -> Optional[int]:
         """Drop a cached partial tail before publishing its full successor."""
         replace_at: Optional[int] = None
@@ -683,7 +728,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_memory_objs,
             cached_tensors,
             cached_chunk_dev_ptrs,
-            cached_shared_handles,
         ):
             if layer_cache is None:
                 continue
@@ -808,21 +852,23 @@ class AscendLMCacheEngine(LMCacheEngine):
         layer_id: int,
         handles: List,
         cached_shared_handles: Optional[List],
+        chunk_index_base: int = 0,
     ) -> None:
-        """Retain the current ordered shared handle set for a layer.
-
-        Sparse retrieve publishes handles for the whole active prefix, not only
-        newly appended chunks. Treating this as an append-only log can make a
-        later coverage check pass by length even though the newest chunk has no
-        handle, causing passive ranks to wait for an envelope rank0 skips.
-        """
+        """Append one validated suffix to a layer's shared handle cache."""
         if cached_shared_handles is None:
             return
         if not cached_shared_handles:
             cached_shared_handles.extend([] for _ in range(self.num_layers))
         while len(cached_shared_handles) <= layer_id:
             cached_shared_handles.append([])
-        cached_shared_handles[layer_id] = list(handles)
+        layer_handles = cached_shared_handles[layer_id]
+        if len(layer_handles) != chunk_index_base:
+            raise ValueError(
+                "Sparse shared handle cache is not append-aligned: "
+                f"layer_id={layer_id}, cached={len(layer_handles)}, "
+                f"append_at={chunk_index_base}"
+            )
+        layer_handles.extend(handles)
 
     def _fence_shared_cpu_store_publication(self) -> None:
         fence = getattr(
@@ -905,22 +951,53 @@ class AscendLMCacheEngine(LMCacheEngine):
         return True
 
     @staticmethod
-    def _min_layer_cache_chunks(
+    def _uniform_layer_cache_chunks(
         cache_by_layer: Optional[List],
         num_layers: int,
+        name: str,
     ) -> int:
-        if cache_by_layer is None or len(cache_by_layer) != num_layers:
+        if not cache_by_layer:
             return 0
-        min_chunks: Optional[int] = None
-        for layer_id in range(num_layers):
-            layer_cache = cache_by_layer[layer_id]
-            layer_chunks = 0 if layer_cache is None else len(layer_cache)
-            min_chunks = (
-                layer_chunks
-                if min_chunks is None
-                else min(min_chunks, layer_chunks)
+        if len(cache_by_layer) != num_layers:
+            raise ValueError(
+                f"Sparse retrieve {name} has {len(cache_by_layer)} layers, "
+                f"expected {num_layers}."
             )
-        return 0 if min_chunks is None else min_chunks
+        counts = {len(layer or []) for layer in cache_by_layer}
+        if len(counts) != 1:
+            raise ValueError(
+                f"Sparse retrieve {name} has inconsistent per-layer chunk "
+                f"counts: {sorted(counts)}"
+            )
+        return counts.pop()
+
+    def _cached_sparse_prefix_chunks(
+        self,
+        cached_tensors: Optional[List],
+        cached_memory_objs: Optional[List],
+    ) -> int:
+        counts = {
+            count
+            for count in (
+                self._uniform_layer_cache_chunks(
+                    cached_tensors,
+                    self.num_layers,
+                    "tensor cache",
+                ),
+                self._uniform_layer_cache_chunks(
+                    cached_memory_objs,
+                    self.num_layers,
+                    "MemoryObj cache",
+                ),
+            )
+            if count
+        }
+        if len(counts) > 1:
+            raise ValueError(
+                "Sparse retrieve tensor and MemoryObj caches cover different "
+                f"prefix lengths: {sorted(counts)}"
+            )
+        return counts.pop() if counts else 0
 
     def _ensure_layerwise_connector_layout(self, **kwargs) -> None:
         """Initialize connector KV layout before allocating layerwise chunks.
@@ -1206,7 +1283,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                             cached_starts[chunk_idx] == start
                             and cached_ends[chunk_idx] == end
                         ):
+                            if any(
+                                chunk_idx >= len(cached_keys[layer_id])
+                                or cached_keys[layer_id][chunk_idx]
+                                != new_keys[layer_id][chunk_idx]
+                                for layer_id in range(self.num_layers)
+                            ):
+                                raise ValueError(
+                                    "Sparse retrieve cached prefix key mismatch "
+                                    f"at chunk {chunk_idx}."
+                                )
                             continue
+                        raise ValueError(
+                            "Sparse retrieve cached prefix range changed at "
+                            f"chunk {chunk_idx}: cached="
+                            f"[{cached_starts[chunk_idx]}, "
+                            f"{cached_ends[chunk_idx]}), current=[{start}, {end})."
+                        )
                     cached_starts.append(start)
                     cached_ends.append(end)
                     for layer_id in range(self.num_layers):
@@ -1309,7 +1402,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[None, None, None]:
+    ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
         """
         Store the KV cache in a layerwise manner.
 
@@ -1322,21 +1415,28 @@ class AscendLMCacheEngine(LMCacheEngine):
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
 
-        return: A generator that yields None. In the first iteration, the
-            generator allocates the memory objects for all layers and moves
+        return: A generator that yields None for each layer and a
+            LayerwiseStoreResult after the final layer. In the first iteration,
+            the generator allocates the memory objects for all layers and moves
             the KV cache of the first layer from GPU to CPU. In the next
             iterations, it moves the KV cache of layer i from GPU to the memory
             objects (on CPU) and puts the memory objects of layer i-1 to the
             storage backends. In the last iteration, it puts the memory objects
-            of the last layer to the storage backends.
+            of the last layer to the storage backends and yields the completed
+            store output.
         """
+        store_result = LayerwiseStoreResult(
+            request_id=str(kwargs.get("req_id", "unspecified")),
+            kv_group=int(kwargs.get("kv_group", 0) or 0),
+        )
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             for layer_id in range(self.num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
-            yield
+            yield store_result
             return
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
@@ -1349,7 +1449,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             for layer_id in range(self.num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
-            yield
+            yield store_result
             return
 
         assert self.storage_manager is not None
@@ -1359,6 +1459,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        store_result.request_id = req_id
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -1384,25 +1485,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             # Still need to yield to avoid StopIteration
             for layer_id in range(self.num_layers):
                 yield
+            yield store_result
             return
 
-        cached_keys = kwargs.get("cached_keys")
-        assert cached_keys is not None
-        assert isinstance(cached_keys, list)
-
-        cached_starts = kwargs.get("cached_starts")
-        assert cached_starts is not None
-        assert isinstance(cached_starts, list)
-
-        cached_ends = kwargs.get("cached_ends")
-        assert cached_ends is not None
-        assert isinstance(cached_ends, list)
-
-        cached_memory_objs = kwargs.get("cached_memory_objs")
-        cached_tensors = kwargs.get("cached_tensors")
-        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
-        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
-        cached_shared_handles = kwargs.get("cached_shared_handles")
+        cached_keys = store_result.keys
+        cached_starts = store_result.starts
+        cached_ends = store_result.ends
+        cached_memory_objs = store_result.memory_objs
+        cached_tensors = store_result.tensors
+        cached_chunk_dev_ptrs = store_result.chunk_dev_ptrs
+        cached_chunk_ptrs_npu = store_result.chunk_ptrs
 
         starts = []
         ends = []
@@ -1630,7 +1722,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors=cached_tensors,
                     cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
-                    cached_shared_handles=cached_shared_handles,
                 )
 
             self._append_layerwise_store_cache_chunks(
@@ -1728,7 +1819,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 requested_tokens=requested_tokens,
                 actual_tokens=tot_token_num,
             )
-        yield
+        yield store_result
 
     def _retrieve_layer_head_token_wise_shared_passive(
         self,
@@ -1759,6 +1850,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
         cached_shared_handles = kwargs.get("cached_shared_handles")
+        append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
 
         starts: list[int] = []
         ends: list[int] = []
@@ -1778,6 +1870,71 @@ class AscendLMCacheEngine(LMCacheEngine):
             if keys
             else []
         )
+        required_chunks = len(starts)
+        cached_prefix_chunks = self._cached_sparse_prefix_chunks(
+            cached_tensors,
+            cached_memory_objs,
+        )
+        if cached_prefix_chunks > required_chunks:
+            raise ValueError(
+                "Sparse passive cached prefix exceeds current metadata: "
+                f"cached_chunks={cached_prefix_chunks}, "
+                f"required_chunks={required_chunks}"
+            )
+        metadata_counts = {
+            len(values)
+            for values in (cached_starts, cached_ends)
+            if values is not None
+        }
+        if cached_keys is not None:
+            if cached_keys and len(cached_keys) != self.num_layers:
+                raise ValueError("Sparse passive cached key metadata is incomplete.")
+            metadata_counts.update(len(layer) for layer in cached_keys)
+        if len(metadata_counts) > 1:
+            raise ValueError("Sparse passive cached metadata has inconsistent lengths.")
+        cached_metadata_chunks = metadata_counts.pop() if metadata_counts else 0
+        if not cached_keys:
+            cached_metadata_chunks = 0
+        if not cached_starts or not cached_ends:
+            cached_metadata_chunks = 0
+        if not cached_prefix_chunks <= cached_metadata_chunks <= required_chunks:
+            raise ValueError(
+                "Sparse passive cached metadata does not cover the materialized "
+                f"prefix: metadata={cached_metadata_chunks}, "
+                f"cached={cached_prefix_chunks}, required={required_chunks}"
+            )
+        for chunk_index in range(cached_metadata_chunks):
+            if (
+                cached_starts[chunk_index] != starts[chunk_index]
+                or cached_ends[chunk_index] != ends[chunk_index]
+                or any(
+                    cached_keys[layer_id][chunk_index]
+                    != keys_layer_major[layer_id][chunk_index]
+                    for layer_id in range(self.num_layers)
+                )
+            ):
+                raise ValueError(
+                    "Sparse passive cached prefix changed at chunk "
+                    f"{chunk_index}."
+                )
+        cached_handle_chunks = self._uniform_layer_cache_chunks(
+            cached_shared_handles,
+            self.num_layers,
+            "passive shared handle cache",
+        )
+        if cached_handle_chunks != cached_prefix_chunks:
+            raise ValueError(
+                "Sparse passive cached handles do not cover the materialized "
+                f"prefix: handles={cached_handle_chunks}, "
+                f"cached_chunks={cached_prefix_chunks}"
+            )
+        missing_chunks = required_chunks - cached_prefix_chunks
+        for start, end in zip(
+            starts[:cached_prefix_chunks],
+            ends[:cached_prefix_chunks],
+            strict=False,
+        ):
+            ret_mask[start:end] = True
 
         assert_layerwise_gpu_connector(self.gpu_connector)
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
@@ -1787,24 +1944,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         to_release: list[MemoryObj] = []
         passive_views_handed_off = False
-        passive_metadata_cached = False
-        expected_handle_count: Optional[int] = None
-
-        def append_passive_chunk_metadata() -> None:
-            nonlocal passive_metadata_cached
-            if passive_metadata_cached or expected_handle_count is None:
-                return
-            passive_metadata_cached = True
-            if cached_starts is not None and not cached_starts:
-                cached_starts.extend(starts[:expected_handle_count])
-            if cached_ends is not None and not cached_ends:
-                cached_ends.extend(ends[:expected_handle_count])
-            if cached_keys is not None and not cached_keys:
-                cached_keys.extend([] for _ in range(self.num_layers))
-                for cache_layer_id, layer_keys in enumerate(keys_layer_major):
-                    cached_keys[cache_layer_id].extend(
-                        layer_keys[:expected_handle_count]
-                    )
+        metadata_appended = False
 
         try:
             for layer_id in range(self.num_layers):
@@ -1828,35 +1968,55 @@ class AscendLMCacheEngine(LMCacheEngine):
                     selected_tokens = sparse_request
                     token_start_index = 0
 
-                envelope = self._receive_shared_envelope()
-                self._validate_shared_layerwise_envelope(
-                    envelope,
-                    req_id=req_id,
-                    phase=phase,
-                    request_ordinal=request_ordinal,
-                    layer_id=layer_id,
-                    kv_group=kv_group,
-                )
-                if envelope.status in ("miss", "skipped"):
+                if not missing_chunks:
                     mem_objs_layer = []
                 else:
-                    if expected_handle_count is None:
-                        expected_handle_count = len(envelope.handles)
-                        for start, end in zip(
-                            starts[:expected_handle_count],
-                            ends[:expected_handle_count],
-                            strict=False,
-                        ):
-                            ret_mask[start:end] = True
-                        append_passive_chunk_metadata()
-                    elif len(envelope.handles) != expected_handle_count:
+                    envelope = self._receive_shared_envelope()
+                    self._validate_shared_layerwise_envelope(
+                        envelope,
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                    )
+                    if envelope.status != "ok":
+                        raise ValueError(
+                            "Sparse passive prefix extension requires present "
+                            f"handles, received status={envelope.status!r}."
+                        )
+                    if len(envelope.handles) != missing_chunks:
                         raise ValueError(
                             "Sparse shared CPU passive received inconsistent "
                             f"handle count at layer {layer_id}: "
-                            f"{len(envelope.handles)} != {expected_handle_count}"
+                            f"{len(envelope.handles)} != {missing_chunks}"
                         )
+                    if not metadata_appended:
+                        metadata_appended = True
+                        for start, end in zip(
+                            starts[cached_prefix_chunks:],
+                            ends[cached_prefix_chunks:],
+                            strict=False,
+                        ):
+                            ret_mask[start:end] = True
+                        if cached_starts is not None:
+                            cached_starts.extend(starts[cached_metadata_chunks:])
+                        if cached_ends is not None:
+                            cached_ends.extend(ends[cached_metadata_chunks:])
+                        if cached_keys is not None:
+                            if not cached_keys:
+                                cached_keys.extend(
+                                    [] for _ in range(self.num_layers)
+                                )
+                            for cache_layer_id in range(self.num_layers):
+                                cached_keys[cache_layer_id].extend(
+                                    keys_layer_major[cache_layer_id][
+                                        cached_metadata_chunks:
+                                    ]
+                                )
                     mem_objs_layer: list[MemoryObj] = []
-                    for chunk_index, handle in enumerate(envelope.handles):
+                    for chunk_offset, handle in enumerate(envelope.handles):
+                        chunk_index = cached_prefix_chunks + chunk_offset
                         expected_shape, expected_dtype, expected_fmt = (
                             self._expected_shared_cpu_chunk_metadata(
                                 kv_group=kv_group,
@@ -1902,6 +2062,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         layer_id,
                         envelope.handles,
                         cached_shared_handles,
+                        cached_prefix_chunks,
                     )
 
                 if sparse_payload is not None:
@@ -1920,12 +2081,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None
             )
+            append.commit()
             yield ret_mask
         finally:
             if not passive_views_handed_off:
                 for mem_obj in to_release:
                     if mem_obj.is_valid():
                         mem_obj.ref_count_down()
+            append.rollback()
 
     def retrieve_layer_head_token_wise(
         self,
@@ -1984,6 +2147,23 @@ class AscendLMCacheEngine(LMCacheEngine):
             consumer.close()
 
     def _retrieve_layer_head_token_wise_bootstrap(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        append = _SparseCacheAppend(kwargs)
+        kwargs["_sparse_cache_append"] = append
+        try:
+            yield from self._retrieve_layer_head_token_wise_bootstrap_impl(
+                tokens,
+                mask,
+                **kwargs,
+            )
+        finally:
+            append.rollback()
+
+    def _retrieve_layer_head_token_wise_bootstrap_impl(
         self,
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
@@ -2059,11 +2239,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if has_shared_cached_retrieve:
             kwargs["_use_cached_retrieve"] = True
 
-        if (
-            shared_sparse_retrieve
-            and shared_retrieve_passive
-            and not has_shared_cached_retrieve
-        ):
+        if shared_sparse_retrieve and shared_retrieve_passive:
             passive_kwargs = dict(kwargs)
             passive_kwargs.pop("ret_mask", None)
             yield from self._retrieve_layer_head_token_wise_shared_passive(
@@ -2093,11 +2269,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
         cached_shared_handles = kwargs.get("cached_shared_handles")
-
-        has_cached_retrieve_data = self._has_retrieve_data_cache(
+        append: _SparseCacheAppend = kwargs["_sparse_cache_append"]
+        cached_prefix_chunks = self._cached_sparse_prefix_chunks(
             cached_tensors,
             cached_memory_objs,
-            self.num_layers,
         )
 
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
@@ -2112,6 +2287,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         kwargs.pop("_use_cached_retrieve", None)
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        if cached_prefix_chunks > required_chunks:
+            raise ValueError(
+                "Sparse retrieve cached prefix exceeds current metadata: "
+                f"cached_chunks={cached_prefix_chunks}, "
+                f"required_chunks={required_chunks}"
+            )
         cached_tensors_cover = self._retrieve_data_cache_covers(
             cached_tensors,
             self.num_layers,
@@ -2123,30 +2304,35 @@ class AscendLMCacheEngine(LMCacheEngine):
             required_chunks,
         )
         use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
+        missing_keys = [
+            layer_keys[cached_prefix_chunks:]
+            for layer_keys in retrieve_keys
+        ]
 
-        if has_cached_retrieve_data and required_chunks and not use_cached_retrieve:
-            raise ValueError(
-                "Layerwise sparse retrieve cache is incomplete; refusing to "
-                "append a duplicate prefix or launch with partial pointer "
-                "state. Drop the request retrieve state and retry from "
-                "storage/shared CPU: "
-                f"req_id={kwargs.get('req_id', 'unspecified')}, "
-                f"kv_group={kv_group}, required_chunks={required_chunks}, "
-                f"cached_tensor_chunks="
-                f"{self._min_layer_cache_chunks(cached_tensors, self.num_layers)}, "
-                f"cached_memory_obj_chunks="
-                f"{self._min_layer_cache_chunks(cached_memory_objs, self.num_layers)}"
-            )
-
-        cached_shared_handles_cover = self._retrieve_data_cache_covers(
+        cached_handle_chunks = self._uniform_layer_cache_chunks(
             cached_shared_handles,
             self.num_layers,
-            required_chunks,
+            "shared handle cache",
         )
+        if cached_handle_chunks > cached_prefix_chunks:
+            raise ValueError(
+                "Sparse shared handle cache exceeds the materialized prefix: "
+                f"handles={cached_handle_chunks}, "
+                f"cached_chunks={cached_prefix_chunks}"
+            )
+        if (
+            cached_prefix_chunks < required_chunks
+            and cached_handle_chunks != cached_prefix_chunks
+        ):
+            raise ValueError(
+                "Sparse shared prefix extension requires complete cached "
+                f"handles: handles={cached_handle_chunks}, "
+                f"cached_chunks={cached_prefix_chunks}"
+            )
         publish_shared_handles = (
             shared_sparse_retrieve
             and not shared_retrieve_passive
-            and not cached_shared_handles_cover
+            and cached_handle_chunks < required_chunks
         )
 
         if use_cached_retrieve:
@@ -2166,7 +2352,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         get_generator = None
         if not use_cached_retrieve and not shared_sparse_retrieve:
             get_generator = self.storage_manager.layerwise_batched_get(
-                retrieve_keys, location=location
+                missing_keys, location=location
             )
 
         if cached_tensors_cover and cached_tensors is not None:
@@ -2279,12 +2465,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
         sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
-        if shared_sparse_retrieve and not use_cached_retrieve and retrieve_keys:
+        if shared_sparse_retrieve and not use_cached_retrieve and any(missing_keys):
             missing_locations: list[tuple[int, int]] = []
             if sampled_worker_retrieve:
                 local_cpu_backend = self._shared_local_cpu_backend()
                 try:
-                    for layer_keys in retrieve_keys:
+                    for layer_keys in missing_keys:
                         local_prefix = local_cpu_backend.batched_get_prefix_with_misses(
                             layer_keys
                         )
@@ -2297,7 +2483,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     release_local_prefix_layers()
                     raise
             else:
-                for layer_id, layer_keys in enumerate(retrieve_keys):
+                for layer_id, layer_keys in enumerate(missing_keys):
                     layer_locations: list[str] = []
                     for chunk_index, key in enumerate(layer_keys):
                         key_location = self._find_shared_rank0_chunk_location(key)
@@ -2335,14 +2521,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                             "shared_cpu_phase", "sparse_decode_bootstrap"
                         ),
                         kv_group=kv_group,
-                        keys_layer_major=retrieve_keys,
+                        keys_layer_major=missing_keys,
                         chunk_locations_layer_major=(
                             shared_chunk_locations_layer_major
                         ),
                         token_count=len(tokens),
                         chunk_token_lengths=[
                             int(end - start)
-                            for start, end in zip(starts, ends, strict=False)
+                            for start, end in zip(
+                                starts[cached_prefix_chunks:],
+                                ends[cached_prefix_chunks:],
+                                strict=False,
+                            )
                         ],
                     )
                 except Exception:
@@ -2372,7 +2562,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
-                        for layer_id, layer_keys in enumerate(retrieve_keys):
+                        for layer_id, layer_keys in enumerate(missing_keys):
                             if sampled_worker_retrieve:
                                 local_prefix = local_prefix_layers[layer_id]
                                 assert local_prefix is not None
@@ -2472,17 +2662,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for mem_obj in mem_objs_layer
             ]
 
-        def mark_pre_resolved_layer_handed_off(
-            mem_objs_layer: List[MemoryObj],
-        ) -> None:
-            if cached_memory_objs is None or not pending_pre_resolved_release:
-                return
-            for mem_obj in mem_objs_layer:
-                try:
-                    pending_pre_resolved_release.remove(mem_obj)
-                except ValueError:
-                    pass
-
         def release_pending_pre_resolved() -> None:
             nonlocal pending_pre_resolved_release
             for mem_obj in pending_pre_resolved_release:
@@ -2495,29 +2674,21 @@ class AscendLMCacheEngine(LMCacheEngine):
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
         shared_store_publication_fenced = False
-        existing_rank0_backing_layers = kwargs.get(
-            "shared_cpu_existing_rank0_backing_layers"
+        existing_rank0_backing_ids = (
+            self.shared_cpu_rank0_request_object_ids(
+                kwargs.get("req_id"),
+                int(kwargs.get("kv_group", 0) or 0),
+            )
+            if publish_shared_handles and cached_mem_layers is not None
+            else set()
         )
-        existing_rank0_backing_ids: Optional[set[int]] = None
-
-        def is_existing_rank0_backing(mem_obj: MemoryObj) -> bool:
-            nonlocal existing_rank0_backing_ids
-            if not existing_rank0_backing_layers:
-                return False
-            if existing_rank0_backing_ids is None:
-                existing_rank0_backing_ids = {
-                    id(obj)
-                    for layer_objs in existing_rank0_backing_layers
-                    for obj in (layer_objs or [])
-                }
-            return id(mem_obj) in existing_rank0_backing_ids
 
         def claim_cached_shared_mem_objs_for_publication(
             mem_objs_layer: List[MemoryObj],
         ) -> None:
             """Take the request pin/ref needed by rank0 handle publication."""
             for mem_obj in mem_objs_layer:
-                if is_existing_rank0_backing(mem_obj):
+                if id(mem_obj) in existing_rank0_backing_ids:
                     continue
                 try:
                     mem_obj.ref_count_up()
@@ -2650,15 +2821,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_chunk_dev_ptrs,
                                 cached_chunk_ptrs_npu,
                             )
-                            if shared_sparse_retrieve:
-                                mark_pre_resolved_layer_handed_off(
-                                    mem_objs_layer
-                                )
                     else:
                         mem_objs_layer = []
 
                 if publish_shared_handles:
-                    if required_chunks and not mem_objs_layer:
+                    publish_mem_objs = (
+                        cached_memory_objs[layer_id][cached_handle_chunks:]
+                        if cached_memory_objs is not None
+                        and len(cached_memory_objs) > layer_id
+                        else []
+                    )
+                    if required_chunks and not publish_mem_objs:
                         message = (
                             "Shared CPU sparse decode has no MemoryObjs to "
                             "publish for required chunks."
@@ -2687,22 +2860,26 @@ class AscendLMCacheEngine(LMCacheEngine):
                             shared_store_publication_fenced = True
                         if cached_mem_layers is not None:
                             claim_cached_shared_mem_objs_for_publication(
-                                mem_objs_layer
+                                publish_mem_objs
                             )
                         handles = self._make_shared_handles_for_layer(
                             req_id=kwargs.get("req_id", "unspecified"),
                             phase=kwargs.get(
                                 "shared_cpu_phase", "sparse_decode_bootstrap"
                             ),
-                            keys_layer=retrieve_keys[layer_id],
-                            mem_objs_layer=mem_objs_layer,
+                            keys_layer=retrieve_keys[layer_id][
+                                cached_handle_chunks:
+                            ],
+                            mem_objs_layer=publish_mem_objs,
                             layer_id=layer_id,
                             kv_group=kv_group,
+                            chunk_index_base=cached_handle_chunks,
                         )
                         self._append_shared_handle_cache(
                             layer_id,
                             handles,
                             cached_shared_handles,
+                            cached_handle_chunks,
                         )
                         envelope = SharedHandleEnvelope(
                             request_id=kwargs.get("req_id", "unspecified"),
@@ -2767,16 +2944,21 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
-            release_pending_pre_resolved()
             # The LMCache vLLM adapter records request state after this final
             # yield and drains sparse retrievers with close(), so ownership must
             # be handed off before yielding.
-            cached_publication_handed_off = True
+            cached_publication_handed_off = cached_memory_objs is not None
+            if cached_publication_handed_off:
+                pending_pre_resolved_release = []
+            else:
+                release_pending_pre_resolved()
+            append.commit()
 
             yield ret_mask
         finally:
             release_unowned_cached_publication_objs()
             release_pending_pre_resolved()
+            append.rollback()
 
 
     @torch.inference_mode()

@@ -23,6 +23,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
@@ -252,7 +253,11 @@ class TestFromRequestTrackerDecodeFullChunk:
         tracker = RequestTracker(
             req_id="test_req",
             prompt_len=prompt_len,
-            token_ids=list(range(num_saved, num_saved + 1)) if is_decode else list(range(100)),
+            token_ids=(
+                list(range(num_saved, num_saved + 1))
+                if is_decode
+                else list(range(100))
+            ),
             allocated_block_ids=[0],
             num_saved_tokens=num_saved,
         )
@@ -410,6 +415,8 @@ class TestStoreLayerPassiveGuard:
         results = list(gen)
         # num_layers yields (one per save_kv_layer) + final wait_for_save yield
         assert len(results) == 5
+        assert results[:-1] == [None] * 4
+        assert isinstance(results[-1], LayerwiseStoreResult)
 
     def test_active_rank_proceeds_to_store(self):
         """An active rank (rank 0) should NOT skip — it should proceed."""
@@ -442,9 +449,7 @@ class TestStoreLayerPassiveGuard:
         tokens = [1, 2, 3, 4]
         mask = torch.tensor([True, True, True, True])
 
-        gen = LMCacheEngine.store_layer(
-            engine, tokens, mask=mask, cached_keys=[]
-        )
+        gen = LMCacheEngine.store_layer(engine, tokens, mask=mask)
         list(gen)
         engine.token_database.process_tokens.assert_called()
 
@@ -503,7 +508,6 @@ def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
     cached_tensors = [["tensor-0", "partial-tensor-1"]]
     cached_chunk_dev_ptrs = [[11, 22]]
     cached_chunk_ptrs_npu = [torch.tensor([11, 22], dtype=torch.long)]
-    cached_shared_handles = [["handle-0", "partial-handle-1"]]
 
     replaced_at = (
         AscendLMCacheEngine._truncate_store_cache_for_full_chunk_successor(
@@ -516,7 +520,6 @@ def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
             cached_tensors=cached_tensors,
             cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
-            cached_shared_handles=cached_shared_handles,
         )
     )
 
@@ -528,7 +531,6 @@ def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
     assert cached_tensors == [["tensor-0"]]
     assert cached_chunk_dev_ptrs == [[11]]
     assert cached_chunk_ptrs_npu[0].tolist() == [11]
-    assert cached_shared_handles == [["handle-0"]]
 
 
 class TestLayerwiseLayoutWarmup:
@@ -628,7 +630,7 @@ class TestConnectorGetShape:
         assert shape == torch.Size([32768])
 
     def test_get_shape_mla_latent_equals_mla_kv(self):
-        """MLA_LATENT and MLA_KV should produce the same shape (same plane structure)."""
+        """MLA_LATENT and MLA_KV produce the same plane structure."""
         from lmcache_ascend.v1.kv_format import KVCacheFormat
 
         conn_latent = self._make_connector_with_format(KVCacheFormat.MLA_LATENT)
@@ -747,7 +749,11 @@ class TestTwoGroupKeySeparation:
         indexer_results = list(db.process_tokens(tokens=tokens, kv_group=1))
 
         assert len(latent_results) == len(indexer_results)
-        for (_, _, lk), (_, _, ik) in zip(latent_results, indexer_results):
+        for (_, _, lk), (_, _, ik) in zip(
+            latent_results,
+            indexer_results,
+            strict=True,
+        ):
             assert lk.kv_group == 0
             assert ik.kv_group == 1
             assert lk != ik
@@ -1069,8 +1075,9 @@ class TestPerGroupLazyInit:
         assert alloc0 is not alloc1
         per_slot_latent = max_model_len * (512 + 64) * 2
         per_slot_indexer = max_model_len * 128 * 2
-        assert alloc0.tensor.numel() == per_slot_latent * conn._layerwise_staging_pool_slots()
-        assert alloc1.tensor.numel() == per_slot_indexer * conn._layerwise_staging_pool_slots()
+        pool_slots = conn._layerwise_staging_pool_slots()
+        assert alloc0.tensor.numel() == per_slot_latent * pool_slots
+        assert alloc1.tensor.numel() == per_slot_indexer * pool_slots
 
         pool_obj0, staging0 = conn._allocate_layerwise_staging_buffer(
             num_tokens=256,
@@ -1165,6 +1172,67 @@ def _ascend_adapter_method(name):
     )
 
     return getattr(LMCacheAscendConnectorV1Impl, name)
+
+
+def _ascend_adapter_fake(**attrs):
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        LMCacheAscendConnectorV1Impl,
+    )
+
+    fake = object.__new__(LMCacheAscendConnectorV1Impl)
+    fake._finished_req_ids_waiting_for_save = set()
+    fake._late_finished_sending = set()
+    for name, value in attrs.items():
+        setattr(fake, name, value)
+    return fake
+
+
+class TestAscendAdapterInitialization:
+    @staticmethod
+    def _construct(role, kv_role):
+        from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+            LMCacheAscendConnectorV1Impl,
+        )
+
+        def base_init(adapter, *_args, **_kwargs):
+            adapter.config = SimpleNamespace(store_async=True)
+            adapter.use_layerwise = True
+            adapter.kv_role = kv_role
+
+        generic_base = LMCacheAscendConnectorV1Impl.__mro__[1]
+        with patch.object(generic_base, "__init__", base_init):
+            return LMCacheAscendConnectorV1Impl(
+                SimpleNamespace(),
+                role,
+                SimpleNamespace(),
+            )
+
+    @pytest.mark.parametrize(
+        ("role_name", "kv_role"),
+        [
+            ("SCHEDULER", "kv_producer"),
+            ("WORKER", "kv_consumer"),
+        ],
+    )
+    def test_layerwise_async_allowed_without_worker_store(
+        self,
+        role_name,
+        kv_role,
+    ):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorRole,
+        )
+
+        adapter = self._construct(getattr(KVConnectorRole, role_name), kv_role)
+        assert adapter.store_async is True
+
+    def test_layerwise_async_rejected_for_storing_worker(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorRole,
+        )
+
+        with pytest.raises(ValueError, match="not supported with async store"):
+            self._construct(KVConnectorRole.WORKER, "kv_producer")
 
 
 class TestAdapterGroupSplit:
@@ -1319,9 +1387,12 @@ class TestStorerDualPop:
 
     @staticmethod
     def _make_fake(meta, storers):
-        return SimpleNamespace(
+        return _ascend_adapter_fake(
             kv_role="kv_producer",
             use_layerwise=True,
+            store_async=False,
+            lmcache_engine=MagicMock(),
+            _wait_for_save_done=False,
             _layerwise_save_storers=storers,
             _should_defer_latent_save_under_tp=lambda: False,
             _layerwise_save_storer_key=(
@@ -1330,16 +1401,12 @@ class TestStorerDualPop:
             _is_decode_window_save_request=_adapter_method(
                 "_is_decode_window_save_request"
             ),
-            _advance_layerwise_storer_once=_adapter_method(
-                "_advance_layerwise_storer_once"
-            ),
-            _close_layerwise_storer=_adapter_method("_close_layerwise_storer"),
-            _record_decode_window_save_group_completed=(
-                lambda request, kv_group: None
+            _finalize_layerwise_storer=lambda storer: (True, None),
+            _consume_completed_layerwise_store=(
+                lambda request, kv_group, completed, result: None
             ),
             _mark_decode_window_save_completed=lambda request: None,
             _maybe_lookup_unpin_for_request=lambda request: None,
-            _maybe_seed_worker_retrieve_state_from_store=lambda request: None,
             _parent=SimpleNamespace(
                 _get_connector_metadata=lambda: meta,
             ),
@@ -1358,7 +1425,7 @@ class TestStorerDualPop:
         storers = {("r1", 0): gen0, ("r1", 1): gen1}
 
         fake = self._make_fake(meta, storers)
-        _adapter_method("wait_for_save")(fake)
+        _ascend_adapter_method("wait_for_save")(fake)
         # Both group storers are popped.
         assert ("r1", 0) not in storers
         assert ("r1", 1) not in storers
@@ -1376,13 +1443,12 @@ class TestStorerDualPop:
         storers = {("r2", 0): gen0}  # indexer storer never created
 
         fake = self._make_fake(meta, storers)
-        _adapter_method("wait_for_save")(fake)
+        _ascend_adapter_method("wait_for_save")(fake)
         assert storers == {}
 
 
 class TestAscendDecodeWindowWaitForSaveCompletion:
-    """Ascend wait_for_save must not treat legacy storer keys as a completed
-    range-scoped decode-window save."""
+    """Verify range-scoped completion and remote-store ordering."""
 
     def _make_request(self):
         return SimpleNamespace(
@@ -1408,7 +1474,7 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
                 req.decode_window_end,
             )
 
-        return SimpleNamespace(
+        return _ascend_adapter_fake(
             kv_role="kv_producer",
             use_layerwise=True,
             store_async=False,
@@ -1416,14 +1482,13 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
             _wait_for_save_done=False,
             _layerwise_save_storers=storers,
             _layerwise_save_storer_key=_range_key,
-            _save_storer_key=_ascend_adapter_method("_save_storer_key"),
             _should_defer_latent_save_under_tp=lambda: False,
-            _drain_layerwise_storer_fully=lambda storer: True,
-            _close_layerwise_storer=lambda storer: None,
-            _record_decode_window_save_group_completed=(
-                lambda req, kv_group: completed_groups.append(kv_group)
+            _finalize_layerwise_storer=lambda storer: (True, None),
+            _consume_completed_layerwise_store=(
+                lambda req, kv_group, completed, result: (
+                    completed_groups.append(kv_group)
+                )
             ),
-            _maybe_seed_worker_retrieve_state_from_store=lambda req: None,
             _mark_decode_window_save_completed=lambda req: None,
             _maybe_lookup_unpin_for_request=lambda req: None,
             _parent=SimpleNamespace(
@@ -1450,31 +1515,38 @@ class TestAscendDecodeWindowWaitForSaveCompletion:
         assert storers == {}
         assert completed_groups == [0]
 
-    def test_legacy_key_drains_but_does_not_record_decode_window_completion(self):
-        request = self._make_request()
-        completed_groups = []
-        storers = {("r-window", 0): iter(())}
-        fake = self._make_fake(request, storers, completed_groups)
-
-        _ascend_adapter_method("wait_for_save")(fake)
-
-        assert storers == {}
-        assert completed_groups == []
-
     def test_remote_store_barrier_precedes_save_completion(self):
         request = self._make_request()
         fake = self._make_fake(request, {}, [])
         events = []
+        fake._finished_req_ids_waiting_for_save = {"r-window"}
         fake.lmcache_engine.wait_for_pending_sync_stores.side_effect = (
             lambda: events.append(("barrier", fake._wait_for_save_done))
         )
-        fake._replay_finished_stores_after_save = lambda: events.append(
-            ("replay", fake._wait_for_save_done)
+        fake._finalize_worker_requests_after_store = lambda _req_ids: (
+            events.append(("finalize", fake._wait_for_save_done))
+            or set()
         )
 
         _ascend_adapter_method("wait_for_save")(fake)
 
-        assert events == [("barrier", False), ("replay", True)]
+        assert events == [("barrier", False), ("finalize", True)]
+
+    def test_failed_remote_store_barrier_keeps_save_step_pending(self):
+        request = self._make_request()
+        fake = self._make_fake(request, {}, [])
+        fake._finished_req_ids_waiting_for_save = {"r-window"}
+        fake._finalize_worker_requests_after_store = MagicMock(return_value=set())
+        fake.lmcache_engine.wait_for_pending_sync_stores.side_effect = (
+            TimeoutError("store barrier timed out")
+        )
+
+        with pytest.raises(TimeoutError, match="store barrier timed out"):
+            _ascend_adapter_method("wait_for_save")(fake)
+
+        assert fake._wait_for_save_done is False
+        assert fake._finished_req_ids_waiting_for_save == {"r-window"}
+        fake._finalize_worker_requests_after_store.assert_not_called()
 
 
 class TestRetrieverPairAdvancement:
@@ -1939,17 +2011,30 @@ class TestVLLMCallSequence:
 
         fake = _make_fake_adapter(num_layers=2, dsa_two_groups=True)
         req = _make_save_req("r1", 128)
-        req.cached_keys = [["k0"], ["k1"]]
-        req.cached_starts = [0]
-        req.cached_ends = [128]
-        req.cached_tensors = [[torch.zeros(1)], [torch.zeros(1)]]
+        latent_result = LayerwiseStoreResult(
+            request_id="r1",
+            starts=[0],
+            ends=[128],
+            keys=[["k0"], ["k1"]],
+            memory_objs=[["m0"], ["m1"]],
+            tensors=[[torch.zeros(1)], [torch.zeros(1)]],
+        )
+        index_result = LayerwiseStoreResult(
+            request_id="r1",
+            kv_group=1,
+            starts=[0],
+            ends=[128],
+            keys=[["ik0"], ["ik1"]],
+            memory_objs=[["im0"], ["im1"]],
+            tensors=[[torch.zeros(1)], [torch.zeros(1)]],
+        )
 
         fake._layerwise_save_storers[
             ("r1", "normal_save", 0, 0, 128)
-        ] = _long_generator(n=1)
+        ] = _long_generator(value=latent_result, n=1)
         fake._layerwise_save_storers[
             ("r1", "normal_save", 1, 0, 128)
-        ] = _long_generator(n=1)
+        ] = _long_generator(value=index_result, n=1)
         meta = LMCacheConnectorMetadata(requests=[req])
         fake._parent = SimpleNamespace(
             _connector_metadata=meta,
@@ -1961,6 +2046,10 @@ class TestVLLMCallSequence:
         assert fake._layerwise_save_storers == {}
         assert "r1" in fake._worker_retrieve_state
         assert fake._worker_retrieve_state["r1"].cached_keys == [["k0"], ["k1"]]
+        assert fake._worker_retrieve_state["r1"].cached_keys_indexer == [
+            ["ik0"],
+            ["ik1"],
+        ]
 
     def test_save_sequence_without_dsa_two_groups_is_latent_only(self):
         from lmcache.integration.vllm.vllm_v1_adapter import (
@@ -1994,6 +2083,7 @@ class TestVLLMCallSequence:
 
 
 class TestPermuteKvCachesToContiguous:
+
     def test_dsa_index_one_tuple(self) -> None:
         from lmcache_ascend.v1.npu_connector.utils import (
             permute_kv_caches_to_contiguous,

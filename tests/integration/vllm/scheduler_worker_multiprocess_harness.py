@@ -9,14 +9,13 @@ Scheduler process: LMCacheLookupClient (ZMQ IPC, same as production).
 # Standard
 import copy
 import multiprocessing as mp
-import os
 import queue
 import sys
 import time
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 # Third Party
@@ -210,7 +209,11 @@ def _run_ascend_wait_for_save(
     adapter: LMCacheConnectorV1Impl, requests: list[ReqMeta]
 ) -> None:
     """Ascend NPU wait_for_save (store + pin defer/unpin)."""
-    if not hasattr(adapter, "_replay_finished_stores_after_save"):
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        LMCacheAscendConnectorV1Impl,
+    )
+
+    if not isinstance(adapter, LMCacheAscendConnectorV1Impl):
         raise RuntimeError(
             "NPU wait_for_save requires LMCacheAscendConnectorV1Impl"
         )
@@ -221,7 +224,7 @@ def _run_ascend_wait_for_save(
     mock_pp = MagicMock()
     mock_pp.is_last_rank = True
     with patch(
-        "lmcache_ascend.integration.vllm.vllm_v1_adapter.get_pp_group",
+        "lmcache.integration.vllm.vllm_v1_adapter.get_pp_group",
         return_value=mock_pp,
     ):
         adapter.wait_for_save()
@@ -233,7 +236,9 @@ def _prime_npu_gpu_connector(connector: Any, kvcaches: list[torch.Tensor]) -> No
     connector._initialize_pointers(kvcaches)
 
 
-def _rebuild_lookup_client_config_and_metadata(scheduler_init: dict[str, Any]) -> tuple[Any, Any]:
+def _rebuild_lookup_client_config_and_metadata(
+    scheduler_init: dict[str, Any],
+) -> tuple[Any, Any]:
     """Rebuild config/metadata in scheduler child (must match worker ZMQ paths)."""
     # Third Party
     from tests.v1.utils import create_test_config, create_test_metadata
@@ -521,7 +526,11 @@ class MultiprocessHarness:
         self.worker_cmd.put(cmd)
         return self._wait_result(self.worker_res, timeout)
 
-    def scheduler_call(self, cmd: dict[str, Any], timeout: float = 60) -> dict[str, Any]:
+    def scheduler_call(
+        self,
+        cmd: dict[str, Any],
+        timeout: float = 60,
+    ) -> dict[str, Any]:
         self.scheduler_cmd.put(cmd)
         return self._wait_result(self.scheduler_res, timeout)
 
