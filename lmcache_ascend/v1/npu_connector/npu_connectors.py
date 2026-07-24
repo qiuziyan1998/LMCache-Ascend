@@ -53,6 +53,9 @@ _DENSE_DIRECT_LOAD_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
 _DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
+_SPARSE_TRANSFER_TOPK = max(
+    0, int(os.getenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "0"))
+)
 
 _SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
 
@@ -1248,6 +1251,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ]
         self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
         self._active_prepared_sparse_retrievers: dict[int, int] = {}
+        if _SPARSE_TRANSFER_TOPK:
+            logger.warning(
+                "Limiting each sparse LMCache transfer to the first %d "
+                "selected tokens for debugging; vLLM's sparse-attention "
+                "width is unchanged",
+                _SPARSE_TRANSFER_TOPK,
+            )
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
@@ -1931,6 +1941,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_idx, target_slot_mapping.shape[0]
         )
         return target_slot_mapping, selected_token_idx
+
+    @staticmethod
+    def _limit_sparse_transfer_inputs(
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not _SPARSE_TRANSFER_TOPK
+            or _SPARSE_TRANSFER_TOPK >= selected_token_idx.numel()
+        ):
+            return slot_mapping_packed, selected_token_idx
+        return (
+            slot_mapping_packed[:_SPARSE_TRANSFER_TOPK],
+            selected_token_idx[:_SPARSE_TRANSFER_TOPK],
+        )
 
     def _run_sparse_direct_kv_transfer_layer(
         self,
@@ -3200,6 +3225,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             token_start_index,
                         )
                     )
+                if _SPARSE_TRANSFER_TOPK:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._limit_sparse_transfer_inputs(
+                            slot_mapping_packed,
+                            selected_token_idx,
+                        )
+                    )
 
                 self._run_prepared_sparse_direct_kv_transfer_layer(
                     plan=destination_plan,
@@ -3346,6 +3378,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_mapping,
                         selected_token_idx,
                         token_start_index,
+                    )
+                )
+            if _SPARSE_TRANSFER_TOPK:
+                slot_mapping_packed, selected_token_idx = (
+                    self._limit_sparse_transfer_inputs(
+                        slot_mapping_packed,
+                        selected_token_idx,
                     )
                 )
 

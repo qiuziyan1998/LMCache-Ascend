@@ -345,6 +345,43 @@ def test_sparse_pack_rejects_target_slot_mapping_length_mismatch() -> None:
         )
 
 
+def test_sparse_transfer_topk_limits_aligned_views(monkeypatch) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    slots = torch.tensor([901, 902, 903, 904], dtype=torch.long)
+    selected = torch.tensor([31, 17, 9, 4], dtype=torch.int32)
+
+    limited_slots, limited_selected = (
+        VLLMPagedMemLayerwiseNPUConnector._limit_sparse_transfer_inputs(
+            slots,
+            selected,
+        )
+    )
+
+    assert limited_slots.tolist() == [901, 902]
+    assert limited_selected.tolist() == [31, 17]
+    assert slots.numel() == selected.numel() == 4
+
+
+@pytest.mark.parametrize("limit", [0, 4, 8])
+def test_sparse_transfer_topk_preserves_shorter_inputs(
+    monkeypatch,
+    limit: int,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", limit)
+    slots = torch.arange(4, dtype=torch.long)
+    selected = torch.arange(4, dtype=torch.int32)
+
+    limited_slots, limited_selected = (
+        VLLMPagedMemLayerwiseNPUConnector._limit_sparse_transfer_inputs(
+            slots,
+            selected,
+        )
+    )
+
+    assert limited_slots is slots
+    assert limited_selected is selected
+
+
 def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")
