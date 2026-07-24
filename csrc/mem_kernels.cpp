@@ -560,15 +560,16 @@ static void launch_dense_multi_chunk_direct_kernel(
       config.dims.block_size, page2l, lmc_host_interleaved);
 }
 
-static uint32_t dense_direct_aiv_num(int32_t num_tokens) {
+static uint32_t direct_aiv_num(int32_t num_tokens) {
   const uint32_t token_cores =
       num_tokens > 0 ? static_cast<uint32_t>(num_tokens) : 1U;
-  auto ascendcPlatform =
-      platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
-  const uint32_t hardware_cores = ascendcPlatform->GetCoreNumAiv();
-  if (hardware_cores == 0) {
-    return 1U;
-  }
+  // The device core count is invariant for the lifetime of a worker process.
+  static const uint32_t hardware_cores = [] {
+    auto platform =
+        platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
+    const uint32_t aiv_num = platform->GetCoreNumAiv();
+    return std::max(1U, aiv_num);
+  }();
   return std::min(hardware_cores, token_cores);
 }
 
@@ -625,8 +626,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
       vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
       dsa_hidden_dims);
   config.dims.num_tokens = num_sparse;
-  config.ub_params.aiv_num =
-      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
 
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
@@ -675,8 +675,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 
   SingleLayerKVConfig config = layer_state.config;
   config.dims.num_tokens = num_sparse;
-  config.ub_params.aiv_num =
-      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
   config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
@@ -715,8 +714,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
   }
 
   const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
-  const uint32_t aiv_num =
-      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  const uint32_t aiv_num = direct_aiv_num(num_sparse);
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
   uint8_t *slot_mapping_ptr =
@@ -860,7 +858,7 @@ void dense_mla_dsa_batched_direct_kv_transfer(
       token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
       v_hidden_dims, dsa_hidden_dims);
   config.dims.num_tokens = num_tokens;
-  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
+  config.ub_params.aiv_num = direct_aiv_num(num_tokens);
 
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
@@ -910,7 +908,7 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
 
   SingleLayerKVConfig config = layer_state.config;
   config.dims.num_tokens = num_tokens;
-  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
+  config.ub_params.aiv_num = direct_aiv_num(num_tokens);
   config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);

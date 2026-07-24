@@ -305,6 +305,42 @@ def allocate_stacked_cpu_chunks(
     return chunks, mem_objs
 
 
+def shared_cpu_slab_bytes(
+    partition: ChunkPartition,
+    dims: MlaDsaDims,
+    dtype: torch.dtype,
+    num_layers: int,
+) -> int:
+    element_size = torch.empty(0, dtype=dtype).element_size()
+    layer_bytes = sum(
+        _align_up(chunk_tokens * dims.plane_elems * element_size)
+        for chunk_tokens in partition.chunk_sizes
+    )
+    return layer_bytes * num_layers
+
+
+def allocate_stacked_cpu_chunks_from_slab(
+    slab: torch.Tensor,
+    offset: int,
+    partition: ChunkPartition,
+    dims: MlaDsaDims,
+    dtype: torch.dtype,
+) -> tuple[List[torch.Tensor], int]:
+    chunks = []
+    element_size = torch.empty(0, dtype=dtype).element_size()
+    for chunk_tokens in partition.chunk_sizes:
+        logical_bytes = chunk_tokens * dims.plane_elems * element_size
+        end = offset + logical_bytes
+        if end > slab.numel():
+            raise RuntimeError(
+                f"shared CPU slab is too small: need {end} B, "
+                f"have {slab.numel()} B"
+            )
+        chunks.append(slab[offset:end].view(dtype))
+        offset += _align_up(logical_bytes)
+    return chunks, offset
+
+
 def release_pin_memory_objects(mem_objs: Sequence[MemoryObj]) -> None:
     for mem_obj in mem_objs:
         mem_obj.ref_count_down()
@@ -615,6 +651,8 @@ def build_load_benchmark_harness(
     num_layers: int,
     num_selected: int,
     seed: int,
+    shared_cpu_slab: torch.Tensor | None = None,
+    populate_cpu_source: bool = True,
 ) -> LoadBenchmarkHarness:
     device = src_kv_cache[0][0].device
     dtype = src_kv_cache[0][0].dtype
@@ -659,24 +697,43 @@ def build_load_benchmark_harness(
     store_layer_states = []
     stacked_cpu_mem_objs: List[MemoryObj] = []
     pin_allocators: List[PinMemoryAllocator] = []
+    shared_offset = 0
+
+    if shared_cpu_slab is not None:
+        required = shared_cpu_slab_bytes(partition, dims, dtype, num_layers)
+        if shared_cpu_slab.numel() < required:
+            raise RuntimeError(
+                f"shared CPU slab is too small: need {required} B, "
+                f"have {shared_cpu_slab.numel()} B"
+            )
 
     for layer_id in range(num_layers):
-        mem_allocator = create_pin_memory_allocator(partition, dims, dtype)
-        pin_allocators.append(mem_allocator)
-        stacked, layer_mem_objs = allocate_stacked_cpu_chunks(
-            mem_allocator, partition, dims, dtype
-        )
-        stacked_cpu_mem_objs.extend(layer_mem_objs)
-        populate_stacked_cpu_from_src(
-            src_layer=src_kv_cache[layer_id],
-            stacked_cpu_chunks=stacked,
-            staging_cache=staging_cache,
-            slot_mapping_full=slot_mapping_full,
-            partition=partition,
-            dims=dims,
-            kv_format=kv_format,
-        )
-        torch.npu.synchronize()
+        if shared_cpu_slab is None:
+            mem_allocator = create_pin_memory_allocator(partition, dims, dtype)
+            pin_allocators.append(mem_allocator)
+            stacked, layer_mem_objs = allocate_stacked_cpu_chunks(
+                mem_allocator, partition, dims, dtype
+            )
+            stacked_cpu_mem_objs.extend(layer_mem_objs)
+        else:
+            stacked, shared_offset = allocate_stacked_cpu_chunks_from_slab(
+                shared_cpu_slab,
+                shared_offset,
+                partition,
+                dims,
+                dtype,
+            )
+        if populate_cpu_source:
+            populate_stacked_cpu_from_src(
+                src_layer=src_kv_cache[layer_id],
+                stacked_cpu_chunks=stacked,
+                staging_cache=staging_cache,
+                slot_mapping_full=slot_mapping_full,
+                partition=partition,
+                dims=dims,
+                kv_format=kv_format,
+            )
+            torch.npu.synchronize()
         stacked_by_layer.append(stacked)
         expected_stacked_by_layer.append([chunk.detach().clone() for chunk in stacked])
         chunk_ptrs = build_chunk_ptrs_npu(stacked, device)

@@ -258,6 +258,9 @@ _DENSE_DIRECT_LOAD_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
 _DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
+_SPARSE_TRANSFER_TOPK = max(
+    0, int(os.getenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "0"))
+)
 
 _SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
 
@@ -1452,6 +1455,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             torch.npu.Event() for _ in range(self.load_stream_num)
         ]
         self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
+        if _SPARSE_TRANSFER_TOPK:
+            logger.warning(
+                "Limiting each sparse LMCache transfer to the first %d "
+                "selected tokens for debugging; vLLM's sparse-attention "
+                "width is unchanged",
+                _SPARSE_TRANSFER_TOPK,
+            )
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
@@ -2288,6 +2298,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if tmp_gpu_buffer_obj is not None:
                 tmp_gpu_buffer_obj.ref_count_down()
 
+    @staticmethod
+    def _limit_sparse_transfer_inputs(
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not _SPARSE_TRANSFER_TOPK
+            or _SPARSE_TRANSFER_TOPK >= selected_token_idx.numel()
+        ):
+            return slot_mapping_packed, selected_token_idx
+        return (
+            slot_mapping_packed[:_SPARSE_TRANSFER_TOPK],
+            selected_token_idx[:_SPARSE_TRANSFER_TOPK],
+        )
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -2424,38 +2449,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         plan: _SparseDestinationPlan,
         source_layer: PreparedSparseSourceLayer,
         layer_id: int,
-        load_stream: torch.cuda.Stream,
-        load_stream_idx: int,
-        current_stream: torch.cuda.Stream,
         slot_mapping_packed: torch.Tensor,
         selected_token_idx: torch.Tensor,
         chunk_size: int,
         total_tokens: int,
         sparse_host_interleaved: bool,
     ) -> None:
-        """Launch one prepared layer without source or native-state lookup."""
+        """Launch one prepared layer directly on the current compute stream."""
         if selected_token_idx.numel() == 0:
             return
-        chunk_ptrs_npu = source_layer.chunk_ptrs_npu
-
-        join = getattr(self, "_active_sparse_load_join", None)
-        if join is not None:
-            if self.load_stream_list[load_stream_idx] is not load_stream:
-                raise RuntimeError("sparse load stream index does not match its stream")
-            join.used_stream_indices.add(load_stream_idx)
-        with torch.cuda.stream(load_stream):
-            load_stream.wait_stream(current_stream)
-            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
-                plan.states[layer_id],
-                slot_mapping_packed,
-                selected_token_idx,
-                chunk_ptrs_npu,
-                chunk_size,
-                total_tokens,
-                sparse_host_interleaved,
-            )
-        if join is None:
-            current_stream.wait_stream(load_stream)
+        sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+            plan.states[layer_id],
+            slot_mapping_packed,
+            selected_token_idx,
+            source_layer.chunk_ptrs_npu,
+            chunk_size,
+            total_tokens,
+            sparse_host_interleaved,
+        )
 
     def _sparse_selected_token_idx(
         self,
@@ -3497,10 +3508,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 init_staging=False,
             )
 
-        load_stream_idx = self.load_stream_idx
-        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
-        load_stream = self.load_stream_list[load_stream_idx]
-
         sparse_k_hidden_dims = layout.k_hidden_dims
         sparse_v_hidden_dims = layout.v_hidden_dims
         sparse_dsa_hidden_dims = layout.dsa_hidden_dims
@@ -3521,22 +3528,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         for layer_id, source_layer in enumerate(source.layers):
             sparse_request = yield
-            current_stream = (
-                torch.npu.current_stream()
-                if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
-                else torch.cuda.current_stream()
-            )
 
             (
                 selected_token_idx,
                 token_start_index,
                 target_slot_mapping,
-                payload_event,
+                _payload_event,
                 selected_token_counts,
             ) = self._unpack_sparse_dynamic_request(sparse_request)
+            # The producer, this transfer, and its consumer are submitted to
+            # the same current stream, so stream order replaces the event wait.
 
-            if payload_event is not None:
-                _wait_payload_events(current_stream, payload_event)
             if target_slot_mapping is not None:
                 slot_mapping_packed, selected_token_idx = (
                     self._pack_sparse_explicit_slot_inputs(
@@ -3551,6 +3553,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_mapping,
                         selected_token_idx,
                         token_start_index,
+                    )
+                )
+            if _SPARSE_TRANSFER_TOPK:
+                slot_mapping_packed, selected_token_idx = (
+                    self._limit_sparse_transfer_inputs(
+                        slot_mapping_packed,
+                        selected_token_idx,
                     )
                 )
 
@@ -3570,9 +3579,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 plan=destination_plan,
                 source_layer=source_layer,
                 layer_id=layer_id,
-                load_stream=load_stream,
-                load_stream_idx=load_stream_idx,
-                current_stream=current_stream,
                 slot_mapping_packed=slot_mapping_packed,
                 selected_token_idx=selected_token_idx,
                 chunk_size=chunk_size,
@@ -3761,6 +3767,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_mapping,
                         selected_token_idx,
                         token_start_index,
+                    )
+                )
+            if _SPARSE_TRANSFER_TOPK:
+                slot_mapping_packed, selected_token_idx = (
+                    self._limit_sparse_transfer_inputs(
+                        slot_mapping_packed,
+                        selected_token_idx,
                     )
                 )
 
