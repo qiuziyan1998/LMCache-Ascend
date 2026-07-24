@@ -21,10 +21,12 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 import random
 import statistics
 import sys
 import time
+import uuid
 from pathlib import Path
 from queue import Empty
 from typing import Any
@@ -43,12 +45,18 @@ except ImportError:
 
 from kv_cache_fixtures import generate_mla_kv_cache  # noqa: E402
 from load_benchmark_utils import (  # noqa: E402
+    ALIGN_BYTES,
     LoadBenchmarkHarness,
+    MlaDsaDims,
     build_load_benchmark_harness,
+    compute_chunk_partition,
     format_bytes_short,
     recommended_num_blocks,
     run_all_direct_fast_layers,
+    shared_cpu_slab_bytes,
 )
+from lmcache.v1.memory_management import MixedMemoryAllocator  # noqa: E402
+from lmcache.v1.shared_cpu_cache import SharedSlabMapping  # noqa: E402
 
 CASE_NAMES = (
     "src_contiguous__dst_contiguous",
@@ -74,6 +82,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument(
+        "--shared-cpu-slab",
+        action="store_true",
+        help="make all ranks read the same rank-0-created pinned CPU slab",
+    )
     parser.add_argument("--output-json", default="")
     args = parser.parse_args()
 
@@ -153,11 +166,15 @@ def _verify_case(
 
 
 def _build_harness(
-    args: argparse.Namespace, rank: int
+    args: argparse.Namespace,
+    rank: int,
+    shared_cpu_slab: torch.Tensor | None = None,
+    *,
+    populate_cpu_source: bool = True,
 ) -> tuple[LoadBenchmarkHarness, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
     device = torch.device(f"npu:{args.devices[rank]}")
     torch.npu.set_device(device)
-    torch.manual_seed(args.seed + rank)
+    torch.manual_seed(args.seed if args.shared_cpu_slab else args.seed + rank)
 
     num_blocks = recommended_num_blocks(args.num_tokens, args.block_size)
     source_cache = generate_mla_kv_cache(
@@ -178,6 +195,8 @@ def _build_harness(
         num_layers=args.num_layers,
         num_selected=args.num_selected,
         seed=args.seed,
+        shared_cpu_slab=shared_cpu_slab,
+        populate_cpu_source=populate_cpu_source,
     )
     num_slots = (
         harness.dst_direct_fast[0][0].shape[0] * harness.dst_direct_fast[0][0].shape[1]
@@ -191,6 +210,22 @@ def _build_harness(
     )
 
 
+def _shared_slab_size(args: argparse.Namespace) -> int:
+    k_hidden_dims = args.num_kv_heads * args.kv_lora_rank
+    v_hidden_dims = args.num_kv_heads * args.qk_rope_head_dim
+    return shared_cpu_slab_bytes(
+        compute_chunk_partition(args.num_tokens, args.chunk_size),
+        MlaDsaDims(
+            k_hidden_dims=k_hidden_dims,
+            v_hidden_dims=v_hidden_dims,
+            dsa_hidden_dims=0,
+            plane_elems=k_hidden_dims + v_hidden_dims,
+        ),
+        torch.bfloat16,
+        args.num_layers,
+    )
+
+
 def _worker(
     rank: int,
     args: argparse.Namespace,
@@ -198,8 +233,45 @@ def _worker(
     output: Any,
 ) -> None:
     harness = None
+    shared_owner = None
+    shared_mapping = None
     try:
-        harness, cases = _build_harness(args, rank)
+        if args.shared_cpu_slab:
+            device = torch.device(f"npu:{args.devices[rank]}")
+            torch.npu.set_device(device)
+            slab_size = _shared_slab_size(args)
+            if rank == 0:
+                shared_owner = MixedMemoryAllocator(
+                    slab_size,
+                    shm_name=args.shared_slab_name,
+                    align_bytes=ALIGN_BYTES,
+                )
+                shared_cpu_slab = shared_owner.buffer
+            else:
+                shared_cpu_slab = None
+            barrier.wait(timeout=300)
+            if rank != 0:
+                shared_mapping = SharedSlabMapping.attach(
+                    shm_name=args.shared_slab_name,
+                    size=slab_size,
+                    generation=0,
+                    writable=True,
+                )
+                shared_cpu_slab = shared_mapping.tensor
+
+            if rank == 0:
+                harness, cases = _build_harness(
+                    args, rank, shared_cpu_slab, populate_cpu_source=True
+                )
+            barrier.wait(timeout=300)
+            if rank != 0:
+                harness, cases = _build_harness(
+                    args, rank, shared_cpu_slab, populate_cpu_source=False
+                )
+            barrier.wait(timeout=300)
+        else:
+            harness, cases = _build_harness(args, rank)
+
         results: dict[str, list[dict[str, float | int]]] = {}
         for name in CASE_NAMES:
             case = cases[name]
@@ -245,12 +317,21 @@ def _worker(
         output.put({"rank": rank, "device": args.devices[rank], "error": repr(exc)})
         raise
     finally:
+        if args.shared_cpu_slab:
+            try:
+                barrier.wait(timeout=300)
+            except Exception:
+                pass
         if harness is not None:
             try:
                 torch.npu.synchronize()
             except Exception:
                 pass
             harness.close()
+        if shared_mapping is not None:
+            shared_mapping.close()
+        if shared_owner is not None:
+            shared_owner.close()
 
 
 def _summarize(
@@ -271,13 +352,14 @@ def _summarize(
         "chunk_size": args.chunk_size,
         "plane_elems": plane_elems,
         "element_size": element_size,
+        "cpu_slab": "shared" if args.shared_cpu_slab else "private-per-rank",
         "bytes_per_rank_per_invocation": bytes_per_invocation,
         "cases": {},
     }
     print(
         f"devices={args.devices} tokens={args.num_tokens} "
         f"selected={args.num_selected} layers={args.num_layers} "
-        f"chunk_size={args.chunk_size}"
+        f"chunk_size={args.chunk_size} cpu_slab={summary['cpu_slab']}"
     )
     print(
         f"payload per rank per invocation: {format_bytes_short(bytes_per_invocation)}"
@@ -361,6 +443,13 @@ def _summarize(
 
 def main() -> None:
     args = _parse_args()
+    args.shared_slab_name = (
+        f"/lmcache_sparse_bench_{os.getpid()}_{uuid.uuid4().hex}"
+        if args.shared_cpu_slab
+        else None
+    )
+    if args.shared_cpu_slab:
+        print(f"shared CPU slab: {args.shared_slab_name}")
     context = mp.get_context("spawn")
     barrier = context.Barrier(len(args.devices))
     output = context.Queue()
@@ -383,6 +472,8 @@ def main() -> None:
             if process.is_alive():
                 process.terminate()
                 process.join()
+        if args.shared_cpu_slab:
+            SharedSlabMapping.unlink(args.shared_slab_name)
 
     errors = [worker for worker in workers if "error" in worker]
     if errors:
