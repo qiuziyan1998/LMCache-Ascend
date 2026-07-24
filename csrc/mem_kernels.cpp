@@ -626,8 +626,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
       vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
       dsa_hidden_dims);
   config.dims.num_tokens = num_sparse;
-  config.ub_params.aiv_num =
-      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
 
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
@@ -676,8 +675,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 
   SingleLayerKVConfig config = layer_state.config;
   config.dims.num_tokens = num_sparse;
-  config.ub_params.aiv_num =
-      static_cast<uint32_t>(std::min(4, static_cast<int>(num_sparse)));
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
   config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
