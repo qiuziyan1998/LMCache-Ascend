@@ -157,11 +157,8 @@ def _verify_case(
         for source_plane, destination_plane in zip(
             source_layer, destination_layer, strict=True
         ):
-            tail = source_plane.shape[2:]
-            expected = source_plane.reshape(-1, *tail).index_select(0, source_slots)
-            actual = destination_plane.reshape(-1, *tail).index_select(
-                0, destination_slots
-            )
+            expected = source_plane.flatten(0, 1).index_select(0, source_slots)
+            actual = destination_plane.flatten(0, 1).index_select(0, destination_slots)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
