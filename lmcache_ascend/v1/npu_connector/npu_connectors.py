@@ -1247,6 +1247,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             torch.npu.Event() for _ in range(self.load_stream_num)
         ]
         self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
+        self._active_prepared_sparse_retrievers: dict[int, int] = {}
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
@@ -2070,6 +2071,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         chunk_size: int,
         total_tokens: int,
         sparse_host_interleaved: bool,
+        sparse_batch_size: int,
     ) -> None:
         """Launch one prepared layer without source or native-state lookup."""
         if selected_token_idx.numel() == 0:
@@ -2091,6 +2093,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 chunk_size,
                 total_tokens,
                 sparse_host_interleaved,
+                sparse_batch_size,
             )
         if join is None:
             current_stream.wait_stream(load_stream)
@@ -3155,55 +3158,72 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             expected_device=layout.kv_device,
         )
 
-        for layer_id, source_layer in enumerate(source.layers):
-            sparse_request = yield
-            current_stream = (
-                torch.npu.current_stream()
-                if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
-                else torch.cuda.current_stream()
-            )
-
-            (
-                selected_token_idx,
-                token_start_index,
-                target_slot_mapping,
-                payload_event,
-            ) = self._unpack_sparse_dynamic_request(sparse_request)
-
-            if payload_event is not None:
-                _wait_payload_events(current_stream, payload_event)
-            if target_slot_mapping is not None:
-                slot_mapping_packed, selected_token_idx = (
-                    self._pack_sparse_explicit_slot_inputs(
-                        selected_token_idx,
-                        target_slot_mapping,
-                    )
+        active_retrievers = getattr(
+            self, "_active_prepared_sparse_retrievers", None
+        )
+        if active_retrievers is None:
+            active_retrievers = self._active_prepared_sparse_retrievers = {}
+        # start_load_kv primes every request generator before layer dispatch,
+        # so this per-group count is the sparse kernel fan-out for the step.
+        active_retrievers[kv_group] = active_retrievers.get(kv_group, 0) + 1
+        try:
+            for layer_id, source_layer in enumerate(source.layers):
+                sparse_request = yield
+                current_stream = (
+                    torch.npu.current_stream()
+                    if hasattr(torch, "npu")
+                    and hasattr(torch.npu, "current_stream")
+                    else torch.cuda.current_stream()
                 )
+
+                (
+                    selected_token_idx,
+                    token_start_index,
+                    target_slot_mapping,
+                    payload_event,
+                ) = self._unpack_sparse_dynamic_request(sparse_request)
+
+                if payload_event is not None:
+                    _wait_payload_events(current_stream, payload_event)
+                if target_slot_mapping is not None:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_explicit_slot_inputs(
+                            selected_token_idx,
+                            target_slot_mapping,
+                        )
+                    )
+                else:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_layer_inputs(
+                            slot_mapping,
+                            selected_token_idx,
+                            token_start_index,
+                        )
+                    )
+
+                self._run_prepared_sparse_direct_kv_transfer_layer(
+                    plan=destination_plan,
+                    source_layer=source_layer,
+                    layer_id=layer_id,
+                    load_stream=load_stream,
+                    load_stream_idx=load_stream_idx,
+                    current_stream=current_stream,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=source.total_tokens,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    sparse_batch_size=active_retrievers[kv_group],
+                )
+
+            yield
+            yield
+        finally:
+            remaining = active_retrievers[kv_group] - 1
+            if remaining:
+                active_retrievers[kv_group] = remaining
             else:
-                slot_mapping_packed, selected_token_idx = (
-                    self._pack_sparse_layer_inputs(
-                        slot_mapping,
-                        selected_token_idx,
-                        token_start_index,
-                    )
-                )
-
-            self._run_prepared_sparse_direct_kv_transfer_layer(
-                plan=destination_plan,
-                source_layer=source_layer,
-                layer_id=layer_id,
-                load_stream=load_stream,
-                load_stream_idx=load_stream_idx,
-                current_stream=current_stream,
-                slot_mapping_packed=slot_mapping_packed,
-                selected_token_idx=selected_token_idx,
-                chunk_size=chunk_size,
-                total_tokens=source.total_tokens,
-                sparse_host_interleaved=sparse_host_interleaved,
-            )
-
-        yield
-        yield
+                del active_retrievers[kv_group]
 
     def batched_to_gpu_head_token_wise(self, **kwargs):
         """

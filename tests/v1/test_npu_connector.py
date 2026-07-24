@@ -778,23 +778,33 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
         lambda **kwargs: transfer_calls.append(kwargs),
     )
 
-    gen = connector.batched_to_gpu_head_token_wise(
-        prepared_sparse_source=source,
-        kvcaches=[(object(), object())],
-        slot_mapping=torch.arange(4, dtype=torch.long),
-        sync=False,
-        kv_group=0,
-    )
-    next(gen)
+    generators = [
+        connector.batched_to_gpu_head_token_wise(
+            prepared_sparse_source=source,
+            kvcaches=[(object(), object())],
+            slot_mapping=torch.arange(4, dtype=torch.long),
+            sync=False,
+            kv_group=0,
+        )
+        for _ in range(2)
+    ]
+    for generator in generators:
+        next(generator)
     selected = torch.arange(4, dtype=torch.int32)
-    gen.send((selected, 0))
+    for generator in generators:
+        generator.send((selected, 0))
 
-    assert len(plan_calls) == 1
-    assert "source" not in plan_calls[0]
-    assert "chunk_size" not in plan_calls[0]
-    assert len(transfer_calls) == 1
-    assert transfer_calls[0]["plan"] is destination_plan
-    assert transfer_calls[0]["source_layer"] is source_layer
+    assert len(plan_calls) == 2
+    assert all("source" not in call for call in plan_calls)
+    assert all("chunk_size" not in call for call in plan_calls)
+    assert len(transfer_calls) == 2
+    assert all(call["plan"] is destination_plan for call in transfer_calls)
+    assert all(call["source_layer"] is source_layer for call in transfer_calls)
+    assert all(call["sparse_batch_size"] == 2 for call in transfer_calls)
+
+    for generator in generators:
+        generator.close()
+    assert connector._active_prepared_sparse_retrievers == {}
 
 
 def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> None:
@@ -872,6 +882,7 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
         chunk_size=256,
         total_tokens=4,
         sparse_host_interleaved=True,
+        sparse_batch_size=2,
     )
 
     assert len(calls) == 1
@@ -880,7 +891,7 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
     assert args[1] is slots
     assert args[2] is selected
     assert args[3] is chunk_ptrs
-    assert args[4:] == (256, 4, True)
+    assert args[4:] == (256, 4, True, 2)
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
@@ -929,6 +940,7 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
             chunk_size=256,
             total_tokens=4,
             sparse_host_interleaved=True,
+            sparse_batch_size=2,
         )
 
     launch(0)
