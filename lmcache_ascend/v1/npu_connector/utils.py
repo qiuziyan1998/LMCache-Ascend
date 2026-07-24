@@ -332,7 +332,6 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     chunk_size: int,
     total_tokens: int,
     lmc_host_interleaved: bool,
-    sparse_batch_size: int = 1,
 ) -> None:
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         destination_state,
@@ -342,7 +341,6 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         chunk_size,
         total_tokens,
         lmc_host_interleaved,
-        sparse_batch_size,
     )
 
 

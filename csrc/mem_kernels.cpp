@@ -560,8 +560,7 @@ static void launch_dense_multi_chunk_direct_kernel(
       config.dims.block_size, page2l, lmc_host_interleaved);
 }
 
-static uint32_t direct_aiv_num(int32_t num_tokens,
-                               int64_t request_fanout = 1) {
+static uint32_t direct_aiv_num(int32_t num_tokens) {
   const uint32_t token_cores =
       num_tokens > 0 ? static_cast<uint32_t>(num_tokens) : 1U;
   // The device core count is invariant for the lifetime of a worker process.
@@ -571,9 +570,7 @@ static uint32_t direct_aiv_num(int32_t num_tokens,
     const uint32_t aiv_num = platform->GetCoreNumAiv();
     return std::max(1U, aiv_num);
   }();
-  const uint32_t request_cores =
-      std::max(1U, hardware_cores / static_cast<uint32_t>(request_fanout));
-  return std::min(request_cores, token_cores);
+  return std::min(hardware_cores, token_cores);
 }
 
 } // namespace
@@ -709,11 +706,9 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     const SparseDirectDestinationState &destination_state,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
-    const int64_t total_tokens, const bool lmc_host_interleaved,
-    const int64_t sparse_batch_size) {
+    const int64_t total_tokens, const bool lmc_host_interleaved) {
   const c10::OptionalDeviceGuard slot_device_guard(
       device_of(slot_mapping_packed));
-  TORCH_CHECK(sparse_batch_size > 0, "sparse_batch_size must be positive.");
 
   const int32_t num_sparse = static_cast<int32_t>(selected_token_idx.size(0));
   if (num_sparse == 0) {
@@ -721,7 +716,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
   }
 
   const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
-  const uint32_t aiv_num = direct_aiv_num(num_sparse, sparse_batch_size);
+  const uint32_t aiv_num = direct_aiv_num(num_sparse);
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
   uint8_t *slot_mapping_ptr =

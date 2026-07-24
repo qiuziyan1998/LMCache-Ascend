@@ -133,11 +133,10 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared_wrapper(
     const SparseDirectDestinationState &destination_state,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, int64_t chunk_size, int64_t total_tokens,
-    bool lmc_host_interleaved, int64_t sparse_batch_size) {
+    bool lmc_host_interleaved) {
   sparse_mla_dsa_batched_direct_kv_transfer_prepared(
       destination_state, slot_mapping_packed, selected_token_idx,
-      chunk_ptrs_npu, chunk_size, total_tokens, lmc_host_interleaved,
-      sparse_batch_size);
+      chunk_ptrs_npu, chunk_size, total_tokens, lmc_host_interleaved);
 }
 
 void dense_mla_dsa_batched_direct_kv_transfer_wrapper(
@@ -268,7 +267,7 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("destination_state"), py::arg("slot_mapping_packed"),
         py::arg("selected_token_idx"), py::arg("chunk_ptrs_npu"),
         py::arg("chunk_size"), py::arg("total_tokens"),
-        py::arg("lmc_host_interleaved"), py::arg("sparse_batch_size") = 1);
+        py::arg("lmc_host_interleaved"));
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),

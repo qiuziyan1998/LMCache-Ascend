@@ -731,15 +731,9 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
 def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector.load_stream_idx = 0
-    connector.load_stream_num = 1
-    connector.load_stream_list = [object()]
     connector.lmcache_chunk_size = 256
     connector.kv_device = torch.device("cpu")
     connector._group_layouts = {}
-
-    class _Stream:
-        pass
 
     class _Layout:
         k_hidden_dims = 1
@@ -762,7 +756,6 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
     plan_calls = []
     transfer_calls = []
 
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
     monkeypatch.setattr(
         connector,
         "_lazy_initialize_buffer_with_staging",
@@ -829,7 +822,13 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
         next(generator)
     selected = torch.arange(4, dtype=torch.int32)
     for generator in generators:
-        generator.send((selected, 0))
+        generator.send(
+            {
+                "selected_token_ids": selected,
+                "token_start_index": 0,
+                "payload_event": object(),
+            }
+        )
 
     assert len(plan_calls) == 2
     assert all("source" not in call for call in plan_calls)
@@ -837,11 +836,13 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
     assert len(transfer_calls) == 2
     assert all(call["plan"] is destination_plan for call in transfer_calls)
     assert all(call["source_layer"] is source_layer for call in transfer_calls)
-    assert all(call["sparse_batch_size"] == 2 for call in transfer_calls)
+    assert all(
+        "load_stream" not in call and "current_stream" not in call
+        for call in transfer_calls
+    )
 
     for generator in generators:
         generator.close()
-    assert connector._active_prepared_sparse_retrievers == {}
 
 
 def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> None:
@@ -880,7 +881,7 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
     assert not hasattr(first, "source")
 
 
-def test_prepared_sparse_launch_combines_destination_request_and_step_state(
+def test_prepared_sparse_launch_avoids_load_stream_handoff(
     monkeypatch,
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
@@ -897,10 +898,12 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
     )
     slots = torch.arange(2, dtype=torch.long)
     selected = torch.arange(2, dtype=torch.int32)
-    load_stream = _NoopStream()
-    current_stream = _NoopStream()
     calls = []
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    def fail_stream_context(_stream):
+        raise AssertionError("prepared sparse launch entered a load stream")
+
+    monkeypatch.setattr(torch.cuda, "stream", fail_stream_context)
     monkeypatch.setattr(
         npu_connectors,
         "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
@@ -911,15 +914,11 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
         plan=plan,
         source_layer=source_layer,
         layer_id=0,
-        load_stream=load_stream,
-        load_stream_idx=0,
-        current_stream=current_stream,
         slot_mapping_packed=slots,
         selected_token_idx=selected,
         chunk_size=256,
         total_tokens=4,
         sparse_host_interleaved=True,
-        sparse_batch_size=2,
     )
 
     assert len(calls) == 1
@@ -928,7 +927,7 @@ def test_prepared_sparse_launch_combines_destination_request_and_step_state(
     assert args[1] is slots
     assert args[2] is selected
     assert args[3] is chunk_ptrs
-    assert args[4:] == (256, 4, True, 2)
+    assert args[4:] == (256, 4, True)
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
@@ -942,15 +941,7 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     connector._sparse_load_done_events = done_events
     connector._active_sparse_load_join = None
 
-    plan = npu_connectors._SparseDestinationPlan(
-        [object()],
-        (torch.long, "cpu", 0, 1, 1, 0),
-        (object(),),
-    )
-    source_layer = PreparedSparseSourceLayer(
-        tensors=(torch.zeros(4),),
-        chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
-    )
+    connector._sparse_direct_validated_layers = set()
     monkeypatch.setattr(
         npu_connectors.torch,
         "npu",
@@ -960,14 +951,24 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(
         npu_connectors,
-        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        "sparse_mla_dsa_batched_direct_kv_transfer_fast",
         lambda *args: None,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_sparse_direct_pointer_cache_signature",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_direct_layer_state",
+        lambda **kwargs: (object(), (0, 0)),
     )
 
     def launch(stream_index: int) -> None:
-        connector._run_prepared_sparse_direct_kv_transfer_layer(
-            plan=plan,
-            source_layer=source_layer,
+        connector._run_sparse_direct_kv_transfer_layer(
+            kvcaches_ref=[(object(), object())],
+            kv_group=0,
             layer_id=0,
             load_stream=load_streams[stream_index],
             load_stream_idx=stream_index,
@@ -976,8 +977,15 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
             selected_token_idx=torch.arange(2, dtype=torch.int32),
             chunk_size=256,
             total_tokens=4,
+            chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+            sparse_kv_format=0,
+            sparse_token_major=False,
+            sparse_vllm_two_major=False,
+            sparse_k_hidden_dims=1,
+            sparse_v_hidden_dims=1,
+            sparse_dsa_hidden_dims=0,
             sparse_host_interleaved=True,
-            sparse_batch_size=2,
+            layer_tensors=[torch.zeros(4)],
         )
 
     launch(0)

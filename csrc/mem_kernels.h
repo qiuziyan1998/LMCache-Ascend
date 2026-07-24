@@ -257,8 +257,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     const SparseDirectDestinationState &destination_state,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
-    const int64_t total_tokens, const bool lmc_host_interleaved,
-    const int64_t sparse_batch_size);
+    const int64_t total_tokens, const bool lmc_host_interleaved);
 
 // Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
 // direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.

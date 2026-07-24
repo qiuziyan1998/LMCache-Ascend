@@ -1250,7 +1250,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             torch.npu.Event() for _ in range(self.load_stream_num)
         ]
         self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
-        self._active_prepared_sparse_retrievers: dict[int, int] = {}
         if _SPARSE_TRANSFER_TOPK:
             logger.warning(
                 "Limiting each sparse LMCache transfer to the first %d "
@@ -2088,40 +2087,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         plan: _SparseDestinationPlan,
         source_layer: PreparedSparseSourceLayer,
         layer_id: int,
-        load_stream: torch.cuda.Stream,
-        load_stream_idx: int,
-        current_stream: torch.cuda.Stream,
         slot_mapping_packed: torch.Tensor,
         selected_token_idx: torch.Tensor,
         chunk_size: int,
         total_tokens: int,
         sparse_host_interleaved: bool,
-        sparse_batch_size: int,
     ) -> None:
-        """Launch one prepared layer without source or native-state lookup."""
+        """Launch one prepared layer directly on the current compute stream."""
         if selected_token_idx.numel() == 0:
             return
-        chunk_ptrs_npu = source_layer.chunk_ptrs_npu
-
-        join = getattr(self, "_active_sparse_load_join", None)
-        if join is not None:
-            if self.load_stream_list[load_stream_idx] is not load_stream:
-                raise RuntimeError("sparse load stream index does not match its stream")
-            join.used_stream_indices.add(load_stream_idx)
-        with torch.cuda.stream(load_stream):
-            load_stream.wait_stream(current_stream)
-            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
-                plan.states[layer_id],
-                slot_mapping_packed,
-                selected_token_idx,
-                chunk_ptrs_npu,
-                chunk_size,
-                total_tokens,
-                sparse_host_interleaved,
-                sparse_batch_size,
-            )
-        if join is None:
-            current_stream.wait_stream(load_stream)
+        sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+            plan.states[layer_id],
+            slot_mapping_packed,
+            selected_token_idx,
+            source_layer.chunk_ptrs_npu,
+            chunk_size,
+            total_tokens,
+            sparse_host_interleaved,
+        )
 
     def _sparse_selected_token_idx(
         self,
@@ -3161,10 +3144,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 init_staging=False,
             )
 
-        load_stream_idx = self.load_stream_idx
-        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
-        load_stream = self.load_stream_list[load_stream_idx]
-
         sparse_k_hidden_dims = layout.k_hidden_dims
         sparse_v_hidden_dims = layout.v_hidden_dims
         sparse_dsa_hidden_dims = layout.dsa_hidden_dims
@@ -3183,79 +3162,54 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             expected_device=layout.kv_device,
         )
 
-        active_retrievers = getattr(
-            self, "_active_prepared_sparse_retrievers", None
-        )
-        if active_retrievers is None:
-            active_retrievers = self._active_prepared_sparse_retrievers = {}
-        # start_load_kv primes every request generator before layer dispatch,
-        # so this per-group count is the sparse kernel fan-out for the step.
-        active_retrievers[kv_group] = active_retrievers.get(kv_group, 0) + 1
-        try:
-            for layer_id, source_layer in enumerate(source.layers):
-                sparse_request = yield
-                current_stream = (
-                    torch.npu.current_stream()
-                    if hasattr(torch, "npu")
-                    and hasattr(torch.npu, "current_stream")
-                    else torch.cuda.current_stream()
+        for layer_id, source_layer in enumerate(source.layers):
+            sparse_request = yield
+
+            (
+                selected_token_idx,
+                token_start_index,
+                target_slot_mapping,
+                _payload_event,
+            ) = self._unpack_sparse_dynamic_request(sparse_request)
+            # The producer, this transfer, and its consumer are submitted to
+            # the same current stream, so stream order replaces the event wait.
+
+            if target_slot_mapping is not None:
+                slot_mapping_packed, selected_token_idx = (
+                    self._pack_sparse_explicit_slot_inputs(
+                        selected_token_idx,
+                        target_slot_mapping,
+                    )
                 )
-
-                (
-                    selected_token_idx,
-                    token_start_index,
-                    target_slot_mapping,
-                    payload_event,
-                ) = self._unpack_sparse_dynamic_request(sparse_request)
-
-                if payload_event is not None:
-                    _wait_payload_events(current_stream, payload_event)
-                if target_slot_mapping is not None:
-                    slot_mapping_packed, selected_token_idx = (
-                        self._pack_sparse_explicit_slot_inputs(
-                            selected_token_idx,
-                            target_slot_mapping,
-                        )
-                    )
-                else:
-                    slot_mapping_packed, selected_token_idx = (
-                        self._pack_sparse_layer_inputs(
-                            slot_mapping,
-                            selected_token_idx,
-                            token_start_index,
-                        )
-                    )
-                if _SPARSE_TRANSFER_TOPK:
-                    slot_mapping_packed, selected_token_idx = (
-                        self._limit_sparse_transfer_inputs(
-                            slot_mapping_packed,
-                            selected_token_idx,
-                        )
-                    )
-
-                self._run_prepared_sparse_direct_kv_transfer_layer(
-                    plan=destination_plan,
-                    source_layer=source_layer,
-                    layer_id=layer_id,
-                    load_stream=load_stream,
-                    load_stream_idx=load_stream_idx,
-                    current_stream=current_stream,
-                    slot_mapping_packed=slot_mapping_packed,
-                    selected_token_idx=selected_token_idx,
-                    chunk_size=chunk_size,
-                    total_tokens=source.total_tokens,
-                    sparse_host_interleaved=sparse_host_interleaved,
-                    sparse_batch_size=active_retrievers[kv_group],
-                )
-
-            yield
-            yield
-        finally:
-            remaining = active_retrievers[kv_group] - 1
-            if remaining:
-                active_retrievers[kv_group] = remaining
             else:
-                del active_retrievers[kv_group]
+                slot_mapping_packed, selected_token_idx = (
+                    self._pack_sparse_layer_inputs(
+                        slot_mapping,
+                        selected_token_idx,
+                        token_start_index,
+                    )
+                )
+            if _SPARSE_TRANSFER_TOPK:
+                slot_mapping_packed, selected_token_idx = (
+                    self._limit_sparse_transfer_inputs(
+                        slot_mapping_packed,
+                        selected_token_idx,
+                    )
+                )
+
+            self._run_prepared_sparse_direct_kv_transfer_layer(
+                plan=destination_plan,
+                source_layer=source_layer,
+                layer_id=layer_id,
+                slot_mapping_packed=slot_mapping_packed,
+                selected_token_idx=selected_token_idx,
+                chunk_size=chunk_size,
+                total_tokens=source.total_tokens,
+                sparse_host_interleaved=sparse_host_interleaved,
+            )
+
+        yield
+        yield
 
     def batched_to_gpu_head_token_wise(self, **kwargs):
         """
