@@ -2309,26 +2309,28 @@ class AscendLMCacheEngine(LMCacheEngine):
             for layer_keys in retrieve_keys
         ]
 
-        cached_handle_chunks = self._uniform_layer_cache_chunks(
-            cached_shared_handles,
-            self.num_layers,
-            "shared handle cache",
-        )
-        if cached_handle_chunks > cached_prefix_chunks:
-            raise ValueError(
-                "Sparse shared handle cache exceeds the materialized prefix: "
-                f"handles={cached_handle_chunks}, "
-                f"cached_chunks={cached_prefix_chunks}"
+        cached_handle_chunks = 0
+        if shared_sparse_retrieve:
+            cached_handle_chunks = self._uniform_layer_cache_chunks(
+                cached_shared_handles,
+                self.num_layers,
+                "shared handle cache",
             )
-        if (
-            cached_prefix_chunks < required_chunks
-            and cached_handle_chunks != cached_prefix_chunks
-        ):
-            raise ValueError(
-                "Sparse shared prefix extension requires complete cached "
-                f"handles: handles={cached_handle_chunks}, "
-                f"cached_chunks={cached_prefix_chunks}"
-            )
+            if cached_handle_chunks > cached_prefix_chunks:
+                raise ValueError(
+                    "Sparse shared handle cache exceeds the materialized prefix: "
+                    f"handles={cached_handle_chunks}, "
+                    f"cached_chunks={cached_prefix_chunks}"
+                )
+            if (
+                cached_prefix_chunks < required_chunks
+                and cached_handle_chunks != cached_prefix_chunks
+            ):
+                raise ValueError(
+                    "Sparse shared prefix extension requires complete cached "
+                    f"handles: handles={cached_handle_chunks}, "
+                    f"cached_chunks={cached_prefix_chunks}"
+                )
         publish_shared_handles = (
             shared_sparse_retrieve
             and not shared_retrieve_passive
