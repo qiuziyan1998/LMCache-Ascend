@@ -88,6 +88,9 @@ CASE_NAMES = (
 PATH_DIRECT = "direct_full"
 PATH_SHARDED = "shard_h2d_allgather_scatter"
 PATH_NAMES = (PATH_DIRECT, PATH_SHARDED)
+HCCL_HOST_PORT_COUNT = 32
+HCCL_MIN_BASE_PORT = 1024
+HCCL_MAX_BASE_PORT = 65520
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--output-json", default="")
+    parser.add_argument(
+        "--hccl-if-base-port",
+        type=int,
+        default=None,
+        help=(
+            "HCCL host-NIC base port. By default, preserve HCCL_IF_BASE_PORT "
+            "from the environment or choose a free block automatically."
+        ),
+    )
     args = parser.parse_args()
 
     devices = [int(value) for value in args.devices.split(",") if value.strip()]
@@ -157,6 +169,16 @@ def _parse_args() -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
         parser.error("--warmup cannot be negative")
+    if args.hccl_if_base_port is not None and not (
+        HCCL_MIN_BASE_PORT
+        <= args.hccl_if_base_port
+        <= HCCL_MAX_BASE_PORT - HCCL_HOST_PORT_COUNT + 1
+    ):
+        parser.error(
+            "--hccl-if-base-port must leave room for "
+            f"{HCCL_HOST_PORT_COUNT} ports in "
+            f"[{HCCL_MIN_BASE_PORT}, {HCCL_MAX_BASE_PORT}]"
+        )
     args.devices = devices
     return args
 
@@ -165,6 +187,78 @@ def _find_free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _can_bind_tcp_port_block(base_port: int, count: int) -> bool:
+    sockets: list[socket.socket] = []
+    try:
+        for port in range(base_port, base_port + count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.append(sock)
+            sock.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def _find_free_tcp_port_block(count: int) -> int:
+    """Find a free consecutive host-port block outside common ephemeral ports."""
+    candidates = list(
+        range(
+            10_000,
+            32_000 - count + 1,
+            count,
+        )
+    )
+    random.Random(os.getpid() ^ time.monotonic_ns()).shuffle(candidates)
+    for base_port in candidates:
+        if _can_bind_tcp_port_block(base_port, count):
+            return base_port
+    raise RuntimeError(
+        f"could not find {count} consecutive free TCP ports for HCCL; "
+        "pass --hccl-if-base-port with an available reserved range"
+    )
+
+
+def _configure_hccl_base_port(args: argparse.Namespace) -> tuple[int, str]:
+    if args.hccl_if_base_port is not None:
+        base_port = args.hccl_if_base_port
+        source = "command line"
+    elif "HCCL_IF_BASE_PORT" in os.environ:
+        try:
+            base_port = int(os.environ["HCCL_IF_BASE_PORT"])
+        except ValueError as exc:
+            raise RuntimeError(
+                "HCCL_IF_BASE_PORT must be an integer, got "
+                f"{os.environ['HCCL_IF_BASE_PORT']!r}"
+            ) from exc
+        source = "environment"
+    else:
+        base_port = _find_free_tcp_port_block(HCCL_HOST_PORT_COUNT)
+        source = "auto-selected"
+
+    if not (
+        HCCL_MIN_BASE_PORT <= base_port <= HCCL_MAX_BASE_PORT - HCCL_HOST_PORT_COUNT + 1
+    ):
+        raise RuntimeError(
+            f"HCCL_IF_BASE_PORT={base_port} does not leave room for "
+            f"{HCCL_HOST_PORT_COUNT} ports in "
+            f"[{HCCL_MIN_BASE_PORT}, {HCCL_MAX_BASE_PORT}]"
+        )
+    if not _can_bind_tcp_port_block(base_port, HCCL_HOST_PORT_COUNT):
+        last_port = base_port + HCCL_HOST_PORT_COUNT - 1
+        raise RuntimeError(
+            f"HCCL host-port range {base_port}-{last_port} is already in use; "
+            "stop the conflicting job or pass --hccl-if-base-port with a free "
+            "reserved range"
+        )
+
+    os.environ["HCCL_IF_BASE_PORT"] = str(base_port)
+    args.hccl_if_base_port = base_port
+    return base_port, source
 
 
 def _locality_cases(
@@ -687,6 +781,7 @@ def _summarize(
     summary: dict[str, Any] = {
         "devices": args.devices,
         "world_size": world_size,
+        "hccl_if_base_port": args.hccl_if_base_port,
         "num_tokens": args.num_tokens,
         "num_selected": args.num_selected,
         "local_selected": args.num_selected // world_size,
@@ -779,12 +874,18 @@ def _summarize(
 
 def main() -> None:
     args = _parse_args()
+    hccl_base_port, hccl_port_source = _configure_hccl_base_port(args)
     args.shared_slab_name = (
         f"/lmcache_tp_allgather_bench_{os.getpid()}_{uuid.uuid4().hex}"
     )
     args.init_method = f"tcp://127.0.0.1:{_find_free_tcp_port()}"
     print(f"shared CPU slab: {args.shared_slab_name}")
     print(f"HCCL init method: {args.init_method}")
+    print(
+        "HCCL host ports: "
+        f"{hccl_base_port}-{hccl_base_port + HCCL_HOST_PORT_COUNT - 1} "
+        f"({hccl_port_source})"
+    )
 
     context = mp.get_context("spawn")
     barrier = context.Barrier(len(args.devices))
