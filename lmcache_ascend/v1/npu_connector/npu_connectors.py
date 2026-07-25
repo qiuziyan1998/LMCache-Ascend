@@ -3,7 +3,7 @@
 from contextlib import contextmanager, nullcontext
 import json
 import os
-from typing import Any, Generator, List, Optional, Set, Union
+from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -80,6 +80,7 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
 _MTP_DW_DEEP_SEEN_LIMIT = 256
 _MTP_DW_CHECKSUM_LIMIT = 32
 _MTP_DW_UINT64_MASK = (1 << 64) - 1
+_EXPLICIT_SPARSE_LOAD_RESULT_KEY = "_lmcache_explicit_sparse_load_result"
 
 
 def _bounded_stable_int_checksum(values: Any) -> int:
@@ -1990,6 +1991,179 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_counts,
         )
 
+    @staticmethod
+    def _set_explicit_sparse_load_result(
+        payload: dict[str, Any],
+        req_id: Any,
+        layer_id: int,
+        requested: int,
+        status: str,
+    ) -> None:
+        payload[_EXPLICIT_SPARSE_LOAD_RESULT_KEY] = {
+            "request_id": req_id,
+            "layer_id": layer_id,
+            "requested_tokens": requested,
+            "loaded_tokens": requested if status == "loaded" else 0,
+            "status": status,
+        }
+
+    @staticmethod
+    def _explicit_sparse_error(
+        req_id: Any, layer_id: int, reason: str
+    ) -> RuntimeError:
+        return RuntimeError(
+            "Explicit sparse retrieve failed: "
+            f"request={req_id} layer={layer_id} reason={reason}"
+        )
+
+    def _validate_explicit_sparse_source(
+        self,
+        req_id: Any,
+        layer_id: int,
+        layer_tensors: Sequence[torch.Tensor],
+        total_tokens: int,
+        chunk_size: int,
+        kv_group: int,
+        chunk_ptrs_npu: Optional[torch.Tensor],
+        chunk_token_counts: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Validate fixed source metadata without reading dynamic NPU inputs."""
+        if total_tokens <= 0 or chunk_size <= 0:
+            raise self._explicit_sparse_error(
+                req_id,
+                layer_id,
+                f"invalid source sizes total={total_tokens} chunk={chunk_size}",
+            )
+        required_chunks = (total_tokens + chunk_size - 1) // chunk_size
+        if chunk_token_counts is not None and len(chunk_token_counts) > 0:
+            try:
+                normalized_chunk_counts = tuple(
+                    int(count) for count in chunk_token_counts
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "source chunk_token_counts must contain integers for the "
+                    "fixed-chunk Ascend sparse transfer",
+                ) from exc
+
+            fixed_chunk_compatible = (
+                len(normalized_chunk_counts) == required_chunks
+            )
+            if fixed_chunk_compatible:
+                for chunk_index, count in enumerate(
+                    normalized_chunk_counts
+                ):
+                    required_tokens = min(
+                        chunk_size,
+                        total_tokens - chunk_index * chunk_size,
+                    )
+                    if chunk_index + 1 < required_chunks:
+                        if count != chunk_size:
+                            fixed_chunk_compatible = False
+                            break
+                    elif count < required_tokens or count > chunk_size:
+                        fixed_chunk_compatible = False
+                        break
+            if not fixed_chunk_compatible:
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "variable chunk_token_counts are unsupported by the "
+                    "fixed-chunk Ascend sparse transfer: "
+                    f"chunk_token_counts={normalized_chunk_counts}, "
+                    f"fixed_chunk_size={chunk_size}, "
+                    f"total_tokens={total_tokens}. Every non-final chunk must "
+                    "contain exactly fixed_chunk_size tokens, and the final "
+                    "chunk must contain the remaining prefix (up to "
+                    "fixed_chunk_size).",
+                )
+        if len(layer_tensors) != required_chunks:
+            raise self._explicit_sparse_error(
+                req_id,
+                layer_id,
+                "source chunk coverage is incomplete "
+                f"chunks={len(layer_tensors)} required={required_chunks}",
+            )
+        if (
+            chunk_ptrs_npu is not None
+            and chunk_ptrs_npu.numel() != required_chunks
+        ):
+            raise self._explicit_sparse_error(
+                req_id,
+                layer_id,
+                "source pointer coverage is incomplete "
+                f"pointers={chunk_ptrs_npu.numel()} required={required_chunks}",
+            )
+        source_dtype = None
+        for chunk_index, tensor in enumerate(layer_tensors):
+            if not isinstance(tensor, torch.Tensor):
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "source chunk is not a tensor "
+                    f"chunk={chunk_index} type={type(tensor).__name__}",
+                )
+            if tensor.device.type != "cpu":
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "source chunk must be on CPU "
+                    f"chunk={chunk_index} device={tensor.device}",
+                )
+            if not tensor.is_contiguous():
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "source chunk must be contiguous "
+                    f"chunk={chunk_index} stride={tensor.stride()}",
+                )
+            if source_dtype is None:
+                source_dtype = tensor.dtype
+            elif tensor.dtype != source_dtype:
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "source chunk dtype is inconsistent "
+                    f"chunk={chunk_index} dtype={tensor.dtype} "
+                    f"expected={source_dtype}",
+                )
+
+            required_tokens = min(
+                chunk_size,
+                total_tokens - chunk_index * chunk_size,
+            )
+            available_tokens = self._lmc_plane_num_tokens(tensor, kv_group)
+            if available_tokens < required_tokens:
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "source chunk is short "
+                    f"chunk={chunk_index} available={available_tokens} "
+                    f"required={required_tokens}",
+                )
+
+    def _validate_host_selected_bounds(
+        self,
+        req_id: Any,
+        layer_id: int,
+        selected: torch.Tensor,
+        total_tokens: int,
+    ) -> None:
+        # Production NPU indices remain device-side; the producer prepare op
+        # enforces its boundary and the transfer kernel guards total_tokens.
+        if selected.numel() == 0 or selected.device.type != "cpu":
+            return
+        lo, hi = int(selected.min()), int(selected.max())
+        if lo < 0 or hi >= total_tokens:
+            raise self._explicit_sparse_error(
+                req_id,
+                layer_id,
+                f"selected token is out of bounds min={lo} max={hi} "
+                f"total={total_tokens}",
+            )
+
     def _pack_sparse_layer_inputs(
         self,
         slot_mapping: torch.Tensor,
@@ -2163,6 +2337,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     dtype=torch.long,
                     device=self.kv_device,
                 )
+            if selected_token_counts.device.type == "cpu":
+                counts = selected_token_counts.reshape(-1).to(dtype=torch.long)
+                width = (
+                    int(selected_token_idx.shape[-1])
+                    if selected_token_idx.dim() > 0
+                    else 0
+                )
+                if bool(torch.any((counts < 0) | (counts > width))):
+                    raise ValueError(
+                        "selected_token_counts must describe a valid row prefix "
+                        f"in [0, {width}], got {counts.tolist()}"
+                    )
             selected_token_counts = selected_token_counts.to(
                 device=self.kv_device, dtype=torch.long
             ).reshape(-1)
@@ -3536,26 +3722,63 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 _payload_event,
                 selected_token_counts,
             ) = self._unpack_sparse_dynamic_request(sparse_request)
+            if (
+                isinstance(sparse_request, dict)
+                and selected_token_counts is not None
+                and target_slot_mapping is None
+            ):
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "selected_token_counts requires target_slot_mapping",
+                )
+            strict_payload = (
+                isinstance(sparse_request, dict)
+                and target_slot_mapping is not None
+                and selected_token_counts is not None
+            )
+            if strict_payload:
+                sparse_request.pop(_EXPLICIT_SPARSE_LOAD_RESULT_KEY, None)
             # The producer, this transfer, and its consumer are submitted to
             # the same current stream, so stream order replaces the event wait.
 
-            if target_slot_mapping is not None:
-                slot_mapping_packed, selected_token_idx = (
-                    self._pack_sparse_explicit_slot_inputs(
-                        selected_token_idx,
-                        target_slot_mapping,
-                        selected_token_counts,
+            try:
+                if target_slot_mapping is not None:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_explicit_slot_inputs(
+                            selected_token_idx,
+                            target_slot_mapping,
+                            selected_token_counts,
+                        )
                     )
-                )
-            else:
-                slot_mapping_packed, selected_token_idx = (
-                    self._pack_sparse_layer_inputs(
-                        slot_mapping,
-                        selected_token_idx,
-                        token_start_index,
+                else:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_layer_inputs(
+                            slot_mapping,
+                            selected_token_idx,
+                            token_start_index,
+                        )
                     )
+            except Exception as exc:
+                if strict_payload:
+                    raise self._explicit_sparse_error(
+                        req_id, layer_id, f"invalid payload: {exc}"
+                    ) from exc
+                raise
+            requested = int(selected_token_idx.numel())
+            if strict_payload and requested == 0:
+                self._set_explicit_sparse_load_result(
+                    sparse_request, req_id, layer_id, 0, "no_op"
                 )
+                continue
             if _SPARSE_TRANSFER_TOPK:
+                if strict_payload and _SPARSE_TRANSFER_TOPK < requested:
+                    raise self._explicit_sparse_error(
+                        req_id,
+                        layer_id,
+                        "debug transfer limit would drop selected tokens "
+                        f"limit={_SPARSE_TRANSFER_TOPK} requested={requested}",
+                    )
                 slot_mapping_packed, selected_token_idx = (
                     self._limit_sparse_transfer_inputs(
                         slot_mapping_packed,
@@ -3563,6 +3786,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 )
 
+            if requested:
+                self._validate_explicit_sparse_source(
+                    req_id,
+                    layer_id,
+                    source_layer.tensors,
+                    source.total_tokens,
+                    chunk_size,
+                    kv_group,
+                    source_layer.chunk_ptrs_npu,
+                    chunk_token_counts=source.chunk_token_counts,
+                )
+            if strict_payload:
+                self._validate_host_selected_bounds(
+                    req_id, layer_id, selected_token_idx, source.total_tokens
+                )
             deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
             capture_content = _should_capture_deep_payload(
                 enabled=_mtp_dw_deep_diag_enabled(),
@@ -3585,6 +3823,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens=source.total_tokens,
                 sparse_host_interleaved=sparse_host_interleaved,
             )
+            if strict_payload:
+                self._set_explicit_sparse_load_result(
+                    sparse_request, req_id, layer_id, requested, "loaded"
+                )
             if capture_content and layer_id == 0:
                 source_chunk_ranges = []
                 for chunk_index, tensor in enumerate(source_layer.tensors):
@@ -3733,7 +3975,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 payload_event,
                 selected_token_counts,
             ) = self._unpack_sparse_dynamic_request(dynamic_request)
+            if (
+                isinstance(dynamic_request, dict)
+                and selected_token_counts is not None
+                and target_slot_mapping is None
+            ):
+                raise self._explicit_sparse_error(
+                    req_id,
+                    layer_id,
+                    "selected_token_counts requires target_slot_mapping",
+                )
             explicit_sparse_payload = target_slot_mapping is not None
+            strict_payload = (
+                isinstance(dynamic_request, dict)
+                and target_slot_mapping is not None
+                and selected_token_counts is not None
+            )
+            if strict_payload:
+                dynamic_request.pop(_EXPLICIT_SPARSE_LOAD_RESULT_KEY, None)
             deep_seen = {}
             capture_deep_payload = False
             if deep_diag_enabled:
@@ -3753,23 +4012,43 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if payload_event is not None:
                 _wait_payload_events(current_stream, payload_event)
 
-            if explicit_sparse_payload:
-                slot_mapping_packed, selected_token_idx = (
-                    self._pack_sparse_explicit_slot_inputs(
-                        selected_token_idx,
-                        target_slot_mapping,
-                        selected_token_counts,
+            try:
+                if explicit_sparse_payload:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_explicit_slot_inputs(
+                            selected_token_idx,
+                            target_slot_mapping,
+                            selected_token_counts,
+                        )
                     )
-                )
-            else:
-                slot_mapping_packed, selected_token_idx = (
-                    self._pack_sparse_layer_inputs(
-                        slot_mapping,
-                        selected_token_idx,
-                        token_start_index,
+                else:
+                    slot_mapping_packed, selected_token_idx = (
+                        self._pack_sparse_layer_inputs(
+                            slot_mapping,
+                            selected_token_idx,
+                            token_start_index,
+                        )
                     )
+            except Exception as exc:
+                if strict_payload:
+                    raise self._explicit_sparse_error(
+                        req_id, layer_id, f"invalid payload: {exc}"
+                    ) from exc
+                raise
+            requested = int(selected_token_idx.numel())
+            if strict_payload and requested == 0:
+                self._set_explicit_sparse_load_result(
+                    dynamic_request, req_id, layer_id, 0, "no_op"
                 )
+                continue
             if _SPARSE_TRANSFER_TOPK:
+                if strict_payload and _SPARSE_TRANSFER_TOPK < requested:
+                    raise self._explicit_sparse_error(
+                        req_id,
+                        layer_id,
+                        "debug transfer limit would drop selected tokens "
+                        f"limit={_SPARSE_TRANSFER_TOPK} requested={requested}",
+                    )
                 slot_mapping_packed, selected_token_idx = (
                     self._limit_sparse_transfer_inputs(
                         slot_mapping_packed,
@@ -3787,6 +4066,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if layer_cached_tensors is not None:
                 cpu_tensors = layer_cached_tensors
             else:
+                if strict_payload and any(
+                    memory_obj.tensor is None for memory_obj in memory_objs_layer
+                ):
+                    raise self._explicit_sparse_error(
+                        req_id, layer_id, "source contains a tensor-less MemoryObj"
+                    )
                 cpu_tensors = [
                     memory_obj.tensor
                     for memory_obj in memory_objs_layer
@@ -3794,6 +4079,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
 
             if not cpu_tensors:
+                if strict_payload:
+                    raise self._explicit_sparse_error(
+                        req_id, layer_id, "source is empty for a non-zero load"
+                    )
                 continue
 
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
@@ -3806,6 +4095,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if lmcache_cached_tokens > 0
                 else self._sparse_total_tokens_from_layer_chunks(cpu_tensors, kv_group)
             )
+            if strict_payload:
+                self._validate_explicit_sparse_source(
+                    req_id,
+                    layer_id,
+                    cpu_tensors,
+                    total_tokens,
+                    chunk_size,
+                    kv_group,
+                    chunk_ptrs_npu,
+                )
+                self._validate_host_selected_bounds(
+                    req_id, layer_id, selected_token_idx, total_tokens
+                )
             self._run_sparse_direct_kv_transfer_layer(
                 kvcaches_ref=kvcaches_snapshot,
                 kv_group=kv_group,
@@ -3831,6 +4133,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ),
                 cpu_tensors=cpu_tensors,
             )
+            if strict_payload:
+                self._set_explicit_sparse_load_result(
+                    dynamic_request, req_id, layer_id, requested, "loaded"
+                )
             capture_content_probe = (
                 deep_diag_enabled
                 and layer_id == 0

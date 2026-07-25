@@ -401,6 +401,46 @@ def test_sparse_pack_explicit_slots_excludes_padding_by_row_count() -> None:
     assert not set(packed.tolist()).intersection({1000, 1001, 1200, 1201, 1202})
 
 
+def test_sparse_pack_preserves_shuffled_source_target_pairs() -> None:
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor(
+        [[3, 91, 249, 777], [0, 17, 888, 999]], dtype=torch.int32
+    )
+    targets = torch.tensor(
+        [[1902, 900, 1701, 1000], [42, 1337, 1200, 1201]],
+        dtype=torch.long,
+    )
+
+    packed, selected_out = (
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            selected,
+            targets,
+            torch.tensor([3, 2], dtype=torch.int32),
+        )
+    )
+
+    assert list(zip(selected_out.tolist(), packed.tolist(), strict=True)) == [
+        (3, 1902),
+        (91, 900),
+        (249, 1701),
+        (0, 42),
+        (17, 1337),
+    ]
+
+
+@pytest.mark.parametrize("count", [-1, 4])
+def test_sparse_pack_rejects_invalid_row_prefix_count(count: int) -> None:
+    connector = _make_sparse_pack_connector()
+    with pytest.raises(ValueError, match="valid row prefix"):
+        VLLMPagedMemLayerwiseNPUConnector._pack_sparse_explicit_slot_inputs(
+            connector,
+            torch.tensor([[3, 91, 249]], dtype=torch.int32),
+            torch.tensor([[900, 901, 902]], dtype=torch.long),
+            torch.tensor([count], dtype=torch.int32),
+        )
+
+
 def test_sparse_pack_explicit_slots_allows_empty_row_payload() -> None:
     connector = _make_sparse_pack_connector()
     selected = torch.tensor([0, 91, 249], dtype=torch.int32)
@@ -417,6 +457,448 @@ def test_sparse_pack_explicit_slots_allows_empty_row_payload() -> None:
 
     assert packed.numel() == 0
     assert selected_out.numel() == 0
+
+
+def _strict_prepared_generator(
+    monkeypatch,
+    *,
+    source: PreparedSparseSource,
+    transfer_calls: list,
+    req_id: str,
+):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.lmcache_chunk_size = 4
+    connector.kv_device = torch.device("cpu")
+    connector._layerwise_sparse_idx_cache = None
+    connector._group_layouts = {
+        0: SimpleNamespace(
+            k_hidden_dims=1,
+            v_hidden_dims=0,
+            dsa_hidden_dims=0,
+            kv_format=SimpleNamespace(value=0),
+            kv_device=torch.device("cpu"),
+        )
+    }
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_sparse_lmc_host_interleaved",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_lmc_plane_num_tokens",
+        lambda tensor, kv_group=None: tensor.numel(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_run_prepared_sparse_direct_kv_transfer_layer",
+        lambda **kwargs: transfer_calls.append(kwargs),
+    )
+    generator = connector._batched_to_gpu_head_token_wise_prepared(
+        {
+            "prepared_sparse_source": source,
+            "kvcaches": [object()],
+            "slot_mapping": torch.arange(8, dtype=torch.long),
+            "kv_group": 0,
+            "req_id": req_id,
+        }
+    )
+    next(generator)
+    return generator
+
+
+def test_prepared_explicit_sparse_reports_complete_shuffled_transfer(
+    monkeypatch,
+) -> None:
+    calls = []
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4), torch.zeros(2)),
+                chunk_ptrs_npu=torch.tensor([101, 202], dtype=torch.int64),
+            ),
+        ),
+        total_tokens=6,
+        chunk_token_counts=(4, 2),
+    )
+    generator = _strict_prepared_generator(
+        monkeypatch, source=source, transfer_calls=calls, req_id="req-ok"
+    )
+    payload = {
+        "selected_token_ids": torch.tensor([[5, 1, 4, 999]], dtype=torch.int32),
+        "target_slot_mapping": torch.tensor(
+            [[1701, 42, 903, 0]], dtype=torch.long
+        ),
+        "selected_token_counts": torch.tensor([3], dtype=torch.int32),
+    }
+
+    generator.send(payload)
+
+    assert calls[0]["selected_token_idx"].tolist() == [5, 1, 4]
+    assert calls[0]["slot_mapping_packed"].tolist() == [1701, 42, 903]
+    result = payload[npu_connectors._EXPLICIT_SPARSE_LOAD_RESULT_KEY]
+    assert (result["requested_tokens"], result["loaded_tokens"]) == (3, 3)
+    generator.close()
+
+
+def test_prepared_explicit_sparse_zero_count_is_noop(monkeypatch) -> None:
+    calls = []
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(),
+                chunk_ptrs_npu=torch.empty(0, dtype=torch.int64),
+            ),
+        ),
+        total_tokens=4,
+    )
+    generator = _strict_prepared_generator(
+        monkeypatch, source=source, transfer_calls=calls, req_id="req-zero"
+    )
+    payload = {
+        "selected_token_ids": torch.tensor([[99]], dtype=torch.int32),
+        "target_slot_mapping": torch.tensor([[1701]], dtype=torch.long),
+        "selected_token_counts": torch.tensor([0], dtype=torch.int32),
+    }
+
+    generator.send(payload)
+
+    assert calls == []
+    assert payload[npu_connectors._EXPLICIT_SPARSE_LOAD_RESULT_KEY][
+        "status"
+    ] == "no_op"
+    generator.close()
+
+
+def test_prepared_legacy_explicit_slots_without_counts_are_supported(
+    monkeypatch,
+) -> None:
+    transfer_calls = []
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4),),
+                chunk_ptrs_npu=torch.tensor([101], dtype=torch.int64),
+            ),
+        ),
+        total_tokens=4,
+    )
+    generator = _strict_prepared_generator(
+        monkeypatch,
+        source=source,
+        transfer_calls=transfer_calls,
+        req_id="req-legacy",
+    )
+    payload = {
+        "selected_token_ids": torch.tensor(
+            [[3, 1]], dtype=torch.int32
+        ),
+        "target_slot_mapping": torch.tensor(
+            [[1701, 42]], dtype=torch.long
+        ),
+    }
+
+    generator.send(payload)
+
+    assert len(transfer_calls) == 1
+    assert transfer_calls[0]["selected_token_idx"].tolist() == [3, 1]
+    assert transfer_calls[0]["slot_mapping_packed"].tolist() == [1701, 42]
+    assert npu_connectors._EXPLICIT_SPARSE_LOAD_RESULT_KEY not in payload
+    generator.close()
+
+
+def test_prepared_sparse_counts_without_targets_are_rejected(
+    monkeypatch,
+) -> None:
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4),),
+                chunk_ptrs_npu=torch.tensor([101], dtype=torch.int64),
+            ),
+        ),
+        total_tokens=4,
+    )
+    generator = _strict_prepared_generator(
+        monkeypatch,
+        source=source,
+        transfer_calls=[],
+        req_id="req-count-only",
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"request=req-count-only layer=0 "
+            r"reason=selected_token_counts requires target_slot_mapping"
+        ),
+    ):
+        generator.send(
+            {
+                "selected_token_ids": torch.tensor(
+                    [[1]], dtype=torch.int32
+                ),
+                "selected_token_counts": torch.tensor(
+                    [1], dtype=torch.int32
+                ),
+            }
+        )
+
+
+def test_prepared_explicit_sparse_rejects_variable_chunk_token_counts(
+    monkeypatch,
+) -> None:
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(
+                    torch.zeros(2),
+                    torch.zeros(2),
+                    torch.zeros(2),
+                ),
+                chunk_ptrs_npu=torch.tensor(
+                    [101, 202, 303], dtype=torch.int64
+                ),
+            ),
+        ),
+        total_tokens=6,
+        chunk_token_counts=(2, 2, 2),
+    )
+    transfer_calls = []
+    generator = _strict_prepared_generator(
+        monkeypatch,
+        source=source,
+        transfer_calls=transfer_calls,
+        req_id="req-variable-chunks",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"request=req-variable-chunks layer=0 "
+            r"reason=variable chunk_token_counts are unsupported by the "
+            r"fixed-chunk Ascend sparse transfer"
+        ),
+    ):
+        generator.send(
+            {
+                "selected_token_ids": torch.tensor(
+                    [[1]], dtype=torch.int32
+                ),
+                "target_slot_mapping": torch.tensor(
+                    [[1701]], dtype=torch.long
+                ),
+            }
+        )
+    assert transfer_calls == []
+
+
+def test_normal_legacy_explicit_slots_without_counts_are_supported(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kvcaches = [(object(), object())]
+    connector.load_stream_idx = 0
+    connector.load_stream_num = 1
+    connector.lmcache_chunk_size = 4
+    connector.kv_device = torch.device("cpu")
+
+    class _Stream:
+        def wait_stream(self, stream):
+            pass
+
+        def wait_event(self, event):
+            pass
+
+    class _Layout:
+        k_hidden_dims = 1
+        v_hidden_dims = 0
+        dsa_hidden_dims = 0
+        kv_format = SimpleNamespace(value=0)
+        vllm_two_major = False
+
+    connector.load_stream_list = [_Stream()]
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(current_stream=lambda: _Stream()),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(
+        connector,
+        "initialize_kvcaches_ptr",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda kvcaches, kv_group=0, init_staging=False: _Layout(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_layerwise_token_major",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_sparse_lmc_host_interleaved",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu: torch.tensor(
+            [101], dtype=torch.long
+        ),
+    )
+    transfer_calls = []
+    monkeypatch.setattr(
+        connector,
+        "_run_sparse_direct_kv_transfer_layer",
+        lambda **kwargs: transfer_calls.append(kwargs),
+    )
+
+    generator = connector.batched_to_gpu_head_token_wise(
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=True,
+        cached_tensors=[[torch.zeros(4)]],
+        lmcache_cached_tokens=4,
+        kv_group=0,
+        req_id="req-normal-legacy",
+    )
+    next(generator)
+    payload = {
+        "memory_objs_layer": [],
+        "selected_token_ids": torch.tensor(
+            [[3, 1]], dtype=torch.int32
+        ),
+        "target_slot_mapping": torch.tensor(
+            [[1701, 42]], dtype=torch.long
+        ),
+    }
+
+    generator.send(payload)
+
+    assert len(transfer_calls) == 1
+    assert transfer_calls[0]["selected_token_idx"].tolist() == [3, 1]
+    assert transfer_calls[0]["slot_mapping_packed"].tolist() == [1701, 42]
+    assert npu_connectors._EXPLICIT_SPARSE_LOAD_RESULT_KEY not in payload
+    generator.close()
+
+
+def test_prepared_explicit_sparse_rejects_incomplete_source(monkeypatch) -> None:
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4),),
+                chunk_ptrs_npu=torch.tensor([101], dtype=torch.int64),
+            ),
+        ),
+        total_tokens=6,
+    )
+    generator = _strict_prepared_generator(
+        monkeypatch, source=source, transfer_calls=[], req_id="req-missing"
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"request=req-missing layer=0 reason=source chunk coverage",
+    ):
+        generator.send(
+            {
+                "selected_token_ids": torch.tensor([[1]], dtype=torch.int32),
+                "target_slot_mapping": torch.tensor([[1701]], dtype=torch.long),
+                "selected_token_counts": torch.tensor([1], dtype=torch.int32),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("middle_chunk", "reason"),
+    [
+        (object(), "source chunk is not a tensor"),
+        (torch.zeros(3), "source chunk is short"),
+        (
+            torch.zeros(4, dtype=torch.int32),
+            "source chunk dtype is inconsistent",
+        ),
+    ],
+)
+def test_prepared_explicit_sparse_validates_every_source_chunk(
+    monkeypatch,
+    middle_chunk,
+    reason,
+) -> None:
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4), middle_chunk, torch.zeros(2)),
+                chunk_ptrs_npu=torch.tensor(
+                    [101, 202, 303], dtype=torch.int64
+                ),
+            ),
+        ),
+        total_tokens=10,
+    )
+    transfer_calls = []
+    generator = _strict_prepared_generator(
+        monkeypatch,
+        source=source,
+        transfer_calls=transfer_calls,
+        req_id="req-interior",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"request=req-interior layer=0 reason={reason}",
+    ):
+        generator.send(
+            {
+                "selected_token_ids": torch.tensor(
+                    [[1]], dtype=torch.int32
+                ),
+                "target_slot_mapping": torch.tensor(
+                    [[1701]], dtype=torch.long
+                ),
+                "selected_token_counts": torch.tensor(
+                    [1], dtype=torch.int32
+                ),
+            }
+        )
+    assert transfer_calls == []
+
+
+def test_prepared_explicit_sparse_rejects_host_selected_oob(monkeypatch) -> None:
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4), torch.zeros(2)),
+                chunk_ptrs_npu=torch.tensor([101, 202], dtype=torch.int64),
+            ),
+        ),
+        total_tokens=6,
+    )
+    generator = _strict_prepared_generator(
+        monkeypatch, source=source, transfer_calls=[], req_id="req-oob"
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"request=req-oob layer=0 reason=selected token is out of bounds",
+    ):
+        generator.send(
+            {
+                "selected_token_ids": torch.tensor([[6]], dtype=torch.int32),
+                "target_slot_mapping": torch.tensor([[1701]], dtype=torch.long),
+                "selected_token_counts": torch.tensor([1], dtype=torch.int32),
+            }
+        )
 
 
 def test_sparse_pack_legacy_slots_miss_compact_scratch_window() -> None:
