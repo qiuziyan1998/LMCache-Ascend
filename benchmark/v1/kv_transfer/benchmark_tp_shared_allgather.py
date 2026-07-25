@@ -143,6 +143,15 @@ def _parse_args() -> argparse.Namespace:
             "from the environment or choose a free block automatically."
         ),
     )
+    parser.add_argument(
+        "--inherit-hccl-socket-ports",
+        action="store_true",
+        help=(
+            "Preserve HCCL_HOST_SOCKET_PORT_RANGE and "
+            "HCCL_NPU_SOCKET_PORT_RANGE. By default both are set to 'auto' "
+            "to avoid collisions with other or recently stopped HCCL jobs."
+        ),
+    )
     args = parser.parse_args()
 
     devices = [int(value) for value in args.devices.split(",") if value.strip()]
@@ -259,6 +268,24 @@ def _configure_hccl_base_port(args: argparse.Namespace) -> tuple[int, str]:
     os.environ["HCCL_IF_BASE_PORT"] = str(base_port)
     args.hccl_if_base_port = base_port
     return base_port, source
+
+
+def _configure_hccl_socket_ports(args: argparse.Namespace) -> dict[str, str]:
+    """Avoid fixed host- and NPU-side HCCL ports used by root-info setup."""
+    names = (
+        "HCCL_HOST_SOCKET_PORT_RANGE",
+        "HCCL_NPU_SOCKET_PORT_RANGE",
+    )
+    if not args.inherit_hccl_socket_ports:
+        if args.hccl_if_base_port is None:
+            os.environ.pop("HCCL_IF_BASE_PORT", None)
+            os.environ["HCCL_HOST_SOCKET_PORT_RANGE"] = "auto"
+        else:
+            os.environ.pop("HCCL_HOST_SOCKET_PORT_RANGE", None)
+        os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "auto"
+    values = {name: os.environ.get(name, "<unset>") for name in names}
+    args.hccl_socket_ports = values
+    return values
 
 
 def _locality_cases(
@@ -782,6 +809,7 @@ def _summarize(
         "devices": args.devices,
         "world_size": world_size,
         "hccl_if_base_port": args.hccl_if_base_port,
+        "hccl_socket_ports": args.hccl_socket_ports,
         "num_tokens": args.num_tokens,
         "num_selected": args.num_selected,
         "local_selected": args.num_selected // world_size,
@@ -874,6 +902,7 @@ def _summarize(
 
 def main() -> None:
     args = _parse_args()
+    hccl_socket_ports = _configure_hccl_socket_ports(args)
     hccl_base_port, hccl_port_source = _configure_hccl_base_port(args)
     args.shared_slab_name = (
         f"/lmcache_tp_allgather_bench_{os.getpid()}_{uuid.uuid4().hex}"
@@ -886,6 +915,8 @@ def main() -> None:
         f"{hccl_base_port}-{hccl_base_port + HCCL_HOST_PORT_COUNT - 1} "
         f"({hccl_port_source})"
     )
+    for name, value in hccl_socket_ports.items():
+        print(f"{name}={value}")
 
     context = mp.get_context("spawn")
     barrier = context.Barrier(len(args.devices))
