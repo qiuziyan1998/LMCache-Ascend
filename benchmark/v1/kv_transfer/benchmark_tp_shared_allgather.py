@@ -129,7 +129,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-lora-rank", type=int, default=512)
     parser.add_argument("--qk-rope-head-dim", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verify", action="store_true")
@@ -833,10 +833,16 @@ def _summarize(
         "full useful payload per invocation: "
         f"{format_bytes_short(useful_bytes_per_invocation)}"
     )
+    if args.num_layers * args.iters < 100:
+        print(
+            "WARNING: fewer than 100 timed layer transfers per repeat; "
+            "cross-rank wall metrics may be dominated by process start skew. "
+            "Use --num-layers 8 --iters 50 for throughput measurements."
+        )
     print(
         "\ncase                                      "
-        "direct ms/layer  sharded ms/layer  speedup  "
-        "direct effective GB/s  sharded effective GB/s"
+        "direct event GB/s  sharded event GB/s  event speedup  "
+        "direct wall GB/s  sharded wall GB/s  wall speedup"
     )
 
     for case_name in CASE_NAMES:
@@ -860,19 +866,42 @@ def _summarize(
             effective_gbps = (
                 useful_bytes_per_repeat / (median_critical_ms / 1000.0) / 1e9
             )
+            rank_event_bandwidths = [
+                useful_bytes_per_repeat / (duration_ms / 1000.0) / 1e9
+                for duration_ms in event_ms
+            ]
+            median_rank_event_ms = statistics.median(event_ms)
+            start_skew_ms = []
+            for repeat in range(args.repeats):
+                starts = [
+                    worker["results"][case_name][path_name][repeat]["wall_start_ns"]
+                    for worker in workers
+                ]
+                start_skew_ms.append((max(starts) - min(starts)) / 1e6)
             path_summary[path_name] = {
                 "median_critical_wall_ms": median_critical_ms,
                 "median_ms_per_layer": median_ms_per_layer,
                 "effective_full_payload_gbps": effective_gbps,
-                "median_rank_event_ms": statistics.median(event_ms),
+                "median_rank_event_ms": median_rank_event_ms,
+                "median_rank_event_ms_per_layer": median_rank_event_ms
+                / (args.iters * args.num_layers),
+                "rank_event_effective_full_payload_gbps": statistics.median(
+                    rank_event_bandwidths
+                ),
+                "min_rank_event_effective_full_payload_gbps": min(
+                    rank_event_bandwidths
+                ),
+                "max_rank_event_effective_full_payload_gbps": max(
+                    rank_event_bandwidths
+                ),
                 "min_rank_event_ms": min(event_ms),
                 "max_rank_event_ms": max(event_ms),
+                "median_start_skew_ms": statistics.median(start_skew_ms),
+                "max_start_skew_ms": max(start_skew_ms),
                 "critical_wall_samples_ms": critical_wall_ms,
             }
 
-        direct_ms = path_summary[PATH_DIRECT]["median_ms_per_layer"]
-        sharded_ms = path_summary[PATH_SHARDED]["median_ms_per_layer"]
-        paired_speedups = [
+        paired_wall_speedups = [
             direct_sample / sharded_sample
             for direct_sample, sharded_sample in zip(
                 critical_by_path[PATH_DIRECT],
@@ -881,20 +910,43 @@ def _summarize(
             )
             if sharded_sample > 0
         ]
-        speedup = statistics.median(paired_speedups)
+        paired_event_speedups = [
+            worker["results"][case_name][PATH_DIRECT][repeat]["event_ms"]
+            / worker["results"][case_name][PATH_SHARDED][repeat]["event_ms"]
+            for worker in workers
+            for repeat in range(args.repeats)
+            if worker["results"][case_name][PATH_SHARDED][repeat]["event_ms"] > 0
+        ]
+        wall_speedup = statistics.median(paired_wall_speedups)
+        event_speedup = statistics.median(paired_event_speedups)
+        direct_event_gbps = path_summary[PATH_DIRECT][
+            "rank_event_effective_full_payload_gbps"
+        ]
+        sharded_event_gbps = path_summary[PATH_SHARDED][
+            "rank_event_effective_full_payload_gbps"
+        ]
+        direct_wall_gbps = path_summary[PATH_DIRECT]["effective_full_payload_gbps"]
+        sharded_wall_gbps = path_summary[PATH_SHARDED]["effective_full_payload_gbps"]
         print(
             f"{case_name:42} "
-            f"{direct_ms:15.3f}  {sharded_ms:16.3f}  "
-            f"{speedup:7.3f}x  "
-            f"{path_summary[PATH_DIRECT]['effective_full_payload_gbps']:21.2f}  "
-            f"{path_summary[PATH_SHARDED]['effective_full_payload_gbps']:22.2f}"
+            f"{direct_event_gbps:19.2f}  "
+            f"{sharded_event_gbps:20.2f}  "
+            f"{event_speedup:13.3f}x  "
+            f"{direct_wall_gbps:18.2f}  "
+            f"{sharded_wall_gbps:19.2f}  "
+            f"{wall_speedup:12.3f}x"
         )
         summary["cases"][case_name] = {
             "paths": path_summary,
             "paired_speedup": {
-                "median": speedup,
-                "min": min(paired_speedups),
-                "max": max(paired_speedups),
+                "median": wall_speedup,
+                "min": min(paired_wall_speedups),
+                "max": max(paired_wall_speedups),
+            },
+            "paired_rank_event_speedup": {
+                "median": event_speedup,
+                "min": min(paired_event_speedups),
+                "max": max(paired_event_speedups),
             },
         }
     return summary
