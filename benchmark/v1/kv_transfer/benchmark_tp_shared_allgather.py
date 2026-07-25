@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare full sparse direct load with TP-sharded load plus AllGather.
+"""Compare full sparse K load with TP-sharded load plus AllGather.
 
 This is a standalone data-plane benchmark. It does not use or modify the
 vLLM/LMCache runtime connector. The benchmark preserves the relevant runtime
 layouts and operations:
 
 * rank 0 creates and populates one shared, pinned LMCache CPU slab;
-* every rank maps the same MLA-latent chunks (chunk size 256 by default);
+* every rank maps the same single-plane K chunks (chunk size 256 by default);
 * the baseline uses the production sparse direct host-to-paged-NPU kernel;
 * the proposed path transfers a rank-contiguous 1/world_size token slice into
-  an MLA-shaped NPU staging cache, AllGathers K and V, then scatters the full
-  result into a vLLM-shaped paged destination.
+  an NPU staging cache, AllGathers K, then scatters the full result into a
+  vLLM-shaped paged destination;
+* isolated H2D, AllGather, and scatter measurements show where time is spent;
+* a no-scatter path gives the lower bound when the gathered output can be used
+  directly;
+* a double-buffered pipeline subdivides each rank's shard so sparse H2D for
+  chunk N+1 can overlap AllGather/scatter for chunk N.
 
 The selected-token count must be divisible by the TP world size. Contiguous
 rank slices then make the rank-ordered AllGather output match the original
@@ -59,10 +64,9 @@ except ImportError:
     torch_npu = None
 
 # First Party
-from kv_cache_fixtures import generate_mla_kv_cache  # noqa: E402
 from load_benchmark_utils import (  # noqa: E402
     ALIGN_BYTES,
-    KV_FORMAT_MLA_LATENT,
+    KV_FORMAT_DSA_INDEX,
     LoadBenchmarkHarness,
     MlaDsaDims,
     as_vllm_kv_caches,
@@ -87,7 +91,27 @@ CASE_NAMES = (
 )
 PATH_DIRECT = "direct_full"
 PATH_SHARDED = "shard_h2d_allgather_scatter"
-PATH_NAMES = (PATH_DIRECT, PATH_SHARDED)
+PATH_H2D = "stage_local_h2d"
+PATH_ALLGATHER = "stage_allgather"
+PATH_SCATTER = "stage_scatter"
+PATH_NO_SCATTER = "shard_h2d_allgather_no_scatter"
+PATH_PIPELINED = "pipeline_h2d_allgather_scatter"
+PATH_NAMES = (
+    PATH_DIRECT,
+    PATH_SHARDED,
+    PATH_NO_SCATTER,
+    PATH_PIPELINED,
+    PATH_H2D,
+    PATH_ALLGATHER,
+    PATH_SCATTER,
+)
+COMPARISON_PATHS = (
+    PATH_DIRECT,
+    PATH_SHARDED,
+    PATH_NO_SCATTER,
+    PATH_PIPELINED,
+)
+STAGE_PATHS = (PATH_H2D, PATH_ALLGATHER, PATH_SCATTER)
 HCCL_HOST_PORT_COUNT = 32
 HCCL_MIN_BASE_PORT = 1024
 HCCL_MAX_BASE_PORT = 65520
@@ -100,20 +124,31 @@ class TransferCase:
     selected_token_idx: torch.Tensor
     target_slot_mapping: torch.Tensor
     local_selected_token_idx: torch.Tensor
+    pipeline_target_slot_mappings: tuple[torch.Tensor, ...]
 
 
 @dataclass
 class ShardedAllGatherHarness:
     """NPU buffers and prepared state for the proposed two-stage path."""
 
-    local_staging: tuple[torch.Tensor, torch.Tensor]
+    local_staging: tuple[torch.Tensor]
     local_destination_state: Any
     local_slot_mapping: torch.Tensor
     local_k: torch.Tensor
-    local_v: torch.Tensor
     gathered_k: torch.Tensor
-    gathered_v: torch.Tensor
-    destinations: list[tuple[torch.Tensor, torch.Tensor]]
+    destinations: list[tuple[torch.Tensor]]
+    pipeline_staging: list[tuple[torch.Tensor]]
+    pipeline_destination_states: list[Any]
+    pipeline_local_k: list[torch.Tensor]
+    pipeline_gathered_k: list[torch.Tensor]
+    pipeline_local_slot_mapping: torch.Tensor
+    pipeline_load_done: list[Any]
+    pipeline_buffer_free: list[Any]
+    pipeline_buffer_used: list[bool]
+    pipeline_entry: Any
+    load_stream: Any
+    collective_stream: Any
+    pipeline_chunk_ranges: tuple[tuple[int, int], ...]
     local_selected: int
 
 
@@ -127,10 +162,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-kv-heads", type=int, default=1)
     parser.add_argument("--kv-lora-rank", type=int, default=512)
-    parser.add_argument("--qk-rope-head-dim", type=int, default=64)
+    parser.add_argument(
+        "--qk-rope-head-dim",
+        type=int,
+        default=64,
+        help=(
+            "Accepted for command compatibility but ignored: this benchmark "
+            "models only the decode-critical K plane."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=7)
+    parser.add_argument(
+        "--pipeline-chunks",
+        type=int,
+        default=4,
+        help=(
+            "Subdivide each rank's 1/world_size shard into this many pieces "
+            "for the double-buffered H2D/AllGather pipeline."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--output-json", default="")
@@ -173,11 +225,18 @@ def _parse_args() -> argparse.Namespace:
         "qk_rope_head_dim",
         "iters",
         "repeats",
+        "pipeline_chunks",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
         parser.error("--warmup cannot be negative")
+    local_selected = args.num_selected // len(devices)
+    if args.pipeline_chunks > local_selected:
+        parser.error(
+            "--pipeline-chunks cannot exceed "
+            "--num-selected / number of devices"
+        )
     if args.hccl_if_base_port is not None and not (
         HCCL_MIN_BASE_PORT
         <= args.hccl_if_base_port
@@ -288,6 +347,19 @@ def _configure_hccl_socket_ports(args: argparse.Namespace) -> dict[str, str]:
     return values
 
 
+def _split_evenly(size: int, pieces: int) -> tuple[tuple[int, int], ...]:
+    """Return non-empty, near-even half-open ranges covering ``size``."""
+    quotient, remainder = divmod(size, pieces)
+    ranges = []
+    start = 0
+    for piece in range(pieces):
+        piece_size = quotient + (1 if piece < remainder else 0)
+        end = start + piece_size
+        ranges.append((start, end))
+        start = end
+    return tuple(ranges)
+
+
 def _locality_cases(
     *,
     num_tokens: int,
@@ -295,6 +367,7 @@ def _locality_cases(
     num_slots: int,
     rank: int,
     world_size: int,
+    pipeline_chunks: int,
     seed: int,
     device: torch.device,
 ) -> dict[str, TransferCase]:
@@ -321,15 +394,33 @@ def _locality_cases(
     local_selected = num_selected // world_size
     local_start = rank * local_selected
     local_end = local_start + local_selected
+    pipeline_chunk_ranges = _split_evenly(local_selected, pipeline_chunks)
 
     def make_case(
         selected: torch.Tensor,
         destination: torch.Tensor,
     ) -> TransferCase:
+        pipeline_target_slot_mappings = []
+        for chunk_start, chunk_end in pipeline_chunk_ranges:
+            gathered_positions = torch.cat(
+                [
+                    torch.arange(
+                        peer_rank * local_selected + chunk_start,
+                        peer_rank * local_selected + chunk_end,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    for peer_rank in range(world_size)
+                ]
+            )
+            pipeline_target_slot_mappings.append(
+                destination.index_select(0, gathered_positions)
+            )
         return TransferCase(
             selected_token_idx=selected,
             target_slot_mapping=destination,
             local_selected_token_idx=selected[local_start:local_end],
+            pipeline_target_slot_mappings=tuple(pipeline_target_slot_mappings),
         )
 
     return {
@@ -343,9 +434,9 @@ def _locality_cases(
 def _shared_slab_size(args: argparse.Namespace) -> int:
     dims = MlaDsaDims(
         k_hidden_dims=args.num_kv_heads * args.kv_lora_rank,
-        v_hidden_dims=args.num_kv_heads * args.qk_rope_head_dim,
-        dsa_hidden_dims=0,
-        plane_elems=args.num_kv_heads * (args.kv_lora_rank + args.qk_rope_head_dim),
+        v_hidden_dims=0,
+        dsa_hidden_dims=args.num_kv_heads * args.kv_lora_rank,
+        plane_elems=args.num_kv_heads * args.kv_lora_rank,
     )
     return shared_cpu_slab_bytes(
         compute_chunk_partition(args.num_tokens, args.chunk_size),
@@ -366,18 +457,27 @@ def _build_direct_harness(
     torch.npu.set_device(device)
     torch.manual_seed(args.seed)
     num_blocks = recommended_num_blocks(args.num_tokens, args.block_size)
-    source_cache = generate_mla_kv_cache(
-        num_blocks=num_blocks,
-        device=device,
-        num_layers=args.num_layers,
-        num_kv_heads=args.num_kv_heads,
-        kv_lora_rank=args.kv_lora_rank,
-        qk_rope_head_dim=args.qk_rope_head_dim,
-        block_size=args.block_size,
-        dtype=torch.bfloat16,
-    )
+    # The decode-critical sparse path under test loads only the latent K plane.
+    # DSA_INDEX is the existing production single-plane prepared-transfer
+    # format; here it is used mechanically for the K-shaped tensor so the host
+    # chunks, sparse H2D kernel, and byte accounting all exclude V.
+    source_cache = [
+        (
+            torch.randn(
+                (
+                    num_blocks,
+                    args.block_size,
+                    args.num_kv_heads,
+                    args.kv_lora_rank,
+                ),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+        )
+        for _ in range(args.num_layers)
+    ]
     return build_load_benchmark_harness(
-        fmt="mla_latent",
+        fmt="dsa_index",
         src_kv_cache=source_cache,
         num_tokens=args.num_tokens,
         chunk_size=args.chunk_size,
@@ -389,16 +489,15 @@ def _build_direct_harness(
     )
 
 
-def _empty_mla_layer(
+def _empty_k_layer(
     *,
     num_slots: int,
     block_size: int,
     num_kv_heads: int,
     kv_lora_rank: int,
-    qk_rope_head_dim: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor]:
     num_blocks = (num_slots + block_size - 1) // block_size
     return (
         torch.empty(
@@ -407,16 +506,6 @@ def _empty_mla_layer(
                 block_size,
                 num_kv_heads,
                 kv_lora_rank,
-            ),
-            dtype=dtype,
-            device=device,
-        ),
-        torch.empty(
-            (
-                num_blocks,
-                block_size,
-                num_kv_heads,
-                qk_rope_head_dim,
             ),
             dtype=dtype,
             device=device,
@@ -431,12 +520,11 @@ def _build_sharded_harness(
 ) -> ShardedAllGatherHarness:
     device = direct.src_kv_cache[0][0].device
     local_selected = args.num_selected // world_size
-    local_staging = _empty_mla_layer(
+    local_staging = _empty_k_layer(
         num_slots=local_selected,
         block_size=args.block_size,
         num_kv_heads=args.num_kv_heads,
         kv_lora_rank=args.kv_lora_rank,
-        qk_rope_head_dim=args.qk_rope_head_dim,
         dtype=direct.dtype,
         device=device,
     )
@@ -448,28 +536,18 @@ def _build_sharded_harness(
     local_destination_state = prepare_sparse_direct_destination_state(
         as_vllm_kv_caches(local_staging),
         local_slot_mapping,
-        KV_FORMAT_MLA_LATENT,
+        KV_FORMAT_DSA_INDEX,
         direct.dims.k_hidden_dims,
         direct.dims.v_hidden_dims,
         direct.dims.dsa_hidden_dims,
     )
 
     local_k = local_staging[0].flatten(0, 1)[:local_selected]
-    local_v = local_staging[1].flatten(0, 1)[:local_selected]
-    if not local_k.is_contiguous() or not local_v.is_contiguous():
-        raise RuntimeError("local MLA staging views must be contiguous")
+    if not local_k.is_contiguous():
+        raise RuntimeError("local K staging view must be contiguous")
 
     gathered_k = torch.empty(
         (args.num_selected, args.num_kv_heads, args.kv_lora_rank),
-        dtype=direct.dtype,
-        device=device,
-    )
-    gathered_v = torch.empty(
-        (
-            args.num_selected,
-            args.num_kv_heads,
-            args.qk_rope_head_dim,
-        ),
         dtype=direct.dtype,
         device=device,
     )
@@ -477,15 +555,71 @@ def _build_sharded_harness(
         tuple(torch.empty_like(plane) for plane in layer)
         for layer in direct.src_kv_cache
     ]
+
+    pipeline_chunk_ranges = _split_evenly(local_selected, args.pipeline_chunks)
+    max_pipeline_local = max(end - start for start, end in pipeline_chunk_ranges)
+    pipeline_staging = [
+        _empty_k_layer(
+            num_slots=max_pipeline_local,
+            block_size=args.block_size,
+            num_kv_heads=args.num_kv_heads,
+            kv_lora_rank=args.kv_lora_rank,
+            dtype=direct.dtype,
+            device=device,
+        )
+        for _ in range(2)
+    ]
+    pipeline_local_slot_mapping = torch.arange(
+        max_pipeline_local,
+        dtype=torch.long,
+        device=device,
+    )
+    pipeline_destination_states = [
+        prepare_sparse_direct_destination_state(
+            as_vllm_kv_caches(staging),
+            pipeline_local_slot_mapping,
+            KV_FORMAT_DSA_INDEX,
+            direct.dims.k_hidden_dims,
+            0,
+            direct.dims.k_hidden_dims,
+        )
+        for staging in pipeline_staging
+    ]
+    pipeline_local_k = [
+        staging[0].flatten(0, 1)[:max_pipeline_local]
+        for staging in pipeline_staging
+    ]
+    pipeline_gathered_k = [
+        torch.empty(
+            (
+                max_pipeline_local * world_size,
+                args.num_kv_heads,
+                args.kv_lora_rank,
+            ),
+            dtype=direct.dtype,
+            device=device,
+        )
+        for _ in range(2)
+    ]
     return ShardedAllGatherHarness(
         local_staging=local_staging,
         local_destination_state=local_destination_state,
         local_slot_mapping=local_slot_mapping,
         local_k=local_k,
-        local_v=local_v,
         gathered_k=gathered_k,
-        gathered_v=gathered_v,
         destinations=destinations,
+        pipeline_staging=pipeline_staging,
+        pipeline_destination_states=pipeline_destination_states,
+        pipeline_local_k=pipeline_local_k,
+        pipeline_gathered_k=pipeline_gathered_k,
+        pipeline_local_slot_mapping=pipeline_local_slot_mapping,
+        pipeline_load_done=[torch.npu.Event() for _ in range(2)],
+        pipeline_buffer_free=[torch.npu.Event() for _ in range(2)],
+        pipeline_buffer_used=[False, False],
+        pipeline_entry=torch.npu.Event(),
+        load_stream=torch.npu.Stream(device=device),
+        collective_stream=torch.npu.Stream(device=device),
+        pipeline_chunk_ranges=pipeline_chunk_ranges,
         local_selected=local_selected,
     )
 
@@ -499,25 +633,34 @@ def _run_direct(
     run_all_direct_fast_layers(direct)
 
 
+def _scatter_k(
+    destination_k: torch.Tensor,
+    gathered_k: torch.Tensor,
+    target_slot_mapping: torch.Tensor,
+    dims: MlaDsaDims,
+) -> None:
+    if torch_npu is None:
+        raise RuntimeError("torch_npu is required for this benchmark")
+    target_indices = target_slot_mapping.reshape(-1, 1)
+    torch_npu.npu_scatter_nd_update_(
+        destination_k.view(-1, dims.k_hidden_dims),
+        target_indices,
+        gathered_k.view(-1, dims.k_hidden_dims),
+    )
+
+
 def _scatter_gathered_layer(
     sharded: ShardedAllGatherHarness,
     layer_id: int,
     target_slot_mapping: torch.Tensor,
     dims: MlaDsaDims,
 ) -> None:
-    if torch_npu is None:
-        raise RuntimeError("torch_npu is required for this benchmark")
-    destination_k, destination_v = sharded.destinations[layer_id]
-    target_indices = target_slot_mapping.reshape(-1, 1)
-    torch_npu.npu_scatter_nd_update_(
-        destination_k.view(-1, dims.k_hidden_dims),
-        target_indices,
-        sharded.gathered_k.view(-1, dims.k_hidden_dims),
-    )
-    torch_npu.npu_scatter_nd_update_(
-        destination_v.view(-1, dims.v_hidden_dims),
-        target_indices,
-        sharded.gathered_v.view(-1, dims.v_hidden_dims),
+    (destination_k,) = sharded.destinations[layer_id]
+    _scatter_k(
+        destination_k,
+        sharded.gathered_k,
+        target_slot_mapping,
+        dims,
     )
 
 
@@ -540,10 +683,6 @@ def _run_sharded(
             sharded.gathered_k,
             sharded.local_k,
         )
-        dist.all_gather_into_tensor(
-            sharded.gathered_v,
-            sharded.local_v,
-        )
         _scatter_gathered_layer(
             sharded,
             layer_id,
@@ -552,15 +691,200 @@ def _run_sharded(
         )
 
 
-def _verify_case(
+def _run_local_h2d(
     direct: LoadBenchmarkHarness,
     sharded: ShardedAllGatherHarness,
     case: TransferCase,
 ) -> None:
-    _run_direct(direct, case)
-    _run_sharded(direct, sharded, case)
-    torch.npu.synchronize()
-    target_slots = case.target_slot_mapping.to(torch.long)
+    for layer_id in range(direct.num_layers):
+        run_direct_fast_load_layer(
+            destination_state=sharded.local_destination_state,
+            slot_mapping_packed=sharded.local_slot_mapping,
+            selected_token_idx=case.local_selected_token_idx,
+            chunk_ptrs_npu=direct.chunk_ptrs_by_layer[layer_id],
+            chunk_size=direct.chunk_size,
+            total_tokens=direct.num_tokens,
+            kv_format=direct.kv_format,
+        )
+
+
+def _run_allgather_only(
+    direct: LoadBenchmarkHarness,
+    sharded: ShardedAllGatherHarness,
+) -> None:
+    for _ in range(direct.num_layers):
+        dist.all_gather_into_tensor(
+            sharded.gathered_k,
+            sharded.local_k,
+        )
+
+
+def _run_scatter_only(
+    direct: LoadBenchmarkHarness,
+    sharded: ShardedAllGatherHarness,
+    case: TransferCase,
+) -> None:
+    for layer_id in range(direct.num_layers):
+        _scatter_gathered_layer(
+            sharded,
+            layer_id,
+            case.target_slot_mapping,
+            direct.dims,
+        )
+
+
+def _run_no_scatter(
+    direct: LoadBenchmarkHarness,
+    sharded: ShardedAllGatherHarness,
+    case: TransferCase,
+) -> None:
+    """Measure K-only sparse H2D plus one AllGather with direct output use."""
+    for layer_id in range(direct.num_layers):
+        run_direct_fast_load_layer(
+            destination_state=sharded.local_destination_state,
+            slot_mapping_packed=sharded.local_slot_mapping,
+            selected_token_idx=case.local_selected_token_idx,
+            chunk_ptrs_npu=direct.chunk_ptrs_by_layer[layer_id],
+            chunk_size=direct.chunk_size,
+            total_tokens=direct.num_tokens,
+            kv_format=direct.kv_format,
+        )
+        dist.all_gather_into_tensor(
+            sharded.gathered_k,
+            sharded.local_k,
+        )
+
+
+def _run_pipelined(
+    direct: LoadBenchmarkHarness,
+    sharded: ShardedAllGatherHarness,
+    case: TransferCase,
+) -> None:
+    """Double-buffer local H2D against the preceding chunk's collective."""
+    current_stream = torch.npu.current_stream()
+    sharded.pipeline_entry.record(current_stream)
+    sharded.load_stream.wait_event(sharded.pipeline_entry)
+    issued = 0
+    used_buffers: set[int] = set()
+    pending_work = None
+    pending_destination_k = None
+    pending_gathered_k = None
+    pending_target_slot_mapping = None
+    pending_buffer_id = None
+
+    for layer_id in range(direct.num_layers):
+        (destination_k,) = sharded.destinations[layer_id]
+        for chunk_id, (chunk_start, chunk_end) in enumerate(
+            sharded.pipeline_chunk_ranges
+        ):
+            buffer_id = issued % 2
+            chunk_tokens = chunk_end - chunk_start
+            used_buffers.add(buffer_id)
+
+            with torch.npu.stream(sharded.load_stream):
+                if sharded.pipeline_buffer_used[buffer_id]:
+                    sharded.load_stream.wait_event(
+                        sharded.pipeline_buffer_free[buffer_id]
+                    )
+                run_direct_fast_load_layer(
+                    destination_state=sharded.pipeline_destination_states[
+                        buffer_id
+                    ],
+                    slot_mapping_packed=sharded.pipeline_local_slot_mapping[
+                        :chunk_tokens
+                    ],
+                    selected_token_idx=case.local_selected_token_idx[
+                        chunk_start:chunk_end
+                    ],
+                    chunk_ptrs_npu=direct.chunk_ptrs_by_layer[layer_id],
+                    chunk_size=direct.chunk_size,
+                    total_tokens=direct.num_tokens,
+                    kv_format=direct.kv_format,
+                )
+                sharded.pipeline_load_done[buffer_id].record(
+                    sharded.load_stream
+                )
+
+            # H2D for the current chunk is now in flight. Complete and place
+            # the preceding chunk while that independent load stream runs.
+            if pending_work is not None:
+                assert pending_destination_k is not None
+                assert pending_gathered_k is not None
+                assert pending_target_slot_mapping is not None
+                assert pending_buffer_id is not None
+                with torch.npu.stream(sharded.collective_stream):
+                    pending_work.wait()
+                    _scatter_k(
+                        pending_destination_k,
+                        pending_gathered_k,
+                        pending_target_slot_mapping,
+                        direct.dims,
+                    )
+                    sharded.pipeline_buffer_free[pending_buffer_id].record(
+                        sharded.collective_stream
+                    )
+                    sharded.pipeline_buffer_used[pending_buffer_id] = True
+
+            with torch.npu.stream(sharded.collective_stream):
+                sharded.collective_stream.wait_event(
+                    sharded.pipeline_load_done[buffer_id]
+                )
+                local_k = sharded.pipeline_local_k[buffer_id][
+                    :chunk_tokens
+                ]
+                gathered_k = sharded.pipeline_gathered_k[buffer_id][
+                    : chunk_tokens * dist.get_world_size()
+                ]
+                pending_work = dist.all_gather_into_tensor(
+                    gathered_k,
+                    local_k,
+                    async_op=True,
+                )
+                pending_destination_k = destination_k
+                pending_gathered_k = gathered_k
+                pending_target_slot_mapping = (
+                    case.pipeline_target_slot_mappings[chunk_id]
+                )
+                pending_buffer_id = buffer_id
+            issued += 1
+
+        # A production attention layer cannot consume its cache until every
+        # chunk is placed, so finish the final collective at each layer
+        # boundary instead of assuming cross-layer prefetch.
+        if pending_work is not None:
+            assert pending_destination_k is not None
+            assert pending_gathered_k is not None
+            assert pending_target_slot_mapping is not None
+            assert pending_buffer_id is not None
+            with torch.npu.stream(sharded.collective_stream):
+                pending_work.wait()
+                _scatter_k(
+                    pending_destination_k,
+                    pending_gathered_k,
+                    pending_target_slot_mapping,
+                    direct.dims,
+                )
+                sharded.pipeline_buffer_free[pending_buffer_id].record(
+                    sharded.collective_stream
+                )
+                sharded.pipeline_buffer_used[pending_buffer_id] = True
+            pending_work = None
+            pending_destination_k = None
+            pending_gathered_k = None
+            pending_target_slot_mapping = None
+            pending_buffer_id = None
+
+    # Make the caller's timing stream depend on every pipeline buffer. This
+    # keeps the NPU end event honest without a host-side synchronize per run.
+    for buffer_id in used_buffers:
+        current_stream.wait_event(sharded.pipeline_buffer_free[buffer_id])
+
+
+def _assert_paged_destinations_match(
+    direct: LoadBenchmarkHarness,
+    sharded: ShardedAllGatherHarness,
+    target_slots: torch.Tensor,
+) -> None:
     for layer_id, (direct_layer, sharded_layer) in enumerate(
         zip(direct.dst_direct_fast, sharded.destinations, strict=True)
     ):
@@ -574,6 +898,43 @@ def _verify_case(
                 raise AssertionError(
                     f"empty verification payload at layer={layer_id}, plane={plane_id}"
                 )
+
+
+def _verify_case(
+    direct: LoadBenchmarkHarness,
+    sharded: ShardedAllGatherHarness,
+    case: TransferCase,
+) -> None:
+    target_slots = case.target_slot_mapping.to(torch.long)
+    _run_direct(direct, case)
+    _run_sharded(direct, sharded, case)
+    torch.npu.synchronize()
+    _assert_paged_destinations_match(direct, sharded, target_slots)
+
+    # Poison the previous result so a missing pipeline scatter cannot be
+    # hidden by the already-correct non-pipelined destination.
+    for layer in sharded.destinations:
+        for plane in layer:
+            plane.fill_(float("nan"))
+    _run_pipelined(direct, sharded, case)
+    torch.npu.synchronize()
+    _assert_paged_destinations_match(direct, sharded, target_slots)
+
+    # The no-scatter lower bound leaves the rank-ordered selected K rows in
+    # gathered_k. Verify this layout independently of paged placement.
+    _run_no_scatter(direct, sharded, case)
+    torch.npu.synchronize()
+    expected_gathered = (
+        direct.dst_direct_fast[-1][0]
+        .flatten(0, 1)
+        .index_select(0, target_slots)
+    )
+    torch.testing.assert_close(
+        sharded.gathered_k,
+        expected_gathered,
+        rtol=0,
+        atol=0,
+    )
 
 
 def _time_path(
@@ -684,6 +1045,7 @@ def _worker(
             num_slots=num_slots,
             rank=rank,
             world_size=len(args.devices),
+            pipeline_chunks=args.pipeline_chunks,
             seed=args.seed,
             device=device,
         )
@@ -708,21 +1070,48 @@ def _worker(
                 _verify_case(direct, sharded, case)
             direct_run = partial(_run_direct, direct, case)
             sharded_run = partial(_run_sharded, direct, sharded, case)
+            path_runs = {
+                PATH_DIRECT: direct_run,
+                PATH_SHARDED: sharded_run,
+                PATH_NO_SCATTER: partial(
+                    _run_no_scatter,
+                    direct,
+                    sharded,
+                    case,
+                ),
+                PATH_PIPELINED: partial(
+                    _run_pipelined,
+                    direct,
+                    sharded,
+                    case,
+                ),
+                PATH_H2D: partial(
+                    _run_local_h2d,
+                    direct,
+                    sharded,
+                    case,
+                ),
+                PATH_ALLGATHER: partial(
+                    _run_allgather_only,
+                    direct,
+                    sharded,
+                ),
+                PATH_SCATTER: partial(
+                    _run_scatter_only,
+                    direct,
+                    sharded,
+                    case,
+                ),
+            }
             results[case_name] = {
-                PATH_DIRECT: _time_path(
-                    direct_run,
+                path_name: _time_path(
+                    path_run,
                     warmup=args.warmup,
                     iters=args.iters,
                     repeats=args.repeats,
                     barrier=barrier,
-                ),
-                PATH_SHARDED: _time_path(
-                    sharded_run,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    repeats=args.repeats,
-                    barrier=barrier,
-                ),
+                )
+                for path_name, path_run in path_runs.items()
             }
 
         output.put(
@@ -799,11 +1188,23 @@ def _summarize(
 ) -> dict[str, Any]:
     plane_elems = workers[0]["plane_elems"]
     element_size = workers[0]["element_size"]
-    useful_bytes_per_invocation = (
+    full_k_bytes_per_invocation = (
         args.num_selected * plane_elems * element_size * args.num_layers
     )
-    useful_bytes_per_repeat = useful_bytes_per_invocation * args.iters
     world_size = len(workers)
+    local_k_bytes_per_invocation = full_k_bytes_per_invocation // world_size
+    full_k_bytes_per_layer = full_k_bytes_per_invocation // args.num_layers
+    local_k_bytes_per_layer = local_k_bytes_per_invocation // args.num_layers
+    pipeline_chunk_tokens = [
+        end - start
+        for start, end in _split_evenly(
+            args.num_selected // world_size,
+            args.pipeline_chunks,
+        )
+    ]
+    pipeline_chunk_local_bytes = [
+        tokens * plane_elems * element_size for tokens in pipeline_chunk_tokens
+    ]
 
     summary: dict[str, Any] = {
         "devices": args.devices,
@@ -816,10 +1217,17 @@ def _summarize(
         "num_layers": args.num_layers,
         "chunk_size": args.chunk_size,
         "block_size": args.block_size,
+        "pipeline_chunks": args.pipeline_chunks,
         "plane_elems": plane_elems,
         "element_size": element_size,
+        "payload_planes": ["k"],
         "cpu_slab": "shared-rank0-owned",
-        "useful_bytes_per_invocation": useful_bytes_per_invocation,
+        "full_k_bytes_per_invocation": full_k_bytes_per_invocation,
+        "local_k_bytes_per_invocation": local_k_bytes_per_invocation,
+        "full_k_bytes_per_layer": full_k_bytes_per_layer,
+        "allgather_local_input_bytes_per_layer": local_k_bytes_per_layer,
+        "pipeline_chunk_tokens": pipeline_chunk_tokens,
+        "pipeline_chunk_local_bytes": pipeline_chunk_local_bytes,
         "cases": {},
     }
 
@@ -827,11 +1235,21 @@ def _summarize(
         f"devices={args.devices} tokens={args.num_tokens} "
         f"selected={args.num_selected} local_selected="
         f"{args.num_selected // world_size} layers={args.num_layers} "
-        f"chunk_size={args.chunk_size} block_size={args.block_size}"
+        f"chunk_size={args.chunk_size} block_size={args.block_size} "
+        f"pipeline_chunks={args.pipeline_chunks}"
     )
     print(
-        "full useful payload per invocation: "
-        f"{format_bytes_short(useful_bytes_per_invocation)}"
+        "K-only payload per invocation: full="
+        f"{format_bytes_short(full_k_bytes_per_invocation)} local/rank="
+        f"{format_bytes_short(local_k_bytes_per_invocation)}"
+    )
+    print(
+        "AllGather per layer: local input/rank="
+        f"{format_bytes_short(local_k_bytes_per_layer)} assembled output="
+        f"{format_bytes_short(full_k_bytes_per_layer)}; pipeline local chunks="
+        f"{min(pipeline_chunk_tokens)}-{max(pipeline_chunk_tokens)} tokens "
+        f"({format_bytes_short(min(pipeline_chunk_local_bytes))}-"
+        f"{format_bytes_short(max(pipeline_chunk_local_bytes))})"
     )
     if args.num_layers * args.iters < 100:
         print(
@@ -839,15 +1257,8 @@ def _summarize(
             "cross-rank wall metrics may be dominated by process start skew. "
             "Use --num-layers 8 --iters 50 for throughput measurements."
         )
-    print(
-        "\ncase                                      "
-        "direct event GB/s  sharded event GB/s  event speedup  "
-        "direct wall GB/s  sharded wall GB/s  wall speedup"
-    )
-
     for case_name in CASE_NAMES:
         path_summary: dict[str, Any] = {}
-        critical_by_path: dict[str, list[float]] = {}
         for path_name in PATH_NAMES:
             event_ms = [
                 worker["results"][case_name][path_name][repeat]["event_ms"]
@@ -860,14 +1271,23 @@ def _summarize(
                 path_name,
                 args.repeats,
             )
-            critical_by_path[path_name] = critical_wall_ms
             median_critical_ms = statistics.median(critical_wall_ms)
-            median_ms_per_layer = median_critical_ms / (args.iters * args.num_layers)
-            effective_gbps = (
-                useful_bytes_per_repeat / (median_critical_ms / 1000.0) / 1e9
+            median_wall_ms_per_layer = median_critical_ms / (
+                args.iters * args.num_layers
+            )
+            path_bytes_per_invocation = (
+                local_k_bytes_per_invocation
+                if path_name == PATH_H2D
+                else full_k_bytes_per_invocation
+            )
+            path_bytes_per_repeat = path_bytes_per_invocation * args.iters
+            effective_wall_gbps = (
+                path_bytes_per_repeat
+                / (median_critical_ms / 1000.0)
+                / 1e9
             )
             rank_event_bandwidths = [
-                useful_bytes_per_repeat / (duration_ms / 1000.0) / 1e9
+                path_bytes_per_repeat / (duration_ms / 1000.0) / 1e9
                 for duration_ms in event_ms
             ]
             median_rank_event_ms = statistics.median(event_ms)
@@ -880,75 +1300,151 @@ def _summarize(
                 start_skew_ms.append((max(starts) - min(starts)) / 1e6)
             path_summary[path_name] = {
                 "median_critical_wall_ms": median_critical_ms,
-                "median_ms_per_layer": median_ms_per_layer,
-                "effective_full_payload_gbps": effective_gbps,
+                "median_wall_ms_per_layer": median_wall_ms_per_layer,
+                "effective_k_payload_wall_gbps": effective_wall_gbps,
                 "median_rank_event_ms": median_rank_event_ms,
                 "median_rank_event_ms_per_layer": median_rank_event_ms
                 / (args.iters * args.num_layers),
-                "rank_event_effective_full_payload_gbps": statistics.median(
+                "rank_event_effective_k_payload_gbps": statistics.median(
                     rank_event_bandwidths
                 ),
-                "min_rank_event_effective_full_payload_gbps": min(
+                "min_rank_event_effective_k_payload_gbps": min(
                     rank_event_bandwidths
                 ),
-                "max_rank_event_effective_full_payload_gbps": max(
+                "max_rank_event_effective_k_payload_gbps": max(
                     rank_event_bandwidths
                 ),
+                "bytes_per_invocation": path_bytes_per_invocation,
                 "min_rank_event_ms": min(event_ms),
                 "max_rank_event_ms": max(event_ms),
                 "median_start_skew_ms": statistics.median(start_skew_ms),
                 "max_start_skew_ms": max(start_skew_ms),
                 "critical_wall_samples_ms": critical_wall_ms,
             }
+            if path_name == PATH_ALLGATHER:
+                local_input_bytes_per_repeat = (
+                    local_k_bytes_per_invocation * args.iters
+                )
+                path_summary[path_name][
+                    "effective_local_input_wall_gbps"
+                ] = (
+                    local_input_bytes_per_repeat
+                    / (median_critical_ms / 1000.0)
+                    / 1e9
+                )
+                local_input_event_bandwidths = [
+                    local_input_bytes_per_repeat
+                    / (duration_ms / 1000.0)
+                    / 1e9
+                    for duration_ms in event_ms
+                ]
+                path_summary[path_name][
+                    "rank_event_effective_local_input_gbps"
+                ] = statistics.median(local_input_event_bandwidths)
 
-        paired_wall_speedups = [
-            direct_sample / sharded_sample
-            for direct_sample, sharded_sample in zip(
-                critical_by_path[PATH_DIRECT],
-                critical_by_path[PATH_SHARDED],
-                strict=True,
-            )
-            if sharded_sample > 0
-        ]
-        paired_event_speedups = [
-            worker["results"][case_name][PATH_DIRECT][repeat]["event_ms"]
-            / worker["results"][case_name][PATH_SHARDED][repeat]["event_ms"]
-            for worker in workers
-            for repeat in range(args.repeats)
-            if worker["results"][case_name][PATH_SHARDED][repeat]["event_ms"] > 0
-        ]
-        wall_speedup = statistics.median(paired_wall_speedups)
-        event_speedup = statistics.median(paired_event_speedups)
-        direct_event_gbps = path_summary[PATH_DIRECT][
-            "rank_event_effective_full_payload_gbps"
-        ]
-        sharded_event_gbps = path_summary[PATH_SHARDED][
-            "rank_event_effective_full_payload_gbps"
-        ]
-        direct_wall_gbps = path_summary[PATH_DIRECT]["effective_full_payload_gbps"]
-        sharded_wall_gbps = path_summary[PATH_SHARDED]["effective_full_payload_gbps"]
-        print(
-            f"{case_name:42} "
-            f"{direct_event_gbps:19.2f}  "
-            f"{sharded_event_gbps:20.2f}  "
-            f"{event_speedup:13.3f}x  "
-            f"{direct_wall_gbps:18.2f}  "
-            f"{sharded_wall_gbps:19.2f}  "
-            f"{wall_speedup:12.3f}x"
-        )
+        speedups: dict[str, Any] = {}
+        for alternative in COMPARISON_PATHS[1:]:
+            paired_wall_speedups = [
+                direct_sample / alternative_sample
+                for direct_sample, alternative_sample in zip(
+                    path_summary[PATH_DIRECT]["critical_wall_samples_ms"],
+                    path_summary[alternative]["critical_wall_samples_ms"],
+                    strict=True,
+                )
+                if alternative_sample > 0
+            ]
+            paired_event_speedups = [
+                worker["results"][case_name][PATH_DIRECT][repeat]["event_ms"]
+                / worker["results"][case_name][alternative][repeat]["event_ms"]
+                for worker in workers
+                for repeat in range(args.repeats)
+                if (
+                    worker["results"][case_name][alternative][repeat][
+                        "event_ms"
+                    ]
+                    > 0
+                )
+            ]
+            speedups[alternative] = {
+                "paired_wall": {
+                    "median": statistics.median(paired_wall_speedups),
+                    "min": min(paired_wall_speedups),
+                    "max": max(paired_wall_speedups),
+                },
+                "paired_rank_event": {
+                    "median": statistics.median(paired_event_speedups),
+                    "min": min(paired_event_speedups),
+                    "max": max(paired_event_speedups),
+                },
+            }
         summary["cases"][case_name] = {
             "paths": path_summary,
-            "paired_speedup": {
-                "median": wall_speedup,
-                "min": min(paired_wall_speedups),
-                "max": max(paired_wall_speedups),
-            },
-            "paired_rank_event_speedup": {
-                "median": event_speedup,
-                "min": min(paired_event_speedups),
-                "max": max(paired_event_speedups),
-            },
+            "speedup_vs_direct": speedups,
         }
+
+    print(
+        "\nEnd-to-end critical wall time (ms/layer; speedup is direct/alternative)"
+    )
+    print(
+        "case                                      "
+        "direct   sharded   no-scatter   pipeline   "
+        "shard spd   no-scat spd   pipe spd"
+    )
+    for case_name in CASE_NAMES:
+        case_summary = summary["cases"][case_name]
+        paths = case_summary["paths"]
+        speedups = case_summary["speedup_vs_direct"]
+        print(
+            f"{case_name:42} "
+            f"{paths[PATH_DIRECT]['median_wall_ms_per_layer']:7.3f}  "
+            f"{paths[PATH_SHARDED]['median_wall_ms_per_layer']:8.3f}  "
+            f"{paths[PATH_NO_SCATTER]['median_wall_ms_per_layer']:10.3f}  "
+            f"{paths[PATH_PIPELINED]['median_wall_ms_per_layer']:8.3f}  "
+            f"{speedups[PATH_SHARDED]['paired_wall']['median']:8.3f}x  "
+            f"{speedups[PATH_NO_SCATTER]['paired_wall']['median']:10.3f}x  "
+            f"{speedups[PATH_PIPELINED]['paired_wall']['median']:7.3f}x"
+        )
+
+    print("\nEnd-to-end effective full-K GB/s (critical wall)")
+    print(
+        "case                                      "
+        "direct   sharded   no-scatter   pipeline"
+    )
+    for case_name in CASE_NAMES:
+        paths = summary["cases"][case_name]["paths"]
+        print(
+            f"{case_name:42} "
+            f"{paths[PATH_DIRECT]['effective_k_payload_wall_gbps']:7.2f}  "
+            f"{paths[PATH_SHARDED]['effective_k_payload_wall_gbps']:8.2f}  "
+            f"{paths[PATH_NO_SCATTER]['effective_k_payload_wall_gbps']:10.2f}  "
+            f"{paths[PATH_PIPELINED]['effective_k_payload_wall_gbps']:8.2f}"
+        )
+
+    print(
+        "\nIsolated stage critical wall time "
+        "(us/layer; AG assembled GB/s is comparable full-K throughput)"
+    )
+    print(
+        "case                                      "
+        "local H2D   AllGather   scatter   stage sum   "
+        "AG assembled GB/s   AG local-in GB/s"
+    )
+    for case_name in CASE_NAMES:
+        paths = summary["cases"][case_name]["paths"]
+        h2d_us = paths[PATH_H2D]["median_wall_ms_per_layer"] * 1000
+        allgather_us = (
+            paths[PATH_ALLGATHER]["median_wall_ms_per_layer"] * 1000
+        )
+        scatter_us = paths[PATH_SCATTER]["median_wall_ms_per_layer"] * 1000
+        print(
+            f"{case_name:42} "
+            f"{h2d_us:9.2f}  "
+            f"{allgather_us:10.2f}  "
+            f"{scatter_us:8.2f}  "
+            f"{h2d_us + allgather_us + scatter_us:9.2f}  "
+            f"{paths[PATH_ALLGATHER]['effective_k_payload_wall_gbps']:17.2f}  "
+            f"{paths[PATH_ALLGATHER]['effective_local_input_wall_gbps']:16.2f}"
+        )
     return summary
 
 
