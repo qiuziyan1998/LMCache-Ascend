@@ -190,6 +190,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::call_guard<py::gil_scoped_release>());
   m.def("free_pinned_numa_ptr", &free_pinned_numa_ptr);
   m.def("alloc_shm_pinned_ptr", &alloc_shm_pinned_ptr,
+        py::arg("size"), py::arg("shm_name"),
+        py::arg("interleave_nodes") = std::vector<int>{},
         py::call_guard<py::gil_scoped_release>());
   m.def("attach_shm_pinned_ptr", &attach_shm_pinned_ptr,
         py::arg("size"), py::arg("shm_name"), py::arg("writable") = true,

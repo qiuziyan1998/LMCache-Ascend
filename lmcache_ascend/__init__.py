@@ -63,6 +63,23 @@ def _patch_config():
         "Unset means use effective max_local_cpu_size.",
     }
 
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_numa_policy"] = {
+        "type": str,
+        "default": "first_touch",
+        "env_converter": str,
+        "description": "NUMA placement for the shared CPU slab: "
+        "'first_touch' preserves the existing behavior; 'interleave' "
+        "distributes pages across allowed NUMA nodes.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_numa_nodes"] = {
+        "type": str | int | list[int] | None,
+        "default": None,
+        "env_converter": lambda value: value,
+        "description": "Optional NUMA node list for shared CPU slab "
+        "interleaving. Unset means all nodes allowed to the process.",
+    }
+
     lmcache.v1.config._CONFIG_DEFINITIONS[
         "shared_cpu_materialize_index_on_decode_cold"
     ] = {

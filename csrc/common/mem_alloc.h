@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 /*
  * These following APIs are called directly in LMCache,
@@ -17,7 +18,9 @@ uintptr_t alloc_pinned_numa_ptr(std::size_t size, int node);
 
 void free_pinned_numa_ptr(uintptr_t ptr, std::size_t size);
 
-uintptr_t alloc_shm_pinned_ptr(std::size_t size, const std::string &shm_name);
+uintptr_t alloc_shm_pinned_ptr(
+    std::size_t size, const std::string &shm_name,
+    const std::vector<int> &interleave_nodes = {});
 
 uintptr_t attach_shm_pinned_ptr(
     std::size_t size, const std::string &shm_name, bool writable);
