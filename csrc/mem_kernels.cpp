@@ -639,8 +639,12 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   const int32_t selected_count_stride = selected_token_counts.has_value()
       ? static_cast<int32_t>(selected_token_counts->stride(0))
       : 1;
-  config.ub_params.aiv_num =
-      direct_aiv_num(request_count > 0 ? request_count : num_sparse);
+  // Count-aware payloads retain fixed-width rows so the kernel can skip each
+  // row's padded tail.  The connector normally submits one request per
+  // launch, therefore request_count is commonly one even when the row
+  // contains thousands of selected tokens.  Size the launch from the token
+  // capacity and let the kernel shard valid tokens within each row.
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
 
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
@@ -707,8 +711,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
   const int32_t selected_count_stride = selected_token_counts.has_value()
       ? static_cast<int32_t>(selected_token_counts->stride(0))
       : 1;
-  config.ub_params.aiv_num =
-      direct_aiv_num(request_count > 0 ? request_count : num_sparse);
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
   config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
@@ -765,8 +768,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
   const int32_t selected_count_stride = selected_token_counts.has_value()
       ? static_cast<int32_t>(selected_token_counts->stride(0))
       : 1;
-  const uint32_t aiv_num =
-      direct_aiv_num(request_count > 0 ? request_count : num_sparse);
+  const uint32_t aiv_num = direct_aiv_num(num_sparse);
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
   uint8_t *slot_mapping_ptr =
