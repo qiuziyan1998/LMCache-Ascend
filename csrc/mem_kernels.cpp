@@ -644,8 +644,10 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
 
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
   uint8_t *counts_ptr = selected_token_counts.has_value()
-      ? get_kernel_ptr<uint8_t, torch::Tensor>(*selected_token_counts)
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
       : nullptr;
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
@@ -713,8 +715,10 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
   uint8_t *counts_ptr = selected_token_counts.has_value()
-      ? get_kernel_ptr<uint8_t, torch::Tensor>(*selected_token_counts)
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
       : nullptr;
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
@@ -769,8 +773,10 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
   uint8_t *counts_ptr = selected_token_counts.has_value()
-      ? get_kernel_ptr<uint8_t, torch::Tensor>(*selected_token_counts)
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
       : nullptr;
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
