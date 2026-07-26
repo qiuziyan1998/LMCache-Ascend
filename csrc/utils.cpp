@@ -968,13 +968,16 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
 void validate_sparse_single_layer_inputs(
     const torch::Tensor &slot_mapping_packed,
     const torch::Tensor &selected_token_idx) {
-  if (slot_mapping_packed.dim() != 1 || selected_token_idx.dim() != 1) {
+  if ((slot_mapping_packed.dim() != 1 &&
+       slot_mapping_packed.dim() != 2) ||
+      slot_mapping_packed.dim() != selected_token_idx.dim()) {
     PyErr_SetString(PyExc_ValueError,
-                    "slot_mapping_packed and selected_token_idx must be 1D.");
+                    "slot_mapping_packed and selected_token_idx must both be "
+                    "1D or both be 2D.");
     throw py::error_already_set();
   }
 
-  if (slot_mapping_packed.size(0) != selected_token_idx.size(0)) {
+  if (slot_mapping_packed.sizes() != selected_token_idx.sizes()) {
     PyErr_SetString(
         PyExc_ValueError,
         "slot_mapping_packed and selected_token_idx must have the same length.");

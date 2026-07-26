@@ -236,6 +236,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
     dsa_hidden_dims: int = 0,
     lmc_host_interleaved: bool = False,
     chunk_ptrs_npu: Optional[torch.Tensor] = None,
+    selected_token_counts: Optional[torch.Tensor] = None,
 ) -> None:
     vllm_kv_caches = _normalize_vllm_kv_caches(vllm_kv_caches)
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer(
@@ -253,6 +254,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer(
         dsa_hidden_dims,
         lmc_host_interleaved,
         chunk_ptrs_npu,
+        selected_token_counts,
     )
 
 
@@ -311,6 +313,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_fast(
     total_tokens: int,
     lmc_host_interleaved: bool,
     validate_inputs: bool = False,
+    selected_token_counts: Optional[torch.Tensor] = None,
 ) -> None:
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer_fast(
         layer_state,
@@ -321,6 +324,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_fast(
         total_tokens,
         lmc_host_interleaved,
         validate_inputs,
+        selected_token_counts,
     )
 
 
@@ -332,6 +336,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     chunk_size: int,
     total_tokens: int,
     lmc_host_interleaved: bool,
+    selected_token_counts: Optional[torch.Tensor] = None,
 ) -> None:
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         destination_state,
@@ -341,6 +346,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         chunk_size,
         total_tokens,
         lmc_host_interleaved,
+        selected_token_counts,
     )
 
 

@@ -2007,11 +2007,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
         if target_slot_mapping is not None:
-            return self._pack_sparse_explicit_slot_inputs(
+            packed, selected, _ = self._pack_sparse_explicit_slot_inputs(
                 selected_token_idx,
                 target_slot_mapping,
                 selected_token_counts,
             )
+            return packed, selected
 
         if selected_token_idx is not None and selected_token_idx.numel() > 0:
             if selected_token_idx.dim() > 1:
@@ -2127,7 +2128,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         target_slot_mapping: Union[torch.Tensor, list],
         selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Use caller-provided target slots for row-wise MTP sparse loads."""
         if selected_token_idx is None:
             selected_token_idx = []
@@ -2164,7 +2165,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     device=self.kv_device,
                 )
             selected_token_counts = selected_token_counts.to(
-                device=self.kv_device, dtype=torch.long
+                device=self.kv_device, dtype=torch.int32
             ).reshape(-1)
             if selected_token_idx.dim() == 1:
                 if selected_token_counts.numel() != 1:
@@ -2172,10 +2173,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "single-row sparse payload requires exactly one "
                         f"selected_token_count, got {selected_token_counts.numel()}"
                     )
-                row_width = int(selected_token_idx.shape[0])
-                valid_mask = torch.arange(
-                    row_width, device=self.kv_device, dtype=torch.long
-                ) < selected_token_counts[0]
             elif selected_token_idx.dim() == 2:
                 if selected_token_counts.numel() != selected_token_idx.shape[0]:
                     raise ValueError(
@@ -2183,17 +2180,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         f"{selected_token_counts.numel()} vs "
                         f"{selected_token_idx.shape[0]}"
                     )
-                row_width = int(selected_token_idx.shape[1])
-                valid_mask = torch.arange(
-                    row_width, device=self.kv_device, dtype=torch.long
-                ).reshape(1, -1) < selected_token_counts.reshape(-1, 1)
             else:
                 raise ValueError(
                     "selected_token_counts requires a one- or two-dimensional "
                     f"sparse payload, got {selected_token_idx.dim()} dimensions"
                 )
-            selected_token_idx = selected_token_idx[valid_mask]
-            target_slot_mapping = target_slot_mapping[valid_mask]
         else:
             selected_token_idx = selected_token_idx.reshape(-1)
             target_slot_mapping = target_slot_mapping.reshape(-1)
@@ -2203,9 +2194,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"length: {target_slot_mapping.numel()} vs {selected_token_idx.numel()}"
             )
         selected_token_idx = self._sparse_selected_token_idx(
-            selected_token_idx, target_slot_mapping.shape[0]
+            selected_token_idx, target_slot_mapping.numel()
         )
-        return target_slot_mapping, selected_token_idx
+        return target_slot_mapping, selected_token_idx, selected_token_counts
 
     def _run_sparse_staging_kv_transfer_layer(
         self,
@@ -2338,6 +2329,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping_ref: Optional[torch.Tensor] = None,
         cpu_tensors: Optional[List[torch.Tensor]] = None,
         payload_event: Optional[Any] = None,
+        selected_token_counts: Optional[torch.Tensor] = None,
     ) -> str:
         num_sparse = int(selected_token_idx.numel())
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
@@ -2415,6 +2407,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     total_tokens,
                     sparse_host_interleaved,
                     validate_inputs,
+                    selected_token_counts,
                 )
                 if validate_inputs:
                     self._sparse_direct_validated_layers.add(validate_key)
@@ -2436,6 +2429,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_dsa_hidden_dims,
                     sparse_host_interleaved,
                     chunk_ptrs_npu,
+                    selected_token_counts,
                 )
                 kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer"
 
@@ -2454,6 +2448,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         chunk_size: int,
         total_tokens: int,
         sparse_host_interleaved: bool,
+        selected_token_counts: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch one prepared layer directly on the current compute stream."""
         if selected_token_idx.numel() == 0:
@@ -2466,6 +2461,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             chunk_size,
             total_tokens,
             sparse_host_interleaved,
+            selected_token_counts,
         )
 
     def _sparse_selected_token_idx(
@@ -3540,7 +3536,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # the same current stream, so stream order replaces the event wait.
 
             if target_slot_mapping is not None:
-                slot_mapping_packed, selected_token_idx = (
+                slot_mapping_packed, selected_token_idx, selected_token_counts = (
                     self._pack_sparse_explicit_slot_inputs(
                         selected_token_idx,
                         target_slot_mapping,
@@ -3555,7 +3551,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         token_start_index,
                     )
                 )
-            if _SPARSE_TRANSFER_TOPK:
+                selected_token_counts = None
+            if _SPARSE_TRANSFER_TOPK and selected_token_counts is None:
                 slot_mapping_packed, selected_token_idx = (
                     self._limit_sparse_transfer_inputs(
                         slot_mapping_packed,
@@ -3584,6 +3581,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 chunk_size=chunk_size,
                 total_tokens=source.total_tokens,
                 sparse_host_interleaved=sparse_host_interleaved,
+                selected_token_counts=selected_token_counts,
             )
             if capture_content and layer_id == 0:
                 source_chunk_ranges = []
@@ -3754,7 +3752,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 _wait_payload_events(current_stream, payload_event)
 
             if explicit_sparse_payload:
-                slot_mapping_packed, selected_token_idx = (
+                slot_mapping_packed, selected_token_idx, selected_token_counts = (
                     self._pack_sparse_explicit_slot_inputs(
                         selected_token_idx,
                         target_slot_mapping,
@@ -3769,7 +3767,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         token_start_index,
                     )
                 )
-            if _SPARSE_TRANSFER_TOPK:
+            if _SPARSE_TRANSFER_TOPK and selected_token_counts is None:
                 slot_mapping_packed, selected_token_idx = (
                     self._limit_sparse_transfer_inputs(
                         slot_mapping_packed,
@@ -3830,6 +3828,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     slot_mapping_packed if explicit_sparse_payload else slot_mapping
                 ),
                 cpu_tensors=cpu_tensors,
+                selected_token_counts=selected_token_counts,
             )
             capture_content_probe = (
                 deep_diag_enabled
