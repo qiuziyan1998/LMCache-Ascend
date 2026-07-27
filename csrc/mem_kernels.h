@@ -284,6 +284,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
 // kernel with an optional AIV override. kernel_variant=1 runs the dedicated
 // K-only kernel. addressing_mode: 0=auto, 1=division, 2=power-of-two shift.
 // work_assignment: 0=balanced contiguous valid tokens, 1=striped tiles.
+// validate_inputs may be disabled only after validating an unchanged config.
 void sparse_k_batched_direct_kv_transfer_experimental(
     const SparseDirectDestinationState &destination_state,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
@@ -291,7 +292,7 @@ void sparse_k_batched_direct_kv_transfer_experimental(
     const int64_t total_tokens, const int64_t kernel_variant,
     const int64_t aiv_num, const int64_t tile_tokens,
     const bool pipeline, const int64_t addressing_mode,
-    const int64_t work_assignment,
+    const int64_t work_assignment, const bool validate_inputs = true,
     const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
 uint32_t sparse_transfer_hardware_aiv_num();

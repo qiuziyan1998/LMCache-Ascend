@@ -150,13 +150,13 @@ void sparse_k_batched_direct_kv_transfer_experimental_wrapper(
     torch::Tensor &chunk_ptrs_npu, int64_t chunk_size,
     int64_t total_tokens, int64_t kernel_variant, int64_t aiv_num,
     int64_t tile_tokens, bool pipeline, int64_t addressing_mode,
-    int64_t work_assignment,
+    int64_t work_assignment, bool validate_inputs = true,
     const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt) {
   sparse_k_batched_direct_kv_transfer_experimental(
       destination_state, slot_mapping_packed, selected_token_idx,
       chunk_ptrs_npu, chunk_size, total_tokens, kernel_variant, aiv_num,
       tile_tokens, pipeline, addressing_mode, work_assignment,
-      selected_token_counts);
+      validate_inputs, selected_token_counts);
 }
 
 void dense_mla_dsa_batched_direct_kv_transfer_wrapper(
@@ -302,6 +302,7 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("tile_tokens") = 1, py::arg("pipeline") = false,
         py::arg("addressing_mode") = 0,
         py::arg("work_assignment") = 0,
+        py::arg("validate_inputs") = true,
         py::arg("selected_token_counts") = py::none());
   m.def("sparse_transfer_hardware_aiv_num",
         &sparse_transfer_hardware_aiv_num);

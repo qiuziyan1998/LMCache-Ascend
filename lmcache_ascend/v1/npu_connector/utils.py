@@ -363,6 +363,7 @@ def sparse_k_batched_direct_kv_transfer_experimental(
     pipeline: bool = False,
     addressing_mode: int = 0,
     work_assignment: int = 0,
+    validate_inputs: bool = True,
     selected_token_counts: Optional[torch.Tensor] = None,
 ) -> None:
     """Run a configured one-plane sparse transfer for kernel tuning.
@@ -370,7 +371,9 @@ def sparse_k_batched_direct_kv_transfer_experimental(
     ``kernel_variant=0`` is the original generic kernel with an optional AIV
     override. ``kernel_variant=1`` is the dedicated K-only kernel.  All
     settings are runtime arguments so a benchmark can sweep them after one
-    extension build.
+    extension build. Leave ``validate_inputs`` enabled for normal callers;
+    the benchmark disables it only after one validated launch of the same
+    immutable configuration.
     """
     lmc_ops.sparse_k_batched_direct_kv_transfer_experimental(
         destination_state,
@@ -385,6 +388,7 @@ def sparse_k_batched_direct_kv_transfer_experimental(
         pipeline,
         addressing_mode,
         work_assignment,
+        validate_inputs,
         selected_token_counts,
     )
 

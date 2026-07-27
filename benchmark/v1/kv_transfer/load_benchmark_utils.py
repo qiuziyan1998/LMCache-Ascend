@@ -674,6 +674,7 @@ def build_load_benchmark_harness(
     seed: int,
     shared_cpu_slab: torch.Tensor | None = None,
     populate_cpu_source: bool = True,
+    copy_expected_cpu_chunks: bool = True,
 ) -> LoadBenchmarkHarness:
     device = src_kv_cache[0][0].device
     dtype = src_kv_cache[0][0].dtype
@@ -756,7 +757,13 @@ def build_load_benchmark_harness(
             )
             torch.npu.synchronize()
         stacked_by_layer.append(stacked)
-        expected_stacked_by_layer.append([chunk.detach().clone() for chunk in stacked])
+        # Generic store verification needs immutable CPU references. Transfer
+        # microbenchmarks can opt out to avoid private copies and page scans.
+        expected_stacked_by_layer.append(
+            [chunk.detach().clone() for chunk in stacked]
+            if copy_expected_cpu_chunks
+            else []
+        )
         chunk_ptrs = build_chunk_ptrs_npu(stacked, device)
         chunk_ptrs_by_layer.append(chunk_ptrs)
         if dense_load:
@@ -1040,6 +1047,10 @@ def _assert_stacked_cpu_chunks_equal(
     *,
     label: str,
 ) -> None:
+    if any(not layer for layer in h.expected_stacked_by_layer):
+        raise RuntimeError(
+            "CPU reference chunks were disabled for this benchmark harness"
+        )
     for layer_id, (actual_layer, expected_layer) in enumerate(
         zip(h.stacked_by_layer, h.expected_stacked_by_layer, strict=False)
     ):

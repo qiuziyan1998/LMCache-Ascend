@@ -9,13 +9,24 @@ from one LMCache-Ascend build:
 - `k_pipeline`: the dedicated K-only kernel with a two-buffer
   host-to-UB / UB-to-NPU pipeline.
 
-The benchmark uses the existing one-plane `DSA_INDEX` memory representation
-with a configurable hidden dimension (512 BF16 elements by default). This
-mimics the latent K payload while ensuring neither the baseline nor the new
-kernel transfers V.
+The source uses the production-style `MLA_LATENT` chunk allocation: a
+configurable K plane (512 BF16 elements by default) followed by the normal
+64-element V/rope plane. The latter remains in memory so chunk spacing,
+registration, and page behavior are realistic, but neither kernel reads it.
+The destination is prepared through the existing one-plane `DSA_INDEX`
+specialization over the K tensor; this invokes the same generic MLA transfer
+code with `V=0`. Bandwidth accounting includes K only.
+The harness suppresses its optional per-rank CPU reference clones, so a shared
+slab remains the only source allocation and is not pre-scanned by every
+worker.
 
 All tuning parameters are kernel arguments. Rebuilding between configurations
 is not required.
+
+Each experimental configuration performs one fully validated launch before
+warmup. Timed launches disable repeated tensor/device validation so their host
+path is comparable to the production prepared kernel. `--verify` additionally
+checks exact K values, untouched V, and untouched padded row tails.
 
 ## Build
 
@@ -25,6 +36,8 @@ Python process imports the rebuilt extension rather than an older installed
 copy:
 
 ```bash
+git submodule update --init --recursive
+pip install -v --no-build-isolation -e .
 python3 -c 'import lmcache_ascend.c_ops as c; print(c.__file__)'
 ```
 

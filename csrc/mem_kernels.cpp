@@ -824,52 +824,108 @@ void sparse_k_batched_direct_kv_transfer_experimental(
     const int64_t total_tokens, const int64_t kernel_variant,
     const int64_t aiv_num, const int64_t tile_tokens,
     const bool pipeline, const int64_t addressing_mode,
-    const int64_t work_assignment,
+    const int64_t work_assignment, const bool validate_inputs,
     const c10::optional<torch::Tensor> &selected_token_counts) {
-  TORCH_CHECK(kernel_variant == 0 || kernel_variant == 1,
-              "kernel_variant must be 0 (original) or 1 (K-only).");
-  TORCH_CHECK(destination_state.v_hidden_dims == 0 &&
-                  destination_state.dsa_hidden_dims >= 0,
-              "Experimental sparse K transfer requires a one-plane "
-              "destination state (v_hidden_dims == 0).");
-  TORCH_CHECK(chunk_size > 0 && chunk_size <= std::numeric_limits<int32_t>::max(),
-              "chunk_size must be a positive int32 value.");
-  TORCH_CHECK(total_tokens > 0 &&
-                  total_tokens <= std::numeric_limits<int32_t>::max(),
-              "total_tokens must be a positive int32 value.");
-  TORCH_CHECK(tile_tokens > 0 &&
-                  tile_tokens <= destination_state.max_tokens_per_loop,
-              "tile_tokens must be in [1, ",
-              destination_state.max_tokens_per_loop, "].");
-  TORCH_CHECK(addressing_mode >= 0 && addressing_mode <= 2,
-              "addressing_mode must be 0 (auto), 1 (division), or 2 "
-              "(power-of-two shift).");
-  TORCH_CHECK(work_assignment == 0 || work_assignment == 1,
-              "work_assignment must be 0 (balanced) or 1 (striped).");
-  TORCH_CHECK(aiv_num >= 0 &&
-                  aiv_num <= static_cast<int64_t>(hardware_aiv_num()),
-              "aiv_num must be 0 (auto) or in [1, ",
-              hardware_aiv_num(), "].");
-  TORCH_CHECK(slot_mapping_packed.numel() == selected_token_idx.numel(),
-              "slot_mapping_packed and selected_token_idx must have the "
-              "same number of elements.");
-  TORCH_CHECK(selected_token_idx.scalar_type() == at::ScalarType::Int,
-              "selected_token_idx must be torch.int32.");
-  TORCH_CHECK(chunk_ptrs_npu.scalar_type() == at::ScalarType::Long,
-              "chunk_ptrs_npu must be torch.int64.");
-  TORCH_CHECK(destination_state.k_hidden_dims > 0,
-              "k_hidden_dims must be positive.");
-  TORCH_CHECK(
-      destination_state.scalar_type_num == kvcache_ops::AscendType::FP16 ||
-          destination_state.scalar_type_num == kvcache_ops::AscendType::BF16 ||
-          destination_state.scalar_type_num == kvcache_ops::AscendType::INT8,
-      "Experimental sparse K transfer supports FP16, BF16, and INT8.");
-  TORCH_CHECK(
-      selected_token_idx.numel() <= std::numeric_limits<int32_t>::max(),
-      "selected_token_idx is too large for the device kernel.");
-  TORCH_CHECK(
-      chunk_ptrs_npu.numel() <= std::numeric_limits<int32_t>::max(),
-      "chunk_ptrs_npu is too large for the device kernel.");
+  if (validate_inputs) {
+    validate_sparse_single_layer_inputs(slot_mapping_packed,
+                                        selected_token_idx);
+    TORCH_CHECK(kernel_variant == 0 || kernel_variant == 1,
+                "kernel_variant must be 0 (original) or 1 (K-only).");
+    TORCH_CHECK(destination_state.v_hidden_dims == 0,
+                "Experimental sparse K transfer requires a one-plane "
+                "destination state (v_hidden_dims == 0).");
+    TORCH_CHECK(
+        destination_state.kvcache_format ==
+            kvcache_ops::KVCacheFormat::DSA_INDEX,
+        "Experimental sparse K transfer requires a prepared DSA_INDEX "
+        "destination state.");
+    TORCH_CHECK(
+        chunk_size > 0 && chunk_size <= std::numeric_limits<int32_t>::max(),
+        "chunk_size must be a positive int32 value.");
+    TORCH_CHECK(total_tokens > 0 &&
+                    total_tokens <= std::numeric_limits<int32_t>::max(),
+                "total_tokens must be a positive int32 value.");
+    TORCH_CHECK(tile_tokens > 0 &&
+                    tile_tokens <= destination_state.max_tokens_per_loop,
+                "tile_tokens must be in [1, ",
+                destination_state.max_tokens_per_loop, "].");
+    TORCH_CHECK(addressing_mode >= 0 && addressing_mode <= 2,
+                "addressing_mode must be 0 (auto), 1 (division), or 2 "
+                "(power-of-two shift).");
+    TORCH_CHECK(work_assignment == 0 || work_assignment == 1,
+                "work_assignment must be 0 (balanced) or 1 (striped).");
+    TORCH_CHECK(aiv_num >= 0 &&
+                    aiv_num <= static_cast<int64_t>(hardware_aiv_num()),
+                "aiv_num must be 0 (auto) or in [1, ",
+                hardware_aiv_num(), "].");
+    TORCH_CHECK(slot_mapping_packed.numel() == selected_token_idx.numel(),
+                "slot_mapping_packed and selected_token_idx must have the "
+                "same number of elements.");
+    TORCH_CHECK(chunk_ptrs_npu.scalar_type() == at::ScalarType::Long,
+                "chunk_ptrs_npu must be torch.int64.");
+    TORCH_CHECK(slot_mapping_packed.scalar_type() == at::ScalarType::Int ||
+                    slot_mapping_packed.scalar_type() == at::ScalarType::Long,
+                "slot_mapping_packed must be torch.int32 or torch.int64.");
+    TORCH_CHECK(
+        vllm_ascend::get_dtype_from_torch(slot_mapping_packed.scalar_type()) ==
+            destination_state.slot_type_num,
+        "slot_mapping_packed dtype differs from the prepared destination "
+        "state.");
+    TORCH_CHECK(slot_mapping_packed.is_contiguous() &&
+                    selected_token_idx.is_contiguous(),
+                "slot_mapping_packed and selected_token_idx must be "
+                "contiguous.");
+    TORCH_CHECK(chunk_ptrs_npu.is_contiguous() &&
+                    chunk_ptrs_npu.device().is_privateuseone(),
+                "chunk_ptrs_npu must be a contiguous NPU tensor.");
+    TORCH_CHECK(chunk_ptrs_npu.device() == selected_token_idx.device() &&
+                    slot_mapping_packed.device() ==
+                        selected_token_idx.device(),
+                "slot_mapping_packed, selected_token_idx, and "
+                "chunk_ptrs_npu must be on the same NPU device.");
+    TORCH_CHECK(destination_state.k_hidden_dims > 0,
+                "k_hidden_dims must be positive.");
+    TORCH_CHECK(
+        destination_state.scalar_type_num == kvcache_ops::AscendType::FP16 ||
+            destination_state.scalar_type_num ==
+                kvcache_ops::AscendType::BF16 ||
+            destination_state.scalar_type_num ==
+                kvcache_ops::AscendType::INT8,
+        "Experimental sparse K transfer supports FP16, BF16, and INT8.");
+    const int64_t element_size =
+        destination_state.scalar_type_num == kvcache_ops::AscendType::INT8
+        ? 1
+        : 2;
+    TORCH_CHECK(destination_state.k_hidden_dims * element_size % 32 == 0,
+                "The K payload for one token must be 32-byte aligned.");
+    TORCH_CHECK(
+        selected_token_idx.numel() <= std::numeric_limits<int32_t>::max(),
+        "selected_token_idx is too large for the device kernel.");
+    TORCH_CHECK(
+        chunk_ptrs_npu.numel() <= std::numeric_limits<int32_t>::max(),
+        "chunk_ptrs_npu is too large for the device kernel.");
+    TORCH_CHECK(
+        !selected_token_counts.has_value() ||
+            selected_token_counts->numel() <=
+                std::numeric_limits<int32_t>::max(),
+        "selected_token_counts is too large for the device kernel.");
+    if (selected_token_counts.has_value()) {
+      TORCH_CHECK(selected_token_counts->scalar_type() ==
+                      at::ScalarType::Int,
+                  "selected_token_counts must be torch.int32.");
+      TORCH_CHECK(selected_token_counts->numel() > 0 &&
+                      selected_token_counts->dim() == 1 &&
+                      selected_token_counts->is_contiguous() &&
+                      selected_token_counts->device() ==
+                          selected_token_idx.device(),
+                  "selected_token_counts must be a non-empty contiguous 1D "
+                  "tensor on the selected_token_idx device.");
+      TORCH_CHECK(
+          selected_token_idx.numel() % selected_token_counts->numel() == 0,
+          "selected_token_idx.numel() must be divisible by the number "
+          "of selected_token_counts rows.");
+    }
+  }
 
   const c10::OptionalDeviceGuard slot_device_guard(
       device_of(slot_mapping_packed));
@@ -880,17 +936,15 @@ void sparse_k_batched_direct_kv_transfer_experimental(
   }
 
   const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
-  TORCH_CHECK(num_chunks > 0, "chunk_ptrs_npu must not be empty.");
+  if (validate_inputs) {
+    TORCH_CHECK(num_chunks > 0, "chunk_ptrs_npu must not be empty.");
+    TORCH_CHECK(
+        num_chunks == (total_tokens + chunk_size - 1) / chunk_size,
+        "chunk_ptrs_npu length must equal ceil(total_tokens / chunk_size).");
+  }
   const int32_t request_count = selected_token_counts.has_value()
       ? static_cast<int32_t>(selected_token_counts->numel())
       : 0;
-  TORCH_CHECK(request_count == 0 || num_sparse % request_count == 0,
-              "selected_token_idx.numel() must be divisible by the number "
-              "of selected_token_counts rows.");
-  if (selected_token_counts.has_value()) {
-    TORCH_CHECK(selected_token_counts->scalar_type() == at::ScalarType::Int,
-                "selected_token_counts must be torch.int32.");
-  }
   const int32_t row_width =
       request_count > 0 ? num_sparse / request_count : 0;
   const int32_t selected_count_stride = selected_token_counts.has_value()
@@ -922,7 +976,7 @@ void sparse_k_batched_direct_kv_transfer_experimental(
   int32_t chunk_mask = 0;
   const bool chunk_is_power_of_two =
       (chunk_size_i & (chunk_size_i - 1)) == 0;
-  if (addressing_mode == 2) {
+  if (validate_inputs && addressing_mode == 2) {
     TORCH_CHECK(chunk_is_power_of_two,
                 "Power-of-two addressing requires a power-of-two "
                 "chunk_size.");

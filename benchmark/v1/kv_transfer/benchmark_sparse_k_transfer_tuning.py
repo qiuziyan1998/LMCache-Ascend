@@ -4,8 +4,9 @@
 
 The extension is compiled once.  AIV count, UB tile size, double buffering,
 chunk addressing, and work assignment are runtime arguments.  The benchmark
-uses the production one-plane ``DSA_INDEX`` layout as the exact original
-K-only baseline; no V payload is allocated or counted.
+keeps the production ``MLA_LATENT`` host layout (K followed by an unused
+V/rope plane) and prepares a one-plane destination through the existing
+``DSA_INDEX`` specialization. Neither kernel reads or counts the V plane.
 
 Recommended first run:
 
@@ -51,9 +52,10 @@ try:
 except ImportError:
     pass
 
-from kv_cache_fixtures import generate_dsa_index_kv_cache  # noqa: E402
+from kv_cache_fixtures import generate_mla_kv_cache  # noqa: E402
 from load_benchmark_utils import (  # noqa: E402
     ALIGN_BYTES,
+    KV_FORMAT_DSA_INDEX,
     LoadBenchmarkHarness,
     MlaDsaDims,
     build_load_benchmark_harness,
@@ -65,6 +67,7 @@ from load_benchmark_utils import (  # noqa: E402
 from lmcache.v1.memory_management import MixedMemoryAllocator  # noqa: E402
 from lmcache.v1.shared_cpu_cache import SharedSlabMapping  # noqa: E402
 from lmcache_ascend.v1.npu_connector.utils import (  # noqa: E402
+    prepare_sparse_direct_destination_state,
     sparse_k_batched_direct_kv_transfer_experimental,
     sparse_mla_dsa_batched_direct_kv_transfer_prepared,
     sparse_transfer_hardware_aiv_num,
@@ -202,6 +205,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-layers", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--k-hidden-dims", type=int, default=512)
+    parser.add_argument(
+        "--host-v-hidden-dims",
+        type=int,
+        default=64,
+        help="unused trailing V plane retained in each MLA_LATENT host chunk",
+    )
     parser.add_argument("--selected-counts", default="")
     parser.add_argument("--chunk-sizes", default="")
     parser.add_argument(
@@ -250,6 +259,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--shared-cpu-slab", action="store_true")
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-csv", default="")
+    parser.add_argument(
+        "--worker-timeout-sec",
+        type=int,
+        default=86400,
+        help="parent wait timeout for long standard/full sweeps",
+    )
     args = parser.parse_args()
 
     preset = PRESETS[args.preset]
@@ -332,12 +347,18 @@ def _parse_args() -> argparse.Namespace:
     if unknown:
         parser.error(f"unknown locality cases: {sorted(unknown)}")
 
-    for name in ("num_tokens", "num_layers", "block_size", "k_hidden_dims"):
+    for name in (
+        "num_tokens",
+        "num_layers",
+        "block_size",
+        "k_hidden_dims",
+        "host_v_hidden_dims",
+    ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    for name in ("iters", "repeats", "top"):
+    for name in ("iters", "repeats", "top", "worker_timeout_sec"):
         if getattr(args, name) <= 0:
-            parser.error(f"--{name} must be positive")
+            parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
         parser.error("--warmup cannot be negative")
     if args.near_best_percent < 0:
@@ -525,16 +546,18 @@ def _build_harness(
     torch.manual_seed(args.seed if args.shared_cpu_slab else args.seed + rank)
 
     num_blocks = recommended_num_blocks(args.num_tokens, args.block_size)
-    source_cache = generate_dsa_index_kv_cache(
+    source_cache = generate_mla_kv_cache(
         num_blocks=num_blocks,
         device=device,
         num_layers=args.num_layers,
-        dsa_head_dim=args.k_hidden_dims,
+        num_kv_heads=1,
+        kv_lora_rank=args.k_hidden_dims,
+        qk_rope_head_dim=args.host_v_hidden_dims,
         block_size=args.block_size,
         dtype=torch.bfloat16,
     )
     harness = build_load_benchmark_harness(
-        fmt="dsa_index",
+        fmt="mla_latent",
         src_kv_cache=source_cache,
         num_tokens=args.num_tokens,
         chunk_size=shape.chunk_size,
@@ -543,7 +566,22 @@ def _build_harness(
         seed=args.seed,
         shared_cpu_slab=shared_cpu_slab,
         populate_cpu_source=populate_cpu_source,
+        copy_expected_cpu_chunks=False,
     )
+    # Keep the production MLA_LATENT source-chunk allocation (K followed by
+    # the unused V/rope plane), but prepare a one-plane destination so both
+    # the original and experimental kernels copy K only.
+    harness.layer_states = [
+        prepare_sparse_direct_destination_state(
+            (harness.dst_direct_fast[layer_id][0],),
+            harness.slot_mapping_full,
+            KV_FORMAT_DSA_INDEX,
+            args.k_hidden_dims,
+            0,
+            args.k_hidden_dims,
+        )
+        for layer_id in range(args.num_layers)
+    ]
     num_slots = (
         harness.dst_direct_fast[0][0].shape[0]
         * harness.dst_direct_fast[0][0].shape[1]
@@ -575,6 +613,8 @@ def _run_layers(
     harness: LoadBenchmarkHarness,
     config: KernelConfig,
     selected_counts: torch.Tensor | None,
+    *,
+    validate_inputs: bool = False,
 ) -> None:
     for layer_id in range(harness.num_layers):
         if config.variant == "production":
@@ -602,6 +642,7 @@ def _run_layers(
             config.pipeline,
             ADDRESSING_MODES[config.addressing],
             WORK_ASSIGNMENTS[config.work_assignment],
+            validate_inputs,
             selected_counts,
         )
 
@@ -614,8 +655,14 @@ def _verify(
     selected_counts: torch.Tensor | None,
 ) -> None:
     for layer in harness.dst_direct_fast:
-        layer[0].zero_()
-    _run_layers(harness, config, selected_counts)
+        for plane in layer:
+            plane.zero_()
+    _run_layers(
+        harness,
+        config,
+        selected_counts,
+        validate_inputs=True,
+    )
     torch.npu.synchronize()
 
     valid_positions = torch.tensor(
@@ -638,6 +685,11 @@ def _verify(
         expected = source.index_select(0, source_slots)
         actual = destination.index_select(0, valid_destinations)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        untouched_v = destination_layer[1].flatten(0, 1).index_select(
+            0, valid_destinations
+        )
+        if torch.count_nonzero(untouched_v).item() != 0:
+            raise AssertionError(f"{config.name} unexpectedly copied V")
 
     if len(valid_positions) == shape.capacity:
         return
@@ -663,9 +715,9 @@ def _verify(
 def _shared_slab_size(args: argparse.Namespace) -> int:
     dims = MlaDsaDims(
         k_hidden_dims=args.k_hidden_dims,
-        v_hidden_dims=0,
-        dsa_hidden_dims=args.k_hidden_dims,
-        plane_elems=args.k_hidden_dims,
+        v_hidden_dims=args.host_v_hidden_dims,
+        dsa_hidden_dims=0,
+        plane_elems=args.k_hidden_dims + args.host_v_hidden_dims,
     )
     return max(
         shared_cpu_slab_bytes(
@@ -759,6 +811,14 @@ def _worker(
                             config,
                             selected_counts,
                         )
+                    elif config.variant != "production":
+                        _run_layers(
+                            harness,
+                            config,
+                            selected_counts,
+                            validate_inputs=True,
+                        )
+                        torch.npu.synchronize()
                     for _ in range(args.warmup):
                         _run_layers(harness, config, selected_counts)
                     torch.npu.synchronize()
@@ -776,13 +836,11 @@ def _worker(
                         end_event.synchronize()
                         wall_end_ns = time.monotonic_ns()
                         samples.append(
-                            {
-                                "event_ms": float(
-                                    start_event.elapsed_time(end_event)
-                                ),
-                                "wall_start_ns": wall_start_ns,
-                                "wall_end_ns": wall_end_ns,
-                            }
+                            (
+                                float(start_event.elapsed_time(end_event)),
+                                wall_start_ns,
+                                wall_end_ns,
+                            )
                         )
                         barrier.wait(timeout=300)
                     locality_results[config.name] = {
@@ -849,11 +907,25 @@ def _summarize(
             "num_layers": args.num_layers,
             "block_size": args.block_size,
             "k_hidden_dims": args.k_hidden_dims,
+            "host_v_hidden_dims": args.host_v_hidden_dims,
+            "selected_counts": args.selected_counts,
+            "chunk_sizes": args.chunk_sizes,
+            "request_counts": args.request_counts,
+            "valid_fractions": args.valid_fractions,
+            "aiv_counts": args.aiv_counts,
+            "tile_tokens": args.tile_tokens,
+            "addressing_modes": args.addressing_modes,
+            "work_assignments": args.work_assignments,
+            "variants": args.variants,
+            "localities": args.localities,
             "warmup": args.warmup,
             "iters": args.iters,
             "repeats": args.repeats,
             "near_best_percent": args.near_best_percent,
+            "seed": args.seed,
+            "verify": args.verify,
             "shared_cpu_slab": args.shared_cpu_slab,
+            "worker_timeout_sec": args.worker_timeout_sec,
             "max_aiv_num_by_rank": [
                 worker["max_aiv_num"] for worker in workers
             ],
@@ -892,7 +964,7 @@ def _summarize(
                     "config"
                 ]
                 event_ms = [
-                    sample["event_ms"]
+                    sample[0]
                     for worker_result in worker_shape
                     for sample in worker_result["results"][locality][
                         config_name
@@ -911,8 +983,8 @@ def _summarize(
                         for worker_result in worker_shape
                     ]
                     wall_seconds = (
-                        max(sample["wall_end_ns"] for sample in samples)
-                        - min(sample["wall_start_ns"] for sample in samples)
+                        max(sample[2] for sample in samples)
+                        - min(sample[1] for sample in samples)
                     ) / 1e9
                     wall_bandwidths.append(
                         bytes_per_repeat * len(workers) / wall_seconds / 1e9
@@ -1051,6 +1123,33 @@ def _write_outputs(
         print(f"Wrote CSV: {path}")
 
 
+def _collect_workers(
+    processes: Sequence[mp.Process],
+    output: Any,
+    timeout_sec: int,
+) -> list[dict[str, Any]]:
+    workers = []
+    deadline = time.monotonic() + timeout_sec
+    while len(workers) < len(processes):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "timed out waiting for benchmark workers; "
+                f"received {len(workers)}/{len(processes)} results"
+            )
+        try:
+            workers.append(output.get(timeout=min(1.0, remaining)))
+        except Empty:
+            if all(not process.is_alive() for process in processes):
+                exit_codes = [process.exitcode for process in processes]
+                raise RuntimeError(
+                    "benchmark workers exited before reporting all results: "
+                    f"received {len(workers)}/{len(processes)}, "
+                    f"exit codes={exit_codes}"
+                )
+    return workers
+
+
 def main() -> None:
     args = _parse_args()
     shapes = _shapes(args)
@@ -1106,12 +1205,12 @@ def main() -> None:
     for process in processes:
         process.start()
 
-    workers = []
     try:
-        for _ in processes:
-            workers.append(output.get(timeout=7200))
-    except Empty as exc:
-        raise RuntimeError("timed out waiting for benchmark workers") from exc
+        workers = _collect_workers(
+            processes,
+            output,
+            args.worker_timeout_sec,
+        )
     finally:
         for process in processes:
             process.join(timeout=30)
