@@ -1,6 +1,7 @@
 #include "mem_alloc.h"
 #include "managed_mem.h"
 #include <acl/acl.h>
+#include <algorithm>
 #include <cstdlib> // for std::getenv
 #include <cstring> // for strerror
 #include <errno.h>
@@ -11,6 +12,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <vector>
 
 uintptr_t alloc_pinned_ptr(std::size_t size, unsigned int flags) {
   void *ptr = nullptr;
@@ -109,6 +111,68 @@ static void first_touch(void *p, size_t size) {
   }
 }
 
+namespace {
+
+class ScopedInterleavePolicy {
+ public:
+  explicit ScopedInterleavePolicy(const std::vector<int> &nodes) {
+    if (nodes.empty()) {
+      return;
+    }
+
+    int mode;
+    if (get_mempolicy(&mode, nullptr, 0, nullptr, 0) != 0) {
+      throw std::runtime_error(std::string("get_mempolicy failed: ") +
+                               strerror(errno));
+    }
+    if (mode != MPOL_DEFAULT) {
+      throw std::runtime_error(
+          "shared CPU cache NUMA interleave requires the default thread "
+          "memory policy; remove the external numactl policy");
+    }
+
+    int max_node = *std::max_element(nodes.begin(), nodes.end());
+    if (max_node < 0) {
+      throw std::runtime_error("NUMA interleave nodes must be non-negative");
+    }
+    constexpr std::size_t bits_per_word = sizeof(unsigned long) * 8;
+    std::vector<unsigned long> mask(max_node / bits_per_word + 1);
+    for (int node : nodes) {
+      if (node < 0) {
+        throw std::runtime_error("NUMA interleave nodes must be non-negative");
+      }
+      mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
+    }
+    if (set_mempolicy(MPOL_INTERLEAVE, mask.data(), max_node + 1) != 0) {
+      throw std::runtime_error(std::string("set_mempolicy failed: ") +
+                               strerror(errno));
+    }
+    active_ = true;
+  }
+
+  ~ScopedInterleavePolicy() {
+    if (active_) {
+      set_mempolicy(MPOL_DEFAULT, nullptr, 0);
+    }
+  }
+
+  void restore() {
+    if (!active_) {
+      return;
+    }
+    if (set_mempolicy(MPOL_DEFAULT, nullptr, 0) != 0) {
+      throw std::runtime_error(std::string("restore mempolicy failed: ") +
+                               strerror(errno));
+    }
+    active_ = false;
+  }
+
+ private:
+  bool active_ = false;
+};
+
+}  // namespace
+
 static void reserve_shm_storage(int fd, std::size_t size,
                                 const std::string &shm_name) {
   if (size > static_cast<std::size_t>(std::numeric_limits<off_t>::max())) {
@@ -125,7 +189,9 @@ static void reserve_shm_storage(int fd, std::size_t size,
   }
 }
 
-uintptr_t alloc_shm_pinned_ptr(std::size_t size, const std::string &shm_name) {
+uintptr_t alloc_shm_pinned_ptr(
+    std::size_t size, const std::string &shm_name,
+    const std::vector<int> &interleave_nodes) {
   if (size == 0) {
     throw std::runtime_error("alloc_shm_pinned_ptr requires size > 0 for " +
                              shm_name);
@@ -134,6 +200,7 @@ uintptr_t alloc_shm_pinned_ptr(std::size_t size, const std::string &shm_name) {
     throw std::runtime_error("alloc_shm_pinned_ptr requires a shm_name");
   }
 
+  ScopedInterleavePolicy numa_policy(interleave_nodes);
   int fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   if (fd < 0) {
     throw std::runtime_error(
@@ -168,7 +235,14 @@ uintptr_t alloc_shm_pinned_ptr(std::size_t size, const std::string &shm_name) {
                              strerror(errno));
   }
 
-  first_touch(ptr, size);
+  try {
+    first_touch(ptr, size);
+    numa_policy.restore();
+  } catch (...) {
+    munmap(ptr, size);
+    shm_unlink(shm_name.c_str());
+    throw;
+  }
   auto devPtr = register_ptr(ptr, size);
   if (devPtr == nullptr) {
     munmap(ptr, size);

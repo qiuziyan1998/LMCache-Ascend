@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared CPU sparse decode collective-order tests."""
+"""Sparse decode cache-state and shared collective-order tests."""
 
 # Standard
 from types import SimpleNamespace
@@ -1449,6 +1449,106 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     assert cached_shared_handles == [[old_handle, new_handle]]
     assert len(broadcasts) == 1
     assert broadcasts[0].handles == [new_handle]
+
+
+def test_sparse_per_rank_retrieves_missing_suffix_without_shared_handles(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    old_mem_obj = _FakeTensorMemObj(torch.empty(1))
+    new_mem_obj = _FakeTensorMemObj(torch.empty(1))
+    get_calls = []
+
+    def layerwise_batched_get(keys, *, location):
+        get_calls.append((keys, location))
+        yield SimpleNamespace(result=lambda: [new_mem_obj])
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
+    engine.storage_manager = SimpleNamespace(
+        layerwise_batched_get=layerwise_batched_get
+    )
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "MooncakeStore",
+        [0, 1],
+        [1, 2],
+        [[key0, key1]],
+    )
+    cached_memory_objs = [[old_mem_obj]]
+    cached_tensors = [[old_mem_obj.tensor]]
+    cached_shared_handles = []
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1, 2],
+        cached_keys=[[key0, key1]],
+        cached_starts=[0, 1],
+        cached_ends=[1, 2],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=cached_tensors,
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=cached_shared_handles,
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0, 1], 0))
+    retriever.close()
+
+    assert get_calls == [([[key1]], "MooncakeStore")]
+    assert cached_memory_objs == [[old_mem_obj, new_mem_obj]]
+    assert cached_tensors == [[old_mem_obj.tensor, new_mem_obj.tensor]]
+    assert cached_shared_handles == []
+
+
+def test_sparse_shared_extension_still_requires_complete_handles():
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    old_mem_obj = _FakeTensorMemObj(torch.empty(1))
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.storage_manager = object()
+    engine.gpu_connector = object()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0, 1],
+        [1, 2],
+        [[key0, key1]],
+    )
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1, 2],
+        cached_keys=[[key0, key1]],
+        cached_starts=[0, 1],
+        cached_ends=[1, 2],
+        cached_memory_objs=[[old_mem_obj]],
+        cached_tensors=[[old_mem_obj.tensor]],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    with pytest.raises(ValueError, match="requires complete cached handles"):
+        next(retriever)
 
 
 def test_sparse_rank0_hot_shared_handles_do_not_republish(monkeypatch):
