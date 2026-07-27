@@ -130,12 +130,14 @@ void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
     kvcache_ops::KVCacheFormat format, uint32_t blockDim, void *stream,
     uint8_t *chunkPtrsPtr, uint8_t *vllmKeyPtr, uint8_t *vllmValuePtr,
     uint8_t *vllmDsaPtr, uint8_t *slotMappingPtr, uint8_t *selectedTokenIdxPtr,
+    uint8_t *selectedTokenCountsPtr,
     const int64_t vllmKeyBufferSize, const int64_t vllmValueBufferSize,
     const int64_t vllmDsaBufferSize, const int32_t maxTokensPerLoop,
     const int64_t kHiddenDims, const int64_t vHiddenDims, const int64_t dsaHiddenDims,
     const int32_t numTokens, const int32_t numChunks, const int32_t chunkSize,
     const int32_t totalTokens, const int32_t blockSize,
-    const bool lmcHostInterleaved = false);
+    const bool lmcHostInterleaved = false, const int32_t rowWidth = 0,
+    const int32_t requestCount = 0, const int32_t selectedCountStride = 1);
 
 void single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
@@ -242,14 +244,16 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
     const bool vllm_two_major = false, const int64_t k_hidden_dims = 0,
     const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0,
     const bool lmc_host_interleaved = false,
-    const c10::optional<torch::Tensor> &chunk_ptrs_npu = c10::nullopt);
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu = c10::nullopt,
+    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
 // Hot path: reuse cached per-layer config; no CPU chunk tensors required.
 void sparse_mla_dsa_batched_direct_kv_transfer_fast(
     SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_packed,
     torch::Tensor &selected_token_idx, torch::Tensor &chunk_ptrs_npu,
     const int64_t chunk_size, const int64_t total_tokens,
-    const bool lmc_host_interleaved, const bool validate_inputs = false);
+    const bool lmc_host_interleaved, const bool validate_inputs = false,
+    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
 // Prepared warm path: destination state is process-owned; all request and step
 // inputs are supplied by the decode generator at launch time.
@@ -257,7 +261,8 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     const SparseDirectDestinationState &destination_state,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
-    const int64_t total_tokens, const bool lmc_host_interleaved);
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
 // Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
 // direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.

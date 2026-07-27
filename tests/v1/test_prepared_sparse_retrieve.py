@@ -77,6 +77,26 @@ def test_prepared_sparse_retrieve_bypasses_bootstrap() -> None:
     assert connector.transfers == [first_payload, second_payload]
 
 
+def test_prepared_sparse_retrieve_uses_source_token_count() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.gpu_connector = _RecordingConnector(num_layers=2)
+    engine.is_healthy = lambda: True
+
+    source = _prepared_source()
+    retriever = engine.retrieve_layer_head_token_wise(
+        [],
+        prepared_sparse_source=source,
+        kvcaches=[object(), object()],
+        slot_mapping=torch.arange(4),
+        sync=False,
+        kv_group=0,
+    )
+
+    assert next(retriever).numel() == source.total_tokens
+    retriever.close()
+
+
 def test_dense_store_prepares_sparse_pointer_cache_without_shared_cpu() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     calls = []

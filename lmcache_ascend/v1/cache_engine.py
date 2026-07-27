@@ -2122,9 +2122,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         prepared_source: PreparedSparseSource = retrieve_kwargs[
             "prepared_sparse_source"
         ]
+        token_count = int(prepared_source.total_tokens)
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping sparse retrieve")
-            yield torch.zeros(len(tokens), dtype=torch.bool)
+            yield torch.zeros(token_count, dtype=torch.bool)
             return
 
         assert self.gpu_connector is not None, (
@@ -2133,7 +2134,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         ret_mask = retrieve_kwargs.get("ret_mask")
         if ret_mask is None:
-            ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+            ret_mask = torch.zeros(token_count, dtype=torch.bool, device="cpu")
 
         consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**retrieve_kwargs)
         next(consumer)

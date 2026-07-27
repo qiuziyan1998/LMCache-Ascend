@@ -495,19 +495,23 @@ namespace {
 static void launch_sparse_multi_chunk_direct_kernel(
     const SingleLayerKVConfig &config, uint8_t *selected_token_idx_ptr,
     uint8_t *chunk_ptrs_ptr, int32_t num_chunks, int32_t chunk_size,
-    int32_t total_tokens, bool lmc_host_interleaved) {
+    int32_t total_tokens, bool lmc_host_interleaved,
+    uint8_t *selected_token_counts_ptr = nullptr, int32_t row_width = 0,
+    int32_t request_count = 0, int32_t selected_count_stride = 1) {
   if (is_mla_dsa_format(config.kvcache_format)) {
     kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
         config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
         kernel_format(config.kvcache_format), config.ub_params.aiv_num, config.ub_params.stream,
         chunk_ptrs_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
         config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
-        selected_token_idx_ptr, config.strides.vllm_k_bytes,
+        selected_token_idx_ptr, selected_token_counts_ptr,
+        config.strides.vllm_k_bytes,
         config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
         config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
         config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
         num_chunks, chunk_size, total_tokens, config.dims.block_size,
-        lmc_host_interleaved);
+        lmc_host_interleaved, row_width, request_count,
+        selected_count_stride);
     return;
   }
 
@@ -584,7 +588,8 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
     const bool vllm_two_major, const int64_t k_hidden_dims,
     const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
     const bool lmc_host_interleaved,
-    const c10::optional<torch::Tensor> &chunk_ptrs_npu) {
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu,
+    const c10::optional<torch::Tensor> &selected_token_counts) {
   validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
   validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
   TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
@@ -600,7 +605,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
 
   const int32_t num_sparse =
-      static_cast<int32_t>(selected_token_idx.size(0));
+      static_cast<int32_t>(selected_token_idx.numel());
   if (num_sparse == 0) {
     return;
   }
@@ -626,10 +631,28 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
       vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
       dsa_hidden_dims);
   config.dims.num_tokens = num_sparse;
+  const int32_t request_count = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->numel())
+      : 0;
+  const int32_t row_width =
+      request_count > 0 ? num_sparse / request_count : 0;
+  const int32_t selected_count_stride = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->stride(0))
+      : 1;
+  // Count-aware payloads retain fixed-width rows so the kernel can skip each
+  // row's padded tail.  The connector normally submits one request per
+  // launch, therefore request_count is commonly one even when the row
+  // contains thousands of selected tokens.  Size the launch from the token
+  // capacity and let the kernel shard valid tokens within each row.
   config.ub_params.aiv_num = direct_aiv_num(num_sparse);
 
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
+  uint8_t *counts_ptr = selected_token_counts.has_value()
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
+      : nullptr;
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
 
@@ -638,11 +661,15 @@ void sparse_mla_dsa_batched_direct_kv_transfer(
 
   at_npu::native::OpCommand cmd;
   cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
-  cmd.SetCustomHandler([config, selected_ptr, chunk_ptrs_ptr, num_chunks,
-                        chunk_size_i, total_tokens_i, lmc_host_interleaved]() -> int {
+  cmd.SetCustomHandler([config, selected_ptr, counts_ptr, row_width,
+                        request_count, selected_count_stride,
+                        chunk_ptrs_ptr, num_chunks,
+                        chunk_size_i, total_tokens_i,
+                        lmc_host_interleaved]() -> int {
     launch_sparse_multi_chunk_direct_kernel(
         config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
-        total_tokens_i, lmc_host_interleaved);
+        total_tokens_i, lmc_host_interleaved, counts_ptr, row_width,
+        request_count, selected_count_stride);
     return 0;
   });
   cmd.Run();
@@ -652,7 +679,8 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
     SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_packed,
     torch::Tensor &selected_token_idx, torch::Tensor &chunk_ptrs_npu,
     const int64_t chunk_size, const int64_t total_tokens,
-    const bool lmc_host_interleaved, const bool validate_inputs) {
+    const bool lmc_host_interleaved, const bool validate_inputs,
+    const c10::optional<torch::Tensor> &selected_token_counts) {
   if (validate_inputs) {
     validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
@@ -666,7 +694,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
 
   const int32_t num_sparse =
-      static_cast<int32_t>(selected_token_idx.size(0));
+      static_cast<int32_t>(selected_token_idx.numel());
   if (num_sparse == 0) {
     return;
   }
@@ -675,6 +703,14 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 
   SingleLayerKVConfig config = layer_state.config;
   config.dims.num_tokens = num_sparse;
+  const int32_t request_count = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->numel())
+      : 0;
+  const int32_t row_width =
+      request_count > 0 ? num_sparse / request_count : 0;
+  const int32_t selected_count_stride = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->stride(0))
+      : 1;
   config.ub_params.aiv_num = direct_aiv_num(num_sparse);
   config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
@@ -682,6 +718,11 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
+  uint8_t *counts_ptr = selected_token_counts.has_value()
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
+      : nullptr;
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
 
@@ -690,11 +731,15 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 
   at_npu::native::OpCommand cmd;
   cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
-  cmd.SetCustomHandler([config, selected_ptr, chunk_ptrs_ptr, num_chunks,
-                        chunk_size_i, total_tokens_i, lmc_host_interleaved]() -> int {
+  cmd.SetCustomHandler([config, selected_ptr, counts_ptr, row_width,
+                        request_count, selected_count_stride,
+                        chunk_ptrs_ptr, num_chunks,
+                        chunk_size_i, total_tokens_i,
+                        lmc_host_interleaved]() -> int {
     launch_sparse_multi_chunk_direct_kernel(
         config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
-        total_tokens_i, lmc_host_interleaved);
+        total_tokens_i, lmc_host_interleaved, counts_ptr, row_width,
+        request_count, selected_count_stride);
     return 0;
   });
   cmd.Run();
@@ -704,16 +749,25 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     const SparseDirectDestinationState &destination_state,
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
-    const int64_t total_tokens, const bool lmc_host_interleaved) {
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const c10::optional<torch::Tensor> &selected_token_counts) {
   const c10::OptionalDeviceGuard slot_device_guard(
       device_of(slot_mapping_packed));
 
-  const int32_t num_sparse = static_cast<int32_t>(selected_token_idx.size(0));
+  const int32_t num_sparse = static_cast<int32_t>(selected_token_idx.numel());
   if (num_sparse == 0) {
     return;
   }
 
   const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+  const int32_t request_count = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->numel())
+      : 0;
+  const int32_t row_width =
+      request_count > 0 ? num_sparse / request_count : 0;
+  const int32_t selected_count_stride = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->stride(0))
+      : 1;
   const uint32_t aiv_num = direct_aiv_num(num_sparse);
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
@@ -721,6 +775,11 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
   uint8_t *selected_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
+  uint8_t *counts_ptr = selected_token_counts.has_value()
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
+      : nullptr;
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
 
@@ -731,16 +790,20 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
   at_npu::native::OpCommand cmd;
   cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
   cmd.SetCustomHandler([state, stream, aiv_num, slot_mapping_ptr, selected_ptr,
+                        counts_ptr, row_width, request_count,
+                        selected_count_stride,
                         chunk_ptrs_ptr, num_sparse, num_chunks, chunk_size_i,
                         total_tokens_i, lmc_host_interleaved]() -> int {
     kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
         state.scalar_type_num, state.slot_type_num,
         kernel_format(state.kvcache_format), aiv_num, stream, chunk_ptrs_ptr,
         state.vllm_k_ptr, state.vllm_v_ptr, state.vllm_dsa_ptr,
-        slot_mapping_ptr, selected_ptr, state.vllm_k_bytes, state.vllm_v_bytes,
+        slot_mapping_ptr, selected_ptr, counts_ptr, state.vllm_k_bytes,
+        state.vllm_v_bytes,
         state.vllm_dsa_bytes, state.max_tokens_per_loop, state.k_hidden_dims,
         state.v_hidden_dims, state.dsa_hidden_dims, num_sparse, num_chunks,
-        chunk_size_i, total_tokens_i, state.block_size, lmc_host_interleaved);
+        chunk_size_i, total_tokens_i, state.block_size, lmc_host_interleaved,
+        row_width, request_count, selected_count_stride);
     return 0;
   });
   cmd.Run();

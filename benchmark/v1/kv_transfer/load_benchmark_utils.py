@@ -167,6 +167,27 @@ def bandwidth_gb_per_s(bytes_moved: int, time_ms: float) -> float:
     return (bytes_moved / 1e9) / (time_ms / 1000.0)
 
 
+def rate_per_second(work_items: int, time_ms: float) -> float:
+    """Completed work items per second."""
+    if time_ms <= 0 or work_items <= 0:
+        return 0.0
+    return work_items / (time_ms / 1000.0)
+
+
+def percentile(samples: Sequence[float], quantile: float) -> float:
+    """Linearly interpolated percentile for a non-empty sample sequence."""
+    if not samples:
+        raise ValueError("percentile requires at least one sample")
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be in [0, 1]")
+    ordered = sorted(float(sample) for sample in samples)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
 def compute_direct_host_bytes(
     *,
     num_selected: int,

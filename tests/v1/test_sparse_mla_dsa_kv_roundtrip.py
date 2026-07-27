@@ -625,6 +625,142 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             if mem_objs:
                 release_pin_memory_objects(mem_objs)
 
+    @pytest.mark.parametrize(
+        ("row_width", "row_counts"),
+        [
+            (4096, (2048,)),
+            (2048, (1537, 509)),
+        ],
+    )
+    def test_prepared_sparse_count_rows_copy_only_valid_prefixes(
+        self,
+        row_width: int,
+        row_counts: tuple[int, ...],
+    ) -> None:
+        """Count-aware rows use all valid tokens without copying padded tails."""
+        num_tokens = 8192
+        row_count = len(row_counts)
+        payload_capacity = row_count * row_width
+        block_size = 128
+        common = dict(
+            num_blocks=72,
+            device="npu",
+            num_layers=1,
+            num_kv_heads=1,
+            kv_lora_rank=64,
+            qk_rope_head_dim=32,
+            block_size=block_size,
+            dtype=torch.bfloat16,
+        )
+        harness = None
+        try:
+            source_cache = generate_dsa_kv_cache(
+                dsa_head_dim=32,
+                **common,
+            )
+            harness = build_load_benchmark_harness(
+                fmt="dsa",
+                src_kv_cache=source_cache,
+                num_tokens=num_tokens,
+                chunk_size=256,
+                num_layers=1,
+                num_selected=payload_capacity,
+                seed=321,
+            )
+            selected = harness.selected_token_idx.reshape(
+                row_count,
+                row_width,
+            )
+            target_slots = torch.arange(
+                payload_capacity,
+                dtype=torch.long,
+                device=selected.device,
+            ).reshape(row_count, row_width)
+            selected_counts = torch.tensor(
+                row_counts,
+                dtype=torch.int32,
+                device=selected.device,
+            )
+            destination = harness.dst_direct_fast[0]
+            for plane in destination:
+                plane.zero_()
+
+            destination_state = prepare_sparse_direct_destination_state(
+                list(destination),
+                target_slots,
+                KV_FORMAT_DSA,
+                harness.dims.k_hidden_dims,
+                harness.dims.v_hidden_dims,
+                harness.dims.dsa_hidden_dims,
+            )
+            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+                destination_state,
+                target_slots,
+                selected,
+                harness.chunk_ptrs_by_layer[0],
+                harness.chunk_size,
+                harness.num_tokens,
+                False,
+                selected_counts,
+            )
+            torch.npu.synchronize()
+
+            valid_positions = []
+            padded_positions = []
+            for row, count in enumerate(row_counts):
+                row_start = row * row_width
+                valid_positions.extend(range(row_start, row_start + count))
+                padded_positions.extend(
+                    range(row_start + count, row_start + row_width)
+                )
+            valid_positions_npu = torch.tensor(
+                valid_positions,
+                dtype=torch.long,
+                device=selected.device,
+            )
+            padded_positions_npu = torch.tensor(
+                padded_positions,
+                dtype=torch.long,
+                device=selected.device,
+            )
+            selected_flat = selected.reshape(-1).to(torch.long)
+            source_slots = harness.slot_mapping_full.index_select(
+                0,
+                selected_flat,
+            )
+            target_slots_flat = target_slots.reshape(-1)
+
+            for source_plane, destination_plane in zip(
+                harness.src_kv_cache[0],
+                destination,
+                strict=True,
+            ):
+                source_flat = source_plane.flatten(0, 1)
+                destination_flat = destination_plane.flatten(0, 1)
+                expected = source_flat.index_select(
+                    0,
+                    source_slots.index_select(0, valid_positions_npu),
+                )
+                actual = destination_flat.index_select(
+                    0,
+                    target_slots_flat.index_select(
+                        0,
+                        valid_positions_npu,
+                    ),
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                padding = destination_flat.index_select(
+                    0,
+                    target_slots_flat.index_select(
+                        0,
+                        padded_positions_npu,
+                    ),
+                )
+                assert torch.count_nonzero(padding).item() == 0
+        finally:
+            if harness is not None:
+                harness.close()
+
     @pytest.mark.parametrize("fmt", ["mla", "dsa"])
     def test_sparse_direct_compact_scratch_slots_match_selected_source(
         self, fmt: str
