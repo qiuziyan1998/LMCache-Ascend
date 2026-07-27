@@ -260,6 +260,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-csv", default="")
     parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        help="rank-0 progress interval in completed configuration cases; 0 disables",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the sweep size and exit before starting NPU workers",
+    )
+    parser.add_argument(
         "--worker-timeout-sec",
         type=int,
         default=86400,
@@ -363,6 +374,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--warmup cannot be negative")
     if args.near_best_percent < 0:
         parser.error("--near-best-percent cannot be negative")
+    if args.progress_every < 0:
+        parser.error("--progress-every cannot be negative")
     if args.k_hidden_dims * 2 % 32:
         parser.error(
             "--k-hidden-dims with BF16 must make each token 32-byte aligned"
@@ -741,9 +754,29 @@ def _worker(
     shared_mapping = None
     harness = None
     try:
+        worker_start = time.monotonic()
+        if rank == 0:
+            print(
+                f"[progress] initializing NPU worker on device "
+                f"{args.devices[rank]}",
+                flush=True,
+            )
         device = torch.device(f"npu:{args.devices[rank]}")
         torch.npu.set_device(device)
         max_aiv_num = sparse_transfer_hardware_aiv_num()
+        total_config_cases = sum(
+            len(_kernel_configs(args, max_aiv_num, shape))
+            * len(args.localities)
+            for shape in shapes
+        )
+        completed_config_cases = 0
+        if rank == 0:
+            print(
+                f"[progress] worker ready: device={args.devices[rank]} "
+                f"hardware_aiv={max_aiv_num} "
+                f"configuration_cases={total_config_cases}",
+                flush=True,
+            )
 
         if args.shared_cpu_slab:
             slab_size = _shared_slab_size(args)
@@ -769,10 +802,16 @@ def _worker(
             shared_cpu_slab = None
 
         all_results: dict[str, Any] = {}
-        for shape in shapes:
+        for shape_index, shape in enumerate(shapes, start=1):
             if harness is not None:
                 harness.close()
                 harness = None
+            if rank == 0:
+                print(
+                    f"[progress] preparing shape {shape_index}/{len(shapes)}: "
+                    f"{shape.name}",
+                    flush=True,
+                )
             if args.shared_cpu_slab:
                 if rank == 0:
                     harness, cases, selected_counts, counts = _build_harness(
@@ -798,8 +837,19 @@ def _worker(
                 )
 
             configs = _kernel_configs(args, max_aiv_num, shape)
+            if rank == 0:
+                print(
+                    f"[progress] running {shape.name}: "
+                    f"{len(configs)} configs x {len(args.localities)} localities",
+                    flush=True,
+                )
             shape_results: dict[str, Any] = {}
             for locality in args.localities:
+                if rank == 0:
+                    print(
+                        f"[progress] {shape.name}: starting {locality}",
+                        flush=True,
+                    )
                 _set_case(harness, cases[locality])
                 locality_results: dict[str, Any] = {}
                 for config in configs:
@@ -847,6 +897,32 @@ def _worker(
                         "config": asdict(config),
                         "samples": samples,
                     }
+                    completed_config_cases += 1
+                    should_report = (
+                        args.progress_every > 0
+                        and completed_config_cases % args.progress_every == 0
+                    )
+                    if rank == 0 and (
+                        should_report
+                        or completed_config_cases == total_config_cases
+                    ):
+                        elapsed = time.monotonic() - worker_start
+                        rate = completed_config_cases / elapsed
+                        remaining = total_config_cases - completed_config_cases
+                        eta = remaining / rate if rate > 0 else math.inf
+                        percentage = (
+                            100
+                            * completed_config_cases
+                            / total_config_cases
+                        )
+                        print(
+                            f"[progress] {completed_config_cases}/"
+                            f"{total_config_cases} cases "
+                            f"({percentage:.1f}%) "
+                            f"elapsed={elapsed / 60:.1f} min "
+                            f"eta={eta / 60:.1f} min last={config.name}",
+                            flush=True,
+                        )
                 shape_results[locality] = locality_results
             all_results[shape.name] = {
                 "shape": asdict(shape),
@@ -926,6 +1002,7 @@ def _summarize(
             "verify": args.verify,
             "shared_cpu_slab": args.shared_cpu_slab,
             "worker_timeout_sec": args.worker_timeout_sec,
+            "progress_every": args.progress_every,
             "max_aiv_num_by_rank": [
                 worker["max_aiv_num"] for worker in workers
             ],
@@ -1158,39 +1235,49 @@ def main() -> None:
         if args.shared_cpu_slab
         else None
     )
-    estimated_configs = (
-        (1 if "production" in args.variants else 0)
-        + (
-            max(0, len(args.aiv_counts) - int(0 in args.aiv_counts))
-            if "original_tuned" in args.variants
-            else 0
-        )
-        + sum(
-            len(args.aiv_counts)
-            * len(args.tile_tokens)
-            * len(args.addressing_modes)
-            * len(args.work_assignments)
-            for variant in ("k_serial", "k_pipeline")
-            if variant in args.variants
-        )
+    requested_aiv_ceiling = max(
+        (aiv_num for aiv_num in args.aiv_counts if aiv_num > 0),
+        default=1,
     )
-    timed_repeats = (
-        len(shapes)
-        * len(args.localities)
-        * estimated_configs
-        * args.repeats
+    estimated_config_counts = [
+        len(_kernel_configs(args, requested_aiv_ceiling, shape))
+        for shape in shapes
+    ]
+    estimated_config_cases = sum(
+        count * len(args.localities) for count in estimated_config_counts
     )
+    estimated_layer_launches = 0
+    for shape in shapes:
+        for config in _kernel_configs(args, requested_aiv_ceiling, shape):
+            setup_invocations = int(args.verify or config.variant != "production")
+            invocations = (
+                setup_invocations
+                + args.warmup
+                + args.iters * args.repeats
+            )
+            estimated_layer_launches += (
+                len(args.localities) * args.num_layers * invocations
+            )
+    timed_repeats = estimated_config_cases * args.repeats
     print(
         f"devices={args.devices} preset={args.preset} shapes={len(shapes)} "
         f"localities={len(args.localities)} "
-        f"estimated_configs/shape={estimated_configs}"
+        f"estimated_configs/shape="
+        f"{min(estimated_config_counts)}-{max(estimated_config_counts)}",
+        flush=True,
     )
     print(
-        f"estimated timed repeats/rank={timed_repeats}; "
-        f"CPU slab={'shared' if args.shared_cpu_slab else 'private-per-rank'}"
+        f"estimated configuration cases/rank={estimated_config_cases}; "
+        f"timed repeats/rank={timed_repeats}; "
+        f"layer launches/rank={estimated_layer_launches:,}; "
+        f"CPU slab={'shared' if args.shared_cpu_slab else 'private-per-rank'}",
+        flush=True,
     )
     if args.shared_cpu_slab:
-        print(f"shared CPU slab: {args.shared_slab_name}")
+        print(f"shared CPU slab: {args.shared_slab_name}", flush=True)
+    if args.dry_run:
+        print("dry run: no NPU workers started", flush=True)
+        return
 
     context = mp.get_context("spawn")
     barrier = context.Barrier(len(args.devices))

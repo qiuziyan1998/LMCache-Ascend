@@ -64,10 +64,38 @@ python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_tuning.py \
 The smoke preset covers 256 and 2048 selected tokens, both no-count and
 one-row count-aware metadata, and contiguous plus fully scattered addresses.
 
-## Focused tuning run
+## Focused tuning runs
 
-This is the recommended matrix for choosing a setting for the current
-top-K=2048 decode path:
+Do not begin with the full Cartesian product. First prune AIV/tile/pipeline
+candidates on the scattered no-count path:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+numactl --interleave=all \
+python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_tuning.py \
+  --devices 0,1,2,3,4,5,6,7 \
+  --num-tokens 20000 \
+  --selected-counts 256,2048 \
+  --chunk-sizes 256 \
+  --request-counts 0 \
+  --aiv-counts 4,8,16,0 \
+  --tile-tokens 1,8,16 \
+  --addressing-modes auto \
+  --work-assignments striped \
+  --variants production,k_serial,k_pipeline \
+  --localities src_scattered__dst_scattered \
+  --num-layers 8 \
+  --warmup 3 \
+  --iters 20 \
+  --repeats 5 \
+  --shared-cpu-slab \
+  --output-json /workspace/qzy/sparse-k-prune.json \
+  --output-csv /workspace/qzy/sparse-k-prune.csv
+```
+
+Then verify a short list around the winners across request counts and
+localities. For example, the following checks the most useful serial
+shift/striped candidates:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -79,19 +107,20 @@ python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_tuning.py \
   --chunk-sizes 256 \
   --request-counts 0,1,4 \
   --valid-fractions 1.0,0.75 \
-  --aiv-counts 2,4,8,12,16,24,0 \
-  --tile-tokens 1,2,4,8,16,32 \
-  --addressing-modes auto,divide \
-  --work-assignments balanced,striped \
+  --aiv-counts 4,16,0 \
+  --tile-tokens 8,16 \
+  --addressing-modes auto \
+  --work-assignments striped \
+  --variants production,k_serial \
   --localities all \
   --num-layers 8 \
-  --warmup 5 \
-  --iters 50 \
-  --repeats 7 \
+  --warmup 3 \
+  --iters 20 \
+  --repeats 5 \
   --shared-cpu-slab \
   --verify \
-  --output-json /workspace/qzy/sparse-k-focused.json \
-  --output-csv /workspace/qzy/sparse-k-focused.csv
+  --output-json /workspace/qzy/sparse-k-validate.json \
+  --output-csv /workspace/qzy/sparse-k-validate.csv
 ```
 
 `request-counts=0` omits `selected_token_counts`. Positive values create
@@ -103,6 +132,12 @@ benchmark intentionally exercises the sparse prepared path.
 For a faster first performance run, use only
 `--localities src_scattered__dst_scattered`, then validate the winner with
 `--localities all`.
+
+The benchmark prints the number of configuration cases and estimated layer
+launches before starting. Add `--dry-run` to inspect that work without
+starting NPU workers. Rank 0 prints flushed setup and periodic ETA messages;
+`--progress-every 10` is the default, and `--progress-every 0` disables only
+the periodic messages.
 
 ## Broader presets
 
@@ -124,7 +159,9 @@ python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_tuning.py \
   --variants production,original_tuned \
   --aiv-counts 2,4,8,12,16,24,32,0 \
   --localities src_scattered__dst_scattered \
-  --verify
+  --verify \
+  --output-json /workspace/qzy/sparse-k-original-aiv.json \
+  --output-csv /workspace/qzy/sparse-k-original-aiv.csv
 ```
 
 Requested AIV values larger than the device AIV count are filtered at runtime.
