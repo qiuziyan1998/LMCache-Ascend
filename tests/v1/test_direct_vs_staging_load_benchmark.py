@@ -27,6 +27,10 @@ from kv_cache_fixtures import (  # noqa: E402
     generate_dsa_kv_cache,
     generate_mla_kv_cache,
 )
+from benchmark_lmcache_retrieve import (  # noqa: E402
+    _formats_for,
+    _parse_args as parse_retrieve_benchmark_args,
+)
 from load_benchmark_utils import (  # noqa: E402
     bandwidth_gb_per_s,
     benchmark_load_harness,
@@ -34,6 +38,8 @@ from load_benchmark_utils import (  # noqa: E402
     build_load_benchmark_harness,
     compute_direct_host_bytes,
     kv_format_from_name,
+    percentile,
+    rate_per_second,
     verify_load_benchmark_harness,
     verify_store_benchmark_harness,
 )
@@ -356,6 +362,57 @@ def test_compute_direct_host_bytes_mla_2048() -> None:
 def test_bandwidth_gb_per_s_zero_guard() -> None:
     assert bandwidth_gb_per_s(1024, 0.0) == 0.0
     assert bandwidth_gb_per_s(0, 1.0) == 0.0
+
+
+def test_retrieve_benchmark_rate_per_second() -> None:
+    assert rate_per_second(4096, 2.0) == 2_048_000.0
+    assert rate_per_second(0, 2.0) == 0.0
+    assert rate_per_second(4096, 0.0) == 0.0
+
+
+def test_retrieve_benchmark_percentile_interpolates() -> None:
+    samples = (4.0, 1.0, 3.0, 2.0)
+    assert percentile(samples, 0.0) == 1.0
+    assert percentile(samples, 0.5) == 2.5
+    assert percentile(samples, 0.95) == pytest.approx(3.85)
+    assert percentile(samples, 1.0) == 4.0
+
+
+def test_retrieve_benchmark_percentile_rejects_invalid_input() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        percentile((), 0.5)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        percentile((1.0,), 1.1)
+
+
+def test_retrieve_benchmark_models_one_request_union_row() -> None:
+    args = parse_retrieve_benchmark_args(
+        [
+            "--mtp",
+            "2",
+            "--topk",
+            "2048",
+            "--valid-count",
+            "3072",
+        ]
+    )
+    assert args.mtp * args.topk == 4096
+    assert args.valid_count == 3072
+    assert _formats_for("both") == ("mla_latent", "dsa_index")
+
+
+def test_retrieve_benchmark_rejects_count_beyond_union_capacity() -> None:
+    with pytest.raises(SystemExit):
+        parse_retrieve_benchmark_args(
+            [
+                "--mtp",
+                "1",
+                "--topk",
+                "2048",
+                "--valid-count",
+                "2049",
+            ]
+        )
 
 
 @pytest.mark.skipif(
