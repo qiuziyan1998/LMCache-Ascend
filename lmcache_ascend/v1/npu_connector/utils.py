@@ -350,6 +350,50 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     )
 
 
+def sparse_k_batched_direct_kv_transfer_experimental(
+    destination_state,
+    slot_mapping_packed: torch.Tensor,
+    selected_token_idx: torch.Tensor,
+    chunk_ptrs_npu: torch.Tensor,
+    chunk_size: int,
+    total_tokens: int,
+    kernel_variant: int,
+    aiv_num: int = 0,
+    tile_tokens: int = 1,
+    pipeline: bool = False,
+    addressing_mode: int = 0,
+    work_assignment: int = 0,
+    selected_token_counts: Optional[torch.Tensor] = None,
+) -> None:
+    """Run a configured one-plane sparse transfer for kernel tuning.
+
+    ``kernel_variant=0`` is the original generic kernel with an optional AIV
+    override. ``kernel_variant=1`` is the dedicated K-only kernel.  All
+    settings are runtime arguments so a benchmark can sweep them after one
+    extension build.
+    """
+    lmc_ops.sparse_k_batched_direct_kv_transfer_experimental(
+        destination_state,
+        slot_mapping_packed,
+        selected_token_idx,
+        chunk_ptrs_npu,
+        chunk_size,
+        total_tokens,
+        kernel_variant,
+        aiv_num,
+        tile_tokens,
+        pipeline,
+        addressing_mode,
+        work_assignment,
+        selected_token_counts,
+    )
+
+
+def sparse_transfer_hardware_aiv_num() -> int:
+    """Return the worker device's AIV count used by sparse transfer auto mode."""
+    return int(lmc_ops.sparse_transfer_hardware_aiv_num())
+
+
 def dense_mla_dsa_batched_direct_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     vllm_kv_caches: _KVCacheArg,

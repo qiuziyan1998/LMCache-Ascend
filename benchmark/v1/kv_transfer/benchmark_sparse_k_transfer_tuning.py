@@ -1,0 +1,1136 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Tune and compare the original and experimental K-only sparse H2D kernels.
+
+The extension is compiled once.  AIV count, UB tile size, double buffering,
+chunk addressing, and work assignment are runtime arguments.  The benchmark
+uses the production one-plane ``DSA_INDEX`` layout as the exact original
+K-only baseline; no V payload is allocated or counted.
+
+Recommended first run:
+
+  ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  numactl --interleave=all \
+  python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_tuning.py \
+    --devices 0,1,2,3,4,5,6,7 \
+    --preset smoke --shared-cpu-slab --verify \
+    --output-json /workspace/qzy/sparse-k-smoke.json
+
+The ``standard`` and ``full`` presets expand the shape and configuration
+matrix.  Every preset can be overridden with the comma-separated list flags.
+"""
+
+from __future__ import annotations
+
+# Standard
+from dataclasses import asdict, dataclass
+import argparse
+import csv
+import json
+import math
+import multiprocessing as mp
+import os
+from pathlib import Path
+from queue import Empty
+import random
+import statistics
+import sys
+import time
+from typing import Any, Iterable, Sequence
+import uuid
+
+# Third Party
+import torch
+
+_BENCHMARK_DIR = Path(__file__).resolve().parent
+if str(_BENCHMARK_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCHMARK_DIR))
+
+try:
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+except ImportError:
+    pass
+
+from kv_cache_fixtures import generate_dsa_index_kv_cache  # noqa: E402
+from load_benchmark_utils import (  # noqa: E402
+    ALIGN_BYTES,
+    LoadBenchmarkHarness,
+    MlaDsaDims,
+    build_load_benchmark_harness,
+    compute_chunk_partition,
+    format_bytes_short,
+    recommended_num_blocks,
+    shared_cpu_slab_bytes,
+)
+from lmcache.v1.memory_management import MixedMemoryAllocator  # noqa: E402
+from lmcache.v1.shared_cpu_cache import SharedSlabMapping  # noqa: E402
+from lmcache_ascend.v1.npu_connector.utils import (  # noqa: E402
+    sparse_k_batched_direct_kv_transfer_experimental,
+    sparse_mla_dsa_batched_direct_kv_transfer_prepared,
+    sparse_transfer_hardware_aiv_num,
+)
+
+
+LOCALITY_CASES = (
+    "src_contiguous__dst_contiguous",
+    "src_contiguous__dst_scattered",
+    "src_scattered__dst_contiguous",
+    "src_scattered__dst_scattered",
+)
+
+ADDRESSING_MODES = {"auto": 0, "divide": 1, "shift": 2}
+WORK_ASSIGNMENTS = {"balanced": 0, "striped": 1}
+VARIANTS = {"production", "original_tuned", "k_serial", "k_pipeline"}
+
+
+@dataclass(frozen=True)
+class Shape:
+    chunk_size: int
+    selected_per_row: int
+    request_count: int
+    valid_fraction: float
+
+    @property
+    def rows(self) -> int:
+        return max(1, self.request_count)
+
+    @property
+    def capacity(self) -> int:
+        return self.rows * self.selected_per_row
+
+    @property
+    def count_aware(self) -> bool:
+        return self.request_count > 0
+
+    @property
+    def name(self) -> str:
+        count_label = f"r{self.request_count}" if self.count_aware else "nocount"
+        return (
+            f"k{self.selected_per_row}_c{self.chunk_size}_{count_label}_"
+            f"v{self.valid_fraction:g}"
+        )
+
+
+@dataclass(frozen=True)
+class KernelConfig:
+    name: str
+    variant: str
+    kernel_variant: int
+    aiv_num: int
+    tile_tokens: int
+    pipeline: bool
+    addressing: str
+    work_assignment: str
+
+
+@dataclass(frozen=True)
+class Preset:
+    selected_counts: tuple[int, ...]
+    chunk_sizes: tuple[int, ...]
+    request_counts: tuple[int, ...]
+    valid_fractions: tuple[float, ...]
+    aiv_counts: tuple[int, ...]
+    tile_tokens: tuple[int, ...]
+    addressing_modes: tuple[str, ...]
+    work_assignments: tuple[str, ...]
+    localities: tuple[str, ...]
+
+
+PRESETS = {
+    "smoke": Preset(
+        selected_counts=(256, 2048),
+        chunk_sizes=(256,),
+        request_counts=(0, 1),
+        valid_fractions=(1.0,),
+        aiv_counts=(4, 8, 16, 0),
+        tile_tokens=(1, 8, 16),
+        addressing_modes=("auto", "divide"),
+        work_assignments=("balanced", "striped"),
+        localities=(
+            "src_contiguous__dst_contiguous",
+            "src_scattered__dst_scattered",
+        ),
+    ),
+    "standard": Preset(
+        selected_counts=(64, 128, 256, 512, 1024, 2048, 4096),
+        chunk_sizes=(256, 1000),
+        request_counts=(0, 1),
+        valid_fractions=(1.0,),
+        aiv_counts=(2, 4, 8, 12, 16, 24, 0),
+        tile_tokens=(1, 4, 8, 16, 32),
+        addressing_modes=("auto", "divide"),
+        work_assignments=("balanced", "striped"),
+        localities=LOCALITY_CASES,
+    ),
+    "full": Preset(
+        selected_counts=(64, 128, 256, 512, 1024, 2048, 4096),
+        chunk_sizes=(64, 128, 256, 512, 1000),
+        request_counts=(0, 1, 2, 4, 8),
+        valid_fractions=(1.0, 0.75),
+        aiv_counts=(2, 4, 8, 12, 16, 24, 32, 0),
+        tile_tokens=(1, 2, 4, 8, 16, 32),
+        addressing_modes=("auto", "divide"),
+        work_assignments=("balanced", "striped"),
+        localities=LOCALITY_CASES,
+    ),
+}
+
+
+def _csv_values(raw: str, cast) -> tuple:
+    return tuple(cast(value.strip()) for value in raw.split(",") if value.strip())
+
+
+def _positive_ints(
+    raw: str, option: str, *, allow_zero: bool = False
+) -> tuple[int, ...]:
+    values = _csv_values(raw, int)
+    lower = 0 if allow_zero else 1
+    if not values or any(value < lower for value in values):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{option} must contain {qualifier} integers")
+    return tuple(dict.fromkeys(values))
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--devices", default="0")
+    parser.add_argument("--preset", choices=tuple(PRESETS), default="smoke")
+    parser.add_argument("--num-tokens", type=int, default=20000)
+    parser.add_argument("--num-layers", type=int, default=8)
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--k-hidden-dims", type=int, default=512)
+    parser.add_argument("--selected-counts", default="")
+    parser.add_argument("--chunk-sizes", default="")
+    parser.add_argument(
+        "--request-counts",
+        default="",
+        help="0 disables selected_token_counts; 1+ creates that many rows",
+    )
+    parser.add_argument("--valid-fractions", default="")
+    parser.add_argument(
+        "--aiv-counts",
+        default="",
+        help="runtime AIV candidates; 0 means the production auto count",
+    )
+    parser.add_argument("--tile-tokens", default="")
+    parser.add_argument(
+        "--addressing-modes",
+        default="",
+        help="comma-separated subset of auto,divide,shift",
+    )
+    parser.add_argument(
+        "--work-assignments",
+        default="",
+        help="comma-separated subset of balanced,striped",
+    )
+    parser.add_argument(
+        "--variants",
+        default="production,original_tuned,k_serial,k_pipeline",
+    )
+    parser.add_argument(
+        "--localities",
+        default="",
+        help="comma-separated locality names, or all",
+    )
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument(
+        "--near-best-percent",
+        type=float,
+        default=3.0,
+        help="prefer the fewest AIVs within this percentage of best latency",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--shared-cpu-slab", action="store_true")
+    parser.add_argument("--output-json", default="")
+    parser.add_argument("--output-csv", default="")
+    args = parser.parse_args()
+
+    preset = PRESETS[args.preset]
+    args.devices = list(_positive_ints(args.devices, "--devices", allow_zero=True))
+    if len(set(args.devices)) != len(args.devices):
+        parser.error("--devices cannot contain duplicates")
+    try:
+        args.selected_counts = (
+            _positive_ints(args.selected_counts, "--selected-counts")
+            if args.selected_counts
+            else preset.selected_counts
+        )
+        args.chunk_sizes = (
+            _positive_ints(args.chunk_sizes, "--chunk-sizes")
+            if args.chunk_sizes
+            else preset.chunk_sizes
+        )
+        args.request_counts = (
+            _positive_ints(
+                args.request_counts, "--request-counts", allow_zero=True
+            )
+            if args.request_counts
+            else preset.request_counts
+        )
+        args.aiv_counts = (
+            _positive_ints(args.aiv_counts, "--aiv-counts", allow_zero=True)
+            if args.aiv_counts
+            else preset.aiv_counts
+        )
+        args.tile_tokens = (
+            _positive_ints(args.tile_tokens, "--tile-tokens")
+            if args.tile_tokens
+            else preset.tile_tokens
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    args.valid_fractions = (
+        _csv_values(args.valid_fractions, float)
+        if args.valid_fractions
+        else preset.valid_fractions
+    )
+    if any(not 0 < fraction <= 1 for fraction in args.valid_fractions):
+        parser.error("--valid-fractions values must be in (0, 1]")
+
+    args.addressing_modes = (
+        _csv_values(args.addressing_modes, str)
+        if args.addressing_modes
+        else preset.addressing_modes
+    )
+    unknown = set(args.addressing_modes) - set(ADDRESSING_MODES)
+    if unknown:
+        parser.error(f"unknown addressing modes: {sorted(unknown)}")
+
+    args.work_assignments = (
+        _csv_values(args.work_assignments, str)
+        if args.work_assignments
+        else preset.work_assignments
+    )
+    unknown = set(args.work_assignments) - set(WORK_ASSIGNMENTS)
+    if unknown:
+        parser.error(f"unknown work assignments: {sorted(unknown)}")
+
+    args.variants = _csv_values(args.variants, str)
+    unknown = set(args.variants) - VARIANTS
+    if unknown:
+        parser.error(f"unknown variants: {sorted(unknown)}")
+    if "production" not in args.variants:
+        parser.error("--variants must include production as the comparison baseline")
+
+    if args.localities:
+        args.localities = (
+            LOCALITY_CASES
+            if args.localities == "all"
+            else _csv_values(args.localities, str)
+        )
+    else:
+        args.localities = preset.localities
+    unknown = set(args.localities) - set(LOCALITY_CASES)
+    if unknown:
+        parser.error(f"unknown locality cases: {sorted(unknown)}")
+
+    for name in ("num_tokens", "num_layers", "block_size", "k_hidden_dims"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    for name in ("iters", "repeats", "top"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name} must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup cannot be negative")
+    if args.near_best_percent < 0:
+        parser.error("--near-best-percent cannot be negative")
+    if args.k_hidden_dims * 2 % 32:
+        parser.error(
+            "--k-hidden-dims with BF16 must make each token 32-byte aligned"
+        )
+    return args
+
+
+def _shapes(args: argparse.Namespace) -> list[Shape]:
+    shapes = []
+    for chunk_size in args.chunk_sizes:
+        for selected in args.selected_counts:
+            for request_count in args.request_counts:
+                for valid_fraction in args.valid_fractions:
+                    if request_count == 0 and valid_fraction != 1.0:
+                        continue
+                    shape = Shape(
+                        chunk_size=chunk_size,
+                        selected_per_row=selected,
+                        request_count=request_count,
+                        valid_fraction=valid_fraction,
+                    )
+                    if shape.capacity < args.num_tokens:
+                        shapes.append(shape)
+    if not shapes:
+        raise ValueError(
+            "no valid sparse shapes: selected_per_row * request_count must "
+            "be smaller than --num-tokens"
+        )
+    return shapes
+
+
+def _kernel_configs(
+    args: argparse.Namespace, max_aiv_num: int, shape: Shape
+) -> list[KernelConfig]:
+    requested_aivs = [
+        value for value in args.aiv_counts if value == 0 or value <= max_aiv_num
+    ]
+    if not requested_aivs:
+        requested_aivs = [0]
+    chunk_is_power_of_two = not (
+        shape.chunk_size & (shape.chunk_size - 1)
+    )
+    addressing_candidates = []
+    effective_addressing = set()
+    for addressing in args.addressing_modes:
+        if addressing == "shift" and not chunk_is_power_of_two:
+            continue
+        effective = (
+            "divide"
+            if addressing == "divide" or not chunk_is_power_of_two
+            else "shift"
+        )
+        if effective in effective_addressing:
+            continue
+        addressing_candidates.append(addressing)
+        effective_addressing.add(effective)
+
+    configs: list[KernelConfig] = []
+    if "production" in args.variants:
+        configs.append(
+            KernelConfig(
+                name="production",
+                variant="production",
+                kernel_variant=0,
+                aiv_num=0,
+                tile_tokens=1,
+                pipeline=False,
+                addressing="auto",
+                work_assignment="balanced",
+            )
+        )
+
+    if "original_tuned" in args.variants:
+        for aiv_num in requested_aivs:
+            if aiv_num == 0:
+                continue
+            configs.append(
+                KernelConfig(
+                    name=f"original_aiv{aiv_num}",
+                    variant="original_tuned",
+                    kernel_variant=0,
+                    aiv_num=aiv_num,
+                    tile_tokens=1,
+                    pipeline=False,
+                    addressing="auto",
+                    work_assignment="balanced",
+                )
+            )
+
+    for variant, pipeline in (("k_serial", False), ("k_pipeline", True)):
+        if variant not in args.variants:
+            continue
+        for aiv_num in requested_aivs:
+            for tile_tokens in args.tile_tokens:
+                for addressing in addressing_candidates:
+                    for assignment in args.work_assignments:
+                        configs.append(
+                            KernelConfig(
+                                name=(
+                                    f"{variant}_aiv{aiv_num}_t{tile_tokens}_"
+                                    f"{addressing}_{assignment}"
+                                ),
+                                variant=variant,
+                                kernel_variant=1,
+                                aiv_num=aiv_num,
+                                tile_tokens=tile_tokens,
+                                pipeline=pipeline,
+                                addressing=addressing,
+                                work_assignment=assignment,
+                            )
+                        )
+    return configs
+
+
+def _valid_counts(shape: Shape) -> list[int]:
+    if not shape.count_aware:
+        return [shape.capacity]
+    base = max(1, int(round(shape.selected_per_row * shape.valid_fraction)))
+    spread = max(1, shape.selected_per_row // 64)
+    return [
+        max(1, min(shape.selected_per_row, base - (row % 4) * spread))
+        for row in range(shape.request_count)
+    ]
+
+
+def _valid_positions(shape: Shape, counts: Sequence[int]) -> list[int]:
+    if not shape.count_aware:
+        return list(range(shape.capacity))
+    return [
+        row * shape.selected_per_row + offset
+        for row, count in enumerate(counts)
+        for offset in range(count)
+    ]
+
+
+def _locality_cases(
+    *,
+    num_tokens: int,
+    capacity: int,
+    num_slots: int,
+    seed: int,
+    device: torch.device,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    source_contiguous = torch.arange(capacity, dtype=torch.int32, device=device)
+    source_scattered = torch.tensor(
+        random.Random(seed).sample(range(num_tokens), capacity),
+        dtype=torch.int32,
+        device=device,
+    )
+    destination_contiguous = torch.arange(
+        capacity, dtype=torch.long, device=device
+    )
+    destination_scattered = torch.tensor(
+        random.Random(seed + 1).sample(range(num_slots), capacity),
+        dtype=torch.long,
+        device=device,
+    )
+    return {
+        LOCALITY_CASES[0]: (source_contiguous, destination_contiguous),
+        LOCALITY_CASES[1]: (source_contiguous, destination_scattered),
+        LOCALITY_CASES[2]: (source_scattered, destination_contiguous),
+        LOCALITY_CASES[3]: (source_scattered, destination_scattered),
+    }
+
+
+def _build_harness(
+    args: argparse.Namespace,
+    shape: Shape,
+    rank: int,
+    shared_cpu_slab: torch.Tensor | None = None,
+    *,
+    populate_cpu_source: bool = True,
+) -> tuple[
+    LoadBenchmarkHarness,
+    dict[str, tuple[torch.Tensor, torch.Tensor]],
+    torch.Tensor | None,
+    list[int],
+]:
+    device = torch.device(f"npu:{args.devices[rank]}")
+    torch.npu.set_device(device)
+    torch.manual_seed(args.seed if args.shared_cpu_slab else args.seed + rank)
+
+    num_blocks = recommended_num_blocks(args.num_tokens, args.block_size)
+    source_cache = generate_dsa_index_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=args.num_layers,
+        dsa_head_dim=args.k_hidden_dims,
+        block_size=args.block_size,
+        dtype=torch.bfloat16,
+    )
+    harness = build_load_benchmark_harness(
+        fmt="dsa_index",
+        src_kv_cache=source_cache,
+        num_tokens=args.num_tokens,
+        chunk_size=shape.chunk_size,
+        num_layers=args.num_layers,
+        num_selected=shape.capacity,
+        seed=args.seed,
+        shared_cpu_slab=shared_cpu_slab,
+        populate_cpu_source=populate_cpu_source,
+    )
+    num_slots = (
+        harness.dst_direct_fast[0][0].shape[0]
+        * harness.dst_direct_fast[0][0].shape[1]
+    )
+    counts = _valid_counts(shape)
+    selected_counts = (
+        torch.tensor(counts, dtype=torch.int32, device=device)
+        if shape.count_aware
+        else None
+    )
+    cases = _locality_cases(
+        num_tokens=args.num_tokens,
+        capacity=shape.capacity,
+        num_slots=num_slots,
+        seed=args.seed,
+        device=device,
+    )
+    return harness, cases, selected_counts, counts
+
+
+def _set_case(
+    harness: LoadBenchmarkHarness,
+    case: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    harness.selected_token_idx, harness.slot_mapping_packed = case
+
+
+def _run_layers(
+    harness: LoadBenchmarkHarness,
+    config: KernelConfig,
+    selected_counts: torch.Tensor | None,
+) -> None:
+    for layer_id in range(harness.num_layers):
+        if config.variant == "production":
+            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+                harness.layer_states[layer_id],
+                harness.slot_mapping_packed,
+                harness.selected_token_idx,
+                harness.chunk_ptrs_by_layer[layer_id],
+                harness.chunk_size,
+                harness.num_tokens,
+                False,
+                selected_counts,
+            )
+            continue
+        sparse_k_batched_direct_kv_transfer_experimental(
+            harness.layer_states[layer_id],
+            harness.slot_mapping_packed,
+            harness.selected_token_idx,
+            harness.chunk_ptrs_by_layer[layer_id],
+            harness.chunk_size,
+            harness.num_tokens,
+            config.kernel_variant,
+            config.aiv_num,
+            config.tile_tokens,
+            config.pipeline,
+            ADDRESSING_MODES[config.addressing],
+            WORK_ASSIGNMENTS[config.work_assignment],
+            selected_counts,
+        )
+
+
+def _verify(
+    harness: LoadBenchmarkHarness,
+    shape: Shape,
+    counts: Sequence[int],
+    config: KernelConfig,
+    selected_counts: torch.Tensor | None,
+) -> None:
+    for layer in harness.dst_direct_fast:
+        layer[0].zero_()
+    _run_layers(harness, config, selected_counts)
+    torch.npu.synchronize()
+
+    valid_positions = torch.tensor(
+        _valid_positions(shape, counts),
+        dtype=torch.long,
+        device=harness.selected_token_idx.device,
+    )
+    valid_selected = harness.selected_token_idx.index_select(0, valid_positions)
+    valid_destinations = harness.slot_mapping_packed.index_select(
+        0, valid_positions
+    )
+    source_slots = harness.slot_mapping_full.index_select(
+        0, valid_selected.to(torch.long)
+    )
+    for source_layer, destination_layer in zip(
+        harness.src_kv_cache, harness.dst_direct_fast, strict=True
+    ):
+        source = source_layer[0].flatten(0, 1)
+        destination = destination_layer[0].flatten(0, 1)
+        expected = source.index_select(0, source_slots)
+        actual = destination.index_select(0, valid_destinations)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    if len(valid_positions) == shape.capacity:
+        return
+    valid_set = set(_valid_positions(shape, counts))
+    padded_positions = torch.tensor(
+        [index for index in range(shape.capacity) if index not in valid_set],
+        dtype=torch.long,
+        device=harness.selected_token_idx.device,
+    )
+    padded_destinations = harness.slot_mapping_packed.index_select(
+        0, padded_positions
+    )
+    for destination_layer in harness.dst_direct_fast:
+        padded = destination_layer[0].flatten(0, 1).index_select(
+            0, padded_destinations
+        )
+        if torch.count_nonzero(padded).item() != 0:
+            raise AssertionError(
+                f"{config.name} copied one or more padded row-tail tokens"
+            )
+
+
+def _shared_slab_size(args: argparse.Namespace) -> int:
+    dims = MlaDsaDims(
+        k_hidden_dims=args.k_hidden_dims,
+        v_hidden_dims=0,
+        dsa_hidden_dims=args.k_hidden_dims,
+        plane_elems=args.k_hidden_dims,
+    )
+    return max(
+        shared_cpu_slab_bytes(
+            compute_chunk_partition(args.num_tokens, chunk_size),
+            dims,
+            torch.bfloat16,
+            args.num_layers,
+        )
+        for chunk_size in args.chunk_sizes
+    )
+
+
+def _worker(
+    rank: int,
+    args: argparse.Namespace,
+    shapes: Sequence[Shape],
+    barrier: Any,
+    output: Any,
+) -> None:
+    shared_owner = None
+    shared_mapping = None
+    harness = None
+    try:
+        device = torch.device(f"npu:{args.devices[rank]}")
+        torch.npu.set_device(device)
+        max_aiv_num = sparse_transfer_hardware_aiv_num()
+
+        if args.shared_cpu_slab:
+            slab_size = _shared_slab_size(args)
+            if rank == 0:
+                shared_owner = MixedMemoryAllocator(
+                    slab_size,
+                    shm_name=args.shared_slab_name,
+                    align_bytes=ALIGN_BYTES,
+                )
+                shared_cpu_slab = shared_owner.buffer
+            else:
+                shared_cpu_slab = None
+            barrier.wait(timeout=300)
+            if rank != 0:
+                shared_mapping = SharedSlabMapping.attach(
+                    shm_name=args.shared_slab_name,
+                    size=slab_size,
+                    generation=0,
+                    writable=True,
+                )
+                shared_cpu_slab = shared_mapping.tensor
+        else:
+            shared_cpu_slab = None
+
+        all_results: dict[str, Any] = {}
+        for shape in shapes:
+            if harness is not None:
+                harness.close()
+                harness = None
+            if args.shared_cpu_slab:
+                if rank == 0:
+                    harness, cases, selected_counts, counts = _build_harness(
+                        args,
+                        shape,
+                        rank,
+                        shared_cpu_slab,
+                        populate_cpu_source=True,
+                    )
+                barrier.wait(timeout=300)
+                if rank != 0:
+                    harness, cases, selected_counts, counts = _build_harness(
+                        args,
+                        shape,
+                        rank,
+                        shared_cpu_slab,
+                        populate_cpu_source=False,
+                    )
+                barrier.wait(timeout=300)
+            else:
+                harness, cases, selected_counts, counts = _build_harness(
+                    args, shape, rank
+                )
+
+            configs = _kernel_configs(args, max_aiv_num, shape)
+            shape_results: dict[str, Any] = {}
+            for locality in args.localities:
+                _set_case(harness, cases[locality])
+                locality_results: dict[str, Any] = {}
+                for config in configs:
+                    if args.verify:
+                        _verify(
+                            harness,
+                            shape,
+                            counts,
+                            config,
+                            selected_counts,
+                        )
+                    for _ in range(args.warmup):
+                        _run_layers(harness, config, selected_counts)
+                    torch.npu.synchronize()
+
+                    samples = []
+                    for _ in range(args.repeats):
+                        barrier.wait(timeout=300)
+                        start_event = torch.npu.Event(enable_timing=True)
+                        end_event = torch.npu.Event(enable_timing=True)
+                        wall_start_ns = time.monotonic_ns()
+                        start_event.record()
+                        for _ in range(args.iters):
+                            _run_layers(harness, config, selected_counts)
+                        end_event.record()
+                        end_event.synchronize()
+                        wall_end_ns = time.monotonic_ns()
+                        samples.append(
+                            {
+                                "event_ms": float(
+                                    start_event.elapsed_time(end_event)
+                                ),
+                                "wall_start_ns": wall_start_ns,
+                                "wall_end_ns": wall_end_ns,
+                            }
+                        )
+                        barrier.wait(timeout=300)
+                    locality_results[config.name] = {
+                        "config": asdict(config),
+                        "samples": samples,
+                    }
+                shape_results[locality] = locality_results
+            all_results[shape.name] = {
+                "shape": asdict(shape),
+                "valid_counts": counts,
+                "results": shape_results,
+            }
+            barrier.wait(timeout=300)
+
+        output.put(
+            {
+                "rank": rank,
+                "device": args.devices[rank],
+                "max_aiv_num": max_aiv_num,
+                "results": all_results,
+            }
+        )
+    except BaseException as exc:
+        try:
+            barrier.abort()
+        except Exception:
+            pass
+        output.put(
+            {
+                "rank": rank,
+                "device": args.devices[rank],
+                "error": repr(exc),
+            }
+        )
+        raise
+    finally:
+        if harness is not None:
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                pass
+            harness.close()
+        if shared_mapping is not None:
+            shared_mapping.close()
+        if shared_owner is not None:
+            shared_owner.close()
+
+
+def _median(values: Iterable[float]) -> float:
+    return statistics.median(list(values))
+
+
+def _summarize(
+    args: argparse.Namespace,
+    shapes: Sequence[Shape],
+    workers: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    element_size = torch.empty(0, dtype=torch.bfloat16).element_size()
+    summary: dict[str, Any] = {
+        "settings": {
+            "devices": args.devices,
+            "preset": args.preset,
+            "num_tokens": args.num_tokens,
+            "num_layers": args.num_layers,
+            "block_size": args.block_size,
+            "k_hidden_dims": args.k_hidden_dims,
+            "warmup": args.warmup,
+            "iters": args.iters,
+            "repeats": args.repeats,
+            "near_best_percent": args.near_best_percent,
+            "shared_cpu_slab": args.shared_cpu_slab,
+            "max_aiv_num_by_rank": [
+                worker["max_aiv_num"] for worker in workers
+            ],
+        },
+        "shapes": {},
+    }
+    flat_rows: list[dict[str, Any]] = []
+    speedups_by_config: dict[str, list[float]] = {}
+
+    for shape in shapes:
+        worker_shape = [worker["results"][shape.name] for worker in workers]
+        valid_tokens = sum(worker_shape[0]["valid_counts"])
+        bytes_per_invocation = (
+            valid_tokens
+            * args.k_hidden_dims
+            * element_size
+            * args.num_layers
+        )
+        bytes_per_repeat = bytes_per_invocation * args.iters
+        shape_summary = {
+            "shape": asdict(shape),
+            "valid_counts": worker_shape[0]["valid_counts"],
+            "bytes_per_invocation": bytes_per_invocation,
+            "localities": {},
+        }
+        print(
+            f"\n{shape.name}: valid_tokens={valid_tokens} "
+            f"payload={format_bytes_short(bytes_per_invocation)}"
+        )
+
+        for locality in args.localities:
+            config_names = list(worker_shape[0]["results"][locality])
+            rows = []
+            for config_name in config_names:
+                config = worker_shape[0]["results"][locality][config_name][
+                    "config"
+                ]
+                event_ms = [
+                    sample["event_ms"]
+                    for worker_result in worker_shape
+                    for sample in worker_result["results"][locality][
+                        config_name
+                    ]["samples"]
+                ]
+                rank_bandwidths = [
+                    bytes_per_repeat / (duration_ms / 1000) / 1e9
+                    for duration_ms in event_ms
+                ]
+                wall_bandwidths = []
+                for repeat in range(args.repeats):
+                    samples = [
+                        worker_result["results"][locality][config_name][
+                            "samples"
+                        ][repeat]
+                        for worker_result in worker_shape
+                    ]
+                    wall_seconds = (
+                        max(sample["wall_end_ns"] for sample in samples)
+                        - min(sample["wall_start_ns"] for sample in samples)
+                    ) / 1e9
+                    wall_bandwidths.append(
+                        bytes_per_repeat * len(workers) / wall_seconds / 1e9
+                    )
+                row = {
+                    "shape": shape.name,
+                    "locality": locality,
+                    **config,
+                    "valid_tokens": valid_tokens,
+                    "bytes_per_invocation": bytes_per_invocation,
+                    "median_ms_per_layer": _median(event_ms)
+                    / (args.iters * args.num_layers),
+                    "median_rank_gbps": _median(rank_bandwidths),
+                    "min_rank_gbps": min(rank_bandwidths),
+                    "median_wall_gbps": _median(wall_bandwidths),
+                }
+                rows.append(row)
+
+            baseline = next(
+                (row for row in rows if row["variant"] == "production"),
+                None,
+            )
+            for row in rows:
+                row["speedup_vs_production"] = (
+                    baseline["median_ms_per_layer"]
+                    / row["median_ms_per_layer"]
+                    if baseline is not None
+                    else math.nan
+                )
+                if baseline is not None:
+                    speedups_by_config.setdefault(row["name"], []).append(
+                        row["speedup_vs_production"]
+                    )
+            rows.sort(key=lambda row: row["median_ms_per_layer"])
+            near_best_limit = rows[0]["median_ms_per_layer"] * (
+                1 + args.near_best_percent / 100
+            )
+            efficient_candidates = [
+                row
+                for row in rows
+                if row["median_ms_per_layer"] <= near_best_limit
+            ]
+            max_aiv = min(
+                worker["max_aiv_num"] for worker in workers
+            )
+            efficient = min(
+                efficient_candidates,
+                key=lambda row: (
+                    row["aiv_num"] if row["aiv_num"] > 0 else max_aiv,
+                    row["median_ms_per_layer"],
+                ),
+            )
+            flat_rows.extend(rows)
+            shape_summary["localities"][locality] = {
+                "baseline": baseline,
+                "best": rows[0],
+                "fewest_aiv_near_best": efficient,
+                "configs": rows,
+            }
+
+            print(f"  {locality}")
+            print(
+                "    config                                             "
+                "us/layer  rank GB/s  wall GB/s  speedup"
+            )
+            for row in rows[: args.top]:
+                print(
+                    f"    {row['name'][:50]:50} "
+                    f"{row['median_ms_per_layer'] * 1000:8.2f}  "
+                    f"{row['median_rank_gbps']:9.2f}  "
+                    f"{row['median_wall_gbps']:9.2f}  "
+                    f"{row['speedup_vs_production']:7.3f}x"
+                )
+            print(
+                f"    fewest AIV within {args.near_best_percent:g}%: "
+                f"{efficient['name']} "
+                f"({efficient['median_ms_per_layer'] * 1000:.2f} us/layer)"
+            )
+        summary["shapes"][shape.name] = shape_summary
+
+    stable = []
+    for name, speedups in speedups_by_config.items():
+        stable.append(
+            {
+                "name": name,
+                "geomean_speedup": math.exp(
+                    sum(math.log(value) for value in speedups) / len(speedups)
+                ),
+                "worst_speedup": min(speedups),
+                "best_speedup": max(speedups),
+                "cases": len(speedups),
+            }
+        )
+    stable.sort(
+        key=lambda item: (item["geomean_speedup"], item["worst_speedup"]),
+        reverse=True,
+    )
+    summary["stable_recommendations"] = stable
+    if stable:
+        print("\nStable settings across all cases in which each config appears")
+        print(
+            "config                                             "
+            "geomean  worst   best"
+        )
+        for item in stable[: args.top]:
+            print(
+                f"{item['name'][:50]:50} "
+                f"{item['geomean_speedup']:7.3f}x "
+                f"{item['worst_speedup']:7.3f}x "
+                f"{item['best_speedup']:7.3f}x"
+            )
+    return summary, flat_rows
+
+
+def _write_outputs(
+    args: argparse.Namespace,
+    summary: dict[str, Any],
+    flat_rows: Sequence[dict[str, Any]],
+) -> None:
+    if args.output_json:
+        path = Path(args.output_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"\nWrote JSON: {path}")
+    if args.output_csv:
+        path = Path(args.output_csv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as output:
+            writer = csv.DictWriter(
+                output,
+                fieldnames=list(flat_rows[0]) if flat_rows else [],
+            )
+            if flat_rows:
+                writer.writeheader()
+                writer.writerows(flat_rows)
+        print(f"Wrote CSV: {path}")
+
+
+def main() -> None:
+    args = _parse_args()
+    shapes = _shapes(args)
+    args.shared_slab_name = (
+        f"/lmcache_sparse_k_tune_{os.getpid()}_{uuid.uuid4().hex}"
+        if args.shared_cpu_slab
+        else None
+    )
+    estimated_configs = (
+        (1 if "production" in args.variants else 0)
+        + (
+            max(0, len(args.aiv_counts) - int(0 in args.aiv_counts))
+            if "original_tuned" in args.variants
+            else 0
+        )
+        + sum(
+            len(args.aiv_counts)
+            * len(args.tile_tokens)
+            * len(args.addressing_modes)
+            * len(args.work_assignments)
+            for variant in ("k_serial", "k_pipeline")
+            if variant in args.variants
+        )
+    )
+    timed_repeats = (
+        len(shapes)
+        * len(args.localities)
+        * estimated_configs
+        * args.repeats
+    )
+    print(
+        f"devices={args.devices} preset={args.preset} shapes={len(shapes)} "
+        f"localities={len(args.localities)} "
+        f"estimated_configs/shape={estimated_configs}"
+    )
+    print(
+        f"estimated timed repeats/rank={timed_repeats}; "
+        f"CPU slab={'shared' if args.shared_cpu_slab else 'private-per-rank'}"
+    )
+    if args.shared_cpu_slab:
+        print(f"shared CPU slab: {args.shared_slab_name}")
+
+    context = mp.get_context("spawn")
+    barrier = context.Barrier(len(args.devices))
+    output = context.Queue()
+    processes = [
+        context.Process(
+            target=_worker,
+            args=(rank, args, shapes, barrier, output),
+        )
+        for rank in range(len(args.devices))
+    ]
+    for process in processes:
+        process.start()
+
+    workers = []
+    try:
+        for _ in processes:
+            workers.append(output.get(timeout=7200))
+    except Empty as exc:
+        raise RuntimeError("timed out waiting for benchmark workers") from exc
+    finally:
+        for process in processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+        if args.shared_cpu_slab:
+            SharedSlabMapping.unlink(args.shared_slab_name)
+
+    errors = [worker for worker in workers if "error" in worker]
+    if errors:
+        raise RuntimeError(f"benchmark worker errors: {errors}")
+    failed = [process.exitcode for process in processes if process.exitcode]
+    if failed:
+        raise RuntimeError(f"benchmark workers failed: exit codes {failed}")
+    workers.sort(key=lambda worker: worker["rank"])
+    summary, flat_rows = _summarize(args, shapes, workers)
+    _write_outputs(args, summary, flat_rows)
+
+
+if __name__ == "__main__":
+    main()

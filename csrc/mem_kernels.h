@@ -139,6 +139,22 @@ void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
     const bool lmcHostInterleaved = false, const int32_t rowWidth = 0,
     const int32_t requestCount = 0, const int32_t selectedCountStride = 1);
 
+// Runtime-configurable K-only sparse transfer.  This is intentionally a
+// separate entry point so the production generic kernel remains an exact
+// benchmark baseline.
+void single_layer_sparse_k_transfer(
+    kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
+    uint32_t blockDim, void *stream, uint8_t *chunkPtrsPtr,
+    uint8_t *vllmKPtr, uint8_t *slotMappingPtr,
+    uint8_t *selectedTokenIdxPtr, uint8_t *selectedTokenCountsPtr,
+    const int64_t vllmKBufferSize, const int64_t kHiddenDims,
+    const int32_t numTokens, const int32_t numChunks,
+    const int32_t chunkSize, const int32_t chunkShift,
+    const int32_t chunkMask, const int32_t totalTokens,
+    const int32_t tileTokens, const bool pipeline,
+    const int32_t workAssignment, const int32_t rowWidth,
+    const int32_t requestCount, const int32_t selectedCountStride);
+
 void single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     kvcache_ops::KVCacheFormat format, uint32_t blockDim, void *stream,
@@ -263,6 +279,22 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
     const int64_t total_tokens, const bool lmc_host_interleaved,
     const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
+
+// Benchmark/tuning API. kernel_variant=0 runs the original generic one-plane
+// kernel with an optional AIV override. kernel_variant=1 runs the dedicated
+// K-only kernel. addressing_mode: 0=auto, 1=division, 2=power-of-two shift.
+// work_assignment: 0=balanced contiguous valid tokens, 1=striped tiles.
+void sparse_k_batched_direct_kv_transfer_experimental(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
+    const int64_t total_tokens, const int64_t kernel_variant,
+    const int64_t aiv_num, const int64_t tile_tokens,
+    const bool pipeline, const int64_t addressing_mode,
+    const int64_t work_assignment,
+    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
+
+uint32_t sparse_transfer_hardware_aiv_num();
 
 // Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
 // direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.

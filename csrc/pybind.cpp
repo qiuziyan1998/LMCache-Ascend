@@ -144,6 +144,21 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared_wrapper(
       selected_token_counts);
 }
 
+void sparse_k_batched_direct_kv_transfer_experimental_wrapper(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &chunk_ptrs_npu, int64_t chunk_size,
+    int64_t total_tokens, int64_t kernel_variant, int64_t aiv_num,
+    int64_t tile_tokens, bool pipeline, int64_t addressing_mode,
+    int64_t work_assignment,
+    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt) {
+  sparse_k_batched_direct_kv_transfer_experimental(
+      destination_state, slot_mapping_packed, selected_token_idx,
+      chunk_ptrs_npu, chunk_size, total_tokens, kernel_variant, aiv_num,
+      tile_tokens, pipeline, addressing_mode, work_assignment,
+      selected_token_counts);
+}
+
 void dense_mla_dsa_batched_direct_kv_transfer_wrapper(
     std::vector<torch::Tensor> &lmc_tensors, const py::object &vllm_kv_caches_obj,
     torch::Tensor &slot_mapping_full, torch::Tensor &chunk_offsets_npu,
@@ -278,6 +293,18 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("chunk_size"), py::arg("total_tokens"),
         py::arg("lmc_host_interleaved"),
         py::arg("selected_token_counts") = py::none());
+  m.def("sparse_k_batched_direct_kv_transfer_experimental",
+        &sparse_k_batched_direct_kv_transfer_experimental_wrapper,
+        py::arg("destination_state"), py::arg("slot_mapping_packed"),
+        py::arg("selected_token_idx"), py::arg("chunk_ptrs_npu"),
+        py::arg("chunk_size"), py::arg("total_tokens"),
+        py::arg("kernel_variant"), py::arg("aiv_num") = 0,
+        py::arg("tile_tokens") = 1, py::arg("pipeline") = false,
+        py::arg("addressing_mode") = 0,
+        py::arg("work_assignment") = 0,
+        py::arg("selected_token_counts") = py::none());
+  m.def("sparse_transfer_hardware_aiv_num",
+        &sparse_transfer_hardware_aiv_num);
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),
