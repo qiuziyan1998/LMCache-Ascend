@@ -886,6 +886,10 @@ void sparse_k_batched_direct_kv_transfer_experimental(
     TORCH_CHECK(destination_state.k_hidden_dims > 0,
                 "k_hidden_dims must be positive.");
     TORCH_CHECK(
+        destination_state.k_hidden_dims <=
+            std::numeric_limits<uint32_t>::max(),
+        "k_hidden_dims must fit the uint32 DataCopy element-count API.");
+    TORCH_CHECK(
         destination_state.scalar_type_num == kvcache_ops::AscendType::FP16 ||
             destination_state.scalar_type_num ==
                 kvcache_ops::AscendType::BF16 ||
@@ -896,6 +900,12 @@ void sparse_k_batched_direct_kv_transfer_experimental(
         destination_state.scalar_type_num == kvcache_ops::AscendType::INT8
         ? 1
         : 2;
+    TORCH_CHECK(
+        tile_tokens <=
+            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) /
+                (destination_state.k_hidden_dims * element_size),
+        "The per-tile UB allocation must fit the uint32 InitBuffer byte-count "
+        "API.");
     TORCH_CHECK(destination_state.k_hidden_dims * element_size % 32 == 0,
                 "The K payload for one token must be 32-byte aligned.");
     TORCH_CHECK(
