@@ -587,6 +587,45 @@ uint32_t sparse_transfer_hardware_aiv_num() {
   return hardware_aiv_num();
 }
 
+namespace {
+
+void validate_bandwidth_destination(const torch::Tensor &destination,
+                                    int64_t num_bytes) {
+  TORCH_CHECK(destination.defined(), "destination must be defined.");
+  TORCH_CHECK(destination.device().is_privateuseone(),
+              "destination must be an NPU tensor.");
+  TORCH_CHECK(destination.scalar_type() == at::ScalarType::Byte,
+              "destination must be torch.uint8.");
+  TORCH_CHECK(destination.is_contiguous(),
+              "destination must be contiguous.");
+  TORCH_CHECK(num_bytes > 0, "num_bytes must be positive.");
+  TORCH_CHECK(num_bytes <= static_cast<int64_t>(destination.nbytes()),
+              "num_bytes exceeds destination capacity: requested ",
+              num_bytes, " bytes, capacity is ", destination.nbytes(),
+              " bytes.");
+}
+
+} // namespace
+
+void benchmark_aclrt_memcpy_h2d(torch::Tensor &destination,
+                                const uintptr_t host_src_ptr,
+                                const int64_t num_bytes,
+                                const bool validate_inputs) {
+  const c10::OptionalDeviceGuard device_guard(device_of(destination));
+  if (validate_inputs) {
+    validate_bandwidth_destination(destination, num_bytes);
+    TORCH_CHECK(host_src_ptr != 0, "host_src_ptr must not be null.");
+  }
+
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  aclError ret = aclrtMemcpyAsync(
+      destination.data_ptr(), destination.nbytes(),
+      reinterpret_cast<const void *>(host_src_ptr),
+      static_cast<size_t>(num_bytes), ACL_MEMCPY_HOST_TO_DEVICE, stream);
+  TORCH_CHECK(ret == ACL_ERROR_NONE,
+              "aclrtMemcpyAsync H2D benchmark copy failed, ret=", ret);
+}
+
 void sparse_mla_dsa_batched_direct_kv_transfer(
     std::vector<torch::Tensor> &lmc_tensors,
     std::vector<torch::Tensor> &vllm_kv_caches,

@@ -306,6 +306,10 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("selected_token_counts") = py::none());
   m.def("sparse_transfer_hardware_aiv_num",
         &sparse_transfer_hardware_aiv_num);
+  m.def("benchmark_aclrt_memcpy_h2d",
+        &benchmark_aclrt_memcpy_h2d,
+        py::arg("destination"), py::arg("host_src_ptr"),
+        py::arg("num_bytes"), py::arg("validate_inputs") = true);
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),

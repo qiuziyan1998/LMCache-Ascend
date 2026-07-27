@@ -167,6 +167,55 @@ python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_tuning.py \
 Requested AIV values larger than the device AIV count are filtered at runtime.
 `aiv=0` means the production automatic count.
 
+## High-accuracy bandwidth test
+
+Use the `bandwidth` preset to determine whether the earlier 30+ GB/s estimate
+is real. This preset does not use a synthetic AscendC copy kernel. It sends
+256, 512, 1024, 2048, 4096, 8192, and 16384 tokens through the existing
+production, K-only serial, and K-only pipelined sparse kernels. It then fits:
+
+```text
+time = fixed latency + useful K bytes / bandwidth
+```
+
+over payloads of at least 1 MiB per layer. The raw `aclrtMemcpyAsync`
+reference uses registered CPU memory and the same payload sizes, but is
+reported separately from the sparse-kernel fits.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+numactl --interleave=all \
+python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_tuning.py \
+  --devices 0,1,2,3,4,5,6,7 \
+  --preset bandwidth \
+  --num-tokens 20000 \
+  --num-layers 8 \
+  --warmup 5 \
+  --iters 5 \
+  --target-bytes-per-sample 1G \
+  --max-iters 4096 \
+  --repeats 11 \
+  --shared-cpu-slab \
+  --verify \
+  --output-json /workspace/qzy/sparse-k-bandwidth.json \
+  --output-csv /workspace/qzy/sparse-k-bandwidth.csv
+```
+
+The target-byte option chooses enough iterations for stable timing at small
+payloads; `--iters` remains a lower bound. The console and JSON report fitted
+GB/s, a 95% slope confidence interval, fixed latency, R-squared, and maximum
+fit residual. Trust a 30+ GB/s result only if it is repeatable, has a narrow
+confidence interval, high R-squared, and small residuals. Compare:
+
+- raw memcpy fit: runtime copy-engine reference;
+- production sparse fit: unchanged production behavior;
+- K-only fit: optimization headroom actually realized by the existing
+  transfer kernel.
+
+Use `--no-raw-memcpy-reference` to omit the raw reference. For a quick
+sanity check before the full run, reduce the target to `128M` and repeats to
+five.
+
 ## Interpreting output
 
 For every shape and locality, results are sorted by NPU event time and include:

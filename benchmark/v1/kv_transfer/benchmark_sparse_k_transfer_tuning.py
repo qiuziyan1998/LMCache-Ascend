@@ -19,6 +19,13 @@ Recommended first run:
 
 The ``standard`` and ``full`` presets expand the shape and configuration
 matrix.  Every preset can be overridden with the comma-separated list flags.
+
+The ``bandwidth`` preset is deliberately narrow: it sends 256 through 16384
+tokens through the existing production and K-only sparse kernels, batches
+enough invocations to amortize event overhead, and fits
+``time = fixed_latency + bytes / bandwidth``. It also measures raw
+``aclrtMemcpyAsync`` on registered memory as a reference; it does not compile
+or launch a synthetic bandwidth kernel.
 """
 
 from __future__ import annotations
@@ -64,8 +71,12 @@ from load_benchmark_utils import (  # noqa: E402
     recommended_num_blocks,
     shared_cpu_slab_bytes,
 )
-from lmcache.v1.memory_management import MixedMemoryAllocator  # noqa: E402
+from lmcache.v1.memory_management import (  # noqa: E402
+    MixedMemoryAllocator,
+    PinMemoryAllocator,
+)
 from lmcache.v1.shared_cpu_cache import SharedSlabMapping  # noqa: E402
+import lmcache_ascend.c_ops as lmc_ops  # noqa: E402
 from lmcache_ascend.v1.npu_connector.utils import (  # noqa: E402
     prepare_sparse_direct_destination_state,
     sparse_k_batched_direct_kv_transfer_experimental,
@@ -165,6 +176,20 @@ PRESETS = {
         work_assignments=("balanced", "striped"),
         localities=LOCALITY_CASES,
     ),
+    "bandwidth": Preset(
+        selected_counts=(256, 512, 1024, 2048, 4096, 8192, 16384),
+        chunk_sizes=(256,),
+        request_counts=(0,),
+        valid_fractions=(1.0,),
+        aiv_counts=(0,),
+        tile_tokens=(16,),
+        addressing_modes=("auto",),
+        work_assignments=("striped",),
+        localities=(
+            "src_contiguous__dst_contiguous",
+            "src_scattered__dst_scattered",
+        ),
+    ),
     "full": Preset(
         selected_counts=(64, 128, 256, 512, 1024, 2048, 4096),
         chunk_sizes=(64, 128, 256, 512, 1000),
@@ -192,6 +217,37 @@ def _positive_ints(
         qualifier = "non-negative" if allow_zero else "positive"
         raise ValueError(f"{option} must contain {qualifier} integers")
     return tuple(dict.fromkeys(values))
+
+
+def _byte_size(raw: str, option: str, *, allow_zero: bool = False) -> int:
+    text = raw.strip().upper().replace("IB", "B")
+    multipliers = {
+        "B": 1,
+        "KB": 1 << 10,
+        "K": 1 << 10,
+        "MB": 1 << 20,
+        "M": 1 << 20,
+        "GB": 1 << 30,
+        "G": 1 << 30,
+    }
+    for suffix in ("GB", "MB", "KB", "G", "M", "K", "B"):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)].strip()
+            try:
+                value = int(float(number) * multipliers[suffix])
+            except ValueError as exc:
+                raise ValueError(f"{option} is not a byte size: {raw}") from exc
+            break
+    else:
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(f"{option} is not a byte size: {raw}") from exc
+    minimum = 0 if allow_zero else 1
+    if value < minimum:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{option} must be {qualifier}")
+    return value
 
 
 def _parse_args() -> argparse.Namespace:
@@ -246,6 +302,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--target-bytes-per-sample",
+        default="",
+        help=(
+            "dynamically increase iterations until each timed sample moves "
+            "this many useful K bytes; bandwidth preset default: 512M; "
+            "0 keeps --iters fixed"
+        ),
+    )
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=4096,
+        help="cap for target-bytes-derived iterations",
+    )
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument(
@@ -257,6 +328,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--shared-cpu-slab", action="store_true")
+    parser.add_argument(
+        "--raw-memcpy-reference",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "measure raw aclrtMemcpyAsync over the same payload sizes "
+            "(enabled by default for the bandwidth preset)"
+        ),
+    )
+    parser.add_argument(
+        "--fit-min-payload",
+        default="",
+        help=(
+            "minimum useful K bytes per layer in affine bandwidth fits; "
+            "bandwidth preset default: 1M; 0 disables fits"
+        ),
+    )
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-csv", default="")
     parser.add_argument(
@@ -310,8 +398,22 @@ def _parse_args() -> argparse.Namespace:
             if args.tile_tokens
             else preset.tile_tokens
         )
+        args.target_bytes_per_sample = _byte_size(
+            args.target_bytes_per_sample
+            or ("512M" if args.preset == "bandwidth" else "0"),
+            "--target-bytes-per-sample",
+            allow_zero=True,
+        )
+        args.fit_min_payload = _byte_size(
+            args.fit_min_payload
+            or ("1M" if args.preset == "bandwidth" else "0"),
+            "--fit-min-payload",
+            allow_zero=True,
+        )
     except ValueError as exc:
         parser.error(str(exc))
+    if args.raw_memcpy_reference is None:
+        args.raw_memcpy_reference = args.preset == "bandwidth"
 
     args.valid_fractions = (
         _csv_values(args.valid_fractions, float)
@@ -367,7 +469,13 @@ def _parse_args() -> argparse.Namespace:
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    for name in ("iters", "repeats", "top", "worker_timeout_sec"):
+    for name in (
+        "iters",
+        "max_iters",
+        "repeats",
+        "top",
+        "worker_timeout_sec",
+    ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
@@ -499,6 +607,27 @@ def _valid_counts(shape: Shape) -> list[int]:
         max(1, min(shape.selected_per_row, base - (row % 4) * spread))
         for row in range(shape.request_count)
     ]
+
+
+def _useful_k_bytes_per_layer(
+    args: argparse.Namespace, shape: Shape
+) -> int:
+    return (
+        sum(_valid_counts(shape))
+        * args.k_hidden_dims
+        * torch.empty(0, dtype=torch.bfloat16).element_size()
+    )
+
+
+def _timed_iters(
+    args: argparse.Namespace, useful_bytes_per_invocation: int
+) -> int:
+    if args.target_bytes_per_sample <= 0:
+        return args.iters
+    target_iters = math.ceil(
+        args.target_bytes_per_sample / useful_bytes_per_invocation
+    )
+    return max(args.iters, min(args.max_iters, target_iters))
 
 
 def _valid_positions(shape: Shape, counts: Sequence[int]) -> list[int]:
@@ -753,6 +882,8 @@ def _worker(
     shared_owner = None
     shared_mapping = None
     harness = None
+    raw_allocator = None
+    raw_mem_obj = None
     try:
         worker_start = time.monotonic()
         if rank == 0:
@@ -837,10 +968,17 @@ def _worker(
                 )
 
             configs = _kernel_configs(args, max_aiv_num, shape)
+            useful_bytes_per_layer = _useful_k_bytes_per_layer(args, shape)
+            timed_iters = _timed_iters(
+                args, useful_bytes_per_layer * args.num_layers
+            )
             if rank == 0:
                 print(
                     f"[progress] running {shape.name}: "
-                    f"{len(configs)} configs x {len(args.localities)} localities",
+                    f"{len(configs)} configs x {len(args.localities)} "
+                    f"localities; payload/layer="
+                    f"{format_bytes_short(useful_bytes_per_layer)} "
+                    f"timed_iters={timed_iters}",
                     flush=True,
                 )
             shape_results: dict[str, Any] = {}
@@ -880,7 +1018,7 @@ def _worker(
                         end_event = torch.npu.Event(enable_timing=True)
                         wall_start_ns = time.monotonic_ns()
                         start_event.record()
-                        for _ in range(args.iters):
+                        for _ in range(timed_iters):
                             _run_layers(harness, config, selected_counts)
                         end_event.record()
                         end_event.synchronize()
@@ -927,9 +1065,125 @@ def _worker(
             all_results[shape.name] = {
                 "shape": asdict(shape),
                 "valid_counts": counts,
+                "timed_iters": timed_iters,
                 "results": shape_results,
             }
             barrier.wait(timeout=300)
+
+        raw_memcpy_results: dict[str, Any] = {}
+        if args.raw_memcpy_reference:
+            raw_sizes = sorted(
+                {
+                    _useful_k_bytes_per_layer(args, shape)
+                    for shape in shapes
+                }
+            )
+            max_raw_size = max(raw_sizes)
+            if args.shared_cpu_slab:
+                raw_source = shared_cpu_slab[:max_raw_size]
+            else:
+                raw_allocator = PinMemoryAllocator(
+                    max(max_raw_size, 64 * 1024 * 1024)
+                )
+                raw_mem_obj = raw_allocator.allocate(
+                    torch.Size([max_raw_size]), torch.uint8
+                )
+                if raw_mem_obj is None or raw_mem_obj.tensor is None:
+                    raise RuntimeError(
+                        "failed to allocate raw memcpy registered source"
+                    )
+                raw_source = raw_mem_obj.tensor
+                pattern_size = min(max_raw_size, 1024 * 1024)
+                pattern = (
+                    torch.arange(pattern_size, dtype=torch.int64)
+                    .add(args.seed + rank)
+                    .bitwise_xor(
+                        torch.arange(pattern_size, dtype=torch.int64) >> 5
+                    )
+                    .to(torch.uint8)
+                )
+                for offset in range(0, max_raw_size, pattern_size):
+                    count = min(pattern_size, max_raw_size - offset)
+                    raw_source[offset : offset + count].copy_(
+                        pattern[:count]
+                    )
+            raw_destination = torch.empty(
+                max_raw_size, dtype=torch.uint8, device=device
+            )
+            host_source_ptr = int(raw_source.data_ptr())
+            barrier.wait(timeout=300)
+            if args.verify:
+                raw_destination.zero_()
+                lmc_ops.benchmark_aclrt_memcpy_h2d(
+                    raw_destination,
+                    host_source_ptr,
+                    max_raw_size,
+                    True,
+                )
+                torch.npu.synchronize()
+                actual = raw_destination.cpu()
+                if not torch.equal(actual, raw_source):
+                    mismatch = torch.nonzero(actual != raw_source)
+                    first = (
+                        int(mismatch[0].item())
+                        if mismatch.numel()
+                        else -1
+                    )
+                    raise AssertionError(
+                        "raw aclrtMemcpyAsync verification failed at byte "
+                        f"{first}"
+                    )
+            for raw_size in raw_sizes:
+                raw_iters = _timed_iters(args, raw_size)
+                lmc_ops.benchmark_aclrt_memcpy_h2d(
+                    raw_destination,
+                    host_source_ptr,
+                    raw_size,
+                    True,
+                )
+                for _ in range(args.warmup):
+                    lmc_ops.benchmark_aclrt_memcpy_h2d(
+                        raw_destination,
+                        host_source_ptr,
+                        raw_size,
+                        False,
+                    )
+                torch.npu.synchronize()
+                samples = []
+                for _ in range(args.repeats):
+                    barrier.wait(timeout=300)
+                    start_event = torch.npu.Event(enable_timing=True)
+                    end_event = torch.npu.Event(enable_timing=True)
+                    wall_start_ns = time.monotonic_ns()
+                    start_event.record()
+                    for _ in range(raw_iters):
+                        lmc_ops.benchmark_aclrt_memcpy_h2d(
+                            raw_destination,
+                            host_source_ptr,
+                            raw_size,
+                            False,
+                        )
+                    end_event.record()
+                    end_event.synchronize()
+                    wall_end_ns = time.monotonic_ns()
+                    samples.append(
+                        (
+                            float(start_event.elapsed_time(end_event)),
+                            wall_start_ns,
+                            wall_end_ns,
+                        )
+                    )
+                    barrier.wait(timeout=300)
+                raw_memcpy_results[str(raw_size)] = {
+                    "timed_iters": raw_iters,
+                    "samples": samples,
+                }
+                if rank == 0:
+                    print(
+                        f"[raw memcpy] payload={format_bytes_short(raw_size)} "
+                        f"timed_iters={raw_iters}",
+                        flush=True,
+                    )
 
         output.put(
             {
@@ -937,6 +1191,7 @@ def _worker(
                 "device": args.devices[rank],
                 "max_aiv_num": max_aiv_num,
                 "results": all_results,
+                "raw_memcpy": raw_memcpy_results,
             }
         )
     except BaseException as exc:
@@ -959,6 +1214,10 @@ def _worker(
             except Exception:
                 pass
             harness.close()
+        if raw_mem_obj is not None:
+            raw_mem_obj.ref_count_down()
+        if raw_allocator is not None:
+            raw_allocator.close()
         if shared_mapping is not None:
             shared_mapping.close()
         if shared_owner is not None:
@@ -967,6 +1226,66 @@ def _worker(
 
 def _median(values: Iterable[float]) -> float:
     return statistics.median(list(values))
+
+
+def _ols_bandwidth_fit(
+    points: Sequence[tuple[int, float]],
+) -> dict[str, float | int]:
+    """Fit time_ms = intercept + bytes / bandwidth."""
+    if len(points) < 3:
+        raise ValueError("bandwidth fit requires at least three points")
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) / 1000 for point in points]
+    x_mean = statistics.mean(xs)
+    y_mean = statistics.mean(ys)
+    sxx = sum((value - x_mean) ** 2 for value in xs)
+    sxy = sum(
+        (x - x_mean) * (y - y_mean)
+        for x, y in zip(xs, ys, strict=True)
+    )
+    slope = sxy / sxx
+    intercept = y_mean - slope * x_mean
+    predicted = [intercept + slope * value for value in xs]
+    residuals = [
+        actual - estimate
+        for actual, estimate in zip(ys, predicted, strict=True)
+    ]
+    sse = sum(value * value for value in residuals)
+    syy = sum((value - y_mean) ** 2 for value in ys)
+    degrees = len(points) - 2
+    slope_se = math.sqrt((sse / degrees) / sxx)
+    # Student-t 97.5% quantiles for the small series used here.
+    t_value = {
+        1: 12.706,
+        2: 4.303,
+        3: 3.182,
+        4: 2.776,
+        5: 2.571,
+        6: 2.447,
+        7: 2.365,
+        8: 2.306,
+        9: 2.262,
+        10: 2.228,
+    }.get(degrees, 1.96)
+    slope_low = slope - t_value * slope_se
+    slope_high = slope + t_value * slope_se
+    return {
+        "point_count": len(points),
+        "min_payload_bytes": int(min(xs)),
+        "max_payload_bytes": int(max(xs)),
+        "bandwidth_gbps": 1 / slope / 1e9 if slope > 0 else math.nan,
+        "bandwidth_ci95_low_gbps": (
+            1 / slope_high / 1e9 if slope_high > 0 else math.nan
+        ),
+        "bandwidth_ci95_high_gbps": (
+            1 / slope_low / 1e9 if slope_low > 0 else math.nan
+        ),
+        "fixed_latency_us": intercept * 1e6,
+        "r_squared": 1 - sse / syy if syy > 0 else 1.0,
+        "max_abs_residual_us": (
+            max(abs(value) for value in residuals) * 1e6
+        ),
+    }
 
 
 def _summarize(
@@ -996,11 +1315,15 @@ def _summarize(
             "localities": args.localities,
             "warmup": args.warmup,
             "iters": args.iters,
+            "target_bytes_per_sample": args.target_bytes_per_sample,
+            "max_iters": args.max_iters,
             "repeats": args.repeats,
             "near_best_percent": args.near_best_percent,
             "seed": args.seed,
             "verify": args.verify,
             "shared_cpu_slab": args.shared_cpu_slab,
+            "raw_memcpy_reference": args.raw_memcpy_reference,
+            "fit_min_payload": args.fit_min_payload,
             "worker_timeout_sec": args.worker_timeout_sec,
             "progress_every": args.progress_every,
             "max_aiv_num_by_rank": [
@@ -1015,22 +1338,25 @@ def _summarize(
     for shape in shapes:
         worker_shape = [worker["results"][shape.name] for worker in workers]
         valid_tokens = sum(worker_shape[0]["valid_counts"])
+        timed_iters = int(worker_shape[0]["timed_iters"])
         bytes_per_invocation = (
             valid_tokens
             * args.k_hidden_dims
             * element_size
             * args.num_layers
         )
-        bytes_per_repeat = bytes_per_invocation * args.iters
+        bytes_per_repeat = bytes_per_invocation * timed_iters
         shape_summary = {
             "shape": asdict(shape),
             "valid_counts": worker_shape[0]["valid_counts"],
             "bytes_per_invocation": bytes_per_invocation,
+            "timed_iters": timed_iters,
             "localities": {},
         }
         print(
             f"\n{shape.name}: valid_tokens={valid_tokens} "
-            f"payload={format_bytes_short(bytes_per_invocation)}"
+            f"payload={format_bytes_short(bytes_per_invocation)} "
+            f"timed_iters={timed_iters}"
         )
 
         for locality in args.localities:
@@ -1046,6 +1372,16 @@ def _summarize(
                     for sample in worker_result["results"][locality][
                         config_name
                     ]["samples"]
+                ]
+                critical_ms_per_layer = [
+                    max(
+                        worker_result["results"][locality][config_name][
+                            "samples"
+                        ][repeat][0]
+                        for worker_result in worker_shape
+                    )
+                    / (timed_iters * args.num_layers)
+                    for repeat in range(args.repeats)
                 ]
                 rank_bandwidths = [
                     bytes_per_repeat / (duration_ms / 1000) / 1e9
@@ -1070,10 +1406,19 @@ def _summarize(
                     "shape": shape.name,
                     "locality": locality,
                     **config,
+                    "chunk_size": shape.chunk_size,
+                    "selected_per_row": shape.selected_per_row,
+                    "request_count": shape.request_count,
+                    "valid_fraction": shape.valid_fraction,
                     "valid_tokens": valid_tokens,
+                    "bytes_per_layer": bytes_per_invocation // args.num_layers,
                     "bytes_per_invocation": bytes_per_invocation,
+                    "timed_iters": timed_iters,
                     "median_ms_per_layer": _median(event_ms)
-                    / (args.iters * args.num_layers),
+                    / (timed_iters * args.num_layers),
+                    "median_critical_ms_per_layer": _median(
+                        critical_ms_per_layer
+                    ),
                     "median_rank_gbps": _median(rank_bandwidths),
                     "min_rank_gbps": min(rank_bandwidths),
                     "median_wall_gbps": _median(wall_bandwidths),
@@ -1141,6 +1486,161 @@ def _summarize(
                 f"({efficient['median_ms_per_layer'] * 1000:.2f} us/layer)"
             )
         summary["shapes"][shape.name] = shape_summary
+
+    bandwidth_fits = []
+    if args.fit_min_payload > 0:
+        series: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for row in flat_rows:
+            key = (
+                row["locality"],
+                row["name"],
+                row["chunk_size"],
+                row["request_count"],
+                row["valid_fraction"],
+            )
+            series.setdefault(key, []).append(row)
+        for key, rows in series.items():
+            eligible = [
+                row
+                for row in rows
+                if row["bytes_per_layer"] >= args.fit_min_payload
+            ]
+            unique_payloads = {
+                row["bytes_per_layer"] for row in eligible
+            }
+            if len(unique_payloads) < 3:
+                continue
+            eligible.sort(key=lambda row: row["bytes_per_layer"])
+            fit = _ols_bandwidth_fit(
+                [
+                    (
+                        row["bytes_per_layer"],
+                        row["median_critical_ms_per_layer"],
+                    )
+                    for row in eligible
+                ]
+            )
+            bandwidth_fits.append(
+                {
+                    "locality": key[0],
+                    "name": key[1],
+                    "variant": eligible[0]["variant"],
+                    "chunk_size": key[2],
+                    "request_count": key[3],
+                    "valid_fraction": key[4],
+                    **fit,
+                }
+            )
+        bandwidth_fits.sort(
+            key=lambda item: (
+                item["locality"],
+                -float(item["bandwidth_gbps"]),
+            )
+        )
+        print(
+            f"\nExisting sparse-kernel affine fits "
+            f"(payload/layer >= {format_bytes_short(args.fit_min_payload)})"
+        )
+        print(
+            "locality                                  config"
+            "                              GB/s   95% CI"
+            "             fixed us   R^2     max residual us"
+        )
+        for fit in bandwidth_fits:
+            print(
+                f"{fit['locality'][:40]:40} "
+                f"{fit['name'][:35]:35} "
+                f"{fit['bandwidth_gbps']:6.2f} "
+                f"[{fit['bandwidth_ci95_low_gbps']:6.2f}, "
+                f"{fit['bandwidth_ci95_high_gbps']:6.2f}] "
+                f"{fit['fixed_latency_us']:10.2f} "
+                f"{fit['r_squared']:7.5f} "
+                f"{fit['max_abs_residual_us']:15.2f}"
+            )
+    summary["bandwidth_fits"] = bandwidth_fits
+
+    raw_summary: dict[str, Any] | None = None
+    if args.raw_memcpy_reference:
+        raw_rows = []
+        raw_results = workers[0]["raw_memcpy"]
+        print("\nRaw aclrtMemcpyAsync reference (slowest-rank event)")
+        print(
+            "payload       iters   event us   event GB/s   "
+            "aggregate wall GB/s"
+        )
+        for size_text in sorted(raw_results, key=int):
+            size = int(size_text)
+            timed_iters = int(raw_results[size_text]["timed_iters"])
+            critical_event_ms = []
+            aggregate_wall_gbps = []
+            for repeat in range(args.repeats):
+                samples = [
+                    worker["raw_memcpy"][size_text]["samples"][repeat]
+                    for worker in workers
+                ]
+                critical_event_ms.append(
+                    max(sample[0] for sample in samples) / timed_iters
+                )
+                wall_seconds_per_copy = (
+                    (
+                        max(sample[2] for sample in samples)
+                        - min(sample[1] for sample in samples)
+                    )
+                    / 1e9
+                    / timed_iters
+                )
+                aggregate_wall_gbps.append(
+                    size * len(workers) / wall_seconds_per_copy / 1e9
+                )
+            median_event_ms = _median(critical_event_ms)
+            row = {
+                "payload_bytes": size,
+                "timed_iters": timed_iters,
+                "median_critical_event_ms": median_event_ms,
+                "median_critical_event_gbps": (
+                    size / (median_event_ms / 1000) / 1e9
+                ),
+                "median_aggregate_wall_gbps": _median(
+                    aggregate_wall_gbps
+                ),
+            }
+            raw_rows.append(row)
+            print(
+                f"{format_bytes_short(size):>10} "
+                f"{timed_iters:7d} "
+                f"{median_event_ms * 1000:10.2f} "
+                f"{row['median_critical_event_gbps']:12.2f} "
+                f"{row['median_aggregate_wall_gbps']:22.2f}"
+            )
+        eligible = [
+            row
+            for row in raw_rows
+            if row["payload_bytes"] >= args.fit_min_payload
+        ]
+        raw_fit = (
+            _ols_bandwidth_fit(
+                [
+                    (
+                        row["payload_bytes"],
+                        row["median_critical_event_ms"],
+                    )
+                    for row in eligible
+                ]
+            )
+            if args.fit_min_payload > 0 and len(eligible) >= 3
+            else None
+        )
+        raw_summary = {"rows": raw_rows, "fit": raw_fit}
+        if raw_fit is not None:
+            print(
+                "raw memcpy affine fit: "
+                f"{raw_fit['bandwidth_gbps']:.2f} GB/s "
+                f"(95% CI {raw_fit['bandwidth_ci95_low_gbps']:.2f}-"
+                f"{raw_fit['bandwidth_ci95_high_gbps']:.2f}), "
+                f"fixed={raw_fit['fixed_latency_us']:.2f} us, "
+                f"R^2={raw_fit['r_squared']:.5f}"
+            )
+    summary["raw_aclrt_memcpy_async"] = raw_summary
 
     stable = []
     for name, speedups in speedups_by_config.items():
@@ -1248,12 +1748,15 @@ def main() -> None:
     )
     estimated_layer_launches = 0
     for shape in shapes:
+        timed_iters = _timed_iters(
+            args, _useful_k_bytes_per_layer(args, shape) * args.num_layers
+        )
         for config in _kernel_configs(args, requested_aiv_ceiling, shape):
             setup_invocations = int(args.verify or config.variant != "production")
             invocations = (
                 setup_invocations
                 + args.warmup
-                + args.iters * args.repeats
+                + timed_iters * args.repeats
             )
             estimated_layer_launches += (
                 len(args.localities) * args.num_layers * invocations
@@ -1273,6 +1776,22 @@ def main() -> None:
         f"CPU slab={'shared' if args.shared_cpu_slab else 'private-per-rank'}",
         flush=True,
     )
+    if args.target_bytes_per_sample > 0:
+        shape_iters = [
+            _timed_iters(
+                args,
+                _useful_k_bytes_per_layer(args, shape) * args.num_layers,
+            )
+            for shape in shapes
+        ]
+        print(
+            f"target useful K payload/sample="
+            f"{format_bytes_short(args.target_bytes_per_sample)}; "
+            f"timed iters/shape={min(shape_iters)}-{max(shape_iters)}; "
+            f"raw aclrtMemcpyAsync reference="
+            f"{'on' if args.raw_memcpy_reference else 'off'}",
+            flush=True,
+        )
     if args.shared_cpu_slab:
         print(f"shared CPU slab: {args.shared_slab_name}", flush=True)
     if args.dry_run:

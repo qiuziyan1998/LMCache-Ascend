@@ -2,6 +2,7 @@
 #include "kernels/types.h"
 #include "managed_mem.h"
 #include "utils.h"
+#include <cstdint>
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -296,6 +297,12 @@ void sparse_k_batched_direct_kv_transfer_experimental(
     const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
 uint32_t sparse_transfer_hardware_aiv_num();
+
+// Benchmark-only raw H2D reference path. host_src_ptr is the CPU virtual
+// address of a registered host allocation.
+void benchmark_aclrt_memcpy_h2d(
+    torch::Tensor &destination, const uintptr_t host_src_ptr,
+    const int64_t num_bytes, const bool validate_inputs = true);
 
 // Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
 // direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.
