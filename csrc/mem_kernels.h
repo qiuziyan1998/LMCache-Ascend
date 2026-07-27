@@ -140,15 +140,16 @@ void single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
     const bool lmcHostInterleaved = false, const int32_t rowWidth = 0,
     const int32_t requestCount = 0, const int32_t selectedCountStride = 1);
 
-// Runtime-configurable K-only sparse transfer.  This is intentionally a
+// Runtime-configurable planar sparse transfer. This is intentionally a
 // separate entry point so the production generic kernel remains an exact
-// benchmark baseline.
+// benchmark baseline. vHiddenDims == 0 selects the one-plane case.
 void single_layer_sparse_k_transfer(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     uint32_t blockDim, void *stream, uint8_t *chunkPtrsPtr,
-    uint8_t *vllmKPtr, uint8_t *slotMappingPtr,
+    uint8_t *vllmKPtr, uint8_t *vllmVPtr, uint8_t *slotMappingPtr,
     uint8_t *selectedTokenIdxPtr, uint8_t *selectedTokenCountsPtr,
-    const int64_t vllmKBufferSize, const int64_t kHiddenDims,
+    const int64_t vllmKBufferSize, const int64_t vllmVBufferSize,
+    const int64_t kHiddenDims, const int64_t vHiddenDims,
     const int32_t numTokens, const int32_t numChunks,
     const int32_t chunkSize, const int32_t chunkShift,
     const int32_t chunkMask, const int32_t totalTokens,
@@ -281,9 +282,10 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     const int64_t total_tokens, const bool lmc_host_interleaved,
     const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
-// Benchmark/tuning API. kernel_variant=0 runs the original generic one-plane
+// Benchmark/tuning API. kernel_variant=0 runs the original generic planar
 // kernel with an optional AIV override. kernel_variant=1 runs the dedicated
-// K-only kernel. addressing_mode: 0=auto, 1=division, 2=power-of-two shift.
+// runtime-tuned planar kernel. DSA_INDEX uses one plane; MLA_LATENT uses both
+// K and V planes. addressing_mode: 0=auto, 1=division, 2=power-of-two shift.
 // work_assignment: 0=balanced contiguous valid tokens, 1=striped tiles.
 // validate_inputs may be disabled only after validating an unchanged config.
 void sparse_k_batched_direct_kv_transfer_experimental(

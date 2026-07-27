@@ -575,6 +575,18 @@ static uint32_t hardware_aiv_num() {
   return hardware_cores;
 }
 
+static uint64_t hardware_ub_size() {
+  // Like the AIV count, per-core UB capacity is invariant within a worker.
+  static const uint64_t ub_size = [] {
+    auto platform =
+        platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
+    uint64_t bytes = 0;
+    platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, bytes);
+    return bytes;
+  }();
+  return ub_size;
+}
+
 static uint32_t direct_aiv_num(int32_t num_tokens) {
   const uint32_t token_cores =
       num_tokens > 0 ? static_cast<uint32_t>(num_tokens) : 1U;
@@ -869,15 +881,21 @@ void sparse_k_batched_direct_kv_transfer_experimental(
     validate_sparse_single_layer_inputs(slot_mapping_packed,
                                         selected_token_idx);
     TORCH_CHECK(kernel_variant == 0 || kernel_variant == 1,
-                "kernel_variant must be 0 (original) or 1 (K-only).");
-    TORCH_CHECK(destination_state.v_hidden_dims == 0,
-                "Experimental sparse K transfer requires a one-plane "
-                "destination state (v_hidden_dims == 0).");
+                "kernel_variant must be 0 (original) or 1 (optimized).");
     TORCH_CHECK(
         destination_state.kvcache_format ==
-            kvcache_ops::KVCacheFormat::DSA_INDEX,
-        "Experimental sparse K transfer requires a prepared DSA_INDEX "
-        "destination state.");
+                kvcache_ops::KVCacheFormat::DSA_INDEX ||
+            destination_state.kvcache_format ==
+                kvcache_ops::KVCacheFormat::MLA_LATENT,
+        "Experimental sparse planar transfer requires a prepared DSA_INDEX "
+        "or MLA_LATENT destination state.");
+    TORCH_CHECK(
+        destination_state.kvcache_format !=
+                kvcache_ops::KVCacheFormat::MLA_LATENT ||
+            (destination_state.v_hidden_dims > 0 &&
+             destination_state.vllm_v_ptr != nullptr),
+        "MLA_LATENT optimized transfer requires a positive V-plane width "
+        "and destination pointer.");
     TORCH_CHECK(
         chunk_size > 0 && chunk_size <= std::numeric_limits<int32_t>::max(),
         "chunk_size must be a positive int32 value.");
@@ -924,17 +942,21 @@ void sparse_k_batched_direct_kv_transfer_experimental(
                 "chunk_ptrs_npu must be on the same NPU device.");
     TORCH_CHECK(destination_state.k_hidden_dims > 0,
                 "k_hidden_dims must be positive.");
+    TORCH_CHECK(destination_state.v_hidden_dims >= 0,
+                "v_hidden_dims must be non-negative.");
     TORCH_CHECK(
         destination_state.k_hidden_dims <=
-            std::numeric_limits<uint32_t>::max(),
-        "k_hidden_dims must fit the uint32 DataCopy element-count API.");
+                std::numeric_limits<uint32_t>::max() &&
+            destination_state.v_hidden_dims <=
+                std::numeric_limits<uint32_t>::max(),
+        "K/V hidden dims must fit the uint32 DataCopy element-count API.");
     TORCH_CHECK(
         destination_state.scalar_type_num == kvcache_ops::AscendType::FP16 ||
             destination_state.scalar_type_num ==
                 kvcache_ops::AscendType::BF16 ||
             destination_state.scalar_type_num ==
                 kvcache_ops::AscendType::INT8,
-        "Experimental sparse K transfer supports FP16, BF16, and INT8.");
+        "Experimental sparse planar transfer supports FP16, BF16, and INT8.");
     const int64_t element_size =
         destination_state.scalar_type_num == kvcache_ops::AscendType::INT8
         ? 1
@@ -942,11 +964,26 @@ void sparse_k_batched_direct_kv_transfer_experimental(
     TORCH_CHECK(
         tile_tokens <=
             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) /
-                (destination_state.k_hidden_dims * element_size),
+                ((destination_state.k_hidden_dims +
+                  destination_state.v_hidden_dims) *
+                 element_size),
         "The per-tile UB allocation must fit the uint32 InitBuffer byte-count "
         "API.");
+    const uint64_t tile_buffer_bytes =
+        static_cast<uint64_t>(2) * static_cast<uint64_t>(tile_tokens) *
+        static_cast<uint64_t>(destination_state.k_hidden_dims +
+                              destination_state.v_hidden_dims) *
+        static_cast<uint64_t>(element_size);
+    TORCH_CHECK(
+        tile_buffer_bytes <= hardware_ub_size(),
+        "The double-buffered optimized sparse tile requires ",
+        tile_buffer_bytes, " UB bytes, but the device provides ",
+        hardware_ub_size(), " bytes.");
     TORCH_CHECK(destination_state.k_hidden_dims * element_size % 32 == 0,
                 "The K payload for one token must be 32-byte aligned.");
+    TORCH_CHECK(destination_state.v_hidden_dims == 0 ||
+                    destination_state.v_hidden_dims * element_size % 32 == 0,
+                "The V payload for one token must be 32-byte aligned.");
     TORCH_CHECK(
         selected_token_idx.numel() <= std::numeric_limits<int32_t>::max(),
         "selected_token_idx is too large for the device kernel.");
@@ -1068,10 +1105,11 @@ void sparse_k_batched_direct_kv_transfer_experimental(
         }
         kvcache_ops::single_layer_sparse_k_transfer(
             state.scalar_type_num, state.slot_type_num, resolved_aiv_num,
-            stream, chunk_ptrs_ptr, state.vllm_k_ptr, slot_mapping_ptr,
-            selected_ptr, counts_ptr, state.vllm_k_bytes,
-            state.k_hidden_dims, num_sparse, num_chunks, chunk_size_i,
-            chunk_shift, chunk_mask, total_tokens_i, tile_tokens_i, pipeline,
+            stream, chunk_ptrs_ptr, state.vllm_k_ptr, state.vllm_v_ptr,
+            slot_mapping_ptr, selected_ptr, counts_ptr, state.vllm_k_bytes,
+            state.vllm_v_bytes, state.k_hidden_dims, state.v_hidden_dims,
+            num_sparse, num_chunks, chunk_size_i, chunk_shift, chunk_mask,
+            total_tokens_i, tile_tokens_i, pipeline,
             static_cast<int32_t>(work_assignment), row_width, request_count,
             selected_count_stride);
         return 0;

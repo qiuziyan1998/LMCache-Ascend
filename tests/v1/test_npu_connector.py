@@ -1099,6 +1099,151 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     assert args[4:] == (256, 4, True)
 
 
+def test_prepared_mla_launch_uses_opt_in_optimized_planar_kernel(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    native_state = object()
+    plan = npu_connectors._SparseDestinationPlan(
+        [(object(), object())],
+        (
+            torch.long,
+            "cpu",
+            npu_connectors.KVCacheFormat.MLA_LATENT.value,
+            512,
+            64,
+            0,
+        ),
+        (native_state,),
+    )
+    chunk_ptrs = torch.tensor([123], dtype=torch.int64)
+    source_layer = PreparedSparseSourceLayer(
+        tensors=(torch.zeros(4),),
+        chunk_ptrs_npu=chunk_ptrs,
+    )
+    slots = torch.arange(2048, dtype=torch.long)
+    selected = torch.arange(2048, dtype=torch.int32)
+    optimized_calls = []
+    production_calls = []
+
+    monkeypatch.setattr(npu_connectors, "_SPARSE_MLA_OPTIMIZED", True)
+    monkeypatch.setattr(
+        npu_connectors, "_SPARSE_MLA_OPTIMIZED_MIN_TOKENS", 2048
+    )
+    monkeypatch.setattr(npu_connectors, "_SPARSE_MLA_OPTIMIZED_AIV_NUM", 0)
+    monkeypatch.setattr(
+        npu_connectors, "_SPARSE_MLA_OPTIMIZED_TILE_TOKENS", 16
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_k_batched_direct_kv_transfer_experimental",
+        lambda *args, **kwargs: optimized_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: production_calls.append(args),
+    )
+
+    launch = dict(
+        plan=plan,
+        source_layer=source_layer,
+        layer_id=0,
+        slot_mapping_packed=slots,
+        selected_token_idx=selected,
+        chunk_size=256,
+        total_tokens=4,
+        sparse_host_interleaved=False,
+    )
+    connector._run_prepared_sparse_direct_kv_transfer_layer(**launch)
+    connector._run_prepared_sparse_direct_kv_transfer_layer(**launch)
+
+    assert production_calls == []
+    assert len(optimized_calls) == 2
+    first_args, first_kwargs = optimized_calls[0]
+    assert first_args == (
+        native_state,
+        slots,
+        selected,
+        chunk_ptrs,
+        256,
+        4,
+    )
+    assert first_kwargs == {
+        "kernel_variant": 1,
+        "aiv_num": 0,
+        "tile_tokens": 16,
+        "pipeline": True,
+        "addressing_mode": 0,
+        "work_assignment": 1,
+        "validate_inputs": True,
+        "selected_token_counts": None,
+    }
+    assert optimized_calls[1][1]["validate_inputs"] is False
+    assert len(plan.optimized_validation_keys) == 1
+
+
+def test_prepared_optimized_mla_falls_back_for_small_or_interleaved_load(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    native_state = object()
+    plan = npu_connectors._SparseDestinationPlan(
+        [(object(), object())],
+        (
+            torch.long,
+            "cpu",
+            npu_connectors.KVCacheFormat.MLA_LATENT.value,
+            512,
+            64,
+            0,
+        ),
+        (native_state,),
+    )
+    chunk_ptrs = torch.tensor([123], dtype=torch.int64)
+    source_layer = PreparedSparseSourceLayer(
+        tensors=(torch.zeros(4),),
+        chunk_ptrs_npu=chunk_ptrs,
+    )
+    optimized_calls = []
+    production_calls = []
+    monkeypatch.setattr(npu_connectors, "_SPARSE_MLA_OPTIMIZED", True)
+    monkeypatch.setattr(
+        npu_connectors, "_SPARSE_MLA_OPTIMIZED_MIN_TOKENS", 2048
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_k_batched_direct_kv_transfer_experimental",
+        lambda *args, **kwargs: optimized_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: production_calls.append(args),
+    )
+
+    base = dict(
+        plan=plan,
+        source_layer=source_layer,
+        layer_id=0,
+        slot_mapping_packed=torch.arange(256, dtype=torch.long),
+        selected_token_idx=torch.arange(256, dtype=torch.int32),
+        chunk_size=256,
+        total_tokens=4,
+    )
+    connector._run_prepared_sparse_direct_kv_transfer_layer(
+        **base, sparse_host_interleaved=False
+    )
+    base["slot_mapping_packed"] = torch.arange(2048, dtype=torch.long)
+    base["selected_token_idx"] = torch.arange(2048, dtype=torch.int32)
+    connector._run_prepared_sparse_direct_kv_transfer_layer(
+        **base, sparse_host_interleaved=True
+    )
+
+    assert optimized_calls == []
+    assert len(production_calls) == 2
+
+
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     monkeypatch,
 ) -> None:

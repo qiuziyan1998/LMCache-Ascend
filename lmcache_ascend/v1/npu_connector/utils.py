@@ -366,14 +366,16 @@ def sparse_k_batched_direct_kv_transfer_experimental(
     validate_inputs: bool = True,
     selected_token_counts: Optional[torch.Tensor] = None,
 ) -> None:
-    """Run a configured one-plane sparse transfer for kernel tuning.
+    """Run a configured planar sparse transfer for tuning or opt-in regression.
 
     ``kernel_variant=0`` is the original generic kernel with an optional AIV
-    override. ``kernel_variant=1`` is the dedicated K-only kernel.  All
-    settings are runtime arguments so a benchmark can sweep them after one
-    extension build. Leave ``validate_inputs`` enabled for normal callers;
-    the benchmark disables it only after one validated launch of the same
-    immutable configuration.
+    override. ``kernel_variant=1`` is the runtime-tuned kernel. A prepared
+    ``DSA_INDEX`` destination copies one plane; ``MLA_LATENT`` copies both
+    planar components in one launch. All settings are runtime arguments so a
+    benchmark can sweep them after one extension build. Leave
+    ``validate_inputs`` enabled for normal callers; the benchmark and
+    production regression path disable it only after one validated launch of
+    the same immutable configuration.
     """
     lmc_ops.sparse_k_batched_direct_kv_transfer_experimental(
         destination_state,

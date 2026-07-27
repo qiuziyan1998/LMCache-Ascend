@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Tune and compare the original and experimental K-only sparse H2D kernels.
+"""Tune and compare the original and experimental sparse planar H2D kernels.
 
 The extension is compiled once.  AIV count, UB tile size, double buffering,
 chunk addressing, and work assignment are runtime arguments.  The benchmark
-keeps the production ``MLA_LATENT`` host layout (K followed by an unused
-V/rope plane) and prepares a one-plane destination through the existing
-``DSA_INDEX`` specialization. Neither kernel reads or counts the V plane.
+keeps the production ``MLA_LATENT`` host layout. ``--transfer-planes k``
+prepares a one-plane destination through the existing ``DSA_INDEX``
+specialization for comparison with earlier K-only results.
+``--transfer-planes kv`` copies and verifies both MLA_LATENT planes in one
+kernel launch, matching the opt-in production regression path.
 
 Recommended first run:
 
@@ -21,7 +23,7 @@ The ``standard`` and ``full`` presets expand the shape and configuration
 matrix.  Every preset can be overridden with the comma-separated list flags.
 
 The ``bandwidth`` preset is deliberately narrow: it sends 256 through 16384
-tokens through the existing production and K-only sparse kernels, batches
+tokens through the existing production and optimized sparse kernels, batches
 enough invocations to amortize event overhead, and fits
 ``time = fixed_latency + bytes / bandwidth``. It also measures raw
 ``aclrtMemcpyAsync`` on registered memory as a reference; it does not compile
@@ -63,6 +65,7 @@ from kv_cache_fixtures import generate_mla_kv_cache  # noqa: E402
 from load_benchmark_utils import (  # noqa: E402
     ALIGN_BYTES,
     KV_FORMAT_DSA_INDEX,
+    KV_FORMAT_MLA_LATENT,
     LoadBenchmarkHarness,
     MlaDsaDims,
     build_load_benchmark_harness,
@@ -265,7 +268,16 @@ def _parse_args() -> argparse.Namespace:
         "--host-v-hidden-dims",
         type=int,
         default=64,
-        help="unused trailing V plane retained in each MLA_LATENT host chunk",
+        help="width of the trailing MLA_LATENT V/rope plane",
+    )
+    parser.add_argument(
+        "--transfer-planes",
+        choices=("k", "kv"),
+        default="k",
+        help=(
+            "k preserves the earlier K-only benchmark; kv copies and verifies "
+            "both production MLA_LATENT planes in one kernel launch"
+        ),
     )
     parser.add_argument("--selected-counts", default="")
     parser.add_argument("--chunk-sizes", default="")
@@ -307,7 +319,8 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help=(
             "dynamically increase iterations until each timed sample moves "
-            "this many useful K bytes; bandwidth preset default: 512M; "
+            "this many useful transferred bytes; bandwidth preset default: "
+            "512M; "
             "0 keeps --iters fixed"
         ),
     )
@@ -341,7 +354,8 @@ def _parse_args() -> argparse.Namespace:
         "--fit-min-payload",
         default="",
         help=(
-            "minimum useful K bytes per layer in affine bandwidth fits; "
+            "minimum useful transferred bytes per layer in affine bandwidth "
+            "fits; "
             "bandwidth preset default: 1M; 0 disables fits"
         ),
     )
@@ -612,9 +626,12 @@ def _valid_counts(shape: Shape) -> list[int]:
 def _useful_k_bytes_per_layer(
     args: argparse.Namespace, shape: Shape
 ) -> int:
+    hidden_dims = args.k_hidden_dims
+    if args.transfer_planes == "kv":
+        hidden_dims += args.host_v_hidden_dims
     return (
         sum(_valid_counts(shape))
-        * args.k_hidden_dims
+        * hidden_dims
         * torch.empty(0, dtype=torch.bfloat16).element_size()
     )
 
@@ -649,8 +666,16 @@ def _locality_cases(
     device: torch.device,
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     source_contiguous = torch.arange(capacity, dtype=torch.int32, device=device)
+    source_random = random.Random(seed)
+    source_scattered_values = source_random.sample(
+        range(num_tokens - 1), capacity - 1
+    )
+    # Always exercise the partial final chunk when num_tokens is not an exact
+    # chunk multiple; this catches a wrong planar V offset deterministically.
+    source_scattered_values.append(num_tokens - 1)
+    source_random.shuffle(source_scattered_values)
     source_scattered = torch.tensor(
-        random.Random(seed).sample(range(num_tokens), capacity),
+        source_scattered_values,
         dtype=torch.int32,
         device=device,
     )
@@ -710,20 +735,32 @@ def _build_harness(
         populate_cpu_source=populate_cpu_source,
         copy_expected_cpu_chunks=False,
     )
-    # Keep the production MLA_LATENT source-chunk allocation (K followed by
-    # the unused V/rope plane), but prepare a one-plane destination so both
-    # the original and experimental kernels copy K only.
-    harness.layer_states = [
-        prepare_sparse_direct_destination_state(
-            (harness.dst_direct_fast[layer_id][0],),
-            harness.slot_mapping_full,
-            KV_FORMAT_DSA_INDEX,
-            args.k_hidden_dims,
-            0,
-            args.k_hidden_dims,
-        )
-        for layer_id in range(args.num_layers)
-    ]
+    if args.transfer_planes == "k":
+        # Preserve the earlier K-only comparison while retaining the exact
+        # production host allocation (including its unused trailing plane).
+        harness.layer_states = [
+            prepare_sparse_direct_destination_state(
+                (harness.dst_direct_fast[layer_id][0],),
+                harness.slot_mapping_full,
+                KV_FORMAT_DSA_INDEX,
+                args.k_hidden_dims,
+                0,
+                args.k_hidden_dims,
+            )
+            for layer_id in range(args.num_layers)
+        ]
+    else:
+        harness.layer_states = [
+            prepare_sparse_direct_destination_state(
+                harness.dst_direct_fast[layer_id],
+                harness.slot_mapping_full,
+                KV_FORMAT_MLA_LATENT,
+                args.k_hidden_dims,
+                args.host_v_hidden_dims,
+                0,
+            )
+            for layer_id in range(args.num_layers)
+        ]
     num_slots = (
         harness.dst_direct_fast[0][0].shape[0]
         * harness.dst_direct_fast[0][0].shape[1]
@@ -790,6 +827,7 @@ def _run_layers(
 
 
 def _verify(
+    args: argparse.Namespace,
     harness: LoadBenchmarkHarness,
     shape: Shape,
     counts: Sequence[int],
@@ -819,19 +857,22 @@ def _verify(
     source_slots = harness.slot_mapping_full.index_select(
         0, valid_selected.to(torch.long)
     )
+    plane_count = 1 if args.transfer_planes == "k" else 2
     for source_layer, destination_layer in zip(
         harness.src_kv_cache, harness.dst_direct_fast, strict=True
     ):
-        source = source_layer[0].flatten(0, 1)
-        destination = destination_layer[0].flatten(0, 1)
-        expected = source.index_select(0, source_slots)
-        actual = destination.index_select(0, valid_destinations)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        untouched_v = destination_layer[1].flatten(0, 1).index_select(
-            0, valid_destinations
-        )
-        if torch.count_nonzero(untouched_v).item() != 0:
-            raise AssertionError(f"{config.name} unexpectedly copied V")
+        for plane_index in range(plane_count):
+            source = source_layer[plane_index].flatten(0, 1)
+            destination = destination_layer[plane_index].flatten(0, 1)
+            expected = source.index_select(0, source_slots)
+            actual = destination.index_select(0, valid_destinations)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if args.transfer_planes == "k":
+            untouched_v = destination_layer[1].flatten(0, 1).index_select(
+                0, valid_destinations
+            )
+            if torch.count_nonzero(untouched_v).item() != 0:
+                raise AssertionError(f"{config.name} unexpectedly copied V")
 
     if len(valid_positions) == shape.capacity:
         return
@@ -845,13 +886,15 @@ def _verify(
         0, padded_positions
     )
     for destination_layer in harness.dst_direct_fast:
-        padded = destination_layer[0].flatten(0, 1).index_select(
-            0, padded_destinations
-        )
-        if torch.count_nonzero(padded).item() != 0:
-            raise AssertionError(
-                f"{config.name} copied one or more padded row-tail tokens"
+        for plane_index in range(plane_count):
+            padded = destination_layer[plane_index].flatten(0, 1).index_select(
+                0, padded_destinations
             )
+            if torch.count_nonzero(padded).item() != 0:
+                raise AssertionError(
+                    f"{config.name} copied one or more padded row-tail tokens "
+                    f"in plane {plane_index}"
+                )
 
 
 def _shared_slab_size(args: argparse.Namespace) -> int:
@@ -993,6 +1036,7 @@ def _worker(
                 for config in configs:
                     if args.verify:
                         _verify(
+                            args,
                             harness,
                             shape,
                             counts,
@@ -1303,6 +1347,7 @@ def _summarize(
             "block_size": args.block_size,
             "k_hidden_dims": args.k_hidden_dims,
             "host_v_hidden_dims": args.host_v_hidden_dims,
+            "transfer_planes": args.transfer_planes,
             "selected_counts": args.selected_counts,
             "chunk_sizes": args.chunk_sizes,
             "request_counts": args.request_counts,
@@ -1339,11 +1384,11 @@ def _summarize(
         worker_shape = [worker["results"][shape.name] for worker in workers]
         valid_tokens = sum(worker_shape[0]["valid_counts"])
         timed_iters = int(worker_shape[0]["timed_iters"])
+        hidden_dims = args.k_hidden_dims + (
+            args.host_v_hidden_dims if args.transfer_planes == "kv" else 0
+        )
         bytes_per_invocation = (
-            valid_tokens
-            * args.k_hidden_dims
-            * element_size
-            * args.num_layers
+            valid_tokens * hidden_dims * element_size * args.num_layers
         )
         bytes_per_repeat = bytes_per_invocation * timed_iters
         shape_summary = {
@@ -1785,7 +1830,7 @@ def main() -> None:
             for shape in shapes
         ]
         print(
-            f"target useful K payload/sample="
+            f"target useful transferred payload/sample="
             f"{format_bytes_short(args.target_bytes_per_sample)}; "
             f"timed iters/shape={min(shape_iters)}-{max(shape_iters)}; "
             f"raw aclrtMemcpyAsync reference="

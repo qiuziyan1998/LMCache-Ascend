@@ -35,6 +35,7 @@ from lmcache_ascend.v1.npu_connector.utils import (
     dense_mla_dsa_batched_direct_kv_transfer_fast,
     prepare_sparse_direct_destination_state,
     prepare_sparse_direct_layer_state,
+    sparse_k_batched_direct_kv_transfer_experimental,
     sparse_mla_dsa_batched_direct_kv_transfer,
     sparse_mla_dsa_batched_direct_kv_transfer_fast,
     sparse_mla_dsa_batched_direct_kv_transfer_prepared,
@@ -260,6 +261,18 @@ _DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 _SPARSE_TRANSFER_TOPK = max(
     0, int(os.getenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "0"))
+)
+_SPARSE_MLA_OPTIMIZED = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_MLA_OPTIMIZED", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_MLA_OPTIMIZED_MIN_TOKENS = max(
+    1, int(os.getenv("LMCACHE_ASCEND_SPARSE_MLA_OPTIMIZED_MIN_TOKENS", "2048"))
+)
+_SPARSE_MLA_OPTIMIZED_AIV_NUM = max(
+    0, int(os.getenv("LMCACHE_ASCEND_SPARSE_MLA_OPTIMIZED_AIV_NUM", "0"))
+)
+_SPARSE_MLA_OPTIMIZED_TILE_TOKENS = max(
+    1, int(os.getenv("LMCACHE_ASCEND_SPARSE_MLA_OPTIMIZED_TILE_TOKENS", "16"))
 )
 
 _SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
@@ -1413,7 +1426,12 @@ class _GroupLayout:
 class _SparseDestinationPlan:
     """Process-owned native states for one paged-KV destination group."""
 
-    __slots__ = ("kvcaches_ref", "signature", "states")
+    __slots__ = (
+        "kvcaches_ref",
+        "signature",
+        "states",
+        "optimized_validation_keys",
+    )
 
     def __init__(
         self,
@@ -1424,6 +1442,7 @@ class _SparseDestinationPlan:
         self.kvcaches_ref = kvcaches_ref
         self.signature = signature
         self.states = states
+        self.optimized_validation_keys: set[tuple] = set()
 
 
 class _SparseLoadJoin:
@@ -1461,6 +1480,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 "selected tokens for debugging; vLLM's sparse-attention "
                 "width is unchanged",
                 _SPARSE_TRANSFER_TOPK,
+            )
+        if _SPARSE_MLA_OPTIMIZED:
+            logger.warning(
+                "Enabling experimental optimized MLA sparse retrieve: "
+                "min_tokens=%d aiv_num=%d tile_tokens=%d; DSA_INDEX and "
+                "unsupported layouts retain the production kernel",
+                _SPARSE_MLA_OPTIMIZED_MIN_TOKENS,
+                _SPARSE_MLA_OPTIMIZED_AIV_NUM,
+                _SPARSE_MLA_OPTIMIZED_TILE_TOKENS,
             )
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
@@ -2452,6 +2480,56 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         """Launch one prepared layer directly on the current compute stream."""
         if selected_token_idx.numel() == 0:
+            return
+        use_optimized = (
+            _SPARSE_MLA_OPTIMIZED
+            and plan.signature[2] == KVCacheFormat.MLA_LATENT.value
+            and not sparse_host_interleaved
+            and selected_token_idx.numel()
+            >= _SPARSE_MLA_OPTIMIZED_MIN_TOKENS
+        )
+        if use_optimized:
+            counts_signature = (
+                None
+                if selected_token_counts is None
+                else (
+                    selected_token_counts.numel(),
+                    selected_token_counts.stride(0),
+                    selected_token_counts.dtype,
+                )
+            )
+            validation_key = (
+                layer_id,
+                chunk_size,
+                total_tokens,
+                source_layer.chunk_ptrs_npu.numel(),
+                slot_mapping_packed.dtype,
+                selected_token_idx.dtype,
+                counts_signature,
+                _SPARSE_MLA_OPTIMIZED_AIV_NUM,
+                _SPARSE_MLA_OPTIMIZED_TILE_TOKENS,
+            )
+            validate_inputs = (
+                validation_key not in plan.optimized_validation_keys
+            )
+            sparse_k_batched_direct_kv_transfer_experimental(
+                plan.states[layer_id],
+                slot_mapping_packed,
+                selected_token_idx,
+                source_layer.chunk_ptrs_npu,
+                chunk_size,
+                total_tokens,
+                kernel_variant=1,
+                aiv_num=_SPARSE_MLA_OPTIMIZED_AIV_NUM,
+                tile_tokens=_SPARSE_MLA_OPTIMIZED_TILE_TOKENS,
+                pipeline=True,
+                addressing_mode=0,
+                work_assignment=1,
+                validate_inputs=validate_inputs,
+                selected_token_counts=selected_token_counts,
+            )
+            if validate_inputs:
+                plan.optimized_validation_keys.add(validation_key)
             return
         sparse_mla_dsa_batched_direct_kv_transfer_prepared(
             plan.states[layer_id],

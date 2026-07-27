@@ -51,6 +51,7 @@ def test_generated_launch_pointer_arguments_use_gm_addr() -> None:
     pointer_names = (
         "chunkPtrs",
         "vllmKPtr",
+        "vllmVPtr",
         "slotMappingPtr",
         "selectedTokenIdxPtr",
         "selectedTokenCountsPtr",
@@ -91,11 +92,14 @@ def test_device_entry_and_generated_launch_argument_order_match() -> None:
     expected_device = [
         "chunkPtrs",
         "vllmKPtr",
+        "vllmVPtr",
         "slotMappingPtr",
         "selectedTokenIdxPtr",
         "selectedTokenCountsPtr",
         "vllmKBufferSize",
+        "vllmVBufferSize",
         "kHiddenDims",
+        "vHiddenDims",
         "numTokens",
         "numChunks",
         "chunkSize",
@@ -112,10 +116,11 @@ def test_device_entry_and_generated_launch_argument_order_match() -> None:
     expected_launch = [
         "chunkPtrsPtr",
         "vllmKPtr",
+        "vllmVPtr",
         "slotMappingPtr",
         "selectedTokenIdxPtr",
         "selectedTokenCountsPtr",
-        *expected_device[5:],
+        *expected_device[6:],
     ]
     assert device_names == expected_device
     assert launch_names == expected_launch
@@ -135,3 +140,17 @@ def test_all_supported_type_pairs_have_device_and_host_instantiations() -> None:
             )
             assert source.count(device) == 1
             assert source.count(host) == 1
+
+
+def test_planar_source_uses_actual_final_chunk_size_and_copies_both_planes() -> None:
+    source = _KERNEL_SOURCE.read_text(encoding="utf-8")
+
+    assert "min(chunkSize_, totalTokens_ - chunkId * chunkSize_)" in source
+    assert (
+        "static_cast<int64_t>(chunkTokens) * kHiddenDims_ +"
+        in source
+    )
+    assert "vllmV_[slot * vHiddenDims_]" in source
+    assert (
+        "static_cast<uint64_t>(kHiddenDims_ + vHiddenDims_)" in source
+    )
