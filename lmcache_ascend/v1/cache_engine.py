@@ -2508,14 +2508,33 @@ class AscendLMCacheEngine(LMCacheEngine):
             if sampled_worker_retrieve:
                 local_cpu_backend = self._shared_local_cpu_backend()
                 try:
-                    for layer_keys in missing_keys:
-                        local_prefix = local_cpu_backend.batched_get_prefix_with_misses(
-                            layer_keys
+                    batched_prefix_get = getattr(
+                        local_cpu_backend,
+                        "batched_get_prefixes_with_misses",
+                        None,
+                    )
+                    if callable(batched_prefix_get):
+                        local_prefix_layers.extend(batched_prefix_get(missing_keys))
+                        if len(local_prefix_layers) != len(missing_keys):
+                            raise ValueError(
+                                "Shared CPU batched local-prefix lookup returned "
+                                "an unexpected layer count: "
+                                f"expected={len(missing_keys)}, "
+                                f"got={len(local_prefix_layers)}"
+                            )
+                    else:
+                        # Compatibility with LMCache versions that predate the
+                        # cross-layer LocalCPU prefix API.
+                        local_prefix_layers.extend(
+                            local_cpu_backend.batched_get_prefix_with_misses(
+                                layer_keys
+                            )
+                            for layer_keys in missing_keys
                         )
+                    for local_prefix in local_prefix_layers:
                         layer_locations = [LOCAL_CPU_BACKEND_NAME] * len(
                             local_prefix.local_memory_objs
                         ) + ["RemoteBackend"] * len(local_prefix.remote_positions)
-                        local_prefix_layers.append(local_prefix)
                         shared_chunk_locations_layer_major.append(layer_locations)
                 except Exception:
                     release_local_prefix_layers()
