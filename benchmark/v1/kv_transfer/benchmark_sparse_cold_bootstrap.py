@@ -35,6 +35,9 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.gpu_connector.gpu_connectors import (
+    VLLMPagedMemLayerwiseGPUConnector,
+)
 from lmcache.v1.gpu_connector.sparse import build_prepared_sparse_source
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_page_key
@@ -334,10 +337,14 @@ class SyntheticPageFirstStorageManager:
         return results
 
 
-class SyntheticGPUConnector:
+class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     """Connector surface needed by cold and prepared sparse generators."""
 
     def __init__(self, stats: StageStats, num_layers: int) -> None:
+        # Deliberately skip the production connector initializer: it creates
+        # device streams and buffers that a metadata-only benchmark must not
+        # require. Inheriting the concrete layerwise type keeps this test
+        # double compatible with LMCache's nominal connector assertion.
         self.stats = stats
         self.num_layers = num_layers
 

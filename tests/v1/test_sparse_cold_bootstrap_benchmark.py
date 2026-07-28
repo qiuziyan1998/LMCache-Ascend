@@ -83,3 +83,16 @@ def test_cold_bootstrap_token_database_config_is_schema_independent():
     assert config.get_extra_config_value("missing", "fallback") == "fallback"
     assert metadata.chunk_size == 128
     assert metadata.kv_shape[0] == 7
+
+
+def test_synthetic_connector_satisfies_layerwise_connector_contract():
+    benchmark = _load_benchmark_module()
+    # First Party
+    from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
+
+    connector = benchmark.SyntheticGPUConnector(
+        benchmark.StageStats(),
+        num_layers=3,
+    )
+
+    assert_layerwise_gpu_connector(connector)
