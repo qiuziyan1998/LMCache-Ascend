@@ -61,3 +61,25 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse()
         assert result.broadcast_envelopes == 3
         assert result.transferred_bytes == 512 * 1152 * 3
         assert result.warm_total_s > 0
+
+
+def test_cold_bootstrap_token_database_config_is_schema_independent():
+    benchmark = _load_benchmark_module()
+
+    assert not hasattr(benchmark, "LMCacheEngineConfig")
+    token_database, metadata = benchmark._make_token_database(
+        chunk_size=128,
+        num_layers=7,
+    )
+
+    config = token_database.config
+    assert config.chunk_size == 128
+    assert config.pre_caching_hash_algorithm == "builtin"
+    assert config.save_unfull_chunk is True
+    assert config.dsa_two_groups is True
+    assert config.remote_url is None
+    assert config.enable_pd is False
+    assert config.get_extra_config_value("save_only_first_rank") is True
+    assert config.get_extra_config_value("missing", "fallback") == "fallback"
+    assert metadata.chunk_size == 128
+    assert metadata.kv_shape[0] == 7

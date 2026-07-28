@@ -35,7 +35,6 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.sparse import build_prepared_sparse_source
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_page_key
@@ -48,6 +47,34 @@ from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 
 GB = 1_000_000_000
+
+
+@dataclass
+class SyntheticTokenDatabaseConfig:
+    """Version-independent config subset required by ``ChunkedTokenDatabase``.
+
+    The benchmark can run against several LMCache revisions. Constructing a
+    complete config through ``LMCacheEngineConfig.from_legacy`` makes it depend
+    on every legacy config field having a matching dataclass field, even though
+    the synthetic token database only consumes the fields below.
+    """
+
+    chunk_size: int
+    pre_caching_hash_algorithm: str = "builtin"
+    save_unfull_chunk: bool = True
+    dsa_two_groups: bool = True
+    remote_url: Optional[str] = None
+    enable_pd: bool = False
+    extra_config: dict[str, Any] = field(
+        default_factory=lambda: {"save_only_first_rank": True}
+    )
+
+    def get_extra_config_value(
+        self,
+        key: str,
+        default_value: Any = None,
+    ) -> Any:
+        return self.extra_config.get(key, default_value)
 
 
 @dataclass
@@ -378,13 +405,7 @@ def _make_token_database(
     chunk_size: int,
     num_layers: int,
 ) -> tuple[ChunkedTokenDatabase, LMCacheMetadata]:
-    config = LMCacheEngineConfig.from_legacy(
-        backend="cpu",
-        chunk_size=chunk_size,
-        save_unfull_chunk=True,
-    )
-    config.dsa_two_groups = True
-    config.extra_config = {"save_only_first_rank": True}
+    config = SyntheticTokenDatabaseConfig(chunk_size=chunk_size)
     metadata = LMCacheMetadata(
         model_name="/workspace/models/GLM-5.1-w4a8",
         world_size=8,
