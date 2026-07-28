@@ -222,6 +222,89 @@ Use `--no-raw-memcpy-reference` to omit the raw reference. For a quick
 sanity check before the full run, reduce the target to `128M` and repeats to
 five.
 
+## Two-stream saturation test
+
+`benchmark_sparse_k_transfer_streams.py` tests whether two independent sparse
+H2D kernels can obtain more aggregate bandwidth than one stream. It uses the
+optimized two-plane `MLA_LATENT` kernel and reports four cases:
+
+- one 2048-token transfer;
+- one 4096-token transfer;
+- two independent 2048-token transfers on one stream;
+- the same two independent transfers on separate NPU streams.
+
+The latter three move the same number of useful bytes. The two transfers use
+disjoint source selections and independent destination KV caches. Therefore,
+the concurrent result measures stream overlap without introducing a
+destination race. `--verify` checks both planes of every layer for all paths,
+including the concurrent path. `--aiv-count` is applied to each kernel, so
+the concurrent case may use twice that many AIVs if the runtime can schedule
+both kernels simultaneously.
+
+First isolate one NPU:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+numactl --interleave=all \
+python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_streams.py \
+  --devices 0 \
+  --num-tokens 20000 \
+  --selected-count 2048 \
+  --num-layers 8 \
+  --chunk-size 256 \
+  --block-size 128 \
+  --aiv-count 8 \
+  --tile-tokens 8 \
+  --locality scattered \
+  --warmup 5 \
+  --iters 50 \
+  --repeats 11 \
+  --verify \
+  --output-json /workspace/qzy/sparse-k-streams-device0.json
+```
+
+Then reproduce the TP8 shared-CPU-cache pressure:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+numactl --interleave=all \
+python3 benchmark/v1/kv_transfer/benchmark_sparse_k_transfer_streams.py \
+  --devices 0,1,2,3,4,5,6,7 \
+  --num-tokens 20000 \
+  --selected-count 2048 \
+  --num-layers 8 \
+  --chunk-size 256 \
+  --block-size 128 \
+  --aiv-count 8 \
+  --tile-tokens 8 \
+  --locality scattered \
+  --warmup 5 \
+  --iters 50 \
+  --repeats 11 \
+  --shared-cpu-slab \
+  --verify \
+  --output-json /workspace/qzy/sparse-k-streams-tp8.json
+```
+
+Use the critical NPU-event metric for the per-rank transfer result and the
+aggregate wall metric to detect cross-rank CPU/PCIe contention. Interpret the
+equal-payload comparisons as follows:
+
+- concurrent is materially faster than sequential: two streams recover
+  otherwise unused copy/DMA capacity;
+- concurrent is close to sequential: the H2D path is already saturated;
+- concurrent is slower: the kernels contend for PCIe, memory, or AIV
+  resources;
+- single 4096 is faster than both two-transfer cases: per-launch overhead is
+  significant, even if two streams overlap part of it.
+
+Require a repeatable margin larger than normal run-to-run noise (the script
+uses 3% as a conservative interpretation threshold) before changing the
+serving path. Repeat the single-device test with `--aiv-count 4` and
+`--aiv-count 16` if eight AIVs per kernel wins: this distinguishes a genuine
+two-stream effect from a setting that only compensates for an under-sized
+single kernel.
+
 ## Interpreting output
 
 For every shape and locality, results are sorted by NPU event time and include:
