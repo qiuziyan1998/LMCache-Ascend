@@ -1502,6 +1502,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
 
+    def synchronize_dense_load_stream(self) -> None:
+        self.load_stream.synchronize()
+
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
         """Join sparse request load streams after all layer submissions.
@@ -3630,6 +3633,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         Sparse layerwise retrieve: scatter selected KV tokens from CPU pinned
         memory objects into paged NPU KV via direct NPU read (no staging).
         """
+        if kwargs.get("materialize_only", False):
+            # Preserve the layerwise generator protocol while deliberately
+            # skipping every CPU-to-NPU payload. The cache engine still
+            # resolves, owns, and seals the complete CPU latent source.
+            for _ in range(self.num_layers):
+                yield
+            yield
+            yield
+            return
         if kwargs.get("prepared_sparse_source") is not None:
             yield from self._batched_to_gpu_head_token_wise_prepared(kwargs)
             return
