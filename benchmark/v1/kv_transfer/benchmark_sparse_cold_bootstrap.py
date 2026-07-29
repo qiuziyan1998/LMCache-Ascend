@@ -11,6 +11,9 @@ through the same cold generator protocol used by the vLLM adapter:
 5. install pointer tables and publish shared handles;
 6. seal a prepared source and execute one metadata-free warm retrieve.
 
+It also runs latent and DSA-index bootstrap as a paired request, comparing
+independent token hashing with request-local reuse of the latent chunk plan.
+
 The remote store is synthetic so CPU metadata can be measured independently
 from a particular Mooncake deployment. Its page accounting matches
 ``mooncake_page_first_multi_buffer=true``: one token chunk is one Mooncake
@@ -85,6 +88,8 @@ class StageStats:
     """Stage timings and operation counts collected from one bootstrap."""
 
     metadata_s: float = 0.0
+    token_process_s: float = 0.0
+    page_key_s: float = 0.0
     local_probe_s: float = 0.0
     capacity_s: float = 0.0
     remote_s: float = 0.0
@@ -103,6 +108,7 @@ class StageStats:
     handle_objects: int = 0
     broadcast_envelopes: int = 0
     transferred_bytes: int = 0
+    hash_plan_reuses: int = 0
 
 
 @dataclass
@@ -111,6 +117,7 @@ class BenchmarkResult:
 
     name: str
     prefix_mode: str
+    chunk_plan_mode: str
     kv_group: int
     num_layers: int
     num_chunks: int
@@ -269,7 +276,10 @@ class SyntheticPageFirstStorageManager:
         self.bytes_per_token = bytes_per_token
         self.remote_gbps = remote_gbps
         self.rpc_overhead_us = rpc_overhead_us
-        self.shared_tensor = torch.empty(1, dtype=torch.uint8)
+        self.shared_tensor = torch.empty(
+            chunk_size * bytes_per_token,
+            dtype=torch.uint8,
+        )
 
     def _tokens_for_chunk(self, chunk_index: int, num_chunks: int) -> int:
         if chunk_index + 1 < num_chunks:
@@ -287,9 +297,28 @@ class SyntheticPageFirstStorageManager:
         self.stats.remote_calls += 1
         self.stats.remote_logical_keys += len(keys)
 
+        page_key_started = time.perf_counter()
+        page_keys_by_identity: dict[tuple[Any, ...], str] = {}
+        page_ids: list[str] = []
+        for key in keys:
+            identity = (
+                key.model_name,
+                key.world_size,
+                key.worker_id,
+                key.chunk_hash,
+                key.dtype,
+                key.tags,
+                key.kv_group,
+            )
+            page_id = page_keys_by_identity.get(identity)
+            if page_id is None:
+                page_id = mooncake_page_key(key, self.num_layers)
+                page_keys_by_identity[identity] = page_id
+            page_ids.append(page_id)
+        self.stats.page_key_s += time.perf_counter() - page_key_started
+
         indices_by_page: dict[str, list[int]] = {}
-        for index, key in enumerate(keys):
-            page_id = mooncake_page_key(key, self.num_layers)
+        for index, page_id in enumerate(page_ids):
             indices_by_page.setdefault(page_id, []).append(index)
 
         ordered_pages = list(indices_by_page.items())
@@ -311,7 +340,7 @@ class SyntheticPageFirstStorageManager:
             for chunk_index, (page_id, _indices) in enumerate(ordered_pages)
         }
         transferred_bytes = sum(
-            bytes_by_hash[mooncake_page_key(key, self.num_layers)] for key in keys
+            bytes_by_hash[page_id] for page_id in page_ids
         )
         self.stats.mooncake_page_objects += num_chunks
         self.stats.lmcache_memory_objects += len(keys)
@@ -324,9 +353,12 @@ class SyntheticPageFirstStorageManager:
             time.sleep(delay_s)
 
         results: list[SyntheticMemoryObj] = []
-        for key in keys:
-            logical_bytes = bytes_by_hash[mooncake_page_key(key, self.num_layers)]
-            memory_obj = SyntheticMemoryObj(logical_bytes, self.shared_tensor)
+        for key, page_id in zip(keys, page_ids, strict=True):
+            logical_bytes = bytes_by_hash[page_id]
+            memory_obj = SyntheticMemoryObj(
+                logical_bytes,
+                self.shared_tensor[:logical_bytes],
+            )
             # StorageManager normally installs a cache-owned reference before
             # returning the caller-owned object.
             memory_obj.ref_count_up()
@@ -442,6 +474,27 @@ def _make_engine(
         chunk_size=args.chunk_size,
         num_layers=args.num_layers,
     )
+    process_tokens = token_database.process_tokens
+
+    def measured_process_tokens(
+        *process_args: Any,
+        **process_kwargs: Any,
+    ) -> Any:
+        iterator = iter(process_tokens(*process_args, **process_kwargs))
+        reused_hashes = process_kwargs.get("hashes") is not None
+        if reused_hashes:
+            stats.hash_plan_reuses += 1
+        while True:
+            started = time.perf_counter()
+            try:
+                result = next(iterator)
+            except StopIteration:
+                stats.token_process_s += time.perf_counter() - started
+                return
+            stats.token_process_s += time.perf_counter() - started
+            yield result
+
+    token_database.process_tokens = measured_process_tokens
     bytes_per_token = (
         args.latent_bytes_per_token if kv_group == 0 else args.indexer_bytes_per_token
     )
@@ -557,6 +610,8 @@ def run_once(
     *,
     kv_group: int,
     prefix_mode: str,
+    tokens: Optional[list[int]] = None,
+    shared_preflight_state: Optional[dict[str, Any]] = None,
 ) -> StageStats:
     """Execute one cold bootstrap followed by one prepared warm retrieve."""
     stats = StageStats()
@@ -566,13 +621,15 @@ def run_once(
         kv_group=kv_group,
         prefix_mode=prefix_mode,
     )
-    tokens = list(range(args.num_tokens))
+    if tokens is None:
+        tokens = list(range(args.num_tokens))
     ret_mask = torch.zeros(args.num_tokens, dtype=torch.bool)
     cold = engine.retrieve_layer_head_token_wise(
         tokens,
         ret_mask=ret_mask,
         kv_group=kv_group,
         req_id=f"cold-g{kv_group}-{prefix_mode}",
+        shared_cpu_request_preflight_state=shared_preflight_state,
         **caches,
     )
     stats.cold_prime_s, stats.cold_total_s = _drive_retriever(
@@ -640,33 +697,75 @@ def _median_stats(samples: list[StageStats]) -> StageStats:
     return StageStats(**values)
 
 
-def run_case(
+def _run_pair_once(
     args: Namespace,
     *,
-    kv_group: int,
     prefix_mode: str,
-) -> BenchmarkResult:
-    """Run warmup and measured repetitions for one group/probe configuration."""
+    chunk_plan_mode: str,
+) -> dict[int, StageStats]:
+    tokens = list(range(args.num_tokens))
+    shared_state: Optional[dict[str, Any]] = (
+        {} if chunk_plan_mode == "reuse" else None
+    )
+    return {
+        kv_group: run_once(
+            args,
+            kv_group=kv_group,
+            prefix_mode=prefix_mode,
+            tokens=tokens,
+            shared_preflight_state=shared_state,
+        )
+        for kv_group in args.kv_groups
+    }
+
+
+def run_pair_case(
+    args: Namespace,
+    *,
+    prefix_mode: str,
+    chunk_plan_mode: str,
+) -> list[BenchmarkResult]:
+    """Run one paired latent/indexer cold-bootstrap configuration."""
     for _ in range(args.warmup):
-        run_once(args, kv_group=kv_group, prefix_mode=prefix_mode)
-    samples = [
-        run_once(args, kv_group=kv_group, prefix_mode=prefix_mode)
+        _run_pair_once(
+            args,
+            prefix_mode=prefix_mode,
+            chunk_plan_mode=chunk_plan_mode,
+        )
+    pair_samples = [
+        _run_pair_once(
+            args,
+            prefix_mode=prefix_mode,
+            chunk_plan_mode=chunk_plan_mode,
+        )
         for _ in range(args.repeats)
     ]
-    bytes_per_token = (
-        args.latent_bytes_per_token if kv_group == 0 else args.indexer_bytes_per_token
-    )
-    return BenchmarkResult(
-        name=f"g{kv_group}_{prefix_mode.replace('-', '_')}",
-        prefix_mode=prefix_mode,
-        kv_group=kv_group,
-        num_layers=args.num_layers,
-        num_chunks=math.ceil(args.num_tokens / args.chunk_size),
-        bytes_per_token=bytes_per_token,
-        repeats=args.repeats,
-        median=_median_stats(samples),
-        samples=samples,
-    )
+    results = []
+    for kv_group in args.kv_groups:
+        samples = [sample[kv_group] for sample in pair_samples]
+        bytes_per_token = (
+            args.latent_bytes_per_token
+            if kv_group == 0
+            else args.indexer_bytes_per_token
+        )
+        results.append(
+            BenchmarkResult(
+                name=(
+                    f"g{kv_group}_{prefix_mode.replace('-', '_')}_"
+                    f"{chunk_plan_mode}"
+                ),
+                prefix_mode=prefix_mode,
+                chunk_plan_mode=chunk_plan_mode,
+                kv_group=kv_group,
+                num_layers=args.num_layers,
+                num_chunks=math.ceil(args.num_tokens / args.chunk_size),
+                bytes_per_token=bytes_per_token,
+                repeats=args.repeats,
+                median=_median_stats(samples),
+                samples=samples,
+            )
+        )
+    return results
 
 
 def _ms(seconds: float) -> float:
@@ -677,27 +776,45 @@ def print_results(results: list[BenchmarkResult]) -> None:
     """Print timing and topology summaries for all measured configurations."""
     print("\nCold bootstrap wall time (median ms; prime is the blocking first next())")
     print(
-        f"{'case':24} {'prime':>9} {'cold total':>11} {'warm':>9} "
-        f"{'metadata':>10} {'local probe':>12} {'capacity':>10} {'remote':>9}"
+        f"{'case':38} {'prime':>9} {'cold total':>11} {'warm':>9}"
     )
     for result in results:
         stats = result.median
         print(
-            f"{result.name:24} "
+            f"{result.name:38} "
             f"{_ms(stats.cold_prime_s):9.3f} "
             f"{_ms(stats.cold_total_s):11.3f} "
-            f"{_ms(stats.warm_total_s):9.3f} "
+            f"{_ms(stats.warm_total_s):9.3f}"
+        )
+
+    print(
+        "\nCold bootstrap timing breakdown (median ms; "
+        "token keys are inside metadata, page keys are inside remote)"
+    )
+    print(
+        f"{'case':38} {'metadata':>10} {'token keys':>11} {'page keys':>10} "
+        f"{'local probe':>12} {'capacity':>10} {'remote':>9} "
+        f"{'pointers':>9} {'handles':>9}"
+    )
+    for result in results:
+        stats = result.median
+        print(
+            f"{result.name:38} "
             f"{_ms(stats.metadata_s):10.3f} "
+            f"{_ms(stats.token_process_s):11.3f} "
+            f"{_ms(stats.page_key_s):10.3f} "
             f"{_ms(stats.local_probe_s):12.3f} "
             f"{_ms(stats.capacity_s):10.3f} "
-            f"{_ms(stats.remote_s):9.3f}"
+            f"{_ms(stats.remote_s):9.3f} "
+            f"{_ms(stats.pointer_s):9.3f} "
+            f"{_ms(stats.handle_s):9.3f}"
         )
 
     print("\nPage-first topology and metadata counts (median)")
     print(
-        f"{'case':24} {'probe calls':>12} {'key probes':>11} "
+        f"{'case':38} {'probe calls':>12} {'key probes':>11} "
         f"{'remote calls':>13} {'LMCache objs':>13} {'Mooncake files':>15} "
-        f"{'buffers/file':>13}"
+        f"{'buffers/file':>13} {'plan reuse':>11}"
     )
     for result in results:
         stats = result.median
@@ -707,56 +824,62 @@ def print_results(results: list[BenchmarkResult]) -> None:
             else 0
         )
         print(
-            f"{result.name:24} "
+            f"{result.name:38} "
             f"{int(stats.local_probe_calls):12d} "
             f"{int(stats.local_key_probes):11d} "
             f"{int(stats.remote_calls):13d} "
             f"{int(stats.lmcache_memory_objects):13d} "
             f"{int(stats.mooncake_page_objects):15d} "
-            f"{buffers_per_file:13.1f}"
+            f"{buffers_per_file:13.1f} "
+            f"{int(stats.hash_plan_reuses):11d}"
         )
 
-    by_group: dict[int, dict[str, BenchmarkResult]] = {}
-    for result in results:
-        by_group.setdefault(result.kv_group, {})[result.prefix_mode] = result
+    result_map = {
+        (result.kv_group, result.prefix_mode, result.chunk_plan_mode): result
+        for result in results
+    }
     print("\nCross-layer LocalCPU probe speedup")
-    for kv_group, modes in sorted(by_group.items()):
-        baseline = modes.get("per-layer")
-        optimized = modes.get("batched")
-        if baseline is None or optimized is None:
-            continue
-        prime_speedup = baseline.median.cold_prime_s / optimized.median.cold_prime_s
-        probe_speedup = (
-            baseline.median.local_probe_s / optimized.median.local_probe_s
-            if optimized.median.local_probe_s
-            else float("inf")
-        )
-        print(
-            f"  kv_group={kv_group}: prime={prime_speedup:.3f}x, "
-            f"local_probe={probe_speedup:.3f}x"
-        )
+    for chunk_plan_mode in ("independent", "reuse"):
+        for kv_group in (0, 1):
+            baseline = result_map.get((kv_group, "per-layer", chunk_plan_mode))
+            optimized = result_map.get((kv_group, "batched", chunk_plan_mode))
+            if baseline is None or optimized is None:
+                continue
+            print(
+                f"  kv_group={kv_group} plan={chunk_plan_mode}: "
+                f"prime="
+                f"{baseline.median.cold_prime_s / optimized.median.cold_prime_s:.3f}x, "
+                f"local_probe="
+                f"{baseline.median.local_probe_s / optimized.median.local_probe_s:.3f}x"
+            )
 
+    print("\nCross-group chunk-plan speedup")
     for prefix_mode in ("per-layer", "batched"):
-        group_results = [
-            result for result in results if result.prefix_mode == prefix_mode
+        baseline = [
+            result_map.get((kv_group, prefix_mode, "independent"))
+            for kv_group in (0, 1)
         ]
-        if len(group_results) < 2:
+        optimized = [
+            result_map.get((kv_group, prefix_mode, "reuse"))
+            for kv_group in (0, 1)
+        ]
+        if any(result is None for result in baseline + optimized):
             continue
-        combined_prime_ms = sum(
-            _ms(result.median.cold_prime_s) for result in group_results
-        )
-        combined_total_ms = sum(
-            _ms(result.median.cold_total_s) for result in group_results
-        )
+        baseline = [result for result in baseline if result is not None]
+        optimized = [result for result in optimized if result is not None]
+        baseline_prime = sum(item.median.cold_prime_s for item in baseline)
+        optimized_prime = sum(item.median.cold_prime_s for item in optimized)
+        baseline_metadata = sum(item.median.metadata_s for item in baseline)
+        optimized_metadata = sum(item.median.metadata_s for item in optimized)
+        index_baseline = baseline[1].median
+        index_optimized = optimized[1].median
         print(
-            f"  both groups ({prefix_mode}): prime={combined_prime_ms:.3f} ms, "
-            f"cold_total={combined_total_ms:.3f} ms"
+            f"  prefix={prefix_mode}: "
+            f"prime={baseline_prime / optimized_prime:.3f}x, "
+            f"metadata={baseline_metadata / optimized_metadata:.3f}x, "
+            f"indexer metadata="
+            f"{index_baseline.metadata_s / index_optimized.metadata_s:.3f}x"
         )
-
-
-def _serialize_result(result: BenchmarkResult) -> dict[str, Any]:
-    payload = asdict(result)
-    return payload
 
 
 def parse_args() -> Namespace:
@@ -774,6 +897,11 @@ def parse_args() -> Namespace:
         "--prefix-modes",
         default="per-layer,batched",
         help="Comma-separated LocalCPU probe modes.",
+    )
+    parser.add_argument(
+        "--chunk-plan-modes",
+        default="independent,reuse",
+        help="Compare independent group hashing with latent-to-indexer plan reuse.",
     )
     parser.add_argument(
         "--latent-bytes-per-token",
@@ -821,6 +949,18 @@ def parse_args() -> Namespace:
         value not in valid_modes for value in args.prefix_modes
     ):
         parser.error("--prefix-modes must contain per-layer and/or batched")
+    args.chunk_plan_modes = [
+        value.strip()
+        for value in args.chunk_plan_modes.split(",")
+        if value.strip()
+    ]
+    valid_plan_modes = {"independent", "reuse"}
+    if not args.chunk_plan_modes or any(
+        value not in valid_plan_modes for value in args.chunk_plan_modes
+    ):
+        parser.error("--chunk-plan-modes must contain independent and/or reuse")
+    if "reuse" in args.chunk_plan_modes and args.kv_groups != [0, 1]:
+        parser.error("chunk-plan reuse requires --kv-groups 0,1")
     return args
 
 
@@ -838,6 +978,11 @@ def main() -> None:
         f"{chunks * args.num_layers} LMCache MemoryObjs from {chunks} "
         f"Mooncake page objects/files ({args.num_layers} buffers per page)."
     )
+    print(
+        "chunk plan modes="
+        f"{','.join(args.chunk_plan_modes)} "
+        "(reuse shares latent prefix hashes with the indexer group)"
+    )
     if args.remote_gbps == 0:
         print("remote model=metadata-only (no synthetic payload delay)")
     else:
@@ -847,23 +992,23 @@ def main() -> None:
         )
 
     results = []
-    total_cases = len(args.kv_groups) * len(args.prefix_modes)
+    total_cases = len(args.chunk_plan_modes) * len(args.prefix_modes)
     cases = (
-        (kv_group, prefix_mode)
-        for kv_group in args.kv_groups
+        (chunk_plan_mode, prefix_mode)
+        for chunk_plan_mode in args.chunk_plan_modes
         for prefix_mode in args.prefix_modes
     )
-    for case_index, (kv_group, prefix_mode) in enumerate(cases, start=1):
+    for case_index, (chunk_plan_mode, prefix_mode) in enumerate(cases, start=1):
         print(
             f"[progress] case {case_index}/{total_cases}: "
-            f"kv_group={kv_group} prefix_mode={prefix_mode}",
+            f"chunk_plan={chunk_plan_mode} prefix_mode={prefix_mode}",
             flush=True,
         )
-        results.append(
-            run_case(
+        results.extend(
+            run_pair_case(
                 args,
-                kv_group=kv_group,
                 prefix_mode=prefix_mode,
+                chunk_plan_mode=chunk_plan_mode,
             )
         )
     print_results(results)
@@ -873,7 +1018,7 @@ def main() -> None:
             "config": {
                 key: value for key, value in vars(args).items() if key != "output_json"
             },
-            "results": [_serialize_result(result) for result in results],
+            "results": [asdict(result) for result in results],
         }
         args.output_json.write_text(
             json.dumps(payload, indent=2),

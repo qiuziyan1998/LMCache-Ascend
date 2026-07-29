@@ -37,6 +37,7 @@ import torch
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
+_SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 
 
 
@@ -1209,14 +1210,52 @@ class AscendLMCacheEngine(LMCacheEngine):
             new_starts: List[int] = []
             new_ends: List[int] = []
             keys: List[List[CacheEngineKey]] = []
-
-            for start, end, key in self.token_database.process_tokens(
-                tokens=tokens,
-                mask=mask,
-                request_configs=request_configs,
-                kv_group=kv_group,
-            ):
+            preflight_state = (
+                retrieve_kwargs.get("shared_cpu_request_preflight_state")
+                if retrieve_kwargs is not None
+                else None
+            )
+            chunk_plan = (
+                preflight_state.pop(
+                    _SHARED_CPU_CHUNK_PLAN_KEY,
+                    None,
+                )
+                if sampled_worker_retrieve
+                and kv_group == 1
+                and isinstance(preflight_state, dict)
+                else None
+            )
+            if chunk_plan is not None:
+                generated_keys = self.token_database.process_tokens(
+                    hashes=[entry[2] for entry in chunk_plan],
+                    offsets=[entry[1] - entry[0] for entry in chunk_plan],
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+                token_results = (
+                    (start, end, key)
+                    for (start, end, _), (_, _, key) in zip(
+                        chunk_plan, generated_keys, strict=True
+                    )
+                )
+            else:
+                token_results = self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+            new_chunk_plan: Optional[list[tuple[int, int, Any]]] = (
+                []
+                if sampled_worker_retrieve
+                and kv_group == 0
+                and isinstance(preflight_state, dict)
+                else None
+            )
+            for start, end, key in token_results:
                 assert isinstance(key, CacheEngineKey)
+                if new_chunk_plan is not None:
+                    new_chunk_plan.append((start, end, key.chunk_hash))
 
                 keys_multi_layer = key.split_layers(self.num_layers)
                 if sampled_worker_retrieve:
@@ -1263,6 +1302,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 new_starts.append(start)
                 new_ends.append(end)
                 keys.append(keys_multi_layer)
+
+            if new_chunk_plan is not None:
+                preflight_state[_SHARED_CPU_CHUNK_PLAN_KEY] = tuple(new_chunk_plan)
 
             new_keys = (
                 [list(row) for row in zip(*keys, strict=False)] if keys else []
@@ -2959,6 +3001,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             layer_id=layer_id,
                             kv_group=kv_group,
                             chunk_index_base=cached_handle_chunks,
+                            validate_memory_objs=(
+                                pre_resolved_shared_mem_layers is None
+                            ),
                         )
                         self._append_shared_handle_cache(
                             layer_id,

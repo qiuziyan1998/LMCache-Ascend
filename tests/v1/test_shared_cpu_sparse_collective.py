@@ -3,6 +3,7 @@
 
 # Standard
 from types import SimpleNamespace
+from typing import Any
 
 # Third Party
 import pytest
@@ -351,6 +352,63 @@ def test_sampled_metadata_build_skips_per_chunk_contains():
     assert keys == [[key.split_layers(2)[0]], [key.split_layers(2)[1]]]
     assert ret_mask.tolist() == [True]
 
+
+def test_sampled_metadata_reuses_latent_chunk_hashes_for_indexer() -> None:
+    tokens = [10, 11, 12, 13, 14]
+    mask = torch.tensor([False, False, True, True, True])
+    calls: list[dict[str, Any]] = []
+
+    def process_tokens(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        kv_group = kwargs.get("kv_group", 0)
+        if kwargs.get("hashes") is not None:
+            for offset, chunk_hash in zip(
+                kwargs["offsets"],
+                kwargs["hashes"],
+                strict=True,
+            ):
+                yield 0, offset, _make_key(kv_group, chunk_hash)
+            return
+        yield 2, 4, _make_key(kv_group, 101)
+        yield 4, 5, _make_key(kv_group, 202)
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.use_layerwise = True
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.token_database = SimpleNamespace(process_tokens=process_tokens)
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_shared_retrieve_passive = lambda _kv_group: False
+    preflight_state = {}
+
+    def build(kv_group: int) -> Any:
+        return engine._ensure_retrieve_chunk_metadata(
+            tokens=tokens,
+            mask=mask,
+            request_configs={"lmcache.tag.request": "same"},
+            cached_keys=[],
+            cached_starts=[],
+            cached_ends=[],
+            ret_mask=torch.zeros(len(tokens), dtype=torch.bool),
+            retrieve_kwargs={
+                "kv_group": kv_group,
+                "shared_cpu_request_preflight_state": preflight_state,
+            },
+        )
+
+    _, latent_starts, latent_ends, latent_keys = build(0)
+    _, index_starts, index_ends, index_keys = build(1)
+
+    assert calls[0]["tokens"] is tokens
+    assert calls[1]["hashes"] == [101, 202]
+    assert calls[1]["offsets"] == [2, 1]
+    assert latent_starts == index_starts == [2, 4]
+    assert latent_ends == index_ends == [4, 5]
+    assert [key.chunk_hash for key in latent_keys[0]] == [101, 202]
+    assert [key.chunk_hash for key in index_keys[0]] == [101, 202]
+    assert all(key.kv_group == 0 for layer in latent_keys for key in layer)
+    assert all(key.kv_group == 1 for layer in index_keys for key in layer)
+    assert preflight_state == {}
 
 def test_sparse_request_preflight_error_prevents_partial_latent_publication(
     monkeypatch,
@@ -1382,6 +1440,7 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
 
     def make_handles(**kwargs):
         assert kwargs["mem_objs_layer"] == [mem_obj]
+        assert kwargs["validate_memory_objs"] is True
         assert mem_obj.ref_up_count == 1
         assert mem_obj.pin_count == 1
         assert mem_obj.is_pinned
@@ -1675,6 +1734,7 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
         assert kwargs["keys_layer"] == [key1]
         assert kwargs["mem_objs_layer"] == [new_mem_obj]
         assert kwargs["chunk_index_base"] == 1
+        assert kwargs["validate_memory_objs"] is False
         return [new_handle]
 
     engine._make_shared_handles_for_layer = make_handles

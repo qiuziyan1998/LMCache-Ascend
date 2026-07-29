@@ -37,6 +37,7 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse()
         indexer_bytes_per_token=256,
         remote_gbps=0.0,
         rpc_overhead_us=0.0,
+        kv_groups=[0, 1],
     )
 
     per_layer = benchmark.run_once(
@@ -96,3 +97,36 @@ def test_synthetic_connector_satisfies_layerwise_connector_contract():
     )
 
     assert_layerwise_gpu_connector(connector)
+
+
+def test_cold_bootstrap_pair_reuses_latent_chunk_hash_plan_for_indexer() -> None:
+    benchmark = _load_benchmark_module()
+    args = SimpleNamespace(
+        num_tokens=512,
+        chunk_size=256,
+        num_layers=3,
+        latent_bytes_per_token=1152,
+        indexer_bytes_per_token=256,
+        remote_gbps=0.0,
+        rpc_overhead_us=0.0,
+        kv_groups=[0, 1],
+    )
+
+    independent = benchmark._run_pair_once(
+        args,
+        prefix_mode="batched",
+        chunk_plan_mode="independent",
+    )
+    reused = benchmark._run_pair_once(
+        args,
+        prefix_mode="batched",
+        chunk_plan_mode="reuse",
+    )
+
+    assert independent[0].hash_plan_reuses == 0
+    assert independent[1].hash_plan_reuses == 0
+    assert reused[0].hash_plan_reuses == 0
+    assert reused[1].hash_plan_reuses == 1
+    assert reused[1].lmcache_memory_objects == independent[1].lmcache_memory_objects
+    assert reused[1].mooncake_page_objects == independent[1].mooncake_page_objects
+    assert reused[1].transferred_bytes == independent[1].transferred_bytes
