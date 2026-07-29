@@ -15,9 +15,12 @@ It also runs latent and DSA-index bootstrap as a paired request, comparing
 independent token hashing with request-local reuse of the latent chunk plan.
 
 The remote store is synthetic so CPU metadata can be measured independently
-from a particular Mooncake deployment. Its page accounting matches
-``mooncake_page_first_multi_buffer=true``: one token chunk is one Mooncake
-page/file, while every layer in that page remains a separate LMCache
+from a particular Mooncake deployment. By default, allocation, ``MemoryObj``
+construction, and LRU insertion use the production LMCache implementations;
+``--object-mode synthetic`` retains the lightweight metadata-only model. Page
+accounting matches ``mooncake_page_first_multi_buffer=true``: full token
+chunks use one multi-buffer Mooncake page, while an unfull tail chunk falls
+back to one legacy file per layer. Every layer remains a separate LMCache
 ``MemoryObj`` and destination buffer.
 """
 
@@ -42,8 +45,14 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemLayerwiseGPUConnector,
 )
 from lmcache.v1.gpu_connector.sparse import build_prepared_sparse_source
+from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_page_key
+from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+    MooncakestoreConnector,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import (
     LocalCPUBackend,
     LocalCPUPrefixGetResult,
@@ -94,6 +103,7 @@ class StageStats:
     capacity_s: float = 0.0
     remote_s: float = 0.0
     remote_layout_s: float = 0.0
+    remote_lookup_s: float = 0.0
     remote_buffer_s: float = 0.0
     remote_wrapper_s: float = 0.0
     remote_pointer_s: float = 0.0
@@ -108,6 +118,8 @@ class StageStats:
     local_probe_calls: int = 0
     local_key_probes: int = 0
     remote_calls: int = 0
+    remote_lookup_calls: int = 0
+    remote_transfer_calls: int = 0
     remote_logical_keys: int = 0
     mooncake_page_objects: int = 0
     lmcache_memory_objects: int = 0
@@ -125,6 +137,7 @@ class BenchmarkResult:
     name: str
     prefix_mode: str
     chunk_plan_mode: str
+    object_mode: str
     kv_group: int
     num_layers: int
     num_chunks: int
@@ -174,6 +187,13 @@ class SyntheticMemoryObj:
     def get_physical_size(self) -> int:
         return self.logical_bytes
 
+    def get_size(self) -> int:
+        return self.logical_bytes
+
+    @property
+    def data_ptr(self) -> int:
+        return self.tensor.data_ptr()
+
 
 class SyntheticAddressManager:
     """Capacity-only allocator view used by the real preflight method."""
@@ -195,7 +215,7 @@ class SyntheticBuffer:
         return self.size
 
 
-class SyntheticLocalCPUBackend:
+class BenchmarkLocalCPUBackend:
     """LocalCPU hot-cache surface with measurable prefix lookup modes."""
 
     def __init__(
@@ -204,26 +224,61 @@ class SyntheticLocalCPUBackend:
         stats: StageStats,
         slab_bytes: int,
         prefix_mode: str,
+        object_mode: str,
+        chunk_size: int,
     ) -> None:
         self.stats = stats
         self.prefix_mode = prefix_mode
+        self.object_mode = object_mode
         self.use_hot = True
-        self.hot_cache: dict[CacheEngineKey, SyntheticMemoryObj] = {}
         self.cpu_lock = threading.RLock()
-        self.cache_policy = SimpleNamespace(update_on_put=lambda _key: None)
+        if object_mode == "production":
+            PinMonitor.GetOrCreate(
+                SimpleNamespace(pin_check_interval_sec=60, pin_timeout_sec=18000)
+            )
+        self.cache_policy = (
+            get_cache_policy("LRU")
+            if object_mode == "production"
+            else SimpleNamespace(
+                update_on_put=lambda _key: None,
+                update_on_put_many=lambda _keys: None,
+            )
+        )
+        self.hot_cache = (
+            self.cache_policy.init_mutable_mapping()
+            if object_mode == "production"
+            else {}
+        )
         self.batched_msg_sender = None
-        root_allocator = SimpleNamespace(
-            buffer=SyntheticBuffer(slab_bytes),
-            address_manager=SyntheticAddressManager(slab_bytes),
+        self.metadata = SimpleNamespace(chunk_size=chunk_size)
+        root_allocator = (
+            TensorMemoryAllocator(torch.empty(slab_bytes, dtype=torch.uint8))
+            if object_mode == "production"
+            else SimpleNamespace(
+                buffer=SyntheticBuffer(slab_bytes),
+                address_manager=SyntheticAddressManager(slab_bytes),
+                align_bytes=4096,
+            )
         )
-        self.memory_allocator = SimpleNamespace(
-            _allocator=root_allocator,
-            align_bytes=4096,
-        )
+        self.memory_allocator = root_allocator
         if prefix_mode == "per-layer":
             # The production code deliberately supports an older LMCache that
             # does not expose the cross-layer method.
             self.batched_get_prefixes_with_misses = None
+
+    allocate = LocalCPUBackend.allocate
+    batched_allocate = LocalCPUBackend.batched_allocate
+
+    def close(self) -> None:
+        """Release production benchmark objects without per-object free calls."""
+        if self.object_mode != "production":
+            return
+        objects = list(self.hot_cache.values())
+        for obj in objects:
+            while obj.is_pinned:
+                obj.unpin()
+        self.memory_allocator.batched_free(objects)
+        self.hot_cache.clear()
 
     def _record_probe(self, layers: Iterable[list[CacheEngineKey]]) -> None:
         layer_list = list(layers)
@@ -270,13 +325,14 @@ class SyntheticPageFirstStorageManager:
         self,
         *,
         stats: StageStats,
-        local_backend: SyntheticLocalCPUBackend,
+        local_backend: BenchmarkLocalCPUBackend,
         num_layers: int,
         num_tokens: int,
         chunk_size: int,
         bytes_per_token: int,
         remote_gbps: float,
         rpc_overhead_us: float,
+        object_mode: str,
     ) -> None:
         self.stats = stats
         self.local_backend = local_backend
@@ -286,21 +342,48 @@ class SyntheticPageFirstStorageManager:
         self.bytes_per_token = bytes_per_token
         self.remote_gbps = remote_gbps
         self.rpc_overhead_us = rpc_overhead_us
-        self.shared_tensor = torch.empty(
-            chunk_size * bytes_per_token,
-            dtype=torch.uint8,
+        self.object_mode = object_mode
+        self.allocator_connector = None
+        self.shared_tensor = (
+            torch.empty(chunk_size * bytes_per_token, dtype=torch.uint8)
+            if object_mode == "synthetic"
+            else None
         )
+        if object_mode == "production":
+            connector = object.__new__(MooncakestoreConnector)
+            connector.local_cpu_backend = local_backend
+            connector._dsa_raw_token_dims = {
+                0: bytes_per_token // 2,
+                1: bytes_per_token // 2,
+            }
+            connector.meta_shapes = [torch.Size([chunk_size * bytes_per_token // 2])]
+            connector.meta_dtypes = [torch.bfloat16]
+            connector.meta_fmt = MemoryFormat.KV_MLA_LATENT_FMT
+            connector.single_token_size = bytes_per_token
+            self.allocator_connector = connector
 
     def _tokens_for_chunk(self, chunk_index: int, num_chunks: int) -> int:
         if chunk_index + 1 < num_chunks:
             return self.chunk_size
         return self.num_tokens - self.chunk_size * (num_chunks - 1)
 
+    def _allocate_production(
+        self,
+        keys: list[CacheEngineKey],
+    ) -> list[Any]:
+        assert self.allocator_connector is not None
+        allocated, _metadata, _mode = (
+            self.allocator_connector._allocate_zero_copy_buffers(keys)
+        )
+        if any(obj is None for obj in allocated):
+            raise MemoryError("production zero-copy allocation returned None")
+        return cast(list[Any], allocated)
+
     def batched_get(
         self,
         keys: list[CacheEngineKey],
         location: Optional[str] = None,
-    ) -> list[SyntheticMemoryObj]:
+    ) -> list[Any]:
         if location != "RemoteBackend":
             raise ValueError(f"unexpected synthetic remote location: {location}")
         started = time.perf_counter()
@@ -350,61 +433,116 @@ class SyntheticPageFirstStorageManager:
             * self.bytes_per_token
             for chunk_index, (page_id, _indices) in enumerate(ordered_pages)
         }
-        transferred_bytes = sum(
-            bytes_by_hash[page_id] for page_id in page_ids
-        )
-        self.stats.mooncake_page_objects += num_chunks
+        full_bytes = self.chunk_size * self.bytes_per_token
+        page_groups = [
+            group for group in ordered_pages if bytes_by_hash[group[0]] == full_bytes
+        ]
+        legacy_indices = [
+            index
+            for page_id, indices in ordered_pages
+            if bytes_by_hash[page_id] != full_bytes
+            for index in indices
+        ]
+        transferred_bytes = sum(bytes_by_hash[page_id] for page_id in page_ids)
+        self.stats.mooncake_page_objects += len(page_groups) + len(legacy_indices)
         self.stats.lmcache_memory_objects += len(keys)
         self.stats.transferred_bytes += transferred_bytes
         self.stats.remote_layout_s += time.perf_counter() - layout_started
 
-        buffer_started = time.perf_counter()
-        allocations = [
-            (
-                bytes_by_hash[page_id],
-                self.shared_tensor[: bytes_by_hash[page_id]],
+        lookup_started = time.perf_counter()
+        lookup_calls = int(bool(ordered_pages))
+        self.stats.remote_lookup_calls += lookup_calls
+        if lookup_calls and self.rpc_overhead_us > 0:
+            time.sleep(self.rpc_overhead_us / 1_000_000)
+        self.stats.remote_lookup_s += time.perf_counter() - lookup_started
+
+        results: list[Optional[Any]] = [None] * len(keys)
+
+        def allocate(indices: list[int]) -> list[Any]:
+            buffer_started = time.perf_counter()
+            if self.object_mode == "production":
+                objects = self._allocate_production([keys[index] for index in indices])
+            else:
+                assert self.shared_tensor is not None
+                allocations = [
+                    (
+                        bytes_by_hash[page_ids[index]],
+                        self.shared_tensor[: bytes_by_hash[page_ids[index]]],
+                    )
+                    for index in indices
+                ]
+                objects = []
+            self.stats.remote_buffer_s += time.perf_counter() - buffer_started
+
+            wrapper_started = time.perf_counter()
+            if self.object_mode == "synthetic":
+                objects = [
+                    SyntheticMemoryObj(logical_bytes, tensor)
+                    for logical_bytes, tensor in allocations
+                ]
+            self.stats.remote_wrapper_s += time.perf_counter() - wrapper_started
+            return objects
+
+        def transfer(byte_count: int) -> None:
+            transfer_started = time.perf_counter()
+            self.stats.remote_transfer_calls += 1
+            delay_s = self.rpc_overhead_us / 1_000_000
+            if self.remote_gbps > 0:
+                delay_s += byte_count / (self.remote_gbps * GB)
+            if delay_s > 0:
+                time.sleep(delay_s)
+            self.stats.remote_transfer_s += time.perf_counter() - transfer_started
+
+        if page_groups:
+            page_indices = [
+                index for _page_id, indices in page_groups for index in indices
+            ]
+            page_objects = allocate(page_indices)
+
+            pointer_started = time.perf_counter()
+            buffer_ptrs: list[list[int]] = []
+            buffer_sizes: list[list[int]] = []
+            offset = 0
+            for _page_id, indices in page_groups:
+                group_objects = page_objects[offset : offset + len(indices)]
+                buffer_ptrs.append([obj.data_ptr for obj in group_objects])
+                buffer_sizes.append([obj.get_size() for obj in group_objects])
+                offset += len(indices)
+            assert len(buffer_ptrs) == len(buffer_sizes) == len(page_groups)
+            self.stats.remote_pointer_s += time.perf_counter() - pointer_started
+
+            transfer(sum(bytes_by_hash[page_ids[index]] for index in page_indices))
+
+            scatter_started = time.perf_counter()
+            for index, obj in zip(page_indices, page_objects, strict=True):
+                results[index] = obj
+            self.stats.remote_scatter_s += time.perf_counter() - scatter_started
+
+        if legacy_indices:
+            legacy_objects = allocate(legacy_indices)
+
+            pointer_started = time.perf_counter()
+            legacy_ptrs = [obj.data_ptr for obj in legacy_objects]
+            legacy_sizes = [obj.get_size() for obj in legacy_objects]
+            assert len(legacy_ptrs) == len(legacy_sizes) == len(legacy_indices)
+            self.stats.remote_pointer_s += time.perf_counter() - pointer_started
+
+            transfer(
+                sum(bytes_by_hash[page_ids[index]] for index in legacy_indices)
             )
-            for page_id, indices in ordered_pages
-            for _ in indices
-        ]
-        self.stats.remote_buffer_s += time.perf_counter() - buffer_started
 
-        wrapper_started = time.perf_counter()
-        memory_objs = [
-            SyntheticMemoryObj(logical_bytes, tensor)
-            for logical_bytes, tensor in allocations
-        ]
-        self.stats.remote_wrapper_s += time.perf_counter() - wrapper_started
-
-        pointer_started = time.perf_counter()
-        buffer_ptrs: list[list[int]] = []
-        buffer_sizes: list[list[int]] = []
-        offset = 0
-        for _page_id, indices in ordered_pages:
-            end = offset + len(indices)
-            page_objects = memory_objs[offset:end]
-            buffer_ptrs.append([obj.tensor.data_ptr() for obj in page_objects])
-            buffer_sizes.append([obj.logical_bytes for obj in page_objects])
-            offset = end
-        assert len(buffer_ptrs) == len(buffer_sizes) == num_chunks
-        self.stats.remote_pointer_s += time.perf_counter() - pointer_started
-
-        transfer_started = time.perf_counter()
-        delay_s = self.rpc_overhead_us / 1_000_000
-        if self.remote_gbps > 0:
-            delay_s += transferred_bytes / (self.remote_gbps * GB)
-        if delay_s > 0:
-            time.sleep(delay_s)
-        self.stats.remote_transfer_s += time.perf_counter() - transfer_started
-
-        scatter_started = time.perf_counter()
-        results: list[Optional[SyntheticMemoryObj]] = [None] * len(keys)
-        offset = 0
-        for _page_id, indices in ordered_pages:
-            for position, index in enumerate(indices, start=offset):
-                results[index] = memory_objs[position]
-            offset += len(indices)
-        self.stats.remote_scatter_s += time.perf_counter() - scatter_started
+            scatter_started = time.perf_counter()
+            for index, obj in zip(legacy_indices, legacy_objects, strict=True):
+                if self.object_mode == "production":
+                    obj = (
+                        MooncakestoreConnector._reshape_partial_chunk_with_token_size(
+                            obj,
+                            bytes_by_hash[page_ids[index]],
+                            self.bytes_per_token,
+                        )
+                    )
+                results[index] = obj
+            self.stats.remote_scatter_s += time.perf_counter() - scatter_started
 
         writeback_started = time.perf_counter()
         LocalCPUBackend.batched_submit_put_task(
@@ -415,7 +553,11 @@ class SyntheticPageFirstStorageManager:
         self.stats.remote_writeback_s += time.perf_counter() - writeback_started
 
         self.stats.remote_s += time.perf_counter() - started
-        return cast(list[SyntheticMemoryObj], results)
+        return cast(list[Any], results)
+
+    def close(self) -> None:
+        """Release production allocations owned by this benchmark run."""
+        self.local_backend.close()
 
 
 class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
@@ -547,12 +689,15 @@ def _make_engine(
     bytes_per_token = (
         args.latent_bytes_per_token if kv_group == 0 else args.indexer_bytes_per_token
     )
-    logical_bytes = args.num_tokens * bytes_per_token * args.num_layers
-    slab_bytes = max(logical_bytes * 2, 1)
-    local_backend = SyntheticLocalCPUBackend(
+    num_objects = math.ceil(args.num_tokens / args.chunk_size) * args.num_layers
+    object_bytes = args.chunk_size * bytes_per_token
+    slab_bytes = math.ceil(object_bytes / 4096) * 4096 * num_objects
+    local_backend = BenchmarkLocalCPUBackend(
         stats=stats,
         slab_bytes=slab_bytes,
         prefix_mode=prefix_mode,
+        object_mode=args.object_mode,
+        chunk_size=args.chunk_size,
     )
     storage_manager = SyntheticPageFirstStorageManager(
         stats=stats,
@@ -563,6 +708,7 @@ def _make_engine(
         bytes_per_token=bytes_per_token,
         remote_gbps=args.remote_gbps,
         rpc_overhead_us=args.rpc_overhead_us,
+        object_mode=args.object_mode,
     )
     connector = SyntheticGPUConnector(stats, args.num_layers)
 
@@ -594,7 +740,12 @@ def _make_engine(
     engine._is_rank0_shared_mem_obj = lambda _obj: True
     engine._shared_cpu_estimated_physical_chunk_bytes = (
         lambda _kv_group, num_tokens=None: (
-            (num_tokens or args.chunk_size) * bytes_per_token
+            (
+                (num_tokens or args.chunk_size) * bytes_per_token
+                + 4095
+            )
+            // 4096
+            * 4096
         )
     )
     engine._validate_rank0_shared_mem_obj = lambda _obj, **_kwargs: None
@@ -721,21 +872,34 @@ def run_once(
 
     expected_chunks = math.ceil(args.num_tokens / args.chunk_size)
     expected_memory_objects = expected_chunks * args.num_layers
+    full_pages, tail_tokens = divmod(args.num_tokens, args.chunk_size)
+    expected_files = full_pages + (args.num_layers if tail_tokens else 0)
     if stats.remote_calls != 1:
         raise AssertionError(
             "page-first cold bootstrap used "
             f"{stats.remote_calls} remote calls, expected 1"
         )
-    if stats.mooncake_page_objects != expected_chunks:
+    expected_transfer_calls = int(full_pages > 0) + int(tail_tokens > 0)
+    if stats.remote_lookup_calls != 1:
+        raise AssertionError(
+            f"Mooncake page lookup count mismatch: {stats.remote_lookup_calls} != 1"
+        )
+    if stats.remote_transfer_calls != expected_transfer_calls:
+        raise AssertionError(
+            "Mooncake transfer call count mismatch: "
+            f"{stats.remote_transfer_calls} != {expected_transfer_calls}"
+        )
+    if stats.mooncake_page_objects != expected_files:
         raise AssertionError(
             "page-first Mooncake object count mismatch: "
-            f"{stats.mooncake_page_objects} != {expected_chunks}"
+            f"{stats.mooncake_page_objects} != {expected_files}"
         )
     if stats.lmcache_memory_objects != expected_memory_objects:
         raise AssertionError(
             "LMCache MemoryObj count mismatch: "
             f"{stats.lmcache_memory_objects} != {expected_memory_objects}"
         )
+    storage_manager.close()
     return stats
 
 
@@ -804,6 +968,7 @@ def run_pair_cases(
                     ),
                     prefix_mode=prefix_mode,
                     chunk_plan_mode=chunk_plan_mode,
+                    object_mode=args.object_mode,
                     kv_group=kv_group,
                     num_layers=args.num_layers,
                     num_chunks=math.ceil(args.num_tokens / args.chunk_size),
@@ -859,15 +1024,19 @@ def print_results(results: list[BenchmarkResult]) -> None:
         )
 
     print("\nPage-first remote breakdown (median ms)")
+    if any(result.object_mode == "production" for result in results):
+        print("  production buffer stage includes metadata, allocation, and wrappers")
     print(
-        f"{'case':38} {'layout':>9} {'buffers':>9} {'wrappers':>9} "
-        f"{'ptr/size':>10} {'transfer':>10} {'scatter':>9} {'hot cache':>11}"
+        f"{'case':38} {'layout':>9} {'lookup':>9} {'buffers':>9} "
+        f"{'wrappers':>9} {'ptr/size':>10} {'transfer':>10} "
+        f"{'scatter':>9} {'hot cache':>11}"
     )
     for result in results:
         stats = result.median
         print(
             f"{result.name:38} "
             f"{_ms(stats.remote_layout_s):9.3f} "
+            f"{_ms(stats.remote_lookup_s):9.3f} "
             f"{_ms(stats.remote_buffer_s):9.3f} "
             f"{_ms(stats.remote_wrapper_s):9.3f} "
             f"{_ms(stats.remote_pointer_s):10.3f} "
@@ -879,7 +1048,8 @@ def print_results(results: list[BenchmarkResult]) -> None:
     print("\nPage-first topology and metadata counts (median)")
     print(
         f"{'case':38} {'probe calls':>12} {'key probes':>11} "
-        f"{'remote calls':>13} {'LMCache objs':>13} {'Mooncake files':>15} "
+        f"{'storage calls':>13} {'lookups':>8} {'xfers':>7} "
+        f"{'LMCache objs':>13} {'Mooncake files':>15} "
         f"{'buffers/file':>13} {'plan reuse':>11}"
     )
     for result in results:
@@ -894,6 +1064,8 @@ def print_results(results: list[BenchmarkResult]) -> None:
             f"{int(stats.local_probe_calls):12d} "
             f"{int(stats.local_key_probes):11d} "
             f"{int(stats.remote_calls):13d} "
+            f"{int(stats.remote_lookup_calls):8d} "
+            f"{int(stats.remote_transfer_calls):7d} "
             f"{int(stats.lmcache_memory_objects):13d} "
             f"{int(stats.mooncake_page_objects):15d} "
             f"{buffers_per_file:13.1f} "
@@ -991,7 +1163,13 @@ def parse_args() -> Namespace:
         "--rpc-overhead-us",
         type=float,
         default=0.0,
-        help="Synthetic fixed latency for the single page-first batch call.",
+        help="Synthetic latency per Mooncake lookup or transfer call.",
+    )
+    parser.add_argument(
+        "--object-mode",
+        choices=("production", "synthetic"),
+        default="production",
+        help="Use real LMCache allocation/MemoryObj/LRU or lightweight stand-ins.",
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=7)
@@ -1000,6 +1178,14 @@ def parse_args() -> Namespace:
 
     if args.num_tokens < 1 or args.chunk_size < 1 or args.num_layers < 1:
         parser.error("token, chunk, and layer counts must be positive")
+    if any(
+        value < 2 or value % 2
+        for value in (
+            args.latent_bytes_per_token,
+            args.indexer_bytes_per_token,
+        )
+    ):
+        parser.error("bytes per token must be positive bfloat16-aligned values")
     if args.repeats < 1 or args.warmup < 0:
         parser.error("repeats must be positive and warmup must be non-negative")
     if args.remote_gbps < 0 or args.rpc_overhead_us < 0:
@@ -1034,15 +1220,19 @@ def main() -> None:
     """Run the requested cold-bootstrap benchmark matrix."""
     args = parse_args()
     chunks = math.ceil(args.num_tokens / args.chunk_size)
+    full_pages, tail_tokens = divmod(args.num_tokens, args.chunk_size)
+    mooncake_files = full_pages + (args.num_layers if tail_tokens else 0)
     print(
         f"tokens={args.num_tokens} chunk_size={args.chunk_size} "
         f"chunks={chunks} layers={args.num_layers} "
-        "layout=mooncake_page_first_multi_buffer"
+        "layout=mooncake_page_first_multi_buffer "
+        f"objects={args.object_mode}"
     )
     print(
         "Each KV group retrieves "
-        f"{chunks * args.num_layers} LMCache MemoryObjs from {chunks} "
-        f"Mooncake page objects/files ({args.num_layers} buffers per page)."
+        f"{chunks * args.num_layers} LMCache MemoryObjs from {mooncake_files} "
+        f"Mooncake files ({full_pages} multi-buffer pages"
+        f" + {args.num_layers if tail_tokens else 0} legacy tail files)."
     )
     print(
         "chunk plan modes="
@@ -1054,7 +1244,7 @@ def main() -> None:
     else:
         print(
             f"remote model={args.remote_gbps:.3f} GB/s + "
-            f"{args.rpc_overhead_us:.1f} us per page-first batch call"
+            f"{args.rpc_overhead_us:.1f} us per Mooncake call"
         )
 
     results = []
