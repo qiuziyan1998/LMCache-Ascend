@@ -101,6 +101,9 @@ class StageStats:
     page_key_s: float = 0.0
     local_probe_s: float = 0.0
     capacity_s: float = 0.0
+    resolver_s: float = 0.0
+    resolver_cpu_s: float = 0.0
+    prime_other_s: float = 0.0
     remote_s: float = 0.0
     remote_layout_s: float = 0.0
     remote_lookup_s: float = 0.0
@@ -112,7 +115,15 @@ class StageStats:
     remote_writeback_s: float = 0.0
     pointer_s: float = 0.0
     handle_s: float = 0.0
+    cache_append_s: float = 0.0
+    cache_append_cpu_s: float = 0.0
+    handle_cache_s: float = 0.0
+    broadcast_s: float = 0.0
+    fence_s: float = 0.0
+    layer_other_s: float = 0.0
     cold_prime_s: float = 0.0
+    cold_layers_s: float = 0.0
+    cold_close_s: float = 0.0
     cold_total_s: float = 0.0
     warm_total_s: float = 0.0
     local_probe_calls: int = 0
@@ -766,14 +777,25 @@ def _make_engine(
         return handles
 
     engine._make_shared_handles_for_layer = make_handles
-    engine._broadcast_shared_envelope = lambda _envelope: setattr(
-        stats,
-        "broadcast_envelopes",
-        stats.broadcast_envelopes + 1,
-    )
+
+    def broadcast(_envelope):
+        started = time.perf_counter()
+        stats.broadcast_envelopes += 1
+        stats.broadcast_s += time.perf_counter() - started
+
+    engine._broadcast_shared_envelope = broadcast
 
     _timed_method(engine, "_ensure_retrieve_chunk_metadata", stats, "metadata_s")
     _timed_method(engine, "_shared_cpu_runtime_capacity_details", stats, "capacity_s")
+    _timed_method(
+        engine,
+        "_resolve_shared_rank0_remote_layers_windowed",
+        stats,
+        "resolver_s",
+    )
+    _timed_method(engine, "_append_retrieve_layer_cache", stats, "cache_append_s")
+    _timed_method(engine, "_append_shared_handle_cache", stats, "handle_cache_s")
+    _timed_method(engine, "_fence_shared_cpu_store_publication", stats, "fence_s")
 
     caches: dict[str, list] = {
         "cached_keys": [],
@@ -793,17 +815,21 @@ def _drive_retriever(
     *,
     num_layers: int,
     num_tokens: int,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     started = time.perf_counter()
     first_mask = next(retriever)
     prime_s = time.perf_counter() - started
     if first_mask is None or int(first_mask.sum().item()) != num_tokens:
         raise AssertionError("cold bootstrap did not retrieve the complete token mask")
+    layers_started = time.perf_counter()
     selected = torch.arange(min(num_tokens, 2048), dtype=torch.long)
     for _ in range(num_layers):
         retriever.send((selected, 0))
+    layers_s = time.perf_counter() - layers_started
+    close_started = time.perf_counter()
     retriever.close()
-    return prime_s, time.perf_counter() - started
+    close_s = time.perf_counter() - close_started
+    return prime_s, time.perf_counter() - started, layers_s, close_s
 
 
 def run_once(
@@ -833,11 +859,46 @@ def run_once(
         shared_cpu_request_preflight_state=shared_preflight_state,
         **caches,
     )
-    stats.cold_prime_s, stats.cold_total_s = _drive_retriever(
-        cold,
-        num_layers=args.num_layers,
-        num_tokens=args.num_tokens,
+    (
+        stats.cold_prime_s,
+        stats.cold_total_s,
+        stats.cold_layers_s,
+        stats.cold_close_s,
+    ) = _drive_retriever(cold, num_layers=args.num_layers, num_tokens=args.num_tokens)
+    tolerance_s = 1e-6
+    if stats.remote_s > stats.resolver_s + tolerance_s:
+        raise AssertionError("remote timing exceeds its enclosing resolver timing")
+    if stats.pointer_s > stats.cache_append_s + tolerance_s:
+        raise AssertionError("pointer timing exceeds its enclosing cache append")
+    layer_stages_s = sum(
+        (
+            stats.cache_append_s,
+            stats.handle_s,
+            stats.handle_cache_s,
+            stats.broadcast_s,
+            stats.fence_s,
+        )
     )
+    if layer_stages_s > stats.cold_layers_s + tolerance_s:
+        raise AssertionError("layer stage timings exceed the measured layer loop")
+    if (
+        stats.cold_prime_s + stats.cold_layers_s + stats.cold_close_s
+        > stats.cold_total_s + tolerance_s
+    ):
+        raise AssertionError("cold sub-stage timings exceed total cold time")
+    stats.resolver_cpu_s = max(0.0, stats.resolver_s - stats.remote_s)
+    stats.cache_append_cpu_s = max(
+        0.0, stats.cache_append_s - stats.pointer_s
+    )
+    stats.prime_other_s = max(
+        0.0,
+        stats.cold_prime_s
+        - stats.metadata_s
+        - stats.local_probe_s
+        - stats.capacity_s
+        - stats.resolver_s,
+    )
+    stats.layer_other_s = max(0.0, stats.cold_layers_s - layer_stages_s)
 
     num_chunks = math.ceil(args.num_tokens / args.chunk_size)
     chunk_counts = [args.chunk_size] * num_chunks
@@ -860,7 +921,7 @@ def run_once(
         req_id=f"warm-g{kv_group}-{prefix_mode}",
         prepared_sparse_source=prepared,
     )
-    _prime_s, stats.warm_total_s = _drive_retriever(
+    _prime_s, stats.warm_total_s, _layers_s, _close_s = _drive_retriever(
         warm,
         num_layers=args.num_layers,
         num_tokens=args.num_tokens,
@@ -898,6 +959,21 @@ def run_once(
         raise AssertionError(
             "LMCache MemoryObj count mismatch: "
             f"{stats.lmcache_memory_objects} != {expected_memory_objects}"
+        )
+    if stats.pointer_objects != expected_memory_objects:
+        raise AssertionError(
+            f"pointer count mismatch: {stats.pointer_objects} "
+            f"!= {expected_memory_objects}"
+        )
+    if stats.handle_objects != expected_memory_objects:
+        raise AssertionError(
+            f"handle count mismatch: {stats.handle_objects} "
+            f"!= {expected_memory_objects}"
+        )
+    if stats.broadcast_envelopes != args.num_layers:
+        raise AssertionError(
+            f"envelope count mismatch: {stats.broadcast_envelopes} "
+            f"!= {args.num_layers}"
         )
     storage_manager.close()
     return stats
@@ -1021,6 +1097,53 @@ def print_results(results: list[BenchmarkResult]) -> None:
             f"{_ms(stats.remote_s):9.3f} "
             f"{_ms(stats.pointer_s):9.3f} "
             f"{_ms(stats.handle_s):9.3f}"
+        )
+
+    print(
+        "\nFirst-yield attribution (median ms; remote is nested inside resolver)"
+    )
+    print(
+        f"{'case':38} {'prime':>9} {'metadata':>10} {'probe':>9} "
+        f"{'capacity':>10} {'resolver':>10} {'remote':>9} "
+        f"{'resolve CPU':>12} {'other':>9}"
+    )
+    for result in results:
+        stats = result.median
+        print(
+            f"{result.name:38} "
+            f"{_ms(stats.cold_prime_s):9.3f} "
+            f"{_ms(stats.metadata_s):10.3f} "
+            f"{_ms(stats.local_probe_s):9.3f} "
+            f"{_ms(stats.capacity_s):10.3f} "
+            f"{_ms(stats.resolver_s):10.3f} "
+            f"{_ms(stats.remote_s):9.3f} "
+            f"{_ms(stats.resolver_cpu_s):12.3f} "
+            f"{_ms(stats.prime_other_s):9.3f}"
+        )
+
+    print(
+        "\nPost-prime layer attribution "
+        "(median ms; pointer is nested inside cache append)"
+    )
+    print(
+        f"{'case':38} {'layers':>9} {'cache append':>13} {'append CPU':>11} "
+        f"{'pointer':>9} {'handles':>9} {'handle cache':>13} "
+        f"{'broadcast':>10} {'fence':>8} {'other':>9} {'close':>9}"
+    )
+    for result in results:
+        stats = result.median
+        print(
+            f"{result.name:38} "
+            f"{_ms(stats.cold_layers_s):9.3f} "
+            f"{_ms(stats.cache_append_s):13.3f} "
+            f"{_ms(stats.cache_append_cpu_s):11.3f} "
+            f"{_ms(stats.pointer_s):9.3f} "
+            f"{_ms(stats.handle_s):9.3f} "
+            f"{_ms(stats.handle_cache_s):13.3f} "
+            f"{_ms(stats.broadcast_s):10.3f} "
+            f"{_ms(stats.fence_s):8.3f} "
+            f"{_ms(stats.layer_other_s):9.3f} "
+            f"{_ms(stats.cold_close_s):9.3f}"
         )
 
     print("\nPage-first remote breakdown (median ms)")
