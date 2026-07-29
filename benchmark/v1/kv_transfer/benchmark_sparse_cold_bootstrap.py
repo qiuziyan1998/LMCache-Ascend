@@ -585,7 +585,7 @@ class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def append_sparse_chunk_ptr_cache_for_layer(
         self,
         layer_id: int,
-        new_tensors: list[torch.Tensor],
+        new_sources: list[Any],
         cached_chunk_dev_ptrs: list[list[int]],
         cached_chunk_ptrs_npu: list[Optional[torch.Tensor]],
     ) -> None:
@@ -594,7 +594,11 @@ class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             cached_chunk_dev_ptrs.append([])
         while len(cached_chunk_ptrs_npu) < self.num_layers:
             cached_chunk_ptrs_npu.append(None)
-        new_ptrs = [id(tensor) for tensor in new_tensors]
+        new_ptrs = [
+            int(ptr() if callable(ptr) else ptr)
+            for source in new_sources
+            for ptr in (source.data_ptr,)
+        ]
         cached_chunk_dev_ptrs[layer_id].extend(new_ptrs)
         pointer_tensor = torch.tensor(new_ptrs, dtype=torch.int64)
         existing = cached_chunk_ptrs_npu[layer_id]
@@ -909,6 +913,7 @@ def run_once(
         num_layers=args.num_layers,
         total_tokens=args.num_tokens,
         chunk_token_counts=chunk_counts,
+        cached_memory_objs=caches["cached_memory_objs"],
     )
     if prepared is None:
         raise AssertionError("cold bootstrap did not produce a prepared source")

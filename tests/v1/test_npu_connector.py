@@ -3,6 +3,7 @@
 # Standard
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 # Third Party
@@ -807,6 +808,7 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
 
 
 def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
     connector.kvcaches = [(object(), object())]
@@ -827,7 +829,13 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
 
     class _MemoryObj:
         def __init__(self, tensor):
-            self.tensor = tensor
+            self._tensor = tensor
+            self.tensor_reads = 0
+
+        @property
+        def tensor(self):
+            self.tensor_reads += 1
+            return self._tensor
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
     monkeypatch.setattr(
@@ -858,13 +866,24 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
             selected_token_idx,
         ),
     )
-    monkeypatch.setattr(
-        connector,
-        "_resolve_sparse_chunk_ptrs_npu",
-        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu: torch.tensor(
-            [123], dtype=torch.long
-        ),
-    )
+    resolve_calls = []
+
+    def _resolve_ptrs(
+        layer_id,
+        cpu_tensors,
+        cached_chunk_ptrs_npu,
+        expected_num_chunks=None,
+    ):
+        resolve_calls.append(
+            (layer_id, cpu_tensors, cached_chunk_ptrs_npu, expected_num_chunks)
+        )
+        return (
+            cached_chunk_ptrs_npu[layer_id]
+            if cached_chunk_ptrs_npu
+            else torch.tensor([123], dtype=torch.long)
+        )
+
+    monkeypatch.setattr(connector, "_resolve_sparse_chunk_ptrs_npu", _resolve_ptrs)
 
     calls = []
 
@@ -896,8 +915,33 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
     assert calls[0]["cpu_tensors"][0] is cached_tensor
     assert calls[0]["layer_tensors"][0] is cached_tensor
 
+    pointer_objs = [_MemoryObj(torch.zeros(4)), _MemoryObj(torch.ones(4))]
+    pointer_table = torch.tensor([101, 102], dtype=torch.long)
+    pointer_gen = connector.batched_to_gpu_head_token_wise(
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=True,
+        cached_tensors=[],
+        cached_memory_objs=[pointer_objs],
+        cached_chunk_ptrs_npu=[pointer_table],
+        lmcache_cached_tokens=4,
+        kv_group=0,
+    )
+    next(pointer_gen)
+    pointer_gen.send(
+        ([pointer_objs[-1]], torch.arange(4, dtype=torch.int32), 0)
+    )
+
+    assert [obj.tensor_reads for obj in pointer_objs] == [1, 0]
+    assert resolve_calls[-1][3] == 2
+    assert calls[-1]["chunk_ptrs_npu"] is pointer_table
+    assert len(calls[-1]["cpu_tensors"]) == 1
+    assert calls[-1]["cpu_tensors"][0] is pointer_objs[0]._tensor
+    gen.close()
+    pointer_gen.close()
+
 
 def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
     connector.lmcache_chunk_size = 256
@@ -913,9 +957,16 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
         kv_device = torch.device("cpu")
         gpu_buffer_allocator = None
 
+    class _Owner:
+        @property
+        def tensor(self):
+            raise AssertionError("prepared transfer materialized an owner tensor")
+
+    owner: Any = _Owner()
     source_layer = PreparedSparseSourceLayer(
-        tensors=(torch.zeros(4),),
+        tensors=(),
         chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+        memory_objs=(owner,),
     )
     source = PreparedSparseSource(
         layers=(source_layer,),

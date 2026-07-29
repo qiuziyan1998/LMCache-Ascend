@@ -812,25 +812,45 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
         new_tensors: List[torch.Tensor] = []
-        for chunk_index, mem_obj in enumerate(mem_objs_layer):
-            tensor = mem_obj.tensor
-            if tensor is None:
+        append_ptrs_fn = getattr(
+            self.gpu_connector,
+            "append_sparse_chunk_ptr_cache_for_layer",
+            None,
+        )
+        pointer_first = (
+            append_ptrs_fn is not None
+            and cached_memory_objs is not None
+            and cached_chunk_dev_ptrs is not None
+            and cached_chunk_ptrs_npu is not None
+            and not any(cached_tensors or ())
+        )
+        if pointer_first:
+            assert append_ptrs_fn is not None
+            if any(not mem_obj.is_valid() for mem_obj in mem_objs_layer):
                 raise ValueError(
-                    "Layerwise sparse retrieve resolved a chunk without a "
-                    "tensor; refusing to shift the direct-load pointer order: "
-                    f"layer_id={layer_id}, chunk_index={chunk_index}"
+                    "Layerwise sparse retrieve resolved an invalid MemoryObj."
                 )
-            new_tensors.append(tensor)
-        if new_tensors and cached_chunk_dev_ptrs is not None:
-            append_ptrs_fn = getattr(
-                self.gpu_connector,
-                "append_sparse_chunk_ptr_cache_for_layer",
-                None,
+            append_ptrs_fn(
+                layer_id,
+                mem_objs_layer,
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
             )
-            if append_ptrs_fn is not None:
-                # Resolve pointer tables before publishing the MemoryObjs/tensors
-                # into ReqMeta so failures cannot leave a hot-reusable partial
-                # state without NPU pointer-cache coverage.
+        else:
+            for chunk_index, mem_obj in enumerate(mem_objs_layer):
+                tensor = mem_obj.tensor
+                if tensor is None:
+                    raise ValueError(
+                        "Layerwise sparse retrieve resolved a chunk without a "
+                        "tensor; refusing to shift the direct-load pointer order: "
+                        f"layer_id={layer_id}, chunk_index={chunk_index}"
+                    )
+                new_tensors.append(tensor)
+            if (
+                new_tensors
+                and cached_chunk_dev_ptrs is not None
+                and append_ptrs_fn is not None
+            ):
                 append_ptrs_fn(
                     layer_id,
                     new_tensors,
@@ -924,17 +944,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_memory_objs: Optional[List],
         num_layers: int,
     ) -> bool:
-        if cached_tensors is not None and len(cached_tensors) == num_layers:
-            return any(
-                AscendLMCacheEngine._cache_layer_has_entries(layer_cache)
-                for layer_cache in cached_tensors
+        return any(
+            cache is not None
+            and len(cache) == num_layers
+            and any(
+                AscendLMCacheEngine._cache_layer_has_entries(layer)
+                for layer in cache
             )
-        if cached_memory_objs is not None and len(cached_memory_objs) == num_layers:
-            return any(
-                AscendLMCacheEngine._cache_layer_has_entries(layer_cache)
-                for layer_cache in cached_memory_objs
-            )
-        return False
+            for cache in (cached_tensors, cached_memory_objs)
+        )
 
     @staticmethod
     def _retrieve_data_cache_covers(
@@ -2933,13 +2951,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         assert task is not None
                         mem_objs_layer = task.result()
                     if mem_objs_layer is not None:
-                        layer_cached_chunks = (
-                            len(cached_tensors[layer_id])
-                            if cached_tensors is not None
-                            and len(cached_tensors) > layer_id
-                            else 0
-                        )
-                        if layer_cached_chunks < len(retrieve_keys[0]):
+                        if cached_prefix_chunks < required_chunks:
                             self._append_retrieve_layer_cache(
                                 layer_id,
                                 mem_objs_layer,
