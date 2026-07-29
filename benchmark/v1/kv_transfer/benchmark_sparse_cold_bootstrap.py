@@ -26,7 +26,7 @@ from argparse import ArgumentParser, Namespace
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, cast
 import json
 import math
 import statistics
@@ -93,6 +93,13 @@ class StageStats:
     local_probe_s: float = 0.0
     capacity_s: float = 0.0
     remote_s: float = 0.0
+    remote_layout_s: float = 0.0
+    remote_buffer_s: float = 0.0
+    remote_wrapper_s: float = 0.0
+    remote_pointer_s: float = 0.0
+    remote_transfer_s: float = 0.0
+    remote_scatter_s: float = 0.0
+    remote_writeback_s: float = 0.0
     pointer_s: float = 0.0
     handle_s: float = 0.0
     cold_prime_s: float = 0.0
@@ -200,8 +207,11 @@ class SyntheticLocalCPUBackend:
     ) -> None:
         self.stats = stats
         self.prefix_mode = prefix_mode
+        self.use_hot = True
         self.hot_cache: dict[CacheEngineKey, SyntheticMemoryObj] = {}
         self.cpu_lock = threading.RLock()
+        self.cache_policy = SimpleNamespace(update_on_put=lambda _key: None)
+        self.batched_msg_sender = None
         root_allocator = SimpleNamespace(
             buffer=SyntheticBuffer(slab_bytes),
             address_manager=SyntheticAddressManager(slab_bytes),
@@ -317,6 +327,7 @@ class SyntheticPageFirstStorageManager:
             page_ids.append(page_id)
         self.stats.page_key_s += time.perf_counter() - page_key_started
 
+        layout_started = time.perf_counter()
         indices_by_page: dict[str, list[int]] = {}
         for index, page_id in enumerate(page_ids):
             indices_by_page.setdefault(page_id, []).append(index)
@@ -345,28 +356,66 @@ class SyntheticPageFirstStorageManager:
         self.stats.mooncake_page_objects += num_chunks
         self.stats.lmcache_memory_objects += len(keys)
         self.stats.transferred_bytes += transferred_bytes
+        self.stats.remote_layout_s += time.perf_counter() - layout_started
 
+        buffer_started = time.perf_counter()
+        allocations = [
+            (
+                bytes_by_hash[page_id],
+                self.shared_tensor[: bytes_by_hash[page_id]],
+            )
+            for page_id, indices in ordered_pages
+            for _ in indices
+        ]
+        self.stats.remote_buffer_s += time.perf_counter() - buffer_started
+
+        wrapper_started = time.perf_counter()
+        memory_objs = [
+            SyntheticMemoryObj(logical_bytes, tensor)
+            for logical_bytes, tensor in allocations
+        ]
+        self.stats.remote_wrapper_s += time.perf_counter() - wrapper_started
+
+        pointer_started = time.perf_counter()
+        buffer_ptrs: list[list[int]] = []
+        buffer_sizes: list[list[int]] = []
+        offset = 0
+        for _page_id, indices in ordered_pages:
+            end = offset + len(indices)
+            page_objects = memory_objs[offset:end]
+            buffer_ptrs.append([obj.tensor.data_ptr() for obj in page_objects])
+            buffer_sizes.append([obj.logical_bytes for obj in page_objects])
+            offset = end
+        assert len(buffer_ptrs) == len(buffer_sizes) == num_chunks
+        self.stats.remote_pointer_s += time.perf_counter() - pointer_started
+
+        transfer_started = time.perf_counter()
         delay_s = self.rpc_overhead_us / 1_000_000
         if self.remote_gbps > 0:
             delay_s += transferred_bytes / (self.remote_gbps * GB)
         if delay_s > 0:
             time.sleep(delay_s)
+        self.stats.remote_transfer_s += time.perf_counter() - transfer_started
 
-        results: list[SyntheticMemoryObj] = []
-        for key, page_id in zip(keys, page_ids, strict=True):
-            logical_bytes = bytes_by_hash[page_id]
-            memory_obj = SyntheticMemoryObj(
-                logical_bytes,
-                self.shared_tensor[:logical_bytes],
-            )
-            # StorageManager normally installs a cache-owned reference before
-            # returning the caller-owned object.
-            memory_obj.ref_count_up()
-            self.local_backend.hot_cache[key] = memory_obj
-            results.append(memory_obj)
+        scatter_started = time.perf_counter()
+        results: list[Optional[SyntheticMemoryObj]] = [None] * len(keys)
+        offset = 0
+        for _page_id, indices in ordered_pages:
+            for position, index in enumerate(indices, start=offset):
+                results[index] = memory_objs[position]
+            offset += len(indices)
+        self.stats.remote_scatter_s += time.perf_counter() - scatter_started
+
+        writeback_started = time.perf_counter()
+        LocalCPUBackend.batched_submit_put_task(
+            self.local_backend,
+            keys,
+            cast(list[Any], results),
+        )
+        self.stats.remote_writeback_s += time.perf_counter() - writeback_started
 
         self.stats.remote_s += time.perf_counter() - started
-        return results
+        return cast(list[SyntheticMemoryObj], results)
 
 
 class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
@@ -720,52 +769,50 @@ def _run_pair_once(
     }
 
 
-def run_pair_case(
+def run_pair_cases(
     args: Namespace,
     *,
     prefix_mode: str,
-    chunk_plan_mode: str,
 ) -> list[BenchmarkResult]:
-    """Run one paired latent/indexer cold-bootstrap configuration."""
-    for _ in range(args.warmup):
-        _run_pair_once(
-            args,
-            prefix_mode=prefix_mode,
-            chunk_plan_mode=chunk_plan_mode,
-        )
-    pair_samples = [
-        _run_pair_once(
-            args,
-            prefix_mode=prefix_mode,
-            chunk_plan_mode=chunk_plan_mode,
-        )
-        for _ in range(args.repeats)
-    ]
-    results = []
-    for kv_group in args.kv_groups:
-        samples = [sample[kv_group] for sample in pair_samples]
-        bytes_per_token = (
-            args.latent_bytes_per_token
-            if kv_group == 0
-            else args.indexer_bytes_per_token
-        )
-        results.append(
-            BenchmarkResult(
-                name=(
-                    f"g{kv_group}_{prefix_mode.replace('-', '_')}_"
-                    f"{chunk_plan_mode}"
-                ),
+    """Interleave plan modes to avoid order-dependent timing bias."""
+    samples_by_mode = {mode: [] for mode in args.chunk_plan_modes}
+    for repeat in range(args.warmup + args.repeats):
+        modes = args.chunk_plan_modes[:: 1 if repeat % 2 == 0 else -1]
+        for chunk_plan_mode in modes:
+            sample = _run_pair_once(
+                args,
                 prefix_mode=prefix_mode,
                 chunk_plan_mode=chunk_plan_mode,
-                kv_group=kv_group,
-                num_layers=args.num_layers,
-                num_chunks=math.ceil(args.num_tokens / args.chunk_size),
-                bytes_per_token=bytes_per_token,
-                repeats=args.repeats,
-                median=_median_stats(samples),
-                samples=samples,
             )
-        )
+            if repeat >= args.warmup:
+                samples_by_mode[chunk_plan_mode].append(sample)
+
+    results = []
+    for chunk_plan_mode, pair_samples in samples_by_mode.items():
+        for kv_group in args.kv_groups:
+            samples = [sample[kv_group] for sample in pair_samples]
+            bytes_per_token = (
+                args.latent_bytes_per_token
+                if kv_group == 0
+                else args.indexer_bytes_per_token
+            )
+            results.append(
+                BenchmarkResult(
+                    name=(
+                        f"g{kv_group}_{prefix_mode.replace('-', '_')}_"
+                        f"{chunk_plan_mode}"
+                    ),
+                    prefix_mode=prefix_mode,
+                    chunk_plan_mode=chunk_plan_mode,
+                    kv_group=kv_group,
+                    num_layers=args.num_layers,
+                    num_chunks=math.ceil(args.num_tokens / args.chunk_size),
+                    bytes_per_token=bytes_per_token,
+                    repeats=args.repeats,
+                    median=_median_stats(samples),
+                    samples=samples,
+                )
+            )
     return results
 
 
@@ -809,6 +856,24 @@ def print_results(results: list[BenchmarkResult]) -> None:
             f"{_ms(stats.remote_s):9.3f} "
             f"{_ms(stats.pointer_s):9.3f} "
             f"{_ms(stats.handle_s):9.3f}"
+        )
+
+    print("\nPage-first remote breakdown (median ms)")
+    print(
+        f"{'case':38} {'layout':>9} {'buffers':>9} {'wrappers':>9} "
+        f"{'ptr/size':>10} {'transfer':>10} {'scatter':>9} {'hot cache':>11}"
+    )
+    for result in results:
+        stats = result.median
+        print(
+            f"{result.name:38} "
+            f"{_ms(stats.remote_layout_s):9.3f} "
+            f"{_ms(stats.remote_buffer_s):9.3f} "
+            f"{_ms(stats.remote_wrapper_s):9.3f} "
+            f"{_ms(stats.remote_pointer_s):10.3f} "
+            f"{_ms(stats.remote_transfer_s):10.3f} "
+            f"{_ms(stats.remote_scatter_s):9.3f} "
+            f"{_ms(stats.remote_writeback_s):11.3f}"
         )
 
     print("\nPage-first topology and metadata counts (median)")
@@ -993,23 +1058,16 @@ def main() -> None:
         )
 
     results = []
-    total_cases = len(args.chunk_plan_modes) * len(args.prefix_modes)
-    cases = (
-        (chunk_plan_mode, prefix_mode)
-        for chunk_plan_mode in args.chunk_plan_modes
-        for prefix_mode in args.prefix_modes
-    )
-    for case_index, (chunk_plan_mode, prefix_mode) in enumerate(cases, start=1):
+    for case_index, prefix_mode in enumerate(args.prefix_modes, start=1):
         print(
-            f"[progress] case {case_index}/{total_cases}: "
-            f"chunk_plan={chunk_plan_mode} prefix_mode={prefix_mode}",
+            f"[progress] case {case_index}/{len(args.prefix_modes)}: "
+            f"prefix_mode={prefix_mode}; chunk plans run interleaved",
             flush=True,
         )
         results.extend(
-            run_pair_case(
+            run_pair_cases(
                 args,
                 prefix_mode=prefix_mode,
-                chunk_plan_mode=chunk_plan_mode,
             )
         )
     print_results(results)
