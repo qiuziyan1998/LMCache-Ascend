@@ -530,6 +530,7 @@ def _make_engine(
     engine.gpu_connector = connector
     engine._shared_cpu_request_leases = {}
     engine.config = SimpleNamespace(
+        chunk_size=args.chunk_size,
         experimental_sampled_layerwise_lookup=True,
         shared_cpu_remote_layers_per_batch=1,
         dsa_two_groups=True,
