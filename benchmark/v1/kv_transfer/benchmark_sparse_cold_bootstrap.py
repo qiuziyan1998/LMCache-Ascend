@@ -103,6 +103,14 @@ class StageStats:
     capacity_s: float = 0.0
     resolver_s: float = 0.0
     resolver_cpu_s: float = 0.0
+    resolver_windows_s: float = 0.0
+    resolver_results_s: float = 0.0
+    resolver_classification_s: float = 0.0
+    resolver_pinning_s: float = 0.0
+    resolver_validation_s: float = 0.0
+    resolver_scatter_s: float = 0.0
+    resolver_rollback_s: float = 0.0
+    resolver_unattributed_s: float = 0.0
     prime_other_s: float = 0.0
     remote_s: float = 0.0
     remote_layout_s: float = 0.0
@@ -271,6 +279,9 @@ class BenchmarkLocalCPUBackend:
                 align_bytes=4096,
             )
         )
+        if object_mode == "production":
+            root_allocator.shm_name = "/lmcache-benchmark"
+            root_allocator.pin_allocator = root_allocator
         self.memory_allocator = root_allocator
         if prefix_mode == "per-layer":
             # The production code deliberately supports an older LMCache that
@@ -733,6 +744,8 @@ def _make_engine(
     engine.enable_shared_cpu_cache = True
     engine.save_only_first_rank = True
     engine.save_indexer_only_first_rank = True
+    engine.dsa_two_groups = True
+    engine.shared_cpu_cache_name = "/lmcache-benchmark"
     engine.shared_cpu_cache_generation = 1
     engine.metadata = metadata
     engine.token_database = token_database
@@ -752,7 +765,9 @@ def _make_engine(
     engine.is_healthy = lambda: True
     engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
     engine._shared_local_cpu_backend = lambda: local_backend
-    engine._is_rank0_shared_mem_obj = lambda _obj: True
+    if args.object_mode == "synthetic":
+        engine._is_rank0_shared_mem_obj = lambda _obj: True
+        engine._validate_rank0_shared_mem_obj = lambda _obj, **_kwargs: None
     engine._shared_cpu_estimated_physical_chunk_bytes = (
         lambda _kv_group, num_tokens=None: (
             (
@@ -763,8 +778,13 @@ def _make_engine(
             * 4096
         )
     )
-    engine._validate_rank0_shared_mem_obj = lambda _obj, **_kwargs: None
     engine.shared_cpu_rank0_request_object_ids = lambda _req_id, _kv_group: set()
+
+    def record_resolver_stage(stage: str, elapsed_s: float) -> None:
+        field_name = f"resolver_{stage}_s"
+        setattr(stats, field_name, getattr(stats, field_name) + elapsed_s)
+
+    engine._shared_rank0_resolver_timing_hook = record_resolver_stage
 
     def make_handles(**kwargs):
         started = time.perf_counter()
@@ -891,6 +911,24 @@ def run_once(
     ):
         raise AssertionError("cold sub-stage timings exceed total cold time")
     stats.resolver_cpu_s = max(0.0, stats.resolver_s - stats.remote_s)
+    resolver_attributed_s = sum(
+        (
+            stats.resolver_windows_s,
+            stats.resolver_results_s,
+            stats.resolver_classification_s,
+            stats.resolver_pinning_s,
+            stats.resolver_validation_s,
+            stats.resolver_scatter_s,
+        )
+    )
+    if resolver_attributed_s > stats.resolver_cpu_s + tolerance_s:
+        raise AssertionError(
+            "resolver sub-stage timings exceed resolver CPU time"
+        )
+    stats.resolver_unattributed_s = max(
+        0.0,
+        stats.resolver_cpu_s - resolver_attributed_s,
+    )
     stats.cache_append_cpu_s = max(
         0.0, stats.cache_append_s - stats.pointer_s
     )
@@ -970,6 +1008,17 @@ def run_once(
             f"pointer count mismatch: {stats.pointer_objects} "
             f"!= {expected_memory_objects}"
         )
+    if args.object_mode == "production":
+        memory_objs = [
+            obj for layer in caches["cached_memory_objs"] for obj in layer
+        ]
+        if any(caches["cached_tensors"]) or any(
+            not obj.is_pinned for obj in memory_objs
+        ):
+            raise AssertionError(
+                "pointer-first bootstrap must retain pinned MemoryObjs without "
+                "constructing per-chunk tensor views"
+            )
     if stats.handle_objects != expected_memory_objects:
         raise AssertionError(
             f"handle count mismatch: {stats.handle_objects} "
@@ -1124,6 +1173,26 @@ def print_results(results: list[BenchmarkResult]) -> None:
             f"{_ms(stats.remote_s):9.3f} "
             f"{_ms(stats.resolver_cpu_s):12.3f} "
             f"{_ms(stats.prime_other_s):9.3f}"
+        )
+
+    print("\nResolver CPU attribution (median ms; remote call excluded)")
+    print(
+        f"{'case':38} {'windows':>9} {'results':>9} {'classify':>10} "
+        f"{'pin':>9} {'validate':>10} {'scatter':>9} "
+        f"{'unattributed':>13} {'rollback':>10}"
+    )
+    for result in results:
+        stats = result.median
+        print(
+            f"{result.name:38} "
+            f"{_ms(stats.resolver_windows_s):9.3f} "
+            f"{_ms(stats.resolver_results_s):9.3f} "
+            f"{_ms(stats.resolver_classification_s):10.3f} "
+            f"{_ms(stats.resolver_pinning_s):9.3f} "
+            f"{_ms(stats.resolver_validation_s):10.3f} "
+            f"{_ms(stats.resolver_scatter_s):9.3f} "
+            f"{_ms(stats.resolver_unattributed_s):13.3f} "
+            f"{_ms(stats.resolver_rollback_s):10.3f}"
         )
 
     print(

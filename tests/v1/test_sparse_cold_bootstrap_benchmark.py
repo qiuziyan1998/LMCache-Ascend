@@ -27,8 +27,16 @@ def _load_benchmark_module():
     return module
 
 
-def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse():
+def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse(
+    monkeypatch,
+):
     benchmark = _load_benchmark_module()
+    monitor = SimpleNamespace(on_pin=lambda _obj: None, on_unpin=lambda _obj: None)
+    monkeypatch.setattr(
+        benchmark.PinMonitor,
+        "GetOrCreate",
+        lambda _config=None: monitor,
+    )
     args = SimpleNamespace(
         num_tokens=512,
         chunk_size=256,
@@ -37,6 +45,7 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse()
         indexer_bytes_per_token=256,
         remote_gbps=0.0,
         rpc_overhead_us=0.0,
+        object_mode="production",
         kv_groups=[0, 1],
     )
 
@@ -62,6 +71,8 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse()
         assert result.broadcast_envelopes == 3
         assert result.transferred_bytes == 512 * 1152 * 3
         assert result.warm_total_s > 0
+        assert result.resolver_validation_s > 0
+        assert result.resolver_rollback_s == 0
 
 
 def test_cold_bootstrap_token_database_config_is_schema_independent():
@@ -109,6 +120,7 @@ def test_cold_bootstrap_pair_reuses_latent_chunk_hash_plan_for_indexer() -> None
         indexer_bytes_per_token=256,
         remote_gbps=0.0,
         rpc_overhead_us=0.0,
+        object_mode="synthetic",
         kv_groups=[0, 1],
     )
 
