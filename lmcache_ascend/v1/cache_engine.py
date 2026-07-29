@@ -28,6 +28,7 @@ from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
 from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.token_database import TokenDatabase
@@ -1739,6 +1740,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             try:
                 t_start = time.perf_counter()
+                page_first_store = mooncake_page_layout_enabled(self.config)
                 mem_obj_generator = self.gpu_connector.batched_from_gpu(
                     memory_objs, starts, ends, **kwargs
                 )
@@ -1756,13 +1758,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_chunk_ptrs_npu,
                         cache_chunk_indices,
                     )
+                    if not page_first_store:
+                        required_futures = self.storage_manager.batched_put(
+                            keys[layer_id],
+                            memory_objs[layer_id],
+                            location=self.store_location,
+                        )
+                        self._track_sync_store_futures(required_futures)
+                        for mem_obj in memory_objs[layer_id]:
+                            pending_store_release.pop(id(mem_obj), None)
+
+                if page_first_store:
+                    flattened_keys = [key for layer_keys in keys for key in layer_keys]
+                    flattened_memory_objs = [
+                        obj for layer_objs in memory_objs for obj in layer_objs
+                    ]
                     required_futures = self.storage_manager.batched_put(
-                        keys[layer_id],
-                        memory_objs[layer_id],
+                        flattened_keys,
+                        flattened_memory_objs,
                         location=self.store_location,
                     )
                     self._track_sync_store_futures(required_futures)
-                    for mem_obj in memory_objs[layer_id]:
+                    for mem_obj in flattened_memory_objs:
                         pending_store_release.pop(id(mem_obj), None)
 
                 tot_time = time.perf_counter() - t_start
@@ -2468,7 +2485,25 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
         sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
-        if shared_sparse_retrieve and not use_cached_retrieve and any(missing_keys):
+        remote_layers_per_batch = max(
+            1,
+            min(
+                self.num_layers,
+                int(
+                    self._get_shared_config_value(
+                        "shared_cpu_remote_layers_per_batch",
+                        1,
+                    )
+                ),
+            ),
+        )
+        if mooncake_page_layout_enabled(self.config):
+            remote_layers_per_batch = self.num_layers
+        if (
+            shared_sparse_retrieve
+            and not use_cached_retrieve
+            and any(missing_keys)
+        ):
             missing_locations: list[tuple[int, int]] = []
             if sampled_worker_retrieve:
                 local_cpu_backend = self._shared_local_cpu_backend()
@@ -2565,43 +2600,71 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
-                        for layer_id, layer_keys in enumerate(missing_keys):
-                            if sampled_worker_retrieve:
-                                local_prefix = local_prefix_layers[layer_id]
-                                assert local_prefix is not None
-                                # The resolver consumes every retained local
-                                # reference, whether it succeeds or raises.
-                                local_prefix_layers[layer_id] = None
-                                mem_objs_layer = (
-                                    self._resolve_shared_rank0_layer_mem_objs(
-                                        req_id=kwargs.get("req_id", "unspecified"),
-                                        phase=kwargs.get(
-                                            "shared_cpu_phase",
-                                            "sparse_decode_bootstrap",
-                                        ),
-                                        layer_id=layer_id,
-                                        kv_group=kv_group,
-                                        keys_layer=layer_keys,
-                                        local_prefix=local_prefix,
-                                    )
+                        remote_only = all(
+                            location_name == "RemoteBackend"
+                            for layer_locations in shared_chunk_locations_layer_major
+                            for location_name in layer_locations
+                        )
+                        if remote_layers_per_batch > 1 and remote_only:
+                            release_local_prefix_layers()
+                            pre_resolved_shared_mem_layers = (
+                                self._resolve_shared_rank0_remote_layers_windowed(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    kv_group=kv_group,
+                                    keys_layer_major=missing_keys,
+                                    layers_per_batch=remote_layers_per_batch,
                                 )
-                            else:
-                                mem_objs_layer = (
-                                    self._resolve_shared_rank0_layer_mem_objs(
-                                        req_id=kwargs.get("req_id", "unspecified"),
-                                        phase=kwargs.get(
-                                            "shared_cpu_phase",
-                                            "sparse_decode_bootstrap",
-                                        ),
-                                        layer_id=layer_id,
-                                        kv_group=kv_group,
-                                        keys_layer=layer_keys,
-                                        chunk_locations=(
-                                            shared_chunk_locations_layer_major[layer_id]
-                                        ),
+                            )
+                        else:
+                            for layer_id, layer_keys in enumerate(missing_keys):
+                                if sampled_worker_retrieve:
+                                    local_prefix = local_prefix_layers[layer_id]
+                                    assert local_prefix is not None
+                                    # The resolver consumes every retained local
+                                    # reference, whether it succeeds or raises.
+                                    local_prefix_layers[layer_id] = None
+                                    mem_objs_layer = (
+                                        self._resolve_shared_rank0_layer_mem_objs(
+                                            req_id=kwargs.get(
+                                                "req_id", "unspecified"
+                                            ),
+                                            phase=kwargs.get(
+                                                "shared_cpu_phase",
+                                                "sparse_decode_bootstrap",
+                                            ),
+                                            layer_id=layer_id,
+                                            kv_group=kv_group,
+                                            keys_layer=layer_keys,
+                                            local_prefix=local_prefix,
+                                        )
                                     )
+                                else:
+                                    mem_objs_layer = (
+                                        self._resolve_shared_rank0_layer_mem_objs(
+                                            req_id=kwargs.get(
+                                                "req_id", "unspecified"
+                                            ),
+                                            phase=kwargs.get(
+                                                "shared_cpu_phase",
+                                                "sparse_decode_bootstrap",
+                                            ),
+                                            layer_id=layer_id,
+                                            kv_group=kv_group,
+                                            keys_layer=layer_keys,
+                                            chunk_locations=(
+                                                shared_chunk_locations_layer_major[
+                                                    layer_id
+                                                ]
+                                            ),
+                                        )
+                                    )
+                                pre_resolved_shared_mem_layers.append(
+                                    mem_objs_layer
                                 )
-                            pre_resolved_shared_mem_layers.append(mem_objs_layer)
                         release_local_prefix_layers()
                     except Exception as exc:
                         failed_layer_id = len(pre_resolved_shared_mem_layers)
