@@ -231,7 +231,7 @@ def test_sparse_rank0_preflight_error_broadcasts_on_first_layer_send(monkeypatch
     assert broadcasts[0].kv_group == 0
 
 
-def test_sparse_retrieve_allocated_ret_mask_clears_metadata_warm_flag(monkeypatch):
+def test_sparse_retrieve_allocated_ret_mask_preserves_metadata_warm_flag(monkeypatch):
     """A fresh ret_mask must be populated even when request metadata is warm."""
 
     monkeypatch.setattr(
@@ -257,7 +257,7 @@ def test_sparse_retrieve_allocated_ret_mask_clears_metadata_warm_flag(monkeypatc
 
     def ensure_metadata(**kwargs):
         retrieve_kwargs = kwargs["retrieve_kwargs"]
-        assert "_retrieve_metadata_warm" not in retrieve_kwargs
+        assert retrieve_kwargs["_retrieve_metadata_warm"] is True
         kwargs["ret_mask"][0:2] = True
         return "LocalCPUBackend", [0], [2], [["layer0-key"]]
 
@@ -319,6 +319,31 @@ def test_metadata_warm_data_cold_repopulates_stale_ret_mask():
     assert keys is cached_keys
     assert ret_mask.tolist() == [False, True, True]
     assert retrieve_kwargs["_retrieve_metadata_warm"] is True
+
+
+def test_metadata_warm_data_hot_repopulates_stale_ret_mask():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._resolve_local_cpu_retrieve_location = lambda location: location
+    ret_mask = torch.ones(3, dtype=torch.bool)
+    retrieve_kwargs = {
+        "_retrieve_metadata_warm": True,
+        "_use_cached_retrieve": True,
+        "cached_retrieve_location": "LocalCPUBackend",
+    }
+
+    AscendLMCacheEngine._ensure_retrieve_chunk_metadata(
+        engine,
+        tokens=[1, 2, 3],
+        mask=None,
+        request_configs=None,
+        cached_keys=[["layer0-key"]],
+        cached_starts=[1],
+        cached_ends=[3],
+        ret_mask=ret_mask,
+        retrieve_kwargs=retrieve_kwargs,
+    )
+
+    assert ret_mask.tolist() == [False, True, True]
 
 
 def test_sampled_metadata_build_skips_per_chunk_contains():
@@ -994,7 +1019,11 @@ def test_sparse_passive_metadata_warm_without_data_waits_for_envelope(monkeypatc
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     engine.gpu_connector = _FakeSparseConsumer()
-    engine.token_database = _FakeTokenDatabase(key)
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("warm passive metadata must not be rebuilt")
+        )
+    )
     engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
     engine.shared_cpu_cache_generation = 7
     engine.metadata = type("Meta", (), {"first_rank": 0})()
@@ -1023,13 +1052,11 @@ def test_sparse_passive_metadata_warm_without_data_waits_for_envelope(monkeypatc
         )
 
     engine._receive_shared_envelope = receive_envelope
-    ret_mask = torch.ones(1, dtype=torch.bool)
     cached_memory_objs = []
     cached_shared_handles = []
 
     retriever = engine.retrieve_layer_head_token_wise(
         [1],
-        ret_mask=ret_mask,
         cached_keys=[[key.get_first_layer()]],
         cached_starts=[0],
         cached_ends=[1],
@@ -1043,7 +1070,7 @@ def test_sparse_passive_metadata_warm_without_data_waits_for_envelope(monkeypatc
         _retrieve_metadata_warm=True,
     )
 
-    next(retriever)
+    ret_mask = next(retriever)
     yielded = retriever.send(([0], 0))
 
     assert received == [True]

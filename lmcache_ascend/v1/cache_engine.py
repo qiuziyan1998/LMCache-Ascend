@@ -935,6 +935,27 @@ class AscendLMCacheEngine(LMCacheEngine):
         return len(tokens) > cached_ends[-1]
 
     @staticmethod
+    def _fill_retrieve_mask(
+        ret_mask: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        *,
+        clear: bool = True,
+    ) -> None:
+        if clear:
+            ret_mask.zero_()
+        if not starts or not ends:
+            return
+        if len(starts) == len(ends) and all(
+            int(start) == int(previous_end)
+            for start, previous_end in zip(starts[1:], ends[:-1], strict=False)
+        ):
+            ret_mask[int(starts[0]) : int(ends[-1])] = True
+            return
+        for start, end in zip(starts, ends, strict=False):
+            ret_mask[int(start) : int(end)] = True
+
+    @staticmethod
     def _cache_layer_has_entries(layer_cache: Any) -> bool:
         if layer_cache is None:
             return False
@@ -1371,9 +1392,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     for layer_id in range(self.num_layers):
                         cached_keys[layer_id].append(new_keys[layer_id][chunk_idx])
 
-            ret_mask.zero_()
-            for start, end in zip(cached_starts, cached_ends, strict=False):
-                ret_mask[start:end] = True
+            self._fill_retrieve_mask(ret_mask, cached_starts, cached_ends)
             if retrieve_kwargs is not None:
                 if location is not None:
                     retrieve_kwargs["cached_retrieve_location"] = location
@@ -1384,6 +1403,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             "_retrieve_metadata_warm"
         ):
             if retrieve_kwargs.get("_use_cached_retrieve"):
+                self._fill_retrieve_mask(
+                    ret_mask,
+                    cached_starts,
+                    cached_ends,
+                )
                 location = self._resolve_local_cpu_retrieve_location(
                     retrieve_kwargs.get("cached_retrieve_location"),
                 )
@@ -1391,9 +1415,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     retrieve_kwargs["cached_retrieve_location"] = location
                 return location, cached_starts, cached_ends, cached_keys
 
-            ret_mask.zero_()
-            for start, end in zip(cached_starts, cached_ends, strict=False):
-                ret_mask[start:end] = True
+            self._fill_retrieve_mask(ret_mask, cached_starts, cached_ends)
 
             location = retrieve_kwargs.get("cached_retrieve_location")
             kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
@@ -1425,8 +1447,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     retrieve_kwargs["cached_retrieve_location"] = location
             return location, cached_starts, cached_ends, cached_keys
 
-        for start, end in zip(cached_starts, cached_ends, strict=False):
-            ret_mask[start:end] = True
+        self._fill_retrieve_mask(ret_mask, cached_starts, cached_ends)
 
         location = None
         if retrieve_kwargs is not None:
@@ -1936,24 +1957,34 @@ class AscendLMCacheEngine(LMCacheEngine):
         append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
 
         metadata_started = cold_start_perf_now() if perf_enabled else 0.0
-        starts: list[int] = []
-        ends: list[int] = []
-        keys: list[list[CacheEngineKey]] = []
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
-            kv_group=kv_group,
-        ):
-            assert isinstance(key, CacheEngineKey)
-            starts.append(start)
-            ends.append(end)
-            keys.append(key.split_layers(self.num_layers))
-        keys_layer_major = (
-            [list(row) for row in zip(*keys, strict=False)]
-            if keys
-            else []
+        metadata_warm = bool(
+            kwargs.get("_retrieve_metadata_warm")
+            and cached_keys
+            and cached_starts
+            and cached_ends
+            and int(cached_ends[-1]) == len(tokens)
         )
+        if metadata_warm:
+            starts = list(cached_starts)
+            ends = list(cached_ends)
+            keys_layer_major = cached_keys
+        else:
+            starts, ends, keys = [], [], []
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                starts.append(start)
+                ends.append(end)
+                keys.append(key.split_layers(self.num_layers))
+            keys_layer_major = (
+                [list(row) for row in zip(*keys, strict=False)]
+                if keys
+                else []
+            )
         required_chunks = len(starts)
         if perf_enabled:
             cold_start_perf_log(
@@ -2000,20 +2031,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"prefix: metadata={cached_metadata_chunks}, "
                 f"cached={cached_prefix_chunks}, required={required_chunks}"
             )
-        for chunk_index in range(cached_metadata_chunks):
-            if (
-                cached_starts[chunk_index] != starts[chunk_index]
-                or cached_ends[chunk_index] != ends[chunk_index]
-                or any(
-                    cached_keys[layer_id][chunk_index]
-                    != keys_layer_major[layer_id][chunk_index]
-                    for layer_id in range(self.num_layers)
-                )
-            ):
-                raise ValueError(
-                    "Sparse passive cached prefix changed at chunk "
-                    f"{chunk_index}."
-                )
+        if not metadata_warm:
+            for chunk_index in range(cached_metadata_chunks):
+                if (
+                    cached_starts[chunk_index] != starts[chunk_index]
+                    or cached_ends[chunk_index] != ends[chunk_index]
+                    or any(
+                        cached_keys[layer_id][chunk_index]
+                        != keys_layer_major[layer_id][chunk_index]
+                        for layer_id in range(self.num_layers)
+                    )
+                ):
+                    raise ValueError(
+                        "Sparse passive cached prefix changed at chunk "
+                        f"{chunk_index}."
+                    )
         cached_handle_chunks = self._uniform_layer_cache_chunks(
             cached_shared_handles,
             self.num_layers,
@@ -2026,12 +2058,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"cached_chunks={cached_prefix_chunks}"
             )
         missing_chunks = required_chunks - cached_prefix_chunks
-        for start, end in zip(
+        self._fill_retrieve_mask(
+            ret_mask,
             starts[:cached_prefix_chunks],
             ends[:cached_prefix_chunks],
-            strict=False,
-        ):
-            ret_mask[start:end] = True
+        )
 
         assert_layerwise_gpu_connector(self.gpu_connector)
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
@@ -2095,12 +2126,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     if not metadata_appended:
                         metadata_appended = True
-                        for start, end in zip(
+                        self._fill_retrieve_mask(
+                            ret_mask,
                             starts[cached_prefix_chunks:],
                             ends[cached_prefix_chunks:],
-                            strict=False,
-                        ):
-                            ret_mask[start:end] = True
+                            clear=False,
+                        )
                         if cached_starts is not None:
                             cached_starts.extend(starts[cached_metadata_chunks:])
                         if cached_ends is not None:
@@ -2197,6 +2228,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     )
                 if perf_enabled:
+                    source_chunks = len(mem_objs_layer)
+                    if (
+                        not source_chunks
+                        and cached_memory_objs is not None
+                        and layer_id < len(cached_memory_objs)
+                    ):
+                        cached_layer = cached_memory_objs[layer_id]
+                        source_chunks = (
+                            len(cached_layer) if cached_layer is not None else 0
+                        )
                     cold_start_perf_log(
                         logger,
                         "npu_layer_submit_cpu",
@@ -2206,6 +2247,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         kv_group=kv_group,
                         layer=layer_id,
                         objects=len(mem_objs_layer),
+                        source_chunks=source_chunks,
                         rank=self.metadata.worker_id,
                         passive=True,
                     )
@@ -2355,8 +2397,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         ):
             ret_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
             kwargs["ret_mask"] = ret_mask
-            metadata_warm = False
-            kwargs.pop("_retrieve_metadata_warm", None)
         elif not metadata_warm:
             ret_mask.zero_()
 
@@ -3208,6 +3248,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     )
                 if perf_enabled:
+                    source_chunks = len(mem_objs_layer)
+                    if (
+                        not source_chunks
+                        and cached_tensors is not None
+                        and layer_id < len(cached_tensors)
+                    ):
+                        cached_layer = cached_tensors[layer_id]
+                        source_chunks = (
+                            len(cached_layer) if cached_layer is not None else 0
+                        )
                     cold_start_perf_log(
                         logger,
                         "npu_layer_submit_cpu",
@@ -3220,6 +3270,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         kv_group=kv_group,
                         layer=layer_id,
                         objects=len(mem_objs_layer),
+                        source_chunks=source_chunks,
                         rank=self.metadata.worker_id,
                         passive=False,
                     )
