@@ -22,6 +22,11 @@ from lmcache.utils import (
     convert_tokens_to_list,
 )
 from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
+from lmcache.v1.cold_start_perf import (
+    cold_start_perf_enabled,
+    cold_start_perf_log,
+    cold_start_perf_now,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
@@ -1918,6 +1923,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         kv_group = kwargs.get("kv_group", 0)
         req_id = kwargs.get("req_id", "unspecified")
         phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
+        perf_enabled = cold_start_perf_enabled()
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         cached_keys = kwargs.get("cached_keys")
         cached_starts = kwargs.get("cached_starts")
@@ -1929,6 +1935,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_shared_handles = kwargs.get("cached_shared_handles")
         append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
 
+        metadata_started = cold_start_perf_now() if perf_enabled else 0.0
         starts: list[int] = []
         ends: list[int] = []
         keys: list[list[CacheEngineKey]] = []
@@ -1948,6 +1955,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             else []
         )
         required_chunks = len(starts)
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "metadata_prepare",
+                started=metadata_started,
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                layers=self.num_layers,
+                chunks=required_chunks,
+                rank=self.metadata.worker_id,
+                passive=True,
+            )
         cached_prefix_chunks = self._cached_sparse_prefix_chunks(
             cached_tensors,
             cached_memory_objs,
@@ -2068,6 +2088,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                             f"handle count at layer {layer_id}: "
                             f"{len(envelope.handles)} != {missing_chunks}"
                         )
+                    prepare_started = (
+                        cold_start_perf_now()
+                        if perf_enabled
+                        else 0.0
+                    )
                     if not metadata_appended:
                         metadata_appended = True
                         for start, end in zip(
@@ -2141,7 +2166,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_shared_handles,
                         cached_prefix_chunks,
                     )
+                    if perf_enabled:
+                        cold_start_perf_log(
+                            logger,
+                            "passive_layer_prepare",
+                            started=prepare_started,
+                            req_id=req_id,
+                            phase=phase,
+                            kv_group=kv_group,
+                            layer=layer_id,
+                            objects=len(mem_objs_layer),
+                            rank=self.metadata.worker_id,
+                        )
 
+                dispatch_started = (
+                    cold_start_perf_now()
+                    if perf_enabled
+                    else 0.0
+                )
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
                     mem_obj_consumer.send(sparse_payload)
@@ -2153,6 +2195,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                             token_start_index,
                             target_slot_mapping,
                         )
+                    )
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "npu_layer_submit_cpu",
+                        started=dispatch_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        layer=layer_id,
+                        objects=len(mem_objs_layer),
+                        rank=self.metadata.worker_id,
+                        passive=True,
                     )
             next(mem_obj_consumer)
             passive_views_handed_off = (
@@ -2277,6 +2332,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
 
         kv_group = kwargs.get("kv_group", 0)
+        perf_enabled = cold_start_perf_enabled()
         kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
         shared_sparse_retrieve = self._should_use_shared_layerwise_retrieve(kv_group)
         shared_retrieve_passive = self._is_shared_retrieve_passive(kv_group)
@@ -2353,6 +2409,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_memory_objs,
         )
 
+        metadata_started = cold_start_perf_now() if perf_enabled else 0.0
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -2365,6 +2422,22 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         kwargs.pop("_use_cached_retrieve", None)
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "metadata_prepare",
+                started=metadata_started,
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get(
+                    "shared_cpu_phase",
+                    "sparse_decode_bootstrap",
+                ),
+                kv_group=kv_group,
+                layers=len(retrieve_keys),
+                chunks=required_chunks,
+                rank=self.metadata.worker_id,
+                passive=False,
+            )
         if cached_prefix_chunks > required_chunks:
             raise ValueError(
                 "Sparse retrieve cached prefix exceeds current metadata: "
@@ -2564,6 +2637,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             and not use_cached_retrieve
             and any(missing_keys)
         ):
+            probe_started = (
+                cold_start_perf_now() if perf_enabled else 0.0
+            )
             missing_locations: list[tuple[int, int]] = []
             if sampled_worker_retrieve:
                 local_cpu_backend = self._shared_local_cpu_backend()
@@ -2609,6 +2685,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                             key_location = ""
                         layer_locations.append(key_location)
                     shared_chunk_locations_layer_major.append(layer_locations)
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "location_probe",
+                    started=probe_started,
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase",
+                        "sparse_decode_bootstrap",
+                    ),
+                    kv_group=kv_group,
+                    layers=len(missing_keys),
+                    chunks=sum(len(layer) for layer in missing_keys),
+                    missing=len(missing_locations),
+                    sampled=sampled_worker_retrieve,
+                )
             if missing_locations:
                 message = (
                     "Shared CPU sparse decode missing required chunks before "
@@ -2632,6 +2724,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 record_request_preflight_error()
             else:
                 try:
+                    capacity_started = (
+                        cold_start_perf_now()
+                        if perf_enabled
+                        else 0.0
+                    )
                     capacity_details = self._shared_cpu_runtime_capacity_details(
                         req_id=kwargs.get("req_id", "unspecified"),
                         phase=kwargs.get(
@@ -2652,6 +2749,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         ],
                     )
+                    if perf_enabled:
+                        cold_start_perf_log(
+                            logger,
+                            "capacity_preflight",
+                            started=capacity_started,
+                            req_id=kwargs.get("req_id", "unspecified"),
+                            phase=kwargs.get(
+                                "shared_cpu_phase",
+                                "sparse_decode_bootstrap",
+                            ),
+                            kv_group=kv_group,
+                            fits=capacity_details.get("fits"),
+                            missing_chunks=capacity_details.get(
+                                "missing_chunk_count"
+                            ),
+                            required_bytes=capacity_details.get(
+                                "required_bytes"
+                            ),
+                            available_bytes=capacity_details.get(
+                                "available_after_eviction"
+                            ),
+                        )
                 except Exception:
                     release_local_prefix_layers()
                     raise
@@ -3071,6 +3190,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                         raise
                     self._broadcast_shared_envelope(envelope)
 
+                dispatch_started = (
+                    cold_start_perf_now()
+                    if perf_enabled
+                    else 0.0
+                )
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = mem_objs_layer
                     ensure_mem_obj_consumer().send(sparse_payload)
@@ -3082,6 +3206,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                             token_start_index,
                             target_slot_mapping,
                         )
+                    )
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "npu_layer_submit_cpu",
+                        started=dispatch_started,
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase",
+                            "sparse_decode_bootstrap",
+                        ),
+                        kv_group=kv_group,
+                        layer=layer_id,
+                        objects=len(mem_objs_layer),
+                        rank=self.metadata.worker_id,
+                        passive=False,
                     )
 
             if mem_obj_consumer is not None:
