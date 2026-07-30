@@ -716,6 +716,61 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     assert fast_calls[1][0][7] is True
 
 
+@pytest.mark.parametrize("consumer_wait", [False, True])
+def test_dense_direct_connector_only_controls_consumer_wait(
+    monkeypatch,
+    consumer_wait: bool,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    transfer_stream = _TrackingStream("load")
+    current_stream = _TrackingStream("compute")
+
+    monkeypatch.setattr(
+        connector,
+        "_dense_direct_pointer_cache_signature",
+        lambda **kwargs: ("signature",),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_direct_layer_state",
+        lambda **kwargs: (object(), ("dense", 0, 0)),
+    )
+    connector._sparse_direct_validated_layers = set()
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_batched_direct_kv_transfer_fast",
+        lambda *args, **kwargs: None,
+    )
+
+    connector._run_dense_direct_kv_transfer_layer(
+        kvcaches_ref=[(object(), object())],
+        kv_group=0,
+        layer_id=0,
+        transfer_stream=transfer_stream,
+        current_stream=current_stream,
+        slot_mapping_full=_RecordableTensor(8),
+        chunk_ptrs_npu=_RecordableTensor(2),
+        chunk_offsets_npu=_RecordableTensor(2, dtype=torch.int32),
+        chunk_sizes_npu=_RecordableTensor(2, dtype=torch.int32),
+        total_tokens=8,
+        fixed_chunk_size=256,
+        dense_kv_format=5,
+        dense_token_major=False,
+        dense_vllm_two_major=False,
+        dense_k_hidden_dims=512,
+        dense_v_hidden_dims=64,
+        dense_dsa_hidden_dims=0,
+        dense_host_interleaved=False,
+        layer_tensors=[torch.zeros(8, dtype=torch.bfloat16)],
+        direction=False,
+        consumer_wait=consumer_wait,
+    )
+
+    assert transfer_stream.events == [("wait_stream", "compute")]
+    expected = [("wait_stream", "load")] if consumer_wait else []
+    assert current_stream.events == expected
+
+
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
@@ -1514,8 +1569,10 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
         starts,
         ends,
         slot_mapping=torch.arange(401, dtype=torch.long),
-        sync=False,
+        sync=True,
         kv_group=0,
+        req_id="cold-connector-only",
+        dsa_cold_connector_only=True,
     )
     next(gen)
     gen.send(
@@ -1529,6 +1586,7 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
 
     assert len(direct_calls) == 1
     assert direct_calls[0]["direction"] is False
+    assert direct_calls[0]["consumer_wait"] is False
     assert direct_calls[0]["fixed_chunk_size"] == 0
     assert direct_calls[0]["total_tokens"] == 401
     assert direct_calls[0]["chunk_offsets_npu"].tolist() == starts

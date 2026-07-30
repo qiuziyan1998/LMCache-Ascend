@@ -66,6 +66,21 @@ def _dsa_cold_tensor_meta(value: Optional[torch.Tensor]) -> str:
     )
 
 
+def _dsa_cold_stream_meta(stream: Any) -> str:
+    if stream is None:
+        return "none"
+    stream_id = None
+    for attr in ("stream_id", "npu_stream", "cuda_stream"):
+        value = getattr(stream, attr, None)
+        if value is not None:
+            stream_id = value
+            break
+    return (
+        f"type={type(stream).__name__},device={getattr(stream, 'device', None)},"
+        f"id={stream_id}"
+    )
+
+
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
@@ -2759,6 +2774,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_host_interleaved: bool,
         layer_tensors: List[torch.Tensor],
         direction: bool,
+        consumer_wait: bool = True,
     ) -> None:
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
@@ -2838,7 +2854,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
-        current_stream.wait_stream(transfer_stream)
+        if consumer_wait:
+            current_stream.wait_stream(transfer_stream)
 
     def _lmc_plane_num_tokens(
         self, lmc_tensor: torch.Tensor, kv_group: Optional[int] = None
@@ -3347,6 +3364,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        connector_only_background = bool(
+            kwargs.get("dsa_cold_connector_only", False)
+        )
+        consumer_wait = sync and not connector_only_background
 
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
@@ -3440,7 +3461,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
             current_stream = torch.cuda.current_stream()
-            if sync:
+            if connector_only_background and layer_id == 0:
+                logger.info(
+                    "[DSA_COLD_PERF] connector_stream_binding req=%s "
+                    "kv_group=%s current_stream=%s load_stream=%s "
+                    "consumer_wait=%s",
+                    kwargs.get("req_id"),
+                    kv_group,
+                    _dsa_cold_stream_meta(current_stream),
+                    _dsa_cold_stream_meta(self.load_stream),
+                    consumer_wait,
+                )
+            if consumer_wait:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0 and logger.isEnabledFor(10):
                 logger.debug("Finished loading layer %d", layer_id - 1)
@@ -3482,6 +3514,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     dense_host_interleaved=dense_host_interleaved,
                     layer_tensors=cpu_tensors,
                     direction=False,
+                    consumer_wait=consumer_wait,
                 )
             else:
                 with torch.cuda.stream(self.load_stream):
@@ -3539,7 +3572,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         yield
 
         # synchronize the last layer
-        if sync:
+        if consumer_wait:
             current_stream.wait_stream(self.load_stream)
 
         # free the buffer memory
