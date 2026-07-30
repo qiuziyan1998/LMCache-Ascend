@@ -8,6 +8,7 @@ from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     PreparedSparseSourceLayer,
 )
+import pytest
 import torch
 
 # First Party
@@ -95,6 +96,31 @@ def test_prepared_sparse_retrieve_uses_source_token_count() -> None:
 
     assert next(retriever).numel() == source.total_tokens
     retriever.close()
+
+
+def test_metadata_only_rejects_prepared_sparse_source() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1, 2, 3, 4],
+        prepared_sparse_source=_prepared_source(),
+        kv_group=1,
+        sparse_metadata_only=True,
+    )
+
+    with pytest.raises(ValueError, match="cannot use a prepared source"):
+        next(retriever)
+
+
+def test_metadata_only_rejects_latent_group() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1, 2, 3, 4],
+        kv_group=0,
+        sparse_metadata_only=True,
+    )
+
+    with pytest.raises(ValueError, match="only valid for kv_group=1"):
+        next(retriever)
 
 
 def test_dense_store_prepares_sparse_pointer_cache_without_shared_cpu() -> None:

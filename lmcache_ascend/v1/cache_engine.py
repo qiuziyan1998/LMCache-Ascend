@@ -908,6 +908,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_tensors.extend([] for _ in range(self.num_layers))
             cached_tensors[layer_id].extend(new_tensors)
 
+    def _sparse_pointer_cache_covers(
+        self,
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        required_chunks: int,
+    ) -> bool:
+        """Return whether every sparse layer has a complete source pointer row."""
+        if required_chunks <= 0:
+            return True
+        if cached_chunk_dev_ptrs is None or cached_chunk_ptrs_npu is None:
+            return False
+        for layer_id in range(self.num_layers):
+            if layer_id >= len(cached_chunk_dev_ptrs):
+                return False
+            host_row = cached_chunk_dev_ptrs[layer_id]
+            if host_row is None or len(host_row) < required_chunks:
+                return False
+            if layer_id >= len(cached_chunk_ptrs_npu):
+                return False
+            npu_row = cached_chunk_ptrs_npu[layer_id]
+            if npu_row is None or int(npu_row.numel()) < required_chunks:
+                return False
+        return True
+
     def _append_shared_handle_cache(
         self,
         layer_id: int,
@@ -1939,6 +1963,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         ret_mask: torch.Tensor,
         **kwargs,
     ) -> Generator[Optional[torch.Tensor], None, None]:
+        metadata_only = bool(kwargs.get("sparse_metadata_only", False))
         assert self.gpu_connector is not None, (
             "gpu_connector is required for sparse shared retrieve"
         )
@@ -2040,6 +2065,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"cached_chunks={cached_prefix_chunks}"
             )
         missing_chunks = required_chunks - cached_prefix_chunks
+        if metadata_only and missing_chunks:
+            notify_fn = getattr(
+                self.gpu_connector,
+                "notify_sparse_memory_objs_updated",
+                None,
+            )
+            if callable(notify_fn):
+                notify_fn()
         for start, end in zip(
             starts[:cached_prefix_chunks],
             ends[:cached_prefix_chunks],
@@ -2047,11 +2080,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         ):
             ret_mask[start:end] = True
 
-        assert_layerwise_gpu_connector(self.gpu_connector)
-        mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
-            **kwargs
-        )
-        next(mem_obj_consumer)
+        mem_obj_consumer = None
+        if not metadata_only:
+            assert_layerwise_gpu_connector(self.gpu_connector)
+            mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
+                **kwargs
+            )
+            next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
         passive_views_handed_off = False
@@ -2176,23 +2211,44 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_prefix_chunks,
                     )
 
-                if sparse_payload is not None:
-                    sparse_payload["memory_objs_layer"] = mem_objs_layer
-                    mem_obj_consumer.send(sparse_payload)
-                else:
-                    mem_obj_consumer.send(
-                        (
-                            mem_objs_layer,
-                            selected_tokens,
-                            token_start_index,
-                            target_slot_mapping,
+                if mem_obj_consumer is not None:
+                    if sparse_payload is not None:
+                        sparse_payload["memory_objs_layer"] = mem_objs_layer
+                        mem_obj_consumer.send(sparse_payload)
+                    else:
+                        mem_obj_consumer.send(
+                            (
+                                mem_objs_layer,
+                                selected_tokens,
+                                token_start_index,
+                                target_slot_mapping,
+                            )
                         )
-                    )
-            next(mem_obj_consumer)
+            if mem_obj_consumer is not None:
+                next(mem_obj_consumer)
+            if metadata_only and not self._sparse_pointer_cache_covers(
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+                required_chunks,
+            ):
+                raise ValueError(
+                    "Sparse passive metadata-only retrieve has incomplete "
+                    "source pointer coverage."
+                )
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None
             )
             append.commit()
+            if metadata_only:
+                _mtp_dw_event(
+                    "retrieve",
+                    owner="lmcache_ascend_retrieve",
+                    req=req_id,
+                    event="metadata_only_complete",
+                    frontier=len(tokens),
+                    kv_group=kv_group,
+                    passive=True,
+                )
             yield ret_mask
         finally:
             if not passive_views_handed_off:
@@ -2212,6 +2268,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         A sealed ``prepared_sparse_source`` selects the metadata-free warm path.
         Requests without one retain the full storage/shared-cache bootstrap path.
         """
+        metadata_only = bool(kwargs.get("sparse_metadata_only", False))
+        if metadata_only:
+            if kwargs.get("prepared_sparse_source") is not None:
+                raise ValueError(
+                    "Sparse metadata-only retrieve cannot use a prepared source."
+                )
+            if int(kwargs.get("kv_group", 0)) != 1:
+                raise ValueError(
+                    "Sparse metadata-only retrieve is only valid for kv_group=1."
+                )
         if kwargs.get("prepared_sparse_source") is not None:
             yield from self._retrieve_prepared_sparse_layers(
                 tokens,
@@ -2311,9 +2377,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
 
         kv_group = kwargs.get("kv_group", 0)
+        metadata_only = bool(kwargs.get("sparse_metadata_only", False))
         kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
         shared_sparse_retrieve = self._should_use_shared_layerwise_retrieve(kv_group)
         shared_retrieve_passive = self._is_shared_retrieve_passive(kv_group)
+        if metadata_only and not shared_sparse_retrieve:
+            raise ValueError(
+                "Sparse metadata-only retrieve requires shared CPU layerwise mode."
+            )
         if not (shared_sparse_retrieve and shared_retrieve_passive):
             assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
@@ -2745,6 +2816,70 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                         record_request_preflight_error()
 
+        metadata_only_cache_prepared = False
+        if (
+            preflight_error_envelope is None
+            and metadata_only
+            and pre_resolved_shared_mem_layers is not None
+            and not use_cached_retrieve
+        ):
+            try:
+                for layer_id, mem_objs_layer in enumerate(
+                    pre_resolved_shared_mem_layers
+                ):
+                    self._append_retrieve_layer_cache(
+                        layer_id,
+                        mem_objs_layer,
+                        cached_memory_objs,
+                        cached_tensors,
+                        cached_chunk_dev_ptrs,
+                        cached_chunk_ptrs_npu,
+                    )
+                metadata_only_cache_prepared = True
+            except Exception as exc:
+                message = (
+                    "Shared CPU sparse metadata-only pointer preflight failed "
+                    "before handle publication."
+                )
+                preflight_error_envelope = self._shared_layerwise_error_envelope(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    request_ordinal=request_ordinal,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    message=message,
+                    details={"error": str(exc)},
+                )
+                preflight_error = ValueError(f"{message} error={exc}")
+                record_request_preflight_error()
+
+        if (
+            preflight_error_envelope is None
+            and metadata_only
+            and not self._sparse_pointer_cache_covers(
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+                required_chunks,
+            )
+        ):
+            message = (
+                "Shared CPU sparse metadata-only retrieve has incomplete "
+                "source pointer coverage before handle publication."
+            )
+            preflight_error_envelope = self._shared_layerwise_error_envelope(
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                request_ordinal=request_ordinal,
+                layer_id=0,
+                kv_group=kv_group,
+                message=message,
+                details={"required_chunks": required_chunks},
+            )
+            preflight_error = ValueError(message)
+            record_request_preflight_error()
+
         if preflight_error_envelope is None and request_preflight_failed_elsewhere():
             release_pre_resolved_shared_mem_layers()
             release_local_prefix_layers()
@@ -2758,6 +2893,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
         if preflight_error_envelope is not None:
+            release_pre_resolved_shared_mem_layers()
             release_local_prefix_layers()
             yield ret_mask
             self._broadcast_shared_envelope(preflight_error_envelope)
@@ -2845,6 +2981,16 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         sparse_memory_objs_notified = False
 
+        if metadata_only and (not use_cached_retrieve or publish_shared_handles):
+            notify_fn = getattr(
+                self.gpu_connector,
+                "notify_sparse_memory_objs_updated",
+                None,
+            )
+            if callable(notify_fn):
+                notify_fn()
+                sparse_memory_objs_notified = True
+
         def ensure_mem_obj_consumer():
             nonlocal mem_obj_consumer, sparse_memory_objs_notified
             if mem_obj_consumer is not None:
@@ -2919,7 +3065,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         task = next(get_generator)
                         assert task is not None
                         mem_objs_layer = task.result()
-                    if mem_objs_layer is not None:
+                    if mem_objs_layer is not None and not metadata_only_cache_prepared:
                         layer_cached_chunks = (
                             len(cached_tensors[layer_id])
                             if cached_tensors is not None
@@ -3043,18 +3189,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                         raise
                     self._broadcast_shared_envelope(envelope)
 
-                if sparse_payload is not None:
-                    sparse_payload["memory_objs_layer"] = mem_objs_layer
-                    ensure_mem_obj_consumer().send(sparse_payload)
-                else:
-                    ensure_mem_obj_consumer().send(
-                        (
-                            mem_objs_layer,
-                            selected_tokens,
-                            token_start_index,
-                            target_slot_mapping,
+                if not metadata_only:
+                    if sparse_payload is not None:
+                        sparse_payload["memory_objs_layer"] = mem_objs_layer
+                        ensure_mem_obj_consumer().send(sparse_payload)
+                    else:
+                        ensure_mem_obj_consumer().send(
+                            (
+                                mem_objs_layer,
+                                selected_tokens,
+                                token_start_index,
+                                target_slot_mapping,
+                            )
                         )
-                    )
 
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
@@ -3067,6 +3214,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             else:
                 release_pending_pre_resolved()
             append.commit()
+
+            if metadata_only:
+                _mtp_dw_event(
+                    "retrieve",
+                    owner="lmcache_ascend_retrieve",
+                    req=kwargs.get("req_id"),
+                    event="metadata_only_complete",
+                    frontier=len(tokens),
+                    kv_group=kv_group,
+                    passive=False,
+                )
 
             yield ret_mask
         finally:
