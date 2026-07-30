@@ -799,6 +799,67 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_tensors.append([])
         cached_tensors[layer_id].extend(new_tensors)
 
+    def _append_group_store_tensors(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        host_pointer_rows: List[List[int]],
+        layer_chunk_ptrs_npu: torch.Tensor,
+    ) -> None:
+        """Publish packed group pointer metadata without per-layer H2D copies."""
+        num_layers = len(memory_objs)
+        if len(host_pointer_rows) != num_layers:
+            raise ValueError(
+                "Dense group store host pointer rows do not match layer count: "
+                f"pointers={len(host_pointer_rows)}, layers={num_layers}"
+            )
+        if layer_chunk_ptrs_npu.dim() != 2 or layer_chunk_ptrs_npu.size(0) != num_layers:
+            raise ValueError(
+                "Dense group store NPU pointer table must be [layers, chunks]: "
+                f"shape={tuple(layer_chunk_ptrs_npu.shape)}, layers={num_layers}"
+            )
+
+        if cached_tensors is not None and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
+        if cached_chunk_dev_ptrs is not None and not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+
+        for layer_id, layer_memory_objs in enumerate(memory_objs):
+            new_tensors = []
+            for chunk_index, memory_obj in enumerate(layer_memory_objs):
+                tensor = memory_obj.tensor
+                if tensor is None:
+                    raise ValueError(
+                        "Dense group store cannot publish a MemoryObj without "
+                        f"a tensor at layer={layer_id}, chunk={chunk_index}."
+                    )
+                new_tensors.append(tensor)
+
+            host_row = host_pointer_rows[layer_id]
+            if len(host_row) != len(new_tensors):
+                raise ValueError(
+                    "Dense group store pointer/tensor count mismatch: "
+                    f"layer={layer_id}, pointers={len(host_row)}, "
+                    f"tensors={len(new_tensors)}"
+                )
+            npu_row = layer_chunk_ptrs_npu[layer_id]
+
+            if cached_tensors is not None:
+                cached_tensors[layer_id].extend(new_tensors)
+            if cached_chunk_dev_ptrs is not None:
+                cached_chunk_dev_ptrs[layer_id].extend(host_row)
+            if cached_chunk_ptrs_npu is not None:
+                existing = cached_chunk_ptrs_npu[layer_id]
+                cached_chunk_ptrs_npu[layer_id] = (
+                    npu_row
+                    if existing is None
+                    else torch.cat((existing, npu_row), dim=0)
+                )
+
     def _append_retrieve_layer_cache(
         self,
         layer_id: int,
@@ -1739,31 +1800,81 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             try:
                 t_start = time.perf_counter()
-                mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                    memory_objs, starts, ends, **kwargs
+                group_store = getattr(
+                    self.gpu_connector, "batched_from_gpu_group", None
+                )
+                supports_group_store = getattr(
+                    self.gpu_connector,
+                    "supports_batched_from_gpu_group",
+                    None,
+                )
+                all_chunks_publishable = cache_chunk_indices is None or (
+                    cache_chunk_indices == list(range(len(starts)))
+                )
+                use_group_store = (
+                    bool(kwargs.get("decode_window_save"))
+                    and callable(group_store)
+                    and callable(supports_group_store)
+                    and supports_group_store(kv_group)
+                    and all_chunks_publishable
                 )
 
-                next(mem_obj_generator)
-
-                for layer_id in range(self.num_layers):
-                    yield
-                    next(mem_obj_generator)
-                    self._append_layer_store_tensors(
-                        layer_id,
+                if use_group_store:
+                    # Preserve the layerwise connector contract. The final drain
+                    # launches the whole group after all layer callbacks arrived.
+                    for _ in range(self.num_layers):
+                        yield
+                    host_pointer_rows, layer_chunk_ptrs_npu = group_store(
+                        memory_objs,
+                        starts,
+                        ends,
+                        **kwargs,
+                    )
+                    self._append_group_store_tensors(
                         memory_objs,
                         cached_tensors,
                         cached_chunk_dev_ptrs,
                         cached_chunk_ptrs_npu,
-                        cache_chunk_indices,
+                        host_pointer_rows,
+                        layer_chunk_ptrs_npu,
                     )
-                    required_futures = self.storage_manager.batched_put(
-                        keys[layer_id],
-                        memory_objs[layer_id],
-                        location=self.store_location,
+                    # Keep backend layer boundaries and ownership transfer
+                    # semantics unchanged in the first version.
+                    for layer_id in range(self.num_layers):
+                        required_futures = self.storage_manager.batched_put(
+                            keys[layer_id],
+                            memory_objs[layer_id],
+                            location=self.store_location,
+                        )
+                        self._track_sync_store_futures(required_futures)
+                        for mem_obj in memory_objs[layer_id]:
+                            pending_store_release.pop(id(mem_obj), None)
+                else:
+                    mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                        memory_objs, starts, ends, **kwargs
                     )
-                    self._track_sync_store_futures(required_futures)
-                    for mem_obj in memory_objs[layer_id]:
-                        pending_store_release.pop(id(mem_obj), None)
+
+                    next(mem_obj_generator)
+
+                    for layer_id in range(self.num_layers):
+                        yield
+                        next(mem_obj_generator)
+                        self._append_layer_store_tensors(
+                            layer_id,
+                            memory_objs,
+                            cached_tensors,
+                            cached_chunk_dev_ptrs,
+                            cached_chunk_ptrs_npu,
+                            cache_chunk_indices,
+                        )
+                        required_futures = self.storage_manager.batched_put(
+                            keys[layer_id],
+                            memory_objs[layer_id],
+                            location=self.store_location,
+                        )
+                        self._track_sync_store_futures(required_futures)
+                        for mem_obj in memory_objs[layer_id]:
+                            pending_store_release.pop(id(mem_obj), None)
 
                 tot_time = time.perf_counter() - t_start
                 logger.info(

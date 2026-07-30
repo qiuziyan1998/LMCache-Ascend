@@ -286,6 +286,16 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
     const bool lmc_host_interleaved, const bool direction,
     const bool validate_inputs = false, const int64_t fixed_chunk_size = 0);
 
+// Group hot path: one host dispatch launches the existing dense-direct kernel
+// for every layer. layer_chunk_ptrs_npu is contiguous [num_layers, num_chunks].
+void dense_mla_dsa_group_direct_kv_transfer_fast(
+    const std::vector<SparseDirectLayerState> &layer_states,
+    torch::Tensor &slot_mapping_full, torch::Tensor &layer_chunk_ptrs_npu,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const bool direction, const bool validate_inputs = false,
+    const int64_t fixed_chunk_size = 0);
+
 void load_and_reshape_flash(torch::Tensor &key_value, torch::Tensor &key_cache,
                             torch::Tensor &value_cache,
                             torch::Tensor &slot_mapping, const int layer_idx);

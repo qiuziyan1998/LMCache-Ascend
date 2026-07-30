@@ -500,6 +500,35 @@ def test_sparse_window_store_cache_publishes_only_full_chunks() -> None:
     assert cached_tensors[0][0] is full_tensor
 
 
+def test_group_store_pointer_table_is_published_without_per_layer_copy() -> None:
+    engine = SimpleNamespace()
+    memory_objs = [
+        [SimpleNamespace(tensor=torch.tensor([1]))],
+        [SimpleNamespace(tensor=torch.tensor([2]))],
+    ]
+    cached_tensors: list[list] = []
+    cached_chunk_dev_ptrs: list[list[int]] = []
+    cached_chunk_ptrs_npu: list[torch.Tensor | None] = []
+    pointer_table = torch.tensor([[101], [202]], dtype=torch.long)
+
+    AscendLMCacheEngine._append_group_store_tensors(
+        engine,
+        memory_objs,
+        cached_tensors,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+        [[101], [202]],
+        pointer_table,
+    )
+
+    assert len(cached_tensors) == 2
+    assert cached_tensors[0][0] is memory_objs[0][0].tensor
+    assert cached_tensors[1][0] is memory_objs[1][0].tensor
+    assert cached_chunk_dev_ptrs == [[101], [202]]
+    assert torch.equal(cached_chunk_ptrs_npu[0], pointer_table[0])
+    assert torch.equal(cached_chunk_ptrs_npu[1], pointer_table[1])
+
+
 def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
     cached_starts = [0, 256]
     cached_ends = [256, 300]

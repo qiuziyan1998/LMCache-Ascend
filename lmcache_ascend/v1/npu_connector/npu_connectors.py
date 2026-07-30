@@ -33,6 +33,7 @@ from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer_fast,
+    dense_mla_dsa_group_direct_kv_transfer_fast,
     prepare_sparse_direct_destination_state,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
@@ -257,6 +258,9 @@ _DENSE_DIRECT_LOAD_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 _DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_GROUP_STORE_DISABLE = os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_GROUP_STORE_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
 _SPARSE_TRANSFER_TOPK = max(
     0, int(os.getenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "0"))
@@ -2775,6 +2779,196 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     fixed_chunk_size=fixed_chunk_size,
                 )
         current_stream.wait_stream(transfer_stream)
+
+    def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
+        """Return whether this group can use the dense direct bulk store path."""
+        return (
+            not _DENSE_DIRECT_STORE_DISABLE
+            and not _DENSE_DIRECT_GROUP_STORE_DISABLE
+            and self._is_mla_dsa_format(kv_group)
+        )
+
+    def batched_from_gpu_group(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ) -> tuple[List[List[int]], torch.Tensor]:
+        """Store every layer with one host dispatch and one completion fence."""
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping_base = int(kwargs.get("slot_mapping_base", 0))
+        if slot_mapping_base < 0:
+            raise ValueError(
+                f"slot_mapping_base must be non-negative, got {slot_mapping_base}"
+            )
+
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        layout = self._lazy_initialize_buffer_with_staging(
+            self.kvcaches,
+            kv_group=kv_group,
+            init_staging=False,
+        )
+        if not self.supports_batched_from_gpu_group(kv_group):
+            raise ValueError(
+                "Dense direct group store requires an MLA/DSA layout and an "
+                "enabled dense-direct store path."
+            )
+
+        slot_mapping_chunks = []
+        chunk_offsets = []
+        chunk_sizes = []
+        current_offset = 0
+        for start, end in zip(starts, ends, strict=False):
+            local_start = start - slot_mapping_base
+            local_end = end - slot_mapping_base
+            if (
+                local_start < 0
+                or local_end < local_start
+                or local_end > len(slot_mapping)
+            ):
+                raise ValueError(
+                    "Layerwise group store chunk is outside the provided "
+                    "slot-mapping window: "
+                    f"chunk=[{start}, {end}), base={slot_mapping_base}, "
+                    f"mapping_tokens={len(slot_mapping)}, "
+                    f"local_chunk=[{local_start}, {local_end})"
+                )
+            slot_mapping_chunks.append(slot_mapping[local_start:local_end])
+            chunk_size = end - start
+            chunk_offsets.append(current_offset)
+            chunk_sizes.append(chunk_size)
+            current_offset += chunk_size
+
+        if not slot_mapping_chunks:
+            raise ValueError("Dense direct group store requires at least one chunk.")
+        slot_mapping_full = (
+            slot_mapping_chunks[0]
+            if len(slot_mapping_chunks) == 1
+            else torch.cat(slot_mapping_chunks, dim=0)
+        )
+        num_tokens = len(slot_mapping_full)
+        self._check_layerwise_transfer_invariants(
+            operation="store",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping_full,
+            kvcaches_ref=self.kvcaches,
+        )
+
+        if len(memory_objs) != self.num_layers:
+            raise RuntimeError(
+                "NPU group store memory object layer count mismatch: "
+                f"got {len(memory_objs)}, expected {self.num_layers}"
+            )
+        if len(self.kvcaches) < self.num_layers:
+            raise RuntimeError(
+                "NPU group store KV cache layer count mismatch: "
+                f"got {len(self.kvcaches)}, expected at least {self.num_layers}"
+            )
+
+        expected_fmt = self._expected_memory_format(kv_group)
+        token_major = self._layerwise_token_major(kv_group)
+        dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        (
+            dense_fixed_chunk_size,
+            chunk_offsets_npu,
+            chunk_sizes_npu,
+        ) = self._prepare_dense_direct_chunk_metadata(
+            chunk_offsets,
+            chunk_sizes,
+            total_tokens=num_tokens,
+            kv_group=kv_group,
+        )
+
+        layer_tensors: List[List[torch.Tensor]] = []
+        for layer_id, memory_objs_layer in enumerate(memory_objs):
+            tensors = []
+            for chunk_index, memory_obj in enumerate(memory_objs_layer):
+                tensor = memory_obj.tensor
+                if tensor is None:
+                    raise ValueError(
+                        "Dense direct group store received a MemoryObj without "
+                        f"a tensor at layer={layer_id}, chunk={chunk_index}."
+                    )
+                if memory_obj.metadata.fmt != expected_fmt:
+                    raise ValueError(
+                        f"Expected memory format {expected_fmt}, "
+                        f"got {memory_obj.metadata.fmt}."
+                    )
+                tensors.append(tensor)
+            if len(tensors) != len(starts):
+                raise ValueError(
+                    "Dense direct group store chunk count mismatch: "
+                    f"layer={layer_id}, tensors={len(tensors)}, "
+                    f"ranges={len(starts)}"
+                )
+            layer_tensors.append(tensors)
+
+        kv_format_value = layout.kv_format.value
+        layer_states = []
+        validation_keys = []
+        for layer_id, tensors in enumerate(layer_tensors):
+            layer_state, validation_key = (
+                self._get_or_create_sparse_direct_layer_state(
+                    kvcaches_ref=self.kvcaches,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    layer_tensors=tensors,
+                    slot_mapping_ref=slot_mapping_full,
+                    total_tokens=num_tokens,
+                    sparse_kv_format=kv_format_value,
+                    sparse_token_major=token_major,
+                    sparse_vllm_two_major=layout.vllm_two_major,
+                    sparse_k_hidden_dims=layout.k_hidden_dims,
+                    sparse_v_hidden_dims=layout.v_hidden_dims,
+                    sparse_dsa_hidden_dims=layout.dsa_hidden_dims,
+                    return_key=True,
+                )
+            )
+            if layer_state is None or validation_key is None:
+                raise RuntimeError(
+                    f"Failed to prepare dense direct state for layer {layer_id}."
+                )
+            layer_states.append(layer_state)
+            validation_keys.append(validation_key)
+
+        validated_layers = getattr(
+            self, "_sparse_direct_validated_layers", set()
+        )
+        validate_inputs = any(
+            key not in validated_layers for key in validation_keys
+        )
+        current_stream = torch.npu.current_stream()
+        with self._stream_context_or_null(self.store_stream):
+            self.store_stream.wait_stream(current_stream)
+            host_pointer_rows, layer_chunk_ptrs_npu = (
+                dense_mla_dsa_group_direct_kv_transfer_fast(
+                    layer_states,
+                    layer_tensors,
+                    slot_mapping_full,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    num_tokens,
+                    dense_host_interleaved,
+                    True,
+                    validate_inputs=validate_inputs,
+                    fixed_chunk_size=dense_fixed_chunk_size,
+                )
+            )
+        current_stream.wait_stream(self.store_stream)
+        self.store_stream.synchronize()
+
+        if validate_inputs:
+            validated_layers.update(validation_keys)
+            self._sparse_direct_validated_layers = validated_layers
+        return host_pointer_rows, layer_chunk_ptrs_npu
 
     def _lmc_plane_num_tokens(
         self, lmc_tensor: torch.Tensor, kv_group: Optional[int] = None

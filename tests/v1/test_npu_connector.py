@@ -1741,6 +1741,90 @@ def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
 
 
+def test_dense_group_store_uses_one_host_dispatch(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kvcaches = [
+        (object(), object()),
+        (object(), object()),
+    ]
+    connector.use_gpu = True
+    connector.kv_device = torch.device("cpu")
+    connector.store_stream = _NoopStream()
+    connector._sparse_direct_validated_layers = set()
+
+    class _Npu:
+        def current_stream(self):
+            return _NoopStream()
+
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_STORE_DISABLE", False)
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_GROUP_STORE_DISABLE", False)
+    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **kwargs: None)
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda kvcaches, *, kv_group, init_staging: _DenseLayout(),
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda kv_group=0: True)
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda kv_group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda kv_group=0: False)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda kv_group=0: False
+    )
+    monkeypatch.setattr(
+        connector, "_check_layerwise_transfer_invariants", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_direct_layer_state",
+        lambda **kwargs: (
+            f"state-{kwargs['layer_id']}",
+            ("state", kwargs["layer_id"]),
+        ),
+    )
+
+    group_calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_group_direct_kv_transfer_fast",
+        lambda *args, **kwargs: (
+            group_calls.append((args, kwargs))
+            or ([[100], [110]], torch.tensor([[100], [110]], dtype=torch.long))
+        ),
+    )
+
+    memory_objs = [
+        [_MemoryObj(torch.zeros(4, dtype=torch.bfloat16))],
+        [_MemoryObj(torch.zeros(4, dtype=torch.bfloat16))],
+    ]
+    host_rows, pointer_table = connector.batched_from_gpu_group(
+        memory_objs,
+        [0],
+        [4],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        slot_mapping_base=0,
+        kv_group=0,
+    )
+
+    assert host_rows == [[100], [110]]
+    assert pointer_table.tolist() == [[100], [110]]
+    assert len(group_calls) == 1
+    args, kwargs = group_calls[0]
+    assert args[0] == ["state-0", "state-1"]
+    assert len(args[1]) == 2
+    assert args[1][0][0] is memory_objs[0][0].tensor
+    assert args[1][1][0] is memory_objs[1][0].tensor
+    assert args[5] == 4
+    assert args[7] is True
+    assert kwargs["validate_inputs"] is True
+    assert kwargs["fixed_chunk_size"] == 4
+
+
 @pytest.mark.parametrize("use_npu", [True])
 @pytest.mark.parametrize(
     "gpu_kv_format",

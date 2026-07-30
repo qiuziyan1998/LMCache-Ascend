@@ -174,6 +174,69 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast_wrapper(
       validate_inputs, fixed_chunk_size);
 }
 
+py::tuple dense_mla_dsa_group_direct_kv_transfer_fast_wrapper(
+    const py::sequence &layer_state_objects,
+    const py::sequence &layer_tensor_objects, torch::Tensor &slot_mapping_full,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    int64_t total_tokens, bool lmc_host_interleaved, bool direction,
+    bool validate_inputs, int64_t fixed_chunk_size = 0) {
+  std::vector<SparseDirectLayerState> layer_states;
+  layer_states.reserve(py::len(layer_state_objects));
+  for (const py::handle layer_state_object : layer_state_objects) {
+    layer_states.push_back(
+        py::cast<SparseDirectLayerState &>(layer_state_object));
+  }
+  TORCH_CHECK(!layer_states.empty(), "layer_states must not be empty.");
+  TORCH_CHECK(static_cast<size_t>(py::len(layer_tensor_objects)) ==
+                  layer_states.size(),
+              "layer tensor rows must match layer states.");
+
+  std::vector<std::vector<int64_t>> host_pointer_rows;
+  std::vector<int64_t> flat_host_pointers;
+  host_pointer_rows.reserve(layer_states.size());
+  int64_t num_chunks = -1;
+  for (size_t layer_id = 0; layer_id < layer_states.size(); ++layer_id) {
+    const py::sequence layer_tensors =
+        py::reinterpret_borrow<py::sequence>(layer_tensor_objects[layer_id]);
+    if (num_chunks < 0) {
+      num_chunks = py::len(layer_tensors);
+      TORCH_CHECK(num_chunks > 0,
+                  "each group store layer must contain at least one chunk.");
+      flat_host_pointers.reserve(layer_states.size() * num_chunks);
+    }
+    TORCH_CHECK(py::len(layer_tensors) == num_chunks,
+                "all group store layers must have the same chunk count.");
+
+    std::vector<int64_t> pointer_row;
+    pointer_row.reserve(num_chunks);
+    for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+      torch::Tensor tensor = layer_tensors[chunk_id].cast<torch::Tensor>();
+      TORCH_CHECK(tensor.device().is_cpu(),
+                  "group direct store requires CPU destination tensors.");
+      void *device_ptr = get_device_ptr(tensor.data_ptr());
+      TORCH_CHECK(device_ptr != nullptr,
+                  "group direct store destination tensor is not registered: "
+                  "layer=", layer_id, ", chunk=", chunk_id);
+      const int64_t pointer_value =
+          reinterpret_cast<int64_t>(device_ptr);
+      pointer_row.push_back(pointer_value);
+      flat_host_pointers.push_back(pointer_value);
+    }
+    host_pointer_rows.push_back(std::move(pointer_row));
+  }
+
+  auto pointer_options =
+      slot_mapping_full.options().dtype(at::ScalarType::Long);
+  torch::Tensor layer_chunk_ptrs_npu =
+      torch::tensor(flat_host_pointers, pointer_options)
+          .reshape({static_cast<int64_t>(layer_states.size()), num_chunks});
+  dense_mla_dsa_group_direct_kv_transfer_fast(
+      layer_states, slot_mapping_full, layer_chunk_ptrs_npu,
+      chunk_offsets_npu, chunk_sizes_npu, total_tokens,
+      lmc_host_interleaved, direction, validate_inputs, fixed_chunk_size);
+  return py::make_tuple(host_pointer_rows, layer_chunk_ptrs_npu);
+}
+
 PYBIND11_MODULE(c_ops, m) {
   m.def("get_device_ptr", [](uintptr_t ptr_addr) {
     return reinterpret_cast<uintptr_t>(
@@ -293,6 +356,13 @@ PYBIND11_MODULE(c_ops, m) {
         &dense_mla_dsa_batched_direct_kv_transfer_fast_wrapper,
         py::arg("layer_state"), py::arg("slot_mapping_full"),
         py::arg("chunk_ptrs_npu"), py::arg("chunk_offsets_npu"),
+        py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
+        py::arg("lmc_host_interleaved"), py::arg("direction"),
+        py::arg("validate_inputs") = false, py::arg("fixed_chunk_size") = 0);
+  m.def("dense_mla_dsa_group_direct_kv_transfer_fast",
+        &dense_mla_dsa_group_direct_kv_transfer_fast_wrapper,
+        py::arg("layer_states"), py::arg("layer_tensors"),
+        py::arg("slot_mapping_full"), py::arg("chunk_offsets_npu"),
         py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
         py::arg("lmc_host_interleaved"), py::arg("direction"),
         py::arg("validate_inputs") = false, py::arg("fixed_chunk_size") = 0);
