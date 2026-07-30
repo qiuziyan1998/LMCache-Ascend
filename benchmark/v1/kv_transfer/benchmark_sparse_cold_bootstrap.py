@@ -1177,8 +1177,8 @@ def print_results(results: list[BenchmarkResult]) -> None:
 
     print("\nResolver CPU attribution (median ms; remote call excluded)")
     print(
-        f"{'case':38} {'windows':>9} {'results':>9} {'classify':>10} "
-        f"{'pin':>9} {'validate':>10} {'scatter':>9} "
+        f"{'case':38} {'windows':>9} {'results':>9} {'adopt/check':>11} "
+        f"{'pin':>9} {'legacy val':>10} {'scatter':>9} "
         f"{'unattributed':>13} {'rollback':>10}"
     )
     for result in results:
@@ -1187,7 +1187,7 @@ def print_results(results: list[BenchmarkResult]) -> None:
             f"{result.name:38} "
             f"{_ms(stats.resolver_windows_s):9.3f} "
             f"{_ms(stats.resolver_results_s):9.3f} "
-            f"{_ms(stats.resolver_classification_s):10.3f} "
+            f"{_ms(stats.resolver_classification_s):11.3f} "
             f"{_ms(stats.resolver_pinning_s):9.3f} "
             f"{_ms(stats.resolver_validation_s):10.3f} "
             f"{_ms(stats.resolver_scatter_s):9.3f} "

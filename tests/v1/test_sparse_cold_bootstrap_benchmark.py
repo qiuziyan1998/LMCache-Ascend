@@ -31,7 +31,11 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse(
     monkeypatch,
 ):
     benchmark = _load_benchmark_module()
-    monitor = SimpleNamespace(on_pin=lambda _obj: None, on_unpin=lambda _obj: None)
+    monitor = SimpleNamespace(
+        on_pin=lambda _obj: None,
+        on_pin_many=lambda _objs: None,
+        on_unpin=lambda _obj: None,
+    )
     monkeypatch.setattr(
         benchmark.PinMonitor,
         "GetOrCreate",
@@ -71,7 +75,8 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse(
         assert result.broadcast_envelopes == 3
         assert result.transferred_bytes == 512 * 1152 * 3
         assert result.warm_total_s > 0
-        assert result.resolver_validation_s > 0
+        assert result.resolver_classification_s > 0
+        assert result.resolver_validation_s == 0
         assert result.resolver_rollback_s == 0
 
 
