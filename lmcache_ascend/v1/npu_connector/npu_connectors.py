@@ -45,6 +45,25 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+DSA_COLD_DIAG_ENABLED = os.environ.get("LMCACHE_DSA_COLD_DIAG", "0") == "1"
+
+
+def _dsa_cold_current_npu_device() -> Any:
+    try:
+        if hasattr(torch, "npu"):
+            return int(torch.npu.current_device())
+    except Exception as exc:
+        return f"unavailable:{type(exc).__name__}:{exc}"
+    return None
+
+
+def _dsa_cold_tensor_meta(value: Optional[torch.Tensor]) -> str:
+    if value is None:
+        return "none"
+    return (
+        f"shape={tuple(value.shape)},dtype={value.dtype},device={value.device},"
+        f"contiguous={value.is_contiguous()}"
+    )
 
 
 def _payload_event_list(payload_event: Any) -> list[Any]:
@@ -1615,19 +1634,61 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         updated_ptrs_npu = None
         if cached_chunk_ptrs_npu is not None:
-            new_ptrs_npu = torch.tensor(
-                new_dev_ptrs, dtype=torch.long, device=self.kv_device
-            )
             existing = (
                 cached_chunk_ptrs_npu[layer_id]
                 if layer_id < len(cached_chunk_ptrs_npu)
                 else None
             )
-            updated_ptrs_npu = (
-                new_ptrs_npu
-                if existing is None
-                else torch.cat((existing, new_ptrs_npu), dim=0)
-            )
+            if DSA_COLD_DIAG_ENABLED:
+                logger.info(
+                    "[DSA_COLD_DIAG] pointer_cache_build_begin "
+                    "layer=%d new_chunks=%d kv_device=%s current_npu_device=%s "
+                    "existing=%s source_devices=%s source_shapes=%s "
+                    "first_ptr=%s last_ptr=%s",
+                    layer_id,
+                    len(new_tensors),
+                    self.kv_device,
+                    _dsa_cold_current_npu_device(),
+                    _dsa_cold_tensor_meta(existing),
+                    sorted({str(tensor.device) for tensor in new_tensors}),
+                    [tuple(tensor.shape) for tensor in new_tensors[:3]],
+                    hex(new_dev_ptrs[0]) if new_dev_ptrs else None,
+                    hex(new_dev_ptrs[-1]) if new_dev_ptrs else None,
+                )
+            try:
+                new_ptrs_npu = torch.tensor(
+                    new_dev_ptrs, dtype=torch.long, device=self.kv_device
+                )
+                updated_ptrs_npu = (
+                    new_ptrs_npu
+                    if existing is None
+                    else torch.cat((existing, new_ptrs_npu), dim=0)
+                )
+            except BaseException:
+                logger.exception(
+                    "[DSA_COLD_DIAG] pointer_cache_build_failed "
+                    "layer=%d new_chunks=%d kv_device=%s current_npu_device=%s "
+                    "existing=%s source_devices=%s source_shapes=%s "
+                    "first_ptr=%s last_ptr=%s",
+                    layer_id,
+                    len(new_tensors),
+                    self.kv_device,
+                    _dsa_cold_current_npu_device(),
+                    _dsa_cold_tensor_meta(existing),
+                    sorted({str(tensor.device) for tensor in new_tensors}),
+                    [tuple(tensor.shape) for tensor in new_tensors[:3]],
+                    hex(new_dev_ptrs[0]) if new_dev_ptrs else None,
+                    hex(new_dev_ptrs[-1]) if new_dev_ptrs else None,
+                )
+                raise
+            if DSA_COLD_DIAG_ENABLED:
+                logger.info(
+                    "[DSA_COLD_DIAG] pointer_cache_build_done "
+                    "layer=%d new_ptrs=%s updated_ptrs=%s",
+                    layer_id,
+                    _dsa_cold_tensor_meta(new_ptrs_npu),
+                    _dsa_cold_tensor_meta(updated_ptrs_npu),
+                )
 
         num_layers = self.num_layers
         if not cached_chunk_dev_ptrs:
