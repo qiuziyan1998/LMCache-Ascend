@@ -3103,6 +3103,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             return mem_obj_consumer
 
         try:
+            if not metadata_only and (group_cache_prepared or use_cached_retrieve):
+                # Active shared-cache preflight has resolved every source
+                # layer. Prime the connector before the first model layer so
+                # its destination-only native plan is not initialized there.
+                ensure_mem_obj_consumer()
+
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
                 sparse_payload = None

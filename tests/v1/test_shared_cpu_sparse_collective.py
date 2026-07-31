@@ -173,6 +173,13 @@ class _CountingLoadGroupConsumer(_FakeSparseConsumer):
     def __init__(self):
         self.group_call_count = 0
         self.layer_call_count = 0
+        self.prime_count = 0
+
+    def batched_to_gpu_head_token_wise(self, **_kwargs):
+        self.prime_count += 1
+        yield
+        while True:
+            yield
 
     def append_sparse_chunk_ptr_cache_for_layer(self, *args, **kwargs):
         self.layer_call_count += 1
@@ -1856,6 +1863,7 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     )
 
     next(retriever)
+    assert consumer.prime_count == 1
     retriever.send(([0, 1], 0))
     retriever.close()
 

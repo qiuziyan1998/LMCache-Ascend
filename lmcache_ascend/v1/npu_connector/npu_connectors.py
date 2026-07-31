@@ -17,10 +17,7 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemLayerwiseGPUConnector,
 )
-from lmcache.v1.gpu_connector.sparse import (
-    PreparedSparseSource,
-    PreparedSparseSourceLayer,
-)
+from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
@@ -2558,7 +2555,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         *,
         plan: _SparseDestinationPlan,
-        source_layer: PreparedSparseSourceLayer,
+        chunk_ptrs_npu: torch.Tensor,
         layer_id: int,
         slot_mapping_packed: torch.Tensor,
         selected_token_idx: torch.Tensor,
@@ -2570,11 +2567,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Launch one prepared layer directly on the current compute stream."""
         if selected_token_idx.numel() == 0:
             return
+        chunk_count = int(chunk_ptrs_npu.numel())
+        chunk_size_int = int(chunk_size)
+        covered_tokens = chunk_count * chunk_size_int
+        if total_tokens <= 0:
+            return
+        if covered_tokens < int(total_tokens):
+            raise ValueError(
+                "Sparse destination-plan retrieve has insufficient chunk "
+                f"pointers: layer_id={layer_id} chunk_count={chunk_count} "
+                f"chunk_size={chunk_size_int} covered_tokens={covered_tokens} "
+                f"total_tokens={int(total_tokens)}"
+            )
         sparse_mla_dsa_batched_direct_kv_transfer_prepared(
             plan.states[layer_id],
             slot_mapping_packed,
             selected_token_idx,
-            source_layer.chunk_ptrs_npu,
+            chunk_ptrs_npu,
             chunk_size,
             total_tokens,
             sparse_host_interleaved,
@@ -3881,7 +3890,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             self._run_prepared_sparse_direct_kv_transfer_layer(
                 plan=destination_plan,
-                source_layer=source_layer,
+                chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
                 layer_id=layer_id,
                 slot_mapping_packed=slot_mapping_packed,
                 selected_token_idx=selected_token_idx,
@@ -3984,11 +3993,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # Snapshot so interleaved latent/indexer sparse generators do not
         # race on the shared connector self.kvcaches pointer.
         kvcaches_snapshot = self.kvcaches
+        bootstrap_destination_plan = None
+        if layout.kv_format in (
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.DSA_KV,
+            KVCacheFormat.MLA_LATENT,
+            KVCacheFormat.DSA_INDEX,
+        ):
+            bootstrap_destination_plan = (
+                self._get_or_create_sparse_destination_plan(
+                    kvcaches_ref=kvcaches_snapshot,
+                    kv_group=kv_group,
+                    slot_mapping_ref=slot_mapping,
+                    sparse_kv_format=sparse_kv_format,
+                    sparse_k_hidden_dims=sparse_k_hidden_dims,
+                    sparse_v_hidden_dims=sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    expected_device=layout.kv_device,
+                )
+            )
 
         for layer_id in range(self.num_layers):
             sparse_request = yield
             # The generator is resumed from vLLM's attention path; refresh the
-            # active compute stream per layer before ordering load -> compute.
+            # active compute stream for this layer's transfer ordering.
             current_stream = (
                 torch.npu.current_stream()
                 if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
@@ -4111,32 +4139,53 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if lmcache_cached_tokens > 0
                 else self._sparse_total_tokens_from_layer_chunks(cpu_tensors, kv_group)
             )
-            self._run_sparse_direct_kv_transfer_layer(
-                kvcaches_ref=kvcaches_snapshot,
-                kv_group=kv_group,
-                layer_id=layer_id,
-                load_stream=load_stream,
-                load_stream_idx=load_stream_idx,
-                current_stream=current_stream,
-                slot_mapping_packed=slot_mapping_packed,
-                selected_token_idx=selected_token_idx,
-                chunk_size=chunk_size,
-                total_tokens=total_tokens,
-                chunk_ptrs_npu=chunk_ptrs_npu,
-                sparse_kv_format=sparse_kv_format,
-                sparse_token_major=sparse_token_major,
-                sparse_vllm_two_major=sparse_vllm_two_major,
-                sparse_k_hidden_dims=sparse_k_hidden_dims,
-                sparse_v_hidden_dims=sparse_v_hidden_dims,
-                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-                sparse_host_interleaved=sparse_host_interleaved,
-                layer_tensors=cpu_tensors,
-                slot_mapping_ref=(
-                    slot_mapping_packed if explicit_sparse_payload else slot_mapping
-                ),
-                cpu_tensors=cpu_tensors,
-                selected_token_counts=selected_token_counts,
-            )
+            if (
+                bootstrap_destination_plan is not None
+                and getattr(self, "_active_sparse_load_join", None) is None
+            ):
+                # A single bootstrap request has no work to overlap on the load
+                # streams.  Use the source-independent destination plan and
+                # current-stream ordering, matching the prepared warm path.
+                self._run_prepared_sparse_direct_kv_transfer_layer(
+                    plan=bootstrap_destination_plan,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    layer_id=layer_id,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    selected_token_counts=selected_token_counts,
+                )
+            else:
+                self._run_sparse_direct_kv_transfer_layer(
+                    kvcaches_ref=kvcaches_snapshot,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    load_stream=load_stream,
+                    load_stream_idx=load_stream_idx,
+                    current_stream=current_stream,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    sparse_kv_format=sparse_kv_format,
+                    sparse_token_major=sparse_token_major,
+                    sparse_vllm_two_major=sparse_vllm_two_major,
+                    sparse_k_hidden_dims=sparse_k_hidden_dims,
+                    sparse_v_hidden_dims=sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    layer_tensors=cpu_tensors,
+                    slot_mapping_ref=(
+                        slot_mapping_packed
+                        if explicit_sparse_payload
+                        else slot_mapping
+                    ),
+                    cpu_tensors=cpu_tensors,
+                    selected_token_counts=selected_token_counts,
+                )
             capture_content_probe = (
                 deep_diag_enabled
                 and layer_id == 0

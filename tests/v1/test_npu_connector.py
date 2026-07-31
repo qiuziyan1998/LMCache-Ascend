@@ -897,6 +897,126 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
     assert calls[0]["layer_tensors"][0] is cached_tensor
 
 
+@pytest.mark.parametrize("deferred_join", [False, True])
+def test_bootstrap_sparse_head_token_wise_uses_destination_plan_without_join(
+    monkeypatch,
+    deferred_join,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kvcaches = [(object(), object())]
+    connector.load_stream_idx = 0
+    connector.load_stream_num = 1
+    connector.load_stream_list = [object()]
+    connector.lmcache_chunk_size = 256
+
+    class _Layout:
+        k_hidden_dims = 1
+        v_hidden_dims = 1
+        dsa_hidden_dims = 0
+        kv_format = npu_connectors.KVCacheFormat.MLA_LATENT
+        vllm_two_major = False
+        kv_device = torch.device("cpu")
+
+    class _MemoryObj:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+    current_stream = object()
+    connector._active_sparse_load_join = (
+        npu_connectors._SparseLoadJoin(current_stream) if deferred_join else None
+    )
+    destination_plan = object()
+    chunk_ptrs = torch.tensor([123], dtype=torch.int64)
+    plan_calls = []
+    prepared_calls = []
+    legacy_calls = []
+
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(current_stream=lambda: current_stream),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "initialize_kvcaches_ptr",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda kvcaches, kv_group, init_staging: _Layout(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_layerwise_token_major",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_sparse_lmc_host_interleaved",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_pack_sparse_layer_inputs",
+        lambda slot_mapping, selected_token_idx, token_start_index: (
+            slot_mapping,
+            selected_token_idx,
+        ),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        lambda layer_id, cpu_tensors, cached_chunk_ptrs_npu: chunk_ptrs,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **kwargs: plan_calls.append(kwargs) or destination_plan,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_run_prepared_sparse_direct_kv_transfer_layer",
+        lambda **kwargs: prepared_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_run_sparse_direct_kv_transfer_layer",
+        lambda **kwargs: legacy_calls.append(kwargs),
+    )
+
+    slot_mapping = torch.arange(4, dtype=torch.long)
+    selected = torch.arange(4, dtype=torch.int32)
+    generator = connector.batched_to_gpu_head_token_wise(
+        slot_mapping=slot_mapping,
+        sync=True,
+        lmcache_cached_tokens=4,
+        kv_group=0,
+    )
+    next(generator)
+    generator.send(([_MemoryObj(torch.zeros(4))], selected, 0, None))
+
+    assert len(plan_calls) == 1
+    assert plan_calls[0]["slot_mapping_ref"] is slot_mapping
+    if deferred_join:
+        assert prepared_calls == []
+        assert len(legacy_calls) == 1
+        assert legacy_calls[0]["current_stream"] is current_stream
+    else:
+        assert legacy_calls == []
+        assert len(prepared_calls) == 1
+        assert prepared_calls[0]["plan"] is destination_plan
+        assert prepared_calls[0]["chunk_ptrs_npu"] is chunk_ptrs
+        assert prepared_calls[0]["slot_mapping_packed"] is slot_mapping
+        assert prepared_calls[0]["selected_token_idx"] is selected
+        assert "load_stream" not in prepared_calls[0]
+        assert "current_stream" not in prepared_calls[0]
+
+    generator.close()
+
+
 def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
@@ -1004,7 +1124,10 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
     assert all("chunk_size" not in call for call in plan_calls)
     assert len(transfer_calls) == 2
     assert all(call["plan"] is destination_plan for call in transfer_calls)
-    assert all(call["source_layer"] is source_layer for call in transfer_calls)
+    assert all(
+        call["chunk_ptrs_npu"] is source_layer.chunk_ptrs_npu
+        for call in transfer_calls
+    )
     assert all(
         "load_stream" not in call and "current_stream" not in call
         for call in transfer_calls
@@ -1081,7 +1204,7 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
 
     connector._run_prepared_sparse_direct_kv_transfer_layer(
         plan=plan,
-        source_layer=source_layer,
+        chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
         layer_id=0,
         slot_mapping_packed=slots,
         selected_token_idx=selected,
@@ -1096,7 +1219,37 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     assert args[1] is slots
     assert args[2] is selected
     assert args[3] is chunk_ptrs
-    assert args[4:] == (256, 4, True)
+    assert args[4:] == (256, 4, True, None)
+
+    with pytest.raises(
+        ValueError,
+        match="destination-plan retrieve has insufficient chunk pointers",
+    ):
+        connector._run_prepared_sparse_direct_kv_transfer_layer(
+            plan=plan,
+            chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
+            layer_id=0,
+            slot_mapping_packed=slots,
+            selected_token_idx=selected,
+            chunk_size=256,
+            total_tokens=257,
+            sparse_host_interleaved=True,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="destination-plan retrieve has insufficient chunk pointers",
+    ):
+        connector._run_prepared_sparse_direct_kv_transfer_layer(
+            plan=plan,
+            chunk_ptrs_npu=torch.empty(0, dtype=torch.int64),
+            layer_id=0,
+            slot_mapping_packed=slots,
+            selected_token_idx=selected,
+            chunk_size=256,
+            total_tokens=1,
+            sparse_host_interleaved=True,
+        )
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
