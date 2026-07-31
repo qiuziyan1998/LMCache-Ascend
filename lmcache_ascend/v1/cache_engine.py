@@ -908,6 +908,77 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_tensors.extend([] for _ in range(self.num_layers))
             cached_tensors[layer_id].extend(new_tensors)
 
+    def _append_retrieve_group_cache(
+        self,
+        mem_objs_by_layer: List[List[MemoryObj]],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+    ) -> None:
+        """Retain storage-get results for all layers with one batched pointer install.
+
+        Validates every MemoryObj tensor, then installs all NPU source pointer
+        rows via a single 2-D H2D copy.  ``cached_memory_objs`` and
+        ``cached_tensors`` are published only after pointer installation
+        succeeds, preserving the partial-state invariant from
+        ``_append_retrieve_layer_cache``.
+        """
+        new_tensors_by_layer: List[List[torch.Tensor]] = []
+        for layer_id, mem_objs_layer in enumerate(mem_objs_by_layer):
+            new_tensors: List[torch.Tensor] = []
+            for chunk_index, mem_obj in enumerate(mem_objs_layer):
+                tensor = mem_obj.tensor
+                if tensor is None:
+                    raise ValueError(
+                        "Layerwise sparse retrieve resolved a chunk without a "
+                        "tensor; refusing to shift the direct-load pointer "
+                        f"order: layer_id={layer_id}, "
+                        f"chunk_index={chunk_index}"
+                    )
+                new_tensors.append(tensor)
+            new_tensors_by_layer.append(new_tensors)
+
+        group_append_fn = getattr(
+            self.gpu_connector,
+            "append_sparse_chunk_ptr_cache_for_layers",
+            None,
+        )
+        if (
+            group_append_fn is None
+            or not new_tensors_by_layer
+            or cached_chunk_dev_ptrs is None
+        ):
+            for layer_id, new_tensors in enumerate(new_tensors_by_layer):
+                self._append_retrieve_layer_cache(
+                    layer_id,
+                    mem_objs_by_layer[layer_id],
+                    cached_memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
+            return
+
+        group_append_fn(
+            new_tensors_by_layer,
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+        )
+
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend(
+                    [] for _ in range(self.num_layers)
+                )
+            for layer_id, mem_objs_layer in enumerate(mem_objs_by_layer):
+                cached_memory_objs[layer_id].extend(mem_objs_layer)
+        if cached_tensors is not None:
+            if not cached_tensors:
+                cached_tensors.extend([] for _ in range(self.num_layers))
+            for layer_id, new_tensors in enumerate(new_tensors_by_layer):
+                cached_tensors[layer_id].extend(new_tensors)
+
     def _sparse_pointer_cache_covers(
         self,
         cached_chunk_dev_ptrs: Optional[List],
@@ -2091,6 +2162,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         to_release: list[MemoryObj] = []
         passive_views_handed_off = False
         metadata_appended = False
+        pending_passive_mem_objs: List[List[MemoryObj]] = []
 
         try:
             for layer_id in range(self.num_layers):
@@ -2189,21 +2261,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                             expected_producer_rank=self.metadata.first_rank,
                         )
                         mem_objs_layer.append(mem_obj)
-                    try:
-                        self._append_retrieve_layer_cache(
-                            layer_id,
-                            mem_objs_layer,
-                            cached_memory_objs,
-                            cached_tensors,
-                            cached_chunk_dev_ptrs,
-                            cached_chunk_ptrs_npu,
-                        )
-                    except Exception:
-                        for mem_obj in mem_objs_layer:
-                            if mem_obj.is_valid():
-                                mem_obj.ref_count_down()
-                        raise
-                    to_release.extend(mem_objs_layer)
+                    if metadata_only:
+                        pending_passive_mem_objs.append(mem_objs_layer)
+                        to_release.extend(mem_objs_layer)
+                    else:
+                        try:
+                            self._append_retrieve_layer_cache(
+                                layer_id,
+                                mem_objs_layer,
+                                cached_memory_objs,
+                                cached_tensors,
+                                cached_chunk_dev_ptrs,
+                                cached_chunk_ptrs_npu,
+                            )
+                        except Exception:
+                            for mem_obj in mem_objs_layer:
+                                if mem_obj.is_valid():
+                                    mem_obj.ref_count_down()
+                            raise
+                        to_release.extend(mem_objs_layer)
                     self._append_shared_handle_cache(
                         layer_id,
                         envelope.handles,
@@ -2226,6 +2302,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
+            if metadata_only and pending_passive_mem_objs:
+                self._append_retrieve_group_cache(
+                    pending_passive_mem_objs,
+                    cached_memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
             if metadata_only and not self._sparse_pointer_cache_covers(
                 cached_chunk_dev_ptrs,
                 cached_chunk_ptrs_npu,
@@ -2817,28 +2901,33 @@ class AscendLMCacheEngine(LMCacheEngine):
                         record_request_preflight_error()
 
         metadata_only_cache_prepared = False
+        group_cache_prepared = False
+        bootstrap_missing_chunks = required_chunks - cached_prefix_chunks
         if (
             preflight_error_envelope is None
-            and metadata_only
             and pre_resolved_shared_mem_layers is not None
             and not use_cached_retrieve
+            and not shared_retrieve_passive
+            and (metadata_only or bootstrap_missing_chunks > 0)
         ):
             try:
-                for layer_id, mem_objs_layer in enumerate(
-                    pre_resolved_shared_mem_layers
-                ):
-                    self._append_retrieve_layer_cache(
-                        layer_id,
-                        mem_objs_layer,
-                        cached_memory_objs,
-                        cached_tensors,
-                        cached_chunk_dev_ptrs,
-                        cached_chunk_ptrs_npu,
-                    )
-                metadata_only_cache_prepared = True
+                self._append_retrieve_group_cache(
+                    pre_resolved_shared_mem_layers,
+                    cached_memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
+                if metadata_only:
+                    metadata_only_cache_prepared = True
+                else:
+                    group_cache_prepared = True
             except Exception as exc:
-                message = (
+                phase_msg = (
                     "Shared CPU sparse metadata-only pointer preflight failed "
+                    "before handle publication."
+                    if metadata_only
+                    else "Shared CPU sparse group pointer preflight failed "
                     "before handle publication."
                 )
                 preflight_error_envelope = self._shared_layerwise_error_envelope(
@@ -2849,10 +2938,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     request_ordinal=request_ordinal,
                     layer_id=0,
                     kv_group=kv_group,
-                    message=message,
+                    message=phase_msg,
                     details={"error": str(exc)},
                 )
-                preflight_error = ValueError(f"{message} error={exc}")
+                preflight_error = ValueError(f"{phase_msg} error={exc}")
                 record_request_preflight_error()
 
         if (
@@ -3065,7 +3154,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                         task = next(get_generator)
                         assert task is not None
                         mem_objs_layer = task.result()
-                    if mem_objs_layer is not None and not metadata_only_cache_prepared:
+                    if (
+                        mem_objs_layer is not None
+                        and not metadata_only_cache_prepared
+                        and not group_cache_prepared
+                    ):
                         layer_cached_chunks = (
                             len(cached_tensors[layer_id])
                             if cached_tensors is not None
@@ -3081,8 +3174,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_chunk_dev_ptrs,
                                 cached_chunk_ptrs_npu,
                             )
-                    else:
-                        mem_objs_layer = []
+                        else:
+                            mem_objs_layer = []
+                    elif metadata_only_cache_prepared or group_cache_prepared:
+                        pass
 
                 if publish_shared_handles:
                     publish_mem_objs = (

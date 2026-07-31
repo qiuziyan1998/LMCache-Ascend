@@ -1650,6 +1650,119 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         cached_chunk_ptrs_npu[layer_id] = updated_ptrs_npu
 
+    def append_sparse_chunk_ptr_cache_for_layers(
+        self,
+        new_tensors_by_layer: List[List[torch.Tensor]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> None:
+        """Install all sparse source pointer rows with one H2D copy.
+
+        Args:
+            new_tensors_by_layer: Newly resolved CPU tensors in layer-major order.
+            cached_chunk_dev_ptrs: Mutable canonical host pointer rows.
+            cached_chunk_ptrs_npu: Mutable layer-major NPU pointer rows, or None.
+
+        Raises:
+            ValueError: If the input cannot form a rectangular all-layer table.
+            RuntimeError: If a CPU tensor pointer cannot be resolved.
+
+        Caller-owned caches are mutated only after pointer resolution and NPU
+        tensor construction both succeed.
+        """
+        if not new_tensors_by_layer:
+            return
+        if len(new_tensors_by_layer) != self.num_layers:
+            raise ValueError(
+                "Sparse group pointer append must cover every layer: "
+                f"layers={len(new_tensors_by_layer)}, expected={self.num_layers}"
+            )
+
+        # Validate uniform suffix chunk count across layers.
+        suffix_counts = {
+            len(tensors) for tensors in new_tensors_by_layer
+        }
+        if len(suffix_counts) != 1:
+            raise ValueError(
+                "Sparse group pointer append has ragged suffix chunk count: "
+                f"counts={sorted(suffix_counts)}"
+            )
+        new_chunk_count = suffix_counts.pop()
+        if new_chunk_count == 0:
+            return
+
+        num_new_layers = len(new_tensors_by_layer)
+
+        # Stage every device pointer locally (no caller mutation yet).
+        staged_dev_ptrs_by_layer: List[List[int]] = []
+        for layer_id in range(num_new_layers):
+            row = [
+                self._resolve_registered_cpu_tensor_device_ptr(
+                    tensor,
+                    layer_id=layer_id,
+                    chunk_index=chunk_index,
+                    source="append_sparse_chunk_ptr_cache_for_layers",
+                )
+                for chunk_index, tensor in enumerate(
+                    new_tensors_by_layer[layer_id]
+                )
+            ]
+            staged_dev_ptrs_by_layer.append(row)
+
+        # Build complete host rows (old prefix + new suffix) and validate
+        # uniform prefix length.
+        complete_host_rows: List[List[int]] = []
+        prefix_counts: set[int] = set()
+        for layer_id in range(num_new_layers):
+            existing_host = (
+                cached_chunk_dev_ptrs[layer_id]
+                if cached_chunk_dev_ptrs
+                and layer_id < len(cached_chunk_dev_ptrs)
+                else []
+            )
+            prefix_counts.add(len(existing_host))
+            complete_host_rows.append(
+                list(existing_host) + staged_dev_ptrs_by_layer[layer_id]
+            )
+        if len(prefix_counts) != 1:
+            raise ValueError(
+                "Sparse group pointer append has ragged existing prefix: "
+                f"prefix_counts={sorted(prefix_counts)}"
+            )
+
+        # Build one 2-D NPU tensor and obtain 1-D row views.
+        row_views: Optional[List[torch.Tensor]] = None
+        if cached_chunk_ptrs_npu is not None:
+            pointer_table = torch.tensor(
+                complete_host_rows,
+                dtype=torch.long,
+                device=self.kv_device,
+            )
+            row_views = list(pointer_table.unbind(0))
+
+        # Publish host and NPU rows only after all staging succeeded.
+        num_layers = self.num_layers
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) < num_new_layers:
+            cached_chunk_dev_ptrs.append([])
+
+        if cached_chunk_ptrs_npu is not None:
+            if not cached_chunk_ptrs_npu:
+                cached_chunk_ptrs_npu.extend(
+                    None for _ in range(num_layers)
+                )
+            while len(cached_chunk_ptrs_npu) < num_new_layers:
+                cached_chunk_ptrs_npu.append(None)
+
+        for layer_id in range(num_new_layers):
+            cached_chunk_dev_ptrs[layer_id].extend(
+                staged_dev_ptrs_by_layer[layer_id]
+            )
+            if cached_chunk_ptrs_npu is not None:
+                assert row_views is not None
+                cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
+
     def _resolve_registered_cpu_tensor_device_ptr(
         self,
         tensor: torch.Tensor,

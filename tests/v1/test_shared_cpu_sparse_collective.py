@@ -130,6 +130,62 @@ class _PoisonSparseConsumer:
             new_row if existing is None else torch.cat((existing, new_row))
         )
 
+    def append_sparse_chunk_ptr_cache_for_layers(
+        self,
+        new_tensors_by_layer,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+    ):
+        num_layers = len(new_tensors_by_layer)
+        while len(cached_chunk_dev_ptrs) < num_layers:
+            cached_chunk_dev_ptrs.append([])
+        while len(cached_chunk_ptrs_npu) < num_layers:
+            cached_chunk_ptrs_npu.append(None)
+        for layer_id, new_tensors in enumerate(new_tensors_by_layer):
+            host_row = [tensor.data_ptr() for tensor in new_tensors]
+            cached_chunk_dev_ptrs[layer_id].extend(host_row)
+            new_row = torch.tensor(host_row, dtype=torch.long)
+            existing = cached_chunk_ptrs_npu[layer_id]
+            cached_chunk_ptrs_npu[layer_id] = (
+                new_row if existing is None else torch.cat((existing, new_row))
+            )
+
+
+class _CountingGroupConsumer(_PoisonSparseConsumer):
+    """Tracks whether the batched group pointer method is used."""
+
+    def __init__(self):
+        self.group_call_count = 0
+        self.layer_call_count = 0
+
+    def append_sparse_chunk_ptr_cache_for_layer(self, *args, **kwargs):
+        self.layer_call_count += 1
+        super().append_sparse_chunk_ptr_cache_for_layer(*args, **kwargs)
+
+    def append_sparse_chunk_ptr_cache_for_layers(self, *args, **kwargs):
+        self.group_call_count += 1
+        super().append_sparse_chunk_ptr_cache_for_layers(*args, **kwargs)
+
+
+class _CountingLoadGroupConsumer(_FakeSparseConsumer):
+    """Counts pointer installs while retaining the sparse load consumer."""
+
+    def __init__(self):
+        self.group_call_count = 0
+        self.layer_call_count = 0
+
+    def append_sparse_chunk_ptr_cache_for_layer(self, *args, **kwargs):
+        self.layer_call_count += 1
+        _PoisonSparseConsumer.append_sparse_chunk_ptr_cache_for_layer(
+            self, *args, **kwargs
+        )
+
+    def append_sparse_chunk_ptr_cache_for_layers(self, *args, **kwargs):
+        self.group_call_count += 1
+        _PoisonSparseConsumer.append_sparse_chunk_ptr_cache_for_layers(
+            self, *args, **kwargs
+        )
+
 
 class _OrderedSparseConsumer:
     def __init__(self, events):
@@ -1046,6 +1102,78 @@ def test_sparse_passive_metadata_only_extends_without_npu_consumer(monkeypatch):
     assert mem_obj.is_valid()
 
 
+def test_sparse_passive_metadata_only_uses_batched_group_pointer_install(
+    monkeypatch,
+):
+    """Passive metadata-only must install pointers in one group call."""
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key = _make_key(kv_group=1, chunk_hash=1)
+    mem_objs = [_FakeTensorMemObj(torch.empty(1)) for _ in range(2)]
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    consumer = _CountingGroupConsumer()
+    engine.gpu_connector = consumer
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _SequencePassiveAllocator(
+        list(mem_objs)
+    )
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+    envelopes = iter(
+        SharedHandleEnvelope(
+            request_id="req-1",
+            phase="sparse_decode_bootstrap",
+            request_ordinal=0,
+            layer_id=layer_id,
+            kv_group=1,
+            status="ok",
+            generation=7,
+            handles=[object()],
+        )
+        for layer_id in range(2)
+    )
+    engine._receive_shared_envelope = lambda: next(envelopes)
+
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=[],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+        cached_shared_handles=[],
+        kv_group=1,
+        req_id="req-1",
+        sparse_metadata_only=True,
+    )
+
+    next(retriever)
+    retriever.send((None, 0))
+    retriever.send((None, 0))
+    retriever.close()
+
+    assert consumer.group_call_count == 1
+    assert consumer.layer_call_count == 0
+    assert len(cached_chunk_dev_ptrs) == 2
+    assert all(len(row) == 1 for row in cached_chunk_dev_ptrs)
+
+
 def test_sparse_passive_extension_failure_rolls_back_all_layers(monkeypatch):
     monkeypatch.setattr(
         ascend_cache_engine,
@@ -1308,6 +1436,83 @@ def test_sparse_rank0_metadata_only_publishes_without_npu_consumer(monkeypatch):
     assert len(broadcasts) == 1
     assert broadcasts[0].kv_group == 1
     assert broadcasts[0].handles == ["handle"]
+
+
+def test_sparse_rank0_metadata_only_uses_batched_group_pointer_install(
+    monkeypatch,
+):
+    """Active metadata-only must install pointers in one group call."""
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key0 = _make_key(kv_group=1, chunk_hash=1)
+    key1 = _make_key(kv_group=1, chunk_hash=2)
+    old_mem_obj = _FakeTensorMemObj(torch.empty(1))
+    new_mem_obj = _FakePinnedMemObj()
+    old_handle, new_handle = object(), object()
+    broadcasts = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
+    engine.storage_manager = object()
+    consumer = _CountingGroupConsumer()
+    engine.gpu_connector = consumer
+    engine.shared_cpu_cache_generation = 7
+    engine._shared_cpu_request_leases = {}
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = AscendLMCacheEngine._has_retrieve_data_cache
+    engine._retrieve_data_cache_covers = (
+        AscendLMCacheEngine._retrieve_data_cache_covers
+    )
+    engine._resolve_local_cpu_retrieve_location = lambda location: location
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0, 1],
+        [1, 2],
+        [[key0, key1]],
+    )
+    engine._find_shared_rank0_chunk_location = lambda _key: "LocalCPUBackend"
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {"fits": True}
+    engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: [new_mem_obj]
+    engine._make_shared_handles_for_layer = lambda **_kwargs: [new_handle]
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+
+    cached_memory_objs = [[old_mem_obj]]
+    cached_tensors = [[old_mem_obj.tensor]]
+    cached_chunk_dev_ptrs = [[123]]
+    cached_chunk_ptrs_npu = [torch.tensor([123], dtype=torch.long)]
+    cached_shared_handles = [[old_handle]]
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1, 2],
+        cached_keys=[[key0]],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=cached_tensors,
+        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+        cached_shared_handles=cached_shared_handles,
+        kv_group=1,
+        req_id="req-1",
+        sparse_metadata_only=True,
+    )
+
+    next(retriever)
+    retriever.send((None, 0))
+    retriever.close()
+
+    assert consumer.group_call_count == 1
+    assert consumer.layer_call_count == 0
+    assert cached_memory_objs == [[old_mem_obj, new_mem_obj]]
+    assert cached_shared_handles == [[old_handle, new_handle]]
+    assert len(cached_chunk_dev_ptrs[0]) == 2
 
 
 def test_sparse_rank0_metadata_only_rejects_incomplete_pointer_preflight(
@@ -1596,7 +1801,8 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     engine.num_layers = 1
     engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
     engine.storage_manager = object()
-    engine.gpu_connector = _FakeSparseConsumer()
+    consumer = _CountingLoadGroupConsumer()
+    engine.gpu_connector = consumer
     engine.shared_cpu_cache_generation = 7
     engine._shared_cpu_request_leases = {}
     engine.is_healthy = lambda: True
@@ -1631,6 +1837,8 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
     cached_memory_objs = [[old_mem_obj]]
     cached_tensors = [[old_mem_obj.tensor]]
+    cached_chunk_dev_ptrs = [[123]]
+    cached_chunk_ptrs_npu = [torch.tensor([123], dtype=torch.long)]
     cached_shared_handles = [[old_handle]]
 
     retriever = engine.retrieve_layer_head_token_wise(
@@ -1640,8 +1848,8 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
         cached_ends=[1],
         cached_memory_objs=cached_memory_objs,
         cached_tensors=cached_tensors,
-        cached_chunk_dev_ptrs=[],
-        cached_chunk_ptrs_npu=[],
+        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
         cached_shared_handles=cached_shared_handles,
         kv_group=0,
         req_id="req-1",
@@ -1654,6 +1862,9 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     assert resolved_keys == [key1]
     assert cached_memory_objs == [[old_mem_obj, new_mem_obj]]
     assert cached_shared_handles == [[old_handle, new_handle]]
+    assert consumer.group_call_count == 1
+    assert consumer.layer_call_count == 0
+    assert len(cached_chunk_dev_ptrs[0]) == 2
     assert len(broadcasts) == 1
     assert broadcasts[0].handles == [new_handle]
 
@@ -1997,6 +2208,120 @@ def test_sparse_pointer_cache_tensor_build_failure_is_atomic(monkeypatch):
 
     assert cached_chunk_dev_ptrs == []
     assert cached_chunk_ptrs_npu == []
+
+
+def test_sparse_group_pointer_cache_builds_one_rectangular_table(monkeypatch):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kv_device = torch.device("cpu")
+    new_tensors = [[torch.empty(1)], [torch.empty(1)]]
+    resolved = [row[0].data_ptr() + 10 for row in new_tensors]
+    monkeypatch.setattr(
+        npu_connectors.lmc_ops,
+        "get_device_ptr",
+        lambda ptr: ptr + 10,
+    )
+
+    original_tensor = torch.tensor
+    tensor_inputs = []
+
+    def record_tensor(data, *args, **kwargs):
+        tensor_inputs.append([list(row) for row in data])
+        return original_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", record_tensor)
+    cached_chunk_dev_ptrs = [[101], [202]]
+    cached_chunk_ptrs_npu = [
+        original_tensor([101], dtype=torch.long),
+        original_tensor([202], dtype=torch.long),
+    ]
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        new_tensors,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+    )
+
+    assert tensor_inputs == [[[101, resolved[0]], [202, resolved[1]]]]
+    assert cached_chunk_dev_ptrs == [
+        [101, resolved[0]],
+        [202, resolved[1]],
+    ]
+    assert [row.tolist() for row in cached_chunk_ptrs_npu] == (
+        cached_chunk_dev_ptrs
+    )
+    assert all(
+        row.ndim == 1 and row.is_contiguous()
+        for row in cached_chunk_ptrs_npu
+    )
+    assert (
+        cached_chunk_ptrs_npu[0].untyped_storage().data_ptr()
+        == cached_chunk_ptrs_npu[1].untyped_storage().data_ptr()
+    )
+
+
+def test_sparse_group_pointer_resolution_failure_is_atomic(monkeypatch):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kv_device = torch.device("cpu")
+    calls = 0
+
+    def resolve_pointer(_ptr):
+        nonlocal calls
+        calls += 1
+        return 1234 if calls == 1 else None
+
+    monkeypatch.setattr(npu_connectors.lmc_ops, "get_device_ptr", resolve_pointer)
+    cached_chunk_dev_ptrs = [[101], [202]]
+    old_rows = [
+        torch.tensor([101], dtype=torch.long),
+        torch.tensor([202], dtype=torch.long),
+    ]
+    cached_chunk_ptrs_npu = list(old_rows)
+
+    with pytest.raises(RuntimeError, match="pointer-cache install failed"):
+        connector.append_sparse_chunk_ptr_cache_for_layers(
+            [[torch.empty(1)], [torch.empty(1)]],
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+        )
+
+    assert cached_chunk_dev_ptrs == [[101], [202]]
+    assert all(
+        current is previous
+        for current, previous in zip(cached_chunk_ptrs_npu, old_rows, strict=True)
+    )
+
+
+def test_sparse_group_pointer_tensor_failure_is_atomic(monkeypatch):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kv_device = torch.device("cpu")
+    monkeypatch.setattr(npu_connectors.lmc_ops, "get_device_ptr", lambda _ptr: 1234)
+    cached_chunk_dev_ptrs = [[101], [202]]
+    old_rows = [
+        torch.tensor([101], dtype=torch.long),
+        torch.tensor([202], dtype=torch.long),
+    ]
+    cached_chunk_ptrs_npu = list(old_rows)
+
+    def fail_tensor(*_args, **_kwargs):
+        raise RuntimeError("npu pointer tensor allocation failed")
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", fail_tensor)
+
+    with pytest.raises(RuntimeError, match="pointer tensor allocation failed"):
+        connector.append_sparse_chunk_ptr_cache_for_layers(
+            [[torch.empty(1)], [torch.empty(1)]],
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+        )
+
+    assert cached_chunk_dev_ptrs == [[101], [202]]
+    assert all(
+        current is previous
+        for current, previous in zip(cached_chunk_ptrs_npu, old_rows, strict=True)
+    )
 
 
 def test_sparse_passive_pointer_failure_releases_unpublished_view(monkeypatch):
