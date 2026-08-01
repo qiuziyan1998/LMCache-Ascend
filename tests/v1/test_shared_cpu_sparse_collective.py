@@ -620,6 +620,7 @@ def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(
         return allocated
 
     engine._resolve_shared_rank0_remote_layers_windowed = resolve_windowed
+    engine._resolve_shared_rank0_page_first_layers = resolve_windowed
     engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: (
         _ for _ in ()
     ).throw(AssertionError("layerwise resolver must be bypassed"))
@@ -643,7 +644,10 @@ def test_sparse_rank0_uses_windowed_remote_preflight_when_enabled(
 
     assert len(windowed_calls) == 1
     assert windowed_calls[0]["keys_layer_major"] == keys_layer_major
-    assert windowed_calls[0]["layers_per_batch"] == expected_layers_per_batch
+    if page_first:
+        assert "layers_per_batch" not in windowed_calls[0]
+    else:
+        assert windowed_calls[0]["layers_per_batch"] == expected_layers_per_batch
 
     retriever.close()
     assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)
@@ -702,6 +706,7 @@ def test_page_first_windowed_preflight_reads_only_missing_suffix(monkeypatch):
         return allocated
 
     engine._resolve_shared_rank0_remote_layers_windowed = resolve_windowed
+    engine._resolve_shared_rank0_page_first_layers = resolve_windowed
     engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: (
         _ for _ in ()
     ).throw(AssertionError("layerwise resolver must be bypassed"))
@@ -726,7 +731,7 @@ def test_page_first_windowed_preflight_reads_only_missing_suffix(monkeypatch):
     assert located_keys == new_keys
     assert len(windowed_calls) == 1
     assert windowed_calls[0]["keys_layer_major"] == missing_keys
-    assert windowed_calls[0]["layers_per_batch"] == num_layers
+    assert "layers_per_batch" not in windowed_calls[0]
 
     retriever.close()
     assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)
@@ -746,6 +751,11 @@ def test_sampled_page_first_preflight_batches_local_prefix_layers(monkeypatch):
         for layer in range(num_layers)
     ]
     allocated = [[_FakePinnedMemObj(), _FakePinnedMemObj()] for _ in range(num_layers)]
+    local_objects = [
+        [_FakePinnedMemObj(), _FakePinnedMemObj()],
+        [_FakePinnedMemObj()],
+        [_FakePinnedMemObj()],
+    ]
 
     class _CrossLayerLocalBackend:
         def __init__(self):
@@ -755,11 +765,11 @@ def test_sampled_page_first_preflight_batches_local_prefix_layers(monkeypatch):
             self.calls.append(keys)
             return [
                 LocalCPUPrefixGetResult(
-                    [],
-                    list(range(len(layer_keys))),
-                    list(layer_keys),
+                    list(local_objects[layer_id]),
+                    list(range(len(local_objects[layer_id]), len(layer_keys))),
+                    list(layer_keys[len(local_objects[layer_id]) :]),
                 )
-                for layer_keys in keys
+                for layer_id, layer_keys in enumerate(keys)
             ]
 
         def batched_get_prefix_with_misses(self, _keys):
@@ -790,7 +800,10 @@ def test_sampled_page_first_preflight_batches_local_prefix_layers(monkeypatch):
         keys_layer_major,
     )
     engine._shared_local_cpu_backend = lambda: local_backend
-    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {"fits": True}
+    capacity_calls = []
+    engine._shared_cpu_runtime_capacity_details = lambda **kwargs: (
+        capacity_calls.append(kwargs) or {"fits": True}
+    )
     windowed_calls = []
 
     def resolve_windowed(**kwargs):
@@ -798,6 +811,7 @@ def test_sampled_page_first_preflight_batches_local_prefix_layers(monkeypatch):
         return allocated
 
     engine._resolve_shared_rank0_remote_layers_windowed = resolve_windowed
+    engine._resolve_shared_rank0_page_first_layers = resolve_windowed
     engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: (
         _ for _ in ()
     ).throw(AssertionError("layerwise resolver must be bypassed"))
@@ -822,7 +836,11 @@ def test_sampled_page_first_preflight_batches_local_prefix_layers(monkeypatch):
     assert local_backend.calls == [keys_layer_major]
     assert len(windowed_calls) == 1
     assert windowed_calls[0]["keys_layer_major"] == keys_layer_major
-    assert windowed_calls[0]["layers_per_batch"] == num_layers
+    assert windowed_calls[0]["local_prefix_layers"]
+    assert "layers_per_batch" not in windowed_calls[0]
+    assert capacity_calls[0]["chunk_locations_layer_major"] == [
+        ["LocalCPUBackend", "RemoteBackend"] for _ in range(num_layers)
+    ]
 
     retriever.close()
     assert all(obj.unpin_count == 1 for layer in allocated for obj in layer)

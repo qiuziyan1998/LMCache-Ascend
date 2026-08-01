@@ -2741,6 +2741,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                     missing=len(missing_locations),
                     sampled=sampled_worker_retrieve,
                 )
+            page_first_locations = (
+                self._shared_page_first_common_prefix_plan(
+                    shared_chunk_locations_layer_major
+                )
+                if mooncake_page_layout_enabled(self.config)
+                else None
+            )
+            if page_first_locations is not None:
+                shared_chunk_locations_layer_major = page_first_locations
             if missing_locations:
                 message = (
                     "Shared CPU sparse decode missing required chunks before "
@@ -2838,12 +2847,38 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
-                        remote_only = all(
-                            location_name == "RemoteBackend"
-                            for layer_locations in shared_chunk_locations_layer_major
-                            for location_name in layer_locations
-                        )
-                        if remote_layers_per_batch > 1 and remote_only:
+                        if page_first_locations is not None:
+                            prefixes = None
+                            if local_prefix_layers:
+                                if any(
+                                    prefix is None for prefix in local_prefix_layers
+                                ):
+                                    raise ValueError(
+                                        "Page-first LocalCPU prefix is incomplete"
+                                    )
+                                prefixes = [
+                                    prefix
+                                    for prefix in local_prefix_layers
+                                    if prefix is not None
+                                ]
+                            pre_resolved_shared_mem_layers = (
+                                self._resolve_shared_rank0_page_first_layers(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    kv_group=kv_group,
+                                    keys_layer_major=missing_keys,
+                                    local_prefix_layers=prefixes,
+                                )
+                            )
+                            release_local_prefix_layers()
+                        elif remote_layers_per_batch > 1 and all(
+                            location == "RemoteBackend"
+                            for layer in shared_chunk_locations_layer_major
+                            for location in layer
+                        ):
                             release_local_prefix_layers()
                             pre_resolved_shared_mem_layers = (
                                 self._resolve_shared_rank0_remote_layers_windowed(
