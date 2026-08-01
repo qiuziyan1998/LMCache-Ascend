@@ -3359,6 +3359,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         expected_fmt = self._expected_memory_format(kv_group)
         kvcaches_snapshot = self.kvcaches
         dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
@@ -3409,6 +3410,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                     layer_id,
                     cpu_tensors,
+                    cached_chunk_ptrs_npu,
                 )
                 assert chunk_offsets_npu is not None
                 assert chunk_sizes_npu is not None

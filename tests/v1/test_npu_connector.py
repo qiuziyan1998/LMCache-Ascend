@@ -1461,7 +1461,12 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
                 cached_chunk_ptrs_arg,
             )
         )
-        return torch.tensor([123, 456], dtype=torch.long)
+        resolved = torch.tensor([123, 456], dtype=torch.long)
+        if cached_chunk_ptrs_arg is not None:
+            while len(cached_chunk_ptrs_arg) <= layer_id:
+                cached_chunk_ptrs_arg.append(None)
+            cached_chunk_ptrs_arg[layer_id] = resolved
+        return resolved
 
     monkeypatch.setattr(
         connector,
@@ -1476,12 +1481,14 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         lambda **kwargs: direct_calls.append(kwargs),
     )
 
+    cached_chunk_ptrs_npu = []
     gen = connector.batched_to_gpu(
         [0, 256],
         [256, 273],
         slot_mapping=torch.arange(273, dtype=torch.long),
         sync=False,
         kv_group=0,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
     )
     next(gen)
     gen.send(
@@ -1494,7 +1501,8 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
 
     assert init_staging_values == [False]
     assert len(pointer_calls) == 1
-    assert pointer_calls[0][2] is None
+    assert pointer_calls[0][2] is cached_chunk_ptrs_npu
+    assert cached_chunk_ptrs_npu[0].tolist() == [123, 456]
     assert len(direct_calls) == 1
     assert direct_calls[0]["direction"] is False
     assert direct_calls[0]["total_tokens"] == 273
@@ -1549,7 +1557,9 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
     monkeypatch.setattr(
         connector,
         "_resolve_sparse_chunk_ptrs_npu",
-        lambda layer_id, cpu_tensors: torch.tensor([111, 222, 333], dtype=torch.long),
+        lambda layer_id, cpu_tensors, cached=None: torch.tensor(
+            [111, 222, 333], dtype=torch.long
+        ),
     )
 
     direct_calls = []
