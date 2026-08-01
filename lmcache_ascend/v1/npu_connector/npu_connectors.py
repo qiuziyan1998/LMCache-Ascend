@@ -3289,7 +3289,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
 
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
@@ -3304,7 +3305,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
-            self.kvcaches,
+            kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
@@ -3319,7 +3320,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             if self.use_gpu and layout.gpu_buffer_allocator is None:
                 layout = self._lazy_initialize_buffer_with_staging(
-                    self.kvcaches,
+                    kvcaches_snapshot,
                     kv_group=kv_group,
                     init_staging=True,
                 )
@@ -3346,7 +3347,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             operation="retrieve",
             kv_group=kv_group,
             slot_mapping_full=slot_mapping_full,
-            kvcaches_ref=self.kvcaches,
+            kvcaches_ref=kvcaches_snapshot,
         )
 
         # Snapshot per-group values so interleaved per-group generators
@@ -3360,7 +3361,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
-        kvcaches_snapshot = self.kvcaches
         dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
         chunk_offsets_npu: Optional[torch.Tensor] = None
@@ -3674,12 +3674,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             yield from self._batched_to_gpu_head_token_wise_prepared(kwargs)
             return
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
-            self.kvcaches,
+            kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
@@ -3717,10 +3718,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         sparse_vllm_two_major = layout.vllm_two_major
-        # Snapshot so interleaved latent/indexer sparse generators do not
-        # race on the shared connector self.kvcaches pointer.
-        kvcaches_snapshot = self.kvcaches
-
         for layer_id in range(self.num_layers):
             sparse_request = yield
             # The generator is resumed from vLLM's attention path; refresh the
@@ -4197,7 +4194,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
@@ -4216,7 +4214,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
-            self.kvcaches,
+            kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
@@ -4231,7 +4229,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             if self.use_gpu and layout.gpu_buffer_allocator is None:
                 layout = self._lazy_initialize_buffer_with_staging(
-                    self.kvcaches,
+                    kvcaches_snapshot,
                     kv_group=kv_group,
                     init_staging=True,
                 )
@@ -4272,7 +4270,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             operation="store",
             kv_group=kv_group,
             slot_mapping_full=slot_mapping_full,
-            kvcaches_ref=self.kvcaches,
+            kvcaches_ref=kvcaches_snapshot,
         )
 
         # Snapshot per-group values so interleaved per-group generators
@@ -4286,7 +4284,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
-        kvcaches_snapshot = self.kvcaches
         dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None

@@ -720,7 +720,8 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector.kvcaches = [(object(), object())]
+    request_kvcaches = [(object(), object())]
+    connector.kvcaches = [(object(),)]
     connector.load_stream_idx = 0
     connector.load_stream_num = 1
     connector.load_stream_list = [object()]
@@ -742,11 +743,12 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
         "initialize_kvcaches_ptr",
         lambda **kwargs: None,
     )
-    monkeypatch.setattr(
-        connector,
-        "_lazy_initialize_buffer",
-        lambda kvcaches, kv_group=0, init_staging=False: _Layout(),
-    )
+    def _lazy_initialize_buffer(kvcaches, kv_group=0, init_staging=False):
+        assert kvcaches is request_kvcaches
+        connector.kvcaches = [(object(),)]
+        return _Layout()
+
+    monkeypatch.setattr(connector, "_lazy_initialize_buffer", _lazy_initialize_buffer)
     monkeypatch.setattr(
         connector,
         "_layerwise_token_major",
@@ -799,12 +801,14 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
         cached_tensors=[[torch.zeros(4)]],
         lmcache_cached_tokens=18879,
         kv_group=0,
+        kvcaches=request_kvcaches,
     )
     next(gen)
     gen.send(([], torch.arange(4, dtype=torch.int32), 0))
 
     assert len(calls) == 1
     assert calls[0]["total_tokens"] == 18879
+    assert calls[0]["kvcaches_ref"] is request_kvcaches
 
 
 def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
@@ -1394,7 +1398,8 @@ def test_prepare_dense_direct_chunk_metadata() -> None:
 def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector.kvcaches = [(object(), object())]
+    request_kvcaches = [(object(), object())]
+    connector.kvcaches = [(object(),)]
     connector.use_gpu = True
     connector.kv_device = torch.device("cpu")
     connector.load_stream = _NoopStream()
@@ -1409,6 +1414,8 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     init_staging_values = []
 
     def _lazy_initialize_buffer_with_staging(kvcaches, *, kv_group, init_staging):
+        assert kvcaches is request_kvcaches
+        connector.kvcaches = [(object(),)]
         init_staging_values.append(init_staging)
         return _DenseLayout()
 
@@ -1489,6 +1496,7 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         sync=False,
         kv_group=0,
         cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+        kvcaches=request_kvcaches,
     )
     next(gen)
     gen.send(
@@ -1507,6 +1515,7 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert direct_calls[0]["direction"] is False
     assert direct_calls[0]["total_tokens"] == 273
     assert direct_calls[0]["fixed_chunk_size"] == 256
+    assert direct_calls[0]["kvcaches_ref"] is request_kvcaches
 
 
 def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
@@ -1599,7 +1608,8 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
 def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector.kvcaches = [(object(), object())]
+    request_kvcaches = [(object(), object())]
+    connector.kvcaches = [(object(),)]
     connector.use_gpu = True
     connector.kv_device = torch.device("cpu")
     connector.store_stream = _NoopStream()
@@ -1618,6 +1628,8 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     init_staging_values = []
 
     def _lazy_initialize_buffer_with_staging(kvcaches, *, kv_group, init_staging):
+        assert kvcaches is request_kvcaches
+        connector.kvcaches = [(object(),)]
         init_staging_values.append(init_staging)
         return _DenseLayout()
 
@@ -1699,6 +1711,7 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
         slot_mapping_base=256,
         sync=False,
         kv_group=0,
+        kvcaches=request_kvcaches,
     )
     next(gen)
     gen.close()
@@ -1710,6 +1723,7 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert direct_calls[0]["direction"] is True
     assert direct_calls[0]["total_tokens"] == 273
     assert direct_calls[0]["fixed_chunk_size"] == 256
+    assert direct_calls[0]["kvcaches_ref"] is request_kvcaches
     assert torch.equal(direct_calls[0]["slot_mapping_full"], local_slot_mapping)
 
 
