@@ -1588,6 +1588,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         keys = []
         memory_objs = []
         tot_token_num = 0
+        requested_end = 0
+        store_complete = True
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -1604,6 +1606,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
+            requested_end = end
 
             keys_multi_layer = key.split_layers(self.num_layers)
             if self._layerwise_chunk_fully_stored(
@@ -1645,6 +1648,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "Local cpu memory under pressure so"
                     " choosing to not store the KV cache."
                 )
+                store_complete = False
                 break
 
             if len(memory_objs_multi_layer) != self.num_layers:
@@ -1903,6 +1907,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        if store_complete:
+            store_result.committed_end = requested_end
         if _mtp_dw_diag_enabled() and kwargs.get("decode_window_save"):
             window_start = kwargs.get("decode_window_start")
             window_end = kwargs.get("decode_window_end")
