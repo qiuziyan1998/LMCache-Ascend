@@ -1246,6 +1246,91 @@ def test_sparse_passive_populates_metadata_and_hands_off_views(monkeypatch):
     assert mem_obj.is_valid()
 
 
+def test_sparse_passive_materialize_only_skips_npu_consumer(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    key = _make_key()
+    mem_obj = _FakeTensorMemObj(torch.empty(1))
+    handle = object()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(mem_obj)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+        request_id="req-materialize",
+        phase="dsa_cold_compact_latent",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="ok",
+        generation=7,
+        handles=[handle],
+    )
+    cached_memory_objs = []
+    cached_tensors = []
+
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=cached_tensors,
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-materialize",
+        shared_cpu_phase="dsa_cold_compact_latent",
+        materialize_only=True,
+    )
+
+    next(retriever)
+    retriever.send(None)
+    retriever.close()
+
+    assert cached_memory_objs == [[mem_obj]]
+    assert cached_tensors == [[mem_obj.tensor]]
+
+
+def test_materialize_only_npu_consumer_never_initializes_transfer_state() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    consumer = connector.batched_to_gpu_head_token_wise(
+        materialize_only=True
+    )
+
+    next(consumer)
+    consumer.send(object())
+    consumer.send(object())
+    next(consumer)
+    consumer.close()
+
+
+def test_dense_load_completion_api_synchronizes_the_load_stream() -> None:
+    calls = []
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.load_stream = SimpleNamespace(synchronize=lambda: calls.append(True))
+
+    connector.synchronize_dense_load_stream()
+
+    assert calls == [True]
+
+
 def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
     monkeypatch.setattr(
         ascend_cache_engine,
