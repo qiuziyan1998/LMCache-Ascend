@@ -255,6 +255,35 @@ class _FakeTokenDatabase:
             yield index, index + 1, key
 
 
+class _IncrementalTokenDatabase(_FakeTokenDatabase):
+    chunk_size = 1
+
+    def __init__(self, keys):
+        super().__init__(keys)
+        self.full_calls = 0
+        self.suffix_calls = 0
+
+    def process_tokens(self, **kwargs):
+        self.full_calls += 1
+        yield from super().process_tokens(**kwargs)
+
+    def process_tokens_from_prefix(
+        self,
+        _tokens,
+        *,
+        prefix_token_count,
+        prefix_hash,
+        **_kwargs,
+    ):
+        self.suffix_calls += 1
+        assert self.keys[prefix_token_count - 1].chunk_hash == prefix_hash
+        for index, key in enumerate(
+            self.keys[prefix_token_count:],
+            start=prefix_token_count,
+        ):
+            yield index, index + 1, key
+
+
 def _make_key(kv_group=0, chunk_hash=1234):
     return CacheEngineKey(
         model_name="model",
@@ -437,6 +466,159 @@ def test_sampled_metadata_build_skips_per_chunk_contains():
     assert ends == [1]
     assert keys == [[key.split_layers(2)[0]], [key.split_layers(2)[1]]]
     assert ret_mask.tolist() == [True]
+
+
+def test_active_metadata_appends_only_incremental_suffix():
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    token_database = _IncrementalTokenDatabase([key0, key1])
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.use_layerwise = True
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.token_database = token_database
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_shared_retrieve_passive = lambda _kv_group: False
+    cached_keys = [
+        [layer_key] for layer_key in key0.split_layers(engine.num_layers)
+    ]
+    cached_starts = [0]
+    cached_ends = [1]
+    retrieve_kwargs = {
+        "kv_group": 0,
+        "cached_metadata_token_ids": [10],
+    }
+    ret_mask = torch.zeros(2, dtype=torch.bool)
+
+    location, starts, ends, keys = engine._ensure_retrieve_chunk_metadata(
+        tokens=[10, 11],
+        mask=None,
+        request_configs=None,
+        cached_keys=cached_keys,
+        cached_starts=cached_starts,
+        cached_ends=cached_ends,
+        ret_mask=ret_mask,
+        retrieve_kwargs=retrieve_kwargs,
+    )
+
+    assert location == "mixed"
+    assert starts == [0, 1]
+    assert ends == [1, 2]
+    assert keys == [
+        list(layer_keys)
+        for layer_keys in zip(
+            key0.split_layers(2),
+            key1.split_layers(2),
+            strict=True,
+        )
+    ]
+    assert token_database.suffix_calls == 1
+    assert token_database.full_calls == 0
+    assert retrieve_kwargs["_retrieve_metadata_mode"] == "incremental"
+    assert retrieve_kwargs["_retrieve_metadata_generated_chunks"] == 1
+    assert ret_mask.tolist() == [True, True]
+
+
+def test_active_metadata_falls_back_when_token_prefix_changes():
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    token_database = _IncrementalTokenDatabase([key0, key1])
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.use_layerwise = True
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.token_database = token_database
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_shared_retrieve_passive = lambda _kv_group: False
+    retrieve_kwargs = {
+        "kv_group": 0,
+        "cached_metadata_token_ids": [99],
+    }
+
+    _, starts, ends, _ = engine._ensure_retrieve_chunk_metadata(
+        tokens=[10, 11],
+        mask=None,
+        request_configs=None,
+        cached_keys=[[key0.get_first_layer()]],
+        cached_starts=[0],
+        cached_ends=[1],
+        ret_mask=torch.zeros(2, dtype=torch.bool),
+        retrieve_kwargs=retrieve_kwargs,
+    )
+
+    assert starts == [0, 1]
+    assert ends == [1, 2]
+    assert token_database.suffix_calls == 0
+    assert token_database.full_calls == 1
+    assert retrieve_kwargs["_retrieve_metadata_mode"] == "full"
+
+
+def test_active_metadata_falls_back_for_nonzero_mask_prefix():
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    token_database = _IncrementalTokenDatabase([key0, key1])
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.use_layerwise = True
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.token_database = token_database
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_shared_retrieve_passive = lambda _kv_group: False
+    retrieve_kwargs = {
+        "kv_group": 0,
+        "cached_metadata_token_ids": [10],
+    }
+
+    engine._ensure_retrieve_chunk_metadata(
+        tokens=[10, 11],
+        mask=torch.tensor([False, True]),
+        request_configs=None,
+        cached_keys=[[key0.get_first_layer()]],
+        cached_starts=[0],
+        cached_ends=[1],
+        ret_mask=torch.zeros(2, dtype=torch.bool),
+        retrieve_kwargs=retrieve_kwargs,
+    )
+
+    assert token_database.suffix_calls == 0
+    assert token_database.full_calls == 1
+    assert retrieve_kwargs["_retrieve_metadata_mode"] == "full"
+
+
+def test_active_incremental_metadata_keeps_missing_suffix_frontier():
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    token_database = _IncrementalTokenDatabase([key0, key1])
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
+    engine.token_database = token_database
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_shared_retrieve_passive = lambda _kv_group: False
+    engine._find_shared_rank0_chunk_location = lambda _key: None
+    retrieve_kwargs = {
+        "kv_group": 0,
+        "cached_metadata_token_ids": [10],
+    }
+
+    location, starts, ends, keys = engine._ensure_retrieve_chunk_metadata(
+        tokens=[10, 11],
+        mask=None,
+        request_configs=None,
+        cached_keys=[[key0.get_first_layer()]],
+        cached_starts=[0],
+        cached_ends=[1],
+        ret_mask=torch.zeros(2, dtype=torch.bool),
+        retrieve_kwargs=retrieve_kwargs,
+    )
+
+    assert location is None
+    assert starts == [0, 1]
+    assert ends == [1, 2]
+    assert keys == [[key0.get_first_layer(), key1.get_first_layer()]]
+    assert token_database.suffix_calls == 1
+    assert token_database.full_calls == 0
+    assert retrieve_kwargs["_retrieve_metadata_mode"] == "incremental"
 
 
 def test_sparse_request_preflight_error_prevents_partial_latent_publication(
@@ -979,6 +1161,13 @@ def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
         "assert_layerwise_gpu_connector",
         lambda _connector: None,
     )
+    timing_events = []
+    monkeypatch.setattr(ascend_cache_engine, "_mtp_dw_diag_enabled", lambda: True)
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "_mtp_dw_event",
+        lambda stage, **fields: timing_events.append((stage, fields)),
+    )
 
     key0 = _make_key(chunk_hash=1)
     key1 = _make_key(chunk_hash=2)
@@ -988,7 +1177,8 @@ def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     engine.gpu_connector = _FakeSparseConsumer()
-    engine.token_database = _FakeTokenDatabase([key0, key1])
+    token_database = _IncrementalTokenDatabase([key0, key1])
+    engine.token_database = token_database
     engine.shared_cpu_cache_passive_allocator = _FakePassiveAllocator(new_view)
     engine.shared_cpu_cache_generation = 7
     engine.metadata = type("Meta", (), {"first_rank": 0})()
@@ -1026,6 +1216,7 @@ def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
         cached_chunk_dev_ptrs=[],
         cached_chunk_ptrs_npu=[],
         cached_shared_handles=cached_shared_handles,
+        cached_metadata_token_ids=[1],
         kv_group=0,
         req_id="req-1",
     )
@@ -1040,6 +1231,14 @@ def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
     assert cached_memory_objs == [[old_view, new_view]]
     assert cached_shared_handles == [[old_handle, new_handle]]
     assert old_view.is_valid() and new_view.is_valid()
+    assert token_database.suffix_calls == 1
+    assert token_database.full_calls == 0
+    assert len(timing_events) == 1
+    stage, fields = timing_events[0]
+    assert stage == "timing"
+    assert fields["event"] == "sparse_passive_metadata_preflight"
+    assert fields["metadata_mode"] == "incremental"
+    assert fields["metadata_generated_chunks"] == 1
 
 
 def test_sparse_passive_metadata_only_extends_without_npu_consumer(monkeypatch):

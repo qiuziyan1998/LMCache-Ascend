@@ -1061,6 +1061,146 @@ class AscendLMCacheEngine(LMCacheEngine):
             and not self._is_shared_retrieve_passive(kv_group)
         )
 
+    def _build_retrieve_metadata_extension(
+        self,
+        *,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        cached_metadata_token_ids: Optional[list[int]],
+    ) -> Optional[
+        tuple[
+            str,
+            int,
+            List[int],
+            List[int],
+            List[List[CacheEngineKey]],
+        ]
+    ]:
+        """Build a chunk-aligned suffix from the cached prefix hash."""
+        process_suffix = getattr(
+            self.token_database,
+            "process_tokens_from_prefix",
+            None,
+        )
+        chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
+        if not callable(process_suffix) or chunk_size <= 0:
+            return None
+        if not cached_keys or len(cached_keys) != self.num_layers:
+            return None
+        chunk_count = len(cached_starts)
+        if chunk_count <= 0 or len(cached_ends) != chunk_count:
+            return None
+        if any(len(layer_keys) != chunk_count for layer_keys in cached_keys):
+            return None
+
+        expected_start = 0
+        for start, end in zip(cached_starts, cached_ends, strict=True):
+            start = int(start)
+            end = int(end)
+            if start != expected_start or end - start != chunk_size:
+                return None
+            expected_start = end
+        prefix_token_count = expected_start
+        if prefix_token_count % chunk_size != 0:
+            return None
+        if len(tokens) < prefix_token_count or len(tokens) % chunk_size != 0:
+            return None
+
+        if cached_metadata_token_ids is None or len(
+            cached_metadata_token_ids
+        ) < prefix_token_count:
+            return None
+        token_prefix = tokens[:prefix_token_count]
+        if isinstance(token_prefix, torch.Tensor):
+            token_prefix = token_prefix.detach().to(device="cpu").tolist()
+        expected_prefix = (
+            cached_metadata_token_ids
+            if len(cached_metadata_token_ids) == prefix_token_count
+            else cached_metadata_token_ids[:prefix_token_count]
+        )
+        if token_prefix != expected_prefix:
+            return None
+
+        if mask is not None:
+            num_falses = int(mask.numel() - mask.long().sum().item())
+            if num_falses != 0:
+                return None
+
+        anchor_hashes = set()
+        anchor_keys = []
+        for layer_id, layer_keys in enumerate(cached_keys):
+            anchor = layer_keys[-1]
+            if (
+                getattr(anchor, "layer_id", None) != layer_id
+                or getattr(anchor, "kv_group", None) != kv_group
+                or not hasattr(anchor, "chunk_hash")
+            ):
+                return None
+            anchor_hashes.add(anchor.chunk_hash)
+            anchor_keys.append(anchor)
+        if len(anchor_hashes) != 1:
+            return None
+        prefix_hash = anchor_keys[0].chunk_hash
+
+        if len(tokens) == prefix_token_count:
+            return (
+                "cached",
+                chunk_count,
+                [],
+                [],
+                [[] for _ in range(self.num_layers)],
+            )
+
+        suffix_starts: List[int] = []
+        suffix_ends: List[int] = []
+        chunk_major_keys: List[List[CacheEngineKey]] = []
+        for start, end, key in process_suffix(
+            tokens,
+            prefix_token_count=prefix_token_count,
+            prefix_hash=prefix_hash,
+            request_configs=request_configs,
+            kv_group=kv_group,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            layer_keys = key.split_layers(self.num_layers)
+            for layer_id, (anchor, layer_key) in enumerate(
+                zip(anchor_keys, layer_keys, strict=True)
+            ):
+                if (
+                    layer_key.layer_id != layer_id
+                    or layer_key.kv_group != kv_group
+                    or layer_key.model_name != anchor.model_name
+                    or layer_key.world_size != anchor.world_size
+                    or layer_key.worker_id != anchor.worker_id
+                    or layer_key.dtype != anchor.dtype
+                    or layer_key.tags != anchor.tags
+                ):
+                    return None
+            suffix_starts.append(int(start))
+            suffix_ends.append(int(end))
+            chunk_major_keys.append(layer_keys)
+        if not suffix_starts or suffix_starts[0] != prefix_token_count:
+            return None
+        if suffix_ends[-1] != len(tokens):
+            return None
+
+        suffix_keys = [
+            list(layer_keys)
+            for layer_keys in zip(*chunk_major_keys, strict=True)
+        ]
+        return (
+            "incremental",
+            chunk_count,
+            suffix_starts,
+            suffix_ends,
+            suffix_keys,
+        )
+
     @staticmethod
     def _needs_retrieve_metadata_refresh(
         cached_keys: List,
@@ -1374,6 +1514,92 @@ class AscendLMCacheEngine(LMCacheEngine):
             new_ends: List[int] = []
             keys: List[List[CacheEngineKey]] = []
 
+            metadata_extension = self._build_retrieve_metadata_extension(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+                cached_keys=cached_keys,
+                cached_starts=cached_starts,
+                cached_ends=cached_ends,
+                cached_metadata_token_ids=(retrieve_kwargs or {}).get(
+                    "cached_metadata_token_ids"
+                ),
+            )
+            if metadata_extension is not None:
+                (
+                    metadata_mode,
+                    _,
+                    suffix_starts,
+                    suffix_ends,
+                    suffix_keys,
+                ) = metadata_extension
+                extension_locations_valid = True
+                for chunk_index in range(len(suffix_starts)):
+                    keys_multi_layer = [
+                        suffix_keys[layer_id][chunk_index]
+                        for layer_id in range(self.num_layers)
+                    ]
+                    if sampled_worker_retrieve:
+                        current_location = "mixed"
+                    elif shared_rank0_retrieve:
+                        locations_multi_layer = [
+                            self._find_shared_rank0_chunk_location(layer_key)
+                            for layer_key in keys_multi_layer
+                        ]
+                        if any(
+                            layer_location is None
+                            for layer_location in locations_multi_layer
+                        ):
+                            current_location = None
+                        else:
+                            current_location = (
+                                locations_multi_layer[0]
+                                if len(set(locations_multi_layer)) == 1
+                                else "mixed"
+                            )
+                    else:
+                        current_location = self._layerwise_chunk_location(
+                            keys_multi_layer
+                        )
+                    if not current_location:
+                        if not shared_rank0_retrieve:
+                            extension_locations_valid = False
+                            break
+                    elif location is None:
+                        location = current_location
+                    elif shared_rank0_retrieve and location != current_location:
+                        location = "mixed"
+                    elif not shared_rank0_retrieve:
+                        assert location == current_location, (
+                            "All retrieved keys should be from the same location "
+                            "when use layerwise retrieval. Please support "
+                            "multi-location retrieval in the future."
+                        )
+
+                if extension_locations_valid:
+                    cached_starts.extend(suffix_starts)
+                    cached_ends.extend(suffix_ends)
+                    for layer_id in range(self.num_layers):
+                        cached_keys[layer_id].extend(suffix_keys[layer_id])
+                    ret_mask.zero_()
+                    for start, end in zip(
+                        cached_starts,
+                        cached_ends,
+                        strict=False,
+                    ):
+                        ret_mask[start:end] = True
+                    if retrieve_kwargs is not None:
+                        if location is not None:
+                            retrieve_kwargs["cached_retrieve_location"] = location
+                        retrieve_kwargs["_retrieve_metadata_warm"] = True
+                        retrieve_kwargs["_retrieve_metadata_mode"] = metadata_mode
+                        retrieve_kwargs["_retrieve_metadata_generated_chunks"] = len(
+                            suffix_starts
+                        )
+                    return location, cached_starts, cached_ends, cached_keys
+                location = None
+
             for start, end, key in self.token_database.process_tokens(
                 tokens=tokens,
                 mask=mask,
@@ -1421,7 +1647,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             "when use layerwise retrieval."
                             "Please support multi-location retrieval in the future."
                         )
-                else:
+                elif not shared_rank0_retrieve:
                     break
 
                 new_starts.append(start)
@@ -1432,6 +1658,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 [list(row) for row in zip(*keys, strict=False)] if keys else []
             )
             if not new_keys:
+                if retrieve_kwargs is not None:
+                    retrieve_kwargs["_retrieve_metadata_mode"] = "full"
+                    retrieve_kwargs["_retrieve_metadata_generated_chunks"] = len(
+                        new_starts
+                    )
                 return location, new_starts, new_ends, new_keys
 
             if not cached_keys:
@@ -1477,6 +1708,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if location is not None:
                     retrieve_kwargs["cached_retrieve_location"] = location
                 retrieve_kwargs["_retrieve_metadata_warm"] = True
+                retrieve_kwargs["_retrieve_metadata_mode"] = "full"
+                retrieve_kwargs["_retrieve_metadata_generated_chunks"] = len(
+                    new_starts
+                )
             return location, cached_starts, cached_ends, cached_keys
 
         if retrieve_kwargs is not None and retrieve_kwargs.get(
@@ -1488,6 +1723,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 if retrieve_kwargs is not None and location is not None:
                     retrieve_kwargs["cached_retrieve_location"] = location
+                retrieve_kwargs["_retrieve_metadata_mode"] = "cached"
+                retrieve_kwargs["_retrieve_metadata_generated_chunks"] = 0
                 return location, cached_starts, cached_ends, cached_keys
 
             ret_mask.zero_()
@@ -1522,6 +1759,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if preferred_location is not None:
                     location = preferred_location
                     retrieve_kwargs["cached_retrieve_location"] = location
+            retrieve_kwargs["_retrieve_metadata_mode"] = "cached"
+            retrieve_kwargs["_retrieve_metadata_generated_chunks"] = 0
             return location, cached_starts, cached_ends, cached_keys
 
         for start, end in zip(cached_starts, cached_ends, strict=False):
@@ -1558,6 +1797,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 retrieve_kwargs["cached_retrieve_location"] = location
         if retrieve_kwargs is not None:
             retrieve_kwargs["_retrieve_metadata_warm"] = True
+            retrieve_kwargs["_retrieve_metadata_mode"] = "cached"
+            retrieve_kwargs["_retrieve_metadata_generated_chunks"] = 0
         return location, cached_starts, cached_ends, cached_keys
 
     @_lmcache_nvtx_annotate
@@ -2068,24 +2309,63 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_shared_handles = kwargs.get("cached_shared_handles")
         append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
 
-        starts: list[int] = []
-        ends: list[int] = []
-        keys: list[list[CacheEngineKey]] = []
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
-            kv_group=kv_group,
-        ):
-            assert isinstance(key, CacheEngineKey)
-            starts.append(start)
-            ends.append(end)
-            keys.append(key.split_layers(self.num_layers))
-        keys_layer_major = (
-            [list(row) for row in zip(*keys, strict=False)]
-            if keys
-            else []
+        metadata_timing_enabled = _mtp_dw_diag_enabled()
+        metadata_started_at = (
+            time.perf_counter() if metadata_timing_enabled else 0.0
         )
+        metadata_extension = None
+        if (
+            cached_keys is not None
+            and cached_starts is not None
+            and cached_ends is not None
+        ):
+            metadata_extension = self._build_retrieve_metadata_extension(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+                cached_keys=cached_keys,
+                cached_starts=cached_starts,
+                cached_ends=cached_ends,
+                cached_metadata_token_ids=kwargs.get("cached_metadata_token_ids"),
+            )
+        metadata_mode = "full"
+        metadata_generated_chunks = 0
+        if metadata_extension is not None:
+            (
+                metadata_mode,
+                _,
+                suffix_starts,
+                suffix_ends,
+                suffix_keys,
+            ) = metadata_extension
+            starts = list(cached_starts) + suffix_starts
+            ends = list(cached_ends) + suffix_ends
+            keys_layer_major = [
+                list(cached_keys[layer_id]) + suffix_keys[layer_id]
+                for layer_id in range(self.num_layers)
+            ]
+            metadata_generated_chunks = len(suffix_starts)
+        else:
+            starts = []
+            ends = []
+            keys: list[list[CacheEngineKey]] = []
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                starts.append(start)
+                ends.append(end)
+                keys.append(key.split_layers(self.num_layers))
+            keys_layer_major = (
+                [list(row) for row in zip(*keys, strict=False)]
+                if keys
+                else []
+            )
+            metadata_generated_chunks = len(starts)
         required_chunks = len(starts)
         cached_prefix_chunks = self._cached_sparse_prefix_chunks(
             cached_tensors,
@@ -2119,20 +2399,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"prefix: metadata={cached_metadata_chunks}, "
                 f"cached={cached_prefix_chunks}, required={required_chunks}"
             )
-        for chunk_index in range(cached_metadata_chunks):
-            if (
-                cached_starts[chunk_index] != starts[chunk_index]
-                or cached_ends[chunk_index] != ends[chunk_index]
-                or any(
-                    cached_keys[layer_id][chunk_index]
-                    != keys_layer_major[layer_id][chunk_index]
-                    for layer_id in range(self.num_layers)
-                )
-            ):
-                raise ValueError(
-                    "Sparse passive cached prefix changed at chunk "
-                    f"{chunk_index}."
-                )
+        if metadata_extension is None:
+            for chunk_index in range(cached_metadata_chunks):
+                if (
+                    cached_starts[chunk_index] != starts[chunk_index]
+                    or cached_ends[chunk_index] != ends[chunk_index]
+                    or any(
+                        cached_keys[layer_id][chunk_index]
+                        != keys_layer_major[layer_id][chunk_index]
+                        for layer_id in range(self.num_layers)
+                    )
+                ):
+                    raise ValueError(
+                        "Sparse passive cached prefix changed at chunk "
+                        f"{chunk_index}."
+                    )
         cached_handle_chunks = self._uniform_layer_cache_chunks(
             cached_shared_handles,
             self.num_layers,
@@ -2145,6 +2426,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"cached_chunks={cached_prefix_chunks}"
             )
         missing_chunks = required_chunks - cached_prefix_chunks
+        if metadata_timing_enabled:
+            _emit_mtp_dw_timing(
+                owner="lmcache_ascend_retrieve",
+                req=req_id,
+                event="sparse_passive_metadata_preflight",
+                frontier=len(tokens),
+                kv_group=kv_group,
+                metadata_only=metadata_only,
+                metadata_mode=metadata_mode,
+                cached_prefix_chunks=cached_prefix_chunks,
+                required_chunks=required_chunks,
+                missing_chunks=missing_chunks,
+                metadata_generated_chunks=metadata_generated_chunks,
+                total_ms=round(
+                    (time.perf_counter() - metadata_started_at) * 1000,
+                    4,
+                ),
+            )
         if metadata_only and missing_chunks:
             notify_fn = getattr(
                 self.gpu_connector,
@@ -3198,6 +3497,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     required_chunks=required_chunks,
                     missing_chunks=bootstrap_missing_chunks,
                     capacity_scan_skipped=capacity_scan_skipped,
+                    metadata_mode=kwargs.get("_retrieve_metadata_mode", "full"),
+                    metadata_generated_chunks=int(
+                        kwargs.get("_retrieve_metadata_generated_chunks", 0) or 0
+                    ),
                     metadata_ms=round(preflight_timings_ms["metadata"], 4),
                     lookup_ms=round(preflight_timings_ms["lookup"], 4),
                     capacity_ms=round(preflight_timings_ms["capacity"], 4),
