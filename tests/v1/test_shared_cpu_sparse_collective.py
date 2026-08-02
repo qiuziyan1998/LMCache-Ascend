@@ -10,7 +10,10 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
+from lmcache.v1.shared_cpu_cache import (
+    SharedHandleEnvelope,
+    SharedHandleGroupEnvelope,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
@@ -293,6 +296,10 @@ def _make_key(kv_group=0, chunk_hash=1234):
         dtype=torch.float16,
         kv_group=kv_group,
     )
+
+
+def _handle_group(*envelopes):
+    return SharedHandleGroupEnvelope(list(envelopes))
 
 
 def test_sparse_rank0_preflight_error_broadcasts_on_first_layer_send(monkeypatch):
@@ -902,7 +909,7 @@ def test_sparse_passive_public_path_accepts_ret_mask_kwarg(monkeypatch):
         torch.float16,
         object(),
     )
-    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+    engine._receive_shared_envelope = lambda: _handle_group(SharedHandleEnvelope(
         request_id="req-1",
         phase="sparse_decode_bootstrap",
         request_ordinal=0,
@@ -911,7 +918,7 @@ def test_sparse_passive_public_path_accepts_ret_mask_kwarg(monkeypatch):
         status="ok",
         generation=7,
         handles=[handle],
-    )
+    ))
     ret_mask = torch.ones(1, dtype=torch.bool)
 
     retriever = engine.retrieve_layer_head_token_wise(
@@ -965,7 +972,7 @@ def test_sparse_passive_metadata_warm_without_data_waits_for_envelope(monkeypatc
 
     def receive_envelope():
         received.append(True)
-        return SharedHandleEnvelope(
+        return _handle_group(SharedHandleEnvelope(
             request_id="req-1",
             phase="sparse_decode_bootstrap",
             request_ordinal=0,
@@ -974,7 +981,7 @@ def test_sparse_passive_metadata_warm_without_data_waits_for_envelope(monkeypatc
             status="ok",
             generation=7,
             handles=[handle],
-        )
+        ))
 
     engine._receive_shared_envelope = receive_envelope
     ret_mask = torch.ones(1, dtype=torch.bool)
@@ -1043,7 +1050,7 @@ def test_sparse_indexer_passive_metadata_warm_waits_without_storage(monkeypatch)
 
     def receive_envelope():
         received.append(True)
-        return SharedHandleEnvelope(
+        return _handle_group(SharedHandleEnvelope(
             request_id="req-1",
             phase="sparse_decode_bootstrap",
             request_ordinal=0,
@@ -1052,7 +1059,7 @@ def test_sparse_indexer_passive_metadata_warm_waits_without_storage(monkeypatch)
             status="ok",
             generation=7,
             handles=[handle],
-        )
+        ))
 
     engine._receive_shared_envelope = receive_envelope
     ret_mask = torch.ones(1, dtype=torch.bool)
@@ -1107,7 +1114,7 @@ def test_sparse_passive_populates_metadata_and_hands_off_views(monkeypatch):
         torch.float16,
         object(),
     )
-    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+    engine._receive_shared_envelope = lambda: _handle_group(SharedHandleEnvelope(
         request_id="req-1",
         phase="sparse_decode_bootstrap",
         request_ordinal=0,
@@ -1116,7 +1123,7 @@ def test_sparse_passive_populates_metadata_and_hands_off_views(monkeypatch):
         status="ok",
         generation=7,
         handles=[handle],
-    )
+    ))
     cached_keys = []
     cached_starts = []
     cached_ends = []
@@ -1187,7 +1194,7 @@ def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
         torch.float16,
         object(),
     )
-    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+    engine._receive_shared_envelope = lambda: _handle_group(SharedHandleEnvelope(
         request_id="req-1",
         phase="sparse_decode_bootstrap",
         request_ordinal=0,
@@ -1196,7 +1203,7 @@ def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
         status="ok",
         generation=7,
         handles=[new_handle],
-    )
+    ))
     cached_keys = [[key0.get_first_layer()]]
     cached_starts = [0]
     cached_ends = [1]
@@ -1233,12 +1240,18 @@ def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
     assert old_view.is_valid() and new_view.is_valid()
     assert token_database.suffix_calls == 1
     assert token_database.full_calls == 0
-    assert len(timing_events) == 1
-    stage, fields = timing_events[0]
+    events = {fields["event"]: (stage, fields) for stage, fields in timing_events}
+    assert set(events) == {
+        "sparse_passive_metadata_preflight",
+        "shared_handle_group_receive",
+    }
+    stage, fields = events["sparse_passive_metadata_preflight"]
     assert stage == "timing"
-    assert fields["event"] == "sparse_passive_metadata_preflight"
     assert fields["metadata_mode"] == "incremental"
     assert fields["metadata_generated_chunks"] == 1
+    _, receive_fields = events["shared_handle_group_receive"]
+    assert receive_fields["layers"] == 1
+    assert receive_fields["handles"] == 1
 
 
 def test_sparse_passive_metadata_only_extends_without_npu_consumer(monkeypatch):
@@ -1263,7 +1276,7 @@ def test_sparse_passive_metadata_only_extends_without_npu_consumer(monkeypatch):
         torch.float16,
         object(),
     )
-    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+    engine._receive_shared_envelope = lambda: _handle_group(SharedHandleEnvelope(
         request_id="req-1",
         phase="sparse_decode_bootstrap",
         request_ordinal=0,
@@ -1272,7 +1285,7 @@ def test_sparse_passive_metadata_only_extends_without_npu_consumer(monkeypatch):
         status="ok",
         generation=7,
         handles=[handle],
-    )
+    ))
     cached_keys = []
     cached_starts = []
     cached_ends = []
@@ -1335,7 +1348,7 @@ def test_sparse_passive_metadata_only_uses_batched_group_pointer_install(
         torch.float16,
         object(),
     )
-    envelopes = iter(
+    envelopes = [
         SharedHandleEnvelope(
             request_id="req-1",
             phase="sparse_decode_bootstrap",
@@ -1347,8 +1360,8 @@ def test_sparse_passive_metadata_only_uses_batched_group_pointer_install(
             handles=[object()],
         )
         for layer_id in range(2)
-    )
-    engine._receive_shared_envelope = lambda: next(envelopes)
+    ]
+    engine._receive_shared_envelope = lambda: _handle_group(*envelopes)
 
     cached_chunk_dev_ptrs = []
     cached_chunk_ptrs_npu = []
@@ -1393,7 +1406,7 @@ def test_sparse_passive_extension_failure_rolls_back_all_layers(monkeypatch):
     old_views = [_FakeTensorMemObj(torch.empty(1)) for _ in range(2)]
     new_view = _FakeTensorMemObj(torch.empty(1))
     old_handles = [[object()], [object()]]
-    envelopes = iter(
+    envelopes = [
         SharedHandleEnvelope(
             request_id="req-1",
             phase="sparse_decode_bootstrap",
@@ -1405,7 +1418,7 @@ def test_sparse_passive_extension_failure_rolls_back_all_layers(monkeypatch):
             handles=[object()],
         )
         for layer_id in range(2)
-    )
+    ]
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
     engine.gpu_connector = _FakeSparseConsumer()
@@ -1420,7 +1433,7 @@ def test_sparse_passive_extension_failure_rolls_back_all_layers(monkeypatch):
         torch.float16,
         object(),
     )
-    engine._receive_shared_envelope = lambda: next(envelopes)
+    engine._receive_shared_envelope = lambda: _handle_group(*envelopes)
     cached_keys = [[key] for key in key0_layers]
     cached_starts = [0]
     cached_ends = [1]
@@ -1444,7 +1457,6 @@ def test_sparse_passive_extension_failure_rolls_back_all_layers(monkeypatch):
     )
 
     next(retriever)
-    retriever.send(([0, 1], 0))
     with pytest.raises(ValueError, match="view failed"):
         retriever.send(([0, 1], 0))
 
@@ -1477,15 +1489,20 @@ def test_sparse_passive_close_before_handoff_releases_views(monkeypatch):
         torch.float16,
         object(),
     )
-    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
-        request_id="req-1",
-        phase="sparse_decode_bootstrap",
-        request_ordinal=0,
-        layer_id=0,
-        kv_group=0,
-        status="ok",
-        generation=7,
-        handles=[object()],
+    engine._receive_shared_envelope = lambda: _handle_group(
+        *[
+            SharedHandleEnvelope(
+                request_id="req-1",
+                phase="sparse_decode_bootstrap",
+                request_ordinal=0,
+                layer_id=layer_id,
+                kv_group=0,
+                status="ok",
+                generation=7,
+                handles=[object()],
+            )
+            for layer_id in range(2)
+        ]
     )
 
     retriever = engine._retrieve_layer_head_token_wise_shared_passive(
@@ -1642,6 +1659,162 @@ def test_sparse_rank0_metadata_only_publishes_without_npu_consumer(monkeypatch):
     assert len(broadcasts) == 1
     assert broadcasts[0].kv_group == 1
     assert broadcasts[0].handles == ["handle"]
+
+
+def test_sparse_rank0_broadcasts_all_layer_handles_once(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    num_layers = 3
+    key = _make_key()
+    layer_keys = key.split_layers(num_layers)
+    mem_objs = [_FakeClaimableMemObj() for _ in range(num_layers)]
+    cached_memory_objs = [[mem_obj] for mem_obj in mem_objs]
+    cached_shared_handles = []
+    broadcasts = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = num_layers
+    engine.storage_manager = object()
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.shared_cpu_cache_generation = 7
+    engine._shared_cpu_request_leases = {}
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = AscendLMCacheEngine._has_retrieve_data_cache
+    engine._retrieve_data_cache_covers = (
+        AscendLMCacheEngine._retrieve_data_cache_covers
+    )
+    engine._resolve_local_cpu_retrieve_location = lambda location: location
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0],
+        [1],
+        [[layer_key] for layer_key in layer_keys],
+    )
+    engine._make_shared_handles_for_layer = lambda **kwargs: [
+        f"handle-{kwargs['layer_id']}"
+    ]
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[[layer_key] for layer_key in layer_keys],
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=cached_shared_handles,
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    assert len(broadcasts) == 1
+    retriever.send(([0], 0))
+    retriever.send(([0], 0))
+    retriever.close()
+
+    group = broadcasts[0]
+    assert isinstance(group, SharedHandleGroupEnvelope)
+    assert len(group.envelopes) == num_layers
+    assert group.handles == ["handle-0", "handle-1", "handle-2"]
+    assert cached_shared_handles == [
+        ["handle-0"],
+        ["handle-1"],
+        ["handle-2"],
+    ]
+
+
+def test_sparse_passive_receives_all_layer_handles_once(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    num_layers = 3
+    key = _make_key()
+    layer_keys = key.split_layers(num_layers)
+    views = [_FakeTensorMemObj(torch.empty(1)) for _ in range(num_layers)]
+    envelopes = [
+        SharedHandleEnvelope(
+            request_id="req-1",
+            phase="sparse_decode_bootstrap",
+            request_ordinal=0,
+            layer_id=layer_id,
+            kv_group=0,
+            status="ok",
+            generation=7,
+            handles=[f"handle-{layer_id}"],
+        )
+        for layer_id in range(num_layers)
+    ]
+    receive_calls = 0
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = num_layers
+    consumer = _CountingLoadGroupConsumer()
+    engine.gpu_connector = consumer
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _SequencePassiveAllocator(views)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+
+    def receive_envelope():
+        nonlocal receive_calls
+        receive_calls += 1
+        return SharedHandleGroupEnvelope(envelopes)
+
+    engine._receive_shared_envelope = receive_envelope
+    cached_memory_objs = []
+    cached_tensors = []
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
+    cached_shared_handles = []
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=cached_tensors,
+        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+        cached_shared_handles=cached_shared_handles,
+        kv_group=0,
+        req_id="req-1",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    assert receive_calls == 1
+    retriever.send(([0], 0))
+    retriever.send(([0], 0))
+    retriever.close()
+
+    assert receive_calls == 1
+    assert consumer.group_call_count == 1
+    assert consumer.layer_call_count == 0
+    assert cached_memory_objs == [[view] for view in views]
+    assert cached_shared_handles == [
+        ["handle-0"],
+        ["handle-1"],
+        ["handle-2"],
+    ]
 
 
 def test_sparse_rank0_metadata_only_uses_batched_group_pointer_install(
@@ -1849,10 +2022,12 @@ def test_sparse_rank0_cached_publication_failure_releases_claim(monkeypatch):
     )
 
     key = _make_key()
-    mem_obj = _FakeClaimableMemObj()
+    layer_keys = key.split_layers(2)
+    mem_objs = [_FakeClaimableMemObj(), _FakeClaimableMemObj()]
+    cached_shared_handles = []
     broadcasts = []
     engine = object.__new__(AscendLMCacheEngine)
-    engine.num_layers = 1
+    engine.num_layers = 2
     engine.storage_manager = object()
     engine.gpu_connector = _FakeSparseConsumer()
     engine.shared_cpu_cache_generation = 7
@@ -1870,23 +2045,27 @@ def test_sparse_rank0_cached_publication_failure_releases_claim(monkeypatch):
         "LocalCPUBackend",
         [0],
         [1],
-        [[key]],
+        [[layer_key] for layer_key in layer_keys],
     )
-    engine._make_shared_handles_for_layer = lambda **_kwargs: (_ for _ in ()).throw(
-        ValueError("publish failed")
-    )
+
+    def make_handles(**kwargs):
+        if kwargs["layer_id"] == 1:
+            raise ValueError("publish failed")
+        return ["layer-0-handle"]
+
+    engine._make_shared_handles_for_layer = make_handles
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
 
     retriever = engine.retrieve_layer_head_token_wise(
         [1],
-        cached_keys=[[key]],
+        cached_keys=[[layer_key] for layer_key in layer_keys],
         cached_starts=[0],
         cached_ends=[1],
-        cached_memory_objs=[[mem_obj]],
+        cached_memory_objs=[[mem_obj] for mem_obj in mem_objs],
         cached_tensors=[],
         cached_chunk_dev_ptrs=[],
         cached_chunk_ptrs_npu=[],
-        cached_shared_handles=[],
+        cached_shared_handles=cached_shared_handles,
         kv_group=0,
         req_id="req-1",
     )
@@ -1895,10 +2074,11 @@ def test_sparse_rank0_cached_publication_failure_releases_claim(monkeypatch):
     with pytest.raises(ValueError, match="publish failed"):
         retriever.send(([0], 0))
 
-    assert mem_obj.ref_up_count == 1
-    assert mem_obj.pin_count == 1
-    assert mem_obj.unpin_count == 1
-    assert mem_obj.ref_down_count == 1
+    assert all(mem_obj.ref_up_count == 1 for mem_obj in mem_objs)
+    assert all(mem_obj.pin_count == 1 for mem_obj in mem_objs)
+    assert all(mem_obj.unpin_count == 1 for mem_obj in mem_objs)
+    assert all(mem_obj.ref_down_count == 1 for mem_obj in mem_objs)
+    assert cached_shared_handles == []
     assert broadcasts
     assert broadcasts[-1].status == "error"
     assert "handle publication failed" in broadcasts[-1].message
@@ -2084,16 +2264,22 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     assert len(cached_chunk_dev_ptrs[0]) == 2
     assert len(broadcasts) == 1
     assert broadcasts[0].handles == [new_handle]
-    assert len(timing_events) == 1
-    stage, fields = timing_events[0]
+    events = {fields["event"]: (stage, fields) for stage, fields in timing_events}
+    assert set(events) == {
+        "sparse_bootstrap_preflight",
+        "shared_handle_group_publish",
+    }
+    stage, fields = events["sparse_bootstrap_preflight"]
     assert stage == "timing"
-    assert fields["event"] == "sparse_bootstrap_preflight"
     assert fields["kv_group"] == 0
     assert fields["cached_prefix_chunks"] == 1
     assert fields["required_chunks"] == 2
     assert fields["missing_chunks"] == 1
     assert fields["capacity_scan_skipped"] is True
     assert fields["total_ms"] >= fields["capacity_ms"]
+    _, publish_fields = events["shared_handle_group_publish"]
+    assert publish_fields["layers"] == 1
+    assert publish_fields["handles"] == 1
 
 
 def test_sparse_per_rank_retrieves_missing_suffix_without_shared_handles(
@@ -2571,7 +2757,7 @@ def test_sparse_passive_pointer_failure_releases_unpublished_view(monkeypatch):
         torch.float16,
         object(),
     )
-    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+    engine._receive_shared_envelope = lambda: _handle_group(SharedHandleEnvelope(
         request_id="req-1",
         phase="sparse_decode_bootstrap",
         request_ordinal=0,
@@ -2580,7 +2766,7 @@ def test_sparse_passive_pointer_failure_releases_unpublished_view(monkeypatch):
         status="ok",
         generation=7,
         handles=[object()],
-    )
+    ))
     engine._append_retrieve_layer_cache = lambda *_args, **_kwargs: (
         (_ for _ in ()).throw(RuntimeError("pointer install failed"))
     )

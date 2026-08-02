@@ -28,7 +28,10 @@ from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
+from lmcache.v1.shared_cpu_cache import (
+    SharedHandleEnvelope,
+    SharedHandleGroupEnvelope,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.token_database import TokenDatabase
 import torch
@@ -2469,8 +2472,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         to_release: list[MemoryObj] = []
         passive_views_handed_off = False
-        metadata_appended = False
-        pending_passive_mem_objs: List[List[MemoryObj]] = []
+        batched_passive_mem_objs: Optional[List[List[MemoryObj]]] = None
 
         try:
             for layer_id in range(self.num_layers):
@@ -2497,28 +2499,110 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if not missing_chunks:
                     mem_objs_layer = []
                 else:
-                    envelope = self._receive_shared_envelope()
-                    self._validate_shared_layerwise_envelope(
-                        envelope,
-                        req_id=req_id,
-                        phase=phase,
-                        request_ordinal=request_ordinal,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                    )
-                    if envelope.status != "ok":
-                        raise ValueError(
-                            "Sparse passive prefix extension requires present "
-                            f"handles, received status={envelope.status!r}."
+                    if batched_passive_mem_objs is None:
+                        handle_group_started_at = (
+                            time.perf_counter()
+                            if metadata_timing_enabled
+                            else 0.0
                         )
-                    if len(envelope.handles) != missing_chunks:
-                        raise ValueError(
-                            "Sparse shared CPU passive received inconsistent "
-                            f"handle count at layer {layer_id}: "
-                            f"{len(envelope.handles)} != {missing_chunks}"
-                        )
-                    if not metadata_appended:
-                        metadata_appended = True
+                        received = self._receive_shared_envelope()
+                        if not isinstance(received, SharedHandleGroupEnvelope):
+                            raise ValueError(
+                                "Sparse passive expected a grouped shared "
+                                "handle envelope, got "
+                                f"{type(received)!r}."
+                            )
+                        group_envelope = received
+
+                        first_envelope = group_envelope.envelopes[0]
+                        if first_envelope.status == "error":
+                            self._validate_shared_layerwise_envelope(
+                                first_envelope,
+                                req_id=req_id,
+                                phase=phase,
+                                request_ordinal=request_ordinal,
+                                layer_id=0,
+                                kv_group=kv_group,
+                            )
+                        if len(group_envelope.envelopes) != self.num_layers:
+                            raise ValueError(
+                                "Sparse passive grouped handle envelope has "
+                                "an inconsistent layer count: "
+                                f"{len(group_envelope.envelopes)} != "
+                                f"{self.num_layers}"
+                            )
+                        for expected_layer_id, envelope in enumerate(
+                            group_envelope.envelopes
+                        ):
+                            self._validate_shared_layerwise_envelope(
+                                envelope,
+                                req_id=req_id,
+                                phase=phase,
+                                request_ordinal=request_ordinal,
+                                layer_id=expected_layer_id,
+                                kv_group=kv_group,
+                            )
+                            if envelope.status != "ok":
+                                raise ValueError(
+                                    "Sparse passive prefix extension requires "
+                                    "present handles, received "
+                                    f"status={envelope.status!r} at layer "
+                                    f"{expected_layer_id}."
+                                )
+                            if len(envelope.handles) != missing_chunks:
+                                raise ValueError(
+                                    "Sparse shared CPU passive received "
+                                    "inconsistent handle count at layer "
+                                    f"{expected_layer_id}: "
+                                    f"{len(envelope.handles)} != "
+                                    f"{missing_chunks}"
+                                )
+
+                        prepared_mem_objs: List[List[MemoryObj]] = []
+                        for prepared_layer_id, envelope in enumerate(
+                            group_envelope.envelopes
+                        ):
+                            prepared_layer_mem_objs: list[MemoryObj] = []
+                            for chunk_offset, handle in enumerate(
+                                envelope.handles
+                            ):
+                                chunk_index = cached_prefix_chunks + chunk_offset
+                                expected_shape, expected_dtype, expected_fmt = (
+                                    self._expected_shared_cpu_chunk_metadata(
+                                        kv_group=kv_group,
+                                        num_tokens=int(
+                                            ends[chunk_index]
+                                            - starts[chunk_index]
+                                        ),
+                                    )
+                                )
+                                mem_obj = (
+                                    self.shared_cpu_cache_passive_allocator.create_view(
+                                        handle,
+                                        expected_request_id=req_id,
+                                        expected_phase=phase,
+                                        expected_layer_id=prepared_layer_id,
+                                        expected_kv_group=kv_group,
+                                        expected_chunk_index=chunk_index,
+                                        expected_key=keys_layer_major[
+                                            prepared_layer_id
+                                        ][chunk_index],
+                                        expected_shape=expected_shape,
+                                        expected_dtype=expected_dtype,
+                                        expected_fmt=expected_fmt,
+                                        expected_cached_positions=range(
+                                            int(starts[chunk_index]),
+                                            int(ends[chunk_index]),
+                                        ),
+                                        expected_producer_rank=(
+                                            self.metadata.first_rank
+                                        ),
+                                    )
+                                )
+                                prepared_layer_mem_objs.append(mem_obj)
+                                to_release.append(mem_obj)
+                            prepared_mem_objs.append(prepared_layer_mem_objs)
+
                         for start, end in zip(
                             starts[cached_prefix_chunks:],
                             ends[cached_prefix_chunks:],
@@ -2540,60 +2624,44 @@ class AscendLMCacheEngine(LMCacheEngine):
                                         cached_metadata_chunks:
                                     ]
                                 )
-                    mem_objs_layer: list[MemoryObj] = []
-                    for chunk_offset, handle in enumerate(envelope.handles):
-                        chunk_index = cached_prefix_chunks + chunk_offset
-                        expected_shape, expected_dtype, expected_fmt = (
-                            self._expected_shared_cpu_chunk_metadata(
+                        self._append_retrieve_group_cache(
+                            prepared_mem_objs,
+                            cached_memory_objs,
+                            cached_tensors,
+                            cached_chunk_dev_ptrs,
+                            cached_chunk_ptrs_npu,
+                        )
+                        for prepared_layer_id, envelope in enumerate(
+                            group_envelope.envelopes
+                        ):
+                            self._append_shared_handle_cache(
+                                prepared_layer_id,
+                                envelope.handles,
+                                cached_shared_handles,
+                                cached_prefix_chunks,
+                            )
+                        batched_passive_mem_objs = prepared_mem_objs
+                        if metadata_timing_enabled:
+                            _emit_mtp_dw_timing(
+                                owner="lmcache_ascend_retrieve",
+                                req=req_id,
+                                event="shared_handle_group_receive",
+                                frontier=len(tokens),
                                 kv_group=kv_group,
-                                num_tokens=int(
-                                    ends[chunk_index] - starts[chunk_index]
+                                metadata_only=metadata_only,
+                                layers=len(group_envelope.envelopes),
+                                handles=len(group_envelope.handles),
+                                total_ms=round(
+                                    (
+                                        time.perf_counter()
+                                        - handle_group_started_at
+                                    )
+                                    * 1000,
+                                    4,
                                 ),
                             )
-                        )
-                        mem_obj = self.shared_cpu_cache_passive_allocator.create_view(
-                            handle,
-                            expected_request_id=req_id,
-                            expected_phase=phase,
-                            expected_layer_id=layer_id,
-                            expected_kv_group=kv_group,
-                            expected_chunk_index=chunk_index,
-                            expected_key=keys_layer_major[layer_id][chunk_index],
-                            expected_shape=expected_shape,
-                            expected_dtype=expected_dtype,
-                            expected_fmt=expected_fmt,
-                            expected_cached_positions=range(
-                                int(starts[chunk_index]),
-                                int(ends[chunk_index]),
-                            ),
-                            expected_producer_rank=self.metadata.first_rank,
-                        )
-                        mem_objs_layer.append(mem_obj)
-                    if metadata_only:
-                        pending_passive_mem_objs.append(mem_objs_layer)
-                        to_release.extend(mem_objs_layer)
-                    else:
-                        try:
-                            self._append_retrieve_layer_cache(
-                                layer_id,
-                                mem_objs_layer,
-                                cached_memory_objs,
-                                cached_tensors,
-                                cached_chunk_dev_ptrs,
-                                cached_chunk_ptrs_npu,
-                            )
-                        except Exception:
-                            for mem_obj in mem_objs_layer:
-                                if mem_obj.is_valid():
-                                    mem_obj.ref_count_down()
-                            raise
-                        to_release.extend(mem_objs_layer)
-                    self._append_shared_handle_cache(
-                        layer_id,
-                        envelope.handles,
-                        cached_shared_handles,
-                        cached_prefix_chunks,
-                    )
+
+                    mem_objs_layer = batched_passive_mem_objs[layer_id]
 
                 if mem_obj_consumer is not None:
                     if sparse_payload is not None:
@@ -2610,14 +2678,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
-            if metadata_only and pending_passive_mem_objs:
-                self._append_retrieve_group_cache(
-                    pending_passive_mem_objs,
-                    cached_memory_objs,
-                    cached_tensors,
-                    cached_chunk_dev_ptrs,
-                    cached_chunk_ptrs_npu,
-                )
             if metadata_only and not self._sparse_pointer_cache_covers(
                 cached_chunk_dev_ptrs,
                 cached_chunk_ptrs_npu,
@@ -3349,7 +3409,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             release_pre_resolved_shared_mem_layers()
             release_local_prefix_layers()
             yield ret_mask
-            self._broadcast_shared_envelope(preflight_error_envelope)
+            self._broadcast_shared_envelope(
+                SharedHandleGroupEnvelope([preflight_error_envelope])
+            )
             assert preflight_error is not None
             raise preflight_error
 
@@ -3377,6 +3439,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
         shared_store_publication_fenced = False
+        shared_handle_group_published = False
         existing_rank0_backing_ids = (
             self.shared_cpu_rank0_request_object_ids(
                 kwargs.get("req_id"),
@@ -3542,7 +3605,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     release_pending_pre_resolved()
                     pre_resolved_shared_mem_layers = None
                     error_envelope = make_request_preflight_error_envelope()
-                    self._broadcast_shared_envelope(error_envelope)
+                    self._broadcast_shared_envelope(
+                        SharedHandleGroupEnvelope([error_envelope])
+                    )
                     raise ValueError(
                         "Shared CPU sparse decode request preflight failed "
                         "before handle publication: "
@@ -3589,110 +3654,147 @@ class AscendLMCacheEngine(LMCacheEngine):
                     elif metadata_only_cache_prepared or group_cache_prepared:
                         pass
 
-                if publish_shared_handles:
-                    publish_mem_objs = (
-                        cached_memory_objs[layer_id][cached_handle_chunks:]
-                        if cached_memory_objs is not None
-                        and len(cached_memory_objs) > layer_id
-                        else []
+                if publish_shared_handles and not shared_handle_group_published:
+                    failed_publication_layer = 0
+                    handle_group_started_at = (
+                        time.perf_counter() if preflight_timing_enabled else 0.0
                     )
-                    if required_chunks and not publish_mem_objs:
-                        message = (
-                            "Shared CPU sparse decode has no MemoryObjs to "
-                            "publish for required chunks."
-                        )
-                        self._broadcast_shared_envelope(
-                            self._shared_layerwise_error_envelope(
-                                req_id=kwargs.get("req_id", "unspecified"),
-                                phase=kwargs.get(
-                                    "shared_cpu_phase", "sparse_decode_bootstrap"
-                                ),
-                                request_ordinal=request_ordinal,
-                                layer_id=layer_id,
-                                kv_group=kv_group,
-                                message=message,
-                                details={"required_chunks": required_chunks},
-                            )
-                        )
-                        raise ValueError(message)
                     try:
                         if not shared_store_publication_fenced:
                             # Store generators normally synchronize each layer
                             # before storage publication. Reassert that contract
-                            # at the cross-rank publication boundary so handles
-                            # can never outrun a direct-to-host store.
+                            # once before publishing the complete group.
                             self._fence_shared_cpu_store_publication()
                             shared_store_publication_fenced = True
-                        if cached_mem_layers is not None:
-                            claim_cached_shared_mem_objs_for_publication(
-                                publish_mem_objs
+                        layer_envelopes: list[SharedHandleEnvelope] = []
+                        for publication_layer_id in range(self.num_layers):
+                            failed_publication_layer = publication_layer_id
+                            publish_mem_objs = (
+                                cached_memory_objs[publication_layer_id][
+                                    cached_handle_chunks:
+                                ]
+                                if cached_memory_objs is not None
+                                and len(cached_memory_objs) > publication_layer_id
+                                else []
                             )
-                        handles = self._make_shared_handles_for_layer(
-                            req_id=kwargs.get("req_id", "unspecified"),
-                            phase=kwargs.get(
-                                "shared_cpu_phase", "sparse_decode_bootstrap"
-                            ),
-                            keys_layer=retrieve_keys[layer_id][
-                                cached_handle_chunks:
-                            ],
-                            mem_objs_layer=publish_mem_objs,
-                            layer_id=layer_id,
-                            kv_group=kv_group,
-                            chunk_index_base=cached_handle_chunks,
-                        )
-                        self._append_shared_handle_cache(
-                            layer_id,
-                            handles,
-                            cached_shared_handles,
-                            cached_handle_chunks,
-                        )
-                        envelope = SharedHandleEnvelope(
-                            request_id=kwargs.get("req_id", "unspecified"),
-                            phase=kwargs.get(
-                                "shared_cpu_phase", "sparse_decode_bootstrap"
-                            ),
-                            request_ordinal=request_ordinal,
-                            layer_id=layer_id,
-                            kv_group=kv_group,
-                            status="ok" if handles else "skipped",
-                            generation=self.shared_cpu_cache_generation,
-                            handles=handles,
-                            message=(
-                                None
-                                if handles
-                                else "no sparse decode shared CPU cache chunks selected"
-                            ),
-                        )
-                    except Exception as exc:
-                        message = (
-                            "Shared CPU sparse decode rank0 handle publication "
-                            "failed."
-                        )
-                        try:
-                            self._broadcast_shared_envelope(
-                                self._shared_layerwise_error_envelope(
-                                    req_id=kwargs.get("req_id", "unspecified"),
+                            if required_chunks and not publish_mem_objs:
+                                raise ValueError(
+                                    "Shared CPU sparse decode has no MemoryObjs "
+                                    "to publish for required chunks."
+                                )
+                            if cached_mem_layers is not None:
+                                claim_cached_shared_mem_objs_for_publication(
+                                    publish_mem_objs
+                                )
+                            handles = self._make_shared_handles_for_layer(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase",
+                                    "sparse_decode_bootstrap",
+                                ),
+                                keys_layer=retrieve_keys[publication_layer_id][
+                                    cached_handle_chunks:
+                                ],
+                                mem_objs_layer=publish_mem_objs,
+                                layer_id=publication_layer_id,
+                                kv_group=kv_group,
+                                chunk_index_base=cached_handle_chunks,
+                            )
+                            self._append_shared_handle_cache(
+                                publication_layer_id,
+                                handles,
+                                cached_shared_handles,
+                                cached_handle_chunks,
+                            )
+                            layer_envelopes.append(
+                                SharedHandleEnvelope(
+                                    request_id=kwargs.get(
+                                        "req_id", "unspecified"
+                                    ),
                                     phase=kwargs.get(
                                         "shared_cpu_phase",
                                         "sparse_decode_bootstrap",
                                     ),
                                     request_ordinal=request_ordinal,
-                                    layer_id=layer_id,
+                                    layer_id=publication_layer_id,
                                     kv_group=kv_group,
-                                    message=message,
-                                    details={
-                                        "error": str(exc),
-                                        "required_chunks": required_chunks,
-                                    },
+                                    status="ok" if handles else "skipped",
+                                    generation=self.shared_cpu_cache_generation,
+                                    handles=handles,
+                                    message=(
+                                        None
+                                        if handles
+                                        else (
+                                            "no sparse decode shared CPU cache "
+                                            "chunks selected"
+                                        )
+                                    ),
+                                )
+                            )
+                    except Exception as exc:
+                        message = (
+                            "Shared CPU sparse decode rank0 batched handle "
+                            "publication failed."
+                        )
+                        try:
+                            self._broadcast_shared_envelope(
+                                SharedHandleGroupEnvelope(
+                                    [
+                                        self._shared_layerwise_error_envelope(
+                                            req_id=kwargs.get(
+                                                "req_id", "unspecified"
+                                            ),
+                                            phase=kwargs.get(
+                                                "shared_cpu_phase",
+                                                "sparse_decode_bootstrap",
+                                            ),
+                                            request_ordinal=request_ordinal,
+                                            layer_id=0,
+                                            kv_group=kv_group,
+                                            message=message,
+                                            details={
+                                                "error": str(exc),
+                                                "required_chunks": required_chunks,
+                                                "failed_layer_id": (
+                                                    failed_publication_layer
+                                                ),
+                                            },
+                                        )
+                                    ]
                                 )
                             )
                         except Exception:
                             logger.exception(
                                 "Failed to broadcast shared CPU sparse decode "
-                                "handle-publication error envelope"
+                                "batched handle-publication error envelope"
                             )
                         raise
-                    self._broadcast_shared_envelope(envelope)
+                    self._broadcast_shared_envelope(
+                        SharedHandleGroupEnvelope(layer_envelopes)
+                    )
+                    shared_handle_group_published = True
+                    if preflight_timing_enabled:
+                        _emit_mtp_dw_timing(
+                            owner="lmcache_ascend_retrieve",
+                            req=kwargs.get("req_id"),
+                            event="shared_handle_group_publish",
+                            frontier=len(tokens),
+                            kv_group=kv_group,
+                            metadata_only=metadata_only,
+                            layers=len(layer_envelopes),
+                            handles=sum(
+                                len(envelope.handles)
+                                for envelope in layer_envelopes
+                            ),
+                            total_ms=round(
+                                (
+                                    time.perf_counter()
+                                    - handle_group_started_at
+                                )
+                                * 1000,
+                                4,
+                            ),
+                        )
 
                 if not metadata_only:
                     if sparse_payload is not None:
