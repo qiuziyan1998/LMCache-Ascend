@@ -1804,6 +1804,13 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     old_handle, new_handle = object(), object()
     resolved_keys = []
     broadcasts = []
+    timing_events = []
+    monkeypatch.setattr(ascend_cache_engine, "_mtp_dw_diag_enabled", lambda: True)
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "_mtp_dw_event",
+        lambda stage, **fields: timing_events.append((stage, fields)),
+    )
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
@@ -1826,7 +1833,10 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     engine._find_shared_rank0_chunk_location = lambda key: (
         resolved_keys.append(key) or "LocalCPUBackend"
     )
-    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {"fits": True}
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {
+        "fits": True,
+        "capacity_scan_skipped": True,
+    }
 
     def resolve_layer(**kwargs):
         assert kwargs["keys_layer"] == [key1]
@@ -1875,6 +1885,16 @@ def test_sparse_rank0_retrieves_and_publishes_only_missing_suffix(monkeypatch):
     assert len(cached_chunk_dev_ptrs[0]) == 2
     assert len(broadcasts) == 1
     assert broadcasts[0].handles == [new_handle]
+    assert len(timing_events) == 1
+    stage, fields = timing_events[0]
+    assert stage == "timing"
+    assert fields["event"] == "sparse_bootstrap_preflight"
+    assert fields["kv_group"] == 0
+    assert fields["cached_prefix_chunks"] == 1
+    assert fields["required_chunks"] == 2
+    assert fields["missing_chunks"] == 1
+    assert fields["capacity_scan_skipped"] is True
+    assert fields["total_ms"] >= fields["capacity_ms"]
 
 
 def test_sparse_per_rank_retrieves_missing_suffix_without_shared_handles(

@@ -51,6 +51,15 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
 
 
+def _emit_mtp_dw_timing(**fields: Any) -> None:
+    """Emit optional timing without changing retrieve behavior."""
+    try:
+        _mtp_dw_event("timing", **fields)
+    except Exception:
+        # Diagnostics must never fail a retrieve preflight.
+        return
+
+
 def _dsa_debug_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
         "1",
@@ -2454,6 +2463,21 @@ class AscendLMCacheEngine(LMCacheEngine):
             the GPU.
         """
 
+        preflight_timing_enabled = _mtp_dw_diag_enabled()
+        preflight_started_at = (
+            time.perf_counter() if preflight_timing_enabled else 0.0
+        )
+        preflight_timings_ms: Optional[dict[str, float]] = None
+        if preflight_timing_enabled:
+            preflight_timings_ms = {
+                "metadata": 0.0,
+                "lookup": 0.0,
+                "capacity": 0.0,
+                "resolve": 0.0,
+                "pointer": 0.0,
+                "connector_prime": 0.0,
+            }
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
@@ -2542,6 +2566,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_memory_objs,
         )
 
+        timing_started_at = (
+            time.perf_counter() if preflight_timing_enabled else 0.0
+        )
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -2552,6 +2579,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask=ret_mask,
             retrieve_kwargs=kwargs,
         )
+        if preflight_timings_ms is not None:
+            preflight_timings_ms["metadata"] += (
+                time.perf_counter() - timing_started_at
+            ) * 1000
         kwargs.pop("_use_cached_retrieve", None)
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
         if cached_prefix_chunks > required_chunks:
@@ -2645,6 +2676,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         preflight_error_envelope: Optional[SharedHandleEnvelope] = None
         preflight_error: Optional[BaseException] = None
         request_preflight_state = kwargs.get("shared_cpu_request_preflight_state")
+        capacity_scan_skipped: Optional[bool] = None
 
         def release_pre_resolved_shared_mem_layers() -> None:
             nonlocal pre_resolved_shared_mem_layers
@@ -2735,6 +2767,9 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
         if shared_sparse_retrieve and not use_cached_retrieve and any(missing_keys):
+            timing_started_at = (
+                time.perf_counter() if preflight_timing_enabled else 0.0
+            )
             missing_locations: list[tuple[int, int]] = []
             if sampled_worker_retrieve:
                 local_cpu_backend = self._shared_local_cpu_backend()
@@ -2761,6 +2796,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                             key_location = ""
                         layer_locations.append(key_location)
                     shared_chunk_locations_layer_major.append(layer_locations)
+            if preflight_timings_ms is not None:
+                preflight_timings_ms["lookup"] += (
+                    time.perf_counter() - timing_started_at
+                ) * 1000
             if missing_locations:
                 message = (
                     "Shared CPU sparse decode missing required chunks before "
@@ -2784,6 +2823,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 record_request_preflight_error()
             else:
                 try:
+                    timing_started_at = (
+                        time.perf_counter() if preflight_timing_enabled else 0.0
+                    )
                     capacity_details = self._shared_cpu_runtime_capacity_details(
                         req_id=kwargs.get("req_id", "unspecified"),
                         phase=kwargs.get(
@@ -2803,6 +2845,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 strict=False,
                             )
                         ],
+                    )
+                    if preflight_timings_ms is not None:
+                        preflight_timings_ms["capacity"] += (
+                            time.perf_counter() - timing_started_at
+                        ) * 1000
+                    capacity_scan_skipped = bool(
+                        capacity_details.get("capacity_scan_skipped", False)
                     )
                 except Exception:
                     release_local_prefix_layers()
@@ -2831,6 +2880,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
+                        timing_started_at = (
+                            time.perf_counter()
+                            if preflight_timing_enabled
+                            else 0.0
+                        )
                         for layer_id, layer_keys in enumerate(missing_keys):
                             if sampled_worker_retrieve:
                                 local_prefix = local_prefix_layers[layer_id]
@@ -2868,6 +2922,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     )
                                 )
                             pre_resolved_shared_mem_layers.append(mem_objs_layer)
+                        if preflight_timings_ms is not None:
+                            preflight_timings_ms["resolve"] += (
+                                time.perf_counter() - timing_started_at
+                            ) * 1000
                         release_local_prefix_layers()
                     except Exception as exc:
                         failed_layer_id = len(pre_resolved_shared_mem_layers)
@@ -2911,6 +2969,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             and (metadata_only or bootstrap_missing_chunks > 0)
         ):
             try:
+                timing_started_at = (
+                    time.perf_counter() if preflight_timing_enabled else 0.0
+                )
                 self._append_retrieve_group_cache(
                     pre_resolved_shared_mem_layers,
                     cached_memory_objs,
@@ -2918,6 +2979,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                 )
+                if preflight_timings_ms is not None:
+                    preflight_timings_ms["pointer"] += (
+                        time.perf_counter() - timing_started_at
+                    ) * 1000
                 if metadata_only:
                     metadata_only_cache_prepared = True
                 else:
@@ -3107,7 +3172,43 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # Active shared-cache preflight has resolved every source
                 # layer. Prime the connector before the first model layer so
                 # its destination-only native plan is not initialized there.
+                timing_started_at = (
+                    time.perf_counter() if preflight_timing_enabled else 0.0
+                )
                 ensure_mem_obj_consumer()
+                if preflight_timings_ms is not None:
+                    preflight_timings_ms["connector_prime"] += (
+                        time.perf_counter() - timing_started_at
+                    ) * 1000
+
+            if preflight_timing_enabled:
+                assert preflight_timings_ms is not None
+                total_ms = (time.perf_counter() - preflight_started_at) * 1000
+                measured_ms = sum(preflight_timings_ms.values())
+                _emit_mtp_dw_timing(
+                    owner="lmcache_ascend_retrieve",
+                    req=kwargs.get("req_id"),
+                    event="sparse_bootstrap_preflight",
+                    frontier=len(tokens),
+                    kv_group=kv_group,
+                    metadata_only=metadata_only,
+                    sampled_worker_retrieve=sampled_worker_retrieve,
+                    use_cached_retrieve=use_cached_retrieve,
+                    cached_prefix_chunks=cached_prefix_chunks,
+                    required_chunks=required_chunks,
+                    missing_chunks=bootstrap_missing_chunks,
+                    capacity_scan_skipped=capacity_scan_skipped,
+                    metadata_ms=round(preflight_timings_ms["metadata"], 4),
+                    lookup_ms=round(preflight_timings_ms["lookup"], 4),
+                    capacity_ms=round(preflight_timings_ms["capacity"], 4),
+                    resolve_ms=round(preflight_timings_ms["resolve"], 4),
+                    pointer_ms=round(preflight_timings_ms["pointer"], 4),
+                    connector_prime_ms=round(
+                        preflight_timings_ms["connector_prime"], 4
+                    ),
+                    other_ms=round(max(0.0, total_ms - measured_ms), 4),
+                    total_ms=round(total_ms, 4),
+                )
 
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
