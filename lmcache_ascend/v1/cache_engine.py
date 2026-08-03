@@ -814,12 +814,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
+        prepared_pointer_batch: Optional[object] = None,
+        defer_pointer_device_table: bool = False,
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
         new_tensors: List[torch.Tensor] = []
         append_ptrs_fn = getattr(
             self.gpu_connector,
             "append_sparse_chunk_ptr_cache_for_layer",
+            None,
+        )
+        commit_ptrs_fn = getattr(
+            self.gpu_connector,
+            "commit_sparse_chunk_ptr_cache_batch_layer",
             None,
         )
         pointer_first = (
@@ -835,12 +842,31 @@ class AscendLMCacheEngine(LMCacheEngine):
                 raise ValueError(
                     "Layerwise sparse retrieve resolved an invalid MemoryObj."
                 )
-            append_ptrs_fn(
-                layer_id,
-                mem_objs_layer,
-                cached_chunk_dev_ptrs,
-                cached_chunk_ptrs_npu,
-            )
+            if defer_pointer_device_table:
+                append_ptrs_fn(
+                    layer_id,
+                    mem_objs_layer,
+                    cached_chunk_dev_ptrs,
+                    None,
+                )
+            elif prepared_pointer_batch is not None:
+                if commit_ptrs_fn is None:
+                    raise RuntimeError(
+                        "Prepared sparse pointer batch has no commit API."
+                    )
+                commit_ptrs_fn(
+                    prepared_pointer_batch,
+                    layer_id,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
+            else:
+                append_ptrs_fn(
+                    layer_id,
+                    mem_objs_layer,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
         else:
             for chunk_index, mem_obj in enumerate(mem_objs_layer):
                 tensor = mem_obj.tensor
@@ -2079,6 +2105,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         to_release: list[MemoryObj] = []
         passive_views_handed_off = False
         metadata_appended = False
+        defer_passive_pointer_table = (
+            bool(kwargs.get("materialize_only", False))
+            and bool(missing_chunks)
+            and cached_memory_objs is not None
+            and cached_chunk_dev_ptrs is not None
+            and cached_chunk_ptrs_npu is not None
+            and not any(
+                ptrs is not None for ptrs in cached_chunk_ptrs_npu
+            )
+            and not any(cached_tensors or ())
+        )
 
         try:
             for layer_id in range(self.num_layers):
@@ -2190,6 +2227,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             cached_tensors,
                             cached_chunk_dev_ptrs,
                             cached_chunk_ptrs_npu,
+                            defer_pointer_device_table=(
+                                defer_passive_pointer_table
+                            ),
                         )
                     except Exception:
                         for mem_obj in mem_objs_layer:
@@ -2257,6 +2297,40 @@ class AscendLMCacheEngine(LMCacheEngine):
                         rank=self.metadata.worker_id,
                         passive=True,
                     )
+            if defer_passive_pointer_table:
+                finalize_ptrs_fn = getattr(
+                    self.gpu_connector,
+                    "finalize_sparse_chunk_ptr_cache_from_host",
+                    None,
+                )
+                if not callable(finalize_ptrs_fn):
+                    raise RuntimeError(
+                        "Deferred sparse pointer table has no finalize API."
+                    )
+                pointer_finalize_started = (
+                    cold_start_perf_now() if perf_enabled else 0.0
+                )
+                assert cached_chunk_dev_ptrs is not None
+                assert cached_chunk_ptrs_npu is not None
+                finalize_ptrs_fn(
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                )
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "passive_pointer_batch_finalize",
+                        started=pointer_finalize_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        layers=self.num_layers,
+                        objects=sum(
+                            len(layer) for layer in cached_chunk_dev_ptrs
+                        ),
+                        rank=self.metadata.worker_id,
+                    )
+
             next(mem_obj_consumer)
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None
@@ -2815,6 +2889,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 "sparse_decode_bootstrap",
                             ),
                             kv_group=kv_group,
+                            scan_skipped=capacity_details.get(
+                                "capacity_scan_skipped", False
+                            ),
                             fits=capacity_details.get("fits"),
                             missing_chunks=capacity_details.get(
                                 "missing_chunk_count"
@@ -3098,6 +3175,59 @@ class AscendLMCacheEngine(LMCacheEngine):
             next(mem_obj_consumer)
             return mem_obj_consumer
 
+        prepared_pointer_batch: Optional[object] = None
+        if (
+            pre_resolved_shared_mem_layers is not None
+            and cached_prefix_chunks < required_chunks
+            and cached_chunk_dev_ptrs is not None
+            and cached_chunk_ptrs_npu is not None
+        ):
+            prepare_ptrs_fn = getattr(
+                self.gpu_connector,
+                "prepare_sparse_chunk_ptr_cache_for_layers",
+                None,
+            )
+            commit_ptrs_fn = getattr(
+                self.gpu_connector,
+                "commit_sparse_chunk_ptr_cache_batch_layer",
+                None,
+            )
+            if callable(prepare_ptrs_fn) and callable(commit_ptrs_fn):
+                pointer_batch_started = (
+                    cold_start_perf_now() if perf_enabled else 0.0
+                )
+                prepared_pointer_batch, pointer_timings = prepare_ptrs_fn(
+                    pre_resolved_shared_mem_layers,
+                    cached_chunk_ptrs_npu,
+                )
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "sparse_pointer_batch_prepare",
+                        started=pointer_batch_started,
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase",
+                            "sparse_decode_bootstrap",
+                        ),
+                        kv_group=kv_group,
+                        layers=len(pre_resolved_shared_mem_layers),
+                        objects=sum(
+                            len(layer)
+                            for layer in pre_resolved_shared_mem_layers
+                        ),
+                        ptr_resolve_ms=float(
+                            pointer_timings.get("ptr_resolve", 0.0)
+                        ),
+                        ptr_tensor_build_ms=float(
+                            pointer_timings.get("ptr_tensor_build", 0.0)
+                        ),
+                        ptr_tensor_concat_ms=float(
+                            pointer_timings.get("ptr_tensor_concat", 0.0)
+                        ),
+                        rank=self.metadata.worker_id,
+                    )
+
         try:
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
@@ -3159,6 +3289,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_tensors,
                                 cached_chunk_dev_ptrs,
                                 cached_chunk_ptrs_npu,
+                                prepared_pointer_batch,
                             )
                     else:
                         mem_objs_layer = []

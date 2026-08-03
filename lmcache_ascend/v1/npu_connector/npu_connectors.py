@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 import json
 import os
 from typing import Any, Generator, List, Optional, Set, Union
@@ -1436,6 +1437,14 @@ class _SparseLoadJoin:
         self.used_stream_indices: set[int] = set()
 
 
+@dataclass(frozen=True)
+class _SparsePointerCacheBatch:
+    """Prepared cross-layer sparse pointer additions."""
+
+    new_dev_ptrs_by_layer: tuple[tuple[int, ...], ...]
+    updated_ptrs_npu_by_layer: tuple[Optional[torch.Tensor], ...]
+
+
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def __init__(
         self,
@@ -1591,6 +1600,154 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return self._lmc_plane_num_tokens(layer_tensors[0], kv_group)
         last_tokens = self._lmc_plane_num_tokens(layer_tensors[-1], kv_group)
         return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
+
+    def prepare_sparse_chunk_ptr_cache_for_layers(
+        self,
+        new_sources_by_layer: List[List[Union[torch.Tensor, MemoryObj]]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> tuple[object, dict[str, float]]:
+        """Resolve all sparse source pointers and build one NPU tensor."""
+        if len(new_sources_by_layer) != self.num_layers:
+            raise ValueError(
+                "Ascend sparse pointer batch must cover every model layer: "
+                f"layers={len(new_sources_by_layer)}, expected={self.num_layers}"
+            )
+
+        started = time.perf_counter()
+        new_dev_ptrs_by_layer = tuple(
+            tuple(
+                self._resolve_registered_cpu_source_device_ptr(
+                    source_obj,
+                    layer_id=layer_id,
+                    chunk_index=chunk_index,
+                    source="prepare_sparse_chunk_ptr_cache_for_layers",
+                )
+                for chunk_index, source_obj in enumerate(layer_sources)
+            )
+            for layer_id, layer_sources in enumerate(new_sources_by_layer)
+        )
+        ptr_resolve_ms = (time.perf_counter() - started) * 1000
+
+        flat_dev_ptrs = [
+            ptr for layer_ptrs in new_dev_ptrs_by_layer for ptr in layer_ptrs
+        ]
+        ptr_tensor_build_ms = 0.0
+        ptr_tensor_concat_ms = 0.0
+        updated_ptrs_npu: list[Optional[torch.Tensor]] = []
+        if cached_chunk_ptrs_npu is None:
+            updated_ptrs_npu = [None] * self.num_layers
+        elif flat_dev_ptrs:
+            started = time.perf_counter()
+            flat_new_ptrs_npu = torch.tensor(
+                flat_dev_ptrs,
+                dtype=torch.long,
+                device=self.kv_device,
+            )
+            ptr_tensor_build_ms = (time.perf_counter() - started) * 1000
+
+            started = time.perf_counter()
+            offset = 0
+            for layer_id, layer_ptrs in enumerate(new_dev_ptrs_by_layer):
+                count = len(layer_ptrs)
+                new_ptrs_npu = flat_new_ptrs_npu.narrow(0, offset, count)
+                offset += count
+                existing = (
+                    cached_chunk_ptrs_npu[layer_id]
+                    if layer_id < len(cached_chunk_ptrs_npu)
+                    else None
+                )
+                updated_ptrs_npu.append(
+                    new_ptrs_npu
+                    if existing is None
+                    else torch.cat((existing, new_ptrs_npu), dim=0)
+                )
+            ptr_tensor_concat_ms = (time.perf_counter() - started) * 1000
+        else:
+            updated_ptrs_npu = [
+                (
+                    cached_chunk_ptrs_npu[layer_id]
+                    if layer_id < len(cached_chunk_ptrs_npu)
+                    else None
+                )
+                for layer_id in range(self.num_layers)
+            ]
+
+        batch = _SparsePointerCacheBatch(
+            new_dev_ptrs_by_layer=new_dev_ptrs_by_layer,
+            updated_ptrs_npu_by_layer=tuple(updated_ptrs_npu),
+        )
+        return batch, {
+            "ptr_resolve": ptr_resolve_ms,
+            "ptr_tensor_build": ptr_tensor_build_ms,
+            "ptr_tensor_concat": ptr_tensor_concat_ms,
+        }
+
+    def commit_sparse_chunk_ptr_cache_batch_layer(
+        self,
+        prepared_batch: object,
+        layer_id: int,
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> None:
+        """Commit one layer without another device tensor construction."""
+        if not isinstance(prepared_batch, _SparsePointerCacheBatch):
+            raise TypeError(
+                "Invalid Ascend sparse pointer batch: "
+                f"{type(prepared_batch).__name__}"
+            )
+        if not 0 <= layer_id < len(prepared_batch.new_dev_ptrs_by_layer):
+            raise IndexError(f"Sparse pointer batch layer out of range: {layer_id}")
+
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(self.num_layers))
+        while len(cached_chunk_dev_ptrs) <= layer_id:
+            cached_chunk_dev_ptrs.append([])
+        cached_chunk_dev_ptrs[layer_id].extend(
+            prepared_batch.new_dev_ptrs_by_layer[layer_id]
+        )
+
+        if cached_chunk_ptrs_npu is None:
+            return
+        if not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(self.num_layers))
+        while len(cached_chunk_ptrs_npu) <= layer_id:
+            cached_chunk_ptrs_npu.append(None)
+        cached_chunk_ptrs_npu[layer_id] = (
+            prepared_batch.updated_ptrs_npu_by_layer[layer_id]
+        )
+
+
+    def finalize_sparse_chunk_ptr_cache_from_host(
+        self,
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: List[Optional[torch.Tensor]],
+    ) -> None:
+        """Build every passive layer pointer table with one device copy."""
+        if len(cached_chunk_dev_ptrs) != self.num_layers:
+            raise ValueError(
+                "Sparse host pointer cache is incomplete: "
+                f"layers={len(cached_chunk_dev_ptrs)}, expected={self.num_layers}"
+            )
+        if any(ptrs is not None for ptrs in cached_chunk_ptrs_npu):
+            raise ValueError(
+                "Sparse pointer finalization requires an empty device cache."
+            )
+        flat_ptrs = [
+            ptr for layer_ptrs in cached_chunk_dev_ptrs for ptr in layer_ptrs
+        ]
+        flat_ptrs_npu = torch.tensor(
+            flat_ptrs,
+            dtype=torch.long,
+            device=self.kv_device,
+        )
+        cached_chunk_ptrs_npu.clear()
+        offset = 0
+        for layer_ptrs in cached_chunk_dev_ptrs:
+            count = len(layer_ptrs)
+            cached_chunk_ptrs_npu.append(
+                flat_ptrs_npu.narrow(0, offset, count)
+            )
+            offset += count
 
     def append_sparse_chunk_ptr_cache_for_layer(
         self,

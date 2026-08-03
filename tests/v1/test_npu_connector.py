@@ -1847,3 +1847,59 @@ def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
 
     with patch(target_patch, new=VLLMPagedMemNPUConnectorV2):
         original_test_vllm_paged_connector_v2_to_gpu_bench(benchmark)
+
+
+def test_sparse_pointer_batch_builds_and_commits_all_layers() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kv_device = torch.device("cpu")
+    connector._resolve_registered_cpu_source_device_ptr = (
+        lambda source_obj, **_kwargs: int(source_obj.item())
+    )
+    cached_ptrs_npu = []
+
+    batch, timings = connector.prepare_sparse_chunk_ptr_cache_for_layers(
+        [
+            [torch.tensor(11), torch.tensor(12)],
+            [torch.tensor(21)],
+        ],
+        cached_ptrs_npu,
+    )
+    cached_dev_ptrs = []
+    connector.commit_sparse_chunk_ptr_cache_batch_layer(
+        batch,
+        0,
+        cached_dev_ptrs,
+        cached_ptrs_npu,
+    )
+    connector.commit_sparse_chunk_ptr_cache_batch_layer(
+        batch,
+        1,
+        cached_dev_ptrs,
+        cached_ptrs_npu,
+    )
+
+    assert cached_dev_ptrs == [[11, 12], [21]]
+    assert cached_ptrs_npu[0].tolist() == [11, 12]
+    assert cached_ptrs_npu[1].tolist() == [21]
+    assert timings["ptr_tensor_build"] >= 0.0
+
+
+def test_sparse_pointer_finalize_builds_all_device_rows_from_host() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kv_device = torch.device("cpu")
+    cached_ptrs_npu = []
+
+    connector.finalize_sparse_chunk_ptr_cache_from_host(
+        [[31, 32], [41]],
+        cached_ptrs_npu,
+    )
+
+    assert cached_ptrs_npu[0].tolist() == [31, 32]
+    assert cached_ptrs_npu[1].tolist() == [41]
+    assert (
+        cached_ptrs_npu[1].data_ptr()
+        == cached_ptrs_npu[0].data_ptr()
+        + cached_ptrs_npu[0].numel() * cached_ptrs_npu[0].element_size()
+    )

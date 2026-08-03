@@ -121,3 +121,34 @@ def test_dense_store_prepares_sparse_pointer_cache_without_shared_cpu() -> None:
     assert calls[0][1][0] is tensor
     assert calls[0][2] is cached_chunk_dev_ptrs
     assert calls[0][3] is cached_chunk_ptrs_npu
+
+
+def test_deferred_pointer_table_keeps_memory_objects_and_host_ptrs() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    calls = []
+    engine.gpu_connector = SimpleNamespace(
+        append_sparse_chunk_ptr_cache_for_layer=(
+            lambda *args: calls.append(args)
+        )
+    )
+    mem_obj = SimpleNamespace(is_valid=lambda: True)
+    cached_memory_objs = []
+    cached_tensors = []
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
+
+    engine._append_retrieve_layer_cache(
+        0,
+        [mem_obj],
+        cached_memory_objs,
+        cached_tensors,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+        defer_pointer_device_table=True,
+    )
+
+    assert calls[0][1] == [mem_obj]
+    assert calls[0][3] is None
+    assert cached_memory_objs == [[mem_obj]]
+    assert cached_tensors == []
