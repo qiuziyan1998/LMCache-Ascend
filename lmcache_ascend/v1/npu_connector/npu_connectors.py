@@ -3,7 +3,7 @@
 from contextlib import contextmanager, nullcontext
 import json
 import os
-from typing import Any, Generator, List, Optional, Set, Union
+from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -22,7 +22,13 @@ from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSourceLayer,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import (
+    GPUMemoryAllocator,
+    LayerPageMemoryObj,
+    LayerPageSource,
+    MemoryFormat,
+    MemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 import torch
 
@@ -45,6 +51,40 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+def _layer_memory_tensor(memory_obj: MemoryObj, layer_id: int) -> torch.Tensor:
+    tensor = (
+        memory_obj.layer_tensor(layer_id)
+        if isinstance(memory_obj, LayerPageMemoryObj)
+        else memory_obj.tensor
+    )
+    if tensor is None:
+        raise ValueError("Layerwise source has no tensor")
+    return tensor
+
+
+def _layer_source_tensors(
+    source: Union[List[MemoryObj], LayerPageSource],
+    layer_id: int,
+    expected_fmt: MemoryFormat,
+) -> list[torch.Tensor]:
+    memory_objs = _layer_source_memory_objs(source, layer_id)
+    if any(memory_obj.metadata.fmt != expected_fmt for memory_obj in memory_objs):
+        raise ValueError(f"Expected memory format {expected_fmt}.")
+    return [_layer_memory_tensor(memory_obj, layer_id) for memory_obj in memory_objs]
+
+
+def _layer_source_memory_objs(
+    source: Union[List[MemoryObj], LayerPageSource], layer_id: int
+) -> Sequence[MemoryObj]:
+    if isinstance(source, LayerPageSource):
+        if source.layer_id != layer_id:
+            raise ValueError(
+                f"Layer-page source selects {source.layer_id}, expected {layer_id}"
+            )
+        return (*source.pages, *source.suffix)
+    return source
 
 
 def _payload_event_list(payload_event: Any) -> list[Any]:
@@ -1437,6 +1477,8 @@ class _SparseLoadJoin:
 
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
+    supports_layer_page_source = True
+
     def __init__(
         self,
         hidden_dim_size: int,
@@ -1660,6 +1702,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         host_ptr = int(
             source_obj.data_ptr()
             if isinstance(source_obj, torch.Tensor)
+            else source_obj.layer_data_ptr(layer_id)
+            if isinstance(source_obj, LayerPageMemoryObj)
             else source_obj.data_ptr
         )
         dev_ptr = lmc_ops.get_device_ptr(host_ptr)
@@ -2523,6 +2567,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cpu_tensors: List[torch.Tensor],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
         expected_num_chunks: Optional[int] = None,
+        source_objs: Optional[Sequence[MemoryObj]] = None,
     ) -> torch.Tensor:
         num_chunks = (
             len(cpu_tensors)
@@ -2549,20 +2594,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 return cached
 
-        if len(cpu_tensors) != num_chunks:
+        pointer_sources: Sequence[Union[torch.Tensor, MemoryObj]] = (
+            source_objs if source_objs is not None else cpu_tensors
+        )
+        if len(pointer_sources) != num_chunks:
             raise RuntimeError(
                 "Ascend sparse pointer-first source has no complete cached "
                 f"pointer table at layer {layer_id}: "
-                f"layout_tensors={len(cpu_tensors)}, chunks={num_chunks}."
+                f"pointer_sources={len(pointer_sources)}, chunks={num_chunks}."
             )
         dev_ptrs = [
             self._resolve_registered_cpu_source_device_ptr(
-                tensor,
+                source,
                 layer_id=layer_id,
                 chunk_index=chunk_index,
                 source="_resolve_sparse_chunk_ptrs_npu",
             )
-            for chunk_index, tensor in enumerate(cpu_tensors)
+            for chunk_index, source in enumerate(pointer_sources)
         ]
         chunk_ptrs_npu = torch.tensor(dev_ptrs, dtype=torch.long, device=self.kv_device)
         if cached_chunk_ptrs_npu is not None:
@@ -3390,8 +3438,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             )
 
+        validated_page_ids: set[int] = set()
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
+            source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
+            page_checks: tuple[MemoryObj, ...] = ()
+            format_sources = source_objs
+            if isinstance(memory_objs_layer, LayerPageSource):
+                page_checks = tuple(
+                    page
+                    for page in memory_objs_layer.pages
+                    if id(page) not in validated_page_ids
+                )
+                format_sources = (*page_checks, *memory_objs_layer.suffix)
+            if any(obj.metadata.fmt != expected_fmt for obj in format_sources):
+                raise ValueError(f"Expected memory format {expected_fmt}.")
+            validated_page_ids.update(map(id, page_checks))
+            pointer_first = dense_direct and bool(source_objs)
+            cpu_tensors = (
+                [_layer_memory_tensor(source_objs[0], layer_id)]
+                if pointer_first
+                else _layer_source_tensors(memory_objs_layer, layer_id, expected_fmt)
+            )
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
             current_stream = torch.cuda.current_stream()
@@ -3401,20 +3469,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 logger.debug("Finished loading layer %d", layer_id - 1)
             # memobj -> gpu_buffer -> kvcaches
             if dense_direct:
-                cpu_tensors = []
-                for memory_obj in memory_objs_layer:
-                    assert memory_obj.tensor is not None
-                    if memory_obj.metadata.fmt != expected_fmt:
-                        raise ValueError(
-                            f"Expected memory format {expected_fmt}, "
-                            f"got {memory_obj.metadata.fmt}."
-                        )
-                    cpu_tensors.append(memory_obj.tensor)
-                chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
-                    layer_id,
-                    cpu_tensors,
-                    cached_chunk_ptrs_npu,
-                )
+                if pointer_first:
+                    chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                        layer_id,
+                        cpu_tensors,
+                        cached_chunk_ptrs_npu,
+                        expected_num_chunks=len(source_objs),
+                        source_objs=source_objs,
+                    )
+                else:
+                    chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                        layer_id, cpu_tensors, cached_chunk_ptrs_npu
+                    )
                 assert chunk_offsets_npu is not None
                 assert chunk_sizes_npu is not None
                 self._run_dense_direct_kv_transfer_layer(
@@ -3442,16 +3508,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else:
                 with torch.cuda.stream(self.load_stream):
                     if self.use_gpu:
-                        cpu_tensors = []
-                        for memory_obj in memory_objs_layer:
-                            assert memory_obj.tensor is not None
-                            if memory_obj.metadata.fmt != expected_fmt:
-                                raise ValueError(
-                                    f"Expected memory format {expected_fmt}, "
-                                    f"got {memory_obj.metadata.fmt}."
-                                )
-                            cpu_tensors.append(memory_obj.tensor)
-
                         # Fused transfer: N H2D memcpy + 1 scatter kernel
                         batched_fused_single_layer_kv_transfer(
                             cpu_tensors,  # CPU memory objects
@@ -3470,13 +3526,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
 
                     else:
-                        for start, end, memory_obj in zip(
-                            starts, ends, memory_objs_layer, strict=False
+                        for start, end, tensor in zip(
+                            starts, ends, cpu_tensors, strict=False
                         ):
-                            assert memory_obj.tensor is not None
-
                             lmc_ops.single_layer_kv_transfer(
-                                memory_obj.tensor,
+                                tensor,
                                 kvcaches_snapshot[layer_id],
                                 slot_mapping[start:end],
                                 False,
@@ -3605,16 +3659,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             if capture_content and layer_id == 0:
                 source_tensors = list(source_layer.tensors)
-                for chunk_index, memory_obj in enumerate(
+                for memory_obj in (
                     source_layer.memory_objs if not source_tensors else ()
                 ):
-                    tensor = memory_obj.tensor
-                    if tensor is None:
-                        raise ValueError(
-                            "Prepared sparse diagnostic source has no tensor: "
-                            f"layer_id={layer_id}, chunk_index={chunk_index}"
-                        )
-                    source_tensors.append(tensor)
+                    source_tensors.append(
+                        _layer_memory_tensor(memory_obj, layer_id)
+                    )
                 source_chunk_ranges = []
                 for chunk_index, tensor in enumerate(source_tensors):
                     range_start = chunk_index * chunk_size
@@ -3851,14 +3901,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     layer_memory_objs[:1] if pointer_first else layer_memory_objs
                 )
                 cpu_tensors = []
-                for chunk_index, memory_obj in enumerate(source_objs):
-                    tensor = memory_obj.tensor
-                    if tensor is None:
-                        raise ValueError(
-                            "Sparse retrieve source has no tensor: "
-                            f"layer_id={layer_id}, chunk_index={chunk_index}"
-                        )
-                    cpu_tensors.append(tensor)
+                for memory_obj in source_objs:
+                    cpu_tensors.append(
+                        _layer_memory_tensor(memory_obj, layer_id)
+                    )
 
             if not cpu_tensors:
                 continue

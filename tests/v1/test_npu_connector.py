@@ -20,7 +20,11 @@ from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     PreparedSparseSourceLayer,
 )
-from lmcache.v1.memory_management import MemoryFormat
+from lmcache.v1.memory_management import (
+    LayerPageSource,
+    MemoryFormat,
+    TensorMemoryAllocator,
+)
 import pytest
 import torch
 
@@ -31,6 +35,63 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
 )
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
 import lmcache_ascend.c_ops as lmc_ops
+
+
+def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    suffix = allocator.allocate(
+        torch.Size([4]),
+        torch.float16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None and suffix is not None
+    pages[0].layer_tensor(0).fill_(1)
+    pages[0].layer_tensor(1).fill_(2)
+    suffix.tensor.fill_(3)
+
+    tensors = npu_connectors._layer_source_tensors(
+        LayerPageSource(tuple(pages), 1, (suffix,)),
+        1,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+
+    assert [int(tensor[0]) for tensor in tensors] == [2, 3]
+    with pytest.raises(ValueError, match="selects 0"):
+        npu_connectors._layer_source_tensors(
+            LayerPageSource(tuple(pages), 0),
+            1,
+            MemoryFormat.KV_MLA_LATENT_FMT,
+        )
+    pages[0].ref_count_down()
+    suffix.ref_count_down()
+
+
+def test_layer_page_pointer_resolution_uses_selected_layer(monkeypatch) -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    monkeypatch.setattr(lmc_ops, "get_device_ptr", lambda address: address + 7)
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+
+    pointer = connector._resolve_registered_cpu_source_device_ptr(
+        pages[0], layer_id=1, chunk_index=0, source="test"
+    )
+
+    assert pointer == pages[0].layer_data_ptr(1) + 7
+    pages[0].ref_count_down()
 
 
 def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
@@ -1460,12 +1521,16 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         layer_id,
         cpu_tensors,
         cached_chunk_ptrs_arg=None,
+        expected_num_chunks=None,
+        source_objs=None,
     ):
         pointer_calls.append(
             (
                 layer_id,
                 list(cpu_tensors),
                 cached_chunk_ptrs_arg,
+                expected_num_chunks,
+                source_objs,
             )
         )
         resolved = torch.tensor([123, 456], dtype=torch.long)
@@ -1510,12 +1575,34 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert init_staging_values == [False]
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is cached_chunk_ptrs_npu
+    assert len(pointer_calls[0][1]) == 1
+    assert len(pointer_calls[0][4]) == 2
     assert cached_chunk_ptrs_npu[0].tolist() == [123, 456]
     assert len(direct_calls) == 1
     assert direct_calls[0]["direction"] is False
     assert direct_calls[0]["total_tokens"] == 273
     assert direct_calls[0]["fixed_chunk_size"] == 256
     assert direct_calls[0]["kvcaches_ref"] is request_kvcaches
+
+    cached_gen = connector.batched_to_gpu(
+        [0, 256],
+        [256, 273],
+        slot_mapping=torch.arange(273, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+        kvcaches=request_kvcaches,
+    )
+    next(cached_gen)
+    cached_gen.send(
+        [
+            _MemoryObj(torch.zeros(256, dtype=torch.bfloat16)),
+            _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
+        ]
+    )
+    cached_gen.close()
+    assert len(pointer_calls[-1][1]) == 1
+    assert pointer_calls[-1][3] == 2
 
 
 def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
@@ -1566,7 +1653,7 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
     monkeypatch.setattr(
         connector,
         "_resolve_sparse_chunk_ptrs_npu",
-        lambda layer_id, cpu_tensors, cached=None: torch.tensor(
+        lambda layer_id, cpu_tensors, cached=None, **_kwargs: torch.tensor(
             [111, 222, 333], dtype=torch.long
         ),
     )
