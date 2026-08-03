@@ -761,6 +761,285 @@ class TestSparseMlaDsaStoreRetrieveRoundtrip:
             if harness is not None:
                 harness.close()
 
+    @pytest.mark.parametrize("frontier", [6400, 7168])
+    def test_prepared_sparse_reuses_payload_addresses_for_three_steps(
+        self,
+        frontier: int,
+    ) -> None:
+        """Replay the long-prompt MTP latent load without step barriers.
+
+        Production submits one prepared sparse-direct transfer for each of the
+        79 latent-cache layers.  Each layer owns fixed selected/count/target
+        workspaces and a 4096-slot scratch, then reuses those addresses across
+        decode steps.  Keep that ordering here: all three steps are submitted
+        on one stream and synchronize only once, after layer 78 of step three.
+
+        The fixed row is MTP(2) * top-k(2048) = 4096 entries.  Invalid tails
+        contain the resident planner's -1 token sentinel, while every target
+        mapping remains in bounds.  Consuming a stale count is therefore seen
+        as an invalid source read, a wrong final value, or a guard overwrite.
+        """
+        row_width = 4096
+        num_layers = 79
+        num_steps = 3
+        block_size = 128
+        chunk_size = 256
+        dtype = torch.bfloat16
+        device = torch.device("npu")
+        guard_value = -512.0
+        dims = MlaDsaDims(
+            k_hidden_dims=512,
+            v_hidden_dims=64,
+            dsa_hidden_dims=0,
+            plane_elems=576,
+        )
+        partition = compute_chunk_partition(frontier, chunk_size)
+        mem_allocator = None
+        mem_objs = []
+        destination_layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+        try:
+            # Keep independent registered source backing for the first layer,
+            # the final target layer, and the MTP layer.  The remaining target
+            # layers share layer 0's source only to keep this regression test
+            # comfortably below the memory footprint of a full server.
+            mem_allocator = create_pin_memory_allocator(partition, dims, dtype)
+            source_chunks: dict[int, list[torch.Tensor]] = {}
+            source_ptrs: dict[int, torch.Tensor] = {}
+            for layer_id, bias in ((0, 0.0), (77, 64.0), (78, 128.0)):
+                chunks, layer_mem_objs = allocate_stacked_cpu_chunks(
+                    mem_allocator,
+                    partition,
+                    dims,
+                    dtype,
+                )
+                mem_objs.extend(layer_mem_objs)
+                _fill_stacked_chunks_with_token_pattern(chunks, dtype=dtype)
+                if bias:
+                    for chunk in chunks:
+                        chunk.add_(bias)
+                source_chunks[layer_id] = chunks
+                source_ptrs[layer_id] = build_chunk_ptrs_npu(chunks, device)
+
+            source_chunks_by_layer = [source_chunks[0]] * num_layers
+            chunk_ptrs_by_layer = [source_ptrs[0]] * num_layers
+            source_chunks_by_layer[77] = source_chunks[77]
+            source_chunks_by_layer[78] = source_chunks[78]
+            chunk_ptrs_by_layer[77] = source_ptrs[77]
+            chunk_ptrs_by_layer[78] = source_ptrs[78]
+
+            selected_by_layer = [
+                torch.empty(
+                    (1, row_width),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for _ in range(num_layers)
+            ]
+            selected_counts_by_layer = [
+                torch.empty(
+                    (1,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for _ in range(num_layers)
+            ]
+            target_slots_by_layer = [
+                torch.empty(
+                    (1, row_width),
+                    dtype=torch.long,
+                    device=device,
+                )
+                for _ in range(num_layers)
+            ]
+            payload_ptrs = [
+                (
+                    selected_by_layer[layer_id].data_ptr(),
+                    selected_counts_by_layer[layer_id].data_ptr(),
+                    target_slots_by_layer[layer_id].data_ptr(),
+                )
+                for layer_id in range(num_layers)
+            ]
+
+            # Every layer gets different payload contents while its bridge
+            # tensors retain the same data_ptr across steps.  This catches a
+            # queued transfer that observes the next step's overwrite instead
+            # of the values preceding its launch.
+            selected_cpu = torch.full(
+                (num_steps, num_layers, row_width),
+                -1,
+                dtype=torch.int32,
+            )
+            target_cpu = torch.empty(
+                (num_steps, num_layers, row_width),
+                dtype=torch.long,
+            )
+            counts_cpu = torch.empty(
+                (num_steps, num_layers),
+                dtype=torch.int32,
+            )
+            positions = torch.arange(row_width, dtype=torch.long)
+            base_counts = (4096, 3072, 2048)
+            for step, base_count in enumerate(base_counts):
+                for layer_id in range(num_layers):
+                    if layer_id == 78:
+                        # The draft layer has one top-k row, not the target
+                        # model's two-row union.
+                        count = 2048 - step * 512
+                    elif layer_id & 1:
+                        count = max(1, base_count - 1024)
+                    else:
+                        count = base_count
+                    counts_cpu[step, layer_id] = count
+                    selected_cpu[step, layer_id, :count] = (
+                        positions[:count] * 137
+                        + step * 211
+                        + layer_id * 43
+                    ).remainder(frontier).to(torch.int32)
+                    target_cpu[step, layer_id] = (
+                        positions * 127
+                        + step * 193
+                        + layer_id * 47
+                    ).remainder(row_width)
+
+            selected_by_launch = selected_cpu.to(device=device)
+            counts_by_launch = counts_cpu.to(device=device)
+            target_by_launch = target_cpu.to(device=device)
+
+            # Production keeps exactly 32 * 128 = 4096 latent scratch slots;
+            # it does not allocate a disjoint window for each decode step.
+            num_destination_blocks = row_width // block_size
+            destination_states = []
+            for layer_id in range(num_layers):
+                destination = (
+                    torch.full(
+                        (
+                            num_destination_blocks,
+                            block_size,
+                            1,
+                            dims.k_hidden_dims,
+                        ),
+                        guard_value,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    torch.full(
+                        (
+                            num_destination_blocks,
+                            block_size,
+                            1,
+                            dims.v_hidden_dims,
+                        ),
+                        guard_value,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                )
+                destination_layers.append(destination)
+                destination_states.append(
+                    prepare_sparse_direct_destination_state(
+                        list(destination),
+                        target_slots_by_layer[layer_id],
+                        KV_FORMAT_MLA_LATENT,
+                        dims.k_hidden_dims,
+                        dims.v_hidden_dims,
+                        dims.dsa_hidden_dims,
+                    )
+                )
+
+            # Complete setup before the barrier-free replay begins.  There is
+            # deliberately no synchronize in either loop below.
+            torch.npu.synchronize()
+            for step in range(num_steps):
+                for layer_id in range(num_layers):
+                    selected_by_layer[layer_id].copy_(
+                        selected_by_launch[step, layer_id]
+                    )
+                    selected_counts_by_layer[layer_id].copy_(
+                        counts_by_launch[step, layer_id].reshape(1),
+                    )
+                    target_slots_by_layer[layer_id].copy_(
+                        target_by_launch[step, layer_id]
+                    )
+                    sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+                        destination_states[layer_id],
+                        target_slots_by_layer[layer_id],
+                        selected_by_layer[layer_id],
+                        chunk_ptrs_by_layer[layer_id],
+                        chunk_size,
+                        frontier,
+                        False,
+                        selected_counts_by_layer[layer_id],
+                    )
+            torch.npu.synchronize()
+
+            assert payload_ptrs == [
+                (
+                    selected_by_layer[layer_id].data_ptr(),
+                    selected_counts_by_layer[layer_id].data_ptr(),
+                    target_slots_by_layer[layer_id].data_ptr(),
+                )
+                for layer_id in range(num_layers)
+            ]
+
+            # Layer 78 is the MTP drafter latent cache; layer 77 is the final
+            # target layer.  Layer 0 catches a failure that starts earlier.
+            for layer_id in (0, 77, 78):
+                # Scratch is persistent and is not cleared between decode
+                # steps.  Derive the final contents from the last legal write
+                # to each slot rather than assuming only step three survives.
+                last_token_by_slot = torch.full(
+                    (row_width,),
+                    -1,
+                    dtype=torch.int32,
+                )
+                for step in range(num_steps):
+                    count = int(counts_cpu[step, layer_id])
+                    slots = target_cpu[step, layer_id, :count]
+                    last_token_by_slot[slots] = selected_cpu[
+                        step, layer_id, :count
+                    ]
+                written_slots = torch.nonzero(
+                    last_token_by_slot >= 0,
+                    as_tuple=False,
+                ).reshape(-1)
+                chunks = source_chunks_by_layer[layer_id]
+                _check_compact_scratch_from_cpu_chunks(
+                    chunks=chunks,
+                    selected=[
+                        int(last_token_by_slot[slot]) for slot in written_slots
+                    ],
+                    dst_slots=[int(slot) for slot in written_slots],
+                    dst_layer=destination_layers[layer_id],
+                    chunk_size=chunk_size,
+                    dims=dims,
+                    label=(
+                        "prepared-three-step "
+                        f"frontier={frontier} layer={layer_id}"
+                    ),
+                )
+
+                unwritten_slots = torch.nonzero(
+                    last_token_by_slot < 0,
+                    as_tuple=False,
+                ).reshape(-1)
+                if unwritten_slots.numel():
+                    for plane in destination_layers[layer_id]:
+                        plane_cpu = plane.reshape(
+                            -1, plane.shape[-1]
+                        ).detach().cpu()
+                        unwritten = plane_cpu.index_select(0, unwritten_slots)
+                        assert torch.all(unwritten == guard_value), (
+                            "prepared sparse transfer consumed an invalid "
+                            "padding sentinel: "
+                            f"frontier={frontier} layer={layer_id} "
+                            f"unwritten_slots={unwritten_slots.numel()}"
+                        )
+        finally:
+            if mem_objs:
+                release_pin_memory_objects(mem_objs)
+            if mem_allocator is not None:
+                mem_allocator.close()
+
     @pytest.mark.parametrize("fmt", ["mla", "dsa"])
     def test_sparse_direct_compact_scratch_slots_match_selected_source(
         self, fmt: str
