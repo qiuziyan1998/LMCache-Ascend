@@ -11,7 +11,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
+from lmcache.v1.shared_cpu_cache import SharedHandleBatch, SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
@@ -160,12 +160,46 @@ class _SequencePassiveAllocator:
         return view
 
 
+class _CompactPassiveAllocator:
+    shm_name = "test"
+    slab_size = 2
+
+    def __init__(self, views):
+        self.views = iter(views)
+
+    def create_batch_view(self, *_args, **_kwargs):
+        return next(self.views)
+
+
 class _FakeTokenDatabase:
     def __init__(self, keys):
         self.keys = keys if isinstance(keys, list) else [keys]
 
     def process_tokens(self, **_kwargs):
         for index, key in enumerate(self.keys):
+            yield index, index + 1, key
+
+
+class _IncrementalTokenDatabase(_FakeTokenDatabase):
+    chunk_size = 1
+
+    def __init__(self, keys):
+        super().__init__(keys)
+        self.full_calls = 0
+        self.suffix_calls = 0
+
+    def process_tokens(self, **kwargs):
+        self.full_calls += 1
+        yield from super().process_tokens(**kwargs)
+
+    def process_tokens_from_prefix(
+        self, _tokens, *, prefix_token_count, prefix_hash, **_kwargs
+    ):
+        self.suffix_calls += 1
+        assert self.keys[prefix_token_count - 1].chunk_hash == prefix_hash
+        for index, key in enumerate(
+            self.keys[prefix_token_count:], start=prefix_token_count
+        ):
             yield index, index + 1, key
 
 
@@ -178,6 +212,101 @@ def _make_key(kv_group=0, chunk_hash=1234):
         dtype=torch.float16,
         kv_group=kv_group,
     )
+
+
+def test_active_metadata_hashes_only_incremental_suffix():
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    token_database = _IncrementalTokenDatabase([key0, key1])
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.token_database = token_database
+    engine._should_use_shared_layerwise_retrieve = lambda _group: True
+    engine._is_shared_retrieve_passive = lambda _group: False
+    cached_keys = [[key] for key in key0.split_layers(2)]
+    kwargs = {
+        "kv_group": 0,
+        "cached_metadata_token_ids": [10],
+        "shared_cpu_request_preflight_state": {},
+    }
+
+    _, starts, ends, keys = engine._ensure_retrieve_chunk_metadata(
+        tokens=[10, 11],
+        mask=None,
+        request_configs=None,
+        cached_keys=cached_keys,
+        cached_starts=[0],
+        cached_ends=[1],
+        ret_mask=torch.zeros(2, dtype=torch.bool),
+        retrieve_kwargs=kwargs,
+    )
+
+    assert starts == [0, 1]
+    assert ends == [1, 2]
+    assert keys == [
+        [key0.split_layers(2)[layer], key1.split_layers(2)[layer]]
+        for layer in range(2)
+    ]
+    assert token_database.suffix_calls == 1
+    assert token_database.full_calls == 0
+    assert kwargs["_retrieve_metadata_mode"] == "incremental"
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "snapshot_length",
+        "mask_shape",
+        "layer_id",
+        "kv_group",
+        "identity",
+        "chunk_hash",
+    ],
+)
+def test_incremental_metadata_rejects_malformed_cached_prefix(malformation):
+    key0 = _make_key(chunk_hash=1)
+    key1 = _make_key(chunk_hash=2)
+    token_database = _IncrementalTokenDatabase([key0, key1])
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.token_database = token_database
+    cached_keys = [[key] for key in key0.split_layers(2)]
+    snapshot = [10]
+    mask = torch.ones(2, dtype=torch.bool)
+    if malformation == "snapshot_length":
+        snapshot.append(11)
+    elif malformation == "mask_shape":
+        mask = mask.reshape(1, 2)
+    elif malformation == "layer_id":
+        cached_keys[1][0] = key0.get_layer(0)
+    elif malformation == "kv_group":
+        cached_keys[1][0] = _make_key(kv_group=1, chunk_hash=1).get_layer(1)
+    elif malformation == "identity":
+        cached_keys[1][0] = CacheEngineKey(
+            model_name="other-model",
+            world_size=8,
+            worker_id=0,
+            chunk_hash=1,
+            dtype=torch.float16,
+            kv_group=0,
+        ).get_layer(1)
+    elif malformation == "chunk_hash":
+        cached_keys[1][0] = _make_key(chunk_hash=99).get_layer(1)
+
+    extension = engine._build_retrieve_metadata_extension(
+        tokens=[10, 11],
+        mask=mask,
+        request_configs=None,
+        kv_group=0,
+        cached_keys=cached_keys,
+        cached_starts=[0],
+        cached_ends=[1],
+        cached_metadata_token_ids=snapshot,
+    )
+
+    assert extension is None
+    assert token_database.suffix_calls == 0
 
 
 def test_sparse_rank0_preflight_error_broadcasts_on_first_layer_send(monkeypatch):
@@ -1532,6 +1661,191 @@ def test_sparse_passive_close_before_handoff_releases_views(monkeypatch):
     assert not mem_obj.is_valid()
 
 
+def test_sparse_passive_partial_view_failure_releases_created_views(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    keys = [_make_key(chunk_hash=1), _make_key(chunk_hash=2)]
+    created = _FakeTensorMemObj(torch.empty(1))
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.token_database = _FakeTokenDatabase(keys)
+    engine.shared_cpu_cache_passive_allocator = _SequencePassiveAllocator(
+        [created, ValueError("bad second view")]
+    )
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+    engine._receive_shared_envelope = lambda: SharedHandleEnvelope(
+        request_id="req-partial",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="ok",
+        generation=7,
+        handles=[object(), object()],
+    )
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1, 2],
+        None,
+        torch.zeros(2, dtype=torch.bool),
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=[],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=0,
+        req_id="req-partial",
+    )
+
+    next(retriever)
+    with pytest.raises(ValueError, match="bad second view"):
+        retriever.send(([0, 1], 0))
+
+    assert created.release_count == 1
+    assert not created.is_valid()
+
+
+@pytest.mark.parametrize(
+    "final_status", ["skipped", "error", "close", "view_error"]
+)
+def test_sparse_passive_compact_waits_for_final_status(monkeypatch, final_status):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    key = _make_key()
+    views = [
+        _FakeTensorMemObj(torch.empty(1)),
+        _FakeTensorMemObj(torch.empty(1)),
+    ]
+    batch = SharedHandleBatch(
+        shm_name="test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=1,
+        physical_sizes=[1],
+        chunk_hashes=[int(key.chunk_hash)],
+        offsets=[0, 1],
+    )
+    envelopes = iter(
+        [
+            SharedHandleEnvelope(
+                request_id="req-passive-compact",
+                phase="sparse_decode_bootstrap",
+                request_ordinal=0,
+                layer_id=0,
+                kv_group=0,
+                status="ok",
+                generation=7,
+                handles=[],
+                batch=batch,
+            ),
+            SharedHandleEnvelope(
+                request_id="req-passive-compact",
+                phase="sparse_decode_bootstrap",
+                request_ordinal=0,
+                layer_id=2,
+                kv_group=0,
+                status="skipped" if final_status == "skipped" else "error",
+                generation=7,
+                handles=[],
+                message=(
+                    "compact shared batch committed"
+                    if final_status == "skipped"
+                    else "compact failed"
+                ),
+                error_details=(
+                    None if final_status == "skipped" else {"error": "failed"}
+                ),
+            ),
+        ]
+    )
+    receives = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.token_database = _FakeTokenDatabase(key)
+    allocator_views = (
+        [views[0], ValueError("bad compact view")]
+        if final_status == "view_error"
+        else views
+    )
+    engine.shared_cpu_cache_passive_allocator = _CompactPassiveAllocator(
+        allocator_views
+    )
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0})()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1]),
+        torch.float16,
+        object(),
+    )
+
+    def receive_envelope():
+        receives.append(True)
+        return next(envelopes)
+
+    engine._receive_shared_envelope = receive_envelope
+    cached_memory_objs = []
+    cached_shared_handles = []
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=cached_shared_handles,
+        kv_group=0,
+        req_id="req-passive-compact",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    if final_status == "close":
+        retriever.close()
+    elif final_status == "view_error":
+        with pytest.raises(ValueError, match="bad compact view"):
+            retriever.send(([0], 0))
+    elif final_status == "error":
+        with pytest.raises(ValueError, match="rank0 error envelope"):
+            retriever.send(([0], 0))
+    else:
+        retriever.send(([0], 0))
+
+    assert receives == [True, True]
+    if final_status != "skipped":
+        assert cached_memory_objs == []
+        assert cached_shared_handles == []
+        expected_releases = (
+            [1, 0]
+            if final_status in ("close", "view_error")
+            else [1, 1]
+        )
+        assert [view.release_count for view in views] == expected_releases
+    else:
+        assert cached_memory_objs == [[views[0]], [views[1]]]
+        assert cached_shared_handles == [[None], [None]]
+        assert all(view.release_count == 0 for view in views)
+
+
 def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
     """Rank0 must still broadcast handles when passive ranks are cold."""
 
@@ -1605,6 +1919,109 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
     assert mem_obj.pin_count == 1
     assert mem_obj.ref_down_count == 0
     assert mem_obj.unpin_count == 0
+
+
+@pytest.mark.parametrize("exit_mode", ["success", "exception", "close"])
+def test_compact_batch_uses_exactly_one_final_status(
+    monkeypatch, exit_mode
+):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    key = _make_key()
+    layer_keys = key.split_layers(2)
+    allocated = [_FakePinnedMemObj(), _FakePinnedMemObj()]
+    preflight_state = {}
+    broadcasts = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(
+        experimental_sampled_layerwise_lookup=False,
+        extra_config={},
+    )
+    engine.storage_manager = object()
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"worker_id": 0})()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _group: True
+    engine._is_passive = lambda: False
+    engine._ensure_layerwise_connector_layout = lambda **_kwargs: None
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "LocalCPUBackend",
+        [0],
+        [1],
+        [[layer_keys[0]], [layer_keys[1]]],
+    )
+    engine._find_shared_rank0_chunk_location = lambda _key: "LocalCPUBackend"
+    engine._get_shared_config_value = lambda _name, default: default
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {"fits": True}
+    engine._resolve_shared_rank0_layer_mem_objs = lambda **kwargs: [
+        allocated[kwargs["layer_id"]]
+    ]
+    batch = SharedHandleBatch(
+        shm_name="test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=1,
+        physical_sizes=[1],
+        chunk_hashes=[int(key.chunk_hash)],
+        offsets=[0, 1],
+    )
+    engine._make_shared_handle_batch = lambda *_args: batch
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+    cached_shared_handles = []
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=[],
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=cached_shared_handles,
+        shared_cpu_request_preflight_state=preflight_state,
+        kv_group=0,
+        req_id="req-compact",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    assert len(broadcasts) == 1
+    assert broadcasts[0].batch is batch
+    assert cached_shared_handles == [[None], [None]]
+
+    if exit_mode == "exception":
+        preflight_state.update(
+            source_kv_group=1,
+            source_layer_id=0,
+            message="indexer failed",
+            details={},
+            error=ValueError("indexer failed"),
+        )
+        with pytest.raises(ValueError, match="request preflight failed"):
+            retriever.send(([0], 0))
+    elif exit_mode == "close":
+        retriever.close()
+    else:
+        retriever.send(([0], 0))
+
+    assert len(broadcasts) == 2
+    assert broadcasts[1].layer_id == engine.num_layers
+    assert broadcasts[1].handles == []
+    assert broadcasts[1].batch is None
+    if exit_mode != "success":
+        assert broadcasts[1].status == "error"
+        assert cached_shared_handles == []
+    else:
+        assert broadcasts[1].status == "skipped"
+        assert broadcasts[1].message == "compact shared batch committed"
+        assert cached_shared_handles == [[None], [None]]
 
 
 def test_sparse_rank0_fences_store_before_first_handle_publication(monkeypatch):

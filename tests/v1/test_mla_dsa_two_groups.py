@@ -454,6 +454,35 @@ class TestStoreLayerPassiveGuard:
         engine.token_database.process_tokens.assert_called()
 
 
+def test_group_store_pointer_table_is_published_without_per_layer_copy() -> None:
+    memory_objs = [
+        [SimpleNamespace(tensor=torch.tensor([1]))],
+        [SimpleNamespace(tensor=torch.tensor([2]))],
+    ]
+    cached_tensors: list[list] = []
+    cached_chunk_dev_ptrs: list[list[int]] = []
+    cached_chunk_ptrs_npu: list[torch.Tensor | None] = []
+    pointer_table = torch.tensor([[101], [202]], dtype=torch.long)
+
+    AscendLMCacheEngine._append_group_store_tensors(
+        SimpleNamespace(),
+        memory_objs,
+        cached_tensors,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+        [[101], [202]],
+        pointer_table,
+    )
+
+    assert cached_tensors == [
+        [memory_objs[0][0].tensor],
+        [memory_objs[1][0].tensor],
+    ]
+    assert cached_chunk_dev_ptrs == [[101], [202]]
+    assert torch.equal(cached_chunk_ptrs_npu[0], pointer_table[0])
+    assert torch.equal(cached_chunk_ptrs_npu[1], pointer_table[1])
+
+
 class TestAscendStoreLayerCompletion:
     @staticmethod
     def _engine(*, stored: bool, allocation=None):

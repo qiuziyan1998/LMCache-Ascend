@@ -2,6 +2,7 @@
 # ruff: noqa: E501
 # Standard
 from contextlib import nullcontext
+import gc
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -29,6 +30,7 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
 )
+from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -207,6 +209,92 @@ def test_sparse_memory_update_resets_fast_direct_state() -> None:
     assert connector._sparse_direct_layer_states is None
     assert connector._sparse_direct_validated_layers == set()
     assert connector._sparse_destination_plans[0] is destination_plan
+
+
+def test_batched_pointer_rows_wait_on_producer_event_and_cleanup(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_pointer_ready_events = {}
+    producer_stream = SimpleNamespace(name="producer")
+    waited = []
+
+    class _Event:
+        def __init__(self):
+            self.recorded_on = None
+
+        def record(self, stream):
+            self.recorded_on = stream
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Event=_Event, current_stream=lambda: producer_stream),
+        raising=False,
+    )
+    pointer_table = torch.tensor([[101], [202]], dtype=torch.long)
+    rows = list(pointer_table.unbind(0))
+    first_ptr = int(rows[0].data_ptr())
+
+    connector.record_sparse_pointer_rows_ready(rows)
+    event = connector._sparse_pointer_ready_events[first_ptr][1]
+    assert event.recorded_on is producer_stream
+
+    consumer_stream = SimpleNamespace(
+        wait_event=lambda ready_event: waited.append(ready_event)
+    )
+    connector._wait_sparse_pointer_row_ready(rows[0], stream=consumer_stream)
+    assert waited == [event]
+
+    rows[0] = None
+    gc.collect()
+    assert first_ptr not in connector._sparse_pointer_ready_events
+
+
+def test_group_store_cat_rows_register_one_ready_event(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_pointer_ready_events = {}
+    producer_stream = SimpleNamespace(name="store")
+    events = []
+
+    class _Event:
+        def record(self, stream):
+            self.stream = stream
+            events.append(self)
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Event=_Event, current_stream=lambda: producer_stream),
+        raising=False,
+    )
+    memory_objs = [
+        [_MemoryObj(torch.zeros(1))],
+        [_MemoryObj(torch.zeros(1))],
+    ]
+    cached_tensors = [[], []]
+    cached_dev_ptrs = [[11], [22]]
+    cached_npu_ptrs = [
+        torch.tensor([11], dtype=torch.long),
+        torch.tensor([22], dtype=torch.long),
+    ]
+
+    AscendLMCacheEngine._append_group_store_tensors(
+        SimpleNamespace(gpu_connector=connector),
+        memory_objs,
+        cached_tensors,
+        cached_dev_ptrs,
+        cached_npu_ptrs,
+        [[101], [202]],
+        torch.tensor([[101], [202]], dtype=torch.long),
+    )
+
+    assert [row.tolist() for row in cached_npu_ptrs] == [[11, 101], [22, 202]]
+    assert len(events) == 1
+    waited = []
+    connector._wait_sparse_pointer_row_ready(
+        cached_npu_ptrs[1],
+        stream=SimpleNamespace(wait_event=lambda event: waited.append(event)),
+    )
+    assert waited == events
 
 
 def test_shared_cpu_store_publication_fences_store_stream() -> None:
@@ -1814,6 +1902,80 @@ def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["total_tokens"] == 401
     assert direct_calls[0]["chunk_offsets_npu"].tolist() == starts
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
+
+
+def test_dense_group_store_uses_one_host_dispatch(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kvcaches = [(object(), object()), (object(), object())]
+    connector.kv_device = torch.device("cpu")
+    connector.store_stream = _NoopStream()
+    connector._sparse_direct_validated_layers = set()
+
+    class _Npu:
+        def current_stream(self):
+            return _NoopStream()
+
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_STORE_DISABLE", False)
+    monkeypatch.setattr(
+        npu_connectors, "_DENSE_DIRECT_GROUP_STORE_DISABLE", False
+    )
+    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **_kw: None)
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda _caches, *, kv_group, init_staging: _DenseLayout(),
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda _group=0: True)
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda _group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda _group=0: False)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda _group=0: False
+    )
+    monkeypatch.setattr(
+        connector, "_check_layerwise_transfer_invariants", lambda **_kw: None
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_direct_layer_state",
+        lambda **kw: (f"state-{kw['layer_id']}", ("state", kw["layer_id"])),
+    )
+    group_calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_group_direct_kv_transfer_fast",
+        lambda *args, **kwargs: (
+            group_calls.append((args, kwargs))
+            or ([[100], [110]], torch.tensor([[100], [110]], dtype=torch.long))
+        ),
+    )
+    memory_objs = [
+        [_MemoryObj(torch.zeros(4, dtype=torch.bfloat16))],
+        [_MemoryObj(torch.zeros(4, dtype=torch.bfloat16))],
+    ]
+
+    host_rows, pointer_table = connector.batched_from_gpu_group(
+        memory_objs,
+        [0],
+        [4],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        kv_group=0,
+    )
+
+    assert host_rows == [[100], [110]]
+    assert pointer_table.tolist() == [[100], [110]]
+    assert len(group_calls) == 1
+    args, kwargs = group_calls[0]
+    assert args[0] == ["state-0", "state-1"]
+    assert args[5] == 4
+    assert args[7] is True
+    assert kwargs["validate_inputs"] is True
+    assert kwargs["fixed_chunk_size"] == 4
 
 
 @pytest.mark.parametrize("use_npu", [True])
