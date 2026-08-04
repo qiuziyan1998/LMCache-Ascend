@@ -549,6 +549,94 @@ class TestAscendStoreLayerCompletion:
 
         assert result.committed_end == 48 * 256
 
+    @staticmethod
+    def _dispatch_engine(chunks):
+        engine = TestAscendStoreLayerCompletion._engine(stored=False)
+        engine.config.chunk_size = 256
+        engine.token_database.process_tokens.return_value = iter(
+            (start, end, key) for start, end, key, _ in chunks
+        )
+        engine.storage_manager.batched_allocate.side_effect = [
+            [memory_obj] for _, _, _, memory_obj in chunks
+        ]
+        engine.storage_manager.batched_put.return_value = []
+        engine.gpu_connector.supports_batched_from_gpu_group.return_value = True
+        engine.gpu_connector.batched_from_gpu_group.return_value = (
+            [[101]],
+            torch.tensor([[101]], dtype=torch.long),
+        )
+        return engine
+
+    def test_complete_windowed_chunks_use_group_store(self):
+        memory_obj = MagicMock()
+        memory_obj.get_size.return_value = 1
+        key = MagicMock(spec=CacheEngineKey)
+        key.split_layers.return_value = [key]
+        engine = self._dispatch_engine([(0, 256, key, memory_obj)])
+
+        with (
+            patch(
+                "lmcache_ascend.v1.cache_engine.assert_layerwise_gpu_connector"
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_page_layout_enabled",
+                return_value=False,
+            ),
+        ):
+            list(
+                AscendLMCacheEngine.store_layer(
+                    engine,
+                    [0] * 256,
+                    decode_window_save=True,
+                    windowed_sparse_save=True,
+                )
+            )
+
+        engine.gpu_connector.batched_from_gpu_group.assert_called_once()
+        engine.gpu_connector.batched_from_gpu.assert_not_called()
+
+    def test_partial_windowed_chunk_uses_layerwise_store(self):
+        full_obj = MagicMock()
+        full_obj.get_size.return_value = 1
+        partial_obj = MagicMock()
+        partial_obj.get_size.return_value = 1
+        full_key = MagicMock(spec=CacheEngineKey)
+        full_key.split_layers.return_value = [full_key]
+        partial_key = MagicMock(spec=CacheEngineKey)
+        partial_key.split_layers.return_value = [partial_key]
+        engine = self._dispatch_engine(
+            [
+                (0, 256, full_key, full_obj),
+                (256, 300, partial_key, partial_obj),
+            ]
+        )
+
+        def layerwise_transfer():
+            yield
+            yield
+
+        engine.gpu_connector.batched_from_gpu.return_value = layerwise_transfer()
+        with (
+            patch(
+                "lmcache_ascend.v1.cache_engine.assert_layerwise_gpu_connector"
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_page_layout_enabled",
+                return_value=False,
+            ),
+        ):
+            list(
+                AscendLMCacheEngine.store_layer(
+                    engine,
+                    [0] * 300,
+                    decode_window_save=True,
+                    windowed_sparse_save=True,
+                )
+            )
+
+        engine.gpu_connector.batched_from_gpu_group.assert_not_called()
+        engine.gpu_connector.batched_from_gpu.assert_called_once()
+
 
 def test_sparse_window_store_cache_publishes_only_full_chunks() -> None:
     engine = SimpleNamespace(enable_shared_cpu_cache=False)

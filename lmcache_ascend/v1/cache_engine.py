@@ -2143,12 +2143,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 supports_group_store = getattr(
                     self.gpu_connector, "supports_batched_from_gpu_group", None
                 )
+                all_chunks_publishable = cache_chunk_indices is None or (
+                    cache_chunk_indices == list(range(len(starts)))
+                )
                 use_group_store = (
                     bool(kwargs.get("decode_window_save"))
-                    and cache_chunk_indices is None
                     and callable(group_store)
                     and callable(supports_group_store)
                     and supports_group_store(kv_group)
+                    and all_chunks_publishable
                 )
                 if use_group_store:
                     for _ in range(self.num_layers):
