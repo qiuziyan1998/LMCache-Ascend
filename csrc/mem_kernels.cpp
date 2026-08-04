@@ -999,6 +999,93 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
   cmd.Run();
 }
 
+void dense_mla_dsa_group_direct_kv_transfer_fast(
+    const std::vector<SparseDirectLayerState> &layer_states,
+    torch::Tensor &slot_mapping_full, torch::Tensor &layer_chunk_ptrs_npu,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const bool direction, const bool validate_inputs,
+    const int64_t fixed_chunk_size) {
+  TORCH_CHECK(!layer_states.empty(), "layer_states must not be empty.");
+  TORCH_CHECK(layer_chunk_ptrs_npu.dim() == 2,
+              "layer_chunk_ptrs_npu must be 2D [layers, chunks].");
+  TORCH_CHECK(layer_chunk_ptrs_npu.size(0) ==
+                  static_cast<int64_t>(layer_states.size()),
+              "layer pointer table row count must match layer_states.");
+  TORCH_CHECK(layer_chunk_ptrs_npu.size(1) > 0,
+              "layer pointer table must contain at least one chunk.");
+  TORCH_CHECK(layer_chunk_ptrs_npu.is_contiguous(),
+              "layer_chunk_ptrs_npu must be contiguous.");
+
+  if (validate_inputs) {
+    torch::Tensor first_pointer_row = layer_chunk_ptrs_npu.select(0, 0);
+    validate_dense_direct_inputs(slot_mapping_full, first_pointer_row,
+                                 chunk_offsets_npu, chunk_sizes_npu,
+                                 total_tokens, fixed_chunk_size);
+    TORCH_CHECK(layer_states.size() <=
+                    static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                "layer count exceeds dense direct int32 kernel limit.");
+    TORCH_CHECK(layer_chunk_ptrs_npu.device() == slot_mapping_full.device() &&
+                    chunk_offsets_npu.device() == slot_mapping_full.device() &&
+                    chunk_sizes_npu.device() == slot_mapping_full.device(),
+                "dense group metadata tensors must use the slot-mapping "
+                "device index.");
+    TORCH_CHECK(chunk_offsets_npu.numel() == chunk_sizes_npu.numel(),
+                "chunk offset and size metadata lengths must match.");
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+  const int32_t num_chunks =
+      static_cast<int32_t>(layer_chunk_ptrs_npu.size(1));
+
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
+  uint8_t *layer_chunk_ptrs_base =
+      get_kernel_ptr<uint8_t, torch::Tensor>(layer_chunk_ptrs_npu);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+
+  std::vector<SingleLayerKVConfig> configs;
+  configs.reserve(layer_states.size());
+  for (const auto &layer_state : layer_states) {
+    SingleLayerKVConfig config = layer_state.config;
+    config.dims.num_tokens = num_tokens;
+    config.ub_params.aiv_num = direct_aiv_num(num_tokens);
+    config.ub_params.stream = stream;
+    config.ptrs.slot_mapping_ptr = slot_mapping_ptr;
+    configs.push_back(config);
+  }
+
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+  const int64_t pointer_row_bytes =
+      static_cast<int64_t>(num_chunks) * sizeof(int64_t);
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_group_direct_kv_transfer");
+  cmd.SetCustomHandler(
+      [configs, layer_chunk_ptrs_base, chunk_offsets_ptr, chunk_sizes_ptr,
+       num_chunks, pointer_row_bytes, fixed_chunk_size_i, total_tokens_i,
+       lmc_host_interleaved, direction]() -> int {
+        for (size_t layer_id = 0; layer_id < configs.size(); ++layer_id) {
+          uint8_t *layer_chunk_ptrs =
+              layer_chunk_ptrs_base + layer_id * pointer_row_bytes;
+          launch_dense_multi_chunk_direct_kernel(
+              configs[layer_id], layer_chunk_ptrs, chunk_offsets_ptr,
+              chunk_sizes_ptr, num_chunks, fixed_chunk_size_i, total_tokens_i,
+              lmc_host_interleaved, direction);
+        }
+        return 0;
+      });
+  cmd.Run();
+}
+
 void batched_fused_sparse_single_layer_kv_transfer(
     std::vector<torch::Tensor> &lmc_tensors, torch::Tensor &staging_cache,
     std::vector<torch::Tensor> &vllm_kv_caches,

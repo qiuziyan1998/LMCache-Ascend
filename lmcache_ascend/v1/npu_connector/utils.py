@@ -415,6 +415,32 @@ def dense_mla_dsa_batched_direct_kv_transfer_fast(
     )
 
 
+def dense_mla_dsa_group_direct_kv_transfer_fast(
+    layer_states: Sequence[object],
+    layer_tensors: Sequence[Sequence[torch.Tensor]],
+    slot_mapping_full: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    lmc_host_interleaved: bool,
+    direction: bool,
+    validate_inputs: bool = False,
+    fixed_chunk_size: int = 0,
+) -> tuple[list[list[int]], torch.Tensor]:
+    return lmc_ops.dense_mla_dsa_group_direct_kv_transfer_fast(
+        list(layer_states),
+        [list(tensors) for tensors in layer_tensors],
+        slot_mapping_full,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        lmc_host_interleaved,
+        direction,
+        validate_inputs,
+        fixed_chunk_size,
+    )
+
+
 def batched_fused_sparse_single_layer_kv_transfer(
     lmc_tensors: Sequence[torch.Tensor],
     staging_cache: torch.Tensor,
