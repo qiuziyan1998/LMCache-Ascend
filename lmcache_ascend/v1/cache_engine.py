@@ -955,13 +955,35 @@ class AscendLMCacheEngine(LMCacheEngine):
         group_append = getattr(
             self.gpu_connector, "append_sparse_chunk_ptr_cache_for_layers", None
         )
-        pointer_first = (
+        retained_group = (
             callable(group_append)
             and cached_memory_objs is not None
             and cached_chunk_dev_ptrs is not None
             and cached_chunk_ptrs_npu is not None
-            and not any(cached_tensors or ())
         )
+        pointer_first = retained_group and not any(cached_tensors or ())
+        if retained_group:
+            layer_counts = (
+                len(cached_memory_objs),
+                len(cached_chunk_dev_ptrs),
+                len(cached_chunk_ptrs_npu),
+            )
+            if any(count != self.num_layers for count in layer_counts):
+                raise ValueError(
+                    "Sparse group pointer prefix layer coverage mismatch: "
+                    f"owners/host/NPU={layer_counts}, expected={self.num_layers}."
+                )
+            for layer_id in range(self.num_layers):
+                owner_count = len(cached_memory_objs[layer_id])
+                host_count = len(cached_chunk_dev_ptrs[layer_id])
+                row = cached_chunk_ptrs_npu[layer_id]
+                npu_count = 0 if row is None else int(row.numel())
+                if owner_count != host_count or host_count != npu_count:
+                    raise ValueError(
+                        "Sparse group pointer prefix coverage mismatch: "
+                        f"layer={layer_id}, owners={owner_count}, "
+                        f"host_ptrs={host_count}, npu_ptrs={npu_count}."
+                    )
         tensors_by_layer: List[List[torch.Tensor]] = []
         for layer_id, mem_objs_layer in enumerate(mem_objs_by_layer):
             if any(not mem_obj.is_valid() for mem_obj in mem_objs_layer):

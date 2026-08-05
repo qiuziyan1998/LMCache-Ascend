@@ -1507,6 +1507,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
         self._sparse_pointer_ready_events: dict[int, tuple[Any, Any]] = {}
 
+    def supports_dense_sparse_cache_retention(self) -> bool:
+        return not _DENSE_DIRECT_LOAD_DISABLE
+
     def synchronize_dense_load_stream(self) -> None:
         self.load_stream.synchronize()
 
@@ -2668,6 +2671,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cpu_tensors: List[torch.Tensor],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
         expected_num_chunks: Optional[int] = None,
+        cached_chunk_dev_ptrs: Optional[List[List[int]]] = None,
     ) -> torch.Tensor:
         num_chunks = (
             len(cpu_tensors)
@@ -2677,6 +2681,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if cached_chunk_ptrs_npu is not None and layer_id < len(cached_chunk_ptrs_npu):
             cached = cached_chunk_ptrs_npu[layer_id]
             if cached is not None and cached.numel() == num_chunks:
+                if cached_chunk_dev_ptrs is not None and (
+                    layer_id >= len(cached_chunk_dev_ptrs)
+                    or len(cached_chunk_dev_ptrs[layer_id]) != num_chunks
+                ):
+                    raise RuntimeError(
+                        "Ascend sparse pointer-cache reuse has incomplete host "
+                        f"coverage at layer {layer_id}: chunks={num_chunks}."
+                    )
                 if cached.dtype != torch.long:
                     raise RuntimeError(
                         "Ascend sparse pointer-cache reuse failed: cached NPU "
@@ -2710,6 +2722,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for chunk_index, tensor in enumerate(cpu_tensors)
         ]
         chunk_ptrs_npu = torch.tensor(dev_ptrs, dtype=torch.long, device=self.kv_device)
+        if cached_chunk_dev_ptrs is not None:
+            while len(cached_chunk_dev_ptrs) <= layer_id:
+                cached_chunk_dev_ptrs.append([])
+            cached_chunk_dev_ptrs[layer_id] = dev_ptrs
         if cached_chunk_ptrs_npu is not None:
             while len(cached_chunk_ptrs_npu) <= layer_id:
                 cached_chunk_ptrs_npu.append(None)
@@ -3678,6 +3694,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         expected_fmt = self._expected_memory_format(kv_group)
         dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
@@ -3729,6 +3746,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     layer_id,
                     cpu_tensors,
                     cached_chunk_ptrs_npu,
+                    cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
                 )
                 assert chunk_offsets_npu is not None
                 assert chunk_sizes_npu is not None

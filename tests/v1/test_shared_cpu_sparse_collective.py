@@ -2571,6 +2571,126 @@ def test_sparse_pointer_first_accepts_one_layout_tensor_for_full_table():
     ) is cached_ptrs[0]
 
 
+def test_dense_pointer_resolution_retains_host_row_without_extra_work(monkeypatch):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.kv_device = torch.device("cpu")
+    tensors = [torch.empty(1), torch.empty(1)]
+    resolved = []
+    tensor_calls = 0
+    original_tensor = npu_connectors.torch.tensor
+
+    def resolve(host_ptr):
+        resolved.append(host_ptr)
+        return host_ptr + 1000
+
+    def build_tensor(*args, **kwargs):
+        nonlocal tensor_calls
+        tensor_calls += 1
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.lmc_ops, "get_device_ptr", resolve)
+    monkeypatch.setattr(npu_connectors.torch, "tensor", build_tensor)
+    cached_host_ptrs = []
+    cached_npu_ptrs = []
+
+    first = connector._resolve_sparse_chunk_ptrs_npu(
+        0,
+        tensors,
+        cached_npu_ptrs,
+        cached_chunk_dev_ptrs=cached_host_ptrs,
+    )
+    second = connector._resolve_sparse_chunk_ptrs_npu(
+        0,
+        tensors,
+        cached_npu_ptrs,
+        cached_chunk_dev_ptrs=cached_host_ptrs,
+    )
+
+    assert len(resolved) == 2
+    assert tensor_calls == 1
+    assert cached_host_ptrs == [[ptr + 1000 for ptr in resolved]]
+    assert cached_npu_ptrs[0] is first
+    assert second is first
+
+
+def test_append_retrieve_group_rejects_incomplete_prefix_before_mutation():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    calls = []
+    engine.gpu_connector = SimpleNamespace(
+        append_sparse_chunk_ptr_cache_for_layers=lambda *args: calls.append(args)
+    )
+    old_objs = [
+        _FakeTensorMemObj(torch.empty(1)),
+        _FakeTensorMemObj(torch.empty(1)),
+    ]
+    new_objs = [
+        [_FakeTensorMemObj(torch.empty(1))],
+        [_FakeTensorMemObj(torch.empty(1))],
+    ]
+    cached_memory_objs = [[old_objs[0]], [old_objs[1]]]
+    cached_tensors = []
+    cached_host_ptrs = [[11], []]
+    cached_npu_ptrs = [
+        torch.tensor([11], dtype=torch.long),
+        torch.tensor([22], dtype=torch.long),
+    ]
+
+    with pytest.raises(ValueError, match="prefix coverage mismatch"):
+        engine._append_retrieve_group_cache(
+            new_objs,
+            cached_memory_objs,
+            cached_tensors,
+            cached_host_ptrs,
+            cached_npu_ptrs,
+        )
+
+    assert calls == []
+    assert cached_memory_objs == [[old_objs[0]], [old_objs[1]]]
+    assert cached_tensors == []
+    assert cached_host_ptrs == [[11], []]
+    assert [row.tolist() for row in cached_npu_ptrs] == [[11], [22]]
+
+
+@pytest.mark.parametrize("layer_count", [1, 3])
+def test_append_retrieve_group_rejects_wrong_outer_layer_count(layer_count):
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    calls = []
+    engine.gpu_connector = SimpleNamespace(
+        append_sparse_chunk_ptr_cache_for_layers=lambda *args: calls.append(args)
+    )
+    cached_memory_objs = [
+        [_FakeTensorMemObj(torch.empty(1))] for _ in range(layer_count)
+    ]
+    cached_tensors = []
+    cached_host_ptrs = [[11] for _ in range(layer_count)]
+    cached_npu_ptrs = [
+        torch.tensor([11], dtype=torch.long) for _ in range(layer_count)
+    ]
+    original_objs = [list(layer) for layer in cached_memory_objs]
+
+    with pytest.raises(ValueError, match="layer coverage mismatch"):
+        engine._append_retrieve_group_cache(
+            [
+                [_FakeTensorMemObj(torch.empty(1))],
+                [_FakeTensorMemObj(torch.empty(1))],
+            ],
+            cached_memory_objs,
+            cached_tensors,
+            cached_host_ptrs,
+            cached_npu_ptrs,
+        )
+
+    assert calls == []
+    assert cached_memory_objs == original_objs
+    assert cached_tensors == []
+    assert cached_host_ptrs == [[11] for _ in range(layer_count)]
+    assert [row.tolist() for row in cached_npu_ptrs] == [
+        [11] for _ in range(layer_count)
+    ]
+
+
 def test_append_retrieve_layer_cache_is_atomic_when_pointer_install_fails():
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
