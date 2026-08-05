@@ -14,6 +14,14 @@ through the same cold generator protocol used by the vLLM adapter:
 It also runs latent and DSA-index bootstrap as a paired request, comparing
 independent token hashing with request-local reuse of the latent chunk plan.
 
+``--cold-compact-ab`` executes both production generator protocols. The
+disabled case densely consumes both KV groups. The enabled case matches
+``_run_dsa_cold_compact_load``: materialize latent, densely consume the indexer,
+then synchronize and resume. H2D, per-layer consumer, and barrier delays are
+synthetic and configurable; the outer protocol wall is measured directly.
+Model compute and compute/H2D overlap are intentionally outside this LMCache
+cold-bootstrap benchmark.
+
 The remote store is synthetic so CPU metadata can be measured independently
 from a particular Mooncake deployment. By default, allocation, ``MemoryObj``
 construction, and LRU insertion use the production LMCache implementations;
@@ -33,6 +41,7 @@ from typing import Any, Iterable, Optional, cast
 import json
 import math
 import statistics
+import sys
 import threading
 import time
 
@@ -62,6 +71,27 @@ from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 
 GB = 1_000_000_000
+_RESOLVER_EMITTED_STAGES = (
+    "windows",
+    "remote_get",
+    "results",
+    "classification",
+    "pinning",
+    "scatter",
+    "rollback",
+)
+_RESOLVER_STAGE_FIELDS = {
+    stage: f"resolver_{stage}_s"
+    for stage in (*_RESOLVER_EMITTED_STAGES, "validation")
+}
+_RESOLVER_CPU_STAGES = (
+    "windows",
+    "results",
+    "classification",
+    "pinning",
+    "validation",
+    "scatter",
+)
 
 
 @dataclass
@@ -104,6 +134,7 @@ class StageStats:
     resolver_s: float = 0.0
     resolver_cpu_s: float = 0.0
     resolver_windows_s: float = 0.0
+    resolver_remote_get_s: float = 0.0
     resolver_results_s: float = 0.0
     resolver_classification_s: float = 0.0
     resolver_pinning_s: float = 0.0
@@ -134,6 +165,10 @@ class StageStats:
     cold_close_s: float = 0.0
     cold_total_s: float = 0.0
     warm_total_s: float = 0.0
+    device_consumer_s: float = 0.0
+    device_h2d_s: float = 0.0
+    device_consumer_layers: int = 0
+    device_bytes: int = 0
     local_probe_calls: int = 0
     local_key_probes: int = 0
     remote_calls: int = 0
@@ -164,6 +199,69 @@ class BenchmarkResult:
     repeats: int
     median: StageStats
     samples: list[StageStats] = field(default_factory=list)
+
+
+@dataclass
+class ColdCompactVariant:
+    """Exclusive cold-start critical-path stages for one flag setting."""
+
+    flag: str
+    protocol: list[str]
+    consumer_modes: dict[int, str]
+    lookup_metadata_s: float
+    mooncake_s: float
+    mooncake_allocation_s: float
+    mooncake_transfer_s: float
+    mooncake_other_s: float
+    resolver_cpu_s: float
+    pointer_handle_s: float
+    bootstrap_other_s: float
+    device_bytes: float
+    device_h2d_s: float
+    device_consumer_s: float
+    synchronization_barrier_s: float
+    critical_path_s: float
+
+
+@dataclass
+class ColdCompactABReport:
+    """Filtered A/B report for ``LMCACHE_ENABLE_DSA_COLD_COMPACT_LOAD``."""
+
+    schema: int
+    model: str
+    parameters: dict[str, Any]
+    variants: dict[str, ColdCompactVariant]
+    comparison: dict[str, float]
+    samples: list[dict[str, Any]]
+
+
+def _record_resolver_stage(
+    stats: StageStats,
+    stage: str,
+    elapsed_s: float,
+) -> None:
+    try:
+        field_name = _RESOLVER_STAGE_FIELDS[stage]
+    except KeyError as exc:
+        raise ValueError(f"Unknown resolver timing stage: {stage}") from exc
+    setattr(stats, field_name, getattr(stats, field_name) + elapsed_s)
+
+
+def _resolver_cpu_attributed_s(stats: StageStats) -> float:
+    return sum(
+        getattr(stats, _RESOLVER_STAGE_FIELDS[stage])
+        for stage in _RESOLVER_CPU_STAGES
+    )
+
+
+@dataclass
+class ColdCompactProtocolSample:
+    """One executable two-group protocol sample."""
+
+    enabled: bool
+    wall_s: float
+    synchronization_barrier_s: float
+    groups: dict[int, StageStats]
 
 
 class SyntheticMemoryObj:
@@ -577,6 +675,14 @@ class SyntheticPageFirstStorageManager:
         self.stats.remote_s += time.perf_counter() - started
         return cast(list[Any], results)
 
+    def contains(
+        self,
+        _key: CacheEngineKey,
+        _locations: Optional[list[str]] = None,
+    ) -> str:
+        """Report the synthetic dataset's always-present remote objects."""
+        return "RemoteBackend"
+
     def close(self) -> None:
         """Release production allocations owned by this benchmark run."""
         self.local_backend.close()
@@ -585,13 +691,25 @@ class SyntheticPageFirstStorageManager:
 class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     """Connector surface needed by cold and prepared sparse generators."""
 
-    def __init__(self, stats: StageStats, num_layers: int) -> None:
+    def __init__(
+        self,
+        stats: StageStats,
+        num_layers: int,
+        num_tokens: int = 0,
+        bytes_per_token: int = 0,
+        h2d_gbps: float = 22.0,
+        consumer_layer_ms: float = 0.0,
+    ) -> None:
         # Deliberately skip the production connector initializer: it creates
         # device streams and buffers that a metadata-only benchmark must not
         # require. Inheriting the concrete layerwise type keeps this test
         # double compatible with LMCache's nominal connector assertion.
         self.stats = stats
         self.num_layers = num_layers
+        self.num_tokens = num_tokens
+        self.bytes_per_token = bytes_per_token
+        self.h2d_gbps = h2d_gbps
+        self.consumer_layer_ms = consumer_layer_ms
 
     def append_sparse_chunk_ptr_cache_for_layer(
         self,
@@ -622,9 +740,30 @@ class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.stats.pointer_s += time.perf_counter() - started
 
     def batched_to_gpu_head_token_wise(self, **_kwargs):
-        payload = yield
-        while payload is not None:
-            payload = yield
+        for _layer_id in range(self.num_layers):
+            yield
+        yield
+        yield
+
+    def _consume(self, tokens: int, layer_ms: float) -> None:
+        started = time.perf_counter()
+        byte_count = tokens * self.bytes_per_token
+        h2d_s = byte_count / (self.h2d_gbps * GB)
+        if h2d_s + layer_ms / 1000:
+            time.sleep(h2d_s + layer_ms / 1000)
+        self.stats.device_h2d_s += h2d_s
+        self.stats.device_consumer_s += time.perf_counter() - started
+        self.stats.device_consumer_layers += 1
+        self.stats.device_bytes += byte_count
+
+    def batched_to_gpu(self, _starts, _ends, **_kwargs):
+        """Model one dense H2D consumer submission per layer."""
+        memory_objs = yield
+        while memory_objs is not None:
+            self._consume(self.num_tokens, self.consumer_layer_ms)
+            if self.stats.device_consumer_layers > self.num_layers:
+                raise AssertionError("dense consumer received too many layers")
+            memory_objs = yield
         yield
 
     def notify_sparse_memory_objs_updated(self) -> None:
@@ -736,12 +875,20 @@ def _make_engine(
         rpc_overhead_us=args.rpc_overhead_us,
         object_mode=args.object_mode,
     )
-    connector = SyntheticGPUConnector(stats, args.num_layers)
+    connector = SyntheticGPUConnector(
+        stats,
+        args.num_layers,
+        args.num_tokens,
+        bytes_per_token,
+        getattr(args, "h2d_gbps", 22.0),
+        getattr(args, "dense_consumer_layer_ms", 0.0),
+    )
 
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = args.num_layers
     engine.use_layerwise = True
     engine.enable_shared_cpu_cache = True
+    engine.shared_cpu_cache_strict = True
     engine.save_only_first_rank = True
     engine.save_indexer_only_first_rank = True
     engine.dsa_two_groups = True
@@ -750,8 +897,16 @@ def _make_engine(
     engine.metadata = metadata
     engine.token_database = token_database
     engine.storage_manager = storage_manager
+    engine.retrieve_locations = ["RemoteBackend"]
     engine.gpu_connector = connector
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_request=lambda _tokens: 0,
+        on_retrieve_finished=lambda _request, _tokens: None,
+    )
     engine._shared_cpu_request_leases = {}
+    engine._shared_page_first_location_plan = (
+        lambda keys: ["RemoteBackend"] * len(keys)
+    )
     engine.config = SimpleNamespace(
         chunk_size=args.chunk_size,
         experimental_sampled_layerwise_lookup=True,
@@ -781,8 +936,7 @@ def _make_engine(
     engine.shared_cpu_rank0_request_object_ids = lambda _req_id, _kv_group: set()
 
     def record_resolver_stage(stage: str, elapsed_s: float) -> None:
-        field_name = f"resolver_{stage}_s"
-        setattr(stats, field_name, getattr(stats, field_name) + elapsed_s)
+        _record_resolver_stage(stats, stage, elapsed_s)
 
     engine._shared_rank0_resolver_timing_hook = record_resolver_stage
 
@@ -911,16 +1065,7 @@ def run_once(
     ):
         raise AssertionError("cold sub-stage timings exceed total cold time")
     stats.resolver_cpu_s = max(0.0, stats.resolver_s - stats.remote_s)
-    resolver_attributed_s = sum(
-        (
-            stats.resolver_windows_s,
-            stats.resolver_results_s,
-            stats.resolver_classification_s,
-            stats.resolver_pinning_s,
-            stats.resolver_validation_s,
-            stats.resolver_scatter_s,
-        )
-    )
+    resolver_attributed_s = _resolver_cpu_attributed_s(stats)
     if resolver_attributed_s > stats.resolver_cpu_s + tolerance_s:
         raise AssertionError(
             "resolver sub-stage timings exceed resolver CPU time"
@@ -1111,6 +1256,372 @@ def run_pair_cases(
     return results
 
 
+def _run_cold_compact_protocol_once(
+    args: Namespace,
+    *,
+    enabled: bool,
+) -> ColdCompactProtocolSample:
+    """Execute the two production-ordered generator protocols once."""
+    tokens = list(range(args.num_tokens))
+    token_mask = torch.ones(args.num_tokens, dtype=torch.bool)
+    request_id = f"ab-{'on' if enabled else 'off'}"
+    shared_state: dict[str, Any] = {}
+    engines: dict[int, AscendLMCacheEngine] = {}
+    stores: list[SyntheticPageFirstStorageManager] = []
+    retrievers = []
+    caches_by_group: dict[int, dict[str, list]] = {}
+    stats_by_group: dict[int, StageStats] = {}
+
+    def close_resources(suppress: bool) -> None:
+        error = None
+        for resource in reversed(retrievers):
+            try:
+                resource.close()
+            except BaseException as exc:
+                error = error or exc
+        for engine in engines.values():
+            try:
+                engine.release_shared_cpu_sparse_request(request_id)
+            except BaseException as exc:
+                error = error or exc
+        for store in reversed(stores):
+            try:
+                store.close()
+            except BaseException as exc:
+                error = error or exc
+        if error is not None and not suppress:
+            raise error
+
+    try:
+        for group in (0, 1):
+            stats = StageStats()
+            engine, storage, caches = _make_engine(
+                args,
+                stats,
+                kv_group=group,
+                prefix_mode=args.ab_prefix_mode,
+            )
+            engines[group] = engine
+            stores.append(storage)
+            caches_by_group[group] = caches
+            stats_by_group[group] = stats
+    except BaseException:
+        close_resources(True)
+        raise
+
+    def dense_retriever(group: int):
+        options = {}
+        if not enabled:
+            options = dict(caches_by_group[group])
+            options["_retain_shared_dense_cache"] = True
+        return engines[group].retrieve_layer(
+            tokens,
+            token_mask,
+            kv_group=group,
+            req_id=request_id,
+            slot_mapping=torch.arange(args.num_tokens, dtype=torch.long),
+            sync=True,
+            shared_cpu_request_preflight_state=(
+                shared_state if not enabled else None
+            ),
+            **options,
+        )
+
+    def sparse_retriever(group: int, *, materialize_only: bool = False):
+        options = dict(caches_by_group[group])
+        if materialize_only:
+            options["materialize_only"] = True
+        return engines[group].retrieve_layer_head_token_wise(
+            tokens,
+            ret_mask=torch.zeros(args.num_tokens, dtype=torch.bool),
+            kv_group=group,
+            req_id=request_id,
+            shared_cpu_request_preflight_state=shared_state,
+            **options,
+        )
+
+    synchronization_barrier_s = 0.0
+    started = time.perf_counter()
+    try:
+        if enabled:
+            latent = sparse_retriever(0, materialize_only=True)
+            indexer = dense_retriever(1)
+            retrievers.extend((latent, indexer))
+            latent_result = next(latent)
+            next(indexer)
+            next(indexer)
+            indexer_result = None
+            for _layer_id in range(args.num_layers):
+                latent_result = latent.send(None)
+                indexer_result = next(indexer)
+            sync_delay_s = args.cold_compact_sync_ms / 1000
+            barrier_delay_s = args.cold_compact_barrier_ms / 1000
+        else:
+            latent = dense_retriever(0)
+            indexer = dense_retriever(1)
+            retrievers.extend((latent, indexer))
+            next(latent)
+            next(indexer)
+            next(latent)
+            next(indexer)
+            latent_result = indexer_result = None
+            for _layer_id in range(args.num_layers):
+                latent_result = next(latent)
+                indexer_result = next(indexer)
+            sync_delay_s = args.normal_sync_ms / 1000
+            barrier_delay_s = 0.0
+        while retrievers:
+            retrievers.pop().close()
+        sync_started = time.perf_counter()
+        if sync_delay_s:
+            time.sleep(sync_delay_s)
+        synchronization_barrier_s = time.perf_counter() - sync_started
+        if any(
+            result is None or int(result.sum().item()) != args.num_tokens
+            for result in (latent_result, indexer_result)
+        ):
+            raise AssertionError("cold-start protocol retrieved an incomplete mask")
+        if not enabled and any(
+            len(caches_by_group[group]["cached_memory_objs"])
+            != args.num_layers
+            or any(
+                not layer
+                for layer in caches_by_group[group]["cached_memory_objs"]
+            )
+            for group in (0, 1)
+        ):
+            raise AssertionError("dense prefix did not retain request-owned cache")
+        if enabled:
+            chunks = math.ceil(args.num_tokens / args.chunk_size)
+            chunk_counts = [args.chunk_size] * chunks
+            chunk_counts[-1] = args.num_tokens - args.chunk_size * (chunks - 1)
+            prepared = build_prepared_sparse_source(
+                caches_by_group[0]["cached_tensors"],
+                caches_by_group[0]["cached_chunk_ptrs_npu"],
+                num_layers=args.num_layers,
+                total_tokens=args.num_tokens,
+                chunk_token_counts=chunk_counts,
+                cached_memory_objs=caches_by_group[0]["cached_memory_objs"],
+            )
+            if prepared is None:
+                raise AssertionError("cold compact did not seal the latent source")
+        barrier_started = time.perf_counter()
+        if barrier_delay_s:
+            time.sleep(barrier_delay_s)
+        synchronization_barrier_s += time.perf_counter() - barrier_started
+        wall_s = time.perf_counter() - started
+    finally:
+        close_resources(sys.exc_info()[0] is not None)
+    for stats in stats_by_group.values():
+        stats.resolver_cpu_s = max(0.0, stats.resolver_s - stats.remote_s)
+    return ColdCompactProtocolSample(
+        enabled=enabled,
+        wall_s=wall_s,
+        synchronization_barrier_s=synchronization_barrier_s,
+        groups=stats_by_group,
+    )
+
+
+def run_cold_compact_ab_cases(
+    args: Namespace,
+) -> dict[str, list[ColdCompactProtocolSample]]:
+    """Interleave explicit flag-off and flag-on generator protocols."""
+    samples: dict[str, list[ColdCompactProtocolSample]] = {
+        "flag_unset": [],
+        "flag_true": [],
+    }
+    for repeat in range(args.warmup + args.repeats):
+        order = (False, True) if repeat % 2 == 0 else (True, False)
+        for enabled in order:
+            result = _run_cold_compact_protocol_once(args, enabled=enabled)
+            if repeat >= args.warmup:
+                samples["flag_true" if enabled else "flag_unset"].append(result)
+    return samples
+
+
+def _cold_compact_variant(
+    sample: ColdCompactProtocolSample,
+) -> ColdCompactVariant:
+    """Attribute one measured outer protocol wall without nested double counts."""
+    enabled = sample.enabled
+    stats = list(sample.groups.values())
+    lookup_metadata_s = sum(
+        max(item.metadata_s, item.token_process_s)
+        + item.local_probe_s
+        + item.capacity_s
+        for item in stats
+    )
+    mooncake_s = sum(item.remote_s for item in stats)
+    mooncake_allocation_s = sum(
+        item.remote_buffer_s + item.remote_wrapper_s for item in stats
+    )
+    mooncake_transfer_s = sum(item.remote_transfer_s for item in stats)
+    mooncake_other_s = max(
+        0.0, mooncake_s - mooncake_allocation_s - mooncake_transfer_s
+    )
+    resolver_cpu_s = sum(item.resolver_cpu_s for item in stats)
+    pointer_handle_s = sum(item.pointer_s + item.handle_s for item in stats)
+    device_consumer_s = sum(item.device_consumer_s for item in stats)
+    device_h2d_s = sum(item.device_h2d_s for item in stats)
+    device_bytes = sum(item.device_bytes for item in stats)
+    attributed_s = sum(
+        (
+            lookup_metadata_s,
+            mooncake_s,
+            resolver_cpu_s,
+            pointer_handle_s,
+            device_consumer_s,
+            sample.synchronization_barrier_s,
+        )
+    )
+    bootstrap_other_s = max(0.0, sample.wall_s - attributed_s)
+    return ColdCompactVariant(
+        flag="true" if enabled else "unset",
+        protocol=(
+            [
+                "materialize_latent",
+                "dense_consume_indexer",
+                "synchronize_and_resume",
+            ]
+            if enabled
+            else ["dense_consume_latent", "dense_consume_indexer", "resume"]
+        ),
+        consumer_modes=(
+            {0: "materialize_only", 1: "dense"}
+            if enabled
+            else {0: "dense", 1: "dense"}
+        ),
+        lookup_metadata_s=lookup_metadata_s,
+        mooncake_s=mooncake_s,
+        mooncake_allocation_s=mooncake_allocation_s,
+        mooncake_transfer_s=mooncake_transfer_s,
+        mooncake_other_s=mooncake_other_s,
+        resolver_cpu_s=resolver_cpu_s,
+        pointer_handle_s=pointer_handle_s,
+        bootstrap_other_s=bootstrap_other_s,
+        device_bytes=device_bytes,
+        device_h2d_s=device_h2d_s,
+        device_consumer_s=device_consumer_s,
+        synchronization_barrier_s=sample.synchronization_barrier_s,
+        critical_path_s=sample.wall_s,
+    )
+
+
+def _median_cold_compact_variant(
+    samples: list[ColdCompactProtocolSample],
+) -> ColdCompactVariant:
+    variants = [_cold_compact_variant(sample) for sample in samples]
+    first = variants[0]
+    values = {
+        name: statistics.median(getattr(item, name) for item in variants)
+        for name in ColdCompactVariant.__dataclass_fields__
+        if name not in {"flag", "protocol", "consumer_modes"}
+    }
+    return ColdCompactVariant(
+        flag=first.flag,
+        protocol=first.protocol,
+        consumer_modes=first.consumer_modes,
+        **values,
+    )
+
+
+def build_cold_compact_ab_report(
+    args: Namespace,
+    samples: dict[str, list[ColdCompactProtocolSample]],
+) -> ColdCompactABReport:
+    """Summarize paired executable flag-off/on protocol samples."""
+    if set(samples) != {"flag_unset", "flag_true"} or any(
+        not values for values in samples.values()
+    ):
+        raise ValueError("cold-compact A/B requires non-empty off/on samples")
+    sample_count = min(len(values) for values in samples.values())
+    paired = []
+    for index in range(sample_count):
+        off = _cold_compact_variant(samples["flag_unset"][index])
+        on = _cold_compact_variant(samples["flag_true"][index])
+        paired.append(
+            {
+                "sample": index + 1,
+                "flag_unset_critical_path_s": off.critical_path_s,
+                "flag_true_critical_path_s": on.critical_path_s,
+                "delta_s": on.critical_path_s - off.critical_path_s,
+                "speedup": off.critical_path_s / on.critical_path_s,
+            }
+        )
+    off = _median_cold_compact_variant(samples["flag_unset"])
+    on = _median_cold_compact_variant(samples["flag_true"])
+    median_delta_s = statistics.median(item["delta_s"] for item in paired)
+    return ColdCompactABReport(
+        schema=1,
+        model="executed_production_ordered_protocol_v2",
+        parameters={
+            "num_tokens": args.num_tokens,
+            "num_layers": args.num_layers,
+            "chunk_size": args.chunk_size,
+            "prefix_mode": args.ab_prefix_mode,
+            "h2d_gbps": args.h2d_gbps,
+            "dense_consumer_layer_ms": args.dense_consumer_layer_ms,
+            "normal_sync_ms": args.normal_sync_ms,
+            "cold_compact_sync_ms": args.cold_compact_sync_ms,
+            "cold_compact_barrier_ms": args.cold_compact_barrier_ms,
+            "sample_count": sample_count,
+            "measured": "CPU, Mooncake emulator, generator order, consumer wall",
+            "synthetic": "H2D rate, per-layer consumer, sync/barrier delays",
+        },
+        variants={
+            "flag_unset": off,
+            "flag_true": on,
+        },
+        comparison={
+            "delta_s": median_delta_s,
+            "speedup": statistics.median(item["speedup"] for item in paired),
+            "slowdown": statistics.median(
+                1 / item["speedup"] for item in paired
+            ),
+        },
+        samples=paired,
+    )
+
+
+def print_cold_compact_ab(report: ColdCompactABReport) -> None:
+    """Print the concise current cold-compact A/B report."""
+    print("\nLMCACHE_ENABLE_DSA_COLD_COMPACT_LOAD A/B (median ms)")
+    print(
+        f"{'setting':12} {'lookup/meta':>12} {'Mooncake':>10} "
+        f"{'resolver CPU':>13} {'ptr/handle':>11} {'H2D':>9} {'consumer':>10} "
+        f"{'sync/barrier':>13} {'critical':>10}"
+    )
+    for name in ("flag_unset", "flag_true"):
+        item = report.variants[name]
+        print(
+            f"{item.flag:12} "
+            f"{_ms(item.lookup_metadata_s):12.3f} "
+            f"{_ms(item.mooncake_s):10.3f} "
+            f"{_ms(item.resolver_cpu_s):13.3f} "
+            f"{_ms(item.pointer_handle_s):11.3f} "
+            f"{_ms(item.device_h2d_s):9.3f} "
+            f"{_ms(item.device_consumer_s):10.3f} "
+            f"{_ms(item.synchronization_barrier_s):13.3f} "
+            f"{_ms(item.critical_path_s):10.3f}"
+        )
+    comparison = report.comparison
+    direction = "slower" if comparison["delta_s"] > 0 else "faster"
+    print(
+        f"  flag=true is {abs(_ms(comparison['delta_s'])):.3f} ms {direction}; "
+        f"off/on={comparison['speedup']:.3f}x"
+    )
+    print(
+        "  device payload: "
+        f"unset={report.variants['flag_unset'].device_bytes / GB:.3f} GB, "
+        f"true={report.variants['flag_true'].device_bytes / GB:.3f} GB"
+    )
+    print(
+        "  Mooncake includes allocation/transfer; resolver CPU excludes its "
+        "nested Mooncake call. Consumer and synchronization are executed "
+        "synthetic delays."
+    )
+
+
 def _ms(seconds: float) -> float:
     return seconds * 1000
 
@@ -1175,10 +1686,10 @@ def print_results(results: list[BenchmarkResult]) -> None:
             f"{_ms(stats.prime_other_s):9.3f}"
         )
 
-    print("\nResolver CPU attribution (median ms; remote call excluded)")
+    print("\nResolver attribution (median ms; remote get excluded from CPU)")
     print(
-        f"{'case':38} {'windows':>9} {'results':>9} {'adopt/check':>11} "
-        f"{'pin':>9} {'legacy val':>10} {'scatter':>9} "
+        f"{'case':38} {'windows':>9} {'remote get':>11} {'results':>9} "
+        f"{'adopt/check':>11} {'pin':>9} {'legacy val':>10} {'scatter':>9} "
         f"{'unattributed':>13} {'rollback':>10}"
     )
     for result in results:
@@ -1186,6 +1697,7 @@ def print_results(results: list[BenchmarkResult]) -> None:
         print(
             f"{result.name:38} "
             f"{_ms(stats.resolver_windows_s):9.3f} "
+            f"{_ms(stats.resolver_remote_get_s):11.3f} "
             f"{_ms(stats.resolver_results_s):9.3f} "
             f"{_ms(stats.resolver_classification_s):11.3f} "
             f"{_ms(stats.resolver_pinning_s):9.3f} "
@@ -1371,6 +1883,52 @@ def parse_args() -> Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--output-json", type=Path)
+    parser.add_argument(
+        "--cold-compact-ab",
+        action="store_true",
+        help="Compare the production ordering with the cold-compact flag off/on.",
+    )
+    parser.add_argument(
+        "--ab-prefix-mode",
+        choices=("per-layer", "batched"),
+        default="batched",
+        help="Measured LocalCPU probe mode used by the A/B report.",
+    )
+    parser.add_argument(
+        "--h2d-gbps",
+        type=float,
+        default=22.0,
+        help="Per-rank payload rate used by the synthetic H2D consumer.",
+    )
+    parser.add_argument(
+        "--dense-consumer-layer-ms",
+        type=float,
+        default=0.0,
+        help="Dense consumer CPU/launch cost per layer and consumed KV group.",
+    )
+    parser.add_argument(
+        "--normal-sync-ms",
+        type=float,
+        default=0.0,
+        help="Final foreground synchronization cost with the flag unset.",
+    )
+    parser.add_argument(
+        "--cold-compact-sync-ms",
+        type=float,
+        default=0.0,
+        help="Dense-load stream synchronization cost with the flag enabled.",
+    )
+    parser.add_argument(
+        "--cold-compact-barrier-ms",
+        type=float,
+        default=0.0,
+        help="Additional scheduler/completion barrier cost with the flag enabled.",
+    )
+    parser.add_argument(
+        "--ab-output-json",
+        type=Path,
+        help="Write only the filtered cold-compact A/B report and samples.",
+    )
     args = parser.parse_args()
 
     if args.num_tokens < 1 or args.chunk_size < 1 or args.num_layers < 1:
@@ -1387,6 +1945,20 @@ def parse_args() -> Namespace:
         parser.error("repeats must be positive and warmup must be non-negative")
     if args.remote_gbps < 0 or args.rpc_overhead_us < 0:
         parser.error("synthetic remote timings must be non-negative")
+    if args.h2d_gbps <= 0:
+        parser.error("--h2d-gbps must be positive")
+    if any(
+        value < 0
+        for value in (
+            args.dense_consumer_layer_ms,
+            args.normal_sync_ms,
+            args.cold_compact_sync_ms,
+            args.cold_compact_barrier_ms,
+        )
+    ):
+        parser.error(
+            "A/B consumer, synchronization, and barrier timings must be non-negative"
+        )
     args.kv_groups = [int(value) for value in args.kv_groups.split(",") if value]
     if not args.kv_groups or any(value not in (0, 1) for value in args.kv_groups):
         parser.error("--kv-groups must contain 0 and/or 1")
@@ -1410,6 +1982,13 @@ def parse_args() -> Namespace:
         parser.error("--chunk-plan-modes must contain independent and/or reuse")
     if "reuse" in args.chunk_plan_modes and args.kv_groups != [0, 1]:
         parser.error("chunk-plan reuse requires --kv-groups 0,1")
+    if args.cold_compact_ab:
+        if args.kv_groups != [0, 1]:
+            parser.error("--cold-compact-ab requires --kv-groups 0,1")
+        if args.ab_prefix_mode not in args.prefix_modes:
+            parser.error("--ab-prefix-mode must also be selected by --prefix-modes")
+    elif args.ab_output_json is not None:
+        parser.error("--ab-output-json requires --cold-compact-ab")
     return args
 
 
@@ -1445,32 +2024,48 @@ def main() -> None:
         )
 
     results = []
-    for case_index, prefix_mode in enumerate(args.prefix_modes, start=1):
-        print(
-            f"[progress] case {case_index}/{len(args.prefix_modes)}: "
-            f"prefix_mode={prefix_mode}; chunk plans run interleaved",
-            flush=True,
+    ab_report = None
+    if args.cold_compact_ab:
+        print("\n[progress] running interleaved cold-compact off/on protocols")
+        ab_report = build_cold_compact_ab_report(
+            args,
+            run_cold_compact_ab_cases(args),
         )
-        results.extend(
-            run_pair_cases(
-                args,
-                prefix_mode=prefix_mode,
+        print_cold_compact_ab(ab_report)
+    else:
+        for case_index, prefix_mode in enumerate(args.prefix_modes, start=1):
+            print(
+                f"[progress] case {case_index}/{len(args.prefix_modes)}: "
+                f"prefix_mode={prefix_mode}; chunk plans run interleaved",
+                flush=True,
             )
-        )
-    print_results(results)
+            results.extend(run_pair_cases(args, prefix_mode=prefix_mode))
+        print_results(results)
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "config": {
-                key: value for key, value in vars(args).items() if key != "output_json"
+                key: value
+                for key, value in vars(args).items()
+                if key not in {"output_json", "ab_output_json"}
             },
             "results": [asdict(result) for result in results],
         }
+        if ab_report is not None:
+            payload["cold_compact_ab"] = asdict(ab_report)
         args.output_json.write_text(
             json.dumps(payload, indent=2),
             encoding="utf-8",
         )
         print(f"\nWrote JSON: {args.output_json}")
+    if args.ab_output_json is not None:
+        assert ab_report is not None
+        args.ab_output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.ab_output_json.write_text(
+            json.dumps(asdict(ab_report), indent=2),
+            encoding="utf-8",
+        )
+        print(f"Wrote filtered A/B JSON: {args.ab_output_json}")
 
 
 if __name__ == "__main__":
