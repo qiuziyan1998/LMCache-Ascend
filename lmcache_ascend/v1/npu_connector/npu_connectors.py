@@ -1502,6 +1502,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
 
+    def synchronize_dense_load_stream(self) -> None:
+        self.load_stream.synchronize()
+
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
         """Join sparse request load streams after all layer submissions.
@@ -1592,22 +1595,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def append_sparse_chunk_ptr_cache_for_layer(
         self,
         layer_id: int,
-        new_tensors: List[torch.Tensor],
+        new_sources: List[Union[torch.Tensor, MemoryObj]],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
     ) -> None:
         """Resolve and append NPU device ptrs for newly retrieved chunks only."""
-        if not new_tensors:
+        if not new_sources:
             return
 
         new_dev_ptrs = [
-            self._resolve_registered_cpu_tensor_device_ptr(
-                tensor,
+            self._resolve_registered_cpu_source_device_ptr(
+                source_obj,
                 layer_id=layer_id,
                 chunk_index=chunk_index,
                 source="append_sparse_chunk_ptr_cache_for_layer",
             )
-            for chunk_index, tensor in enumerate(new_tensors)
+            for chunk_index, source_obj in enumerate(new_sources)
         ]
 
         updated_ptrs_npu = None
@@ -1646,15 +1649,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         cached_chunk_ptrs_npu[layer_id] = updated_ptrs_npu
 
-    def _resolve_registered_cpu_tensor_device_ptr(
+    def _resolve_registered_cpu_source_device_ptr(
         self,
-        tensor: torch.Tensor,
+        source_obj: Union[torch.Tensor, MemoryObj],
         *,
         layer_id: int,
         chunk_index: int,
         source: str,
     ) -> int:
-        host_ptr = int(tensor.data_ptr())
+        host_ptr = int(
+            source_obj.data_ptr()
+            if isinstance(source_obj, torch.Tensor)
+            else source_obj.data_ptr
+        )
         dev_ptr = lmc_ops.get_device_ptr(host_ptr)
         if dev_ptr is None or int(dev_ptr) == 0:
             raise RuntimeError(
@@ -2515,8 +2522,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer_id: int,
         cpu_tensors: List[torch.Tensor],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
+        expected_num_chunks: Optional[int] = None,
     ) -> torch.Tensor:
-        num_chunks = len(cpu_tensors)
+        num_chunks = (
+            len(cpu_tensors)
+            if expected_num_chunks is None
+            else expected_num_chunks
+        )
         if cached_chunk_ptrs_npu is not None and layer_id < len(cached_chunk_ptrs_npu):
             cached = cached_chunk_ptrs_npu[layer_id]
             if cached is not None and cached.numel() == num_chunks:
@@ -2537,8 +2549,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 return cached
 
+        if len(cpu_tensors) != num_chunks:
+            raise RuntimeError(
+                "Ascend sparse pointer-first source has no complete cached "
+                f"pointer table at layer {layer_id}: "
+                f"layout_tensors={len(cpu_tensors)}, chunks={num_chunks}."
+            )
         dev_ptrs = [
-            self._resolve_registered_cpu_tensor_device_ptr(
+            self._resolve_registered_cpu_source_device_ptr(
                 tensor,
                 layer_id=layer_id,
                 chunk_index=chunk_index,
@@ -3271,7 +3289,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
 
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
@@ -3286,7 +3305,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
-            self.kvcaches,
+            kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
@@ -3301,7 +3320,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             if self.use_gpu and layout.gpu_buffer_allocator is None:
                 layout = self._lazy_initialize_buffer_with_staging(
-                    self.kvcaches,
+                    kvcaches_snapshot,
                     kv_group=kv_group,
                     init_staging=True,
                 )
@@ -3328,7 +3347,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             operation="retrieve",
             kv_group=kv_group,
             slot_mapping_full=slot_mapping_full,
-            kvcaches_ref=self.kvcaches,
+            kvcaches_ref=kvcaches_snapshot,
         )
 
         # Snapshot per-group values so interleaved per-group generators
@@ -3342,8 +3361,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
-        kvcaches_snapshot = self.kvcaches
         dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
@@ -3394,6 +3413,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                     layer_id,
                     cpu_tensors,
+                    cached_chunk_ptrs_npu,
                 )
                 assert chunk_offsets_npu is not None
                 assert chunk_sizes_npu is not None
@@ -3584,8 +3604,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_counts=selected_token_counts,
             )
             if capture_content and layer_id == 0:
+                source_tensors = list(source_layer.tensors)
+                for chunk_index, memory_obj in enumerate(
+                    source_layer.memory_objs if not source_tensors else ()
+                ):
+                    tensor = memory_obj.tensor
+                    if tensor is None:
+                        raise ValueError(
+                            "Prepared sparse diagnostic source has no tensor: "
+                            f"layer_id={layer_id}, chunk_index={chunk_index}"
+                        )
+                    source_tensors.append(tensor)
                 source_chunk_ranges = []
-                for chunk_index, tensor in enumerate(source_layer.tensors):
+                for chunk_index, tensor in enumerate(source_tensors):
                     range_start = chunk_index * chunk_size
                     range_end = min(
                         range_start + chunk_size, source.total_tokens
@@ -3598,7 +3629,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         }
                     )
                 content_probe = _sparse_content_probe(
-                    cpu_tensors=list(source_layer.tensors),
+                    cpu_tensors=source_tensors,
                     layer_cache=kvcaches_snapshot[layer_id],
                     selected_token_idx=selected_token_idx,
                     target_slots=slot_mapping_packed,
@@ -3630,16 +3661,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         Sparse layerwise retrieve: scatter selected KV tokens from CPU pinned
         memory objects into paged NPU KV via direct NPU read (no staging).
         """
+        if kwargs.get("materialize_only", False):
+            # Preserve the layerwise generator protocol while deliberately
+            # skipping every CPU-to-NPU payload. The cache engine still
+            # resolves, owns, and seals the complete CPU latent source.
+            for _ in range(self.num_layers):
+                yield
+            yield
+            yield
+            return
         if kwargs.get("prepared_sparse_source") is not None:
             yield from self._batched_to_gpu_head_token_wise_prepared(kwargs)
             return
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
-            self.kvcaches,
+            kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
@@ -3652,6 +3693,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
             "cached_tensors"
+        )
+        cached_memory_objs_by_layer: Optional[List[List[MemoryObj]]] = kwargs.get(
+            "cached_memory_objs"
         )
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = kwargs.get(
             "cached_chunk_ptrs_npu"
@@ -3674,10 +3718,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         sparse_vllm_two_major = layout.vllm_two_major
-        # Snapshot so interleaved latent/indexer sparse generators do not
-        # race on the shared connector self.kvcaches pointer.
-        kvcaches_snapshot = self.kvcaches
-
         for layer_id in range(self.num_layers):
             sparse_request = yield
             # The generator is resumed from vLLM's attention path; refresh the
@@ -3689,6 +3729,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             load_stream = self.load_stream_list[load_stream_idx]
             deep_diag_enabled = _mtp_dw_deep_diag_enabled()
+            diagnostics_enabled = _mtp_dw_diag_enabled()
             req_id = kwargs.get("req_id")
             explicit_sparse_payload = isinstance(sparse_request, dict)
             target_slot_mapping = None
@@ -3782,23 +3823,64 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 and cached_tensors_by_layer[layer_id]
                 else None
             )
+            pointer_first = False
             if layer_cached_tensors is not None:
                 cpu_tensors = layer_cached_tensors
             else:
-                cpu_tensors = [
-                    memory_obj.tensor
-                    for memory_obj in memory_objs_layer
-                    if memory_obj.tensor is not None
-                ]
+                layer_memory_objs = (
+                    cached_memory_objs_by_layer[layer_id]
+                    if cached_memory_objs_by_layer is not None
+                    and layer_id < len(cached_memory_objs_by_layer)
+                    and cached_memory_objs_by_layer[layer_id]
+                    else memory_objs_layer
+                )
+                cached_layer_ptrs = (
+                    cached_chunk_ptrs_npu[layer_id]
+                    if cached_chunk_ptrs_npu is not None
+                    and layer_id < len(cached_chunk_ptrs_npu)
+                    else None
+                )
+                pointer_first = (
+                    lmcache_cached_tokens > 0
+                    and bool(layer_memory_objs)
+                    and not diagnostics_enabled
+                    and cached_layer_ptrs is not None
+                    and cached_layer_ptrs.numel() == len(layer_memory_objs)
+                )
+                source_objs = (
+                    layer_memory_objs[:1] if pointer_first else layer_memory_objs
+                )
+                cpu_tensors = []
+                for chunk_index, memory_obj in enumerate(source_objs):
+                    tensor = memory_obj.tensor
+                    if tensor is None:
+                        raise ValueError(
+                            "Sparse retrieve source has no tensor: "
+                            f"layer_id={layer_id}, chunk_index={chunk_index}"
+                        )
+                    cpu_tensors.append(tensor)
 
             if not cpu_tensors:
                 continue
 
-            chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
-                layer_id,
-                cpu_tensors,
-                cached_chunk_ptrs_npu,
+            source_chunk_count = (
+                len(layer_memory_objs)
+                if layer_cached_tensors is None
+                else len(cpu_tensors)
             )
+            if pointer_first:
+                chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                    layer_id,
+                    cpu_tensors,
+                    cached_chunk_ptrs_npu,
+                    expected_num_chunks=source_chunk_count,
+                )
+            else:
+                chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                    layer_id,
+                    cpu_tensors,
+                    cached_chunk_ptrs_npu,
+                )
             total_tokens = (
                 lmcache_cached_tokens
                 if lmcache_cached_tokens > 0
@@ -4112,7 +4194,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
@@ -4131,7 +4214,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         kv_group = kwargs.get("kv_group", 0)
         layout = self._lazy_initialize_buffer_with_staging(
-            self.kvcaches,
+            kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
@@ -4146,7 +4229,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             if self.use_gpu and layout.gpu_buffer_allocator is None:
                 layout = self._lazy_initialize_buffer_with_staging(
-                    self.kvcaches,
+                    kvcaches_snapshot,
                     kv_group=kv_group,
                     init_staging=True,
                 )
@@ -4187,7 +4270,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             operation="store",
             kv_group=kv_group,
             slot_mapping_full=slot_mapping_full,
-            kvcaches_ref=self.kvcaches,
+            kvcaches_ref=kvcaches_snapshot,
         )
 
         # Snapshot per-group values so interleaved per-group generators
@@ -4201,7 +4284,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         token_major = self._layerwise_token_major(kv_group)
         expected_fmt = self._expected_memory_format(kv_group)
-        kvcaches_snapshot = self.kvcaches
         dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None

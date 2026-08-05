@@ -454,6 +454,73 @@ class TestStoreLayerPassiveGuard:
         engine.token_database.process_tokens.assert_called()
 
 
+class TestAscendStoreLayerCompletion:
+    @staticmethod
+    def _engine(*, stored: bool, allocation=None):
+        engine = MagicMock(spec=AscendLMCacheEngine)
+        engine.config = MagicMock()
+        engine.gpu_connector = MagicMock()
+        engine.stats_monitor = MagicMock()
+        engine.storage_manager = MagicMock()
+        engine.token_database = MagicMock()
+        engine.kv_events_enabled = False
+        engine.store_location = None
+        engine._is_passive.return_value = False
+        engine.is_healthy.return_value = True
+        engine.is_frozen.return_value = False
+        engine.num_layers = 1
+        engine._get_req_id.return_value = "test"
+        engine.stats_monitor.on_store_request.return_value = "monitor"
+        engine.config.extra_config = {}
+        engine.config.get_extra_config_value.return_value = False
+        key = MagicMock(spec=CacheEngineKey)
+        key.split_layers.return_value = [key]
+        engine.token_database.process_tokens.return_value = iter([(0, 256, key)])
+        engine._layerwise_chunk_fully_stored.return_value = stored
+        engine.storage_manager.batched_allocate.return_value = allocation
+        return engine
+
+    def test_reports_fully_stored_prefix_as_committed(self):
+        engine = self._engine(stored=True)
+
+        result = list(AscendLMCacheEngine.store_layer(engine, [0] * 256))[-1]
+
+        assert result.committed_end == 256
+
+    def test_does_not_commit_after_allocation_failure(self):
+        engine = self._engine(stored=False)
+
+        result = list(AscendLMCacheEngine.store_layer(engine, [0] * 256))[-1]
+
+        assert result.committed_end == 0
+
+    def test_reports_32_prefix_16_suffix_frontier_as_committed(self):
+        memory_obj = MagicMock()
+        memory_obj.get_size.return_value = 1
+        engine = self._engine(stored=False, allocation=[memory_obj])
+        key = next(engine.token_database.process_tokens.return_value)[2]
+        engine.token_database.process_tokens.return_value = iter(
+            (chunk * 256, (chunk + 1) * 256, key)
+            for chunk in range(32, 48)
+        )
+
+        def transfer():
+            yield
+            yield
+
+        engine.gpu_connector.batched_from_gpu.return_value = transfer()
+        engine.storage_manager.batched_put.return_value = []
+
+        with patch(
+            "lmcache_ascend.v1.cache_engine.assert_layerwise_gpu_connector"
+        ):
+            result = list(
+                AscendLMCacheEngine.store_layer(engine, [0] * (48 * 256))
+            )[-1]
+
+        assert result.committed_end == 48 * 256
+
+
 def test_sparse_window_store_cache_publishes_only_full_chunks() -> None:
     engine = SimpleNamespace(enable_shared_cpu_cache=False)
     full_tensor = torch.tensor([1])
