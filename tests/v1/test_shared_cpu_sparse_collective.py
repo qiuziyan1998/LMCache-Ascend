@@ -2613,6 +2613,47 @@ def test_dense_pointer_resolution_retains_host_row_without_extra_work(monkeypatc
     assert second is first
 
 
+def test_append_retrieve_group_accepts_empty_prefix():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    calls = []
+
+    def append(sources, host_ptrs, npu_ptrs):
+        calls.append(sources)
+        host_ptrs.extend(([11], [22]))
+        npu_ptrs.extend(
+            (
+                torch.tensor([11], dtype=torch.long),
+                torch.tensor([22], dtype=torch.long),
+            )
+        )
+
+    engine.gpu_connector = SimpleNamespace(
+        append_sparse_chunk_ptr_cache_for_layers=append
+    )
+    new_objs = [
+        [_FakeTensorMemObj(torch.empty(1))],
+        [_FakeTensorMemObj(torch.empty(1))],
+    ]
+    cached_memory_objs = []
+    cached_tensors = []
+    cached_host_ptrs = []
+    cached_npu_ptrs = []
+
+    engine._append_retrieve_group_cache(
+        new_objs,
+        cached_memory_objs,
+        cached_tensors,
+        cached_host_ptrs,
+        cached_npu_ptrs,
+    )
+
+    assert len(calls) == 1
+    assert cached_memory_objs == new_objs
+    assert cached_host_ptrs == [[11], [22]]
+    assert [row.tolist() for row in cached_npu_ptrs] == [[11], [22]]
+
+
 def test_append_retrieve_group_rejects_incomplete_prefix_before_mutation():
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2

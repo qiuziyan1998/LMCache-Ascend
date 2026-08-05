@@ -968,22 +968,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                 len(cached_chunk_dev_ptrs),
                 len(cached_chunk_ptrs_npu),
             )
-            if any(count != self.num_layers for count in layer_counts):
-                raise ValueError(
-                    "Sparse group pointer prefix layer coverage mismatch: "
-                    f"owners/host/NPU={layer_counts}, expected={self.num_layers}."
-                )
-            for layer_id in range(self.num_layers):
-                owner_count = len(cached_memory_objs[layer_id])
-                host_count = len(cached_chunk_dev_ptrs[layer_id])
-                row = cached_chunk_ptrs_npu[layer_id]
-                npu_count = 0 if row is None else int(row.numel())
-                if owner_count != host_count or host_count != npu_count:
+            if any(layer_counts) or any(cached_tensors or ()):
+                if any(count != self.num_layers for count in layer_counts):
                     raise ValueError(
-                        "Sparse group pointer prefix coverage mismatch: "
-                        f"layer={layer_id}, owners={owner_count}, "
-                        f"host_ptrs={host_count}, npu_ptrs={npu_count}."
+                        "Sparse group pointer prefix layer coverage mismatch: "
+                        f"owners/host/NPU={layer_counts}, "
+                        f"expected={self.num_layers}."
                     )
+                for layer_id in range(self.num_layers):
+                    owner_count = len(cached_memory_objs[layer_id])
+                    host_count = len(cached_chunk_dev_ptrs[layer_id])
+                    row = cached_chunk_ptrs_npu[layer_id]
+                    npu_count = 0 if row is None else int(row.numel())
+                    if owner_count != host_count or host_count != npu_count:
+                        raise ValueError(
+                            "Sparse group pointer prefix coverage mismatch: "
+                            f"layer={layer_id}, owners={owner_count}, "
+                            f"host_ptrs={host_count}, npu_ptrs={npu_count}."
+                        )
         tensors_by_layer: List[List[torch.Tensor]] = []
         for layer_id, mem_objs_layer in enumerate(mem_objs_by_layer):
             if any(not mem_obj.is_valid() for mem_obj in mem_objs_layer):
