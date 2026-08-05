@@ -71,6 +71,27 @@ from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 
 GB = 1_000_000_000
+_RESOLVER_EMITTED_STAGES = (
+    "windows",
+    "remote_get",
+    "results",
+    "classification",
+    "pinning",
+    "scatter",
+    "rollback",
+)
+_RESOLVER_STAGE_FIELDS = {
+    stage: f"resolver_{stage}_s"
+    for stage in (*_RESOLVER_EMITTED_STAGES, "validation")
+}
+_RESOLVER_CPU_STAGES = (
+    "windows",
+    "results",
+    "classification",
+    "pinning",
+    "validation",
+    "scatter",
+)
 
 
 @dataclass
@@ -113,6 +134,7 @@ class StageStats:
     resolver_s: float = 0.0
     resolver_cpu_s: float = 0.0
     resolver_windows_s: float = 0.0
+    resolver_remote_get_s: float = 0.0
     resolver_results_s: float = 0.0
     resolver_classification_s: float = 0.0
     resolver_pinning_s: float = 0.0
@@ -211,6 +233,25 @@ class ColdCompactABReport:
     variants: dict[str, ColdCompactVariant]
     comparison: dict[str, float]
     samples: list[dict[str, Any]]
+
+
+def _record_resolver_stage(
+    stats: StageStats,
+    stage: str,
+    elapsed_s: float,
+) -> None:
+    try:
+        field_name = _RESOLVER_STAGE_FIELDS[stage]
+    except KeyError as exc:
+        raise ValueError(f"Unknown resolver timing stage: {stage}") from exc
+    setattr(stats, field_name, getattr(stats, field_name) + elapsed_s)
+
+
+def _resolver_cpu_attributed_s(stats: StageStats) -> float:
+    return sum(
+        getattr(stats, _RESOLVER_STAGE_FIELDS[stage])
+        for stage in _RESOLVER_CPU_STAGES
+    )
 
 
 @dataclass
@@ -895,8 +936,7 @@ def _make_engine(
     engine.shared_cpu_rank0_request_object_ids = lambda _req_id, _kv_group: set()
 
     def record_resolver_stage(stage: str, elapsed_s: float) -> None:
-        field_name = f"resolver_{stage}_s"
-        setattr(stats, field_name, getattr(stats, field_name) + elapsed_s)
+        _record_resolver_stage(stats, stage, elapsed_s)
 
     engine._shared_rank0_resolver_timing_hook = record_resolver_stage
 
@@ -1025,16 +1065,7 @@ def run_once(
     ):
         raise AssertionError("cold sub-stage timings exceed total cold time")
     stats.resolver_cpu_s = max(0.0, stats.resolver_s - stats.remote_s)
-    resolver_attributed_s = sum(
-        (
-            stats.resolver_windows_s,
-            stats.resolver_results_s,
-            stats.resolver_classification_s,
-            stats.resolver_pinning_s,
-            stats.resolver_validation_s,
-            stats.resolver_scatter_s,
-        )
-    )
+    resolver_attributed_s = _resolver_cpu_attributed_s(stats)
     if resolver_attributed_s > stats.resolver_cpu_s + tolerance_s:
         raise AssertionError(
             "resolver sub-stage timings exceed resolver CPU time"
@@ -1655,10 +1686,10 @@ def print_results(results: list[BenchmarkResult]) -> None:
             f"{_ms(stats.prime_other_s):9.3f}"
         )
 
-    print("\nResolver CPU attribution (median ms; remote call excluded)")
+    print("\nResolver attribution (median ms; remote get excluded from CPU)")
     print(
-        f"{'case':38} {'windows':>9} {'results':>9} {'adopt/check':>11} "
-        f"{'pin':>9} {'legacy val':>10} {'scatter':>9} "
+        f"{'case':38} {'windows':>9} {'remote get':>11} {'results':>9} "
+        f"{'adopt/check':>11} {'pin':>9} {'legacy val':>10} {'scatter':>9} "
         f"{'unattributed':>13} {'rollback':>10}"
     )
     for result in results:
@@ -1666,6 +1697,7 @@ def print_results(results: list[BenchmarkResult]) -> None:
         print(
             f"{result.name:38} "
             f"{_ms(stats.resolver_windows_s):9.3f} "
+            f"{_ms(stats.resolver_remote_get_s):11.3f} "
             f"{_ms(stats.resolver_results_s):9.3f} "
             f"{_ms(stats.resolver_classification_s):11.3f} "
             f"{_ms(stats.resolver_pinning_s):9.3f} "

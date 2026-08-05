@@ -79,9 +79,38 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse(
         assert result.broadcast_envelopes == 3
         assert result.transferred_bytes == 512 * 1152 * 3
         assert result.warm_total_s > 0
+        assert result.resolver_remote_get_s > 0
         assert result.resolver_classification_s > 0
         assert result.resolver_validation_s == 0
         assert result.resolver_rollback_s == 0
+
+
+def test_resolver_timing_hook_covers_all_production_stages() -> None:
+    benchmark = _load_benchmark_module()
+    stats = benchmark.StageStats()
+    stages = (
+        "windows",
+        "remote_get",
+        "results",
+        "classification",
+        "pinning",
+        "scatter",
+        "rollback",
+    )
+
+    assert benchmark._RESOLVER_EMITTED_STAGES == stages
+    for index, stage in enumerate(stages, start=1):
+        benchmark._record_resolver_stage(stats, stage, index / 1000)
+        assert getattr(stats, f"resolver_{stage}_s") == pytest.approx(
+            index / 1000
+        )
+    benchmark._record_resolver_stage(stats, "validation", 0.008)
+    assert stats.resolver_validation_s == pytest.approx(0.008)
+    assert benchmark._resolver_cpu_attributed_s(stats) == pytest.approx(
+        sum(index / 1000 for index in (1, 3, 4, 5, 6, 8))
+    )
+    with pytest.raises(ValueError, match="Unknown resolver timing stage"):
+        benchmark._record_resolver_stage(stats, "future_stage", 1.0)
 
 
 def test_cold_bootstrap_token_database_config_is_schema_independent():
