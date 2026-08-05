@@ -931,17 +931,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     if existing is None
                     else torch.cat((existing, new_row), dim=0)
                 )
-        if cached_chunk_ptrs_npu is not None:
-            retained_rows = [
-                row for row in cached_chunk_ptrs_npu if row is not None
-            ]
-            register_ready = getattr(
-                getattr(self, "gpu_connector", None),
-                "record_sparse_pointer_rows_ready",
-                None,
-            )
-            if callable(register_ready):
-                register_ready(retained_rows)
 
     def _append_retrieve_group_cache(
         self,

@@ -2,7 +2,6 @@
 # ruff: noqa: E501
 # Standard
 from contextlib import nullcontext
-import gc
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -211,61 +210,8 @@ def test_sparse_memory_update_resets_fast_direct_state() -> None:
     assert connector._sparse_destination_plans[0] is destination_plan
 
 
-def test_batched_pointer_rows_wait_on_producer_event_and_cleanup(monkeypatch) -> None:
+def test_group_store_cat_rows_append_pointer_table() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector._sparse_pointer_ready_events = {}
-    producer_stream = SimpleNamespace(name="producer")
-    waited = []
-
-    class _Event:
-        def __init__(self):
-            self.recorded_on = None
-
-        def record(self, stream):
-            self.recorded_on = stream
-
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(Event=_Event, current_stream=lambda: producer_stream),
-        raising=False,
-    )
-    pointer_table = torch.tensor([[101], [202]], dtype=torch.long)
-    rows = list(pointer_table.unbind(0))
-    first_ptr = int(rows[0].data_ptr())
-
-    connector.record_sparse_pointer_rows_ready(rows)
-    event = connector._sparse_pointer_ready_events[first_ptr][1]
-    assert event.recorded_on is producer_stream
-
-    consumer_stream = SimpleNamespace(
-        wait_event=lambda ready_event: waited.append(ready_event)
-    )
-    connector._wait_sparse_pointer_row_ready(rows[0], stream=consumer_stream)
-    assert waited == [event]
-
-    rows[0] = None
-    gc.collect()
-    assert first_ptr not in connector._sparse_pointer_ready_events
-
-
-def test_group_store_cat_rows_register_one_ready_event(monkeypatch) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector._sparse_pointer_ready_events = {}
-    producer_stream = SimpleNamespace(name="store")
-    events = []
-
-    class _Event:
-        def record(self, stream):
-            self.stream = stream
-            events.append(self)
-
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(Event=_Event, current_stream=lambda: producer_stream),
-        raising=False,
-    )
     memory_objs = [
         [_MemoryObj(torch.zeros(1))],
         [_MemoryObj(torch.zeros(1))],
@@ -288,13 +234,6 @@ def test_group_store_cat_rows_register_one_ready_event(monkeypatch) -> None:
     )
 
     assert [row.tolist() for row in cached_npu_ptrs] == [[11, 101], [22, 202]]
-    assert len(events) == 1
-    waited = []
-    connector._wait_sparse_pointer_row_ready(
-        cached_npu_ptrs[1],
-        stream=SimpleNamespace(wait_event=lambda event: waited.append(event)),
-    )
-    assert waited == events
 
 
 def test_shared_cpu_store_publication_fences_store_stream() -> None:

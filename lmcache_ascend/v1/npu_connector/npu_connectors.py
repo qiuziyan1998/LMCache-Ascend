@@ -4,7 +4,6 @@ from contextlib import contextmanager, nullcontext
 import json
 import os
 from typing import Any, Generator, List, Optional, Set, Union
-import weakref
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -1505,7 +1504,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_validated_layers: set = set()
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
-        self._sparse_pointer_ready_events: dict[int, tuple[Any, Any]] = {}
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
@@ -1716,7 +1714,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             # The row views retain the table storage after this function returns.
             row_views = list(pointer_table.unbind(0))
-            self.record_sparse_pointer_rows_ready(row_views)
 
         if not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(self.num_layers))
@@ -1732,57 +1729,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if cached_chunk_ptrs_npu is not None:
                 assert row_views is not None
                 cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
-
-    def record_sparse_pointer_rows_ready(
-        self, row_views: List[torch.Tensor]
-    ) -> None:
-        """Retain one producer event only while its pointer rows remain alive."""
-        if not row_views:
-            return
-        ready_event = torch.npu.Event()
-        ready_event.record(torch.npu.current_stream())
-        entries = getattr(self, "_sparse_pointer_ready_events", None)
-        if entries is None:
-            entries = {}
-            self._sparse_pointer_ready_events = entries
-        owner_ref = weakref.ref(self)
-        for row in row_views:
-            row_ptr = int(row.data_ptr())
-
-            def remove_dead_row(row_ref, *, key=row_ptr, owner_ref=owner_ref):
-                owner = owner_ref()
-                if owner is None:
-                    return
-                current_entries = getattr(
-                    owner, "_sparse_pointer_ready_events", None
-                )
-                if current_entries is None:
-                    return
-                current = current_entries.get(key)
-                if current is not None and current[0] is row_ref:
-                    current_entries.pop(key, None)
-
-            row_ref = weakref.ref(row, remove_dead_row)
-            entries[row_ptr] = (row_ref, ready_event)
-
-    def _wait_sparse_pointer_row_ready(
-        self,
-        chunk_ptrs_npu: torch.Tensor,
-        stream: Optional[Any] = None,
-    ) -> None:
-        entries = getattr(self, "_sparse_pointer_ready_events", None)
-        if not entries:
-            return
-        entry = entries.get(int(chunk_ptrs_npu.data_ptr()))
-        if entry is None:
-            return
-        row_ref, ready_event = entry
-        if row_ref() is None:
-            entries.pop(int(chunk_ptrs_npu.data_ptr()), None)
-            return
-        if stream is None:
-            stream = torch.npu.current_stream()
-        stream.wait_event(ready_event)
 
     def _resolve_registered_cpu_source_device_ptr(
         self,
@@ -2536,9 +2482,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             join.used_stream_indices.add(load_stream_idx)
         with torch.cuda.stream(load_stream):
             load_stream.wait_stream(current_stream)
-            self._wait_sparse_pointer_row_ready(
-                chunk_ptrs_npu, stream=load_stream
-            )
             if layer_state is not None:
                 validate_inputs = (
                     validate_key not in self._sparse_direct_validated_layers
@@ -2607,7 +2550,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"pointers: layer_id={layer_id} covered_tokens={covered_tokens} "
                 f"total_tokens={int(total_tokens)}"
             )
-        self._wait_sparse_pointer_row_ready(chunk_ptrs_npu)
         sparse_mla_dsa_batched_direct_kv_transfer_prepared(
             plan.states[layer_id],
             slot_mapping_packed,
