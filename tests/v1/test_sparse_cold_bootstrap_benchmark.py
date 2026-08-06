@@ -350,3 +350,13 @@ def test_cold_compact_ab_rejects_incomplete_protocol_samples() -> None:
 
     with pytest.raises(ValueError, match="non-empty off/on samples"):
         benchmark.build_cold_compact_ab_report(_ab_args(), {"flag_unset": []})
+
+
+def test_layer_merged_matrix_exercises_cold_compact_page_path() -> None:
+    benchmark = _load_benchmark_module()
+    report = benchmark.run_layer_merged_cold_compact_matrix(
+        _ab_args(object_mode="production")
+    )
+
+    assert report["variants"]["merged_0_compact_1"]["physical_pages"] == 0
+    assert report["variants"]["merged_1_compact_1"]["physical_pages"] > 0

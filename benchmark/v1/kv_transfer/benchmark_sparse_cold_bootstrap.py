@@ -959,9 +959,12 @@ def _make_engine(
     )
     engine.config = SimpleNamespace(
         chunk_size=args.chunk_size,
+        enable_shared_cpu_cache=True,
         experimental_sampled_layerwise_lookup=True,
+        remote_url="mooncakestore://benchmark/",
         shared_cpu_remote_layers_per_batch=1,
         dsa_two_groups=True,
+        use_layerwise=True,
         extra_config={
             "mooncake_page_first_multi_buffer": True,
             "mooncake_layer_merged_page_objects": bool(

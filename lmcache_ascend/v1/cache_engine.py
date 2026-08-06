@@ -33,7 +33,10 @@ from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import LayerPageSource, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
+from lmcache.v1.mooncake_layout import (
+    mooncake_layer_pages_enabled,
+    mooncake_page_layout_enabled,
+)
 from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
     SharedHandleEnvelope,
@@ -3136,6 +3139,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         shared_chunk_locations_layer_major: list[list[str]] = []
         pre_resolved_shared_mem_layers: Optional[List[List[MemoryObj]]] = None
+        layer_page_chunks = 0
         local_prefix_layers: List[Optional[LocalCPUPrefixGetResult]] = []
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         preflight_error_envelope: Optional[SharedHandleEnvelope] = None
@@ -3146,18 +3150,22 @@ class AscendLMCacheEngine(LMCacheEngine):
             nonlocal pre_resolved_shared_mem_layers
             if pre_resolved_shared_mem_layers is None:
                 return
-            for mem_objs_layer in reversed(pre_resolved_shared_mem_layers):
-                for mem_obj in reversed(mem_objs_layer):
-                    try:
-                        if getattr(mem_obj, "is_pinned", False):
-                            mem_obj.unpin()
-                        if getattr(mem_obj, "is_valid", lambda: True)():
-                            mem_obj.ref_count_down()
-                    except Exception:
-                        logger.exception(
-                            "Failed to release pre-resolved shared sparse "
-                            "MemoryObj after request-level preflight failure"
-                        )
+            unique = {
+                id(obj): obj
+                for layer in pre_resolved_shared_mem_layers
+                for obj in layer
+            }
+            for mem_obj in reversed(unique.values()):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if getattr(mem_obj, "is_valid", lambda: True)():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release pre-resolved shared sparse "
+                        "MemoryObj after request-level preflight failure"
+                    )
             pre_resolved_shared_mem_layers = None
 
         def release_local_prefix_layers() -> None:
@@ -3419,7 +3427,38 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
-                        if page_first_locations is not None:
+                        full_chunks = next(
+                            (
+                                index
+                                for index, (start, end) in enumerate(
+                                    zip(
+                                        starts[cached_prefix_chunks:],
+                                        ends[cached_prefix_chunks:],
+                                        strict=True,
+                                    )
+                                )
+                                if end - start != self.config.chunk_size
+                            ),
+                            len(missing_keys[0]),
+                        )
+                        if (
+                            mooncake_layer_pages_enabled(self.config)
+                            and full_chunks
+                        ):
+                            release_local_prefix_layers()
+                            (
+                                pre_resolved_shared_mem_layers,
+                                layer_page_chunks,
+                            ) = self._resolve_shared_rank0_layer_pages(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase", "sparse_decode_bootstrap"
+                                ),
+                                kv_group=kv_group,
+                                keys_layer_major=missing_keys,
+                                page_chunks=full_chunks,
+                            )
+                        elif page_first_locations is not None:
                             prefixes = None
                             if local_prefix_layers:
                                 if any(
@@ -3564,8 +3603,26 @@ class AscendLMCacheEngine(LMCacheEngine):
             and cached_prefix_chunks < required_chunks
         ):
             try:
+                page_sources = (
+                    [
+                        LayerPageSource(
+                            tuple(
+                                pre_resolved_shared_mem_layers[0][
+                                    :layer_page_chunks
+                                ]
+                            ),
+                            layer_id,
+                            tuple(layer[layer_page_chunks:]),
+                        )
+                        for layer_id, layer in enumerate(
+                            pre_resolved_shared_mem_layers
+                        )
+                    ]
+                    if layer_page_chunks
+                    else pre_resolved_shared_mem_layers
+                )
                 self._append_retrieve_group_cache(
-                    pre_resolved_shared_mem_layers,
+                    page_sources,
                     cached_memory_objs,
                     cached_tensors,
                     cached_chunk_dev_ptrs,
@@ -3639,11 +3696,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             and pre_resolved_shared_mem_layers is not None
             and not use_cached_retrieve
         ):
-            pending_pre_resolved_release = [
-                mem_obj
-                for mem_objs_layer in pre_resolved_shared_mem_layers
-                for mem_obj in mem_objs_layer
-            ]
+            pending_pre_resolved_release = list(
+                {
+                    id(obj): obj
+                    for layer in pre_resolved_shared_mem_layers
+                    for obj in layer
+                }.values()
+            )
 
         def release_pending_pre_resolved() -> None:
             nonlocal pending_pre_resolved_release
@@ -3830,6 +3889,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                     elif mem_objs_layer is None:
                         mem_objs_layer = []
 
+                source = (
+                    LayerPageSource(
+                        tuple(mem_objs_layer[:layer_page_chunks]),
+                        layer_id,
+                        tuple(mem_objs_layer[layer_page_chunks:]),
+                    )
+                    if layer_page_chunks
+                    else mem_objs_layer
+                )
+
                 if publish_shared_handles and (
                     compact_handle_batch is None or layer_id == 0
                 ):
@@ -3964,12 +4033,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                     else 0.0
                 )
                 if sparse_payload is not None:
-                    sparse_payload["memory_objs_layer"] = mem_objs_layer
+                    sparse_payload["memory_objs_layer"] = source
                     ensure_mem_obj_consumer().send(sparse_payload)
                 else:
                     ensure_mem_obj_consumer().send(
                         (
-                            mem_objs_layer,
+                            source,
                             selected_tokens,
                             token_start_index,
                             target_slot_mapping,
