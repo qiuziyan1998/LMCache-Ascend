@@ -3292,6 +3292,46 @@ class AscendLMCacheEngine(LMCacheEngine):
                             local_prefix.local_memory_objs
                         ) + ["RemoteBackend"] * len(local_prefix.remote_positions)
                         shared_chunk_locations_layer_major.append(layer_locations)
+                    if mooncake_layer_pages_enabled(self.config):
+                        page_chunks = next(
+                            (
+                                index
+                                for index, (start, end) in enumerate(
+                                    zip(
+                                        starts[cached_prefix_chunks:],
+                                        ends[cached_prefix_chunks:],
+                                        strict=False,
+                                    )
+                                )
+                                if end - start != self.config.chunk_size
+                            ),
+                            len(missing_keys[0]),
+                        )
+                        local_pages, _ = (
+                            self.storage_manager.batched_contains_layer_pages(
+                                missing_keys[0][:page_chunks],
+                                [LOCAL_CPU_BACKEND_NAME],
+                            )
+                        )
+                        for locations in shared_chunk_locations_layer_major:
+                            locations[:local_pages] = [
+                                LOCAL_CPU_BACKEND_NAME
+                            ] * local_pages
+                        if page_chunks < len(missing_keys[0]):
+                            tail_keys = [
+                                layer_keys[page_chunks]
+                                for layer_keys in missing_keys
+                            ]
+                            local_tail, _ = self.storage_manager.batched_contains(
+                                tail_keys, [LOCAL_CPU_BACKEND_NAME]
+                            )
+                            if local_tail == len(tail_keys):
+                                for locations in (
+                                    shared_chunk_locations_layer_major
+                                ):
+                                    locations[page_chunks] = (
+                                        LOCAL_CPU_BACKEND_NAME
+                                    )
                 except Exception:
                     release_local_prefix_layers()
                     raise
@@ -3306,6 +3346,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                         layer_locations.append(key_location)
                     shared_chunk_locations_layer_major.append(layer_locations)
             if perf_enabled:
+                local_chunks = sum(
+                    location == LOCAL_CPU_BACKEND_NAME
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                remote_chunks = sum(
+                    location == "RemoteBackend"
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                unresolved_chunks = sum(
+                    not location
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
                 cold_start_perf_log(
                     logger,
                     "location_probe",
@@ -3318,7 +3373,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=kv_group,
                     layers=len(missing_keys),
                     chunks=sum(len(layer) for layer in missing_keys),
-                    missing=len(missing_locations),
+                    missing=unresolved_chunks,
+                    local_chunks=local_chunks,
+                    remote_chunks=remote_chunks,
+                    unresolved_chunks=unresolved_chunks,
                     sampled=sampled_worker_retrieve,
                 )
             page_first_locations = (
