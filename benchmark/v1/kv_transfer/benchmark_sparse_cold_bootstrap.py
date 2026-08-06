@@ -178,6 +178,9 @@ class StageStats:
     mooncake_page_objects: int = 0
     lmcache_memory_objects: int = 0
     pointer_objects: int = 0
+    physical_pages: int = 0
+    logical_entries: int = 0
+    legacy_tail_objects: int = 0
     handle_objects: int = 0
     broadcast_envelopes: int = 0
     transferred_bytes: int = 0
@@ -259,6 +262,7 @@ class ColdCompactProtocolSample:
     """One executable two-group protocol sample."""
 
     enabled: bool
+    layer_merged: bool
     wall_s: float
     synchronization_barrier_s: float
     groups: dict[int, StageStats]
@@ -388,6 +392,10 @@ class BenchmarkLocalCPUBackend:
 
     allocate = LocalCPUBackend.allocate
     batched_allocate = LocalCPUBackend.batched_allocate
+    batched_allocate_layer_pages = LocalCPUBackend.batched_allocate_layer_pages
+    batched_submit_layer_pages = LocalCPUBackend.batched_submit_layer_pages
+    batched_get_layer_page_prefix = LocalCPUBackend.batched_get_layer_page_prefix
+    contains_any_exact = LocalCPUBackend.contains_any_exact
 
     def close(self) -> None:
         """Release production benchmark objects without per-object free calls."""
@@ -463,6 +471,7 @@ class SyntheticPageFirstStorageManager:
         self.remote_gbps = remote_gbps
         self.rpc_overhead_us = rpc_overhead_us
         self.object_mode = object_mode
+        self.storage_backends = {"RemoteBackend": self}
         self.allocator_connector = None
         self.shared_tensor = (
             torch.empty(chunk_size * bytes_per_token, dtype=torch.uint8)
@@ -566,6 +575,8 @@ class SyntheticPageFirstStorageManager:
         transferred_bytes = sum(bytes_by_hash[page_id] for page_id in page_ids)
         self.stats.mooncake_page_objects += len(page_groups) + len(legacy_indices)
         self.stats.lmcache_memory_objects += len(keys)
+        self.stats.logical_entries += len(keys)
+        self.stats.legacy_tail_objects += len(legacy_indices)
         self.stats.transferred_bytes += transferred_bytes
         self.stats.remote_layout_s += time.perf_counter() - layout_started
 
@@ -675,6 +686,44 @@ class SyntheticPageFirstStorageManager:
         self.stats.remote_s += time.perf_counter() - started
         return cast(list[Any], results)
 
+    def batched_contains_layer_pages(self, keys: list[CacheEngineKey]) -> int:
+        self.stats.remote_lookup_calls += int(bool(keys))
+        return len(keys)
+
+    def batched_get_layer_pages(self, keys: list[CacheEngineKey]) -> list[Any]:
+        """Exercise the production merged-page allocator without an NPU."""
+        if self.object_mode != "production":
+            raise RuntimeError("layer-merged matrix requires --object-mode production")
+        assert self.allocator_connector is not None
+        started = time.perf_counter()
+        shapes, dtypes, fmt, _ = self.allocator_connector._metadata_for_raw_key(
+            keys[0]
+        )
+        pages = self.local_backend.batched_allocate_layer_pages(
+            shapes,
+            dtypes,
+            len(keys),
+            self.num_layers,
+            fmt,
+        )
+        if pages is None:
+            return []
+        full_bytes = self.chunk_size * self.bytes_per_token * self.num_layers
+        transfer_started = time.perf_counter()
+        if self.remote_gbps:
+            time.sleep(len(keys) * full_bytes / (self.remote_gbps * GB))
+        self.stats.remote_transfer_s += time.perf_counter() - transfer_started
+        self.local_backend.batched_submit_layer_pages(
+            [key.without_layer() for key in keys], pages
+        )
+        self.stats.remote_calls += 1
+        self.stats.remote_transfer_calls += int(bool(keys))
+        self.stats.physical_pages += len(pages)
+        self.stats.logical_entries += len(pages) * self.num_layers
+        self.stats.transferred_bytes += len(pages) * full_bytes
+        self.stats.remote_s += time.perf_counter() - started
+        return pages
+
     def contains(
         self,
         _key: CacheEngineKey,
@@ -710,6 +759,7 @@ class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.bytes_per_token = bytes_per_token
         self.h2d_gbps = h2d_gbps
         self.consumer_layer_ms = consumer_layer_ms
+        self.supports_layer_page_source = True
 
     def append_sparse_chunk_ptr_cache_for_layer(
         self,
@@ -914,6 +964,9 @@ def _make_engine(
         dsa_two_groups=True,
         extra_config={
             "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": bool(
+                getattr(args, "_layer_merged", False)
+            ),
             "save_only_first_rank": True,
         },
     )
@@ -1260,9 +1313,11 @@ def _run_cold_compact_protocol_once(
     args: Namespace,
     *,
     enabled: bool,
+    layer_merged: bool = False,
 ) -> ColdCompactProtocolSample:
     """Execute the two production-ordered generator protocols once."""
     tokens = list(range(args.num_tokens))
+    args._layer_merged = layer_merged
     token_mask = torch.ones(args.num_tokens, dtype=torch.bool)
     request_id = f"ab-{'on' if enabled else 'off'}"
     shared_state: dict[str, Any] = {}
@@ -1416,6 +1471,7 @@ def _run_cold_compact_protocol_once(
         stats.resolver_cpu_s = max(0.0, stats.resolver_s - stats.remote_s)
     return ColdCompactProtocolSample(
         enabled=enabled,
+        layer_merged=layer_merged,
         wall_s=wall_s,
         synchronization_barrier_s=synchronization_barrier_s,
         groups=stats_by_group,
@@ -1615,6 +1671,73 @@ def print_cold_compact_ab(report: ColdCompactABReport) -> None:
         f"unset={report.variants['flag_unset'].device_bytes / GB:.3f} GB, "
         f"true={report.variants['flag_true'].device_bytes / GB:.3f} GB"
     )
+
+
+def run_layer_merged_cold_compact_matrix(args: Namespace) -> dict[str, Any]:
+    """Run the four feature combinations through the existing protocols."""
+    cases = [(False, False), (True, False), (False, True), (True, True)]
+    samples: dict[str, list[ColdCompactProtocolSample]] = {
+        f"merged_{int(merged)}_compact_{int(compact)}": []
+        for merged, compact in cases
+    }
+    for repeat in range(args.warmup + args.repeats):
+        order = cases[repeat % len(cases) :] + cases[: repeat % len(cases)]
+        for merged, compact in order:
+            sample = _run_cold_compact_protocol_once(
+                args, enabled=compact, layer_merged=merged
+            )
+            if repeat >= args.warmup:
+                samples[f"merged_{int(merged)}_compact_{int(compact)}"].append(
+                    sample
+                )
+    variants = {}
+    for name, case_samples in samples.items():
+        medians = {
+            field: statistics.median(
+                sum(getattr(group, field) for group in sample.groups.values())
+                for sample in case_samples
+            )
+            for field in (
+                "physical_pages",
+                "logical_entries",
+                "legacy_tail_objects",
+                "pointer_s",
+            )
+        }
+        pointer_seal_s = medians.pop("pointer_s")
+        variants[name] = {
+            "status": "measured",
+            "critical_path_s": statistics.median(s.wall_s for s in case_samples),
+            **medians,
+            "pointer_seal_s": pointer_seal_s,
+            "passive_wait_s": None,
+            "passive_wait_status": "unavailable_single_rank_benchmark",
+        }
+    return {
+        "schema": 1,
+        "model": "executed_four_case_single_rank_protocol_v1",
+        "measurement": {
+            "critical_path": "measured",
+            "passive_wait": "unavailable_single_rank_benchmark",
+            "production_linux_npu_required": True,
+        },
+        "variants": variants,
+    }
+
+
+def print_layer_merged_cold_compact_matrix(report: dict[str, Any]) -> None:
+    print("\nLayer-merged objects x cold-compact load (median ms)")
+    print(
+        f"{'case':28} {'critical':>10} {'pages':>8} {'logical':>10} "
+        f"{'tails':>8} {'ptr seal':>10} {'passive wait':>16}"
+    )
+    for name, item in report["variants"].items():
+        print(
+            f"{name:28} {_ms(item['critical_path_s']):10.3f} "
+            f"{int(item['physical_pages']):8d} {int(item['logical_entries']):10d} "
+            f"{int(item['legacy_tail_objects']):8d} "
+            f"{_ms(item['pointer_seal_s']):10.3f} {'unavailable':>16}"
+        )
     print(
         "  Mooncake includes allocation/transfer; resolver CPU excludes its "
         "nested Mooncake call. Consumer and synchronization are executed "
@@ -1889,6 +2012,11 @@ def parse_args() -> Namespace:
         help="Compare the production ordering with the cold-compact flag off/on.",
     )
     parser.add_argument(
+        "--layer-merged-cold-compact-matrix",
+        action="store_true",
+        help="Run all four layer-merged object x cold-compact combinations.",
+    )
+    parser.add_argument(
         "--ab-prefix-mode",
         choices=("per-layer", "batched"),
         default="batched",
@@ -1928,6 +2056,11 @@ def parse_args() -> Namespace:
         "--ab-output-json",
         type=Path,
         help="Write only the filtered cold-compact A/B report and samples.",
+    )
+    parser.add_argument(
+        "--matrix-output-json",
+        type=Path,
+        help="Write only the filtered four-case feature matrix.",
     )
     args = parser.parse_args()
 
@@ -1989,6 +2122,15 @@ def parse_args() -> Namespace:
             parser.error("--ab-prefix-mode must also be selected by --prefix-modes")
     elif args.ab_output_json is not None:
         parser.error("--ab-output-json requires --cold-compact-ab")
+    if args.layer_merged_cold_compact_matrix:
+        if args.kv_groups != [0, 1] or args.object_mode != "production":
+            parser.error(
+                "feature matrix requires --kv-groups 0,1 --object-mode production"
+            )
+    elif args.matrix_output_json is not None:
+        parser.error(
+            "--matrix-output-json requires --layer-merged-cold-compact-matrix"
+        )
     return args
 
 
@@ -2025,7 +2167,12 @@ def main() -> None:
 
     results = []
     ab_report = None
-    if args.cold_compact_ab:
+    matrix_report = None
+    if args.layer_merged_cold_compact_matrix:
+        print("\n[progress] running interleaved four-case feature matrix")
+        matrix_report = run_layer_merged_cold_compact_matrix(args)
+        print_layer_merged_cold_compact_matrix(matrix_report)
+    elif args.cold_compact_ab:
         print("\n[progress] running interleaved cold-compact off/on protocols")
         ab_report = build_cold_compact_ab_report(
             args,
@@ -2047,12 +2194,14 @@ def main() -> None:
             "config": {
                 key: value
                 for key, value in vars(args).items()
-                if key not in {"output_json", "ab_output_json"}
+                if key not in {"output_json", "ab_output_json", "matrix_output_json"}
             },
             "results": [asdict(result) for result in results],
         }
         if ab_report is not None:
             payload["cold_compact_ab"] = asdict(ab_report)
+        if matrix_report is not None:
+            payload["layer_merged_cold_compact_matrix"] = matrix_report
         args.output_json.write_text(
             json.dumps(payload, indent=2),
             encoding="utf-8",
@@ -2066,6 +2215,13 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"Wrote filtered A/B JSON: {args.ab_output_json}")
+    if args.matrix_output_json is not None:
+        assert matrix_report is not None
+        args.matrix_output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.matrix_output_json.write_text(
+            json.dumps(matrix_report, indent=2), encoding="utf-8"
+        )
+        print(f"Wrote filtered feature matrix: {args.matrix_output_json}")
 
 
 if __name__ == "__main__":

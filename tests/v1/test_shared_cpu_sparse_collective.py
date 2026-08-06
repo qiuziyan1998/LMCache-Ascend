@@ -11,6 +11,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.memory_management import LayerPageSource
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch, SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
@@ -1436,6 +1437,130 @@ def test_sparse_passive_materialize_only_skips_npu_consumer(monkeypatch):
     assert cached_tensors == [[mem_obj.tensor]]
 
 
+@pytest.mark.parametrize("complete", [True, False])
+def test_sparse_passive_materialize_only_reuses_one_merged_page(
+    monkeypatch, complete
+):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    perf_events = []
+    monkeypatch.setattr(ascend_cache_engine, "cold_start_perf_enabled", lambda: True)
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: perf_events.append((event, fields)),
+    )
+    key = _make_key()
+    page = _FakeTensorMemObj(torch.empty(1))
+    batch = SharedHandleBatch(
+        shm_name="test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=1,
+        physical_sizes=[1],
+        chunk_hashes=[int(key.chunk_hash)],
+        offsets=[],
+        page_offsets=[0],
+        page_physical_sizes=[2],
+    )
+    envelopes = iter(
+        [
+            SharedHandleEnvelope(
+                request_id="req-page",
+                phase="dsa_cold_compact_latent",
+                request_ordinal=0,
+                layer_id=0,
+                kv_group=0,
+                status="ok",
+                generation=7,
+                handles=[],
+                batch=batch,
+            ),
+            SharedHandleEnvelope(
+                request_id="req-page",
+                phase="dsa_cold_compact_latent",
+                request_ordinal=0,
+                layer_id=2,
+                kv_group=0,
+                status="skipped",
+                generation=7,
+                handles=[],
+                message="compact shared batch committed",
+            ),
+        ]
+    )
+
+    class Connector(_FakeSparseConsumer):
+        def append_sparse_chunk_ptr_cache_for_layers(
+            self, sources, host_ptrs, npu_ptrs
+        ):
+            self.sources = sources
+            host_ptrs.extend(([11], [22]))
+            npu_ptrs.extend((torch.tensor([11]), torch.tensor([22])))
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.gpu_connector = Connector()
+    engine.token_database = _FakeTokenDatabase(key)
+    engine.shared_cpu_cache_passive_allocator = _CompactPassiveAllocator([])
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = type("Meta", (), {"first_rank": 0, "worker_id": 0})()
+    engine._receive_shared_envelope = lambda: next(envelopes)
+    engine._make_passive_layer_page_views = lambda *_args, **_kwargs: (page,)
+    cached_memory_objs = []
+    cached_shared_handles = []
+
+    retriever = engine._retrieve_layer_head_token_wise_shared_passive(
+        [1],
+        None,
+        torch.zeros(1, dtype=torch.bool),
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=cached_shared_handles,
+        kv_group=0,
+        req_id="req-page",
+        shared_cpu_phase="dsa_cold_compact_latent",
+        materialize_only=True,
+    )
+
+    next(retriever)
+    retriever.send(None)
+    if complete:
+        retriever.send(None)
+    retriever.close()
+
+    if complete:
+        assert all(
+            isinstance(source, LayerPageSource)
+            for source in engine.gpu_connector.sources
+        )
+        assert cached_memory_objs == [[page], [page]]
+        assert cached_shared_handles == [[None], [None]]
+        assert page.release_count == 0
+        aggregate = dict(perf_events)["passive_compact_materialize"]
+        assert aggregate["req_id"] == "req-page"
+        assert aggregate["rank"] == 0
+        assert aggregate["kv_group"] == 0
+        assert aggregate["physical_pages"] == 1
+        assert aggregate["logical_entries"] == 2
+        assert aggregate["legacy_tail_objects"] == 0
+        assert aggregate["page_view_build_ms"] >= 0
+        assert aggregate["pointer_seal_ms"] >= 0
+    else:
+        assert cached_memory_objs == []
+        assert cached_shared_handles == []
+        assert page.release_count == 1
+        assert "passive_compact_materialize" not in dict(perf_events)
+
+
 def test_materialize_only_npu_consumer_never_initializes_transfer_state() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 2
@@ -2652,6 +2777,44 @@ def test_append_retrieve_group_accepts_empty_prefix():
     assert cached_memory_objs == new_objs
     assert cached_host_ptrs == [[11], [22]]
     assert [row.tolist() for row in cached_npu_ptrs] == [[11], [22]]
+
+
+def test_append_retrieve_group_preserves_layer_page_sources():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    sources = []
+
+    def append(new_sources, host_ptrs, npu_ptrs):
+        sources.extend(new_sources)
+        host_ptrs.extend(([11], [22]))
+        npu_ptrs.extend(
+            (
+                torch.tensor([11], dtype=torch.long),
+                torch.tensor([22], dtype=torch.long),
+            )
+        )
+
+    engine.gpu_connector = SimpleNamespace(
+        append_sparse_chunk_ptr_cache_for_layers=append
+    )
+    page = _FakeTensorMemObj(torch.empty(1))
+    tails = [_FakeTensorMemObj(torch.empty(1)) for _ in range(2)]
+    page_sources = [
+        LayerPageSource((page,), layer_id, (tails[layer_id],))
+        for layer_id in range(2)
+    ]
+    cached_memory_objs = []
+
+    engine._append_retrieve_group_cache(
+        page_sources,
+        cached_memory_objs,
+        [],
+        [],
+        [],
+    )
+
+    assert sources == page_sources
+    assert cached_memory_objs == [[page, tails[0]], [page, tails[1]]]
 
 
 def test_append_retrieve_group_rejects_incomplete_prefix_before_mutation():

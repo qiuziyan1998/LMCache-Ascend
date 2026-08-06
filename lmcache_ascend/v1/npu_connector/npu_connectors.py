@@ -1699,7 +1699,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
     def append_sparse_chunk_ptr_cache_for_layers(
         self,
-        new_sources_by_layer: List[List[Union[torch.Tensor, MemoryObj]]],
+        new_sources_by_layer: List[
+            Union[Sequence[Union[torch.Tensor, MemoryObj]], LayerPageSource]
+        ],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
     ) -> None:
@@ -1711,7 +1713,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 "Sparse group pointer append must cover every layer: "
                 f"layers={len(new_sources_by_layer)}, expected={self.num_layers}"
             )
-        suffix_counts = {len(sources) for sources in new_sources_by_layer}
+        suffix_counts = {
+            len(sources.pages) + len(sources.suffix)
+            if isinstance(sources, LayerPageSource)
+            else len(sources)
+            for sources in new_sources_by_layer
+        }
         if len(suffix_counts) != 1:
             raise ValueError(
                 "Sparse group pointer append has ragged suffix chunk count: "
@@ -1720,18 +1727,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if suffix_counts.pop() == 0:
             return
 
-        staged_rows = [
-            [
-                self._resolve_registered_cpu_source_device_ptr(
-                    source_obj,
-                    layer_id=layer_id,
-                    chunk_index=chunk_index,
-                    source="append_sparse_chunk_ptr_cache_for_layers",
-                )
-                for chunk_index, source_obj in enumerate(layer_sources)
+        staged_rows = self._layer_page_pointer_rows(new_sources_by_layer)
+        if staged_rows is None:
+            staged_rows = [
+                [
+                    self._resolve_registered_cpu_source_device_ptr(
+                        source_obj,
+                        layer_id=layer_id,
+                        chunk_index=chunk_index,
+                        source="append_sparse_chunk_ptr_cache_for_layers",
+                    )
+                    for chunk_index, source_obj in enumerate(
+                        _layer_source_memory_objs(layer_sources, layer_id)
+                    )
+                ]
+                for layer_id, layer_sources in enumerate(new_sources_by_layer)
             ]
-            for layer_id, layer_sources in enumerate(new_sources_by_layer)
-        ]
         prefix_counts = {
             len(cached_chunk_dev_ptrs[layer_id])
             if layer_id < len(cached_chunk_dev_ptrs)
@@ -1771,6 +1782,78 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if cached_chunk_ptrs_npu is not None:
                 assert row_views is not None
                 cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
+
+    def _layer_page_pointer_rows(
+        self,
+        sources_by_layer: Sequence[
+            Union[Sequence[Union[torch.Tensor, MemoryObj]], LayerPageSource]
+        ],
+    ) -> Optional[list[list[int]]]:
+        """Resolve a homogeneous layer-page batch once per physical page."""
+        if not sources_by_layer or not all(
+            isinstance(source, LayerPageSource)
+            and source.layer_id == layer_id
+            for layer_id, source in enumerate(sources_by_layer)
+        ):
+            return None
+        rows = list(sources_by_layer)
+        first = rows[0]
+        assert isinstance(first, LayerPageSource)
+        pages = first.pages
+        if any(
+            len(source.pages) != len(pages)
+            or any(left is not right for left, right in zip(source.pages, pages))
+            for source in rows
+            if isinstance(source, LayerPageSource)
+        ):
+            return None
+        layout = None
+        for page in pages:
+            prefixes = tuple(page.group_prefix_sum)
+            metadata = page.metadata
+            page_layout = (
+                page.layer_size,
+                metadata.fmt,
+                tuple(metadata.shapes or ()),
+                tuple(metadata.dtypes or ()),
+            )
+            if (
+                not page.valid
+                or page.num_layers != self.num_layers
+                or page.layer_size <= 0
+                or prefixes
+                != tuple(i * page.layer_size for i in range(self.num_layers + 1))
+                or len(page_layout[2]) != self.num_layers
+                or len(set(page_layout[2])) != 1
+                or len(page_layout[3]) != self.num_layers
+                or len(set(page_layout[3])) != 1
+                or (layout is not None and page_layout != layout)
+            ):
+                return None
+            layout = page_layout
+
+        result = [[] for _ in range(self.num_layers)]
+        for chunk_index, page in enumerate(pages):
+            base = self._resolve_registered_cpu_source_device_ptr(
+                page,
+                layer_id=0,
+                chunk_index=chunk_index,
+                source="append_sparse_chunk_ptr_cache_for_layers_page",
+            )
+            for layer_id, row in enumerate(result):
+                row.append(base + page.group_prefix_sum[layer_id])
+        for layer_id, source in enumerate(rows):
+            assert isinstance(source, LayerPageSource)
+            result[layer_id].extend(
+                self._resolve_registered_cpu_source_device_ptr(
+                    suffix,
+                    layer_id=layer_id,
+                    chunk_index=len(pages) + index,
+                    source="append_sparse_chunk_ptr_cache_for_layers_suffix",
+                )
+                for index, suffix in enumerate(source.suffix)
+            )
+        return result
 
     def _resolve_registered_cpu_source_device_ptr(
         self,

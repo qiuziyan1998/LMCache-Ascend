@@ -95,6 +95,117 @@ def test_layer_page_pointer_resolution_uses_selected_layer(monkeypatch) -> None:
     pages[0].ref_count_down()
 
 
+def _make_layer_page_sources():
+    allocator = TensorMemoryAllocator(torch.zeros(32768, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    suffix = [
+        allocator.allocate(
+            torch.Size([4]), torch.float16, MemoryFormat.KV_MLA_LATENT_FMT
+        )
+        for _ in range(2)
+    ]
+    assert pages is not None and all(obj is not None for obj in suffix)
+    return allocator, pages, suffix, [
+        LayerPageSource(tuple(pages), layer_id, (suffix[layer_id],))
+        for layer_id in range(2)
+    ]
+
+
+def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
+    _allocator, pages, suffix, sources = _make_layer_page_sources()
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    calls = []
+    monkeypatch.setattr(
+        lmc_ops,
+        "get_device_ptr",
+        lambda address: calls.append(address) or address + 1000,
+    )
+    tensor_calls = 0
+    original_tensor = torch.tensor
+
+    def counted_tensor(*args, **kwargs):
+        nonlocal tensor_calls
+        tensor_calls += 1
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", counted_tensor)
+    host_rows, npu_rows = [], []
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, npu_rows)
+
+    assert calls[:2] == [page.layer_data_ptr(0) for page in pages]
+    assert len(calls) == len(pages) + len(suffix)
+    assert host_rows == [
+        [page.layer_data_ptr(layer) + 1000 for page in pages]
+        + [suffix[layer].data_ptr + 1000]
+        for layer in range(2)
+    ]
+    assert [row.tolist() for row in npu_rows] == host_rows
+    assert (
+        npu_rows[0].untyped_storage().data_ptr()
+        == npu_rows[1].untyped_storage().data_ptr()
+    )
+    assert tensor_calls == 1
+    for obj in [*pages, *suffix]:
+        obj.ref_count_down()
+
+
+def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    calls = []
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda source, *, layer_id, chunk_index, **_kwargs: calls.append(
+            (source, layer_id, chunk_index)
+        )
+        or 100 * layer_id
+        + chunk_index,
+    )
+    rows = [[object(), object()], [object(), object()]]
+    host_rows = []
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(rows, host_rows, None)
+
+    assert host_rows == [[0, 1], [100, 101]]
+    assert len(calls) == 4
+
+
+def test_group_pointer_append_falls_back_for_malformed_page_layout(
+    monkeypatch,
+) -> None:
+    _allocator, pages, suffix, sources = _make_layer_page_sources()
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    pages[0].group_prefix_sum = (0, pages[0].layer_size, pages[0].layer_size + 1)
+    calls = []
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda _source, *, layer_id, chunk_index, **_kwargs: calls.append(
+            (layer_id, chunk_index)
+        )
+        or 100 * layer_id
+        + chunk_index,
+    )
+    host_rows = []
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, None)
+
+    assert host_rows == [[0, 1, 2], [100, 101, 102]]
+    assert len(calls) == 6
+    for obj in [*pages, *suffix]:
+        obj.ref_count_down()
+
+
 def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")
