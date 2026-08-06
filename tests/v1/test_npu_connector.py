@@ -1541,6 +1541,94 @@ def test_prepare_dense_direct_chunk_metadata() -> None:
         )
 
 
+def _staging_batched_to_gpu(
+    monkeypatch, *, fail_transfer: bool = False
+) -> tuple[Any, list[bool]]:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kvcaches = [(object(), object())]
+    connector.use_gpu = True
+    connector.load_stream = _NoopStream()
+    layout = _DenseLayout()
+    layout.gpu_buffer_allocator = object()
+    releases = []
+    staging_obj = SimpleNamespace(
+        tensor=torch.zeros(1), ref_count_down=lambda: releases.append(True)
+    )
+
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _NoopStream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda *_args, **_kwargs: layout,
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda _group=0: False)
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda _group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda _group=0: False)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda _group=0: False
+    )
+    monkeypatch.setattr(
+        connector, "_check_layerwise_transfer_invariants", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        connector,
+        "_allocate_layerwise_staging_buffer",
+        lambda **_kwargs: (staging_obj, staging_obj.tensor),
+    )
+
+    def transfer(*_args, **_kwargs):
+        if fail_transfer:
+            raise RuntimeError("transfer failed")
+
+    monkeypatch.setattr(
+        npu_connectors, "batched_fused_single_layer_kv_transfer", transfer
+    )
+    generator = connector.batched_to_gpu(
+        [0],
+        [1],
+        slot_mapping=torch.arange(1),
+        sync=False,
+        kv_group=0,
+    )
+    return generator, releases
+
+
+def test_staging_batched_to_gpu_releases_buffer_on_completion(monkeypatch) -> None:
+    generator, releases = _staging_batched_to_gpu(monkeypatch)
+    next(generator)
+    generator.send([_MemoryObj(torch.zeros(1))])
+    assert releases == []
+    next(generator)
+    assert releases == [True]
+    with pytest.raises(StopIteration):
+        next(generator)
+    assert releases == [True]
+
+
+def test_staging_batched_to_gpu_releases_buffer_on_error(monkeypatch) -> None:
+    generator, releases = _staging_batched_to_gpu(monkeypatch, fail_transfer=True)
+    next(generator)
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        generator.send([_MemoryObj(torch.zeros(1))])
+    assert releases == [True]
+
+
+def test_staging_batched_to_gpu_releases_buffer_on_close(monkeypatch) -> None:
+    generator, releases = _staging_batched_to_gpu(monkeypatch)
+    next(generator)
+    generator.close()
+    generator.close()
+    assert releases == [True]
+
+
 def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1

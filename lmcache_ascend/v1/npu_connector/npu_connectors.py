@@ -3721,106 +3721,90 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             )
 
-        validated_page_ids: set[int] = set()
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = yield
-            source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
-            page_checks: tuple[MemoryObj, ...] = ()
-            format_sources = source_objs
-            if isinstance(memory_objs_layer, LayerPageSource):
-                page_checks = tuple(
-                    page
-                    for page in memory_objs_layer.pages
-                    if id(page) not in validated_page_ids
+        try:
+            validated_page_ids: set[int] = set()
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = yield
+                source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
+                page_checks: tuple[MemoryObj, ...] = ()
+                format_sources = source_objs
+                if isinstance(memory_objs_layer, LayerPageSource):
+                    page_checks = tuple(
+                        page
+                        for page in memory_objs_layer.pages
+                        if id(page) not in validated_page_ids
+                    )
+                    format_sources = (*page_checks, *memory_objs_layer.suffix)
+                if any(obj.metadata.fmt != expected_fmt for obj in format_sources):
+                    raise ValueError(f"Expected memory format {expected_fmt}.")
+                validated_page_ids.update(map(id, page_checks))
+                pointer_first = dense_direct and bool(source_objs)
+                cpu_tensors = (
+                    [_layer_memory_tensor(source_objs[0], layer_id)]
+                    if pointer_first
+                    else _layer_source_tensors(memory_objs_layer, layer_id, expected_fmt)
                 )
-                format_sources = (*page_checks, *memory_objs_layer.suffix)
-            if any(obj.metadata.fmt != expected_fmt for obj in format_sources):
-                raise ValueError(f"Expected memory format {expected_fmt}.")
-            validated_page_ids.update(map(id, page_checks))
-            pointer_first = dense_direct and bool(source_objs)
-            cpu_tensors = (
-                [_layer_memory_tensor(source_objs[0], layer_id)]
-                if pointer_first
-                else _layer_source_tensors(memory_objs_layer, layer_id, expected_fmt)
-            )
-            # The generator is resumed from vLLM's attention path; refresh the
-            # active compute stream per layer before ordering load -> compute.
-            current_stream = torch.cuda.current_stream()
-            if sync:
-                current_stream.wait_stream(self.load_stream)
-            if layer_id > 0 and logger.isEnabledFor(10):
-                logger.debug("Finished loading layer %d", layer_id - 1)
-            # memobj -> gpu_buffer -> kvcaches
-            if dense_direct:
-                if pointer_first:
-                    chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
-                        layer_id,
-                        cpu_tensors,
-                        cached_chunk_ptrs_npu,
-                        expected_num_chunks=len(source_objs),
-                        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
-                        source_objs=source_objs,
+                # The generator is resumed from vLLM's attention path; refresh the
+                # active compute stream per layer before ordering load -> compute.
+                current_stream = torch.cuda.current_stream()
+                if sync:
+                    current_stream.wait_stream(self.load_stream)
+                if layer_id > 0 and logger.isEnabledFor(10):
+                    logger.debug("Finished loading layer %d", layer_id - 1)
+                # memobj -> gpu_buffer -> kvcaches
+                if dense_direct:
+                    if pointer_first:
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id,
+                            cpu_tensors,
+                            cached_chunk_ptrs_npu,
+                            expected_num_chunks=len(source_objs),
+                            cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                            source_objs=source_objs,
+                        )
+                    else:
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id,
+                            cpu_tensors,
+                            cached_chunk_ptrs_npu,
+                            cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                        )
+                    assert chunk_offsets_npu is not None
+                    assert chunk_sizes_npu is not None
+                    self._run_dense_direct_kv_transfer_layer(
+                        kvcaches_ref=kvcaches_snapshot,
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        transfer_stream=self.load_stream,
+                        current_stream=current_stream,
+                        slot_mapping_full=slot_mapping_full,
+                        chunk_ptrs_npu=chunk_ptrs_npu,
+                        chunk_offsets_npu=chunk_offsets_npu,
+                        chunk_sizes_npu=chunk_sizes_npu,
+                        total_tokens=num_tokens,
+                        fixed_chunk_size=dense_fixed_chunk_size,
+                        dense_kv_format=kv_format_value,
+                        dense_token_major=token_major,
+                        dense_vllm_two_major=vllm_two_major,
+                        dense_k_hidden_dims=k_hidden_dims,
+                        dense_v_hidden_dims=v_hidden_dims,
+                        dense_dsa_hidden_dims=dsa_hidden_dims,
+                        dense_host_interleaved=dense_host_interleaved,
+                        layer_tensors=cpu_tensors,
+                        direction=False,
                     )
                 else:
-                    chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
-                        layer_id,
-                        cpu_tensors,
-                        cached_chunk_ptrs_npu,
-                        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
-                    )
-                assert chunk_offsets_npu is not None
-                assert chunk_sizes_npu is not None
-                self._run_dense_direct_kv_transfer_layer(
-                    kvcaches_ref=kvcaches_snapshot,
-                    kv_group=kv_group,
-                    layer_id=layer_id,
-                    transfer_stream=self.load_stream,
-                    current_stream=current_stream,
-                    slot_mapping_full=slot_mapping_full,
-                    chunk_ptrs_npu=chunk_ptrs_npu,
-                    chunk_offsets_npu=chunk_offsets_npu,
-                    chunk_sizes_npu=chunk_sizes_npu,
-                    total_tokens=num_tokens,
-                    fixed_chunk_size=dense_fixed_chunk_size,
-                    dense_kv_format=kv_format_value,
-                    dense_token_major=token_major,
-                    dense_vllm_two_major=vllm_two_major,
-                    dense_k_hidden_dims=k_hidden_dims,
-                    dense_v_hidden_dims=v_hidden_dims,
-                    dense_dsa_hidden_dims=dsa_hidden_dims,
-                    dense_host_interleaved=dense_host_interleaved,
-                    layer_tensors=cpu_tensors,
-                    direction=False,
-                )
-            else:
-                with torch.cuda.stream(self.load_stream):
-                    if self.use_gpu:
-                        # Fused transfer: N H2D memcpy + 1 scatter kernel
-                        batched_fused_single_layer_kv_transfer(
-                            cpu_tensors,  # CPU memory objects
-                            staging_tensor,  # GPU staging buffer
-                            kvcaches_snapshot[layer_id],
-                            slot_mapping_full,
-                            chunk_offsets,  # offset for each chunk
-                            chunk_sizes,  # size for each chunk
-                            False,  # to_gpu
-                            kv_format_value,
-                            token_major,
-                            vllm_two_major,
-                            k_hidden_dims,
-                            v_hidden_dims,
-                            dsa_hidden_dims,
-                        )
-
-                    else:
-                        for start, end, tensor in zip(
-                            starts, ends, cpu_tensors, strict=False
-                        ):
-                            lmc_ops.single_layer_kv_transfer(
-                                tensor,
+                    with torch.cuda.stream(self.load_stream):
+                        if self.use_gpu:
+                            # Fused transfer: N H2D memcpy + 1 scatter kernel
+                            batched_fused_single_layer_kv_transfer(
+                                cpu_tensors,  # CPU memory objects
+                                staging_tensor,  # GPU staging buffer
                                 kvcaches_snapshot[layer_id],
-                                slot_mapping[start:end],
-                                False,
+                                slot_mapping_full,
+                                chunk_offsets,  # offset for each chunk
+                                chunk_sizes,  # size for each chunk
+                                False,  # to_gpu
                                 kv_format_value,
                                 token_major,
                                 vllm_two_major,
@@ -3828,22 +3812,40 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 v_hidden_dims,
                                 dsa_hidden_dims,
                             )
-                    if logger.isEnabledFor(10):
-                        logger.debug("Finished loading layer %d", layer_id)
-                continue
-            if logger.isEnabledFor(10):
-                logger.debug("Finished loading layer %d", layer_id)
-        yield
 
-        # synchronize the last layer
-        if sync:
-            current_stream.wait_stream(self.load_stream)
+                        else:
+                            for start, end, tensor in zip(
+                                starts, ends, cpu_tensors, strict=False
+                            ):
+                                lmc_ops.single_layer_kv_transfer(
+                                    tensor,
+                                    kvcaches_snapshot[layer_id],
+                                    slot_mapping[start:end],
+                                    False,
+                                    kv_format_value,
+                                    token_major,
+                                    vllm_two_major,
+                                    k_hidden_dims,
+                                    v_hidden_dims,
+                                    dsa_hidden_dims,
+                                )
+                        if logger.isEnabledFor(10):
+                            logger.debug("Finished loading layer %d", layer_id)
+                    continue
+                if logger.isEnabledFor(10):
+                    logger.debug("Finished loading layer %d", layer_id)
+            yield
 
-        # free the buffer memory
-        if self.use_gpu and tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
-
-        yield
+            # synchronize the last layer
+            if sync:
+                current_stream.wait_stream(self.load_stream)
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+                tmp_gpu_buffer_obj = None
+            yield
+        finally:
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
 
     def _batched_to_gpu_head_token_wise_prepared(
         self,
