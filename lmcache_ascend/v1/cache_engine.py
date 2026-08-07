@@ -537,7 +537,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         owners: dict[int, torch.Tensor] = {}
         group_ends: dict[int, int] = {}
         merged_runs = 0
-        tails: list[tuple[int, list, int]] = []
         chunk_size = int(self.config.chunk_size)
         planner = getattr(self.gpu_connector, "plan_direct_page_sources", None)
         if not callable(planner):
@@ -666,10 +665,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # contiguous committed prefix once this batch succeeds.
                 group_ends[group] = candidate_ends[group]
 
-            aligned_end = len(tokens) // chunk_size * chunk_size
-            if final and aligned_end < len(tokens):
-                tails.append((group, kvcaches, max(submitted, aligned_end)))
-
         if started is not None:
             cold_start_perf_log(
                 logger,
@@ -681,6 +676,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 buffers=sum(map(len, ptrs)),
                 merged_runs=merged_runs,
                 bytes=sum(map(sum, sizes)),
+                token_count=len(tokens),
+                final=final,
+                submitted_ends=dict(state.submitted_end),
+                committed_ends=dict(state.committed_end),
             )
         if keys:
             ready_event = torch.npu.Event()
@@ -739,32 +738,56 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
             )
 
-        # A partial tail cannot advance the committed frontier past an
-        # unfinished full-page write. Final prefill already requires this
-        # fence, so doing it here preserves both ownership and retry order.
-        if tails:
+        # Final publication is also the chunked-prefill correctness fence.
+        # Repair any range that an earlier forward did not submit before vLLM
+        # releases its blocks; this also stores the ordinary partial tail.
+        if final:
             with self._store_cv:
                 self._pending_store_reqs[req_id] = (
                     self._pending_store_reqs.get(req_id, 0) + 1
                 )
             try:
                 self.wait_for_direct_stores((req_id,))
-                for group, kvcaches, tail_start in tails:
-                    if state.committed_end.get(group, 0) >= len(tokens):
+                repaired = False
+                for group, kvcaches in group_caches.items():
+                    committed = state.committed_end.get(group, 0)
+                    if committed >= len(tokens):
                         continue
-                    committed = self._store_direct_cpu_group(
+                    repair_started = cold_start_perf_now()
+                    repaired_end = self._store_direct_cpu_group(
                         req_id,
                         tokens,
                         kvcaches,
                         slot_mappings[group],
                         group,
-                        tail_start,
+                        committed,
                         request_configs,
                     )
-                    state.committed_end[group] = max(
-                        state.committed_end.get(group, 0), committed
+                    if repaired_end < len(tokens):
+                        raise RuntimeError(
+                            "Direct prefill store did not cover the final prefix: "
+                            f"req_id={req_id} group={group} "
+                            f"committed={repaired_end} required={len(tokens)}"
+                        )
+                    state.committed_end[group] = repaired_end
+                    state.submitted_end[group] = repaired_end
+                    repaired = True
+                    if cold_start_perf_enabled():
+                        cold_start_perf_log(
+                            logger,
+                            "direct_npu_cpu_retry",
+                            started=repair_started,
+                            req_id=req_id,
+                            kv_group=group,
+                            reason="incomplete_final_coverage",
+                            committed_end=committed,
+                            required_end=len(tokens),
+                        )
+                if repaired:
+                    logger.warning(
+                        "Repaired incomplete direct prefill coverage for %s",
+                        req_id,
                     )
-                    state.submitted_end[group] = state.committed_end[group]
             finally:
                 with self._store_cv:
                     count = self._pending_store_reqs.get(req_id, 1) - 1

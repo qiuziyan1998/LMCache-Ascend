@@ -145,6 +145,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if not expected.issubset(self._direct_store_observed_layers):
             return
 
+        self._submit_direct_prefill_requests(requests)
+        self._direct_store_observed_layers.clear()
+
+    def _submit_direct_prefill_requests(self, requests: list[ReqMeta]) -> None:
+        """Submit direct pages; also used by the wait-for-save fallback."""
+        assert self.lmcache_engine is not None
         self._refresh_kvcaches_list()
         group_caches = {0: self._kvcaches_for_group(0)}
         if self.config.dsa_two_groups:
@@ -171,7 +177,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 request.request_configs,
                 final=request.is_last_prefill,
             )
-        self._direct_store_observed_layers.clear()
 
     def _effective_skip_leading_tokens(
         self,
@@ -215,8 +220,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
             self.lmcache_engine.wait_for_pending_sync_stores()
             requests = self._direct_prefill_requests() or []
+            final_requests = [
+                request for request in requests if request.is_last_prefill
+            ]
+            if final_requests:
+                # Some chunked-prefill forward paths do not visit every
+                # registered KV layer. Submit from the final metadata before
+                # fencing so an absent layer callback cannot silently omit pages.
+                self._submit_direct_prefill_requests(final_requests)
             final_ids = {
-                request.req_id for request in requests if request.is_last_prefill
+                request.req_id for request in final_requests
             }
             if final_ids:
                 self.lmcache_engine.wait_for_direct_stores(final_ids)
