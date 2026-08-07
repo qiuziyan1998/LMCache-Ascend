@@ -32,6 +32,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
         super().__init__(vllm_config, role, parent)
+        # LMCache-NPU initializes this field only for worker connectors;
+        # EngineCore also constructs this implementation for the scheduler.
+        self.use_layerwise = bool(
+            getattr(
+                self,
+                "use_layerwise",
+                getattr(self.config, "use_layerwise", False),
+            )
+        )
         self.store_async = self.config.store_async
         get_extra = getattr(self.config, "get_extra_config_value", None)
         self._direct_store_requested = bool(
