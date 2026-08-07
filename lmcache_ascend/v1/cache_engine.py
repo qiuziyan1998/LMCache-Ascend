@@ -5,7 +5,10 @@ LMCacheEngine for Ascend NPU.
 """
 
 # Standard
-from concurrent.futures import Future, wait
+from collections import deque
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError, wait
+from dataclasses import dataclass, field
+from weakref import WeakSet
 import json
 import os
 import queue
@@ -51,6 +54,25 @@ logger = init_logger(__name__)
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
+
+
+@dataclass(slots=True)
+class _DirectStoreRequestState:
+    futures: deque[Future] = field(default_factory=deque)
+    pending_keys: set[str] = field(default_factory=set)
+    submitted_end: dict[int, int] = field(default_factory=dict)
+    committed_end: dict[int, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _DirectPageBatch:
+    req_id: str
+    keys: List[CacheEngineKey]
+    ptrs: List[List[int]]
+    sizes: List[List[int]]
+    owners: tuple[torch.Tensor, ...]
+    ready_event: Any
+    group_ends: dict[int, int]
 
 
 
@@ -254,6 +276,21 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self.is_store_async = self.config.store_async
         self._pending_sync_store_futures: set[Future] = set()
+        self._require_store_completion = False
+        self._direct_store_enabled = bool(
+            self.is_store_async
+            and self.config.get_extra_config_value(
+                "mooncake_direct_npu_prefill_store", False
+            )
+            and self._is_passive() is False
+            and mooncake_layer_pages_enabled(self.config)
+            and not self.config.get_extra_config_value("save_chunk_meta", False)
+            and self.config.get_extra_config_value("use_ascend_direct", False)
+        )
+        self._direct_store_states: dict[str, _DirectStoreRequestState] = {}
+        self._direct_store_jobs: deque[Future] = deque()
+        self._direct_retry_args: dict[Future, tuple[Any, ...]] = {}
+        self._direct_completed_futures: WeakSet[Future] = WeakSet()
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
         if self.is_store_async:
             self._store_queue: Optional[queue.Queue] = None
@@ -292,7 +329,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def post_init(self, **kwargs) -> None:
         super().post_init(**kwargs)
-        if self.is_store_async:
+        if self.is_store_async and not self._direct_store_enabled:
             self._device_id = torch.npu.current_device()
             self._ensure_store_worker()
             queue_mode = "unbounded" if self._store_queue_maxsize == 0 else "bounded"
@@ -301,6 +338,576 @@ class AscendLMCacheEngine(LMCacheEngine):
                 queue_mode,
                 self._store_queue_maxsize,
             )
+        elif self._direct_store_enabled:
+            logger.info(
+                "Direct NPU prefill store enabled: max_queue_size=%d",
+                self._store_queue_maxsize,
+            )
+
+    def direct_prefill_store_enabled(self) -> bool:
+        """Return whether this worker can use direct NPU page publication."""
+        return self._direct_store_enabled
+
+    def _wait_direct_backpressure(self) -> None:
+        limit = self._store_queue_maxsize or 2
+        while len(self._direct_store_jobs) >= limit:
+            future = self._direct_store_jobs[0]
+            _, pending = wait(
+                (future,), timeout=self.config.blocking_timeout_secs
+            )
+            if pending:
+                raise TimeoutError("Timed out waiting for direct-store queue space")
+            self._direct_store_jobs.popleft()
+
+    def _direct_store_done(
+        self,
+        req_id: str,
+        key_strings: set[str],
+        group_ends: dict[int, int],
+        future: Future,
+    ) -> None:
+        with self._store_cv:
+            if future in self._direct_completed_futures:
+                return
+            state = self._direct_store_states.get(req_id)
+            try:
+                succeeded = not future.cancelled() and future.exception() is None
+            except Exception:
+                succeeded = False
+            if state is not None:
+                if succeeded:
+                    state.pending_keys.difference_update(key_strings)
+            if not succeeded:
+                return
+            self._direct_completed_futures.add(future)
+            count = self._pending_store_reqs.get(req_id, 1) - 1
+            if count <= 0:
+                self._pending_store_reqs.pop(req_id, None)
+            else:
+                self._pending_store_reqs[req_id] = count
+            self._store_cv.notify_all()
+
+    def _submit_direct_page_batch(self, batch: _DirectPageBatch) -> Future:
+        assert self.storage_manager is not None
+        self._wait_direct_backpressure()
+        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        state = self._direct_store_states.setdefault(
+            batch.req_id, _DirectStoreRequestState()
+        )
+        key_strings = {key.to_string() for key in batch.keys}
+        state.pending_keys.update(key_strings)
+        with self._store_cv:
+            self._pending_store_reqs[batch.req_id] = (
+                self._pending_store_reqs.get(batch.req_id, 0) + 1
+            )
+        try:
+            future = self.storage_manager.batched_put_external_pages(
+                batch.keys,
+                batch.ptrs,
+                batch.sizes,
+                batch.owners,
+                batch.ready_event,
+                batch.req_id,
+            )
+        except Exception:
+            state.pending_keys.difference_update(key_strings)
+            with self._store_cv:
+                count = self._pending_store_reqs.get(batch.req_id, 1) - 1
+                if count <= 0:
+                    self._pending_store_reqs.pop(batch.req_id, None)
+                else:
+                    self._pending_store_reqs[batch.req_id] = count
+                self._store_cv.notify_all()
+            raise
+        state.futures.append(future)
+        self._direct_store_jobs.append(future)
+        if started is not None:
+            cold_start_perf_log(
+                logger,
+                "direct_npu_submit",
+                started=started,
+                req_id=batch.req_id,
+                pages=len(batch.keys),
+                queue_depth=len(self._direct_store_jobs),
+            )
+        return future
+
+    def _store_direct_cpu_group(
+        self,
+        req_id: str,
+        tokens: list[int],
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        kv_group: int,
+        start: int,
+        request_configs: Optional[dict],
+    ) -> int:
+        if start >= len(tokens):
+            return start
+        mask = torch.zeros(len(tokens), dtype=torch.bool)
+        mask[start:] = True
+        storer = self.store_layer(
+            tokens,
+            mask=mask,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            offset=start,
+            sync=True,
+            req_id=req_id,
+            kv_group=kv_group,
+            request_configs=request_configs,
+            require_completion=True,
+        )
+        self._require_store_completion = True
+        try:
+            result = None
+            while True:
+                try:
+                    value = next(storer)
+                    if value is not None:
+                        result = value
+                except StopIteration:
+                    break
+            self.wait_for_pending_sync_stores()
+        finally:
+            self._require_store_completion = False
+        return int(getattr(result, "committed_end", start) or start)
+
+    def _retry_direct_cpu(
+        self,
+        req_id: str,
+        tokens: list[int],
+        group_caches: dict[int, list],
+        slot_mappings: dict[int, torch.Tensor],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+    ) -> None:
+        for group, kvcaches in group_caches.items():
+            committed = self._store_direct_cpu_group(
+                req_id,
+                tokens,
+                kvcaches,
+                slot_mappings[group],
+                group,
+                state.committed_end.get(group, 0),
+                request_configs,
+            )
+            state.committed_end[group] = committed
+            state.submitted_end[group] = committed
+
+    def store_direct_prefill(
+        self,
+        req_id: str,
+        tokens: list[int],
+        group_caches: dict[int, list],
+        slot_mappings: dict[int, torch.Tensor],
+        request_configs: Optional[dict] = None,
+        final: bool = False,
+    ) -> bool:
+        """Publish new full pages from NPU and stage only the final tail on CPU."""
+        if not self._direct_store_enabled or not group_caches:
+            return False
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+        state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
+        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        plan0 = list(
+            self.token_database.process_tokens(
+                tokens=tokens, request_configs=request_configs, kv_group=0
+            )
+        )
+        hashes = [int(key.chunk_hash) for _, _, key in plan0]
+        offsets = [int(end - start) for start, end, _ in plan0]
+        plans = {0: plan0}
+        for group in group_caches:
+            if group == 0:
+                continue
+            plans[group] = list(
+                self.token_database.process_tokens(
+                    hashes=hashes,
+                    offsets=offsets,
+                    request_configs=request_configs,
+                    kv_group=group,
+                )
+            )
+
+        keys: List[CacheEngineKey] = []
+        ptrs: List[List[int]] = []
+        sizes: List[List[int]] = []
+        owners: dict[int, torch.Tensor] = {}
+        group_ends: dict[int, int] = {}
+        merged_runs = 0
+        tails: list[tuple[int, list, int]] = []
+        chunk_size = int(self.config.chunk_size)
+        planner = getattr(self.gpu_connector, "plan_direct_page_sources", None)
+        if not callable(planner):
+            self.wait_for_direct_stores((req_id,))
+            self._retry_direct_cpu(
+                req_id,
+                tokens,
+                group_caches,
+                slot_mappings,
+                request_configs,
+                state,
+            )
+            return True
+
+        candidates: dict[int, list[tuple[int, int, CacheEngineKey]]] = {}
+        candidate_ends: dict[int, int] = {}
+        candidate_refs: list[tuple[int, tuple[int, int, CacheEngineKey]]] = []
+        for group in group_caches:
+            submitted = state.submitted_end.get(group, 0)
+            group_candidates = [
+                (start, end, key)
+                for start, end, key in plans[group]
+                if start >= submitted and end - start == chunk_size
+            ]
+            candidates[group] = group_candidates
+            candidate_refs.extend((group, item) for item in group_candidates)
+            if group_candidates:
+                candidate_ends[group] = group_candidates[-1][1]
+
+        try:
+            exists = (
+                self.storage_manager.batched_external_pages_exist(
+                    [item[2] for _, item in candidate_refs]
+                )
+                if candidate_refs
+                else []
+            )
+        except Exception:
+            self.wait_for_direct_stores((req_id,))
+            self._retry_direct_cpu(
+                req_id,
+                tokens,
+                group_caches,
+                slot_mappings,
+                request_configs,
+                state,
+            )
+            return True
+        if len(exists) != len(candidate_refs):
+            raise RuntimeError("Direct page lookup returned an invalid result count")
+        candidates = {group: [] for group in group_caches}
+        missing_by_group: set[int] = set()
+        for (group, item), present in zip(candidate_refs, exists, strict=True):
+            if present:
+                continue
+            missing_by_group.add(group)
+            candidates[group].append(item)
+        for group in group_caches.keys() - missing_by_group:
+            if group in candidate_ends:
+                state.submitted_end[group] = max(
+                    state.submitted_end.get(group, 0), candidate_ends[group]
+                )
+            if not state.futures:
+                state.committed_end[group] = max(
+                    state.committed_end.get(group, 0),
+                    state.submitted_end.get(group, 0),
+                )
+
+        for group, kvcaches in group_caches.items():
+            submitted = state.committed_end.get(group, 0)
+            full = candidates[group]
+            full = [
+                item
+                for item in full
+                if item[2].to_string() not in state.pending_keys
+            ]
+            if full:
+                starts = [start for start, _, _ in full]
+                ends = [end for _, end, _ in full]
+                planned = planner(
+                    kvcaches, slot_mappings[group], starts, ends, group
+                )
+                if planned is None:
+                    self.wait_for_direct_stores((req_id,))
+                    committed = self._store_direct_cpu_group(
+                        req_id,
+                        tokens,
+                        kvcaches,
+                        slot_mappings[group],
+                        group,
+                        submitted,
+                        request_configs,
+                    )
+                    state.committed_end[group] = committed
+                    state.submitted_end[group] = committed
+                    continue
+                group_ptrs, group_sizes, group_owners = planned
+                max_buffers = int(
+                    self.config.get_extra_config_value(
+                        "mooncake_direct_max_buffers_per_page", 4096
+                    )
+                )
+                if any(len(page_ptrs) > max_buffers for page_ptrs in group_ptrs):
+                    self.wait_for_direct_stores((req_id,))
+                    committed = self._store_direct_cpu_group(
+                        req_id,
+                        tokens,
+                        kvcaches,
+                        slot_mappings[group],
+                        group,
+                        submitted,
+                        request_configs,
+                    )
+                    state.committed_end[group] = committed
+                    state.submitted_end[group] = committed
+                    continue
+                merged_runs += sum(
+                    len(page_ptrs) // len(group_owners)
+                    for page_ptrs in group_ptrs
+                )
+                keys.extend(key for _, _, key in full)
+                ptrs.extend(group_ptrs)
+                sizes.extend(group_sizes)
+                owners.update((id(owner), owner) for owner in group_owners)
+                # Existing pages between missing pages are part of the same
+                # contiguous committed prefix once this batch succeeds.
+                group_ends[group] = candidate_ends[group]
+
+            aligned_end = len(tokens) // chunk_size * chunk_size
+            if final and aligned_end < len(tokens):
+                tails.append((group, kvcaches, max(submitted, aligned_end)))
+
+        if started is not None:
+            cold_start_perf_log(
+                logger,
+                "direct_npu_plan",
+                started=started,
+                req_id=req_id,
+                groups=sorted(group_caches),
+                pages=len(keys),
+                buffers=sum(map(len, ptrs)),
+                merged_runs=merged_runs,
+                bytes=sum(map(sum, sizes)),
+            )
+        if keys:
+            ready_event = torch.npu.Event()
+            ready_event.record()
+            batch = _DirectPageBatch(
+                req_id,
+                keys,
+                ptrs,
+                sizes,
+                tuple(owners.values()),
+                ready_event,
+                group_ends,
+            )
+            try:
+                future = self._submit_direct_page_batch(batch)
+            except Exception as error:
+                retry_started = cold_start_perf_now()
+                self.wait_for_direct_stores((req_id,))
+                self._retry_direct_cpu(
+                    req_id,
+                    tokens,
+                    group_caches,
+                    slot_mappings,
+                    request_configs,
+                    state,
+                )
+                if cold_start_perf_enabled():
+                    cold_start_perf_log(
+                        logger,
+                        "direct_npu_cpu_retry",
+                        started=retry_started,
+                        req_id=req_id,
+                        reason=type(error).__name__,
+                        failed_pages=len(keys),
+                    )
+                return True
+            for group, end in group_ends.items():
+                state.submitted_end[group] = max(
+                    state.submitted_end.get(group, 0), end
+                )
+            self._direct_retry_args[future] = (
+                req_id,
+                tokens,
+                group_caches,
+                slot_mappings,
+                request_configs,
+                {key.to_string() for key in keys},
+                group_ends,
+            )
+            future.add_done_callback(
+                lambda done: self._direct_store_done(
+                    req_id,
+                    {key.to_string() for key in keys},
+                    group_ends,
+                    done,
+                )
+            )
+
+        # A partial tail cannot advance the committed frontier past an
+        # unfinished full-page write. Final prefill already requires this
+        # fence, so doing it here preserves both ownership and retry order.
+        if tails:
+            with self._store_cv:
+                self._pending_store_reqs[req_id] = (
+                    self._pending_store_reqs.get(req_id, 0) + 1
+                )
+            try:
+                self.wait_for_direct_stores((req_id,))
+                for group, kvcaches, tail_start in tails:
+                    if state.committed_end.get(group, 0) >= len(tokens):
+                        continue
+                    committed = self._store_direct_cpu_group(
+                        req_id,
+                        tokens,
+                        kvcaches,
+                        slot_mappings[group],
+                        group,
+                        tail_start,
+                        request_configs,
+                    )
+                    state.committed_end[group] = max(
+                        state.committed_end.get(group, 0), committed
+                    )
+                    state.submitted_end[group] = state.committed_end[group]
+            finally:
+                with self._store_cv:
+                    count = self._pending_store_reqs.get(req_id, 1) - 1
+                    if count <= 0:
+                        self._pending_store_reqs.pop(req_id, None)
+                    else:
+                        self._pending_store_reqs[req_id] = count
+                    self._store_cv.notify_all()
+        return True
+
+    def wait_for_direct_stores(self, req_ids: Iterable[str]) -> set[str]:
+        """Fence request-owned direct puts before vLLM may release KV blocks."""
+        waited: set[str] = set()
+        for req_id in req_ids:
+            state = self._direct_store_states.get(req_id)
+            if state is None:
+                continue
+            started = cold_start_perf_now() if cold_start_perf_enabled() else None
+            outstanding = len(state.futures)
+            failed: list[tuple[Future, tuple[Any, ...], Exception]] = []
+            while state.futures:
+                future = state.futures.popleft()
+                error = None
+                try:
+                    try:
+                        future.result(timeout=self.config.blocking_timeout_secs)
+                    except FutureTimeoutError:
+                        logger.warning(
+                            "Direct NPU page store exceeded the blocking timeout "
+                            "for %s; waiting for the uncancellable native read "
+                            "before releasing KV blocks",
+                            req_id,
+                        )
+                        future.result()
+                except Exception as caught:
+                    error = caught
+                retry = self._direct_retry_args.pop(future, None)
+                if retry is None:
+                    if error is not None:
+                        raise error
+                    continue
+                if error is None:
+                    self._direct_store_done(req_id, retry[-2], retry[-1], future)
+                else:
+                    failed.append((future, retry, error))
+
+            if failed:
+                retry_started = cold_start_perf_now()
+                verified_ends = dict(state.submitted_end)
+                latest_by_group: dict[int, tuple[Any, ...]] = {}
+                failed_end_by_group: dict[int, int] = {}
+                for _, retry, _ in failed:
+                    for group in retry[-1]:
+                        previous = latest_by_group.get(group)
+                        if previous is None or len(retry[1]) > len(previous[1]):
+                            latest_by_group[group] = retry
+                    for group, end in retry[-1].items():
+                        failed_end_by_group[group] = max(
+                            failed_end_by_group.get(group, 0), end
+                        )
+                logger.warning(
+                    "Direct NPU page store failed for %s; retrying through the "
+                    "CPU layerwise path after draining %d direct job(s): %s",
+                    req_id,
+                    outstanding,
+                    failed[0][2],
+                )
+                try:
+                    for group, retry in latest_by_group.items():
+                        _, tokens, group_caches, slot_mappings, configs, _, _ = retry
+                        committed = self._store_direct_cpu_group(
+                            req_id,
+                            tokens,
+                            group_caches[group],
+                            slot_mappings[group],
+                            group,
+                            state.committed_end.get(group, 0),
+                            configs,
+                        )
+                        required_end = failed_end_by_group.get(group, 0)
+                        if committed < required_end:
+                            raise RuntimeError(
+                                "CPU retry did not restore direct-store coverage: "
+                                f"req_id={req_id} group={group} "
+                                f"committed={committed} required={required_end}"
+                            )
+                        state.committed_end[group] = committed
+                    for group, end in verified_ends.items():
+                        state.submitted_end[group] = end
+                        state.committed_end[group] = max(
+                            state.committed_end.get(group, 0), end
+                        )
+                finally:
+                    with self._store_cv:
+                        for future, retry, _ in failed:
+                            self._direct_completed_futures.add(future)
+                            state.pending_keys.difference_update(retry[-2])
+                            count = self._pending_store_reqs.get(req_id, 1) - 1
+                            if count <= 0:
+                                self._pending_store_reqs.pop(req_id, None)
+                            else:
+                                self._pending_store_reqs[req_id] = count
+                        self._store_cv.notify_all()
+                if cold_start_perf_enabled():
+                    cold_start_perf_log(
+                        logger,
+                        "direct_npu_cpu_retry",
+                        started=retry_started,
+                        req_id=req_id,
+                        reason=type(failed[0][2]).__name__,
+                        failed_pages=sum(
+                            len(getattr(error, "failed_pages", ()))
+                            for _, _, error in failed
+                        )
+                        or "unknown",
+                    )
+            else:
+                for group, end in state.submitted_end.items():
+                    state.committed_end[group] = max(
+                        state.committed_end.get(group, 0), end
+                    )
+            waited.add(req_id)
+            if started is not None:
+                cold_start_perf_log(
+                    logger,
+                    "direct_npu_final_wait",
+                    started=started,
+                    req_id=req_id,
+                    outstanding_jobs=outstanding,
+                )
+        return waited
+
+    def drop_direct_store_states(self, req_ids: Iterable[str]) -> None:
+        """Forget completed request bookkeeping after vLLM releases ownership."""
+        for req_id in req_ids:
+            state = self._direct_store_states.get(req_id)
+            if state is not None and not state.futures and not state.pending_keys:
+                self._direct_store_states.pop(req_id, None)
+
+    def direct_store_committed_ends(self, req_id: str) -> dict[int, int]:
+        """Return a snapshot of successfully persisted group frontiers."""
+        state = self._direct_store_states.get(req_id)
+        return {} if state is None else dict(state.committed_end)
 
     def _store_worker_loop(self) -> None:
         if not self.is_store_async:
@@ -551,10 +1158,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         overwrite their freed KV blocks.  If one of those ids still has a
         background store reading paged KV, drain it here to avoid store-after-free.
         """
+        req_id_set = set(req_ids)
+        direct_waited = self.wait_for_direct_stores(req_id_set)
         if not self.is_store_async:
             return set()
 
-        req_id_set = set(req_ids)
         if not req_id_set:
             return set()
 
@@ -563,7 +1171,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 req_id for req_id in req_id_set if req_id in self._pending_store_reqs
             }
             if not pending_at_start:
-                return set()
+                return direct_waited
 
             pending_counts = {
                 req_id: self._pending_store_reqs[req_id] for req_id in pending_at_start
@@ -588,16 +1196,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             sorted(pending_at_start),
             elapsed_ms,
         )
-        return pending_at_start
+        return pending_at_start | direct_waited
 
     def _track_sync_store_futures(self, futures: Iterable[Future]) -> None:
         """Track completion-required futures during synchronous stores."""
-        if not self.is_store_async:
+        if not self.is_store_async or self._require_store_completion:
             self._pending_sync_store_futures.update(futures)
 
     def wait_for_pending_sync_stores(self) -> None:
         """Wait for stores submitted by the current synchronous save step."""
-        if self.is_store_async or not self._pending_sync_store_futures:
+        if not self._pending_sync_store_futures:
             return
 
         futures = self._pending_sync_store_futures
@@ -4284,6 +4892,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
+        self.wait_for_direct_stores(tuple(self._direct_store_states))
+        self._direct_store_states.clear()
         # Push poison pill first so any in-flight work drains before
         # ``storage_manager.close()`` runs inside ``super().close()``.
         if self._store_queue is not None:

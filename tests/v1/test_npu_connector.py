@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Standard
+from collections import deque
+from concurrent.futures import Future
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+from weakref import WeakSet
+import threading
 
 # Third Party
 from lmcache_tests.v1.test_gpu_connector import (
@@ -20,6 +24,7 @@ from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     PreparedSparseSourceLayer,
 )
+from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import (
     LayerPageSource,
     MemoryFormat,
@@ -34,6 +39,7 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemNPUConnectorV2,
 )
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
+import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -93,6 +99,277 @@ def test_layer_page_pointer_resolution_uses_selected_layer(monkeypatch) -> None:
 
     assert pointer == pages[0].layer_data_ptr(1) + 7
     pages[0].ref_count_down()
+
+
+def test_direct_page_planner_preserves_layer_plane_run_order() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.MLA_LATENT,
+        k_hidden_dims=2,
+        v_hidden_dims=1,
+        dsa_hidden_dims=0,
+    )
+    connector._group_layouts = {0: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    kvcaches = [
+        (
+            torch.empty((4, 4, 1, 2), dtype=torch.float16),
+            torch.empty((4, 4, 1, 1), dtype=torch.float16),
+        )
+        for _ in range(2)
+    ]
+    slots = torch.tensor([0, 1, 4, 5], dtype=torch.long)
+
+    planned = connector.plan_direct_page_sources(
+        kvcaches, slots, [0], [4], kv_group=0
+    )
+
+    assert planned is not None
+    ptrs, sizes, owners = planned
+    assert owners == tuple(tensor for layer in kvcaches for tensor in layer)
+    assert sizes == [[8, 8, 4, 4, 8, 8, 4, 4]]
+    expected = []
+    for tensor in owners:
+        token_bytes = tensor[0, 0].numel() * tensor.element_size()
+        expected.extend(
+            [tensor.data_ptr(), tensor.data_ptr() + 4 * token_bytes]
+        )
+    assert ptrs == [expected]
+
+
+def test_direct_page_planner_rejects_invalid_slots() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.DSA_INDEX,
+        k_hidden_dims=2,
+        v_hidden_dims=0,
+        dsa_hidden_dims=2,
+    )
+    connector._group_layouts = {1: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    kvcaches = [(torch.empty((2, 4, 1, 2), dtype=torch.float16),)]
+
+    assert (
+        connector.plan_direct_page_sources(
+            kvcaches,
+            torch.tensor([0, -1], dtype=torch.long),
+            [0],
+            [2],
+            kv_group=1,
+        )
+        is None
+    )
+
+
+def test_direct_page_planner_rejects_cache_dtype_mismatch() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.dtype = torch.bfloat16
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.DSA_INDEX,
+        k_hidden_dims=2,
+        v_hidden_dims=0,
+        dsa_hidden_dims=2,
+    )
+    connector._group_layouts = {1: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+
+    assert (
+        connector.plan_direct_page_sources(
+            [(torch.empty((1, 2, 1, 2), dtype=torch.float16),)],
+            torch.arange(2),
+            [0],
+            [2],
+            kv_group=1,
+        )
+        is None
+    )
+
+
+def test_failed_direct_future_keeps_request_pending_for_cpu_retry() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    state = ascend_cache_engine._DirectStoreRequestState()
+    state.pending_keys.add("key")
+    engine._direct_store_states = {"request": state}
+    engine._pending_store_reqs = {"request": 1}
+    engine._direct_completed_futures = WeakSet()
+    lock = threading.Lock()
+    engine._store_cv = threading.Condition(lock)
+    future = Future()
+    future.set_exception(RuntimeError("failed"))
+
+    engine._direct_store_done("request", {"key"}, {0: 256}, future)
+
+    assert engine._pending_store_reqs == {"request": 1}
+    assert state.pending_keys == {"key"}
+
+
+def test_direct_completion_does_not_publish_out_of_order_frontier() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    state = ascend_cache_engine._DirectStoreRequestState(
+        pending_keys={"key"}, submitted_end={0: 512}
+    )
+    engine._direct_store_states = {"request": state}
+    engine._pending_store_reqs = {"request": 1}
+    engine._direct_completed_futures = WeakSet()
+    engine._store_cv = threading.Condition(threading.Lock())
+    future = Future()
+    future.set_result(None)
+
+    engine._direct_store_done("request", {"key"}, {0: 512}, future)
+
+    assert state.committed_end == {}
+    assert state.pending_keys == set()
+
+
+def test_direct_cpu_retry_restores_submitted_frontier() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    state = ascend_cache_engine._DirectStoreRequestState(
+        committed_end={0: 128}, submitted_end={0: 512}
+    )
+    engine._store_direct_cpu_group = lambda *args: 256
+
+    engine._retry_direct_cpu(
+        "request", [0] * 512, {0: [object()]}, {0: object()}, None, state
+    )
+
+    assert state.committed_end == {0: 256}
+    assert state.submitted_end == {0: 256}
+
+
+def test_direct_failure_retries_each_group_from_its_latest_snapshot() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    first, second = Future(), Future()
+    first.set_exception(RuntimeError("latent failed"))
+    second.set_exception(RuntimeError("indexer failed"))
+    state = ascend_cache_engine._DirectStoreRequestState(
+        futures=deque((first, second)),
+        pending_keys={"latent", "indexer"},
+        submitted_end={0: 4, 1: 6},
+    )
+    engine._direct_store_states = {"request": state}
+    engine._pending_store_reqs = {"request": 2}
+    engine._direct_completed_futures = WeakSet()
+    engine._store_cv = threading.Condition(threading.Lock())
+    engine.config = SimpleNamespace(blocking_timeout_secs=1)
+    engine._direct_retry_args = {
+        first: (
+            "request",
+            [0] * 4,
+            {0: ["latent-cache"]},
+            {0: "latent-slots"},
+            None,
+            {"latent"},
+            {0: 4},
+        ),
+        second: (
+            "request",
+            [0] * 6,
+            {1: ["indexer-cache"]},
+            {1: "indexer-slots"},
+            None,
+            {"indexer"},
+            {1: 6},
+        ),
+    }
+    calls = []
+    engine._store_direct_cpu_group = (
+        lambda _req, tokens, _caches, _slots, group, _start, _configs: (
+            calls.append((group, len(tokens))) or len(tokens)
+        )
+    )
+
+    engine.wait_for_direct_stores(("request",))
+
+    assert calls == [(0, 4), (1, 6)]
+    assert state.committed_end == {0: 4, 1: 6}
+    assert state.pending_keys == set()
+
+
+def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
+    monkeypatch,
+) -> None:
+    class _Event:
+        def record(self) -> None:
+            pass
+
+    class _TokenDatabase:
+        calls = []
+
+        def process_tokens(
+            self, tokens=None, hashes=None, offsets=None, kv_group=0, **kwargs
+        ):
+            self.calls.append((kv_group, hashes, offsets))
+            values = hashes or [11, 22]
+            for index, value in enumerate(values):
+                yield (
+                    index * 2,
+                    (index + 1) * 2,
+                    CacheEngineKey(
+                        "model", 1, 0, value, torch.float16, kv_group=kv_group
+                    ),
+                )
+
+    class _StorageManager:
+        submissions = []
+
+        @staticmethod
+        def batched_external_pages_exist(keys):
+            return [index % 2 == 1 for index in range(len(keys))]
+
+        def batched_put_external_pages(self, *args):
+            self.submissions.append(args)
+            future = Future()
+            future.set_result(None)
+            return future
+
+    class _GPUConnector:
+        owner = torch.empty(16, dtype=torch.uint8)
+
+        def plan_direct_page_sources(
+            self, kvcaches, slot_mapping, starts, ends, kv_group
+        ):
+            return (
+                [[self.owner.data_ptr()] for _ in starts],
+                [[2] for _ in starts],
+                (self.owner,),
+            )
+
+    monkeypatch.setattr(torch.npu, "Event", _Event)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_enabled = True
+    engine._direct_store_states = {}
+    engine._direct_store_jobs = deque()
+    engine._direct_retry_args = {}
+    engine._direct_completed_futures = WeakSet()
+    engine._pending_store_reqs = {}
+    engine._store_queue_maxsize = 2
+    engine._store_cv = threading.Condition(threading.Lock())
+    engine.config = SimpleNamespace(
+        chunk_size=2,
+        blocking_timeout_secs=5,
+        get_extra_config_value=lambda name, default: default,
+    )
+    engine.num_layers = 1
+    engine.token_database = _TokenDatabase()
+    engine.storage_manager = _StorageManager()
+    engine.gpu_connector = _GPUConnector()
+    slots = torch.arange(4)
+
+    assert engine.store_direct_prefill(
+        "request",
+        [1, 2, 3, 4],
+        {0: [object()], 1: [object()]},
+        {0: slots, 1: slots},
+    )
+
+    assert len(engine.storage_manager.submissions) == 1
+    assert len(engine.storage_manager.submissions[0][0]) == 2
+    assert engine.token_database.calls[1] == (1, [11, 22], [2, 2])
+    engine.wait_for_direct_stores(("request",))
+    assert engine._direct_store_states["request"].committed_end == {0: 4, 1: 4}
 
 
 def _make_layer_page_sources():

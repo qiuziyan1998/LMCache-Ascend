@@ -8,6 +8,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     ReqMeta,
 )
 from lmcache.logging import init_logger
+from lmcache.v1.cache_engine import LayerwiseStoreResult
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -32,16 +33,129 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
         super().__init__(vllm_config, role, parent)
         self.store_async = self.config.store_async
+        get_extra = getattr(self.config, "get_extra_config_value", None)
+        self._direct_store_requested = bool(
+            get_extra("mooncake_direct_npu_prefill_store", False)
+            if callable(get_extra)
+            else False
+        )
+        self._direct_store_observed_layers: set[str] = set()
+        if self._direct_store_requested:
+            extra = self.config.extra_config or {}
+            valid = (
+                self.store_async
+                and self.config.store_async_max_queue_size == 2
+                and str(self.config.remote_url).startswith("mooncakestore://")
+                and self.use_layerwise
+                and self.config.enable_shared_cpu_cache
+                and extra.get("mooncake_page_first_multi_buffer", False)
+                and extra.get("mooncake_layer_merged_page_objects", False)
+                and extra.get("save_only_first_rank", False)
+                and extra.get("use_ascend_direct", False)
+                and not extra.get("save_chunk_meta", False)
+            )
+            if not valid:
+                raise ValueError(
+                    "mooncake_direct_npu_prefill_store requires store_async=true, "
+                    "store_async_max_queue_size=2, shared layerwise merged Mooncake "
+                    "pages, save_only_first_rank, use_ascend_direct, and "
+                    "save_chunk_meta=false"
+                )
         if (
             role != KVConnectorRole.SCHEDULER
             and self.kv_role != "kv_consumer"
             and self.use_layerwise
             and self.store_async
+            and not self._direct_store_requested
         ):
             raise ValueError(
                 "Layerwise storing is not supported with async store"
             )
         logger.debug("store_async: %s", self.store_async)
+
+    def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
+        if (
+            not getattr(self, "_direct_store_requested", False)
+            or self.kv_role == "kv_consumer"
+            or self.lmcache_engine is None
+            or not self.lmcache_engine.direct_prefill_store_enabled()
+            or self._parent._connector_metadata is None
+        ):
+            return None
+        metadata = self._parent._get_connector_metadata()
+        requests = list(getattr(metadata, "requests", ()))
+        if not requests or any(
+            request.is_sparse_decode
+            or request.is_decode_window_save
+            or not request.slot_mapping
+            or (
+                self.config.dsa_two_groups
+                and not request.indexer_slot_mapping
+            )
+            or (
+                self.kv_role != "kv_producer"
+                and (
+                    request.save_spec is None
+                    or not request.save_spec.can_save
+                )
+            )
+            for request in requests
+        ):
+            return None
+        return requests
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Use one direct page submission after all required layers are ready."""
+        requests = self._direct_prefill_requests()
+        if requests is None:
+            super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+            return
+        expected = set(self._latent_layer_names)
+        if self.config.dsa_two_groups:
+            expected.update(self._indexer_layer_names)
+        if not expected:
+            super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+            return
+        if layer_name in expected:
+            if layer_name in self._direct_store_observed_layers:
+                self._direct_store_observed_layers.clear()
+            self._direct_store_observed_layers.add(layer_name)
+        if not expected.issubset(self._direct_store_observed_layers):
+            return
+
+        self._refresh_kvcaches_list()
+        group_caches = {0: self._kvcaches_for_group(0)}
+        if self.config.dsa_two_groups:
+            group_caches[1] = self._kvcaches_for_group(1)
+        group_caches = {
+            group: caches for group, caches in group_caches.items() if caches
+        }
+        for request in requests:
+            selected = dict(group_caches)
+            save_spec = request.save_spec
+            if save_spec is not None and self.config.dsa_two_groups:
+                if not save_spec.can_save_latent:
+                    selected.pop(0, None)
+                if not save_spec.can_save_indexer:
+                    selected.pop(1, None)
+            slot_mappings = {0: request.slot_mapping[0]}
+            if 1 in selected:
+                slot_mappings[1] = request.indexer_slot_mapping[0]
+            self.lmcache_engine.store_direct_prefill(
+                request.req_id,
+                request.token_ids,
+                selected,
+                slot_mappings,
+                request.request_configs,
+                final=request.is_last_prefill,
+            )
+        self._direct_store_observed_layers.clear()
 
     def _effective_skip_leading_tokens(
         self,
@@ -84,6 +198,30 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
             self.lmcache_engine.wait_for_pending_sync_stores()
+            requests = self._direct_prefill_requests() or []
+            final_ids = {
+                request.req_id for request in requests if request.is_last_prefill
+            }
+            if final_ids:
+                self.lmcache_engine.wait_for_direct_stores(final_ids)
+                for request in requests:
+                    if request.req_id not in final_ids:
+                        continue
+                    for group, committed_end in (
+                        self.lmcache_engine.direct_store_committed_ends(
+                            request.req_id
+                        ).items()
+                    ):
+                        self._record_prefill_save_group_completed(
+                            request,
+                            group,
+                            LayerwiseStoreResult(
+                                request_id=request.req_id,
+                                kv_group=group,
+                                committed_end=committed_end,
+                            ),
+                        )
+                    self._mark_prefill_committed(request)
 
     def _handle_save_request_error(
         self,
@@ -112,6 +250,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         if releasable_req_ids:
             self._release_finished_worker_requests(releasable_req_ids)
+            self.lmcache_engine.drop_direct_store_states(releasable_req_ids)
         return finished_sending
 
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:

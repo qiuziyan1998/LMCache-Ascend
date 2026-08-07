@@ -1546,6 +1546,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_validated_layers: set = set()
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
+        self._direct_page_layout_cache: dict[
+            int, tuple[tuple, list[tuple[int, int]]]
+        ] = {}
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
@@ -3043,6 +3046,137 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             and not _DENSE_DIRECT_GROUP_STORE_DISABLE
             and self._is_mla_dsa_format(kv_group)
         )
+
+    def plan_direct_page_sources(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+    ) -> Optional[
+        tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
+    ]:
+        """Describe full LMCache pages directly from paged NPU KV storage."""
+        try:
+            layout = self._lazy_initialize_buffer_with_staging(
+                kvcaches, kv_group=kv_group, init_staging=False
+            )
+            if layout.kv_format not in (
+                KVCacheFormat.MLA_LATENT,
+                KVCacheFormat.DSA_INDEX,
+            ):
+                return None
+            if not starts or len(starts) != len(ends):
+                return None
+            slot_base, slot_end = min(starts), max(ends)
+            if slot_base < 0 or slot_end > len(slot_mapping):
+                return None
+            slots = (
+                slot_mapping[slot_base:slot_end]
+                .detach()
+                .to(device="cpu", dtype=torch.long)
+                .tolist()
+            )
+            owners = tuple(
+                tensor
+                for layer in kvcaches[: self.num_layers]
+                for tensor in layer
+            )
+            if len(owners) != self.num_layers * (2 if kv_group == 0 else 1):
+                return None
+            if owners[0].dtype != getattr(self, "dtype", owners[0].dtype):
+                return None
+            if any(
+                tensor.dtype != owners[0].dtype
+                or tensor.device != owners[0].device
+                for tensor in owners[1:]
+            ):
+                return None
+
+            signature = tuple(
+                (
+                    int(tensor.data_ptr()),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                    tensor.device,
+                )
+                for tensor in owners
+            )
+            cache = getattr(self, "_direct_page_layout_cache", None)
+            if cache is None:
+                cache = self._direct_page_layout_cache = {}
+            cached = cache.get(kv_group)
+            if cached is not None and cached[0] == signature:
+                tensor_meta = cached[1]
+            else:
+                tensor_meta = []
+                for tensor in owners:
+                    if tensor.ndim < 3 or not tensor.is_contiguous():
+                        return None
+                    token_bytes = int(
+                        tensor[0, 0].numel() * tensor.element_size()
+                    )
+                    if (
+                        tensor.stride(1) * tensor.element_size() != token_bytes
+                        or tensor.stride(0) != tensor.shape[1] * tensor.stride(1)
+                    ):
+                        return None
+                    tensor_meta.append((int(tensor.data_ptr()), token_bytes))
+                cache[kv_group] = (
+                    signature,
+                    tensor_meta,
+                )
+            slot_capacity = min(
+                int(tensor.shape[0] * tensor.shape[1]) for tensor in owners
+            )
+
+            all_ptrs: List[List[int]] = []
+            all_sizes: List[List[int]] = []
+            for start, end in zip(starts, ends, strict=True):
+                local_start, local_end = start - slot_base, end - slot_base
+                if (
+                    local_start < 0
+                    or local_end <= local_start
+                    or local_end > len(slots)
+                ):
+                    return None
+                page_slots = slots[local_start:local_end]
+                if any(
+                    slot < 0 or slot >= slot_capacity for slot in page_slots
+                ):
+                    return None
+                runs: list[tuple[int, int]] = []
+                run_start = previous = page_slots[0]
+                for slot in page_slots[1:]:
+                    if slot != previous + 1:
+                        runs.append((run_start, previous - run_start + 1))
+                        run_start = slot
+                    previous = slot
+                runs.append((run_start, previous - run_start + 1))
+
+                ptrs: List[int] = []
+                sizes: List[int] = []
+                for base, token_bytes in tensor_meta:
+                    for slot, count in runs:
+                        ptrs.append(base + slot * token_bytes)
+                        sizes.append(count * token_bytes)
+                expected = sum(token_bytes for _, token_bytes in tensor_meta) * (
+                    end - start
+                )
+                metadata_bytes = (
+                    self.get_shape(end - start, kv_group).numel()
+                    * owners[0].element_size()
+                    * self.num_layers
+                )
+                if sum(sizes) != expected or expected != metadata_bytes:
+                    return None
+                all_ptrs.append(ptrs)
+                all_sizes.append(sizes)
+            return all_ptrs, all_sizes, owners
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            return None
 
     def batched_from_gpu_group(
         self,
