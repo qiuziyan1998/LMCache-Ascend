@@ -4400,7 +4400,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     if cached_memory_objs_by_layer is not None
                     and layer_id < len(cached_memory_objs_by_layer)
                     and cached_memory_objs_by_layer[layer_id]
-                    else memory_objs_layer
+                    else _layer_source_memory_objs(memory_objs_layer, layer_id)
                 )
                 cached_layer_ptrs = (
                     cached_chunk_ptrs_npu[layer_id]

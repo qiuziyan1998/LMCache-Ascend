@@ -1474,6 +1474,35 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
     assert calls[-1]["chunk_ptrs_npu"] is pointer_table
     assert len(calls[-1]["cpu_tensors"]) == 1
     assert calls[-1]["cpu_tensors"][0] is pointer_objs[0]._tensor
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([4]),
+        torch.float32,
+        batch_size=1,
+        num_layers=1,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    page_gen = connector.batched_to_gpu_head_token_wise(
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=True,
+        cached_tensors=[],
+        cached_memory_objs=[],
+        cached_chunk_ptrs_npu=[],
+        lmcache_cached_tokens=4,
+        kv_group=0,
+    )
+    next(page_gen)
+    page_gen.send(
+        (
+            LayerPageSource(tuple(pages), 0),
+            torch.arange(4, dtype=torch.int32),
+            0,
+        )
+    )
+    assert calls[-1]["cpu_tensors"][0] is pages[0].layer_tensor(0)
+    page_gen.close()
+    pages[0].ref_count_down()
     gen.close()
     pointer_gen.close()
 
