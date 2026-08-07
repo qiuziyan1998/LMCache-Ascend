@@ -31,9 +31,12 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import LayerPageSource, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
+from lmcache.v1.mooncake_layout import (
+    mooncake_layer_pages_enabled,
+    mooncake_page_layout_enabled,
+)
 from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
     SharedHandleEnvelope,
@@ -934,7 +937,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def _append_retrieve_group_cache(
         self,
-        mem_objs_by_layer: List[List[MemoryObj]],
+        mem_objs_by_layer: List[Union[List[MemoryObj], LayerPageSource]],
         cached_memory_objs: Optional[List],
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
@@ -950,6 +953,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             and cached_chunk_dev_ptrs is not None
             and cached_chunk_ptrs_npu is not None
         )
+        page_sources = any(
+            isinstance(source, LayerPageSource) for source in mem_objs_by_layer
+        )
+        if page_sources and (
+            not callable(group_append) or cached_chunk_dev_ptrs is None
+        ):
+            raise ValueError(
+                "Layer-page sparse sources require all-layer pointer append."
+            )
         pointer_first = retained_group and not any(cached_tensors or ())
         if retained_group:
             layer_counts = (
@@ -975,16 +987,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                             f"layer={layer_id}, owners={owner_count}, "
                             f"host_ptrs={host_count}, npu_ptrs={npu_count}."
                         )
+        owners_by_layer: List[List[MemoryObj]] = []
         tensors_by_layer: List[List[torch.Tensor]] = []
-        for layer_id, mem_objs_layer in enumerate(mem_objs_by_layer):
+        for layer_id, source in enumerate(mem_objs_by_layer):
+            mem_objs_layer = (
+                [*source.pages, *source.suffix]
+                if isinstance(source, LayerPageSource)
+                else source
+            )
             if any(not mem_obj.is_valid() for mem_obj in mem_objs_layer):
                 raise ValueError(
                     f"Layerwise sparse retrieve resolved an invalid layer {layer_id}."
                 )
+            owners_by_layer.append(mem_objs_layer)
             tensors = []
             if not pointer_first:
                 for chunk_index, mem_obj in enumerate(mem_objs_layer):
-                    tensor = mem_obj.tensor
+                    tensor = (
+                        mem_obj.layer_tensor(source.layer_id)
+                        if isinstance(source, LayerPageSource)
+                        and chunk_index < len(source.pages)
+                        else mem_obj.tensor
+                    )
                     if tensor is None:
                         raise ValueError(
                             "Layerwise sparse retrieve resolved a chunk without "
@@ -994,7 +1018,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             tensors_by_layer.append(tensors)
 
         if not callable(group_append) or cached_chunk_dev_ptrs is None:
-            for layer_id, mem_objs_layer in enumerate(mem_objs_by_layer):
+            for layer_id, mem_objs_layer in enumerate(owners_by_layer):
                 self._append_retrieve_layer_cache(
                     layer_id,
                     mem_objs_layer,
@@ -1012,7 +1036,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if cached_memory_objs is not None:
             if not cached_memory_objs:
                 cached_memory_objs.extend([] for _ in range(self.num_layers))
-            for layer_id, mem_objs_layer in enumerate(mem_objs_by_layer):
+            for layer_id, mem_objs_layer in enumerate(owners_by_layer):
                 cached_memory_objs[layer_id].extend(mem_objs_layer)
         if cached_tensors is not None and not pointer_first:
             if not cached_tensors:
@@ -2462,7 +2486,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         compact_batch: Optional[SharedHandleBatch] = None
         compact_final_receive_attempted = False
         materialize_only = bool(kwargs.get("materialize_only", False))
-        pending_materialized_layers: List[List[MemoryObj]] = []
+        pending_materialized_layers: List[
+            Union[List[MemoryObj], LayerPageSource]
+        ] = []
+        compact_pages = ()
+        page_view_build_s = 0.0
+        legacy_tail_objects = 0
 
         try:
             for layer_id in range(self.num_layers):
@@ -2488,6 +2517,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
                 if not missing_chunks:
                     mem_objs_layer = []
+                    source = mem_objs_layer
                 else:
                     envelope = None
                     if compact_batch is None:
@@ -2507,24 +2537,46 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         compact_batch = envelope.batch
                         if compact_batch is not None:
-                            validate_shared_handle_batch(
-                                compact_batch,
-                                expected_shm_name=(
-                                    self.shared_cpu_cache_passive_allocator.shm_name
-                                ),
-                                expected_producer_rank=self.metadata.first_rank,
-                                expected_num_layers=self.num_layers,
-                                expected_num_chunks=missing_chunks,
-                                expected_chunk_hashes=[
-                                    int(key.chunk_hash)
-                                    for key in keys_layer_major[0][
-                                        cached_prefix_chunks:
-                                    ]
-                                ],
-                                slab_size=(
-                                    self.shared_cpu_cache_passive_allocator.slab_size
-                                ),
-                            )
+                            if materialize_only:
+                                page_started = (
+                                    cold_start_perf_now() if perf_enabled else 0.0
+                                )
+                                compact_pages = (
+                                    self._make_passive_layer_page_views(
+                                        compact_batch,
+                                        starts=starts[cached_prefix_chunks:],
+                                        ends=ends[cached_prefix_chunks:],
+                                        keys_layer_major=[
+                                            keys[cached_prefix_chunks:]
+                                            for keys in keys_layer_major
+                                        ],
+                                        kv_group=kv_group,
+                                    )
+                                )
+                                if page_started:
+                                    page_view_build_s = (
+                                        cold_start_perf_now() - page_started
+                                    )
+                                to_release.extend(compact_pages)
+                            else:
+                                validate_shared_handle_batch(
+                                    compact_batch,
+                                    expected_shm_name=(
+                                        self.shared_cpu_cache_passive_allocator.shm_name
+                                    ),
+                                    expected_producer_rank=self.metadata.first_rank,
+                                    expected_num_layers=self.num_layers,
+                                    expected_num_chunks=missing_chunks,
+                                    expected_chunk_hashes=[
+                                        int(key.chunk_hash)
+                                        for key in keys_layer_major[0][
+                                            cached_prefix_chunks:
+                                        ]
+                                    ],
+                                    slab_size=(
+                                        self.shared_cpu_cache_passive_allocator.slab_size
+                                    ),
+                                )
                         elif len(envelope.handles) != missing_chunks:
                             raise ValueError(
                                 "Sparse shared CPU passive received inconsistent "
@@ -2566,7 +2618,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                         else envelope.handles
                     )
                     try:
-                        for chunk_offset, handle in enumerate(handles):
+                        for chunk_offset, handle in enumerate(
+                            handles[len(compact_pages) :], len(compact_pages)
+                        ):
                             chunk_index = cached_prefix_chunks + chunk_offset
                             expected_shape, expected_dtype, expected_fmt = (
                                 self._expected_shared_cpu_chunk_metadata(
@@ -2623,8 +2677,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 mem_obj.ref_count_down()
                         raise
                     try:
+                        source = (
+                            LayerPageSource(
+                                compact_pages,
+                                layer_id,
+                                tuple(mem_objs_layer),
+                            )
+                            if compact_pages
+                            else mem_objs_layer
+                        )
                         if materialize_only:
-                            pending_materialized_layers.append(mem_objs_layer)
+                            pending_materialized_layers.append(source)
                         else:
                             self._append_retrieve_layer_cache(
                                 layer_id,
@@ -2640,6 +2703,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 mem_obj.ref_count_down()
                         raise
                     to_release.extend(mem_objs_layer)
+                    if compact_pages:
+                        legacy_tail_objects += len(mem_objs_layer)
                     self._append_shared_handle_cache(
                         layer_id,
                         handles,
@@ -2655,7 +2720,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             phase=phase,
                             kv_group=kv_group,
                             layer=layer_id,
-                            objects=len(mem_objs_layer),
+                            objects=len(compact_pages) + len(mem_objs_layer),
                             rank=self.metadata.worker_id,
                         )
 
@@ -2665,19 +2730,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                     else 0.0
                 )
                 if sparse_payload is not None:
-                    sparse_payload["memory_objs_layer"] = mem_objs_layer
+                    sparse_payload["memory_objs_layer"] = source
                     mem_obj_consumer.send(sparse_payload)
                 else:
                     mem_obj_consumer.send(
                         (
-                            mem_objs_layer,
+                            source,
                             selected_tokens,
                             token_start_index,
                             target_slot_mapping,
                         )
                     )
                 if perf_enabled:
-                    source_chunks = len(mem_objs_layer)
+                    source_chunks = len(compact_pages) + len(mem_objs_layer)
                     if (
                         not source_chunks
                         and cached_memory_objs is not None
@@ -2695,12 +2760,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                         phase=phase,
                         kv_group=kv_group,
                         layer=layer_id,
-                        objects=len(mem_objs_layer),
+                        objects=len(compact_pages) + len(mem_objs_layer),
                         source_chunks=source_chunks,
                         rank=self.metadata.worker_id,
                         passive=True,
                     )
             if materialize_only and pending_materialized_layers:
+                pointer_started = (
+                    cold_start_perf_now()
+                    if perf_enabled and compact_pages
+                    else 0.0
+                )
                 self._append_retrieve_group_cache(
                     pending_materialized_layers,
                     cached_memory_objs,
@@ -2708,6 +2778,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                 )
+                if pointer_started:
+                    pointer_seal_ms = round(
+                        (cold_start_perf_now() - pointer_started) * 1000, 3
+                    )
+                    cold_start_perf_log(
+                        logger,
+                        "passive_compact_materialize",
+                        started=pointer_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        rank=self.metadata.worker_id,
+                        physical_pages=len(compact_pages),
+                        logical_entries=missing_chunks * self.num_layers,
+                        legacy_tail_objects=legacy_tail_objects,
+                        page_view_build_ms=round(page_view_build_s * 1000, 3),
+                        pointer_seal_ms=pointer_seal_ms,
+                    )
             next(mem_obj_consumer)
             if compact_batch is not None:
                 compact_final_receive_attempted = True
@@ -3051,6 +3139,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         shared_chunk_locations_layer_major: list[list[str]] = []
         pre_resolved_shared_mem_layers: Optional[List[List[MemoryObj]]] = None
+        layer_page_chunks = 0
         local_prefix_layers: List[Optional[LocalCPUPrefixGetResult]] = []
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         preflight_error_envelope: Optional[SharedHandleEnvelope] = None
@@ -3061,18 +3150,22 @@ class AscendLMCacheEngine(LMCacheEngine):
             nonlocal pre_resolved_shared_mem_layers
             if pre_resolved_shared_mem_layers is None:
                 return
-            for mem_objs_layer in reversed(pre_resolved_shared_mem_layers):
-                for mem_obj in reversed(mem_objs_layer):
-                    try:
-                        if getattr(mem_obj, "is_pinned", False):
-                            mem_obj.unpin()
-                        if getattr(mem_obj, "is_valid", lambda: True)():
-                            mem_obj.ref_count_down()
-                    except Exception:
-                        logger.exception(
-                            "Failed to release pre-resolved shared sparse "
-                            "MemoryObj after request-level preflight failure"
-                        )
+            unique = {
+                id(obj): obj
+                for layer in pre_resolved_shared_mem_layers
+                for obj in layer
+            }
+            for mem_obj in reversed(unique.values()):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if getattr(mem_obj, "is_valid", lambda: True)():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release pre-resolved shared sparse "
+                        "MemoryObj after request-level preflight failure"
+                    )
             pre_resolved_shared_mem_layers = None
 
         def release_local_prefix_layers() -> None:
@@ -3199,6 +3292,46 @@ class AscendLMCacheEngine(LMCacheEngine):
                             local_prefix.local_memory_objs
                         ) + ["RemoteBackend"] * len(local_prefix.remote_positions)
                         shared_chunk_locations_layer_major.append(layer_locations)
+                    if mooncake_layer_pages_enabled(self.config):
+                        page_chunks = next(
+                            (
+                                index
+                                for index, (start, end) in enumerate(
+                                    zip(
+                                        starts[cached_prefix_chunks:],
+                                        ends[cached_prefix_chunks:],
+                                        strict=False,
+                                    )
+                                )
+                                if end - start != self.config.chunk_size
+                            ),
+                            len(missing_keys[0]),
+                        )
+                        local_pages, _ = (
+                            self.storage_manager.batched_contains_layer_pages(
+                                missing_keys[0][:page_chunks],
+                                [LOCAL_CPU_BACKEND_NAME],
+                            )
+                        )
+                        for locations in shared_chunk_locations_layer_major:
+                            locations[:local_pages] = [
+                                LOCAL_CPU_BACKEND_NAME
+                            ] * local_pages
+                        if page_chunks < len(missing_keys[0]):
+                            tail_keys = [
+                                layer_keys[page_chunks]
+                                for layer_keys in missing_keys
+                            ]
+                            local_tail, _ = self.storage_manager.batched_contains(
+                                tail_keys, [LOCAL_CPU_BACKEND_NAME]
+                            )
+                            if local_tail == len(tail_keys):
+                                for locations in (
+                                    shared_chunk_locations_layer_major
+                                ):
+                                    locations[page_chunks] = (
+                                        LOCAL_CPU_BACKEND_NAME
+                                    )
                 except Exception:
                     release_local_prefix_layers()
                     raise
@@ -3213,6 +3346,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                         layer_locations.append(key_location)
                     shared_chunk_locations_layer_major.append(layer_locations)
             if perf_enabled:
+                local_chunks = sum(
+                    location == LOCAL_CPU_BACKEND_NAME
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                remote_chunks = sum(
+                    location == "RemoteBackend"
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                unresolved_chunks = sum(
+                    not location
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
                 cold_start_perf_log(
                     logger,
                     "location_probe",
@@ -3225,7 +3373,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=kv_group,
                     layers=len(missing_keys),
                     chunks=sum(len(layer) for layer in missing_keys),
-                    missing=len(missing_locations),
+                    missing=unresolved_chunks,
+                    local_chunks=local_chunks,
+                    remote_chunks=remote_chunks,
+                    unresolved_chunks=unresolved_chunks,
                     sampled=sampled_worker_retrieve,
                 )
             page_first_locations = (
@@ -3334,7 +3485,38 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     pre_resolved_shared_mem_layers = []
                     try:
-                        if page_first_locations is not None:
+                        full_chunks = next(
+                            (
+                                index
+                                for index, (start, end) in enumerate(
+                                    zip(
+                                        starts[cached_prefix_chunks:],
+                                        ends[cached_prefix_chunks:],
+                                        strict=True,
+                                    )
+                                )
+                                if end - start != self.config.chunk_size
+                            ),
+                            len(missing_keys[0]),
+                        )
+                        if (
+                            mooncake_layer_pages_enabled(self.config)
+                            and full_chunks
+                        ):
+                            release_local_prefix_layers()
+                            (
+                                pre_resolved_shared_mem_layers,
+                                layer_page_chunks,
+                            ) = self._resolve_shared_rank0_layer_pages(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase", "sparse_decode_bootstrap"
+                                ),
+                                kv_group=kv_group,
+                                keys_layer_major=missing_keys,
+                                page_chunks=full_chunks,
+                            )
+                        elif page_first_locations is not None:
                             prefixes = None
                             if local_prefix_layers:
                                 if any(
@@ -3479,8 +3661,26 @@ class AscendLMCacheEngine(LMCacheEngine):
             and cached_prefix_chunks < required_chunks
         ):
             try:
+                page_sources = (
+                    [
+                        LayerPageSource(
+                            tuple(
+                                pre_resolved_shared_mem_layers[0][
+                                    :layer_page_chunks
+                                ]
+                            ),
+                            layer_id,
+                            tuple(layer[layer_page_chunks:]),
+                        )
+                        for layer_id, layer in enumerate(
+                            pre_resolved_shared_mem_layers
+                        )
+                    ]
+                    if layer_page_chunks
+                    else pre_resolved_shared_mem_layers
+                )
                 self._append_retrieve_group_cache(
-                    pre_resolved_shared_mem_layers,
+                    page_sources,
                     cached_memory_objs,
                     cached_tensors,
                     cached_chunk_dev_ptrs,
@@ -3554,11 +3754,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             and pre_resolved_shared_mem_layers is not None
             and not use_cached_retrieve
         ):
-            pending_pre_resolved_release = [
-                mem_obj
-                for mem_objs_layer in pre_resolved_shared_mem_layers
-                for mem_obj in mem_objs_layer
-            ]
+            pending_pre_resolved_release = list(
+                {
+                    id(obj): obj
+                    for layer in pre_resolved_shared_mem_layers
+                    for obj in layer
+                }.values()
+            )
 
         def release_pending_pre_resolved() -> None:
             nonlocal pending_pre_resolved_release
@@ -3745,6 +3947,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                     elif mem_objs_layer is None:
                         mem_objs_layer = []
 
+                source = (
+                    LayerPageSource(
+                        tuple(mem_objs_layer[:layer_page_chunks]),
+                        layer_id,
+                        tuple(mem_objs_layer[layer_page_chunks:]),
+                    )
+                    if layer_page_chunks
+                    else mem_objs_layer
+                )
+
                 if publish_shared_handles and (
                     compact_handle_batch is None or layer_id == 0
                 ):
@@ -3879,12 +4091,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                     else 0.0
                 )
                 if sparse_payload is not None:
-                    sparse_payload["memory_objs_layer"] = mem_objs_layer
+                    sparse_payload["memory_objs_layer"] = source
                     ensure_mem_obj_consumer().send(sparse_payload)
                 else:
                     ensure_mem_obj_consumer().send(
                         (
-                            mem_objs_layer,
+                            source,
                             selected_tokens,
                             token_start_index,
                             target_slot_mapping,
