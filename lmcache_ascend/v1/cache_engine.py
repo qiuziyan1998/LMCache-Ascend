@@ -1599,7 +1599,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 len(cached_chunk_dev_ptrs),
                 len(cached_chunk_ptrs_npu),
             )
-            if any(layer_counts) or any(cached_tensors or ()):
+            has_prefix_data = (
+                any(bool(layer) for layer in cached_memory_objs)
+                or any(bool(layer) for layer in cached_chunk_dev_ptrs)
+                or any(
+                    row is not None and int(row.numel())
+                    for row in cached_chunk_ptrs_npu
+                )
+                or any(cached_tensors or ())
+            )
+            if has_prefix_data:
                 if any(count != self.num_layers for count in layer_counts):
                     raise ValueError(
                         "Sparse group pointer prefix layer coverage mismatch: "

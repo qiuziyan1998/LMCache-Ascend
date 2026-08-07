@@ -2787,13 +2787,11 @@ def test_append_retrieve_group_preserves_layer_page_sources():
 
     def append(new_sources, host_ptrs, npu_ptrs):
         sources.extend(new_sources)
-        host_ptrs.extend(([11], [22]))
-        npu_ptrs.extend(
-            (
-                torch.tensor([11], dtype=torch.long),
-                torch.tensor([22], dtype=torch.long),
-            )
-        )
+        host_ptrs[:] = [[11], [22]]
+        npu_ptrs[:] = [
+            torch.tensor([11], dtype=torch.long),
+            torch.tensor([22], dtype=torch.long),
+        ]
 
     engine.gpu_connector = SimpleNamespace(
         append_sparse_chunk_ptr_cache_for_layers=append
@@ -2811,7 +2809,7 @@ def test_append_retrieve_group_preserves_layer_page_sources():
         cached_memory_objs,
         [],
         [],
-        [],
+        [None, None],
     )
 
     assert sources == page_sources
