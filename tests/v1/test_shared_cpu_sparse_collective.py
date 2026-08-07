@@ -1437,9 +1437,10 @@ def test_sparse_passive_materialize_only_skips_npu_consumer(monkeypatch):
     assert cached_tensors == [[mem_obj.tensor]]
 
 
+@pytest.mark.parametrize("materialize_only", [True, False])
 @pytest.mark.parametrize("complete", [True, False])
-def test_sparse_passive_materialize_only_reuses_one_merged_page(
-    monkeypatch, complete
+def test_sparse_passive_reuses_one_merged_page(
+    monkeypatch, complete, materialize_only
 ):
     monkeypatch.setattr(
         ascend_cache_engine,
@@ -1528,7 +1529,7 @@ def test_sparse_passive_materialize_only_reuses_one_merged_page(
         kv_group=0,
         req_id="req-page",
         shared_cpu_phase="dsa_cold_compact_latent",
-        materialize_only=True,
+        materialize_only=materialize_only,
     )
 
     next(retriever)

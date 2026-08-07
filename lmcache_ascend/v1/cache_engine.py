@@ -43,7 +43,6 @@ from lmcache.v1.mooncake_layout import (
 from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
     SharedHandleEnvelope,
-    validate_shared_handle_batch,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.token_database import TokenDatabase
@@ -3168,46 +3167,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         compact_batch = envelope.batch
                         if compact_batch is not None:
-                            if materialize_only:
-                                page_started = (
-                                    cold_start_perf_now() if perf_enabled else 0.0
+                            page_started = (
+                                cold_start_perf_now() if perf_enabled else 0.0
+                            )
+                            compact_pages = self._make_passive_layer_page_views(
+                                compact_batch,
+                                starts=starts[cached_prefix_chunks:],
+                                ends=ends[cached_prefix_chunks:],
+                                keys_layer_major=[
+                                    keys[cached_prefix_chunks:]
+                                    for keys in keys_layer_major
+                                ],
+                                kv_group=kv_group,
+                            )
+                            if page_started:
+                                page_view_build_s = (
+                                    cold_start_perf_now() - page_started
                                 )
-                                compact_pages = (
-                                    self._make_passive_layer_page_views(
-                                        compact_batch,
-                                        starts=starts[cached_prefix_chunks:],
-                                        ends=ends[cached_prefix_chunks:],
-                                        keys_layer_major=[
-                                            keys[cached_prefix_chunks:]
-                                            for keys in keys_layer_major
-                                        ],
-                                        kv_group=kv_group,
-                                    )
-                                )
-                                if page_started:
-                                    page_view_build_s = (
-                                        cold_start_perf_now() - page_started
-                                    )
-                                to_release.extend(compact_pages)
-                            else:
-                                validate_shared_handle_batch(
-                                    compact_batch,
-                                    expected_shm_name=(
-                                        self.shared_cpu_cache_passive_allocator.shm_name
-                                    ),
-                                    expected_producer_rank=self.metadata.first_rank,
-                                    expected_num_layers=self.num_layers,
-                                    expected_num_chunks=missing_chunks,
-                                    expected_chunk_hashes=[
-                                        int(key.chunk_hash)
-                                        for key in keys_layer_major[0][
-                                            cached_prefix_chunks:
-                                        ]
-                                    ],
-                                    slab_size=(
-                                        self.shared_cpu_cache_passive_allocator.slab_size
-                                    ),
-                                )
+                            to_release.extend(compact_pages)
                         elif len(envelope.handles) != missing_chunks:
                             raise ValueError(
                                 "Sparse shared CPU passive received inconsistent "
@@ -3317,7 +3294,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             if compact_pages
                             else mem_objs_layer
                         )
-                        if materialize_only:
+                        if materialize_only or compact_pages:
                             pending_materialized_layers.append(source)
                         else:
                             self._append_retrieve_layer_cache(
@@ -3396,7 +3373,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         rank=self.metadata.worker_id,
                         passive=True,
                     )
-            if materialize_only and pending_materialized_layers:
+            if pending_materialized_layers:
                 pointer_started = (
                     cold_start_perf_now()
                     if perf_enabled and compact_pages
