@@ -101,6 +101,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 self.config.dsa_two_groups
                 and not request.indexer_slot_mapping
             )
+            # The direct planner/fallback currently accepts full mappings only.
+            # A non-zero window base must use the existing layerwise path, which
+            # passes slot_mapping_base through to the NPU connector.
+            or (
+                getattr(request, "windowed_sparse_save", False)
+                and int(getattr(request, "save_slot_mapping_base", 0) or 0) > 0
+            )
             or (
                 self.kv_role != "kv_producer"
                 and (
