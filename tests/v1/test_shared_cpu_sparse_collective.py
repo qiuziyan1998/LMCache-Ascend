@@ -1495,6 +1495,17 @@ def test_sparse_passive_reuses_one_merged_page(
     )
 
     class Connector(_FakeSparseConsumer):
+        def batched_to_gpu_head_token_wise(self, **kwargs):
+            npu_ptrs = kwargs.get("cached_chunk_ptrs_npu")
+            for layer_id in range(2):
+                yield
+                if npu_ptrs is not None:
+                    while len(npu_ptrs) <= layer_id:
+                        npu_ptrs.append(None)
+                    npu_ptrs[layer_id] = torch.tensor([layer_id])
+            yield
+            yield
+
         def append_sparse_chunk_ptr_cache_for_layers(
             self, sources, host_ptrs, npu_ptrs
         ):
@@ -1512,6 +1523,8 @@ def test_sparse_passive_reuses_one_merged_page(
     engine._receive_shared_envelope = lambda: next(envelopes)
     engine._make_passive_layer_page_views = lambda *_args, **_kwargs: (page,)
     cached_memory_objs = []
+    cached_chunk_dev_ptrs = []
+    cached_chunk_ptrs_npu = []
     cached_shared_handles = []
 
     retriever = engine._retrieve_layer_head_token_wise_shared_passive(
@@ -1523,8 +1536,8 @@ def test_sparse_passive_reuses_one_merged_page(
         cached_ends=[],
         cached_memory_objs=cached_memory_objs,
         cached_tensors=[],
-        cached_chunk_dev_ptrs=[],
-        cached_chunk_ptrs_npu=[],
+        cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
         cached_shared_handles=cached_shared_handles,
         kv_group=0,
         req_id="req-page",
@@ -1544,6 +1557,8 @@ def test_sparse_passive_reuses_one_merged_page(
             for source in engine.gpu_connector.sources
         )
         assert cached_memory_objs == [[page], [page]]
+        assert cached_chunk_dev_ptrs == [[11], [22]]
+        assert [row.tolist() for row in cached_chunk_ptrs_npu] == [[11], [22]]
         assert cached_shared_handles == [[None], [None]]
         assert page.release_count == 0
         aggregate = dict(perf_events)["passive_compact_materialize"]
@@ -1557,6 +1572,8 @@ def test_sparse_passive_reuses_one_merged_page(
         assert aggregate["pointer_seal_ms"] >= 0
     else:
         assert cached_memory_objs == []
+        assert cached_chunk_dev_ptrs == []
+        assert cached_chunk_ptrs_npu == []
         assert cached_shared_handles == []
         assert page.release_count == 1
         assert "passive_compact_materialize" not in dict(perf_events)

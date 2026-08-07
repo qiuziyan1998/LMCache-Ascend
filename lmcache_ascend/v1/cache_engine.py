@@ -3114,8 +3114,18 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         assert_layerwise_gpu_connector(self.gpu_connector)
+        transfer_kwargs = kwargs
+        if not cached_prefix_chunks and (
+            cached_chunk_dev_ptrs is not None
+            or cached_chunk_ptrs_npu is not None
+        ):
+            # The consumer needs transient pointers for the transfer, while
+            # the cache engine publishes owners/host/NPU rows atomically.
+            transfer_kwargs = dict(kwargs)
+            transfer_kwargs["cached_chunk_dev_ptrs"] = None
+            transfer_kwargs["cached_chunk_ptrs_npu"] = None
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
-            **kwargs
+            **transfer_kwargs
         )
         next(mem_obj_consumer)
 
