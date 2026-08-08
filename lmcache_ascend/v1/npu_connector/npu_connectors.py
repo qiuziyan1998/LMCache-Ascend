@@ -3185,8 +3185,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for key in validation_keys
         )
         current_stream = torch.npu.current_stream()
+        ordering_event = kwargs.get("ordering_event")
         with self._stream_context_or_null(self.store_stream):
-            self.store_stream.wait_stream(current_stream)
+            if ordering_event is not None:
+                self.store_stream.wait_event(ordering_event)
+            else:
+                self.store_stream.wait_stream(current_stream)
             host_pointer_rows, layer_chunk_ptrs_npu = (
                 dense_mla_dsa_group_direct_kv_transfer_fast(
                     layer_states,

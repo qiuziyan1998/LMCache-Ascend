@@ -53,6 +53,10 @@ _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
 
 
+class AsyncDecodePersistenceError(RuntimeError):
+    """A retryable async decode-save backend persistence failure."""
+
+
 
 def _mtp_dw_diag_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
@@ -254,6 +258,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self.is_store_async = self.config.store_async
         self._pending_sync_store_futures: set[Future] = set()
+        self._decode_store_future_lock = threading.Lock()
+        self._pending_decode_store_futures: Dict[str, set[Future]] = {}
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
         if self.is_store_async:
             self._store_queue: Optional[queue.Queue] = None
@@ -590,10 +596,58 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         return pending_at_start
 
-    def _track_sync_store_futures(self, futures: Iterable[Future]) -> None:
+    def _track_sync_store_futures(
+        self,
+        futures: Iterable[Future],
+        owner: Optional[str] = None,
+    ) -> None:
         """Track completion-required futures during synchronous stores."""
-        if not self.is_store_async:
-            self._pending_sync_store_futures.update(futures)
+        tracked = set(futures)
+        if not tracked:
+            return
+        if owner is not None:
+            with self._decode_store_future_lock:
+                self._pending_decode_store_futures.setdefault(owner, set()).update(
+                    tracked
+                )
+        elif not self.is_store_async:
+            self._pending_sync_store_futures.update(tracked)
+
+    def wait_for_pending_decode_save(self, owner: str) -> None:
+        """Wait for one async decode job's backend persistence futures."""
+        with self._decode_store_future_lock:
+            futures = set(self._pending_decode_store_futures.get(owner, ()))
+        if not futures:
+            return
+        done, pending = wait(
+            futures,
+            timeout=self.config.blocking_timeout_secs,
+        )
+        failure: Optional[BaseException] = None
+        try:
+            for future in done:
+                future.result()
+        except BaseException as exc:
+            failure = exc
+        with self._decode_store_future_lock:
+            current = self._pending_decode_store_futures.get(owner)
+            if current is not None:
+                current.difference_update(done)
+                if not current:
+                    self._pending_decode_store_futures.pop(owner, None)
+        if failure is not None:
+            raise AsyncDecodePersistenceError(
+                f"async decode persistence failed for {owner}"
+            ) from failure
+        if pending:
+            raise AsyncDecodePersistenceError(
+                f"async decode persistence timed out for {owner}: "
+                f"pending={len(pending)}"
+            )
+
+    def state_guard(self) -> Any:
+        """Return the engine state guard for atomic cache publication."""
+        return self._engine_state_lock
 
     def wait_for_pending_sync_stores(self) -> None:
         """Wait for stores submitted by the current synchronous save step."""
@@ -2211,7 +2265,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 memory_objs[layer_id],
                                 location=self.store_location,
                             )
-                            self._track_sync_store_futures(required_futures)
+                            self._track_sync_store_futures(
+                                required_futures,
+                                owner=kwargs.get("async_decode_job_key"),
+                            )
                             for mem_obj in memory_objs[layer_id]:
                                 pending_store_release.pop(id(mem_obj), None)
                 else:
@@ -2237,7 +2294,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                             memory_objs[layer_id],
                             location=self.store_location,
                         )
-                        self._track_sync_store_futures(required_futures)
+                        self._track_sync_store_futures(
+                            required_futures,
+                            owner=kwargs.get("async_decode_job_key"),
+                        )
                         for mem_obj in memory_objs[layer_id]:
                             pending_store_release.pop(id(mem_obj), None)
 
@@ -2251,7 +2311,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                         flattened_memory_objs,
                         location=self.store_location,
                     )
-                    self._track_sync_store_futures(required_futures)
+                    self._track_sync_store_futures(
+                        required_futures,
+                        owner=kwargs.get("async_decode_job_key"),
+                    )
                     for mem_obj in flattened_memory_objs:
                         pending_store_release.pop(id(mem_obj), None)
 
