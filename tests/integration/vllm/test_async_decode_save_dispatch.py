@@ -5,6 +5,7 @@
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
+import json
 import queue
 import threading
 from unittest.mock import MagicMock, call
@@ -16,6 +17,10 @@ pytest.importorskip("lmcache")
 pytest.importorskip("vllm")
 
 # First Party
+from lmcache.integration.vllm import async_decode_save as async_decode_save_module
+from lmcache.integration.vllm.async_decode_save import (
+    ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV,
+)
 from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
     LMCacheAscendConnectorV1Impl,
     _AsyncDecodeSaveTask,
@@ -57,7 +62,12 @@ def _adapter_with_two_jobs():
     return adapter, first, second
 
 
-def test_physical_completion_is_reported_before_ordered_promotion() -> None:
+def test_physical_completion_is_reported_before_ordered_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV, "1")
+    log_info = MagicMock()
+    monkeypatch.setattr(async_decode_save_module.logger, "info", log_info)
     adapter, first, second = _adapter_with_two_jobs()
 
     adapter._finish_async_decode_task(second, [(0, "second")])
@@ -76,6 +86,23 @@ def test_physical_completion_is_reported_before_ordered_promotion() -> None:
         call(second.request, 0, True, "second"),
     ]
     assert "request" not in adapter._async_decode_jobs
+    assert log_info.call_count == 2
+    persisted = [json.loads(call.args[1]) for call in log_info.call_args_list]
+    assert [event["job_id"] for event in persisted] == [2, 1]
+    assert persisted[0] == {
+        "schema": 1,
+        "event": "persist_complete",
+        "request_id": "request",
+        "generation": 4,
+        "job_id": 2,
+        "start": 256,
+        "end": 512,
+        "tokens": 256,
+        "is_final": False,
+        "worker_id": 0,
+        "kv_groups": [0],
+        "attempt": 1,
+    }
 
 
 def test_npu_dispatch_stores_each_kv_group_once_with_all_layers() -> None:

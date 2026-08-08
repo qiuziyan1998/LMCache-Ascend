@@ -15,6 +15,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     ReqMeta,
 )
+from lmcache.integration.vllm.async_decode_save import (
+    async_decode_save_completion_logging_enabled,
+    log_async_decode_save_completion,
+)
 from lmcache.logging import init_logger
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -365,6 +369,23 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # pending. Scheduler-side ordered state prevents frontier advancement
         # but can release this exact job's source block lease immediately.
         self._record_async_decode_save_completion(task.request)
+        if async_decode_save_completion_logging_enabled():
+            metadata = getattr(self.lmcache_engine, "metadata", None)
+            start = int(task.request.decode_window_start or 0)
+            end = int(task.request.decode_window_end or 0)
+            log_async_decode_save_completion(
+                "persist_complete",
+                request_id=task.request.req_id,
+                generation=task.request.decode_save_generation,
+                job_id=task.request.decode_save_job_id,
+                start=start,
+                end=end,
+                tokens=end - start,
+                is_final=task.request.decode_save_is_final,
+                worker_id=int(getattr(metadata, "worker_id", 0) or 0),
+                kv_groups=sorted(kv_group for kv_group, _ in results),
+                attempt=task.attempt + 1,
+            )
 
     def _set_async_decode_error(self, error: BaseException) -> None:
         with self._async_decode_lock:
