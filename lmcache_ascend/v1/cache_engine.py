@@ -63,6 +63,10 @@ class _DirectStoreRequestState:
     committed_end: dict[int, int] = field(default_factory=dict)
     planned_end: int = 0
     planned_hash: int = 0
+    submitted_jobs: int = 0
+    submitted_pages: int = 0
+    submitted_legacy_objects: int = 0
+    submitted_bytes: int = 0
     finalized: bool = False
 
 
@@ -422,10 +426,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise
         state.futures.append(future)
         self._direct_store_jobs.append(future)
+        legacy_objects = sum(hasattr(key, "layer_id") for key in batch.keys)
+        state.submitted_jobs += 1
+        state.submitted_pages += len(batch.keys) - legacy_objects
+        state.submitted_legacy_objects += legacy_objects
+        state.submitted_bytes += sum(map(sum, batch.sizes))
         if started is not None:
-            legacy_objects = sum(
-                hasattr(key, "layer_id") for key in batch.keys
-            )
             cold_start_perf_log(
                 logger,
                 "direct_npu_submit",
@@ -528,6 +534,8 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         if not final:
             return
+        if state.finalized:
+            return
         required_end = self._direct_required_end(state, tokens)
         incomplete = {
             group: state.committed_end.get(group, 0)
@@ -540,6 +548,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"req_id={req_id} committed={incomplete} required={required_end}"
             )
         state.finalized = True
+        logger.info(
+            "[req_id=%s] Direct prefill store complete for %d tokens: "
+            "submitted pages=%d, legacy objects=%d, size=%.4f GB, jobs=%d, "
+            "committed=%s",
+            req_id,
+            required_end,
+            state.submitted_pages,
+            state.submitted_legacy_objects,
+            state.submitted_bytes / 1024**3,
+            state.submitted_jobs,
+            dict(sorted(state.committed_end.items())),
+        )
 
     def _direct_suffix_plans(
         self,

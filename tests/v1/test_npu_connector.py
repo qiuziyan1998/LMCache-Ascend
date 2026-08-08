@@ -273,6 +273,40 @@ def test_final_cpu_fallback_requires_complete_group_coverage() -> None:
     assert state.finalized
 
 
+def test_direct_finalize_logs_one_completion_summary(monkeypatch) -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(save_unfull_chunk=True)
+    state = ascend_cache_engine._DirectStoreRequestState(
+        committed_end={0: 4, 1: 4},
+        submitted_jobs=2,
+        submitted_pages=4,
+        submitted_legacy_objects=2,
+        submitted_bytes=1024,
+    )
+    calls = []
+    monkeypatch.setattr(
+        ascend_cache_engine.logger, "info", lambda *args: calls.append(args)
+    )
+
+    engine._finalize_direct_store(
+        "request", [0] * 4, (0, 1), state, final=True
+    )
+    engine._finalize_direct_store(
+        "request", [0] * 4, (0, 1), state, final=True
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1:] == (
+        "request",
+        4,
+        4,
+        2,
+        1024 / 1024**3,
+        2,
+        {0: 4, 1: 4},
+    )
+
+
 def test_direct_failure_retries_each_group_in_submission_order() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     first, second = Future(), Future()
