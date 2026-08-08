@@ -1419,6 +1419,75 @@ class TestAscendAdapterInitialization:
             self._construct(KVConnectorRole.WORKER, "kv_producer")
 
 
+def test_direct_prefill_uses_window_relative_save_mappings() -> None:
+    calls = []
+    mapping_calls = []
+    engine = SimpleNamespace(
+        store_direct_prefill=lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    adapter = SimpleNamespace(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _refresh_kvcaches_list=lambda: None,
+        _kvcaches_for_group=lambda group: [f"cache-{group}"],
+        _windowed_sparse_save_mapping=lambda request, group, base: (
+            mapping_calls.append(group)
+            or (
+                request.save_indexer_slot_mapping[0]
+                if group
+                else request.save_slot_mapping[0]
+            )
+        ),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=list(range(512)),
+        slot_mapping=["full-latent"],
+        indexer_slot_mapping=["full-indexer"],
+        save_slot_mapping=["window-latent"],
+        save_indexer_slot_mapping=["window-indexer"],
+        save_slot_mapping_base=256,
+        save_spec=None,
+        request_configs=None,
+        is_last_prefill=False,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+
+    assert calls[0][0][3] == {
+        0: "window-latent",
+        1: "window-indexer",
+    }
+    assert calls[0][1]["slot_mapping_base"] == 256
+
+    adapter._windowed_sparse_save_mapping = (
+        lambda request, group, base: None
+        if group
+        else request.save_slot_mapping[0]
+    )
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+    assert calls[-1][0][3] == {0: "full-latent", 1: "full-indexer"}
+    assert calls[-1][1]["slot_mapping_base"] == 0
+
+    mapping_calls.clear()
+    adapter._windowed_sparse_save_mapping = lambda request, group, base: (
+        mapping_calls.append(group) or request.save_indexer_slot_mapping[0]
+    )
+    request.save_spec = SimpleNamespace(
+        can_save_latent=False, can_save_indexer=True
+    )
+    request.save_slot_mapping = []
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+    assert mapping_calls == [1]
+    assert calls[-1][0][2] == {1: ["cache-1"]}
+
+
 class TestAdapterGroupSplit:
     """_refresh_kvcaches_list partitions registered kv_caches into latent and
     indexer groups by 'indexer' in layer_name, and _kvcaches_for_group

@@ -3055,6 +3055,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ends: List[int],
         kv_group: int,
         layerwise: bool = False,
+        slot_mapping_base: int = 0,
     ) -> Optional[
         tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
     ]:
@@ -3071,10 +3072,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if not starts or len(starts) != len(ends):
                 return None
             slot_base, slot_end = min(starts), max(ends)
-            if slot_base < 0 or slot_end > len(slot_mapping):
+            local_base = slot_base - slot_mapping_base
+            local_end = slot_end - slot_mapping_base
+            if (
+                slot_mapping_base < 0
+                or local_base < 0
+                or local_end > len(slot_mapping)
+            ):
                 return None
             slots = (
-                slot_mapping[slot_base:slot_end]
+                slot_mapping[local_base:local_end]
                 .detach()
                 .to(device="cpu", dtype=torch.long)
                 .tolist()

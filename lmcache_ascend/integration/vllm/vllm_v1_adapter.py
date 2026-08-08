@@ -99,14 +99,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             or not request.slot_mapping
             or (
                 self.config.dsa_two_groups
+                and (
+                    request.save_spec is None
+                    or request.save_spec.can_save_indexer
+                )
                 and not request.indexer_slot_mapping
-            )
-            # The direct planner/fallback currently accepts full mappings only.
-            # A non-zero window base must use the existing layerwise path, which
-            # passes slot_mapping_base through to the NPU connector.
-            or (
-                getattr(request, "windowed_sparse_save", False)
-                and int(getattr(request, "save_slot_mapping_base", 0) or 0) > 0
             )
             or (
                 self.kv_role != "kv_producer"
@@ -159,6 +156,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             group: caches for group, caches in group_caches.items() if caches
         }
         for request in requests:
+            mapping_base = int(
+                getattr(request, "save_slot_mapping_base", 0) or 0
+            )
             selected = dict(group_caches)
             save_spec = request.save_spec
             if save_spec is not None and self.config.dsa_two_groups:
@@ -166,9 +166,24 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     selected.pop(0, None)
                 if not save_spec.can_save_indexer:
                     selected.pop(1, None)
-            slot_mappings = {0: request.slot_mapping[0]}
-            if 1 in selected:
-                slot_mappings[1] = request.indexer_slot_mapping[0]
+            if not selected:
+                continue
+            slot_mappings = {
+                group: self._windowed_sparse_save_mapping(
+                    request, group, mapping_base
+                )
+                for group in selected
+            }
+            if any(mapping is None for mapping in slot_mappings.values()):
+                mapping_base = 0
+                slot_mappings = {
+                    group: (
+                        request.indexer_slot_mapping[0]
+                        if group
+                        else request.slot_mapping[0]
+                    )
+                    for group in selected
+                }
             self.lmcache_engine.store_direct_prefill(
                 request.req_id,
                 request.token_ids,
@@ -176,6 +191,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 slot_mappings,
                 request.request_configs,
                 final=request.is_last_prefill,
+                slot_mapping_base=mapping_base,
             )
 
     def _effective_skip_leading_tokens(

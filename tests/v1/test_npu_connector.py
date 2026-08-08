@@ -143,6 +143,17 @@ def test_direct_page_planner_preserves_layer_plane_run_order() -> None:
     assert layer_ptrs == [expected[:4], expected[4:]]
     assert layer_sizes == [[8, 8, 4, 4], [8, 8, 4, 4]]
 
+    relative = connector.plan_direct_page_sources(
+        kvcaches,
+        slots,
+        [256],
+        [260],
+        kv_group=0,
+        slot_mapping_base=256,
+    )
+    assert relative is not None
+    assert relative[:2] == planned[:2]
+
 
 def test_direct_page_planner_rejects_invalid_slots() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
@@ -262,7 +273,7 @@ def test_final_cpu_fallback_requires_complete_group_coverage() -> None:
     assert state.finalized
 
 
-def test_direct_failure_retries_each_group_from_its_latest_snapshot() -> None:
+def test_direct_failure_retries_each_group_in_submission_order() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     first, second = Future(), Future()
     first.set_exception(RuntimeError("latent failed"))
@@ -284,6 +295,7 @@ def test_direct_failure_retries_each_group_from_its_latest_snapshot() -> None:
             {0: ["latent-cache"]},
             {0: "latent-slots"},
             None,
+            0,
             {"latent"},
             {0: 4},
         ),
@@ -293,13 +305,14 @@ def test_direct_failure_retries_each_group_from_its_latest_snapshot() -> None:
             {1: ["indexer-cache"]},
             {1: "indexer-slots"},
             None,
+            0,
             {"indexer"},
             {1: 6},
         ),
     }
     calls = []
     engine._store_direct_cpu_group = (
-        lambda _req, tokens, _caches, _slots, group, _start, _configs: (
+        lambda _req, tokens, _caches, _slots, group, _start, _configs, _base: (
             calls.append((group, len(tokens))) or len(tokens)
         )
     )
@@ -311,35 +324,43 @@ def test_direct_failure_retries_each_group_from_its_latest_snapshot() -> None:
     assert state.pending_keys == set()
 
 
-def test_direct_tail_failure_retries_after_verified_full_pages() -> None:
-    full, tail = Future(), Future()
-    full.set_result(None)
+def test_direct_retry_replays_success_between_failed_windows() -> None:
+    first, middle, tail = Future(), Future(), Future()
+    first.set_exception(RuntimeError("first failed"))
+    middle.set_result(None)
     tail.set_exception(RuntimeError("tail failed"))
     state = ascend_cache_engine._DirectStoreRequestState(
-        futures=deque((full, tail)),
-        pending_keys={"full", "tail"},
+        futures=deque((first, middle, tail)),
+        pending_keys={"first", "middle", "tail"},
         submitted_end={0: 5},
     )
     engine = object.__new__(AscendLMCacheEngine)
     engine._direct_store_states = {"request": state}
-    engine._pending_store_reqs = {"request": 2}
+    engine._pending_store_reqs = {"request": 3}
     engine._direct_completed_futures = WeakSet()
     engine._store_cv = threading.Condition(threading.Lock())
     engine.config = SimpleNamespace(blocking_timeout_secs=1)
     engine._direct_retry_args = {
-        full: ("request", [0] * 4, {0: [0]}, {0: [0]}, None, {"full"}, {0: 4}),
-        tail: ("request", [0] * 5, {0: [0]}, {0: [0]}, None, {"tail"}, {0: 5}),
+        first: (
+            "request", [0] * 2, {0: [0]}, {0: [0]}, None, 0, {"first"}, {0: 2}
+        ),
+        middle: (
+            "request", [0] * 4, {0: [0]}, {0: [0]}, None, 2, {"middle"}, {0: 4}
+        ),
+        tail: (
+            "request", [0] * 5, {0: [0]}, {0: [0]}, None, 4, {"tail"}, {0: 5}
+        ),
     }
     starts = []
     engine._store_direct_cpu_group = (
-        lambda _req, tokens, _cache, _slots, _group, start, _configs: (
-            starts.append(start) or len(tokens)
+        lambda _req, tokens, _cache, _slots, _group, start, _configs, base: (
+            starts.append((start, base)) or len(tokens)
         )
     )
 
     engine.wait_for_direct_stores(("request",))
 
-    assert starts == [4]
+    assert starts == [(0, 0), (4, 4)]
     assert state.committed_end == {0: 5}
 
 
@@ -367,6 +388,18 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
                     ),
                 )
 
+        def process_tokens_from_prefix(
+            self, tokens, prefix_token_count, kv_group=0, **kwargs
+        ):
+            self.calls.append(("suffix", prefix_token_count, len(tokens)))
+            yield (
+                prefix_token_count,
+                len(tokens),
+                CacheEngineKey(
+                    "model", 1, 0, 33, torch.float16, kv_group=kv_group
+                ),
+            )
+
     class _StorageManager:
         submissions = []
 
@@ -382,10 +415,12 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
 
     class _GPUConnector:
         owner = torch.empty(16, dtype=torch.uint8)
+        calls = []
 
         def plan_direct_page_sources(
-            self, kvcaches, slot_mapping, starts, ends, kv_group
+            self, kvcaches, slot_mapping, starts, ends, kv_group, **kwargs
         ):
+            self.calls.append((starts, ends, len(slot_mapping), kwargs))
             return (
                 [[self.owner.data_ptr()] for _ in starts],
                 [[2] for _ in starts],
@@ -425,6 +460,22 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
     assert engine.token_database.calls[1] == (1, [11, 22], [2, 2])
     engine.wait_for_direct_stores(("request",))
     assert engine._direct_store_states["request"].committed_end == {0: 4, 1: 4}
+
+    assert engine.store_direct_prefill(
+        "request",
+        [1, 2, 3, 4, 5, 6],
+        {0: [object()], 1: [object()]},
+        {0: slots[:2], 1: slots[:2]},
+        slot_mapping_base=4,
+    )
+    assert engine.gpu_connector.calls[-1] == (
+        [4],
+        [6],
+        2,
+        {"slot_mapping_base": 4},
+    )
+    engine.wait_for_direct_stores(("request",))
+    assert engine._direct_store_states["request"].committed_end == {0: 6, 1: 6}
 
 
 def test_direct_suffix_planning_hashes_only_new_complete_chunks() -> None:
@@ -539,7 +590,7 @@ def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:
     owner = torch.empty(1)
 
     def planner(*args, **kwargs):
-        assert kwargs == {"layerwise": True}
+        assert kwargs == {"layerwise": True, "slot_mapping_base": 0}
         return [[1], [2]], [[4], [4]], (owner,)
 
     assert engine._submit_direct_tail(
@@ -662,6 +713,15 @@ def test_direct_prefill_skips_disabled_unfull_tail() -> None:
     )
     assert engine._direct_store_states["request"].finalized
     assert _TokenDatabase.calls == 1
+
+    assert engine.store_direct_prefill(
+        "window",
+        list(range(6)),
+        {0: [object()]},
+        {0: torch.arange(2)},
+        slot_mapping_base=4,
+    )
+    assert engine.direct_store_committed_ends("window") == {0: 4}
 
 
 def _make_layer_page_sources():
