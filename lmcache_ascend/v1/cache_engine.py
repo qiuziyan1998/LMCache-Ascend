@@ -61,6 +61,9 @@ class _DirectStoreRequestState:
     pending_keys: set[str] = field(default_factory=set)
     submitted_end: dict[int, int] = field(default_factory=dict)
     committed_end: dict[int, int] = field(default_factory=dict)
+    planned_end: int = 0
+    planned_hash: int = 0
+    finalized: bool = False
 
 
 @dataclass(slots=True)
@@ -362,7 +365,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         self,
         req_id: str,
         key_strings: set[str],
-        group_ends: dict[int, int],
         future: Future,
     ) -> None:
         with self._store_cv:
@@ -421,12 +423,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         state.futures.append(future)
         self._direct_store_jobs.append(future)
         if started is not None:
+            legacy_objects = sum(
+                hasattr(key, "layer_id") for key in batch.keys
+            )
             cold_start_perf_log(
                 logger,
                 "direct_npu_submit",
                 started=started,
                 req_id=batch.req_id,
-                pages=len(batch.keys),
+                pages=len(batch.keys) - legacy_objects,
+                legacy_objects=legacy_objects,
+                format=(
+                    "legacy_tail" if legacy_objects else "page"
+                ),
                 queue_depth=len(self._direct_store_jobs),
             )
         return future
@@ -494,6 +503,244 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.committed_end[group] = committed
             state.submitted_end[group] = committed
 
+    def _direct_required_end(
+        self,
+        state: _DirectStoreRequestState,
+        tokens: list[int],
+    ) -> int:
+        return (
+            len(tokens)
+            if bool(getattr(self.config, "save_unfull_chunk", True))
+            else state.planned_end
+        )
+
+    def _finalize_direct_store(
+        self,
+        req_id: str,
+        tokens: list[int],
+        groups: Iterable[int],
+        state: _DirectStoreRequestState,
+        final: bool,
+    ) -> None:
+        if not final:
+            return
+        required_end = self._direct_required_end(state, tokens)
+        incomplete = {
+            group: state.committed_end.get(group, 0)
+            for group in groups
+            if state.committed_end.get(group, 0) < required_end
+        }
+        if incomplete:
+            raise RuntimeError(
+                "Direct prefill store did not cover the final prefix: "
+                f"req_id={req_id} committed={incomplete} required={required_end}"
+            )
+        state.finalized = True
+
+    def _direct_suffix_plans(
+        self,
+        state: _DirectStoreRequestState,
+        tokens: list[int],
+        groups: Iterable[int],
+        request_configs: Optional[dict],
+    ) -> dict[int, list[tuple[int, int, CacheEngineKey]]]:
+        """Hash only complete chunks added since the previous forward."""
+        chunk_size = int(self.config.chunk_size)
+        full_end = len(tokens) // chunk_size * chunk_size
+        full_tokens = tokens if full_end == len(tokens) else tokens[:full_end]
+        groups = tuple(groups)
+        base = (
+            state.planned_end
+            if state.planned_end <= full_end
+            and all(
+                state.submitted_end.get(group, 0) >= state.planned_end
+                for group in groups
+            )
+            else 0
+        )
+        if base:
+            plan0 = list(
+                self.token_database.process_tokens_from_prefix(
+                    full_tokens,
+                    prefix_token_count=base,
+                    prefix_hash=state.planned_hash,
+                    request_configs=request_configs,
+                    kv_group=0,
+                )
+            )
+        else:
+            base = 0
+            plan0 = list(
+                self.token_database.process_tokens(
+                    tokens=full_tokens,
+                    request_configs=request_configs,
+                    kv_group=0,
+                )
+            )
+        hashes = [int(key.chunk_hash) for _, _, key in plan0]
+        offsets = [end - start for start, end, _ in plan0]
+        plans = {0: plan0}
+        for group in groups:
+            if group == 0:
+                continue
+            plans[group] = [
+                (start + base, end + base, key)
+                for start, end, key in self.token_database.process_tokens(
+                    hashes=hashes,
+                    offsets=offsets,
+                    request_configs=request_configs,
+                    kv_group=group,
+                )
+            ]
+        if plan0:
+            state.planned_end = plan0[-1][1]
+            state.planned_hash = int(plan0[-1][2].chunk_hash)
+        return plans
+
+    def _track_direct_batch(
+        self,
+        batch: _DirectPageBatch,
+        retry: tuple[Any, ...],
+    ) -> Future:
+        future = self._submit_direct_page_batch(batch)
+        state = self._direct_store_states[batch.req_id]
+        for group, end in batch.group_ends.items():
+            state.submitted_end[group] = max(state.submitted_end.get(group, 0), end)
+        key_strings = {key.to_string() for key in batch.keys}
+        self._direct_retry_args[future] = (*retry, key_strings, batch.group_ends)
+        future.add_done_callback(
+            lambda done,
+            req_id=batch.req_id,
+            keys=key_strings: self._direct_store_done(req_id, keys, done)
+        )
+        return future
+
+    def _submit_direct_tail(
+        self,
+        req_id: str,
+        tokens: list[int],
+        group_caches: dict[int, list],
+        slot_mappings: dict[int, torch.Tensor],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+        planner: Callable[..., Any],
+    ) -> bool:
+        """Publish the unaligned suffix with existing per-layer Mooncake keys."""
+        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        start = state.planned_end
+        if start >= len(tokens):
+            return True
+        group_caches = {
+            group: caches
+            for group, caches in group_caches.items()
+            if state.submitted_end.get(group, 0) < len(tokens)
+        }
+        if not group_caches:
+            return True
+        plan0 = list(
+            self.token_database.process_tokens_from_prefix(
+                tokens,
+                prefix_token_count=start,
+                prefix_hash=state.planned_hash,
+                request_configs=request_configs,
+                kv_group=0,
+            )
+            if start
+            else self.token_database.process_tokens(
+                tokens=tokens, request_configs=request_configs, kv_group=0
+            )
+        )
+        tail = [item for item in plan0 if item[0] == start and item[1] == len(tokens)]
+        if len(tail) != 1:
+            return False
+        _, end, latent_key = tail[0]
+        keys: List[CacheEngineKey] = []
+        ptrs: List[List[int]] = []
+        sizes: List[List[int]] = []
+        owners: dict[int, torch.Tensor] = {}
+        group_ends: dict[int, int] = {}
+        max_buffers = int(
+            self.config.get_extra_config_value(
+                "mooncake_direct_max_buffers_per_page", 4096
+            )
+        )
+        for group, kvcaches in group_caches.items():
+            key = latent_key
+            if group:
+                key = next(
+                    self.token_database.process_tokens(
+                        hashes=[int(latent_key.chunk_hash)],
+                        offsets=[end - start],
+                        request_configs=request_configs,
+                        kv_group=group,
+                    )
+                )[2]
+            layer_keys = key.split_layers(self.num_layers)
+            hits, _ = self.storage_manager.batched_contains(
+                list(layer_keys), search_range=["RemoteBackend"]
+            )
+            if hits == len(layer_keys):
+                state.submitted_end[group] = end
+                if not state.futures:
+                    state.committed_end[group] = end
+                continue
+            if hits:
+                return False
+            planned = planner(
+                kvcaches,
+                slot_mappings[group],
+                [start],
+                [end],
+                group,
+                layerwise=True,
+            )
+            if planned is None:
+                return False
+            group_ptrs, group_sizes, group_owners = planned
+            if (
+                len(group_ptrs) != len(layer_keys)
+                or len(group_sizes) != len(layer_keys)
+                or any(len(item) > max_buffers for item in group_ptrs)
+            ):
+                return False
+            keys.extend(layer_keys)
+            ptrs.extend(group_ptrs)
+            sizes.extend(group_sizes)
+            owners.update((id(owner), owner) for owner in group_owners)
+            group_ends[group] = end
+        if not keys:
+            return True
+        if started is not None:
+            cold_start_perf_log(
+                logger,
+                "direct_npu_plan",
+                started=started,
+                req_id=req_id,
+                groups=sorted(group_ends),
+                pages=0,
+                legacy_objects=len(keys),
+                buffers=sum(map(len, ptrs)),
+                bytes=sum(map(sum, sizes)),
+                token_count=len(tokens),
+                format="legacy_tail",
+            )
+        ready_event = torch.npu.Event()
+        ready_event.record()
+        batch = _DirectPageBatch(
+            req_id,
+            keys,
+            ptrs,
+            sizes,
+            tuple(owners.values()),
+            ready_event,
+            group_ends,
+        )
+        self._track_direct_batch(
+            batch,
+            (req_id, tokens, group_caches, slot_mappings, request_configs),
+        )
+        return True
+
     def store_direct_prefill(
         self,
         req_id: str,
@@ -503,32 +750,18 @@ class AscendLMCacheEngine(LMCacheEngine):
         request_configs: Optional[dict] = None,
         final: bool = False,
     ) -> bool:
-        """Publish new full pages from NPU and stage only the final tail on CPU."""
+        """Publish newly completed pages and the final tail directly from NPU."""
         if not self._direct_store_enabled or not group_caches:
             return False
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
         state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
+        if final and state.finalized:
+            return True
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
-        plan0 = list(
-            self.token_database.process_tokens(
-                tokens=tokens, request_configs=request_configs, kv_group=0
-            )
+        plans = self._direct_suffix_plans(
+            state, tokens, group_caches, request_configs
         )
-        hashes = [int(key.chunk_hash) for _, _, key in plan0]
-        offsets = [int(end - start) for start, end, _ in plan0]
-        plans = {0: plan0}
-        for group in group_caches:
-            if group == 0:
-                continue
-            plans[group] = list(
-                self.token_database.process_tokens(
-                    hashes=hashes,
-                    offsets=offsets,
-                    request_configs=request_configs,
-                    kv_group=group,
-                )
-            )
 
         keys: List[CacheEngineKey] = []
         ptrs: List[List[int]] = []
@@ -547,6 +780,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 slot_mappings,
                 request_configs,
                 state,
+            )
+            self._finalize_direct_store(
+                req_id, tokens, group_caches, state, final
             )
             return True
 
@@ -582,6 +818,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 slot_mappings,
                 request_configs,
                 state,
+            )
+            self._finalize_direct_store(
+                req_id, tokens, group_caches, state, final
             )
             return True
         if len(exists) != len(candidate_refs):
@@ -677,6 +916,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 bytes=sum(map(sum, sizes)),
                 token_count=len(tokens),
                 final=final,
+                format="page",
                 submitted_ends=dict(state.submitted_end),
                 committed_ends=dict(state.committed_end),
             )
@@ -693,7 +933,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 group_ends,
             )
             try:
-                future = self._submit_direct_page_batch(batch)
+                self._track_direct_batch(
+                    batch,
+                    (
+                        req_id,
+                        tokens,
+                        group_caches,
+                        slot_mappings,
+                        request_configs,
+                    ),
+                )
             except Exception as error:
                 retry_started = cold_start_perf_now()
                 self.wait_for_direct_stores((req_id,))
@@ -714,33 +963,32 @@ class AscendLMCacheEngine(LMCacheEngine):
                         reason=type(error).__name__,
                         failed_pages=len(keys),
                     )
+                self._finalize_direct_store(
+                    req_id, tokens, group_caches, state, final
+                )
                 return True
-            for group, end in group_ends.items():
-                state.submitted_end[group] = max(
-                    state.submitted_end.get(group, 0), end
-                )
-            self._direct_retry_args[future] = (
-                req_id,
-                tokens,
-                group_caches,
-                slot_mappings,
-                request_configs,
-                {key.to_string() for key in keys},
-                group_ends,
-            )
-            future.add_done_callback(
-                lambda done: self._direct_store_done(
-                    req_id,
-                    {key.to_string() for key in keys},
-                    group_ends,
-                    done,
-                )
-            )
 
         # Final publication is also the chunked-prefill correctness fence.
-        # Repair any range that an earlier forward did not submit before vLLM
-        # releases its blocks; this also stores the ordinary partial tail.
         if final:
+            save_tail = bool(getattr(self.config, "save_unfull_chunk", True))
+            required_end = self._direct_required_end(state, tokens)
+            if save_tail and state.planned_end < len(tokens):
+                try:
+                    self._submit_direct_tail(
+                        req_id,
+                        tokens,
+                        group_caches,
+                        slot_mappings,
+                        request_configs,
+                        state,
+                        planner,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Direct NPU tail planning failed for %s; using CPU fallback",
+                        req_id,
+                        exc_info=True,
+                    )
             with self._store_cv:
                 self._pending_store_reqs[req_id] = (
                     self._pending_store_reqs.get(req_id, 0) + 1
@@ -750,7 +998,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 repaired = False
                 for group, kvcaches in group_caches.items():
                     committed = state.committed_end.get(group, 0)
-                    if committed >= len(tokens):
+                    if committed >= required_end:
+                        state.committed_end.setdefault(group, required_end)
+                        state.submitted_end.setdefault(group, required_end)
                         continue
                     repair_started = cold_start_perf_now()
                     repaired_end = self._store_direct_cpu_group(
@@ -762,12 +1012,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                         committed,
                         request_configs,
                     )
-                    if repaired_end < len(tokens):
-                        raise RuntimeError(
-                            "Direct prefill store did not cover the final prefix: "
-                            f"req_id={req_id} group={group} "
-                            f"committed={repaired_end} required={len(tokens)}"
-                        )
                     state.committed_end[group] = repaired_end
                     state.submitted_end[group] = repaired_end
                     repaired = True
@@ -778,15 +1022,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                             started=repair_started,
                             req_id=req_id,
                             kv_group=group,
-                            reason="incomplete_final_coverage",
+                            reason=(
+                                "incomplete_full_page_coverage"
+                                if committed < state.planned_end
+                                else "tail_planner_fallback"
+                            ),
                             committed_end=committed,
-                            required_end=len(tokens),
+                            required_end=required_end,
                         )
                 if repaired:
                     logger.warning(
                         "Repaired incomplete direct prefill coverage for %s",
                         req_id,
                     )
+                self._finalize_direct_store(
+                    req_id, tokens, group_caches, state, final=True
+                )
             finally:
                 with self._store_cv:
                     count = self._pending_store_reqs.get(req_id, 1) - 1
@@ -807,6 +1058,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             started = cold_start_perf_now() if cold_start_perf_enabled() else None
             outstanding = len(state.futures)
             failed: list[tuple[Future, tuple[Any, ...], Exception]] = []
+            verified_ends = dict(state.committed_end)
+            failed_groups: set[int] = set()
             while state.futures:
                 future = state.futures.popleft()
                 error = None
@@ -829,13 +1082,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                         raise error
                     continue
                 if error is None:
-                    self._direct_store_done(req_id, retry[-2], retry[-1], future)
+                    self._direct_store_done(req_id, retry[-2], future)
                 else:
                     failed.append((future, retry, error))
+                    failed_groups.update(retry[-1])
+                for group, end in retry[-1].items():
+                    if error is None and group not in failed_groups:
+                        verified_ends[group] = max(
+                            verified_ends.get(group, 0), end
+                        )
 
             if failed:
                 retry_started = cold_start_perf_now()
-                verified_ends = dict(state.submitted_end)
                 latest_by_group: dict[int, tuple[Any, ...]] = {}
                 failed_end_by_group: dict[int, int] = {}
                 for _, retry, _ in failed:
@@ -863,7 +1121,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             group_caches[group],
                             slot_mappings[group],
                             group,
-                            state.committed_end.get(group, 0),
+                            verified_ends.get(group, 0),
                             configs,
                         )
                         required_end = failed_end_by_group.get(group, 0)
@@ -875,10 +1133,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         state.committed_end[group] = committed
                     for group, end in verified_ends.items():
-                        state.submitted_end[group] = end
                         state.committed_end[group] = max(
                             state.committed_end.get(group, 0), end
                         )
+                    for group, end in state.submitted_end.items():
+                        if group not in failed_groups:
+                            state.committed_end[group] = max(
+                                state.committed_end.get(group, 0), end
+                            )
                 finally:
                     with self._store_cv:
                         for future, retry, _ in failed:

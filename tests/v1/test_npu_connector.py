@@ -137,6 +137,12 @@ def test_direct_page_planner_preserves_layer_plane_run_order() -> None:
         )
     assert ptrs == [expected]
 
+    layer_ptrs, layer_sizes, _ = connector.plan_direct_page_sources(
+        kvcaches, slots, [0], [4], kv_group=0, layerwise=True
+    )
+    assert layer_ptrs == [expected[:4], expected[4:]]
+    assert layer_sizes == [[8, 8, 4, 4], [8, 8, 4, 4]]
+
 
 def test_direct_page_planner_rejects_invalid_slots() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
@@ -200,7 +206,7 @@ def test_failed_direct_future_keeps_request_pending_for_cpu_retry() -> None:
     future = Future()
     future.set_exception(RuntimeError("failed"))
 
-    engine._direct_store_done("request", {"key"}, {0: 256}, future)
+    engine._direct_store_done("request", {"key"}, future)
 
     assert engine._pending_store_reqs == {"request": 1}
     assert state.pending_keys == {"key"}
@@ -218,7 +224,7 @@ def test_direct_completion_does_not_publish_out_of_order_frontier() -> None:
     future = Future()
     future.set_result(None)
 
-    engine._direct_store_done("request", {"key"}, {0: 512}, future)
+    engine._direct_store_done("request", {"key"}, future)
 
     assert state.committed_end == {}
     assert state.pending_keys == set()
@@ -237,6 +243,23 @@ def test_direct_cpu_retry_restores_submitted_frontier() -> None:
 
     assert state.committed_end == {0: 256}
     assert state.submitted_end == {0: 256}
+
+
+def test_final_cpu_fallback_requires_complete_group_coverage() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(save_unfull_chunk=True)
+    state = ascend_cache_engine._DirectStoreRequestState(committed_end={0: 4})
+
+    with pytest.raises(RuntimeError, match="did not cover"):
+        engine._finalize_direct_store(
+            "request", [0] * 5, (0,), state, final=True
+        )
+
+    state.committed_end[0] = 5
+    engine._finalize_direct_store(
+        "request", [0] * 5, (0,), state, final=True
+    )
+    assert state.finalized
 
 
 def test_direct_failure_retries_each_group_from_its_latest_snapshot() -> None:
@@ -286,6 +309,38 @@ def test_direct_failure_retries_each_group_from_its_latest_snapshot() -> None:
     assert calls == [(0, 4), (1, 6)]
     assert state.committed_end == {0: 4, 1: 6}
     assert state.pending_keys == set()
+
+
+def test_direct_tail_failure_retries_after_verified_full_pages() -> None:
+    full, tail = Future(), Future()
+    full.set_result(None)
+    tail.set_exception(RuntimeError("tail failed"))
+    state = ascend_cache_engine._DirectStoreRequestState(
+        futures=deque((full, tail)),
+        pending_keys={"full", "tail"},
+        submitted_end={0: 5},
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_states = {"request": state}
+    engine._pending_store_reqs = {"request": 2}
+    engine._direct_completed_futures = WeakSet()
+    engine._store_cv = threading.Condition(threading.Lock())
+    engine.config = SimpleNamespace(blocking_timeout_secs=1)
+    engine._direct_retry_args = {
+        full: ("request", [0] * 4, {0: [0]}, {0: [0]}, None, {"full"}, {0: 4}),
+        tail: ("request", [0] * 5, {0: [0]}, {0: [0]}, None, {"tail"}, {0: 5}),
+    }
+    starts = []
+    engine._store_direct_cpu_group = (
+        lambda _req, tokens, _cache, _slots, _group, start, _configs: (
+            starts.append(start) or len(tokens)
+        )
+    )
+
+    engine.wait_for_direct_stores(("request",))
+
+    assert starts == [4]
+    assert state.committed_end == {0: 5}
 
 
 def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
@@ -370,6 +425,243 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
     assert engine.token_database.calls[1] == (1, [11, 22], [2, 2])
     engine.wait_for_direct_stores(("request",))
     assert engine._direct_store_states["request"].committed_end == {0: 4, 1: 4}
+
+
+def test_direct_suffix_planning_hashes_only_new_complete_chunks() -> None:
+    class _TokenDatabase:
+        calls = []
+
+        @staticmethod
+        def _key(value, group):
+            return CacheEngineKey(
+                "model", 1, 0, value, torch.float16, kv_group=group
+            )
+
+        def process_tokens(
+            self, tokens=None, hashes=None, offsets=None, kv_group=0, **kwargs
+        ):
+            self.calls.append(("full", kv_group, len(tokens or ()), hashes))
+            values = [11, 22] if hashes is None else hashes
+            for index, value in enumerate(values):
+                yield index * 2, (index + 1) * 2, self._key(value, kv_group)
+
+        def process_tokens_from_prefix(
+            self, tokens, prefix_token_count, prefix_hash, kv_group=0, **kwargs
+        ):
+            self.calls.append(("suffix", prefix_token_count, prefix_hash))
+            if prefix_token_count < len(tokens):
+                yield prefix_token_count, len(tokens), self._key(33, kv_group)
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine.token_database = _TokenDatabase()
+    state = ascend_cache_engine._DirectStoreRequestState()
+
+    engine._direct_suffix_plans(state, [1, 2, 3, 4], (0, 1), None)
+    state.submitted_end = {0: 4, 1: 4}
+    plans = engine._direct_suffix_plans(state, [1, 2, 3, 4, 5, 6], (0, 1), None)
+    state.submitted_end = {0: 6, 1: 6}
+    duplicate = engine._direct_suffix_plans(
+        state, [1, 2, 3, 4, 5, 6], (0, 1), None
+    )
+
+    assert [(start, end) for start, end, _ in plans[0]] == [(4, 6)]
+    assert [(start, end) for start, end, _ in plans[1]] == [(4, 6)]
+    assert state.planned_end == 6 and state.planned_hash == 33
+    assert ("suffix", 4, 22) in engine.token_database.calls
+    assert duplicate == {0: [], 1: []}
+
+    late_group = ascend_cache_engine._DirectStoreRequestState(
+        submitted_end={0: 4}, planned_end=4, planned_hash=22
+    )
+    rebuilt = engine._direct_suffix_plans(
+        late_group, [1, 2, 3, 4], (0, 1), None
+    )
+    assert [(start, end) for start, end, _ in rebuilt[1]] == [(0, 2), (2, 4)]
+
+
+def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:
+    class _Event:
+        def record(self) -> None:
+            pass
+
+    class _TokenDatabase:
+        @staticmethod
+        def _key(value, group):
+            return CacheEngineKey(
+                "model", 1, 0, value, torch.float16, kv_group=group
+            )
+
+        def process_tokens_from_prefix(self, tokens, prefix_token_count, **kwargs):
+            yield prefix_token_count, len(tokens), self._key(33, 0)
+
+        def process_tokens(self, hashes, offsets, kv_group=0, **kwargs):
+            yield 0, offsets[0], self._key(hashes[0], kv_group)
+
+    class _StorageManager:
+        submissions = []
+        hit_groups = set()
+
+        @staticmethod
+        def batched_contains(keys, search_range=None):
+            assert search_range == ["RemoteBackend"]
+            return (
+                len(keys) if keys[0].kv_group in _StorageManager.hit_groups else 0,
+                {},
+            )
+
+        def batched_put_external_pages(self, *args):
+            self.submissions.append(args)
+            future = Future()
+            future.set_result(None)
+            return future
+
+    monkeypatch.setattr(torch.npu, "Event", _Event)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.token_database = _TokenDatabase()
+    engine.storage_manager = _StorageManager()
+    engine._direct_store_states = {
+        "request": ascend_cache_engine._DirectStoreRequestState(
+            planned_end=4, planned_hash=22
+        )
+    }
+    engine._direct_store_jobs = deque()
+    engine._direct_retry_args = {}
+    engine._direct_completed_futures = WeakSet()
+    engine._pending_store_reqs = {}
+    engine._store_queue_maxsize = 2
+    engine._store_cv = threading.Condition(threading.Lock())
+    engine.config = SimpleNamespace(
+        blocking_timeout_secs=5,
+        get_extra_config_value=lambda name, default: default,
+    )
+    owner = torch.empty(1)
+
+    def planner(*args, **kwargs):
+        assert kwargs == {"layerwise": True}
+        return [[1], [2]], [[4], [4]], (owner,)
+
+    assert engine._submit_direct_tail(
+        "request",
+        [1, 2, 3, 4, 5],
+        {0: [object()], 1: [object()]},
+        {0: torch.arange(5), 1: torch.arange(5)},
+        None,
+        engine._direct_store_states["request"],
+        planner,
+    )
+    assert engine._submit_direct_tail(
+        "request",
+        [1, 2, 3, 4, 5],
+        {0: [object()], 1: [object()]},
+        {0: torch.arange(5), 1: torch.arange(5)},
+        None,
+        engine._direct_store_states["request"],
+        planner,
+    )
+    submission = engine.storage_manager.submissions[0]
+    assert len(engine.storage_manager.submissions) == 1
+    assert len(submission[0]) == 4
+    assert [key.layer_id for key in submission[0]] == [0, 1, 0, 1]
+    assert [key.kv_group for key in submission[0]] == [0, 0, 1, 1]
+    assert submission[-1] == "request"
+    engine.wait_for_direct_stores(("request",))
+    assert engine._direct_store_states["request"].committed_end == {0: 5, 1: 5}
+
+    _StorageManager.hit_groups = {0}
+    engine._direct_store_states["existing"] = (
+        ascend_cache_engine._DirectStoreRequestState(planned_end=4, planned_hash=22)
+    )
+    assert engine._submit_direct_tail(
+        "existing",
+        [1, 2, 3, 4, 5],
+        {0: [object()]},
+        {0: torch.arange(5)},
+        None,
+        engine._direct_store_states["existing"],
+        planner,
+    )
+    assert len(engine.storage_manager.submissions) == 1
+    assert engine.direct_store_committed_ends("existing") == {0: 5}
+
+    engine._direct_store_states["mixed"] = (
+        ascend_cache_engine._DirectStoreRequestState(planned_end=4, planned_hash=22)
+    )
+    assert engine._submit_direct_tail(
+        "mixed",
+        [1, 2, 3, 4, 5],
+        {0: [object()], 1: [object()]},
+        {0: torch.arange(5), 1: torch.arange(5)},
+        None,
+        engine._direct_store_states["mixed"],
+        planner,
+    )
+    retry = next(
+        value for value in engine._direct_retry_args.values() if value[0] == "mixed"
+    )
+    assert retry[-1] == {1: 5}
+
+
+def test_direct_prefill_skips_disabled_unfull_tail() -> None:
+    class _TokenDatabase:
+        calls = 0
+
+        @classmethod
+        def process_tokens(cls, **kwargs):
+            cls.calls += 1
+            return iter(())
+
+    class _StorageManager:
+        @staticmethod
+        def batched_external_pages_exist(keys):
+            assert not keys
+            return []
+
+    class _GPUConnector:
+        @staticmethod
+        def plan_direct_page_sources(*args, **kwargs):
+            raise AssertionError("unaligned tail must not be planned")
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_enabled = True
+    engine._direct_store_states = {}
+    engine._direct_store_jobs = deque()
+    engine._direct_retry_args = {}
+    engine._direct_completed_futures = WeakSet()
+    engine._pending_store_reqs = {}
+    engine._store_queue_maxsize = 2
+    engine._store_cv = threading.Condition(threading.Lock())
+    engine.config = SimpleNamespace(
+        chunk_size=2,
+        save_unfull_chunk=False,
+        blocking_timeout_secs=5,
+        get_extra_config_value=lambda name, default: default,
+    )
+    engine.token_database = _TokenDatabase()
+    engine.storage_manager = _StorageManager()
+    engine.gpu_connector = _GPUConnector()
+    engine._store_direct_cpu_group = lambda *args: (_ for _ in ()).throw(
+        AssertionError("disabled tail must not use CPU fallback")
+    )
+
+    assert engine.store_direct_prefill(
+        "request",
+        [1],
+        {0: [object()]},
+        {0: torch.arange(1)},
+        final=True,
+    )
+    assert engine.direct_store_committed_ends("request") == {0: 0}
+    assert engine.store_direct_prefill(
+        "request",
+        [1],
+        {0: [object()]},
+        {0: torch.arange(1)},
+        final=True,
+    )
+    assert engine._direct_store_states["request"].finalized
+    assert _TokenDatabase.calls == 1
 
 
 def _make_layer_page_sources():

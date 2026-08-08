@@ -3054,6 +3054,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         starts: List[int],
         ends: List[int],
         kv_group: int,
+        layerwise: bool = False,
     ) -> Optional[
         tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
     ]:
@@ -3156,12 +3157,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     previous = slot
                 runs.append((run_start, previous - run_start + 1))
 
-                ptrs: List[int] = []
-                sizes: List[int] = []
-                for base, token_bytes in tensor_meta:
-                    for slot, count in runs:
-                        ptrs.append(base + slot * token_bytes)
-                        sizes.append(count * token_bytes)
+                planes = 2 if kv_group == 0 else 1
+                page_ptrs, page_sizes = [], []
+                for layer in range(self.num_layers if layerwise else 1):
+                    ptrs: List[int] = []
+                    sizes: List[int] = []
+                    metadata = (
+                        tensor_meta[layer * planes : (layer + 1) * planes]
+                        if layerwise
+                        else tensor_meta
+                    )
+                    for base, token_bytes in metadata:
+                        for slot, count in runs:
+                            ptrs.append(base + slot * token_bytes)
+                            sizes.append(count * token_bytes)
+                    page_ptrs.append(ptrs)
+                    page_sizes.append(sizes)
                 expected = sum(token_bytes for _, token_bytes in tensor_meta) * (
                     end - start
                 )
@@ -3170,10 +3181,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     * owners[0].element_size()
                     * self.num_layers
                 )
-                if sum(sizes) != expected or expected != metadata_bytes:
+                if sum(map(sum, page_sizes)) != expected or expected != metadata_bytes:
                     return None
-                all_ptrs.append(ptrs)
-                all_sizes.append(sizes)
+                all_ptrs.extend(page_ptrs)
+                all_sizes.extend(page_sizes)
             return all_ptrs, all_sizes, owners
         except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
             return None
