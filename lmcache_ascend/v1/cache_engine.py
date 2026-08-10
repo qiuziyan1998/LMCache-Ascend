@@ -24,7 +24,12 @@ from lmcache.utils import (
     _lmcache_nvtx_annotate,
     convert_tokens_to_list,
 )
-from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
+from lmcache.v1.cache_engine import (
+    _SHARED_SPARSE_DEFER_COMMIT,
+    _SHARED_SPARSE_PREPARE_ONLY,
+    LayerwiseStoreResult,
+    LMCacheEngine,
+)
 from lmcache.v1.cold_start_perf import (
     cold_start_perf_enabled,
     cold_start_perf_log,
@@ -53,6 +58,33 @@ logger = init_logger(__name__)
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
+
+
+def _shared_sparse_request(request):
+    prepare_only = defer_commit = False
+    if isinstance(request, dict):
+        prepare_only = bool(request.get(_SHARED_SPARSE_PREPARE_ONLY, False))
+        defer_commit = bool(request.get(_SHARED_SPARSE_DEFER_COMMIT, False))
+        if prepare_only or defer_commit:
+            request = dict(request)
+            request.pop(_SHARED_SPARSE_PREPARE_ONLY, None)
+            request.pop(_SHARED_SPARSE_DEFER_COMMIT, None)
+        return (
+            request,
+            request.get("selected_token_ids"),
+            request.get("token_start_index"),
+            None,
+            prepare_only,
+            defer_commit,
+        )
+    if isinstance(request, tuple):
+        if len(request) == 3:
+            selected, start, target = request
+        else:
+            selected, start = request
+            target = None
+        return None, selected, start, target, False, False
+    return None, request, 0, None, False, False
 
 
 @dataclass(slots=True)
@@ -3462,28 +3494,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         compact_pages = ()
         page_view_build_s = 0.0
         legacy_tail_objects = 0
+        defer_finish = False
 
         try:
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
-                sparse_payload = None
-                target_slot_mapping = None
-                if isinstance(sparse_request, dict):
-                    sparse_payload = sparse_request
-                    selected_tokens = sparse_payload.get("selected_token_ids")
-                    token_start_index = sparse_payload.get("token_start_index")
-                elif isinstance(sparse_request, tuple):
-                    if len(sparse_request) == 3:
-                        (
-                            selected_tokens,
-                            token_start_index,
-                            target_slot_mapping,
-                        ) = sparse_request
-                    else:
-                        selected_tokens, token_start_index = sparse_request
-                else:
-                    selected_tokens = sparse_request
-                    token_start_index = 0
+                (
+                    sparse_payload,
+                    selected_tokens,
+                    token_start_index,
+                    target_slot_mapping,
+                    prepare_only,
+                    defer_finish,
+                ) = _shared_sparse_request(sparse_request)
 
                 if not missing_chunks:
                     mem_objs_layer = []
@@ -3672,6 +3695,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                             rank=self.metadata.worker_id,
                         )
 
+                if prepare_only:
+                    sparse_request = yield ret_mask
+                    (
+                        sparse_payload,
+                        selected_tokens,
+                        token_start_index,
+                        target_slot_mapping,
+                        prepare_only,
+                        defer_finish,
+                    ) = _shared_sparse_request(sparse_request)
+                    if prepare_only:
+                        raise ValueError("Duplicate shared sparse prepare request")
+
                 dispatch_started = (
                     cold_start_perf_now()
                     if perf_enabled
@@ -3745,6 +3781,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                         pointer_seal_ms=pointer_seal_ms,
                     )
             next(mem_obj_consumer)
+            if defer_finish:
+                yield ret_mask
             if compact_batch is not None:
                 compact_final_receive_attempted = True
                 final_envelope = self._receive_shared_envelope()
@@ -4829,27 +4867,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "Failed to broadcast compact shared batch final error sentinel"
                 )
 
+        defer_finish = False
         try:
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
-                sparse_payload = None
-                target_slot_mapping = None
-                if isinstance(sparse_request, dict):
-                    sparse_payload = sparse_request
-                    selected_tokens = sparse_payload.get("selected_token_ids")
-                    token_start_index = sparse_payload.get("token_start_index")
-                elif isinstance(sparse_request, tuple):
-                    if len(sparse_request) == 3:
-                        (
-                            selected_tokens,
-                            token_start_index,
-                            target_slot_mapping,
-                        ) = sparse_request
-                    else:
-                        selected_tokens, token_start_index = sparse_request
-                else:
-                    selected_tokens = sparse_request
-                    token_start_index = 0
+                (
+                    sparse_payload,
+                    selected_tokens,
+                    token_start_index,
+                    target_slot_mapping,
+                    prepare_only,
+                    defer_finish,
+                ) = _shared_sparse_request(sparse_request)
 
                 if (
                     shared_sparse_retrieve
@@ -5033,6 +5062,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                         if compact_handle_batch is not None:
                             compact_batch_published = True
 
+                if prepare_only:
+                    sparse_request = yield ret_mask
+                    (
+                        sparse_payload,
+                        selected_tokens,
+                        token_start_index,
+                        target_slot_mapping,
+                        prepare_only,
+                        defer_finish,
+                    ) = _shared_sparse_request(sparse_request)
+                    if prepare_only:
+                        raise ValueError("Duplicate shared sparse prepare request")
+
                 dispatch_started = (
                     cold_start_perf_now()
                     if perf_enabled
@@ -5080,6 +5122,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
+            if defer_finish:
+                yield ret_mask
             if compact_handle_batch is not None:
                 compact_final_status_attempted = True
                 self._broadcast_shared_envelope(

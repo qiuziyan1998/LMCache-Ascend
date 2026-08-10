@@ -11,6 +11,10 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.cache_engine import (
+    _SHARED_SPARSE_DEFER_COMMIT,
+    _SHARED_SPARSE_PREPARE_ONLY,
+)
 from lmcache.v1.memory_management import LayerPageSource
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch, SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
@@ -1861,7 +1865,7 @@ def test_sparse_passive_partial_view_failure_releases_created_views(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    "final_status", ["skipped", "error", "close", "view_error"]
+    "final_status", ["skipped", "deferred", "error", "close", "view_error"]
 )
 def test_sparse_passive_compact_waits_for_final_status(monkeypatch, final_status):
     monkeypatch.setattr(
@@ -1902,12 +1906,16 @@ def test_sparse_passive_compact_waits_for_final_status(monkeypatch, final_status
                 request_ordinal=0,
                 layer_id=2,
                 kv_group=0,
-                status="skipped" if final_status == "skipped" else "error",
+                status=(
+                    "skipped"
+                    if final_status in ("skipped", "deferred")
+                    else "error"
+                ),
                 generation=7,
                 handles=[],
                 message=(
                     "compact shared batch committed"
-                    if final_status == "skipped"
+                    if final_status in ("skipped", "deferred")
                     else "compact failed"
                 ),
                 error_details=(
@@ -1961,6 +1969,8 @@ def test_sparse_passive_compact_waits_for_final_status(monkeypatch, final_status
     )
 
     next(retriever)
+    if final_status == "deferred":
+        retriever.send({_SHARED_SPARSE_PREPARE_ONLY: True})
     retriever.send(([0], 0))
     if final_status == "close":
         retriever.close()
@@ -1970,11 +1980,21 @@ def test_sparse_passive_compact_waits_for_final_status(monkeypatch, final_status
     elif final_status == "error":
         with pytest.raises(ValueError, match="rank0 error envelope"):
             retriever.send(([0], 0))
+    elif final_status == "deferred":
+        retriever.send(
+            {
+                "selected_token_ids": [0],
+                "token_start_index": 0,
+                _SHARED_SPARSE_DEFER_COMMIT: True,
+            }
+        )
+        assert receives == [True]
+        next(retriever)
     else:
         retriever.send(([0], 0))
 
     assert receives == [True, True]
-    if final_status != "skipped":
+    if final_status not in ("skipped", "deferred"):
         assert cached_memory_objs == []
         assert cached_shared_handles == []
         expected_releases = (
@@ -2064,7 +2084,9 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
     assert mem_obj.unpin_count == 0
 
 
-@pytest.mark.parametrize("exit_mode", ["success", "exception", "close"])
+@pytest.mark.parametrize(
+    "exit_mode", ["success", "deferred", "exception", "close"]
+)
 def test_compact_batch_uses_exactly_one_final_status(
     monkeypatch, exit_mode
 ):
@@ -2134,6 +2156,8 @@ def test_compact_batch_uses_exactly_one_final_status(
     )
 
     next(retriever)
+    if exit_mode == "deferred":
+        retriever.send({_SHARED_SPARSE_PREPARE_ONLY: True})
     retriever.send(([0], 0))
     assert len(broadcasts) == 1
     assert broadcasts[0].batch is batch
@@ -2151,6 +2175,16 @@ def test_compact_batch_uses_exactly_one_final_status(
             retriever.send(([0], 0))
     elif exit_mode == "close":
         retriever.close()
+    elif exit_mode == "deferred":
+        retriever.send(
+            {
+                "selected_token_ids": [0],
+                "token_start_index": 0,
+                _SHARED_SPARSE_DEFER_COMMIT: True,
+            }
+        )
+        assert len(broadcasts) == 1
+        next(retriever)
     else:
         retriever.send(([0], 0))
 
