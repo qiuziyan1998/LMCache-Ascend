@@ -256,12 +256,18 @@ def test_direct_cpu_retry_restores_submitted_frontier() -> None:
     assert state.submitted_end == {0: 256}
 
 
-def test_final_cpu_fallback_requires_complete_group_coverage() -> None:
+def test_direct_finalization_requires_exact_group_coverage() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(save_unfull_chunk=True)
     state = ascend_cache_engine._DirectStoreRequestState(committed_end={0: 4})
 
-    with pytest.raises(RuntimeError, match="did not cover"):
+    with pytest.raises(RuntimeError, match="invalid final frontier"):
+        engine._finalize_direct_store(
+            "request", [0] * 5, (0,), state, final=True
+        )
+
+    state.committed_end[0] = 6
+    with pytest.raises(RuntimeError, match="invalid final frontier"):
         engine._finalize_direct_store(
             "request", [0] * 5, (0,), state, final=True
         )
@@ -407,6 +413,7 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
 
     class _TokenDatabase:
         calls = []
+        corrupt_group = False
 
         def process_tokens(
             self, tokens=None, hashes=None, offsets=None, kv_group=0, **kwargs
@@ -528,7 +535,12 @@ def test_direct_suffix_planning_hashes_only_new_complete_chunks() -> None:
             self.calls.append(("full", kv_group, len(tokens or ()), hashes))
             values = [11, 22] if hashes is None else hashes
             for index, value in enumerate(values):
-                yield index * 2, (index + 1) * 2, self._key(value, kv_group)
+                yield (
+                    index * 2,
+                    (index + 1) * 2
+                    + int(self.corrupt_group and kv_group == 1),
+                    self._key(value, kv_group),
+                )
 
         def process_tokens_from_prefix(
             self, tokens, prefix_token_count, prefix_hash, kv_group=0, **kwargs
@@ -563,6 +575,15 @@ def test_direct_suffix_planning_hashes_only_new_complete_chunks() -> None:
         late_group, [1, 2, 3, 4], (0, 1), None
     )
     assert [(start, end) for start, end, _ in rebuilt[1]] == [(0, 2), (2, 4)]
+
+    engine.token_database.corrupt_group = True
+    with pytest.raises(RuntimeError, match="different chunk plans"):
+        engine._direct_suffix_plans(
+            ascend_cache_engine._DirectStoreRequestState(),
+            [1, 2, 3, 4],
+            (0, 1),
+            None,
+        )
 
 
 def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
+import hashlib
 import json
 import os
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
@@ -3641,10 +3642,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "Unable to determine the format of input kv_caches."
                 )
 
-            logger.info(
-                f"Detected KV cache format (kv_group={kv_group}): "
-                f"{layout.kv_format.name}"
-            )
+            if layout.kv_format not in (
+                KVCacheFormat.MLA_LATENT,
+                KVCacheFormat.DSA_INDEX,
+            ):
+                logger.info(
+                    "Detected KV cache format (kv_group=%d): %s",
+                    kv_group,
+                    layout.kv_format.name,
+                )
             self._reset_sparse_direct_layer_states()
             first_layer_cache = kv_caches[0]
 
@@ -3719,6 +3725,50 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else:
                 raise ValueError(f"Unsupported KV cache format: {layout.kv_format}")
 
+            if layout.kv_format in (
+                KVCacheFormat.MLA_LATENT,
+                KVCacheFormat.DSA_INDEX,
+            ):
+                layer_tensors = tuple(first_layer_cache)
+                planes = [
+                    {
+                        "shape": tuple(tensor.shape[2:]),
+                        "stride": tuple(tensor.stride()[2:]),
+                        "dtype": str(tensor.dtype),
+                        "token_stride_bytes": int(
+                            tensor.stride(1) * tensor.element_size()
+                        ),
+                        "token_bytes": int(
+                            tensor.numel()
+                            // (tensor.shape[0] * tensor.shape[1])
+                            * tensor.element_size()
+                        ),
+                    }
+                    for tensor in layer_tensors
+                ]
+                payload = {
+                    "format": layout.kv_format.name,
+                    "layers": self.num_layers,
+                    "chunk_size": self.lmcache_chunk_size,
+                    "planes": planes,
+                    "page_bytes": (
+                        sum(plane["token_bytes"] for plane in planes)
+                        * self.lmcache_chunk_size
+                        * self.num_layers
+                    ),
+                }
+                encoded = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":")
+                )
+                logger.info(
+                    "LMCache NPU payload layout: "
+                    "signature=%s kv_group=%d schema=%s",
+                    hashlib.blake2b(
+                        encoded.encode(), digest_size=8
+                    ).hexdigest(),
+                    kv_group,
+                    payload,
+                )
             self._group_layouts[kv_group] = layout
 
         # Mirror into instance attributes for backward-compatible readers.

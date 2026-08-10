@@ -569,15 +569,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         if state.finalized:
             return
         required_end = self._direct_required_end(state, tokens)
-        incomplete = {
+        invalid = {
             group: state.committed_end.get(group, 0)
             for group in groups
-            if state.committed_end.get(group, 0) < required_end
+            if state.committed_end.get(group, 0) != required_end
         }
-        if incomplete:
+        if invalid:
             raise RuntimeError(
-                "Direct prefill store did not cover the final prefix: "
-                f"req_id={req_id} committed={incomplete} required={required_end}"
+                "Direct prefill store published an invalid final frontier: "
+                f"req_id={req_id} committed={invalid} required={required_end}"
             )
         state.finalized = True
         logger.info(
@@ -648,6 +648,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=group,
                 )
             ]
+            if len(plans[group]) != len(plan0) or any(
+                (left[0], left[1], left[2].chunk_hash)
+                != (right[0], right[1], right[2].chunk_hash)
+                for left, right in zip(plan0, plans[group], strict=True)
+            ):
+                raise RuntimeError(
+                    "Direct prefill KV groups produced different chunk plans: "
+                    f"kv_group={group}"
+                )
         if plan0:
             state.planned_end = plan0[-1][1]
             state.planned_hash = int(plan0[-1][2].chunk_hash)
