@@ -1511,6 +1511,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
+        self.enable_npu_transfer_validation = bool(
+            kwargs.get("enable_npu_transfer_validation", True)
+        )
         self.max_staging_tokens = int(kwargs.get("max_staging_tokens", 0) or 0)
         # Concurrent layerwise staging buffers per kv_group (retrieve batch +
         # overlapping store). Default 2 covers retrieve+store for one request.
@@ -1843,6 +1846,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 layer_id=0,
                 chunk_index=chunk_index,
                 source="append_sparse_chunk_ptr_cache_for_layers_page",
+                required_bytes=page.get_size(),
             )
             for layer_id, row in enumerate(result):
                 row.append(base + page.group_prefix_sum[layer_id])
@@ -1866,6 +1870,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer_id: int,
         chunk_index: int,
         source: str,
+        required_bytes: Optional[int] = None,
     ) -> int:
         host_ptr = int(
             source_obj.data_ptr()
@@ -1874,13 +1879,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if isinstance(source_obj, LayerPageMemoryObj)
             else source_obj.data_ptr
         )
-        dev_ptr = lmc_ops.get_device_ptr(host_ptr)
+        validate_span = getattr(self, "enable_npu_transfer_validation", False)
+        if validate_span:
+            if required_bytes is None:
+                required_bytes = (
+                    int(source_obj.numel() * source_obj.element_size())
+                    if isinstance(source_obj, torch.Tensor)
+                    else int(source_obj.layer_size)
+                    if isinstance(source_obj, LayerPageMemoryObj)
+                    else int(source_obj.get_size())
+                )
+            dev_ptr = lmc_ops.get_device_ptr(host_ptr, required_bytes)
+        else:
+            dev_ptr = lmc_ops.get_device_ptr(host_ptr)
         if dev_ptr is None or int(dev_ptr) == 0:
             raise RuntimeError(
                 "Ascend sparse pointer-cache install failed: CPU tensor is not "
-                "registered or get_device_ptr returned null. "
+                "registered, its registered span is too small, or "
+                "get_device_ptr returned null. "
                 f"source={source}, layer_id={layer_id}, "
-                f"chunk_index={chunk_index}, host_ptr={host_ptr}"
+                f"chunk_index={chunk_index}, host_ptr={host_ptr}, "
+                f"required_bytes={required_bytes if validate_span else 'unchecked'}"
             )
         return int(dev_ptr)
 
@@ -1981,11 +2000,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         return (type(tensor).__name__,)
 
-    @staticmethod
-    def _vllm_layer_cache_identity_signature(value) -> tuple:
-        if isinstance(value, (tuple, list)):
-            return (id(value), len(value))
-        return (id(value),)
+    def _vllm_layer_cache_identity_signature(self, value) -> tuple:
+        is_tensor = isinstance(value, torch.Tensor)
+        tensors = (value,) if is_tensor else value
+        if not isinstance(tensors, (tuple, list)):
+            return (id(value),)
+        if not getattr(self, "enable_npu_transfer_validation", False):
+            return (id(value),) if is_tensor else (id(value), len(tensors))
+        return (
+            id(value),
+            tuple(
+                (
+                    id(tensor),
+                    int(tensor.data_ptr()),
+                    self._tensor_layout_signature(tensor),
+                )
+                for tensor in tensors
+            ),
+        )
 
     def _get_or_create_sparse_destination_plan(
         self,
@@ -2020,6 +2052,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int(sparse_k_hidden_dims),
             int(sparse_v_hidden_dims),
             int(sparse_dsa_hidden_dims),
+            tuple(
+                self._vllm_layer_cache_identity_signature(layer)
+                for layer in kvcaches_ref
+            )
+            if getattr(self, "enable_npu_transfer_validation", False)
+            else (),
         )
         plans = getattr(self, "_sparse_destination_plans", None)
         if plans is None:
@@ -2615,7 +2653,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
                 validate_inputs = (
-                    validate_key not in self._sparse_direct_validated_layers
+                    getattr(self, "enable_npu_transfer_validation", True)
+                    and validate_key not in self._sparse_direct_validated_layers
                 )
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
@@ -3004,7 +3043,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             transfer_stream.wait_stream(current_stream)
             if layer_state is not None:
                 validate_inputs = (
-                    validate_key not in self._sparse_direct_validated_layers
+                    getattr(self, "enable_npu_transfer_validation", True)
+                    and validate_key not in self._sparse_direct_validated_layers
                 )
                 dense_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
@@ -3333,9 +3373,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             layer_states.append(layer_state)
             validation_keys.append(validation_key)
 
-        validate_inputs = any(
-            key not in self._sparse_direct_validated_layers
-            for key in validation_keys
+        validate_inputs = (
+            getattr(self, "enable_npu_transfer_validation", True)
+            and any(
+                key not in self._sparse_direct_validated_layers
+                for key in validation_keys
+            )
         )
         current_stream = torch.npu.current_stream()
         with self._stream_context_or_null(self.store_stream):
@@ -3508,11 +3551,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 message,
             )
             raise RuntimeError(message)
+        if not getattr(self, "enable_npu_transfer_validation", True):
+            return
         if slot_mapping_full is None or slot_mapping_full.numel() == 0:
             return
         if slot_mapping_full.device.type != "cpu":
-            # Avoid a host/device sync in the layerwise hot path. Device-side
-            # slot bounds are still protected by the transfer kernels.
+            # Avoid a host/device sync in the layerwise hot path. Cold compact
+            # validates its existing CPU mapping before copying it to the NPU.
             return
         if kvcaches_len == 0:
             return
@@ -3528,8 +3573,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if capacity <= 0:
             return
 
-        slot_min = int(slot_mapping_full.min().item())
-        slot_max = int(slot_mapping_full.max().item())
+        slot_min_tensor, slot_max_tensor = torch.aminmax(slot_mapping_full)
+        slot_min = int(slot_min_tensor.item())
+        slot_max = int(slot_max_tensor.item())
         if slot_min < 0 or slot_max >= capacity:
             message = (
                 f"{operation} layerwise transfer slot mapping is out of range: "
@@ -3540,6 +3586,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             logger.error(message)
             raise ValueError(message)
+
+    def validate_layerwise_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        kvcaches: list,
+        *,
+        kv_group: int,
+    ) -> None:
+        """Validate a CPU slot map before cold-compact NPU submission."""
+        if not getattr(self, "enable_npu_transfer_validation", False):
+            return
+        if slot_mapping.device.type != "cpu":
+            raise ValueError("NPU transfer validation requires a CPU slot mapping")
+        self._check_layerwise_transfer_invariants(
+            operation="retrieve",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping,
+            kvcaches_ref=kvcaches,
+        )
 
     def _allocate_layerwise_staging_buffer(
         self,

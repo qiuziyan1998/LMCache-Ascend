@@ -235,10 +235,13 @@ py::tuple dense_mla_dsa_group_direct_kv_transfer_fast_wrapper(
 }
 
 PYBIND11_MODULE(c_ops, m) {
-  m.def("get_device_ptr", [](uintptr_t ptr_addr) {
-    return reinterpret_cast<uintptr_t>(
-        get_device_ptr(reinterpret_cast<void *>(ptr_addr)));
-  });
+  m.def(
+      "get_device_ptr",
+      [](uintptr_t ptr_addr, size_t required_size) {
+        return reinterpret_cast<uintptr_t>(get_device_ptr(
+            reinterpret_cast<void *>(ptr_addr), required_size));
+      },
+      py::arg("ptr_addr"), py::arg("required_size") = 1);
   m.def("register_mapping",
         [](uintptr_t host_ptr, uintptr_t dev_ptr, size_t size) {
           return reinterpret_cast<uintptr_t>(

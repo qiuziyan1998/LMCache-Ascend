@@ -101,6 +101,33 @@ def test_layer_page_pointer_resolution_uses_selected_layer(monkeypatch) -> None:
     pages[0].ref_count_down()
 
 
+def test_layer_page_pointer_resolution_validates_registered_span(monkeypatch) -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    calls = []
+    monkeypatch.setattr(
+        lmc_ops,
+        "get_device_ptr",
+        lambda address, size: calls.append((address, size)) or address + 7,
+    )
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.enable_npu_transfer_validation = True
+
+    connector._resolve_registered_cpu_source_device_ptr(
+        pages[0], layer_id=1, chunk_index=0, source="test"
+    )
+
+    assert calls == [(pages[0].layer_data_ptr(1), pages[0].layer_size)]
+    pages[0].ref_count_down()
+
+
 def test_direct_page_planner_preserves_layer_plane_run_order() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 2
@@ -841,6 +868,27 @@ def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
         obj.ref_count_down()
 
 
+def test_group_pointer_append_validates_complete_page_span(monkeypatch) -> None:
+    _allocator, pages, suffix, sources = _make_layer_page_sources()
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    connector.enable_npu_transfer_validation = True
+    calls = []
+    monkeypatch.setattr(
+        lmc_ops,
+        "get_device_ptr",
+        lambda address, size: calls.append((address, size)) or address + 1000,
+    )
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, [], [])
+
+    assert calls[: len(pages)] == [
+        (page.data_ptr, page.get_size()) for page in pages
+    ]
+    for obj in [*pages, *suffix]:
+        obj.ref_count_down()
+
+
 def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     connector = _make_sparse_pack_connector()
     connector.num_layers = 2
@@ -1159,14 +1207,15 @@ def test_shared_cpu_store_publication_fences_store_stream() -> None:
     assert connector.store_stream.events == ["synchronize"]
 
 
-def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
+def test_sparse_direct_state_key_tracks_source_and_destination(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector._sparse_direct_layer_states = None
+    connector.enable_npu_transfer_validation = True
     kvcaches_ref = [
-        (
+        [
             torch.zeros((1, 4), dtype=torch.bfloat16),
             torch.zeros((1, 4), dtype=torch.bfloat16),
-        )
+        ]
     ]
     slot_mapping = torch.arange(4, dtype=torch.long)
     source = torch.zeros(8, dtype=torch.bfloat16)
@@ -1253,12 +1302,56 @@ def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
         sparse_v_hidden_dims=1,
         sparse_dsa_hidden_dims=0,
     )
+    kvcaches_ref[0][0] = torch.zeros((1, 4), dtype=torch.bfloat16)
+    replaced_destination = connector._get_or_create_sparse_direct_layer_state(
+        kvcaches_ref=kvcaches_ref,
+        kv_group=0,
+        layer_id=0,
+        layer_tensors=[source],
+        slot_mapping_ref=slot_mapping,
+        total_tokens=4,
+        sparse_kv_format=0,
+        sparse_token_major=False,
+        sparse_vllm_two_major=False,
+        sparse_k_hidden_dims=1,
+        sparse_v_hidden_dims=1,
+        sparse_dsa_hidden_dims=0,
+    )
 
     assert first is same
     assert same_shape_new_source is first
     assert same_shape_new_slot_mapping is first
     assert changed is not first
-    assert len(prepared) == 2
+    assert replaced_destination is not first
+    assert len(prepared) == 3
+
+
+def test_layerwise_slot_validation_rejects_out_of_range_cpu_mapping() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.dsa_two_groups = True
+    connector.num_layers = 1
+    connector.enable_npu_transfer_validation = True
+
+    with pytest.raises(ValueError, match="slot mapping is out of range"):
+        connector.validate_layerwise_slot_mapping(
+            torch.tensor([0, 4], dtype=torch.long),
+            [[torch.empty((1, 4, 1, 1))]],
+            kv_group=1,
+        )
+
+    connector.enable_npu_transfer_validation = False
+    connector.validate_layerwise_slot_mapping(
+        torch.tensor([0, 4], dtype=torch.long),
+        [[torch.empty((1, 4, 1, 1))]],
+        kv_group=1,
+    )
+    with pytest.raises(RuntimeError, match="mismatched layer counts"):
+        connector._check_layerwise_transfer_invariants(
+            operation="retrieve",
+            kv_group=1,
+            slot_mapping_full=torch.empty(0, dtype=torch.long),
+            kvcaches_ref=[],
+        )
 
 
 def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
@@ -1496,6 +1589,7 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     connector.kv_device = torch.device("cpu")
     connector._sparse_direct_layer_states = None
     connector._sparse_direct_validated_layers = set()
+    connector.enable_npu_transfer_validation = True
 
     class _Stream:
         def wait_stream(self, stream):
@@ -1569,15 +1663,20 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     )
     first_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
     second_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
+    connector.enable_npu_transfer_validation = False
+    connector._sparse_direct_validated_layers.clear()
+    third_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
 
     assert first_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
     assert second_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
-    assert len(fast_calls) == 2
+    assert third_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
+    assert len(fast_calls) == 3
     assert slow_calls == []
     assert fast_calls[0][0][0] is layer_state
     assert fast_calls[1][0][0] is layer_state
     assert fast_calls[0][0][7] is True
     assert fast_calls[1][0][7] is False
+    assert fast_calls[2][0][7] is False
 
 
 def test_dense_direct_fast_state_cache_separates_load_and_store(
@@ -2073,6 +2172,39 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
     assert len(prepare_calls) == 2
     assert not hasattr(first, "validated")
     assert not hasattr(first, "source")
+
+
+def test_sparse_destination_plan_rebuilds_after_tensor_replacement(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.enable_npu_transfer_validation = True
+    connector._sparse_destination_plans = {}
+    kvcaches = [[torch.zeros((1, 4)), torch.zeros((1, 4))]]
+    prepare_calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "prepare_sparse_direct_destination_state",
+        lambda *args: prepare_calls.append(args) or object(),
+    )
+    kwargs = {
+        "kvcaches_ref": kvcaches,
+        "kv_group": 0,
+        "slot_mapping_ref": torch.arange(4, dtype=torch.long),
+        "sparse_kv_format": 0,
+        "sparse_k_hidden_dims": 1,
+        "sparse_v_hidden_dims": 1,
+        "sparse_dsa_hidden_dims": 0,
+        "expected_device": torch.device("cpu"),
+    }
+
+    first = connector._get_or_create_sparse_destination_plan(**kwargs)
+    kvcaches[0][0] = torch.zeros((1, 4))
+    second = connector._get_or_create_sparse_destination_plan(**kwargs)
+
+    assert second is not first
+    assert len(prepare_calls) == 2
 
 
 def test_prepared_sparse_launch_avoids_load_stream_handoff(

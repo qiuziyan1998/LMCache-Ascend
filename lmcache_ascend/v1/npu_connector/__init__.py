@@ -66,6 +66,9 @@ def CreateNPUConnector(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
             conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
+            conn.enable_npu_transfer_validation = getattr(
+                config, "enable_npu_transfer_validation", True
+            )
             return conn
 
         if config.use_gpu_connector_v3:
