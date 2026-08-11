@@ -87,6 +87,63 @@ def _layer_source_memory_objs(
     return source
 
 
+def _resolve_layerwise_slot_mapping(
+    layer_request: Any,
+    default_mapping: torch.Tensor,
+    default_base: int = 0,
+) -> tuple[torch.Tensor, int]:
+    if layer_request is None:
+        return default_mapping, default_base
+    if not isinstance(layer_request, dict) or "slot_mapping" not in layer_request:
+        raise TypeError(
+            "Layerwise transfer request must be a dict containing slot_mapping"
+        )
+    slot_mapping = layer_request["slot_mapping"]
+    if not isinstance(slot_mapping, torch.Tensor):
+        raise TypeError("Layerwise slot_mapping must be a torch.Tensor")
+    slot_mapping_base = int(layer_request.get("slot_mapping_base", 0))
+    if slot_mapping_base < 0:
+        raise ValueError(
+            "slot_mapping_base must be non-negative, "
+            f"got {slot_mapping_base}"
+        )
+    return slot_mapping, slot_mapping_base
+
+
+def _slice_layerwise_slot_mapping(
+    slot_mapping: torch.Tensor,
+    starts: Sequence[int],
+    ends: Sequence[int],
+    slot_mapping_base: int = 0,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    if len(starts) != len(ends):
+        raise ValueError(
+            "Layerwise transfer chunk starts/ends length mismatch: "
+            f"starts={len(starts)}, ends={len(ends)}"
+        )
+    chunks: list[torch.Tensor] = []
+    for start, end in zip(starts, ends, strict=True):
+        local_start = start - slot_mapping_base
+        local_end = end - slot_mapping_base
+        if (
+            local_start < 0
+            or local_end < local_start
+            or local_end > len(slot_mapping)
+        ):
+            raise ValueError(
+                "Layerwise transfer chunk is outside the provided slot-mapping "
+                "window: "
+                f"chunk=[{start}, {end}), base={slot_mapping_base}, "
+                f"mapping_tokens={len(slot_mapping)}, "
+                f"local_chunk=[{local_start}, {local_end})"
+            )
+        chunks.append(slot_mapping[local_start:local_end])
+    if not chunks:
+        return chunks, slot_mapping.new_empty((0,))
+    full = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+    return chunks, full
+
+
 def _payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
@@ -1802,7 +1859,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         pages = first.pages
         if any(
             len(source.pages) != len(pages)
-            or any(left is not right for left, right in zip(source.pages, pages))
+            or any(
+                left is not right
+                for left, right in zip(source.pages, pages, strict=False)
+            )
             for source in rows
             if isinstance(source, LayerPageSource)
         ):
@@ -3742,21 +3802,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     init_staging=True,
                 )
 
-        slot_mapping_chunks = []
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
         for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
             chunk_size = end - start
             chunk_offsets.append(current_offset)
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        slot_mapping_full = (
-            slot_mapping_chunks[0]
-            if len(slot_mapping_chunks) == 1
-            else torch.cat(slot_mapping_chunks, dim=0)
+        _, slot_mapping_full = _slice_layerwise_slot_mapping(
+            slot_mapping,
+            starts,
+            ends,
         )
 
         num_tokens = len(slot_mapping_full)
@@ -3811,7 +3869,39 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         try:
             validated_page_ids: set[int] = set()
             for layer_id in range(self.num_layers):
-                memory_objs_layer = yield
+                layer_payload = yield
+                layer_request = None
+                if isinstance(layer_payload, dict) and "memory_objs" in layer_payload:
+                    memory_objs_layer = layer_payload["memory_objs"]
+                    layer_request = layer_payload.get("layer_request")
+                else:
+                    memory_objs_layer = layer_payload
+                layer_slot_mapping, layer_slot_mapping_base = (
+                    _resolve_layerwise_slot_mapping(
+                        layer_request,
+                        slot_mapping,
+                    )
+                )
+                layer_slot_mapping_chunks, layer_slot_mapping_full = (
+                    _slice_layerwise_slot_mapping(
+                        layer_slot_mapping,
+                        starts,
+                        ends,
+                        layer_slot_mapping_base,
+                    )
+                )
+                if len(layer_slot_mapping_full) != num_tokens:
+                    raise RuntimeError(
+                        "Layerwise retrieve changed transfer token count: "
+                        f"layer={layer_id}, expected={num_tokens}, "
+                        f"actual={len(layer_slot_mapping_full)}"
+                    )
+                self._check_layerwise_transfer_invariants(
+                    operation="retrieve",
+                    kv_group=kv_group,
+                    slot_mapping_full=layer_slot_mapping_full,
+                    kvcaches_ref=kvcaches_snapshot,
+                )
                 source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
                 page_checks: tuple[MemoryObj, ...] = ()
                 format_sources = source_objs
@@ -3829,7 +3919,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cpu_tensors = (
                     [_layer_memory_tensor(source_objs[0], layer_id)]
                     if pointer_first
-                    else _layer_source_tensors(memory_objs_layer, layer_id, expected_fmt)
+                    else _layer_source_tensors(
+                        memory_objs_layer,
+                        layer_id,
+                        expected_fmt,
+                    )
                 )
                 # The generator is resumed from vLLM's attention path; refresh the
                 # active compute stream per layer before ordering load -> compute.
@@ -3864,7 +3958,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         layer_id=layer_id,
                         transfer_stream=self.load_stream,
                         current_stream=current_stream,
-                        slot_mapping_full=slot_mapping_full,
+                        slot_mapping_full=layer_slot_mapping_full,
                         chunk_ptrs_npu=chunk_ptrs_npu,
                         chunk_offsets_npu=chunk_offsets_npu,
                         chunk_sizes_npu=chunk_sizes_npu,
@@ -3888,7 +3982,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 cpu_tensors,  # CPU memory objects
                                 staging_tensor,  # GPU staging buffer
                                 kvcaches_snapshot[layer_id],
-                                slot_mapping_full,
+                                layer_slot_mapping_full,
                                 chunk_offsets,  # offset for each chunk
                                 chunk_sizes,  # size for each chunk
                                 False,  # to_gpu
@@ -3901,13 +3995,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             )
 
                         else:
-                            for start, end, tensor in zip(
-                                starts, ends, cpu_tensors, strict=False
+                            for mapping_chunk, tensor in zip(
+                                layer_slot_mapping_chunks,
+                                cpu_tensors,
+                                strict=False,
                             ):
                                 lmc_ops.single_layer_kv_transfer(
                                     tensor,
                                     kvcaches_snapshot[layer_id],
-                                    slot_mapping[start:end],
+                                    mapping_chunk,
                                     False,
                                     kv_format_value,
                                     token_major,
@@ -4686,35 +4782,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     init_staging=True,
                 )
 
-        slot_mapping_chunks = []
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
         for start, end in zip(starts, ends, strict=False):
-            local_start = start - slot_mapping_base
-            local_end = end - slot_mapping_base
-            if (
-                local_start < 0
-                or local_end < local_start
-                or local_end > len(slot_mapping)
-            ):
-                raise ValueError(
-                    "Layerwise store chunk is outside the provided slot-mapping "
-                    "window: "
-                    f"chunk=[{start}, {end}), base={slot_mapping_base}, "
-                    f"mapping_tokens={len(slot_mapping)}, "
-                    f"local_chunk=[{local_start}, {local_end})"
-                )
-            slot_mapping_chunks.append(slot_mapping[local_start:local_end])
             chunk_size = end - start
             chunk_offsets.append(current_offset)
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        slot_mapping_full = (
-            slot_mapping_chunks[0]
-            if len(slot_mapping_chunks) == 1
-            else torch.cat(slot_mapping_chunks, dim=0)
+        _, slot_mapping_full = _slice_layerwise_slot_mapping(
+            slot_mapping,
+            starts,
+            ends,
+            slot_mapping_base,
         )
 
         num_tokens = len(slot_mapping_full)
@@ -4797,10 +4878,95 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         current_stream = torch.npu.current_stream()
 
+        def log_completed_store_layer(layer_id: int) -> None:
+            if not (_mtp_dw_deep_diag_enabled() and layer_id == 0):
+                return
+            store_req_id = kwargs.get("req_id")
+            if store_req_id is None:
+                return
+            store_tensors = [
+                memory_obj.tensor
+                for memory_obj in memory_objs[layer_id]
+                if memory_obj.tensor is not None
+            ]
+            chunk_ranges = []
+            for chunk_index, tensor in enumerate(store_tensors):
+                range_start = (
+                    int(starts[chunk_index])
+                    if chunk_index < len(starts)
+                    else None
+                )
+                range_end = (
+                    int(ends[chunk_index])
+                    if chunk_index < len(ends)
+                    else None
+                )
+                chunk_ranges.append(
+                    {
+                        "start": range_start,
+                        "end": range_end,
+                        "fingerprint": _bounded_tensor_fingerprint(tensor),
+                    }
+                )
+            _mtp_dw_event(
+                "deep",
+                event="content_store",
+                req=str(store_req_id),
+                kv_group=kv_group,
+                layer=layer_id,
+                window_start=kwargs.get("decode_window_start"),
+                window_end=kwargs.get("decode_window_end"),
+                chunk_ranges=chunk_ranges,
+            )
+
+        store_transfer_pending = False
         try:
+            deferred_layerwise_put = bool(
+                kwargs.get("deferred_layerwise_put", False)
+            )
+            layer_request = None
+            if deferred_layerwise_put:
+                layer_request = yield None
             for layer_id in range(self.num_layers):
+                completed_layer = None
+                if deferred_layerwise_put and layer_id > 0:
+                    self.store_stream.synchronize()
+                    store_transfer_pending = False
+                    completed_layer = layer_id - 1
+                    log_completed_store_layer(completed_layer)
+
+                layer_slot_mapping, layer_slot_mapping_base = (
+                    _resolve_layerwise_slot_mapping(
+                        layer_request,
+                        slot_mapping,
+                        slot_mapping_base,
+                    )
+                )
+                layer_slot_mapping_chunks, layer_slot_mapping_full = (
+                    _slice_layerwise_slot_mapping(
+                        layer_slot_mapping,
+                        starts,
+                        ends,
+                        layer_slot_mapping_base,
+                    )
+                )
+                if len(layer_slot_mapping_full) != num_tokens:
+                    raise RuntimeError(
+                        "Layerwise store changed transfer token count: "
+                        f"layer={layer_id}, expected={num_tokens}, "
+                        f"actual={len(layer_slot_mapping_full)}"
+                    )
+                self._check_layerwise_transfer_invariants(
+                    operation="store",
+                    kv_group=kv_group,
+                    slot_mapping_full=layer_slot_mapping_full,
+                    kvcaches_ref=kvcaches_snapshot,
+                )
                 memory_objs_layer = memory_objs[layer_id]
                 # kvcaches -> gpu_buffer -> memobj
+                # Mark before launching so exception cleanup also fences a
+                # partially enqueued transfer.
+                store_transfer_pending = True
                 if dense_direct:
                     cpu_tensors = []
                     for memory_obj in memory_objs_layer:
@@ -4823,7 +4989,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         layer_id=layer_id,
                         transfer_stream=self.store_stream,
                         current_stream=current_stream,
-                        slot_mapping_full=slot_mapping_full,
+                        slot_mapping_full=layer_slot_mapping_full,
                         chunk_ptrs_npu=chunk_ptrs_npu,
                         chunk_offsets_npu=chunk_offsets_npu,
                         chunk_sizes_npu=chunk_sizes_npu,
@@ -4854,7 +5020,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 cpu_tensors,
                                 staging_tensor,
                                 kvcaches_snapshot[layer_id],
-                                slot_mapping_full,
+                                layer_slot_mapping_full,
                                 chunk_offsets,
                                 chunk_sizes,
                                 True,  # from_gpu
@@ -4866,15 +5032,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 dsa_hidden_dims,
                             )
                         else:
-                            for start, end, memory_obj in zip(
-                                starts, ends, memory_objs_layer, strict=False
+                            for mapping_chunk, memory_obj in zip(
+                                layer_slot_mapping_chunks,
+                                memory_objs_layer,
+                                strict=False,
                             ):
                                 assert memory_obj.tensor is not None
 
                                 lmc_ops.single_layer_kv_transfer(
                                     memory_obj.tensor,
                                     kvcaches_snapshot[layer_id],
-                                    slot_mapping[start:end],
+                                    mapping_chunk,
                                     True,
                                     kv_format_value,
                                     token_major,
@@ -4884,66 +5052,35 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                     dsa_hidden_dims,
                                 )
                         logger.debug("Finished offloading layer %d", layer_id)
-                yield
+                if deferred_layerwise_put:
+                    layer_request = yield completed_layer
+                else:
+                    yield
+                    # Legacy store_layer publishes the CPU objects immediately
+                    # after this generator advances.
+                    self.store_stream.synchronize()
+                    store_transfer_pending = False
+                    log_completed_store_layer(layer_id)
 
-                # store_layer publishes the CPU MemoryObjs immediately after the
-                # generator advances, so the layer's D2H copy must be complete
-                # before returning control regardless of the caller's sync hint.
+            if deferred_layerwise_put:
                 self.store_stream.synchronize()
-                if _mtp_dw_deep_diag_enabled() and layer_id == 0:
-                    store_req_id = kwargs.get("req_id")
-                    if store_req_id is not None:
-                        store_tensors = [
-                            memory_obj.tensor
-                            for memory_obj in memory_objs_layer
-                            if memory_obj.tensor is not None
-                        ]
-                        store_starts = list(starts)
-                        store_ends = list(ends)
-                        chunk_ranges = []
-                        for chunk_index, tensor in enumerate(store_tensors):
-                            range_start = (
-                                int(store_starts[chunk_index])
-                                if chunk_index < len(store_starts)
-                                else None
-                            )
-                            range_end = (
-                                int(store_ends[chunk_index])
-                                if chunk_index < len(store_ends)
-                                else None
-                            )
-                            chunk_ranges.append(
-                                {
-                                    "start": range_start,
-                                    "end": range_end,
-                                    "fingerprint": _bounded_tensor_fingerprint(
-                                        tensor
-                                    ),
-                                }
-                            )
-                        _mtp_dw_event(
-                            "deep",
-                            event="content_store",
-                            req=str(store_req_id),
-                            kv_group=kv_group,
-                            layer=layer_id,
-                            window_start=kwargs.get("decode_window_start"),
-                            window_end=kwargs.get("decode_window_end"),
-                            chunk_ranges=chunk_ranges,
-                        )
+                store_transfer_pending = False
+                final_layer = self.num_layers - 1
+                log_completed_store_layer(final_layer)
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
                 tmp_gpu_buffer_obj.ref_count_down()
                 tmp_gpu_buffer_obj = None
-            yield
+            yield final_layer if deferred_layerwise_put else None
         finally:
+            if store_transfer_pending:
+                self.store_stream.synchronize()
             if (
                 self.use_gpu
                 and tmp_gpu_buffer_obj is not None
                 and tmp_gpu_buffer_obj.is_valid()
             ):
-                self.store_stream.synchronize()
                 tmp_gpu_buffer_obj.ref_count_down()
 
 

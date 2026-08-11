@@ -38,6 +38,74 @@ import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
 import lmcache_ascend.c_ops as lmc_ops
 
 
+def test_dynamic_layerwise_slot_mapping_uses_absolute_chunk_ranges() -> None:
+    full_mapping = torch.tensor([10, 11, 12, 13, 14])
+    chunks, selected = npu_connectors._slice_layerwise_slot_mapping(
+        full_mapping,
+        starts=[1, 3],
+        ends=[3, 5],
+    )
+    assert [chunk.tolist() for chunk in chunks] == [[11, 12], [13, 14]]
+    assert selected.tolist() == [11, 12, 13, 14]
+
+    window_mapping = torch.tensor([21, 22, 23, 24])
+    resolved, base = npu_connectors._resolve_layerwise_slot_mapping(
+        {"slot_mapping": window_mapping, "slot_mapping_base": 1},
+        full_mapping,
+    )
+    _, selected = npu_connectors._slice_layerwise_slot_mapping(
+        resolved,
+        starts=[1, 3],
+        ends=[3, 5],
+        slot_mapping_base=base,
+    )
+    assert selected.tolist() == [21, 22, 23, 24]
+
+
+def test_dynamic_layerwise_slot_mapping_rejects_bad_payload() -> None:
+    mapping = torch.tensor([1, 2])
+    with pytest.raises(TypeError, match="dict containing slot_mapping"):
+        npu_connectors._resolve_layerwise_slot_mapping(mapping, mapping)
+    with pytest.raises(TypeError, match="must be a torch.Tensor"):
+        npu_connectors._resolve_layerwise_slot_mapping(
+            {"slot_mapping": [1, 2]}, mapping
+        )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        npu_connectors._resolve_layerwise_slot_mapping(
+            {"slot_mapping": mapping, "slot_mapping_base": -1}, mapping
+        )
+    with pytest.raises(ValueError, match="length mismatch"):
+        npu_connectors._slice_layerwise_slot_mapping(
+            mapping,
+            starts=[0, 1],
+            ends=[1],
+        )
+    with pytest.raises(ValueError, match="outside the provided"):
+        npu_connectors._slice_layerwise_slot_mapping(
+            mapping,
+            starts=[1],
+            ends=[4],
+        )
+
+
+def test_dynamic_layerwise_slot_mapping_default_and_empty_ranges() -> None:
+    mapping = torch.tensor([1, 2], dtype=torch.int32)
+    resolved, base = npu_connectors._resolve_layerwise_slot_mapping(
+        None, mapping, default_base=7
+    )
+    assert resolved is mapping
+    assert base == 7
+
+    chunks, selected = npu_connectors._slice_layerwise_slot_mapping(
+        mapping,
+        starts=[],
+        ends=[],
+    )
+    assert chunks == []
+    assert selected.shape == (0,)
+    assert selected.dtype == mapping.dtype
+
+
 def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
     allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
@@ -1719,6 +1787,33 @@ def test_staging_batched_to_gpu_releases_buffer_on_completion(monkeypatch) -> No
     assert releases == []
     next(generator)
     assert releases == [True]
+
+
+def test_staging_batched_to_gpu_uses_per_layer_slot_mapping(monkeypatch) -> None:
+    generator, releases = _staging_batched_to_gpu(monkeypatch)
+    mappings = []
+
+    def capture_transfer(*args, **_kwargs):
+        mappings.append(args[3].clone())
+
+    monkeypatch.setattr(
+        npu_connectors,
+        "batched_fused_single_layer_kv_transfer",
+        capture_transfer,
+    )
+    next(generator)
+    dynamic_mapping = torch.tensor([17], dtype=torch.long)
+    generator.send(
+        {
+            "memory_objs": [_MemoryObj(torch.zeros(1))],
+            "layer_request": {"slot_mapping": dynamic_mapping},
+        }
+    )
+    next(generator)
+
+    assert len(mappings) == 1
+    assert torch.equal(mappings[0], dynamic_mapping)
+    assert releases == [True]
     with pytest.raises(StopIteration):
         next(generator)
     assert releases == [True]
@@ -2186,6 +2281,96 @@ def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["total_tokens"] == 401
     assert direct_calls[0]["chunk_offsets_npu"].tolist() == starts
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
+
+
+def test_deferred_batched_from_gpu_rotates_mapping_and_reports_completion(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 3
+    connector.kvcaches = [object(), object(), object()]
+    connector.use_gpu = False
+    connector.store_stream = _TrackingStream("store")
+
+    class _Npu:
+        @staticmethod
+        def current_stream():
+            return _TrackingStream("compute")
+
+        @staticmethod
+        def stream(_stream):
+            return nullcontext()
+
+    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
+    monkeypatch.setattr(
+        connector, "initialize_kvcaches_ptr", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda *_args, **_kwargs: _DenseLayout(),
+    )
+    monkeypatch.setattr(
+        connector, "_is_mla_dsa_format", lambda _group=0: False
+    )
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda _group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(
+        connector, "_layerwise_token_major", lambda _group=0: False
+    )
+    monkeypatch.setattr(
+        connector,
+        "_sparse_lmc_host_interleaved",
+        lambda _group=0: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_check_layerwise_transfer_invariants",
+        lambda **_kwargs: None,
+    )
+    mappings = []
+    monkeypatch.setattr(
+        lmc_ops,
+        "single_layer_kv_transfer",
+        lambda _cpu, _kv, mapping, *_args: mappings.append(
+            mapping.clone()
+        ),
+    )
+    memory_objs = [
+        [_MemoryObj(torch.zeros(1))],
+        [_MemoryObj(torch.zeros(1))],
+        [_MemoryObj(torch.zeros(1))],
+    ]
+    generator = connector.batched_from_gpu(
+        memory_objs,
+        [0],
+        [1],
+        slot_mapping=torch.tensor([0]),
+        sync=False,
+        deferred_layerwise_put=True,
+    )
+
+    assert next(generator) is None
+    assert generator.send({"slot_mapping": torch.tensor([10])}) is None
+    assert generator.send({"slot_mapping": torch.tensor([20])}) == 0
+    assert generator.send({"slot_mapping": torch.tensor([30])}) == 1
+    assert next(generator) == 2
+    with pytest.raises(StopIteration):
+        next(generator)
+
+    assert [mapping.tolist() for mapping in mappings] == [[10], [20], [30]]
+    assert [
+        event
+        for event in connector.store_stream.events
+        if event == "synchronize"
+    ] == [
+        "synchronize",
+        "synchronize",
+        "synchronize",
+    ]
 
 
 def test_dense_group_store_uses_one_host_dispatch(monkeypatch) -> None:
