@@ -125,13 +125,25 @@ def test_cold_direct_indexer_failure_fences_before_cpu_fallback() -> None:
 def test_rank0_partial_page_remains_one_layer_page_source(monkeypatch) -> None:
     key = CacheEngineKey("model", 1, 0, 7, torch.float16)
     keys = [[layer_key] for layer_key in key.split_layers(2)]
+    page_key = CacheEngineKey(
+        "model",
+        1,
+        0,
+        7,
+        torch.float16,
+        {"lmcache.tag.internal.valid_tokens": 3},
+    )
+    requested_page_keys = []
     page = SimpleNamespace(
         valid_tokens=3,
         num_layers=2,
         get_shape=lambda: torch.Size([3, 4]),
     )
     local = SimpleNamespace(
-        batched_get_layer_page_prefix=lambda base_keys: ([page], 1),
+        batched_get_layer_page_prefix=lambda base_keys: (
+            requested_page_keys.extend(base_keys) or [page],
+            1,
+        ),
         contains_any_exact=lambda layer_keys: False,
     )
     engine = object.__new__(AscendLMCacheEngine)
@@ -154,6 +166,7 @@ def test_rank0_partial_page_remains_one_layer_page_source(monkeypatch) -> None:
         kv_group=0,
         keys_layer_major=keys,
         page_chunks=1,
+        base_page_keys=[page_key],
     )
     sources = [
         LayerPageSource(tuple(layer[:page_chunks]), layer_id)
@@ -161,6 +174,7 @@ def test_rank0_partial_page_remains_one_layer_page_source(monkeypatch) -> None:
     ]
 
     assert page_chunks == 1
+    assert requested_page_keys == [page_key]
     assert all(source.pages == (page,) and not source.suffix for source in sources)
 
 

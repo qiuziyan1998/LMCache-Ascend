@@ -2200,28 +2200,31 @@ class AscendLMCacheEngine(LMCacheEngine):
         kv_group: int,
         keys_layer_major: list[list[CacheEngineKey]],
         page_chunks: int,
+        base_page_keys: Optional[list[CacheEngineKey]] = None,
     ) -> tuple[list[list[MemoryObj]], int]:
         """Resolve exact-size full or partial layer pages with legacy fallback."""
         if not 0 < page_chunks <= len(keys_layer_major[0]):
             raise ValueError("Layer-page retrieval requires at least one chunk")
-        page_keys = [
-            key
-            for key in keys_layer_major[0][:page_chunks]
-            if isinstance(key, LayerCacheEngineKey)
-        ]
+        page_keys = (
+            list(base_page_keys[:page_chunks])
+            if base_page_keys is not None
+            else [
+                key.without_layer()
+                for key in keys_layer_major[0][:page_chunks]
+                if isinstance(key, LayerCacheEngineKey)
+            ]
+        )
         if len(page_keys) != page_chunks:
-            raise ValueError("Layer-page retrieval requires layer cache keys")
+            raise ValueError("Layer-page retrieval requires one base key per page")
 
         local = self._shared_local_cpu_backend()
         assert self.storage_manager is not None
-        pages, local_count = local.batched_get_layer_page_prefix(
-            [key.without_layer() for key in page_keys]
-        )
+        pages, local_count = local.batched_get_layer_page_prefix(page_keys)
         owned: list[MemoryObj] = list(pages)
         pinned: list[MemoryObj] = []
         try:
             legacy_suffix = local_count < page_chunks and local.contains_any_exact(
-                [layer[local_count] for layer in keys_layer_major]
+                page_keys[local_count].split_layers(self.num_layers)
             )
             tail_start = local_count
             if local_count < page_chunks and not legacy_suffix:
