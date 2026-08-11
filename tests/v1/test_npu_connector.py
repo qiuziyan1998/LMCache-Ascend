@@ -2803,6 +2803,18 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         ),
     )
 
+    slot_device_calls = []
+
+    def _slot_mapping_on_kv_device(slot_mapping, stream):
+        slot_device_calls.append((slot_mapping, stream))
+        return slot_mapping
+
+    monkeypatch.setattr(
+        connector,
+        "_slot_mapping_on_kv_device",
+        _slot_mapping_on_kv_device,
+    )
+
     pointer_calls = []
 
     def _resolve_chunk_ptrs(
@@ -2862,6 +2874,11 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     gen.close()
 
     assert init_staging_values == [False]
+    assert len(slot_device_calls) == 1
+    assert slot_device_calls[0][1] is connector.load_stream
+    assert torch.equal(
+        slot_device_calls[0][0], torch.arange(273, dtype=torch.long)
+    )
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is cached_chunk_ptrs_npu
     assert len(pointer_calls[0][1]) == 1
@@ -3044,6 +3061,18 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
         ),
     )
 
+    slot_device_calls = []
+
+    def _slot_mapping_on_kv_device(slot_mapping, stream):
+        slot_device_calls.append((slot_mapping, stream))
+        return slot_mapping
+
+    monkeypatch.setattr(
+        connector,
+        "_slot_mapping_on_kv_device",
+        _slot_mapping_on_kv_device,
+    )
+
     pointer_calls = []
 
     def _resolve_chunk_ptrs(
@@ -3093,6 +3122,7 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     gen.close()
 
     assert init_staging_values == [False]
+    assert slot_device_calls == [(local_slot_mapping, connector.store_stream)]
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is None
     assert len(direct_calls) == 1

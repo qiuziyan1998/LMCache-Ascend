@@ -1957,6 +1957,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return torch.npu.stream(stream)
         return torch.cuda.stream(stream)
 
+    def _slot_mapping_on_kv_device(
+        self, slot_mapping: torch.Tensor, stream
+    ) -> torch.Tensor:
+        if self.kv_device is None or slot_mapping.device == self.kv_device:
+            return slot_mapping
+        with self._stream_context_or_null(stream):
+            return slot_mapping.to(self.kv_device, non_blocking=True)
+
     @staticmethod
     def _sparse_direct_pointer_cache_signature(
         *,
@@ -3360,6 +3368,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             slot_mapping_full=slot_mapping_full,
             kvcaches_ref=self.kvcaches,
         )
+        slot_mapping_full = self._slot_mapping_on_kv_device(
+            slot_mapping_full, self.store_stream
+        )
         if len(memory_objs) != self.num_layers:
             raise RuntimeError(
                 "NPU group store memory object layer count mismatch: "
@@ -4086,6 +4097,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             slot_mapping_full=slot_mapping_full,
             kvcaches_ref=kvcaches_snapshot,
         )
+        if dense_direct:
+            slot_mapping_full = self._slot_mapping_on_kv_device(
+                slot_mapping_full, self.load_stream
+            )
 
         # Snapshot per-group values so interleaved per-group generators
         # do not race on the mirrored instance attributes.
@@ -5046,6 +5061,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             slot_mapping_full=slot_mapping_full,
             kvcaches_ref=kvcaches_snapshot,
         )
+        if dense_direct:
+            slot_mapping_full = self._slot_mapping_on_kv_device(
+                slot_mapping_full, self.store_stream
+            )
 
         # Snapshot per-group values so interleaved per-group generators
         # do not race on the mirrored instance attributes.
