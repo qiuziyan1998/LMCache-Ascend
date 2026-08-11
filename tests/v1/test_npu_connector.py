@@ -232,8 +232,8 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     monkeypatch.setattr(
         connector,
         "_resolve_registered_cpu_source_device_ptr",
-        lambda source, *, layer_id, chunk_index, **_kwargs: calls.append(
-            (source, layer_id, chunk_index)
+        lambda source_obj, *, layer_id, chunk_index, **_kwargs: calls.append(
+            (source_obj, layer_id, chunk_index)
         )
         or 100 * layer_id
         + chunk_index,
@@ -1076,6 +1076,11 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
     monkeypatch.setattr(connector, "_lazy_initialize_buffer", _lazy_initialize_buffer)
     monkeypatch.setattr(
         connector,
+        "_is_mla_dsa_format",
+        lambda _kv_group=0: False,
+    )
+    monkeypatch.setattr(
+        connector,
         "_layerwise_token_major",
         lambda kv_group: False,
     )
@@ -1176,6 +1181,11 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
         connector,
         "_lazy_initialize_buffer",
         lambda kvcaches, kv_group=0, init_staging=False: _Layout(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_is_mla_dsa_format",
+        lambda _kv_group=0: False,
     )
     monkeypatch.setattr(
         connector,
@@ -1384,7 +1394,10 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
     assert all("chunk_size" not in call for call in plan_calls)
     assert len(transfer_calls) == 2
     assert all(call["plan"] is destination_plan for call in transfer_calls)
-    assert all(call["source_layer"] is source_layer for call in transfer_calls)
+    assert all(
+        call["chunk_ptrs_npu"] is source_layer.chunk_ptrs_npu
+        for call in transfer_calls
+    )
     assert all(
         "load_stream" not in call and "current_stream" not in call
         for call in transfer_calls
@@ -1441,10 +1454,6 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
         (native_state,),
     )
     chunk_ptrs = torch.tensor([123], dtype=torch.int64)
-    source_layer = PreparedSparseSourceLayer(
-        tensors=(torch.zeros(4),),
-        chunk_ptrs_npu=chunk_ptrs,
-    )
     slots = torch.arange(2, dtype=torch.long)
     selected = torch.arange(2, dtype=torch.int32)
     calls = []
@@ -1461,7 +1470,7 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
 
     connector._run_prepared_sparse_direct_kv_transfer_layer(
         plan=plan,
-        source_layer=source_layer,
+        chunk_ptrs_npu=chunk_ptrs,
         layer_id=0,
         slot_mapping_packed=slots,
         selected_token_idx=selected,
@@ -1476,7 +1485,7 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     assert args[1] is slots
     assert args[2] is selected
     assert args[3] is chunk_ptrs
-    assert args[4:] == (256, 4, True)
+    assert args[4:] == (256, 4, True, None)
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
