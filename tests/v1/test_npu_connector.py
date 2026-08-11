@@ -559,6 +559,41 @@ def test_direct_retry_replays_success_between_failed_windows() -> None:
     assert state.committed_end == {0: 5}
 
 
+def test_direct_retry_rejects_unverified_gap_before_window() -> None:
+    future = Future()
+    future.set_exception(RuntimeError("window failed"))
+    state = ascend_cache_engine._DirectStoreRequestState(
+        futures=deque((future,)),
+        pending_keys={"window"},
+        submitted_end={0: 6},
+        committed_end={0: 0},
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_states = {"request": state}
+    engine._pending_store_reqs = {"request": 1}
+    engine._direct_completed_futures = WeakSet()
+    engine._store_cv = threading.Condition(threading.Lock())
+    engine.config = SimpleNamespace(blocking_timeout_secs=1)
+    engine._direct_retry_args = {
+        future: (
+            "request",
+            [0] * 6,
+            {0: [0]},
+            {0: [0]},
+            None,
+            4,
+            {"window"},
+            {0: 6},
+        )
+    }
+    engine._store_direct_cpu_group = lambda *args: (_ for _ in ()).throw(
+        AssertionError("an unverified gap must fail before CPU repair")
+    )
+
+    with pytest.raises(RuntimeError, match="unverified prefix gap"):
+        engine.wait_for_direct_stores(("request",))
+
+
 def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
     monkeypatch,
 ) -> None:
@@ -990,6 +1025,49 @@ def test_direct_prefill_rejects_missing_prefix_before_window() -> None:
             {0: [object()]},
             {0: torch.arange(2)},
             slot_mapping_base=4,
+        )
+
+
+def test_direct_prefill_checks_chunk_crossing_unaligned_verified_prefix() -> None:
+    class _TokenDatabase:
+        @staticmethod
+        def process_tokens(tokens=None, kv_group=0, **kwargs):
+            for start in range(0, len(tokens), 2):
+                yield (
+                    start,
+                    start + 2,
+                    CacheEngineKey(
+                        "model", 1, 0, start, torch.float16, kv_group=kv_group
+                    ),
+                )
+
+    class _StorageManager:
+        @staticmethod
+        def batched_external_pages_exist(keys):
+            assert [key.chunk_hash for key in keys] == [2, 4]
+            return [False, False]
+
+    class _GPUConnector:
+        @staticmethod
+        def plan_direct_page_sources(*args, **kwargs):
+            raise AssertionError("crossing missing page is outside the save window")
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_enabled = True
+    engine._direct_store_states = {}
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine.token_database = _TokenDatabase()
+    engine.storage_manager = _StorageManager()
+    engine.gpu_connector = _GPUConnector()
+
+    with pytest.raises(RuntimeError, match="uncommitted prefix"):
+        engine.store_direct_prefill(
+            "window",
+            list(range(6)),
+            {0: [object()]},
+            {0: torch.arange(3)},
+            slot_mapping_base=3,
+            verified_prefix_end=3,
         )
 
 
@@ -1808,6 +1886,31 @@ def test_sparse_transfer_topk_preserves_shorter_inputs(
 
     assert limited_slots is slots
     assert limited_selected is selected
+
+
+@pytest.mark.parametrize(
+    ("chunks", "total_tokens"),
+    [(74, 18879), (2, 257), (2, 512), (1, 256)],
+)
+def test_sparse_fixed_chunk_coverage_accepts_exact_tail(
+    chunks: int, total_tokens: int
+) -> None:
+    VLLMPagedMemLayerwiseNPUConnector._validate_sparse_fixed_chunk_coverage(
+        chunks, 256, total_tokens
+    )
+
+
+@pytest.mark.parametrize(
+    ("chunks", "total_tokens"),
+    [(73, 18879), (75, 18879), (1, 257), (3, 257), (3, 512)],
+)
+def test_sparse_fixed_chunk_coverage_rejects_missing_or_extra_tail(
+    chunks: int, total_tokens: int
+) -> None:
+    with pytest.raises(ValueError, match="exact full/tail chunk coverage"):
+        VLLMPagedMemLayerwiseNPUConnector._validate_sparse_fixed_chunk_coverage(
+            chunks, 256, total_tokens
+        )
 
 
 def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:

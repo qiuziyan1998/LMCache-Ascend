@@ -1108,7 +1108,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             group_candidates = [
                 (start, end, key)
                 for start, end, key in plans[group]
-                if start >= submitted and end - start == chunk_size
+                if end > submitted and end - start == chunk_size
             ]
             candidates[group] = group_candidates
             candidate_refs.extend((group, item) for item in group_candidates)
@@ -1458,9 +1458,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                             group_ends,
                         ) = retry
                         for group, required_end in group_ends.items():
-                            start = max(
-                                verified_ends.get(group, 0), mapping_base
-                            )
+                            start = verified_ends.get(group, 0)
+                            if start < mapping_base:
+                                raise RuntimeError(
+                                    "Direct-store completion cannot bridge an "
+                                    "unverified prefix gap: "
+                                    f"req_id={req_id} group={group} "
+                                    f"verified={start} "
+                                    f"mapping_base={mapping_base}"
+                                )
                             if error is None:
                                 verified_ends[group] = max(start, required_end)
                                 continue

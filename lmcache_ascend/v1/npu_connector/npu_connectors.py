@@ -2583,6 +2583,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_idx[:_SPARSE_TRANSFER_TOPK],
         )
 
+    @staticmethod
+    def _validate_sparse_fixed_chunk_coverage(
+        chunk_count: int,
+        chunk_size: int,
+        total_tokens: int,
+    ) -> None:
+        expected = (total_tokens + chunk_size - 1) // chunk_size
+        if chunk_count != expected:
+            raise ValueError(
+                "Sparse direct retrieve requires exact full/tail chunk coverage: "
+                f"chunks={chunk_count}, expected={expected}, "
+                f"chunk_size={chunk_size}, total_tokens={total_tokens}"
+            )
+
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -2615,17 +2629,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return "none"
         chunk_count = int(chunk_ptrs_npu.numel())
         chunk_size_int = int(chunk_size)
-        covered_tokens = chunk_count * chunk_size_int
-        if covered_tokens < int(total_tokens):
-            message = (
-                "Sparse direct retrieve has insufficient chunk pointers: "
-                f"kv_group={kv_group} layer_id={layer_id} "
-                f"num_sparse={num_sparse} chunk_count={chunk_count} "
-                f"chunk_size={chunk_size_int} covered_tokens={covered_tokens} "
-                f"total_tokens={int(total_tokens)}"
-            )
-            logger.error(message)
-            raise ValueError(message)
+        self._validate_sparse_fixed_chunk_coverage(
+            chunk_count, chunk_size_int, int(total_tokens)
+        )
         resolve_tensors = (
             layer_tensors
             if layer_tensors is not None
@@ -2733,15 +2739,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Launch one prepared layer directly on the current compute stream."""
         if selected_token_idx.numel() == 0:
             return
-        covered_tokens = int(chunk_ptrs_npu.numel()) * int(chunk_size)
         if total_tokens <= 0:
             return
-        if covered_tokens < int(total_tokens):
-            raise ValueError(
-                "Sparse destination-plan retrieve has insufficient chunk "
-                f"pointers: layer_id={layer_id} covered_tokens={covered_tokens} "
-                f"total_tokens={int(total_tokens)}"
-            )
+        self._validate_sparse_fixed_chunk_coverage(
+            int(chunk_ptrs_npu.numel()), int(chunk_size), int(total_tokens)
+        )
         sparse_mla_dsa_batched_direct_kv_transfer_prepared(
             plan.states[layer_id],
             slot_mapping_packed,
