@@ -40,6 +40,7 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             and getattr(engine, "kv_role", None)
             in ("kv_both", "kv_consumer")
             and getattr(config, "dsa_two_groups", False)
+            and getattr(config, "enable_sparse_attention", False)
         )
 
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole) -> None:

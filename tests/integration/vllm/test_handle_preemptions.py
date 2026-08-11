@@ -69,7 +69,10 @@ def test_lmcache_connector_patch_advertises_staged_sfa_sparse_load():
     connector._lmcache_engine = SimpleNamespace(
         use_layerwise=True,
         kv_role="kv_both",
-        config=SimpleNamespace(dsa_two_groups=True),
+        config=SimpleNamespace(
+            dsa_two_groups=True,
+            enable_sparse_attention=True,
+        ),
     )
     assert connector.supports_staged_sfa_sparse_load is True
 
@@ -85,6 +88,10 @@ def test_lmcache_connector_patch_advertises_staged_sfa_sparse_load():
 
     connector._lmcache_engine.use_layerwise = True
     connector._lmcache_engine.config.dsa_two_groups = False
+    assert connector.supports_staged_sfa_sparse_load is False
+
+    connector._lmcache_engine.config.dsa_two_groups = True
+    connector._lmcache_engine.config.enable_sparse_attention = False
     assert connector.supports_staged_sfa_sparse_load is False
 
 
@@ -112,10 +119,15 @@ def test_dynamic_connector_advertises_staged_sparse_load_by_role(
     connector._lmcache_engine = SimpleNamespace(
         use_layerwise=True,
         kv_role=kv_role,
-        config=SimpleNamespace(dsa_two_groups=True),
+        config=SimpleNamespace(
+            dsa_two_groups=True,
+            enable_sparse_attention=True,
+        ),
     )
 
     assert connector.supports_staged_sfa_sparse_load is expected
+    connector._lmcache_engine.config.enable_sparse_attention = False
+    assert connector.supports_staged_sfa_sparse_load is False
 
 
 def test_lmcache_connector_preemption_patch_handles_no_inner_impl():
