@@ -2244,16 +2244,33 @@ class AscendLMCacheEngine(LMCacheEngine):
                 owned.extend(fetched)
                 tail_start += remote_count
 
+            legacy_page_layers = (
+                [
+                    list(layer)
+                    for layer in zip(
+                        *(
+                            key.split_layers(self.num_layers)
+                            for key in page_keys[tail_start:page_chunks]
+                        ),
+                        strict=True,
+                    )
+                ]
+                if tail_start < page_chunks
+                else [[] for _ in range(self.num_layers)]
+            )
+            tail_keys_layer_major = [
+                legacy_page_layers[layer_id]
+                + list(keys_layer_major[layer_id][page_chunks:])
+                for layer_id in range(self.num_layers)
+            ]
             tail = (
                 self._resolve_shared_rank0_page_first_layers(
                     req_id=req_id,
                     phase=phase,
                     kv_group=kv_group,
-                    keys_layer_major=[
-                        layer[tail_start:] for layer in keys_layer_major
-                    ],
+                    keys_layer_major=tail_keys_layer_major,
                 )
-                if tail_start < len(keys_layer_major[0])
+                if tail_keys_layer_major[0]
                 else [[] for _ in keys_layer_major]
             )
             tail_objects = [obj for layer in tail for obj in layer]

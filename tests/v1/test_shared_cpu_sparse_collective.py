@@ -178,6 +178,52 @@ def test_rank0_partial_page_remains_one_layer_page_source(monkeypatch) -> None:
     assert all(source.pages == (page,) and not source.suffix for source in sources)
 
 
+def test_rank0_page_miss_expands_base_key_for_legacy_fallback() -> None:
+    page_key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    fallback_keys = []
+    suffix = [[object()], [object()]]
+    local = SimpleNamespace(
+        batched_get_layer_page_prefix=lambda _keys: ([], 0),
+        contains_any_exact=lambda _keys: False,
+    )
+    remote = SimpleNamespace(
+        batched_contains_layer_pages=lambda _keys: 0,
+        batched_get_layer_pages=lambda _keys: pytest.fail(
+            "a missing page must use legacy retrieval"
+        ),
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.storage_manager = SimpleNamespace(
+        storage_backends={"RemoteBackend": remote}
+    )
+    engine._shared_local_cpu_backend = lambda: local
+
+    def resolve_legacy(**kwargs):
+        fallback_keys.extend(kwargs["keys_layer_major"])
+        return suffix
+
+    engine._resolve_shared_rank0_page_first_layers = resolve_legacy
+
+    resolved, page_chunks = engine._resolve_shared_rank0_layer_pages(
+        req_id="request",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[[page_key], [page_key]],
+        page_chunks=1,
+        base_page_keys=[page_key],
+    )
+
+    assert page_chunks == 0
+    assert resolved == suffix
+    assert fallback_keys == [[page_key.get_layer(0)], [page_key.get_layer(1)]]
+    assert all(
+        isinstance(key, ascend_cache_engine.LayerCacheEngineKey)
+        for layer in fallback_keys
+        for key in layer
+    )
+
+
 def test_live_import_commit_adopts_page_without_releasing_request_owner() -> None:
     class _Page:
         def __init__(self) -> None:
