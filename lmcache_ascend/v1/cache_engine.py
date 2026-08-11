@@ -1806,9 +1806,18 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         return pending_at_start | direct_waited
 
-    def _track_sync_store_futures(self, futures: Iterable[Future]) -> None:
-        """Track completion-required futures during synchronous stores."""
-        if not self.is_store_async or self._require_store_completion:
+    def _track_sync_store_futures(
+        self,
+        futures: Iterable[Future],
+        *,
+        require_completion: bool = False,
+    ) -> None:
+        """Track backend futures that must complete before save publication."""
+        if (
+            require_completion
+            or not self.is_store_async
+            or self._require_store_completion
+        ):
             self._pending_sync_store_futures.update(futures)
 
     def wait_for_pending_sync_stores(self) -> None:
@@ -3750,7 +3759,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 memory_objs[layer_id],
                                 location=self.store_location,
                             )
-                            self._track_sync_store_futures(required_futures)
+                            self._track_sync_store_futures(
+                                required_futures, require_completion=True
+                            )
                             for mem_obj in memory_objs[layer_id]:
                                 pending_store_release.pop(id(mem_obj), None)
                 else:
@@ -3776,7 +3787,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             memory_objs[layer_id],
                             location=self.store_location,
                         )
-                        self._track_sync_store_futures(required_futures)
+                        self._track_sync_store_futures(
+                            required_futures, require_completion=True
+                        )
                         for mem_obj in memory_objs[layer_id]:
                             pending_store_release.pop(id(mem_obj), None)
 
@@ -3790,7 +3803,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                         flattened_memory_objs,
                         location=self.store_location,
                     )
-                    self._track_sync_store_futures(required_futures)
+                    self._track_sync_store_futures(
+                        required_futures, require_completion=True
+                    )
                     for mem_obj in flattened_memory_objs:
                         pending_store_release.pop(id(mem_obj), None)
 

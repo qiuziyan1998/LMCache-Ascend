@@ -17,6 +17,7 @@ from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 def _make_engine(timeout: float = 0.01) -> AscendLMCacheEngine:
     engine = object.__new__(AscendLMCacheEngine)
     engine.is_store_async = False
+    engine._require_store_completion = False
     engine.config = SimpleNamespace(blocking_timeout_secs=timeout)
     engine._pending_sync_store_futures = set()
     return engine
@@ -58,3 +59,13 @@ def test_async_store_mode_does_not_join_operation_futures() -> None:
 
     assert not engine._pending_sync_store_futures
     assert not future.done()
+
+
+def test_layerwise_async_store_requires_completion() -> None:
+    engine = _make_engine()
+    engine.is_store_async = True
+    future: Future = Future()
+
+    engine._track_sync_store_futures([future], require_completion=True)
+
+    assert engine._pending_sync_store_futures == {future}
