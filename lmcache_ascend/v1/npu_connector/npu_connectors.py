@@ -1558,7 +1558,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return not _DENSE_DIRECT_LOAD_DISABLE
 
     def synchronize_dense_load_stream(self) -> None:
+        """Synchronize dense load work before unsafe host-side cleanup."""
         self.load_stream.synchronize()
+
+    def record_dense_load_readiness(self) -> Any:
+        """Record and return an opaque completion fence for dense load work."""
+        event = torch.npu.Event()
+        event.record(self.load_stream)
+        return event
+
+    def consume_dense_load_readiness(self, readiness: Any) -> None:
+        """Order the current consumer stream after an opaque dense-load fence."""
+        torch.npu.current_stream().wait_event(readiness)
 
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
@@ -1809,7 +1820,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         pages = first.pages
         if any(
             len(source.pages) != len(pages)
-            or any(left is not right for left, right in zip(source.pages, pages))
+            or any(
+                left is not right
+                for left, right in zip(source.pages, pages, strict=True)
+            )
             for source in rows
             if isinstance(source, LayerPageSource)
         ):
@@ -3088,7 +3102,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             and self._is_mla_dsa_format(kv_group)
         )
 
-    def plan_direct_page_sources(
+    def _plan_direct_page_buffers(
         self,
         kvcaches: list,
         slot_mapping: torch.Tensor,
@@ -3100,7 +3114,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> Optional[
         tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
     ]:
-        """Describe full LMCache pages directly from paged NPU KV storage."""
+        """Describe LMCache page buffers in paged NPU KV tensor storage."""
         try:
             layout = self._lazy_initialize_buffer_with_staging(
                 kvcaches, kv_group=kv_group, init_staging=False
@@ -3125,7 +3139,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 slot_mapping[local_base:local_end]
                 .detach()
                 .to(device="cpu", dtype=torch.long)
-                .tolist()
             )
             owners = tuple(
                 tensor
@@ -3188,22 +3201,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if (
                     local_start < 0
                     or local_end <= local_start
-                    or local_end > len(slots)
+                    or local_end > slots.numel()
                 ):
                     return None
                 page_slots = slots[local_start:local_end]
-                if any(
-                    slot < 0 or slot >= slot_capacity for slot in page_slots
-                ):
+                if bool(((page_slots < 0) | (page_slots >= slot_capacity)).any()):
                     return None
-                runs: list[tuple[int, int]] = []
-                run_start = previous = page_slots[0]
-                for slot in page_slots[1:]:
-                    if slot != previous + 1:
-                        runs.append((run_start, previous - run_start + 1))
-                        run_start = slot
-                    previous = slot
-                runs.append((run_start, previous - run_start + 1))
+                breaks = torch.where(page_slots[1:] != page_slots[:-1] + 1)[0] + 1
+                boundaries = [0, *breaks.tolist(), page_slots.numel()]
+                runs = [
+                    (int(page_slots[left]), right - left)
+                    for left, right in zip(boundaries, boundaries[1:], strict=True)
+                ]
 
                 planes = 2 if kv_group == 0 else 1
                 page_ptrs, page_sizes = [], []
@@ -3236,6 +3245,54 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return all_ptrs, all_sizes, owners
         except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
             return None
+
+    def plan_direct_page_sources(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+        layerwise: bool = False,
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
+    ]:
+        """Describe source buffers for a direct page store."""
+        return self._plan_direct_page_buffers(
+            kvcaches,
+            slot_mapping,
+            starts,
+            ends,
+            kv_group,
+            layerwise,
+            slot_mapping_base,
+        )
+
+    def plan_direct_page_destinations(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+        layerwise: bool = False,
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
+    ]:
+        """Describe destination buffers for a direct page load."""
+        if _DENSE_DIRECT_LOAD_DISABLE:
+            return None
+        return self._plan_direct_page_buffers(
+            kvcaches,
+            slot_mapping,
+            starts,
+            ends,
+            kv_group,
+            layerwise,
+            slot_mapping_base,
+        )
 
     def batched_from_gpu_group(
         self,
@@ -4092,7 +4149,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cpu_tensors = (
                     [_layer_memory_tensor(source_objs[0], layer_id)]
                     if pointer_first
-                    else _layer_source_tensors(memory_objs_layer, layer_id, expected_fmt)
+                    else _layer_source_tensors(
+                        memory_objs_layer, layer_id, expected_fmt
+                    )
                 )
                 # The generator is resumed from vLLM's attention path; refresh the
                 # active compute stream per layer before ordering load -> compute.

@@ -147,6 +147,9 @@ def test_ascend_adapter_drains_pending_stores_for_async_producer():
     adapter.handle_preemptions(preempted_req_ids)
 
     lmcache_engine.wait_for_pending_stores.assert_called_once_with(preempted_req_ids)
+    lmcache_engine.drop_direct_store_states.assert_called_once_with(
+        preempted_req_ids
+    )
 
 
 @pytest.mark.parametrize(

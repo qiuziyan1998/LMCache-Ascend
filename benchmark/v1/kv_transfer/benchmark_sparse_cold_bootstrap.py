@@ -26,10 +26,9 @@ The remote store is synthetic so CPU metadata can be measured independently
 from a particular Mooncake deployment. By default, allocation, ``MemoryObj``
 construction, and LRU insertion use the production LMCache implementations;
 ``--object-mode synthetic`` retains the lightweight metadata-only model. Page
-accounting matches ``mooncake_page_first_multi_buffer=true``: full token
-chunks use one multi-buffer Mooncake page, while an unfull tail chunk falls
-back to one legacy file per layer. Every layer remains a separate LMCache
-``MemoryObj`` and destination buffer.
+accounting matches ``mooncake_page_first_multi_buffer=true``: every token
+chunk, including an unfull tail, uses one multi-buffer Mooncake page. Every
+layer remains a separate LMCache ``MemoryObj`` and destination buffer.
 """
 
 # Standard
@@ -38,6 +37,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Optional, cast
+import hashlib
 import json
 import math
 import statistics
@@ -71,6 +71,38 @@ from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 
 GB = 1_000_000_000
+EVIDENCE_SCHEMA = 1
+EVIDENCE_TOKEN_COUNTS = (18_878, 120_000)
+EVIDENCE_CHUNK_SIZES = (256, 512, 1024)
+EVIDENCE_MANIFEST_FIELDS = (
+    "model",
+    "prompt_hash",
+    "tp",
+    "dp",
+    "mtp",
+    "page_layout",
+    "network",
+    "bytes",
+    "outputs",
+    "ttft_ms",
+    "tpot_ms",
+    "peak_npu_memory_bytes",
+)
+_MOONCAKE_EVENTS = {
+    "mooncake_page_lookup",
+    "mooncake_page_get",
+    "mooncake_legacy_get",
+}
+_EVIDENCE_STAGE_EVENTS = {
+    "metadata_ms": {"metadata_prepare"},
+    "lookup_ms": {"scheduler_lookup", "location_probe", "mooncake_page_lookup"},
+    "capacity_ms": {"capacity_preflight"},
+    "allocation_ms": set(),
+    "transfer_ms": {"mooncake_page_get", "mooncake_legacy_get"},
+    "h2d_ms": {"direct_npu_submit", "npu_layer_submit_cpu", "dense_shared_consume"},
+    "synchronization_ms": {"direct_npu_final_wait"},
+    "prepared_source_ms": {"passive_layer_prepare", "passive_compact_materialize"},
+}
 _RESOLVER_EMITTED_STAGES = (
     "windows",
     "remote_get",
@@ -80,6 +112,254 @@ _RESOLVER_EMITTED_STAGES = (
     "scatter",
     "rollback",
 )
+
+
+def canonical_sha256(value: Any) -> str:
+    """Hash correctness/config material with stable JSON serialization."""
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def correctness_hashes(
+    *,
+    prompt: str,
+    token_ids: list[int],
+    first_token_logits: Any,
+    output_token_ids: list[int],
+) -> dict[str, str]:
+    """Return comparable hashes without embedding large or sensitive payloads."""
+    return {
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "token_ids_sha256": canonical_sha256(token_ids),
+        "first_token_logits_sha256": canonical_sha256(first_token_logits),
+        "output_token_ids_sha256": canonical_sha256(output_token_ids),
+    }
+
+
+def topology_config_signature(manifest: dict[str, Any]) -> str:
+    """Fingerprint fields that must remain identical across performance runs."""
+    return canonical_sha256(
+        {
+            key: manifest[key]
+            for key in (
+                "model",
+                "tp",
+                "dp",
+                "mtp",
+                "page_layout",
+                "network",
+            )
+        }
+    )
+
+
+def validate_evidence_manifest(manifest: dict[str, Any]) -> None:
+    missing = [key for key in EVIDENCE_MANIFEST_FIELDS if key not in manifest]
+    if missing:
+        raise ValueError(f"evidence manifest missing fields: {', '.join(missing)}")
+    if manifest["tp"] != 8 or manifest["dp"] != 2:
+        raise ValueError("evidence contract requires TP8 and DP2")
+    if not isinstance(manifest["outputs"], dict) or "token_ids_sha256" not in manifest[
+        "outputs"
+    ]:
+        raise ValueError("evidence manifest outputs must include token_ids_sha256")
+
+
+def parse_cold_perf_jsonl(lines: Iterable[str]) -> list[dict[str, Any]]:
+    """Extract structured cold-perf payloads from plain or prefixed log lines."""
+    marker = "[LMCACHE_COLD_PERF]"
+    events = []
+    for line in lines:
+        payload = line.strip()
+        if marker in payload:
+            payload = payload.split(marker, 1)[1].strip()
+        if not payload.startswith("{"):
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and "event" in event:
+            events.append(event)
+    return events
+
+
+def filter_request_timeline(
+    events: Iterable[dict[str, Any]], req_id: str
+) -> dict[str, Any]:
+    """Build one request timeline with mutually exclusive stage attribution."""
+    selected = [event for event in events if event.get("req_id") == req_id]
+    if not selected:
+        raise ValueError(f"no cold-perf events for request {req_id!r}")
+    selected.sort(key=lambda item: (item.get("monotonic_ms", 0), item.get("pid", 0)))
+    request_ids = sorted({str(item.get("req_id")) for item in selected})
+    if request_ids != [req_id]:
+        raise ValueError("filtered timeline must contain exactly one request")
+
+    def elapsed(event: dict[str, Any]) -> float:
+        value = float(event.get("elapsed_ms", 0.0))
+        if value < 0:
+            raise ValueError("cold-perf elapsed_ms must be non-negative")
+        return value
+
+    stages = {
+        stage: sum(
+            elapsed(event)
+            for event in selected
+            if event.get("event") in event_names
+        )
+        for stage, event_names in _EVIDENCE_STAGE_EVENTS.items()
+    }
+    stages["allocation_ms"] = sum(
+        float(event.get("allocation_ms", 0.0))
+        for event in selected
+        if event.get("event") in _MOONCAKE_EVENTS
+    )
+    stages["transfer_ms"] = sum(
+        float(event.get("transfer_ms", event.get("elapsed_ms", 0.0)))
+        for event in selected
+        if event.get("event") in {"mooncake_page_get", "mooncake_legacy_get"}
+    )
+    mooncake_ms = sum(
+        elapsed(event)
+        for event in selected
+        if event.get("event") in _MOONCAKE_EVENTS
+    )
+    resolver_wall_ms = sum(
+        elapsed(event)
+        for event in selected
+        if event.get("event") == "remote_resolver"
+    )
+    stages["resolver_cpu_ms"] = max(0.0, resolver_wall_ms - mooncake_ms)
+    worker_complete = [
+        event
+        for event in selected
+        if event.get("event") in {"worker_load_complete", "dense_worker_load_complete"}
+    ]
+    worker_complete_samples_ms = [elapsed(event) for event in worker_complete]
+    worker_complete_ms = (
+        max(worker_complete_samples_ms) if worker_complete_samples_ms else None
+    )
+    return {
+        "req_id": req_id,
+        "event_count": len(selected),
+        "events": selected,
+        "exclusive_stages_ms": stages,
+        "nested_mooncake_ms": mooncake_ms,
+        "resolver_wall_ms": resolver_wall_ms,
+        "worker_complete_ms": worker_complete_ms,
+        "worker_complete_samples_ms": worker_complete_samples_ms,
+        "critical_total_ms": worker_complete_ms,
+        "critical_total_source": "measured_worker_completion_no_synthetic_delay",
+    }
+
+
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        raise ValueError("cannot summarize an empty sample set")
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
+
+
+def summarize_evidence_samples(values: list[float]) -> dict[str, float]:
+    """Use median and nearest-rank p95, including for small cold-run samples."""
+    return {
+        "median": statistics.median(values),
+        "p95_nearest_rank": _nearest_rank_percentile(values, 0.95),
+    }
+
+
+def immutable_evidence_commands(
+    launcher_command: str,
+    *,
+    prompt_hash: str,
+    token_hash: str,
+    repetitions: int = 3,
+    namespace_prefix: str = "lmcache-cold-evidence",
+) -> list[dict[str, Any]]:
+    """Generate exact PowerShell commands for diagnostic and final cold runs."""
+    if repetitions < 3:
+        raise ValueError("final evidence requires at least three repetitions")
+    if not launcher_command.strip():
+        raise ValueError("launcher_command must be an exact non-empty command")
+    commands = []
+    for mode, telemetry in (("diagnostic", "1"), ("final_ttft", "0")):
+        for tokens in EVIDENCE_TOKEN_COUNTS:
+            for chunk_size in EVIDENCE_CHUNK_SIZES:
+                for repetition in range(1, repetitions + 1):
+                    namespace = (
+                        f"{namespace_prefix}-{mode}-t{tokens}-c{chunk_size}-"
+                        f"r{repetition}"
+                    )
+                    command = (
+                        f"$env:LMCACHE_COLD_START_PERF='{telemetry}'; "
+                        f"$env:LMCACHE_CHUNK_SIZE='{chunk_size}'; "
+                        f"$env:LMCACHE_MOONCAKE_NAMESPACE='{namespace}'; "
+                        f"{launcher_command}"
+                    )
+                    commands.append(
+                        {
+                            "mode": mode,
+                            "num_tokens": tokens,
+                            "chunk_size": chunk_size,
+                            "repetition": repetition,
+                            "namespace": namespace,
+                            "prompt_hash": prompt_hash,
+                            "token_hash": token_hash,
+                            "command": command,
+                        }
+                    )
+    return commands
+
+
+def build_evidence_contract(
+    manifest: dict[str, Any], launcher_command: str, *, repetitions: int = 3
+) -> dict[str, Any]:
+    """Create the immutable production evidence contract and command matrix."""
+    validate_evidence_manifest(manifest)
+    commands = immutable_evidence_commands(
+        launcher_command,
+        prompt_hash=str(manifest["prompt_hash"]),
+        token_hash=str(manifest["outputs"]["token_ids_sha256"]),
+        repetitions=repetitions,
+    )
+    return {
+        "schema": EVIDENCE_SCHEMA,
+        "kind": "decoder_cold_start_evidence_contract",
+        "manifest": manifest,
+        "topology_config_signature": topology_config_signature(manifest),
+        "matrix": {
+            "num_tokens": list(EVIDENCE_TOKEN_COUNTS),
+            "chunk_sizes": list(EVIDENCE_CHUNK_SIZES),
+            "repetitions": repetitions,
+        },
+        "measurement_guidance": {
+            "diagnostic": "LMCACHE_COLD_START_PERF=1; use only for stage attribution",
+            "final_ttft": (
+                "LMCACHE_COLD_START_PERF=0; authoritative TTFT/TPOT/memory run; "
+                "no synthetic H2D, consumer, synchronization, or barrier delay"
+            ),
+        },
+        "comparison_rules": {
+            "pairing": "same prompt/token/output hashes and topology signature",
+            "aggregate": "median and nearest-rank p95 per workload/chunk size",
+            "minimum_cold_repetitions": 3,
+            "namespace": "fresh and unique for every repetition",
+            "ttft_authority": "final_ttft mode only",
+        },
+        "filtered_timeline_schema": {
+            "one_req_id": True,
+            "exclusive_stages_ms": list(_EVIDENCE_STAGE_EVENTS)
+            + ["resolver_cpu_ms"],
+            "mooncake_rule": (
+                "Mooncake leaf time is reported once; resolver_cpu_ms subtracts "
+                "nested Mooncake and critical_total_ms is the outer measured wall"
+            ),
+        },
+        "commands": commands,
+    }
 _RESOLVER_STAGE_FIELDS = {
     stage: f"resolver_{stage}_s"
     for stage in (*_RESOLVER_EMITTED_STAGES, "validation")
@@ -180,7 +460,8 @@ class StageStats:
     pointer_objects: int = 0
     physical_pages: int = 0
     logical_entries: int = 0
-    legacy_tail_objects: int = 0
+    partial_page_objects: int = 0
+    partial_buffer_bytes: int = 0
     handle_objects: int = 0
     broadcast_envelopes: int = 0
     transferred_bytes: int = 0
@@ -563,20 +844,21 @@ class SyntheticPageFirstStorageManager:
             for chunk_index, (page_id, _indices) in enumerate(ordered_pages)
         }
         full_bytes = self.chunk_size * self.bytes_per_token
-        page_groups = [
-            group for group in ordered_pages if bytes_by_hash[group[0]] == full_bytes
-        ]
-        legacy_indices = [
-            index
-            for page_id, indices in ordered_pages
+        partial_pages = [
+            page_id
+            for page_id, _indices in ordered_pages
             if bytes_by_hash[page_id] != full_bytes
-            for index in indices
         ]
         transferred_bytes = sum(bytes_by_hash[page_id] for page_id in page_ids)
-        self.stats.mooncake_page_objects += len(page_groups) + len(legacy_indices)
+        self.stats.mooncake_page_objects += len(ordered_pages)
+        self.stats.partial_page_objects += len(partial_pages)
+        if partial_pages:
+            partial_sizes = {bytes_by_hash[page_id] for page_id in partial_pages}
+            if len(partial_sizes) != 1:
+                raise AssertionError("partial page buffers have inconsistent sizes")
+            self.stats.partial_buffer_bytes = partial_sizes.pop()
         self.stats.lmcache_memory_objects += len(keys)
         self.stats.logical_entries += len(keys)
-        self.stats.legacy_tail_objects += len(legacy_indices)
         self.stats.transferred_bytes += transferred_bytes
         self.stats.remote_layout_s += time.perf_counter() - layout_started
 
@@ -624,9 +906,9 @@ class SyntheticPageFirstStorageManager:
                 time.sleep(delay_s)
             self.stats.remote_transfer_s += time.perf_counter() - transfer_started
 
-        if page_groups:
+        if ordered_pages:
             page_indices = [
-                index for _page_id, indices in page_groups for index in indices
+                index for _page_id, indices in ordered_pages for index in indices
             ]
             page_objects = allocate(page_indices)
 
@@ -634,41 +916,26 @@ class SyntheticPageFirstStorageManager:
             buffer_ptrs: list[list[int]] = []
             buffer_sizes: list[list[int]] = []
             offset = 0
-            for _page_id, indices in page_groups:
+            for _page_id, indices in ordered_pages:
                 group_objects = page_objects[offset : offset + len(indices)]
                 buffer_ptrs.append([obj.data_ptr for obj in group_objects])
                 buffer_sizes.append([obj.get_size() for obj in group_objects])
                 offset += len(indices)
-            assert len(buffer_ptrs) == len(buffer_sizes) == len(page_groups)
+            assert len(buffer_ptrs) == len(buffer_sizes) == len(ordered_pages)
             self.stats.remote_pointer_s += time.perf_counter() - pointer_started
 
             transfer(sum(bytes_by_hash[page_ids[index]] for index in page_indices))
 
             scatter_started = time.perf_counter()
             for index, obj in zip(page_indices, page_objects, strict=True):
-                results[index] = obj
-            self.stats.remote_scatter_s += time.perf_counter() - scatter_started
-
-        if legacy_indices:
-            legacy_objects = allocate(legacy_indices)
-
-            pointer_started = time.perf_counter()
-            legacy_ptrs = [obj.data_ptr for obj in legacy_objects]
-            legacy_sizes = [obj.get_size() for obj in legacy_objects]
-            assert len(legacy_ptrs) == len(legacy_sizes) == len(legacy_indices)
-            self.stats.remote_pointer_s += time.perf_counter() - pointer_started
-
-            transfer(
-                sum(bytes_by_hash[page_ids[index]] for index in legacy_indices)
-            )
-
-            scatter_started = time.perf_counter()
-            for index, obj in zip(legacy_indices, legacy_objects, strict=True):
-                if self.object_mode == "production":
+                page_bytes = bytes_by_hash[page_ids[index]]
+                if self.object_mode == "production" and page_bytes != (
+                    self.chunk_size * self.bytes_per_token
+                ):
                     obj = (
                         MooncakestoreConnector._reshape_partial_chunk_with_token_size(
                             obj,
-                            bytes_by_hash[page_ids[index]],
+                            page_bytes,
                             self.bytes_per_token,
                         )
                     )
@@ -1177,14 +1444,13 @@ def run_once(
 
     expected_chunks = math.ceil(args.num_tokens / args.chunk_size)
     expected_memory_objects = expected_chunks * args.num_layers
-    full_pages, tail_tokens = divmod(args.num_tokens, args.chunk_size)
-    expected_files = full_pages + (args.num_layers if tail_tokens else 0)
+    expected_files = expected_chunks
     if stats.remote_calls != 1:
         raise AssertionError(
             "page-first cold bootstrap used "
             f"{stats.remote_calls} remote calls, expected 1"
         )
-    expected_transfer_calls = int(full_pages > 0) + int(tail_tokens > 0)
+    expected_transfer_calls = int(expected_chunks > 0)
     if stats.remote_lookup_calls != 1:
         raise AssertionError(
             f"Mooncake page lookup count mismatch: {stats.remote_lookup_calls} != 1"
@@ -1703,7 +1969,7 @@ def run_layer_merged_cold_compact_matrix(args: Namespace) -> dict[str, Any]:
             for field in (
                 "physical_pages",
                 "logical_entries",
-                "legacy_tail_objects",
+                "partial_page_objects",
                 "pointer_s",
             )
         }
@@ -1732,13 +1998,13 @@ def print_layer_merged_cold_compact_matrix(report: dict[str, Any]) -> None:
     print("\nLayer-merged objects x cold-compact load (median ms)")
     print(
         f"{'case':28} {'critical':>10} {'pages':>8} {'logical':>10} "
-        f"{'tails':>8} {'ptr seal':>10} {'passive wait':>16}"
+        f"{'partial':>8} {'ptr seal':>10} {'passive wait':>16}"
     )
     for name, item in report["variants"].items():
         print(
             f"{name:28} {_ms(item['critical_path_s']):10.3f} "
             f"{int(item['physical_pages']):8d} {int(item['logical_entries']):10d} "
-            f"{int(item['legacy_tail_objects']):8d} "
+            f"{int(item['partial_page_objects']):8d} "
             f"{_ms(item['pointer_seal_s']):10.3f} {'unavailable':>16}"
         )
     print(
@@ -2010,6 +2276,30 @@ def parse_args() -> Namespace:
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--output-json", type=Path)
     parser.add_argument(
+        "--evidence-manifest-json",
+        type=Path,
+        help="Baseline manifest used to emit the production evidence contract.",
+    )
+    parser.add_argument(
+        "--evidence-output-json",
+        type=Path,
+        help="Write the immutable chunk-sweep evidence contract and commands.",
+    )
+    parser.add_argument(
+        "--production-launch-command",
+        help="Exact production launcher appended to each immutable command.",
+    )
+    parser.add_argument("--evidence-repetitions", type=int, default=3)
+    parser.add_argument(
+        "--evidence-log-jsonl",
+        type=Path,
+        help="Optional diagnostic cold-perf log to filter into the report.",
+    )
+    parser.add_argument(
+        "--evidence-req-id",
+        help="Single request id selected from --evidence-log-jsonl.",
+    )
+    parser.add_argument(
         "--cold-compact-ab",
         action="store_true",
         help="Compare the production ordering with the cold-compact flag off/on.",
@@ -2066,6 +2356,27 @@ def parse_args() -> Namespace:
         help="Write only the filtered four-case feature matrix.",
     )
     args = parser.parse_args()
+
+    evidence_values = (
+        args.evidence_manifest_json,
+        args.evidence_output_json,
+        args.production_launch_command,
+    )
+    if any(value is not None for value in evidence_values) and not all(
+        value is not None for value in evidence_values
+    ):
+        parser.error(
+            "evidence contract requires --evidence-manifest-json, "
+            "--evidence-output-json, and --production-launch-command"
+        )
+    if args.evidence_repetitions < 3:
+        parser.error("--evidence-repetitions must be at least 3")
+    if (args.evidence_log_jsonl is None) != (args.evidence_req_id is None):
+        parser.error(
+            "--evidence-log-jsonl and --evidence-req-id must be provided together"
+        )
+    if args.evidence_log_jsonl is not None and args.evidence_output_json is None:
+        parser.error("diagnostic log filtering requires the evidence contract options")
 
     if args.num_tokens < 1 or args.chunk_size < 1 or args.num_layers < 1:
         parser.error("token, chunk, and layer counts must be positive")
@@ -2140,9 +2451,29 @@ def parse_args() -> Namespace:
 def main() -> None:
     """Run the requested cold-bootstrap benchmark matrix."""
     args = parse_args()
+    if getattr(args, "evidence_output_json", None) is not None:
+        manifest = json.loads(
+            args.evidence_manifest_json.read_text(encoding="utf-8")
+        )
+        report = build_evidence_contract(
+            manifest,
+            args.production_launch_command,
+            repetitions=args.evidence_repetitions,
+        )
+        if args.evidence_log_jsonl is not None:
+            with args.evidence_log_jsonl.open(encoding="utf-8") as log_file:
+                report["filtered_timeline"] = filter_request_timeline(
+                    parse_cold_perf_jsonl(log_file), args.evidence_req_id
+                )
+        args.evidence_output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.evidence_output_json.write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
+        )
+        print(f"Wrote evidence contract: {args.evidence_output_json}")
+        return
     chunks = math.ceil(args.num_tokens / args.chunk_size)
     full_pages, tail_tokens = divmod(args.num_tokens, args.chunk_size)
-    mooncake_files = full_pages + (args.num_layers if tail_tokens else 0)
+    mooncake_files = chunks
     print(
         f"tokens={args.num_tokens} chunk_size={args.chunk_size} "
         f"chunks={chunks} layers={args.num_layers} "
@@ -2152,8 +2483,8 @@ def main() -> None:
     print(
         "Each KV group retrieves "
         f"{chunks * args.num_layers} LMCache MemoryObjs from {mooncake_files} "
-        f"Mooncake files ({full_pages} multi-buffer pages"
-        f" + {args.num_layers if tail_tokens else 0} legacy tail files)."
+        f"Mooncake files ({full_pages} full multi-buffer pages"
+        f" + {int(tail_tokens > 0)} merged partial page)."
     )
     print(
         "chunk plan modes="

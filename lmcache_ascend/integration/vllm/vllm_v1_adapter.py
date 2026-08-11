@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -13,7 +14,9 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
 )
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 import torch
 
 if TYPE_CHECKING:
@@ -21,6 +24,21 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
+    descriptors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def aggregate(
+        self, other: KVConnectorWorkerMetadata
+    ) -> "LiveSourceWorkerMetadata":
+        if not isinstance(other, LiveSourceWorkerMetadata):
+            raise TypeError("Cannot aggregate incompatible LMCache worker metadata")
+        merged = {req_id: list(items) for req_id, items in self.descriptors.items()}
+        for req_id, items in other.descriptors.items():
+            merged.setdefault(req_id, []).extend(items)
+        return LiveSourceWorkerMetadata(merged)
 
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
@@ -49,6 +67,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             else False
         )
         self._direct_store_observed_layers: set[str] = set()
+        self._scheduler_live_sources: dict[str, list[dict[str, Any]]] = {}
         if self._direct_store_requested:
             extra = self.config.extra_config or {}
             valid = (
@@ -87,7 +106,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             not getattr(self, "_direct_store_requested", False)
             or self.kv_role == "kv_consumer"
             or self.lmcache_engine is None
-            or not self.lmcache_engine.direct_prefill_store_enabled()
             or self._parent._connector_metadata is None
         ):
             return None
@@ -184,15 +202,67 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     )
                     for group in selected
                 }
-            self.lmcache_engine.store_direct_prefill(
-                request.req_id,
-                request.token_ids,
-                selected,
-                slot_mappings,
-                request.request_configs,
-                final=request.is_last_prefill,
-                slot_mapping_base=mapping_base,
+            live_source = bool(getattr(request, "live_source_requested", False))
+            if live_source:
+                self.lmcache_engine.begin_live_source_descriptor(request.req_id)
+            direct_store = self.lmcache_engine.direct_prefill_store_enabled()
+            if direct_store:
+                self.lmcache_engine.store_direct_prefill(
+                    request.req_id,
+                    request.token_ids,
+                    selected,
+                    slot_mappings,
+                    request.request_configs,
+                    final=request.is_last_prefill,
+                    slot_mapping_base=mapping_base,
+                )
+            elif live_source:
+                self.lmcache_engine.capture_live_source_step(
+                    request.req_id,
+                    request.token_ids,
+                    selected,
+                    slot_mappings,
+                    request.request_configs,
+                    mapping_base,
+                    request.is_last_prefill,
+                )
+            if live_source and request.is_last_prefill:
+                parallel = self._vllm_config.parallel_config
+                self.lmcache_engine.finalize_live_source_descriptor(
+                    request.req_id,
+                    len(request.token_ids),
+                    get_tensor_model_parallel_rank(),
+                    int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
+                )
+
+    def build_connector_worker_meta(self) -> Optional[KVConnectorWorkerMetadata]:
+        if self.lmcache_engine is None:
+            return None
+        descriptors = self.lmcache_engine.drain_live_source_descriptors()
+        return (
+            LiveSourceWorkerMetadata(
+                {req_id: [descriptor] for req_id, descriptor in descriptors.items()}
             )
+            if descriptors
+            else None
+        )
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        super().update_connector_output(connector_output)
+        metadata = getattr(connector_output, "kv_connector_worker_meta", None)
+        if isinstance(metadata, LiveSourceWorkerMetadata):
+            for req_id, descriptors in metadata.descriptors.items():
+                by_rank = {
+                    (int(item["tp_rank"]), int(item["dp_rank"])): item
+                    for item in self._scheduler_live_sources.get(req_id, ())
+                }
+                by_rank.update(
+                    {
+                        (int(item["tp_rank"]), int(item["dp_rank"])): item
+                        for item in descriptors
+                    }
+                )
+                self._scheduler_live_sources[req_id] = list(by_rank.values())
 
     def _effective_skip_leading_tokens(
         self,
@@ -317,6 +387,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
             preempted_req_ids
         )
+        self.lmcache_engine.drop_direct_store_states(preempted_req_ids)
         if waited_req_ids:
             logger.info(
                 "Handled preemptions after draining async stores: req_ids=%s",
@@ -329,5 +400,38 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         _, return_params = super().request_finished(request, block_ids)
+        descriptors = self._scheduler_live_sources.pop(request.request_id, None)
+        params = getattr(request, "kv_transfer_params", None)
+        if descriptors:
+            parallel = self._vllm_config.parallel_config
+            tp_size = int(parallel.tensor_parallel_size)
+            dp_rank = int(
+                getattr(parallel, "data_parallel_rank_local", None) or 0
+            )
+            expected = {
+                (tp_rank, dp_rank) for tp_rank in range(tp_size)
+            }
+            actual = {
+                (int(item["tp_rank"]), int(item["dp_rank"]))
+                for item in descriptors
+            }
+            if actual != expected:
+                logger.warning(
+                    "Incomplete live source ranks for %s: expected=%s actual=%s; "
+                    "using persistent fallback",
+                    request.request_id,
+                    sorted(expected),
+                    sorted(actual),
+                )
+                descriptors = None
+        if (
+            descriptors
+            and isinstance(params, dict)
+            and params.get("request_live_split", False)
+        ):
+            return_params = return_params or {}
+            return_params["ascend_live_split_source_v1"] = {
+                "descriptors": descriptors
+            }
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params
