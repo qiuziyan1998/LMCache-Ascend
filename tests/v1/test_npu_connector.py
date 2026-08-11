@@ -2457,7 +2457,7 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
     assert all("chunk_size" not in call for call in plan_calls)
     assert len(transfer_calls) == 2
     assert all(call["plan"] is destination_plan for call in transfer_calls)
-    assert all(call["source_layer"] is source_layer for call in transfer_calls)
+    assert all(call["chunk_ptrs_npu"] is source_layer.chunk_ptrs_npu for call in transfer_calls)
     assert all(
         "load_stream" not in call and "current_stream" not in call
         for call in transfer_calls
@@ -2465,6 +2465,36 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
 
     for generator in generators:
         generator.close()
+
+
+def test_prepared_sparse_rejects_nonstandard_chunk_coverage() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.lmcache_chunk_size = 4
+    connector._group_layouts = {
+        0: SimpleNamespace(
+            k_hidden_dims=1,
+            v_hidden_dims=1,
+            dsa_hidden_dims=0,
+            kv_format=SimpleNamespace(value=0),
+            kv_device=torch.device("cpu"),
+        )
+    }
+    connector._sparse_lmc_host_interleaved = lambda _group: False
+    source = PreparedSparseSource(
+        layers=(),
+        total_tokens=6,
+        chunk_token_counts=(3, 3),
+    )
+    generator = connector._batched_to_gpu_head_token_wise_prepared(
+        {
+            "prepared_sparse_source": source,
+            "kvcaches": [],
+            "slot_mapping": torch.empty(0, dtype=torch.int64),
+        }
+    )
+
+    with pytest.raises(ValueError, match="full non-tail chunks"):
+        next(generator)
 
 
 def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> None:
@@ -2567,7 +2597,7 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
 
     connector._run_prepared_sparse_direct_kv_transfer_layer(
         plan=plan,
-        source_layer=source_layer,
+        chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
         layer_id=0,
         slot_mapping_packed=slots,
         selected_token_idx=selected,

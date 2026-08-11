@@ -725,8 +725,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
         owner_ranges = sorted(
             (
-                int(owner.untyped_storage().data_ptr()),
-                int(owner.untyped_storage().nbytes()),
+                int(owner.data_ptr()),
+                int(owner.numel() * owner.element_size()),
                 index,
             )
             for index, owner in enumerate(owners)

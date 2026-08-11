@@ -279,14 +279,14 @@ def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
             self.base = base
             self.size = size
 
-        def untyped_storage(self):
-            return self
-
         def data_ptr(self) -> int:
             return self.base
 
-        def nbytes(self) -> int:
-            return self.size
+        def numel(self) -> int:
+            return self.size // 2
+
+        def element_size(self) -> int:
+            return 2
 
     engine = object.__new__(AscendLMCacheEngine)
     engine._live_source_builders = {}
@@ -316,18 +316,21 @@ def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
     assert [segment["source_offset"] for segment in descriptor["segments"]] == [
         0, 16, 0, 16
     ]
+    assert [segment["source_buffer_base"] for segment in descriptor["segments"]] == [
+        1000, 1000, 2000, 2000
+    ]
 
 
 def test_live_source_capture_defers_partial_tail_until_final_step() -> None:
     class _Owner:
-        def untyped_storage(self):
-            return self
-
         def data_ptr(self) -> int:
             return 1000
 
-        def nbytes(self) -> int:
+        def numel(self) -> int:
             return 100
+
+        def element_size(self) -> int:
+            return 1
 
     class _Tokens:
         @staticmethod

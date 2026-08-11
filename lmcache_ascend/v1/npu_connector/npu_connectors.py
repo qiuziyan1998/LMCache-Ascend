@@ -4299,6 +4299,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         chunk_size = self.lmcache_chunk_size
+        chunk_token_counts = source.chunk_token_counts
+        if chunk_token_counts and (
+            any(count != chunk_size for count in chunk_token_counts[:-1])
+            or chunk_token_counts[-1] > chunk_size
+        ):
+            raise ValueError(
+                "Prepared sparse source requires full non-tail chunks and one "
+                f"optional tail of at most {chunk_size} tokens: "
+                f"coverage={chunk_token_counts}"
+            )
 
         destination_plan = self._get_or_create_sparse_destination_plan(
             kvcaches_ref=kvcaches_snapshot,
