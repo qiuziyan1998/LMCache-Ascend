@@ -499,6 +499,13 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> int:
         if start >= len(tokens):
             return start
+        if start < slot_mapping_base:
+            raise RuntimeError(
+                "Direct prefill CPU fallback cannot address an uncommitted "
+                "prefix: "
+                f"req_id={req_id}, kv_group={kv_group}, committed={start}, "
+                f"slot_mapping_base={slot_mapping_base}"
+            )
         mask = torch.zeros(len(tokens), dtype=torch.bool)
         mask[start:] = True
         storer = self.store_layer(
@@ -1039,6 +1046,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         request_configs: Optional[dict] = None,
         final: bool = False,
         slot_mapping_base: int = 0,
+        verified_prefix_end: int = 0,
     ) -> bool:
         """Publish newly completed pages and the final tail directly from NPU."""
         if not self._direct_store_enabled or not group_caches:
@@ -1048,6 +1056,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Direct prefill slot-mapping base is outside the token range: "
                 f"base={slot_mapping_base}, tokens={len(tokens)}"
             )
+        if not 0 <= verified_prefix_end <= slot_mapping_base:
+            raise ValueError(
+                "Direct prefill verified prefix is outside the addressable "
+                "prefix: "
+                f"verified={verified_prefix_end}, base={slot_mapping_base}"
+            )
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
         state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
@@ -1055,8 +1069,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             return True
         for group in group_caches:
             if group not in state.submitted_end:
-                state.submitted_end[group] = slot_mapping_base
-                state.committed_end[group] = slot_mapping_base
+                state.submitted_end[group] = verified_prefix_end
+                state.committed_end[group] = verified_prefix_end
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
         plans = self._direct_suffix_plans(
             state, tokens, group_caches, request_configs
@@ -1133,6 +1147,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 continue
             missing_by_group.add(group)
             candidates[group].append(item)
+        unaddressable = {
+            group: [(start, end) for start, end, _ in group_candidates]
+            for group, group_candidates in candidates.items()
+            if any(start < slot_mapping_base for start, _, _ in group_candidates)
+        }
+        if unaddressable:
+            raise RuntimeError(
+                "Direct prefill store found an uncommitted prefix outside its "
+                "slot-mapping window: "
+                f"req_id={req_id}, slot_mapping_base={slot_mapping_base}, "
+                f"missing={unaddressable}"
+            )
         for group in group_caches.keys() - missing_by_group:
             if group in candidate_ends:
                 state.submitted_end[group] = max(

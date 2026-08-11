@@ -1449,6 +1449,7 @@ def test_direct_prefill_uses_window_relative_save_mappings() -> None:
         save_slot_mapping_base=256,
         save_spec=None,
         request_configs=None,
+        load_spec=None,
         is_last_prefill=False,
     )
 
@@ -1461,6 +1462,13 @@ def test_direct_prefill_uses_window_relative_save_mappings() -> None:
         1: "window-indexer",
     }
     assert calls[0][1]["slot_mapping_base"] == 256
+    assert calls[0][1]["verified_prefix_end"] == 0
+
+    request.load_spec = SimpleNamespace(lmcache_cached_tokens=256)
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+    assert calls[-1][1]["verified_prefix_end"] == 256
 
     adapter._windowed_sparse_save_mapping = (
         lambda request, group, base: None
@@ -1486,6 +1494,21 @@ def test_direct_prefill_uses_window_relative_save_mappings() -> None:
     )
     assert mapping_calls == [1]
     assert calls[-1][0][2] == {1: ["cache-1"]}
+
+
+def test_finish_save_batch_submits_nonfinal_direct_window() -> None:
+    request = SimpleNamespace(req_id="request", is_last_prefill=False)
+    submissions = []
+    adapter = SimpleNamespace(
+        kv_role="kv_both",
+        lmcache_engine=SimpleNamespace(wait_for_pending_sync_stores=lambda: None),
+        _direct_prefill_requests=lambda: [request],
+        _submit_direct_prefill_requests=lambda requests: submissions.extend(requests),
+    )
+
+    _ascend_adapter_method("_finish_save_batch")(adapter, {})
+
+    assert submissions == [request]
 
 
 class TestAdapterGroupSplit:

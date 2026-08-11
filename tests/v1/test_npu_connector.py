@@ -939,7 +939,74 @@ def test_direct_prefill_skips_disabled_unfull_tail() -> None:
         {0: torch.arange(2)},
         slot_mapping_base=4,
     )
-    assert engine.direct_store_committed_ends("window") == {0: 4}
+    assert engine.direct_store_committed_ends("window") == {0: 0}
+
+    assert engine.store_direct_prefill(
+        "verified-window",
+        list(range(6)),
+        {0: [object()]},
+        {0: torch.arange(2)},
+        slot_mapping_base=4,
+        verified_prefix_end=4,
+    )
+    assert engine.direct_store_committed_ends("verified-window") == {0: 4}
+
+
+def test_direct_prefill_rejects_missing_prefix_before_window() -> None:
+    class _TokenDatabase:
+        @staticmethod
+        def process_tokens(tokens=None, kv_group=0, **kwargs):
+            for start in range(0, len(tokens), 2):
+                yield (
+                    start,
+                    start + 2,
+                    CacheEngineKey(
+                        "model", 1, 0, start, torch.float16, kv_group=kv_group
+                    ),
+                )
+
+    class _StorageManager:
+        @staticmethod
+        def batched_external_pages_exist(keys):
+            return [False] * len(keys)
+
+    class _GPUConnector:
+        @staticmethod
+        def plan_direct_page_sources(*args, **kwargs):
+            raise AssertionError("unaddressable prefix must fail before planning")
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_enabled = True
+    engine._direct_store_states = {}
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine.token_database = _TokenDatabase()
+    engine.storage_manager = _StorageManager()
+    engine.gpu_connector = _GPUConnector()
+
+    with pytest.raises(RuntimeError, match="uncommitted prefix"):
+        engine.store_direct_prefill(
+            "window",
+            list(range(6)),
+            {0: [object()]},
+            {0: torch.arange(2)},
+            slot_mapping_base=4,
+        )
+
+
+def test_direct_cpu_fallback_rejects_unaddressable_prefix() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+
+    with pytest.raises(RuntimeError, match="CPU fallback cannot address"):
+        engine._store_direct_cpu_group(
+            "window",
+            list(range(6)),
+            [object()],
+            torch.arange(2),
+            0,
+            0,
+            None,
+            slot_mapping_base=4,
+        )
 
 
 def _make_layer_page_sources():

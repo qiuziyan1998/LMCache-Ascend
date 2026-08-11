@@ -202,6 +202,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     )
                     for group in selected
                 }
+            load_spec = getattr(request, "load_spec", None)
+            committed_prefix = getattr(load_spec, "dsa_committed_end", None)
+            if committed_prefix is None:
+                committed_prefix = getattr(load_spec, "lmcache_cached_tokens", 0)
+            verified_prefix_end = min(
+                mapping_base,
+                int(committed_prefix or 0),
+            )
             live_source = bool(getattr(request, "live_source_requested", False))
             if live_source:
                 self.lmcache_engine.begin_live_source_descriptor(request.req_id)
@@ -215,6 +223,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request.request_configs,
                     final=request.is_last_prefill,
                     slot_mapping_base=mapping_base,
+                    verified_prefix_end=verified_prefix_end,
                 )
             elif live_source:
                 self.lmcache_engine.capture_live_source_step(
@@ -306,14 +315,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
             self.lmcache_engine.wait_for_pending_sync_stores()
             requests = self._direct_prefill_requests() or []
+            if requests:
+                # Layer callbacks are not guaranteed to cover every registered
+                # cache in each chunked-prefill forward. Engine submission is
+                # incremental and idempotent, so fence every window here.
+                self._submit_direct_prefill_requests(requests)
             final_requests = [
                 request for request in requests if request.is_last_prefill
             ]
-            if final_requests:
-                # Some chunked-prefill forward paths do not visit every
-                # registered KV layer. Submit from the final metadata before
-                # fencing so an absent layer callback cannot silently omit pages.
-                self._submit_direct_prefill_requests(final_requests)
             final_ids = {
                 request.req_id for request in final_requests
             }
