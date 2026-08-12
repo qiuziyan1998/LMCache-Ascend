@@ -3079,6 +3079,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
+
+            # The direct kernels consume these tensors through raw device
+            # pointers on transfer_stream. The caching allocator cannot infer
+            # that cross-stream use from the custom launch, so keep their
+            # storage out of the reuse pool until the transfer completes.
+            for transfer_input in (
+                slot_mapping_full,
+                chunk_ptrs_npu,
+                chunk_offsets_npu,
+                chunk_sizes_npu,
+            ):
+                transfer_input.record_stream(transfer_stream)
         current_stream.wait_stream(transfer_stream)
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
