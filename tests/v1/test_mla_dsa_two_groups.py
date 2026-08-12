@@ -2214,6 +2214,39 @@ def test_early_live_metadata_filters_stale_and_reuse_clears_offer(
     assert calls == ["parent"]
 
 
+def test_duplicate_live_source_rank_falls_back(monkeypatch) -> None:
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "request_finished",
+        lambda *_args: (False, {"persistent": True}),
+    )
+    descriptor = {"tp_rank": 0, "dp_rank": 0}
+    adapter = _ascend_adapter_fake(
+        _scheduler_live_sources={"request": [descriptor, dict(descriptor)]},
+        _vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                data_parallel_rank_local=0,
+            )
+        ),
+        store_async=True,
+        kv_role="kv_producer",
+    )
+    request = SimpleNamespace(
+        request_id="request",
+        kv_transfer_params={"request_live_split": True},
+    )
+
+    delay_free, params = _ascend_adapter_method("request_finished")(
+        adapter, request, []
+    )
+
+    assert delay_free is True
+    assert params == {"persistent": True}
+
+
 def test_failed_direct_preflight_uses_overlapped_layerwise_store(monkeypatch) -> None:
     from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 

@@ -600,7 +600,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 (int(item["tp_rank"]), int(item["dp_rank"]))
                 for item in descriptors
             }
-            if actual != expected:
+            if actual != expected or len(descriptors) != len(expected):
                 logger.warning(
                     "Incomplete live source ranks for %s: expected=%s actual=%s; "
                     "using persistent fallback",
