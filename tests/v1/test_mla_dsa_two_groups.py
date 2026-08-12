@@ -1695,6 +1695,7 @@ def _ascend_adapter_fake(**attrs):
     fake._late_finished_sending = set()
     fake._direct_store_observed_layers = set()
     fake._direct_store_step_supported = None
+    fake._unfenced_live_stores = {}
     for name, value in attrs.items():
         setattr(fake, name, value)
     return fake
@@ -1852,6 +1853,181 @@ def test_finish_save_batch_submits_nonfinal_direct_window() -> None:
     assert adapter._completed_layerwise_stores == {}
 
 
+@pytest.mark.parametrize("live", [False, True])
+def test_finish_save_batch_defers_only_finalized_live_store(live: bool) -> None:
+    request = SimpleNamespace(req_id="request", is_last_prefill=True)
+    waited = []
+    engine = SimpleNamespace(
+        wait_for_pending_sync_stores=lambda: None,
+        wait_for_direct_stores=lambda req_ids: waited.append(set(req_ids)),
+        direct_store_committed_ends=lambda _req_id: {0: 128, 1: 128},
+    )
+    marked = []
+    adapter = _ascend_adapter_fake(
+        kv_role="kv_both",
+        lmcache_engine=engine,
+        _completed_layerwise_stores={},
+        _direct_prefill_requests=lambda: [request],
+        _submit_direct_prefill_requests=lambda *_args: None,
+        _unfenced_live_stores={"request": request} if live else {},
+        _record_prefill_save_group_completed=lambda *_args: None,
+        _mark_prefill_committed=lambda req: marked.append(req.req_id),
+    )
+
+    _ascend_adapter_method("_finish_save_batch")(adapter, {})
+
+    assert waited == ([] if live else [{"request"}])
+    assert marked == ([] if live else ["request"])
+
+
+def test_final_live_store_is_not_resubmitted_by_finish_batch() -> None:
+    request = SimpleNamespace(req_id="request")
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=SimpleNamespace(),
+        _direct_group_caches=lambda: (_ for _ in ()).throw(
+            AssertionError("resubmitted final live request")
+        ),
+        _unfenced_live_stores={"request": request},
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+
+
+def test_live_final_metadata_is_built_before_persistent_final_fence() -> None:
+    calls = []
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2],
+        request_configs=None,
+    )
+    engine = SimpleNamespace(
+        drain_live_source_descriptors=lambda: calls.append("metadata") or {},
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            f"store-final-{kwargs['final']}"
+        ),
+        direct_store_committed_ends=lambda _req_id: {},
+        get_finished_stores=lambda _req_ids: set(),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        store_async=True,
+        _unfenced_live_stores={"request": request},
+        _direct_group_caches=lambda: {0: ["cache-0"], 1: ["cache-1"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["cache-0"], 1: ["cache-1"]},
+            {0: "mapping-0", 1: "mapping-1"},
+            0,
+        ),
+        _record_prefill_save_group_completed=lambda *_args: None,
+        _mark_prefill_committed=lambda *_args: None,
+    )
+
+    _ascend_adapter_method("build_connector_worker_meta")(adapter)
+    _ascend_adapter_method("_finalize_worker_requests_after_store")(
+        adapter, {"request"}
+    )
+
+    assert calls[:2] == ["metadata", "store-final-True"]
+
+
+def test_deferred_live_store_failure_does_not_block_other_requests() -> None:
+    failed = SimpleNamespace(req_id="failed", token_ids=[1], request_configs=None)
+    good = SimpleNamespace(req_id="good", token_ids=[1], request_configs=None)
+    calls = []
+
+    def finalize(req_id, *_args, **_kwargs):
+        calls.append(("finalize", req_id))
+        if req_id == "failed":
+            raise RuntimeError("persistent store failed")
+
+    engine = SimpleNamespace(
+        store_direct_prefill=finalize,
+        direct_store_committed_ends=lambda _req_id: {},
+        drop_direct_store_states=lambda req_ids: calls.append(
+            ("drop", set(req_ids))
+        ),
+        wait_for_pending_stores=lambda req_ids: calls.append(
+            ("wait", set(req_ids))
+        ),
+        get_finished_stores=lambda _req_ids: {"good"},
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        store_async=True,
+        _unfenced_live_stores={"failed": failed, "good": good},
+        _direct_group_caches=lambda: {0: ["cache-0"], 1: ["cache-1"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["cache-0"], 1: ["cache-1"]},
+            {0: "mapping-0", 1: "mapping-1"},
+            0,
+        ),
+        _handle_save_request_error=lambda req, error: calls.append(
+            ("error", req.req_id, str(error))
+        ),
+        _record_prefill_save_group_completed=lambda *_args: None,
+        _mark_prefill_committed=lambda req: calls.append(("commit", req.req_id)),
+        _release_finished_worker_requests=lambda req_ids: calls.append(
+            ("release", set(req_ids))
+        ),
+    )
+
+    result = _ascend_adapter_method("_finalize_worker_requests_after_store")(
+        adapter, {"failed", "good"}
+    )
+
+    assert result == {"failed", "good"}
+    assert ("error", "failed", "persistent store failed") in calls
+    assert calls.index(("wait", {"failed"})) < calls.index(("drop", {"failed"}))
+    assert ("commit", "failed") not in calls
+    assert ("commit", "good") in calls
+    assert ("release", {"failed", "good"}) in calls
+    assert adapter._unfenced_live_stores == {}
+
+
+def test_finished_live_store_is_fenced_before_report_and_commit() -> None:
+    request = SimpleNamespace(
+        req_id="request", token_ids=[1, 2], request_configs=None
+    )
+    calls = []
+    engine = SimpleNamespace(
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            ("finalize", args[0])
+        ),
+        direct_store_committed_ends=lambda _req_id: {0: 128, 1: 128},
+        get_finished_stores=lambda req_ids: calls.append(("poll", set(req_ids)))
+        or {"request"},
+        drop_direct_store_states=lambda req_ids: calls.append(("drop", set(req_ids))),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        store_async=True,
+        _unfenced_live_stores={"request": request},
+        _direct_group_caches=lambda: {0: ["cache-0"], 1: ["cache-1"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["cache-0"], 1: ["cache-1"]},
+            {0: "mapping-0", 1: "mapping-1"},
+            0,
+        ),
+        _record_prefill_save_group_completed=lambda *_args: None,
+        _mark_prefill_committed=lambda req: calls.append(("commit", req.req_id)),
+        _release_finished_worker_requests=lambda req_ids: calls.append(
+            ("release", set(req_ids))
+        ),
+    )
+
+    result = _ascend_adapter_method("_finalize_worker_requests_after_store")(
+        adapter, {"request"}
+    )
+
+    assert result == {"request"}
+    assert calls[0] == ("finalize", "request")
+    assert calls[2] == ("commit", "request")
+    assert calls[3] == ("poll", {"request"})
+    assert adapter._unfenced_live_stores == {}
+
+
 def test_finish_save_batch_discards_adoption_after_store_failure() -> None:
     def fail_wait():
         raise RuntimeError("store failed")
@@ -1956,6 +2132,86 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
         ("capture", "request"),
         ("store", "request"),
     ]
+
+
+def test_live_source_fails_closed_for_context_parallel(caplog) -> None:
+    calls = []
+    engine = SimpleNamespace(
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            ("store", kwargs["final"])
+        ),
+    )
+    adapter = SimpleNamespace(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=2,
+                decode_context_parallel_size=1,
+            )
+        ),
+        _refresh_kvcaches_list=lambda: None,
+        _kvcaches_for_group=lambda group: [f"cache-{group}"],
+        _windowed_sparse_save_mapping=lambda request, group, base: (
+            request.indexer_slot_mapping[0]
+            if group
+            else request.slot_mapping[0]
+        ),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=list(range(4)),
+        slot_mapping=["latent"],
+        indexer_slot_mapping=["index"],
+        save_slot_mapping_base=0,
+        save_spec=None,
+        request_configs=None,
+        load_spec=None,
+        live_source_requested=True,
+        is_last_prefill=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(adapter, [request])
+
+    assert calls == [("store", True)]
+    assert "PP/PCP/DCP must all equal 1" in caplog.text
+
+
+def test_early_live_metadata_filters_stale_and_reuse_clears_offer(
+    monkeypatch,
+) -> None:
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    stale = {"tp_rank": 0, "dp_rank": 0}
+    fresh = {"tp_rank": 1, "dp_rank": 0}
+    adapter = _ascend_adapter_fake(
+        _scheduler_live_sources={}, _unfinished_requests={}
+    )
+    metadata_cls = _ascend_adapter_method(
+        "update_connector_worker_metadata"
+    ).__globals__["LiveSourceWorkerMetadata"]
+
+    _ascend_adapter_method("update_connector_worker_metadata")(
+        adapter,
+        metadata_cls({"stale": [stale], "request": [fresh]}),
+        {"request"},
+    )
+    assert adapter._scheduler_live_sources == {"request": [fresh]}
+
+    request = SimpleNamespace(request_id="request")
+    adapter._scheduler_live_sources["request"] = [stale]
+    adapter._unfinished_requests = {}
+    calls = []
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "update_state_after_alloc",
+        lambda *_args: calls.append("parent"),
+    )
+    _ascend_adapter_method("update_state_after_alloc")(adapter, request, 0)
+    assert "request" not in adapter._scheduler_live_sources
+    assert calls == ["parent"]
 
 
 def test_failed_direct_preflight_uses_overlapped_layerwise_store(monkeypatch) -> None:

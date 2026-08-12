@@ -846,23 +846,24 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def finalize_live_source_descriptor(
         self, req_id: str, token_count: int, tp_rank: int, dp_rank: int
-    ) -> None:
+    ) -> bool:
         builder = self._live_source_builders.pop(req_id, None)
         if builder is None or builder["invalid"]:
-            return
+            return False
         if any(builder["ends"].get(group, 0) != token_count for group in (0, 1)):
-            return
+            return False
         totals = [0, 0]
         for segment in builder["segments"]:
             totals[segment["group_id"]] += segment["length"]
         if not all(totals):
-            return
+            return False
         self._completed_live_sources[req_id] = {
             "segments": builder["segments"],
             "group_byte_totals": totals,
             "tp_rank": tp_rank,
             "dp_rank": dp_rank,
         }
+        return True
 
     def drain_live_source_descriptors(self) -> dict[str, dict[str, Any]]:
         descriptors = self._completed_live_sources
@@ -2684,6 +2685,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
+        prepared_chunk_dev_ptrs: Optional[List] = None,
+        prepared_chunk_ptrs_npu: Optional[List] = None,
     ) -> None:
         """Publish an all-layer retained source after one pointer-table copy."""
         group_append = getattr(
@@ -2770,11 +2773,28 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_chunk_ptrs_npu,
                 )
             return
-        group_append(
-            mem_objs_by_layer if pointer_first else tensors_by_layer,
-            cached_chunk_dev_ptrs,
-            cached_chunk_ptrs_npu,
-        )
+        if prepared_chunk_dev_ptrs is None:
+            group_append(
+                mem_objs_by_layer if pointer_first else tensors_by_layer,
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+            )
+        else:
+            if any((cached_chunk_dev_ptrs, cached_chunk_ptrs_npu)):
+                raise ValueError(
+                    "Prepared sparse pointer rows require an empty cache suffix."
+                )
+            expected = [len(owners) for owners in owners_by_layer]
+            if [len(row) for row in prepared_chunk_dev_ptrs] != expected:
+                raise ValueError("Prepared sparse host pointer coverage mismatch.")
+            if prepared_chunk_ptrs_npu is None or [
+                0 if row is None else int(row.numel())
+                for row in prepared_chunk_ptrs_npu
+            ] != expected:
+                raise ValueError("Prepared sparse NPU pointer coverage mismatch.")
+            cached_chunk_dev_ptrs.extend(prepared_chunk_dev_ptrs)
+            assert cached_chunk_ptrs_npu is not None
+            cached_chunk_ptrs_npu.extend(prepared_chunk_ptrs_npu)
         if cached_memory_objs is not None:
             if not cached_memory_objs:
                 cached_memory_objs.extend([] for _ in range(self.num_layers))
@@ -4381,6 +4401,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         assert_layerwise_gpu_connector(self.gpu_connector)
         transfer_kwargs = kwargs
+        transient_chunk_dev_ptrs = None
+        transient_chunk_ptrs_npu = None
         if not cached_prefix_chunks and (
             cached_chunk_dev_ptrs is not None
             or cached_chunk_ptrs_npu is not None
@@ -4388,8 +4410,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             # The consumer needs transient pointers for the transfer, while
             # the cache engine publishes owners/host/NPU rows atomically.
             transfer_kwargs = dict(kwargs)
-            transfer_kwargs["cached_chunk_dev_ptrs"] = None
-            transfer_kwargs["cached_chunk_ptrs_npu"] = None
+            if (
+                cached_chunk_dev_ptrs is not None
+                and cached_chunk_ptrs_npu is not None
+            ):
+                transient_chunk_dev_ptrs = []
+                transient_chunk_ptrs_npu = []
+            transfer_kwargs["cached_chunk_dev_ptrs"] = transient_chunk_dev_ptrs
+            transfer_kwargs["cached_chunk_ptrs_npu"] = transient_chunk_ptrs_npu
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
             **transfer_kwargs
         )
@@ -4406,7 +4434,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         ] = []
         compact_pages = ()
         page_view_build_s = 0.0
+        pointer_seal_s = 0.0
         legacy_tail_objects = 0
+        prepared_compact_ptrs = False
         defer_finish = False
 
         try:
@@ -4461,6 +4491,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     cold_start_perf_now() - page_started
                                 )
                             to_release.extend(compact_pages)
+                            prepare_page_ptrs = getattr(
+                                self.gpu_connector,
+                                "prepare_sparse_page_ptr_cache_for_layers",
+                                None,
+                            )
+                            if (
+                                len(compact_pages) == missing_chunks
+                                and transient_chunk_dev_ptrs is not None
+                                and transient_chunk_ptrs_npu is not None
+                                and callable(prepare_page_ptrs)
+                            ):
+                                pointer_started = (
+                                    cold_start_perf_now() if perf_enabled else 0.0
+                                )
+                                prepared_compact_ptrs = bool(
+                                    prepare_page_ptrs(
+                                        [
+                                            LayerPageSource(compact_pages, index)
+                                            for index in range(self.num_layers)
+                                        ],
+                                        transient_chunk_dev_ptrs,
+                                        transient_chunk_ptrs_npu,
+                                    )
+                                )
+                                if pointer_started:
+                                    pointer_seal_s = (
+                                        cold_start_perf_now() - pointer_started
+                                    )
                         elif len(envelope.handles) != missing_chunks:
                             raise ValueError(
                                 "Sparse shared CPU passive received inconsistent "
@@ -4662,37 +4720,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                         rank=self.metadata.worker_id,
                         passive=True,
                     )
-            if pending_materialized_layers:
-                pointer_started = (
-                    cold_start_perf_now()
-                    if perf_enabled and compact_pages
-                    else 0.0
-                )
-                self._append_retrieve_group_cache(
-                    pending_materialized_layers,
-                    cached_memory_objs,
-                    cached_tensors,
-                    cached_chunk_dev_ptrs,
-                    cached_chunk_ptrs_npu,
-                )
-                if pointer_started:
-                    pointer_seal_ms = round(
-                        (cold_start_perf_now() - pointer_started) * 1000, 3
-                    )
-                    cold_start_perf_log(
-                        logger,
-                        "passive_compact_materialize",
-                        started=pointer_started,
-                        req_id=req_id,
-                        phase=phase,
-                        kv_group=kv_group,
-                        rank=self.metadata.worker_id,
-                        physical_pages=len(compact_pages),
-                        logical_entries=missing_chunks * self.num_layers,
-                        legacy_tail_objects=legacy_tail_objects,
-                        page_view_build_ms=round(page_view_build_s * 1000, 3),
-                        pointer_seal_ms=pointer_seal_ms,
-                    )
             next(mem_obj_consumer)
             if defer_finish:
                 yield ret_mask
@@ -4716,6 +4743,45 @@ class AscendLMCacheEngine(LMCacheEngine):
                         "Compact shared batch received an invalid final status: "
                         f"status={final_envelope.status!r}, "
                         f"message={final_envelope.message!r}"
+                    )
+            if pending_materialized_layers:
+                pointer_started = (
+                    cold_start_perf_now()
+                    if perf_enabled and compact_pages
+                    else 0.0
+                )
+                self._append_retrieve_group_cache(
+                    pending_materialized_layers,
+                    cached_memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                    transient_chunk_dev_ptrs if prepared_compact_ptrs else None,
+                    transient_chunk_ptrs_npu if prepared_compact_ptrs else None,
+                )
+                if pointer_started:
+                    pointer_seal_ms = round(
+                        (
+                            pointer_seal_s
+                            + cold_start_perf_now()
+                            - pointer_started
+                        )
+                        * 1000,
+                        3,
+                    )
+                    cold_start_perf_log(
+                        logger,
+                        "passive_compact_materialize",
+                        started=pointer_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        rank=self.metadata.worker_id,
+                        physical_pages=len(compact_pages),
+                        logical_entries=missing_chunks * self.num_layers,
+                        legacy_tail_objects=legacy_tail_objects,
+                        page_view_build_ms=round(page_view_build_s * 1000, 3),
+                        pointer_seal_ms=pointer_seal_ms,
                     )
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None

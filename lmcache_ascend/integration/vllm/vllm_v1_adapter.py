@@ -73,6 +73,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             tuple[str, int], LayerwiseStoreResult
         ] = {}
         self._scheduler_live_sources: dict[str, list[dict[str, Any]]] = {}
+        self._unfenced_live_stores: dict[str, ReqMeta] = {}
         if self._direct_store_requested:
             extra = self.config.extra_config or {}
             valid = (
@@ -177,6 +178,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         "Failed to drain direct stores while aborting %s",
                         sorted(req_ids),
                     )
+                for req_id in req_ids:
+                    self._unfenced_live_stores.pop(req_id, None)
                 self.lmcache_engine.drop_direct_store_states(req_ids)
 
     def save_kv_layer(
@@ -276,6 +279,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     ) -> None:
         """Submit direct pages; also used by the wait-for-save fallback."""
         assert self.lmcache_engine is not None
+        requests = [
+            request
+            for request in requests
+            if request.req_id not in self._unfenced_live_stores
+        ]
+        if not requests:
+            return
         group_caches = self._direct_group_caches()
         for request in requests:
             selected, slot_mappings, mapping_base = self._direct_request_inputs(
@@ -292,37 +302,20 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 int(committed_prefix or 0),
             )
             live_source = bool(getattr(request, "live_source_requested", False))
+            parallel = self._vllm_config.parallel_config
+            topology_supported = (
+                int(getattr(parallel, "pipeline_parallel_size", 1)) == 1
+                and int(getattr(parallel, "prefill_context_parallel_size", 1)) == 1
+                and int(getattr(parallel, "decode_context_parallel_size", 1)) == 1
+            )
+            if live_source and not topology_supported:
+                logger.warning(
+                    "Live split disabled for %s: PP/PCP/DCP must all equal 1",
+                    request.req_id,
+                )
+                live_source = False
             if live_source:
                 self.lmcache_engine.begin_live_source_descriptor(request.req_id)
-            direct_store = self.lmcache_engine.direct_prefill_store_enabled()
-            if direct_store:
-                if (
-                    live_source
-                    and adopted_requests is not None
-                    and request.req_id in adopted_requests
-                ):
-                    # The persistent write reused below has no missing direct
-                    # pages from which to build a live source descriptor.
-                    self.lmcache_engine.capture_live_source_step(
-                        request.req_id,
-                        request.token_ids,
-                        selected,
-                        slot_mappings,
-                        request.request_configs,
-                        mapping_base,
-                        request.is_last_prefill,
-                    )
-                self.lmcache_engine.store_direct_prefill(
-                    request.req_id,
-                    request.token_ids,
-                    selected,
-                    slot_mappings,
-                    request.request_configs,
-                    final=request.is_last_prefill,
-                    slot_mapping_base=mapping_base,
-                    verified_prefix_end=verified_prefix_end,
-                )
-            elif live_source:
                 self.lmcache_engine.capture_live_source_step(
                     request.req_id,
                     request.token_ids,
@@ -332,14 +325,28 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     mapping_base,
                     request.is_last_prefill,
                 )
+            finalized_live = False
             if live_source and request.is_last_prefill:
-                parallel = self._vllm_config.parallel_config
-                self.lmcache_engine.finalize_live_source_descriptor(
+                finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
                     request.req_id,
                     len(request.token_ids),
                     get_tensor_model_parallel_rank(),
                     int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
                 )
+            direct_store = self.lmcache_engine.direct_prefill_store_enabled()
+            if direct_store:
+                self.lmcache_engine.store_direct_prefill(
+                    request.req_id,
+                    request.token_ids,
+                    selected,
+                    slot_mappings,
+                    request.request_configs,
+                    final=request.is_last_prefill and not finalized_live,
+                    slot_mapping_base=mapping_base,
+                    verified_prefix_end=verified_prefix_end,
+                )
+            if finalized_live and direct_store:
+                self._unfenced_live_stores[request.req_id] = request
 
     def build_connector_worker_meta(self) -> Optional[KVConnectorWorkerMetadata]:
         if self.lmcache_engine is None:
@@ -355,20 +362,22 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     def update_connector_output(self, connector_output: Any) -> None:
         super().update_connector_output(connector_output)
-        metadata = getattr(connector_output, "kv_connector_worker_meta", None)
+
+    def update_connector_worker_metadata(
+        self, metadata: KVConnectorWorkerMetadata, active_req_ids: set[str]
+    ) -> None:
         if isinstance(metadata, LiveSourceWorkerMetadata):
             for req_id, descriptors in metadata.descriptors.items():
-                by_rank = {
-                    (int(item["tp_rank"]), int(item["dp_rank"])): item
-                    for item in self._scheduler_live_sources.get(req_id, ())
-                }
-                by_rank.update(
-                    {
-                        (int(item["tp_rank"]), int(item["dp_rank"])): item
-                        for item in descriptors
-                    }
-                )
-                self._scheduler_live_sources[req_id] = list(by_rank.values())
+                if req_id not in active_req_ids:
+                    continue
+                self._scheduler_live_sources[req_id] = list(descriptors)
+
+    def update_state_after_alloc(
+        self, request: "Request", num_external_tokens: int, blocks: Any = None
+    ) -> None:
+        if request.request_id not in self._unfinished_requests:
+            self._scheduler_live_sources.pop(request.request_id, None)
+        super().update_state_after_alloc(request, num_external_tokens, blocks)
 
     def _effective_skip_leading_tokens(
         self,
@@ -432,9 +441,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 request.req_id for request in requests if request.is_last_prefill
             }
             if final_ids:
-                self.lmcache_engine.wait_for_direct_stores(final_ids)
+                fenced_ids = final_ids - self._unfenced_live_stores.keys()
+                if fenced_ids:
+                    self.lmcache_engine.wait_for_direct_stores(fenced_ids)
                 for request in requests:
-                    if request.req_id not in final_ids:
+                    if (
+                        request.req_id not in final_ids
+                        or request.req_id in self._unfenced_live_stores
+                    ):
                         continue
                     for group, committed_end in (
                         self.lmcache_engine.direct_store_committed_ends(
@@ -471,9 +485,64 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return super()._finalize_worker_requests_after_store(
                 finished_req_ids
             )
+        live_finished = finished_req_ids & self._unfenced_live_stores.keys()
+        failed_sending: set[str] = set()
+        if live_finished:
+            requests = [self._unfenced_live_stores[req_id] for req_id in live_finished]
+            try:
+                for request in requests:
+                    try:
+                        selected, slot_mappings, mapping_base = (
+                            self._direct_request_inputs(
+                                request, self._direct_group_caches()
+                            )
+                        )
+                        self.lmcache_engine.store_direct_prefill(
+                            request.req_id,
+                            request.token_ids,
+                            selected,
+                            slot_mappings,
+                            request.request_configs,
+                            final=True,
+                            slot_mapping_base=mapping_base,
+                        )
+                    except Exception as error:
+                        self._handle_save_request_error(request, error)
+                        try:
+                            self.lmcache_engine.wait_for_pending_stores(
+                                (request.req_id,)
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to drain rejected persistent store for %s",
+                                request.req_id,
+                            )
+                            continue
+                        self.lmcache_engine.drop_direct_store_states((request.req_id,))
+                        failed_sending.add(request.req_id)
+                        continue
+                    for group, committed_end in (
+                        self.lmcache_engine.direct_store_committed_ends(
+                            request.req_id
+                        ).items()
+                    ):
+                        self._record_prefill_save_group_completed(
+                            request,
+                            group,
+                            LayerwiseStoreResult(
+                                request_id=request.req_id,
+                                kv_group=group,
+                                committed_end=committed_end,
+                            ),
+                        )
+                    self._mark_prefill_committed(request)
+            finally:
+                for req_id in live_finished:
+                    self._unfenced_live_stores.pop(req_id, None)
         finished_sending = set(
             self.lmcache_engine.get_finished_stores(finished_req_ids) or ()
         )
+        finished_sending.update(failed_sending)
         releasable_req_ids = (
             finished_sending if self.store_async else finished_req_ids
         )
@@ -501,6 +570,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
             preempted_req_ids
         )
+        for req_id in preempted_req_ids:
+            self._unfenced_live_stores.pop(req_id, None)
         self.lmcache_engine.drop_direct_store_states(preempted_req_ids)
         if waited_req_ids:
             logger.info(

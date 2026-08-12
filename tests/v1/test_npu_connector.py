@@ -1375,6 +1375,50 @@ def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> 
         page.ref_count_down()
 
 
+def test_prepare_page_pointer_cache_is_one_copy_and_rejects_suffix(
+    monkeypatch,
+) -> None:
+    _allocator, pages, suffix, sources = _make_layer_page_sources()
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda page, *, layer_id, **_kwargs: page.layer_data_ptr(layer_id),
+    )
+    tensor_calls = 0
+    original_tensor = torch.tensor
+
+    def counted_tensor(*args, **kwargs):
+        nonlocal tensor_calls
+        tensor_calls += 1
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", counted_tensor)
+    host_rows, npu_rows = [], []
+
+    assert connector.prepare_sparse_page_ptr_cache_for_layers(
+        [LayerPageSource(tuple(pages), layer) for layer in range(2)],
+        host_rows,
+        npu_rows,
+    )
+    assert tensor_calls == 1
+    assert host_rows == [
+        [page.layer_data_ptr(layer) for page in pages] for layer in range(2)
+    ]
+    assert [row.tolist() for row in npu_rows] == host_rows
+
+    unchanged_host = [[7], [8]]
+    unchanged_npu = [torch.tensor([7]), torch.tensor([8])]
+    assert not connector.prepare_sparse_page_ptr_cache_for_layers(
+        sources, unchanged_host, unchanged_npu
+    )
+    assert unchanged_host == [[7], [8]]
+    assert [row.tolist() for row in unchanged_npu] == [[7], [8]]
+    for obj in [*pages, *suffix]:
+        obj.ref_count_down()
+
+
 def test_group_pointer_append_validates_complete_page_span(monkeypatch) -> None:
     _allocator, pages, suffix, sources = _make_layer_page_sources()
     connector = _make_sparse_pack_connector()

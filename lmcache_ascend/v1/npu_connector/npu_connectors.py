@@ -1762,6 +1762,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
                 for layer_id, layer_sources in enumerate(new_sources_by_layer)
             ]
+        self._append_sparse_chunk_ptr_rows(
+            staged_rows, cached_chunk_dev_ptrs, cached_chunk_ptrs_npu
+        )
+
+    def prepare_sparse_page_ptr_cache_for_layers(
+        self,
+        sources_by_layer: List[LayerPageSource],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> bool:
+        """Prepare a transient homogeneous page pointer table, if compatible."""
+        if any(source.suffix for source in sources_by_layer):
+            return False
+        staged_rows = self._layer_page_pointer_rows(sources_by_layer)
+        if staged_rows is None:
+            return False
+        self._append_sparse_chunk_ptr_rows(
+            staged_rows, cached_chunk_dev_ptrs, cached_chunk_ptrs_npu
+        )
+        return True
+
+    def _append_sparse_chunk_ptr_rows(
+        self,
+        staged_rows: list[list[int]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> None:
+        """Append complete host rows and refresh their shared NPU table."""
         prefix_counts = {
             len(cached_chunk_dev_ptrs[layer_id])
             if layer_id < len(cached_chunk_dev_ptrs)

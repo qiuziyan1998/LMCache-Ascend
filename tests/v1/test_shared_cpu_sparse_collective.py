@@ -447,7 +447,7 @@ def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
             "request", group, [(4, 6)], [[base + 16]], [[8]], owners
         )
 
-    engine.finalize_live_source_descriptor("request", 6, 3, 1)
+    assert engine.finalize_live_source_descriptor("request", 6, 3, 1)
     descriptor = engine.drain_live_source_descriptors()["request"]
     assert descriptor["group_byte_totals"] == [24, 24]
     assert (descriptor["tp_rank"], descriptor["dp_rank"]) == (3, 1)
@@ -460,6 +460,7 @@ def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
     assert [segment["source_buffer_base"] for segment in descriptor["segments"]] == [
         1000, 1000, 2000, 2000
     ]
+    assert not engine.finalize_live_source_descriptor("missing", 6, 3, 1)
 
 
 def test_live_source_capture_defers_partial_tail_until_final_step() -> None:
@@ -1946,8 +1947,10 @@ def test_sparse_passive_materialize_only_skips_npu_consumer(monkeypatch):
 
 @pytest.mark.parametrize("materialize_only", [True, False])
 @pytest.mark.parametrize("complete", [True, False])
+@pytest.mark.parametrize("prepare_early", [True, False])
+@pytest.mark.parametrize("valid_final", [True, False])
 def test_sparse_passive_reuses_one_merged_page(
-    monkeypatch, complete, materialize_only
+    monkeypatch, complete, materialize_only, prepare_early, valid_final
 ):
     monkeypatch.setattr(
         ascend_cache_engine,
@@ -1993,29 +1996,55 @@ def test_sparse_passive_reuses_one_merged_page(
                 request_ordinal=0,
                 layer_id=2,
                 kv_group=0,
-                status="skipped",
+                status="skipped" if valid_final else "error",
                 generation=7,
                 handles=[],
-                message="compact shared batch committed",
+                message=(
+                    "compact shared batch committed"
+                    if valid_final
+                    else "failed before compact commit"
+                ),
             ),
         ]
     )
 
     class Connector(_FakeSparseConsumer):
+        def __init__(self):
+            self.pointer_snapshots = []
+            self.final_appends = 0
+            self.events = []
+
         def batched_to_gpu_head_token_wise(self, **kwargs):
+            host_ptrs = kwargs.get("cached_chunk_dev_ptrs")
             npu_ptrs = kwargs.get("cached_chunk_ptrs_npu")
-            for layer_id in range(2):
-                yield
-                if npu_ptrs is not None:
-                    while len(npu_ptrs) <= layer_id:
-                        npu_ptrs.append(None)
-                    npu_ptrs[layer_id] = torch.tensor([layer_id])
+            for _layer_id in range(2):
+                payload = yield
+                self.events.append("send")
+                self.pointer_snapshots.append(
+                    (
+                        [list(row) for row in host_ptrs],
+                        [row.tolist() for row in npu_ptrs],
+                        payload,
+                    )
+                )
             yield
             yield
+
+        def prepare_sparse_page_ptr_cache_for_layers(
+            self, sources, host_ptrs, npu_ptrs
+        ):
+            if not prepare_early:
+                return False
+            self.events.append("prepare")
+            self.sources = sources
+            host_ptrs.extend(([11], [22]))
+            npu_ptrs.extend((torch.tensor([11]), torch.tensor([22])))
+            return True
 
         def append_sparse_chunk_ptr_cache_for_layers(
             self, sources, host_ptrs, npu_ptrs
         ):
+            self.final_appends += 1
             self.sources = sources
             host_ptrs.extend(([11], [22]))
             npu_ptrs.extend((torch.tensor([11]), torch.tensor([22])))
@@ -2055,10 +2084,18 @@ def test_sparse_passive_reuses_one_merged_page(
     next(retriever)
     retriever.send(None)
     if complete:
-        retriever.send(None)
+        if valid_final:
+            retriever.send(None)
+        else:
+            with pytest.raises(ValueError, match="rank0 error envelope"):
+                retriever.send(None)
     retriever.close()
 
-    if complete:
+    early_active = prepare_early
+    expected_transient = (
+        ([[11], [22]], [[11], [22]]) if early_active else ([], [])
+    )
+    if complete and valid_final:
         assert all(
             isinstance(source, LayerPageSource)
             for source in engine.gpu_connector.sources
@@ -2068,6 +2105,17 @@ def test_sparse_passive_reuses_one_merged_page(
         assert [row.tolist() for row in cached_chunk_ptrs_npu] == [[11], [22]]
         assert cached_shared_handles == [[None], [None]]
         assert page.release_count == 0
+        assert engine.gpu_connector.final_appends == (0 if early_active else 1)
+        assert len(engine.gpu_connector.pointer_snapshots) == 2
+        assert engine.gpu_connector.events == (
+            ["prepare", "send", "send"]
+            if early_active
+            else ["send", "send"]
+        )
+        assert all(
+            (host, npu) == expected_transient and payload is not None
+            for host, npu, payload in engine.gpu_connector.pointer_snapshots
+        )
         aggregate = dict(perf_events)["passive_compact_materialize"]
         assert aggregate["req_id"] == "req-page"
         assert aggregate["rank"] == 0
@@ -2083,6 +2131,10 @@ def test_sparse_passive_reuses_one_merged_page(
         assert cached_chunk_ptrs_npu == []
         assert cached_shared_handles == []
         assert page.release_count == 1
+        assert engine.gpu_connector.final_appends == 0
+        assert engine.gpu_connector.pointer_snapshots[0][:2] == (
+            expected_transient
+        )
         assert "passive_compact_materialize" not in dict(perf_events)
 
 
