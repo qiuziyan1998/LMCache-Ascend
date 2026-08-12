@@ -1828,15 +1828,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if isinstance(source, LayerPageSource)
         ):
             return None
-        layout = None
+        compatible_layout = None
         for page in pages:
             prefixes = tuple(page.group_prefix_sum)
             metadata = page.metadata
+            shapes = tuple(metadata.shapes or ())
+            dtypes = tuple(metadata.dtypes or ())
             page_layout = (
-                page.layer_size,
                 metadata.fmt,
-                tuple(metadata.shapes or ()),
-                tuple(metadata.dtypes or ()),
+                dtypes[0] if dtypes else None,
+                (
+                    page.layer_size // page.valid_tokens
+                    if page.valid_tokens > 0
+                    and page.layer_size % page.valid_tokens == 0
+                    else None
+                ),
             )
             if (
                 not page.valid
@@ -1844,14 +1850,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 or page.layer_size <= 0
                 or prefixes
                 != tuple(i * page.layer_size for i in range(self.num_layers + 1))
-                or len(page_layout[2]) != self.num_layers
-                or len(set(page_layout[2])) != 1
-                or len(page_layout[3]) != self.num_layers
-                or len(set(page_layout[3])) != 1
-                or (layout is not None and page_layout != layout)
+                or len(shapes) != self.num_layers
+                or len(set(shapes)) != 1
+                or len(dtypes) != self.num_layers
+                or len(set(dtypes)) != 1
+                or page_layout[2] is None
+                or (
+                    compatible_layout is not None
+                    and page_layout != compatible_layout
+                )
             ):
                 return None
-            layout = page_layout
+            compatible_layout = page_layout
 
         result = [[] for _ in range(self.num_layers)]
         for chunk_index, page in enumerate(pages):
@@ -3112,19 +3122,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             and self._is_mla_dsa_format(kv_group)
         )
 
-    def _plan_direct_page_buffers(
-        self,
-        kvcaches: list,
-        slot_mapping: torch.Tensor,
-        starts: List[int],
-        ends: List[int],
-        kv_group: int,
-        layerwise: bool = False,
-        slot_mapping_base: int = 0,
+    def _reject_direct_page_plan(self, kv_group: int, reason: str):
+        rejections = getattr(self, "_direct_page_plan_rejections", None)
+        if rejections is None:
+            rejections = self._direct_page_plan_rejections = {}
+        rejections[kv_group] = reason
+        return None
+
+    def _direct_page_tensor_layout(
+        self, kvcaches: list, kv_group: int
     ) -> Optional[
-        tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
+        tuple[list[tuple[int, int]], tuple[torch.Tensor, ...], int]
     ]:
-        """Describe LMCache page buffers in paged NPU KV tensor storage."""
+        """Validate and cache the pointer layout shared by all page plans."""
         try:
             layout = self._lazy_initialize_buffer_with_staging(
                 kvcaches, kv_group=kv_group, init_staging=False
@@ -3133,38 +3143,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 KVCacheFormat.MLA_LATENT,
                 KVCacheFormat.DSA_INDEX,
             ):
-                return None
-            if not starts or len(starts) != len(ends):
-                return None
-            slot_base, slot_end = min(starts), max(ends)
-            local_base = slot_base - slot_mapping_base
-            local_end = slot_end - slot_mapping_base
-            if (
-                slot_mapping_base < 0
-                or local_base < 0
-                or local_end > len(slot_mapping)
+                return self._reject_direct_page_plan(
+                    kv_group, f"unsupported_format:{layout.kv_format}"
+                )
+            planes = 2 if kv_group == 0 else 1
+            layers = kvcaches[: self.num_layers]
+            if len(layers) != self.num_layers or any(
+                len(layer) != planes for layer in layers
             ):
-                return None
-            slots = (
-                slot_mapping[local_base:local_end]
-                .detach()
-                .to(device="cpu", dtype=torch.long)
-            )
-            owners = tuple(
-                tensor
-                for layer in kvcaches[: self.num_layers]
-                for tensor in layer
-            )
-            if len(owners) != self.num_layers * (2 if kv_group == 0 else 1):
-                return None
+                return self._reject_direct_page_plan(
+                    kv_group, "owner_layout_mismatch"
+                )
+            owners = tuple(tensor for layer in layers for tensor in layer)
             if owners[0].dtype != getattr(self, "dtype", owners[0].dtype):
-                return None
+                return self._reject_direct_page_plan(
+                    kv_group, "connector_dtype_mismatch"
+                )
             if any(
                 tensor.dtype != owners[0].dtype
                 or tensor.device != owners[0].device
                 for tensor in owners[1:]
             ):
-                return None
+                return self._reject_direct_page_plan(
+                    kv_group, "owner_dtype_or_device_mismatch"
+                )
 
             signature = tuple(
                 (
@@ -3184,26 +3186,99 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 tensor_meta = cached[1]
             else:
                 tensor_meta = []
+                plane_layouts = []
                 for tensor in owners:
                     if tensor.ndim < 3 or not tensor.is_contiguous():
-                        return None
+                        return self._reject_direct_page_plan(
+                            kv_group, "unsupported_tensor_layout"
+                        )
                     token_bytes = int(
                         tensor[0, 0].numel() * tensor.element_size()
                     )
                     if (
                         tensor.stride(1) * tensor.element_size() != token_bytes
-                        or tensor.stride(0) != tensor.shape[1] * tensor.stride(1)
+                        or tensor.stride(0)
+                        != tensor.shape[1] * tensor.stride(1)
                     ):
-                        return None
+                        return self._reject_direct_page_plan(
+                            kv_group, "unsupported_tensor_stride"
+                        )
                     tensor_meta.append((int(tensor.data_ptr()), token_bytes))
-                cache[kv_group] = (
-                    signature,
-                    tensor_meta,
+                    plane_layouts.append(
+                        (tuple(tensor.shape[2:]), tuple(tensor.stride()[2:]))
+                    )
+                reference = plane_layouts[:planes]
+                if any(
+                    plane_layouts[offset : offset + planes] != reference
+                    for offset in range(planes, len(plane_layouts), planes)
+                ):
+                    return self._reject_direct_page_plan(
+                        kv_group, "owner_plane_layout_mismatch"
+                    )
+                cache[kv_group] = (signature, tensor_meta)
+            expected_token_bytes = (
+                self.get_shape(1, kv_group).numel()
+                * owners[0].element_size()
+                * self.num_layers
+            )
+            if (
+                sum(token_bytes for _, token_bytes in tensor_meta)
+                != expected_token_bytes
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "page_byte_layout_mismatch"
                 )
             slot_capacity = min(
                 int(tensor.shape[0] * tensor.shape[1]) for tensor in owners
             )
+            getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
+            return tensor_meta, owners, slot_capacity
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return self._reject_direct_page_plan(
+                kv_group, f"{type(exc).__name__}:{exc}"
+            )
 
+    def direct_page_layout_supported(self, kvcaches: list, kv_group: int) -> bool:
+        """Check direct-store eligibility without scanning request slot mappings."""
+        return self._direct_page_tensor_layout(kvcaches, kv_group) is not None
+
+    def _plan_direct_page_buffers(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+        layerwise: bool = False,
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
+    ]:
+        """Describe LMCache page buffers in paged NPU KV tensor storage."""
+        try:
+            direct_layout = self._direct_page_tensor_layout(kvcaches, kv_group)
+            if direct_layout is None:
+                return None
+            tensor_meta, owners, slot_capacity = direct_layout
+            planes = 2 if kv_group == 0 else 1
+            if not starts or len(starts) != len(ends):
+                return self._reject_direct_page_plan(kv_group, "invalid_ranges")
+            slot_base, slot_end = min(starts), max(ends)
+            local_base = slot_base - slot_mapping_base
+            local_end = slot_end - slot_mapping_base
+            if (
+                slot_mapping_base < 0
+                or local_base < 0
+                or local_end > len(slot_mapping)
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "slot_window_out_of_range"
+                )
+            slots = (
+                slot_mapping[local_base:local_end]
+                .detach()
+                .to(device="cpu", dtype=torch.long)
+            )
             all_ptrs: List[List[int]] = []
             all_sizes: List[List[int]] = []
             for start, end in zip(starts, ends, strict=True):
@@ -3213,10 +3288,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     or local_end <= local_start
                     or local_end > slots.numel()
                 ):
-                    return None
+                    return self._reject_direct_page_plan(
+                        kv_group, "page_range_out_of_bounds"
+                    )
                 page_slots = slots[local_start:local_end]
                 if bool(((page_slots < 0) | (page_slots >= slot_capacity)).any()):
-                    return None
+                    return self._reject_direct_page_plan(
+                        kv_group, "slot_value_out_of_bounds"
+                    )
                 breaks = torch.where(page_slots[1:] != page_slots[:-1] + 1)[0] + 1
                 boundaries = [0, *breaks.tolist(), page_slots.numel()]
                 runs = [
@@ -3224,7 +3303,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for left, right in zip(boundaries, boundaries[1:], strict=True)
                 ]
 
-                planes = 2 if kv_group == 0 else 1
                 page_ptrs, page_sizes = [], []
                 for layer in range(self.num_layers if layerwise else 1):
                     ptrs: List[int] = []
@@ -3249,12 +3327,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     * self.num_layers
                 )
                 if sum(map(sum, page_sizes)) != expected or expected != metadata_bytes:
-                    return None
+                    return self._reject_direct_page_plan(
+                        kv_group, "page_byte_layout_mismatch"
+                    )
                 all_ptrs.extend(page_ptrs)
                 all_sizes.extend(page_sizes)
+            getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
             return all_ptrs, all_sizes, owners
-        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
-            return None
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return self._reject_direct_page_plan(
+                kv_group, f"{type(exc).__name__}:{exc}"
+            )
+
+    def direct_page_plan_rejection(self, kv_group: int) -> Optional[str]:
+        """Return the most recent rejection for aggregate fallback diagnostics."""
+        return getattr(self, "_direct_page_plan_rejections", {}).get(kv_group)
 
     def plan_direct_page_sources(
         self,
@@ -3293,7 +3380,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ]:
         """Describe destination buffers for a direct page load."""
         if _DENSE_DIRECT_LOAD_DISABLE:
-            return None
+            return self._reject_direct_page_plan(
+                kv_group, "dense_direct_load_disabled"
+            )
         return self._plan_direct_page_buffers(
             kvcaches,
             slot_mapping,
@@ -3398,13 +3487,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer_tensors: List[List[torch.Tensor]] = []
         for layer_id, memory_objs_layer in enumerate(memory_objs):
             tensors = []
-            for chunk_index, memory_obj in enumerate(memory_objs_layer):
-                tensor = memory_obj.tensor
-                if tensor is None:
-                    raise ValueError(
-                        "Dense direct group store received a MemoryObj without "
-                        f"a tensor at layer={layer_id}, chunk={chunk_index}."
-                    )
+            for memory_obj in memory_objs_layer:
+                tensor = _layer_memory_tensor(memory_obj, layer_id)
                 if memory_obj.metadata.fmt != expected_fmt:
                     raise ValueError(
                         f"Expected memory format {expected_fmt}, "
@@ -5155,15 +5239,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 memory_objs_layer = memory_objs[layer_id]
                 # kvcaches -> gpu_buffer -> memobj
                 if dense_direct:
-                    cpu_tensors = []
+                    cpu_tensors = [
+                        _layer_memory_tensor(memory_obj, layer_id)
+                        for memory_obj in memory_objs_layer
+                    ]
                     for memory_obj in memory_objs_layer:
-                        assert memory_obj.tensor is not None
                         if memory_obj.metadata.fmt != expected_fmt:
                             raise ValueError(
                                 f"Expected memory format {expected_fmt}, "
                                 f"got {memory_obj.metadata.fmt}."
                             )
-                        cpu_tensors.append(memory_obj.tensor)
                     chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                         layer_id,
                         cpu_tensors,
@@ -5197,10 +5282,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     with torch.npu.stream(self.store_stream):
                         self.store_stream.wait_stream(current_stream)
                         if self.use_gpu:
-                            cpu_tensors = []
-                            for memory_obj in memory_objs_layer:
-                                assert memory_obj.tensor is not None
-                                cpu_tensors.append(memory_obj.tensor)
+                            cpu_tensors = [
+                                _layer_memory_tensor(memory_obj, layer_id)
+                                for memory_obj in memory_objs_layer
+                            ]
 
                             # Fused transfer: 1 scatter kernel + N D2H memcpy
                             batched_fused_single_layer_kv_transfer(
@@ -5222,10 +5307,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             for start, end, memory_obj in zip(
                                 starts, ends, memory_objs_layer, strict=False
                             ):
-                                assert memory_obj.tensor is not None
-
                                 lmc_ops.single_layer_kv_transfer(
-                                    memory_obj.tensor,
+                                    _layer_memory_tensor(memory_obj, layer_id),
                                     kvcaches_snapshot[layer_id],
                                     slot_mapping[start:end],
                                     True,
@@ -5247,9 +5330,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     store_req_id = kwargs.get("req_id")
                     if store_req_id is not None:
                         store_tensors = [
-                            memory_obj.tensor
+                            _layer_memory_tensor(memory_obj, layer_id)
                             for memory_obj in memory_objs_layer
-                            if memory_obj.tensor is not None
                         ]
                         store_starts = list(starts)
                         store_ends = list(ends)

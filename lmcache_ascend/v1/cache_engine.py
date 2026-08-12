@@ -62,6 +62,7 @@ import torch
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
+REMOTE_BACKEND_NAME = "RemoteBackend"
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
 
@@ -105,6 +106,7 @@ class _DirectStoreRequestState:
     submitted_pages: int = 0
     submitted_legacy_objects: int = 0
     submitted_bytes: int = 0
+    fallback_reasons: dict[int, str] = field(default_factory=dict)
     finalized: bool = False
 
 
@@ -394,6 +396,35 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Return whether this worker can use direct NPU page publication."""
         return self._direct_store_enabled
 
+    def direct_prefill_plan_supported(
+        self,
+        group_caches: dict[int, list],
+    ) -> bool:
+        """Check the current direct layout before choosing the save path."""
+        check = getattr(self.gpu_connector, "direct_page_layout_supported", None)
+        if not callable(check):
+            return False
+        for group, caches in group_caches.items():
+            if not check(caches, group):
+                reason = getattr(
+                    self.gpu_connector, "direct_page_plan_rejection", None
+                )
+                detail = (
+                    reason(group) if callable(reason) else "unsupported_layout"
+                )
+                logged = getattr(self, "_direct_preflight_rejections", set())
+                if (group, detail) not in logged:
+                    logged.add((group, detail))
+                    self._direct_preflight_rejections = logged
+                    logger.warning(
+                        "Direct NPU prefill layout preflight failed; using the "
+                        "safe layerwise writer: kv_group=%d reason=%s",
+                        group,
+                        detail,
+                    )
+                return False
+        return True
+
     def _wait_direct_backpressure(self) -> None:
         limit = self._store_queue_maxsize or 2
         while len(self._direct_store_jobs) >= limit:
@@ -519,6 +550,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group=kv_group,
             request_configs=request_configs,
             require_completion=True,
+            all_layers_ready=True,
             slot_mapping_base=slot_mapping_base,
         )
         self._require_store_completion = True
@@ -620,6 +652,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         full_end = len(tokens) // chunk_size * chunk_size
         full_tokens = tokens if full_end == len(tokens) else tokens[:full_end]
         groups = tuple(groups)
+        if all(
+            state.submitted_end.get(group, 0) >= full_end for group in groups
+        ):
+            return {group: [] for group in groups}
         base = (
             state.planned_end
             if state.planned_end <= full_end
@@ -629,7 +665,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             else 0
         )
-        if base:
+        if base == full_end:
+            plan0 = []
+        elif base:
             plan0 = list(
                 self.token_database.process_tokens_from_prefix(
                     full_tokens,
@@ -654,6 +692,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         for group in groups:
             if group == 0:
                 continue
+            if not plan0:
+                plans[group] = []
+                continue
             plans[group] = [
                 (start + base, end + base, key)
                 for start, end, key in self.token_database.process_tokens(
@@ -676,6 +717,41 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.planned_end = plan0[-1][1]
             state.planned_hash = int(plan0[-1][2].chunk_hash)
         return plans
+
+    def adopt_completed_layerwise_store(
+        self, result: LayerwiseStoreResult
+    ) -> None:
+        """Reuse a completed layerwise store as direct-store progress."""
+        if result.committed_end <= 0:
+            return
+        state = self._direct_store_states.setdefault(
+            result.request_id, _DirectStoreRequestState()
+        )
+        group = int(result.kv_group)
+        latest_full = None
+        if result.keys:
+            chunk_size = int(self.config.chunk_size)
+            for start, end, key in zip(
+                result.starts, result.ends, result.keys[0], strict=True
+            ):
+                if end - start == chunk_size:
+                    latest_full = (end, int(key.chunk_hash))
+            if latest_full is not None:
+                end, chunk_hash = latest_full
+                if end == state.planned_end and chunk_hash != state.planned_hash:
+                    raise RuntimeError(
+                        "Completed latent/index stores disagree on their hash "
+                        "frontier"
+                    )
+                if end > state.planned_end:
+                    state.planned_end = end
+                    state.planned_hash = chunk_hash
+        state.submitted_end[group] = max(
+            state.submitted_end.get(group, 0), result.committed_end
+        )
+        state.committed_end[group] = max(
+            state.committed_end.get(group, 0), result.committed_end
+        )
 
     def _track_direct_batch(
         self,
@@ -1072,6 +1148,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 state.submitted_end[group] = verified_prefix_end
                 state.committed_end[group] = verified_prefix_end
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        cpu_fallback_s = 0.0
         plans = self._direct_suffix_plans(
             state, tokens, group_caches, request_configs
         )
@@ -1189,8 +1266,41 @@ class AscendLMCacheEngine(LMCacheEngine):
                     group,
                     slot_mapping_base=slot_mapping_base,
                 )
+                fallback_reason = None
                 if planned is None:
+                    rejection = getattr(
+                        self.gpu_connector, "direct_page_plan_rejection", None
+                    )
+                    fallback_reason = (
+                        rejection(group) or "unsupported_layout"
+                        if callable(rejection)
+                        else "unsupported_layout"
+                    )
+                else:
+                    group_ptrs, group_sizes, group_owners = planned
+                    max_buffers = int(
+                        self.config.get_extra_config_value(
+                            "mooncake_direct_max_buffers_per_page", 4096
+                        )
+                    )
+                    if any(
+                        len(page_ptrs) > max_buffers for page_ptrs in group_ptrs
+                    ):
+                        fallback_reason = "buffer_limit_exceeded"
+                if fallback_reason is not None:
+                    if state.fallback_reasons.get(group) != fallback_reason:
+                        logger.warning(
+                            "Direct NPU prefill store is using CPU fallback: "
+                            "req_id=%s kv_group=%d reason=%s",
+                            req_id,
+                            group,
+                            fallback_reason,
+                        )
+                        state.fallback_reasons[group] = fallback_reason
                     self.wait_for_direct_stores((req_id,))
+                    fallback_started = (
+                        cold_start_perf_now() if cold_start_perf_enabled() else None
+                    )
                     committed = self._store_direct_cpu_group(
                         req_id,
                         tokens,
@@ -1203,28 +1313,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     state.committed_end[group] = committed
                     state.submitted_end[group] = committed
+                    if fallback_started is not None:
+                        fallback_elapsed = cold_start_perf_now() - fallback_started
+                        cpu_fallback_s += fallback_elapsed
+                        cold_start_perf_log(
+                            logger,
+                            "direct_npu_cpu_fallback",
+                            started=fallback_started,
+                            req_id=req_id,
+                            kv_group=group,
+                            reason=fallback_reason,
+                            start=submitted,
+                            end=committed,
+                        )
                     continue
-                group_ptrs, group_sizes, group_owners = planned
-                max_buffers = int(
-                    self.config.get_extra_config_value(
-                        "mooncake_direct_max_buffers_per_page", 4096
-                    )
-                )
-                if any(len(page_ptrs) > max_buffers for page_ptrs in group_ptrs):
-                    self.wait_for_direct_stores((req_id,))
-                    committed = self._store_direct_cpu_group(
-                        req_id,
-                        tokens,
-                        kvcaches,
-                        slot_mappings[group],
-                        group,
-                        submitted,
-                        request_configs,
-                        slot_mapping_base,
-                    )
-                    state.committed_end[group] = committed
-                    state.submitted_end[group] = committed
-                    continue
+                assert planned is not None
                 merged_runs += sum(
                     len(page_ptrs) // len(group_owners)
                     for page_ptrs in group_ptrs
@@ -1246,10 +1349,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 group_ends[group] = candidate_ends[group]
 
         if started is not None:
+            elapsed_s = cold_start_perf_now() - started
+            plan_only_ms = max(elapsed_s - cpu_fallback_s, 0.0) * 1000
             cold_start_perf_log(
                 logger,
                 "direct_npu_plan",
-                started=started,
                 req_id=req_id,
                 groups=sorted(group_caches),
                 pages=len(keys),
@@ -1260,6 +1364,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 slot_mapping_base=slot_mapping_base,
                 final=final,
                 format="page",
+                elapsed_ms=round(plan_only_ms, 3),
+                total_ms=round(elapsed_s * 1000, 3),
+                plan_only_ms=round(plan_only_ms, 3),
+                cpu_fallback_ms=round(cpu_fallback_s * 1000, 3),
                 submitted_ends=dict(state.submitted_end),
                 committed_ends=dict(state.committed_end),
             )
@@ -2030,6 +2138,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if id(mem_obj) not in pending_ids
             ]
 
+    @staticmethod
+    def _layer_memory_tensor(
+        memory_obj: MemoryObj, layer_id: int
+    ) -> torch.Tensor:
+        tensor = (
+            memory_obj.layer_tensor(layer_id)
+            if isinstance(memory_obj, LayerPageMemoryObj)
+            else memory_obj.tensor
+        )
+        if tensor is None:
+            raise ValueError(
+                "Layerwise cache source has no tensor: "
+                f"layer_id={layer_id}, type={type(memory_obj).__name__}"
+            )
+        return tensor
+
     def _append_layer_store_tensors(
         self,
         layer_id: int,
@@ -2044,12 +2168,22 @@ class AscendLMCacheEngine(LMCacheEngine):
             layer_memory_objs = [
                 layer_memory_objs[index] for index in cache_chunk_indices
             ]
-        new_tensors: List[torch.Tensor] = [
-            mem_obj.tensor
-            for mem_obj in layer_memory_objs
-            if mem_obj.tensor is not None
-        ]
-        if new_tensors and cached_chunk_dev_ptrs is not None:
+        has_pages = any(
+            isinstance(memory_obj, LayerPageMemoryObj)
+            for memory_obj in layer_memory_objs
+        )
+        cache_tensors = cached_tensors is not None and (
+            any(cached_tensors) or not has_pages
+        )
+        new_tensors = (
+            [
+                AscendLMCacheEngine._layer_memory_tensor(mem_obj, layer_id)
+                for mem_obj in layer_memory_objs
+            ]
+            if cache_tensors or not has_pages
+            else []
+        )
+        if layer_memory_objs and cached_chunk_dev_ptrs is not None:
             # Resolve direct-load pointer tables while the dense store is on
             # the cold path, before WorkerRetrieveState is sealed.
             append_ptrs_fn = getattr(
@@ -2060,13 +2194,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             if append_ptrs_fn is not None:
                 append_ptrs_fn(
                     layer_id,
-                    new_tensors,
+                    (
+                        layer_memory_objs
+                        if has_pages and not cache_tensors
+                        else new_tensors
+                    ),
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                 )
 
-        if cached_tensors is None:
+        if not cache_tensors:
             return
+        assert cached_tensors is not None
         while len(cached_tensors) <= layer_id:
             cached_tensors.append([])
         cached_tensors[layer_id].extend(new_tensors)
@@ -2107,15 +2246,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_chunk_ptrs_npu,
             )
         else:
-            for chunk_index, mem_obj in enumerate(mem_objs_layer):
-                tensor = mem_obj.tensor
-                if tensor is None:
-                    raise ValueError(
-                        "Layerwise sparse retrieve resolved a chunk without a "
-                        "tensor; refusing to shift the direct-load pointer order: "
-                        f"layer_id={layer_id}, chunk_index={chunk_index}"
-                    )
-                new_tensors.append(tensor)
+            new_tensors = [
+                AscendLMCacheEngine._layer_memory_tensor(mem_obj, layer_id)
+                for mem_obj in mem_objs_layer
+            ]
             if (
                 new_tensors
                 and cached_chunk_dev_ptrs is not None
@@ -2159,7 +2293,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise ValueError(
                 "Dense group store NPU pointer table must be [layers, chunks]."
             )
-        if cached_tensors is not None and not cached_tensors:
+        has_pages = any(
+            isinstance(memory_obj, LayerPageMemoryObj)
+            for memory_obj in memory_objs[0]
+        )
+        cache_tensors = cached_tensors is not None and (
+            any(cached_tensors) or not has_pages
+        )
+        if cache_tensors and not cached_tensors:
             cached_tensors.extend([] for _ in range(num_layers))
         if cached_chunk_dev_ptrs is not None and not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
@@ -2167,19 +2308,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
 
         for layer_id, layer_memory_objs in enumerate(memory_objs):
-            tensors = []
-            for chunk_index, memory_obj in enumerate(layer_memory_objs):
-                tensor = memory_obj.tensor
-                if tensor is None:
-                    raise ValueError(
-                        "Dense group store cannot publish a MemoryObj without "
-                        f"a tensor at layer={layer_id}, chunk={chunk_index}."
-                    )
-                tensors.append(tensor)
             host_row = host_pointer_rows[layer_id]
-            if len(host_row) != len(tensors):
+            if len(host_row) != len(layer_memory_objs):
                 raise ValueError("Dense group store pointer count mismatch.")
-            if cached_tensors is not None:
+            if cache_tensors:
+                tensors = [
+                    AscendLMCacheEngine._layer_memory_tensor(
+                        memory_obj, layer_id
+                    )
+                    for memory_obj in layer_memory_objs
+                ]
+                assert cached_tensors is not None
                 cached_tensors[layer_id].extend(tensors)
             if cached_chunk_dev_ptrs is not None:
                 cached_chunk_dev_ptrs[layer_id].extend(host_row)
@@ -2223,7 +2362,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         owned: list[MemoryObj] = list(pages)
         pinned: list[MemoryObj] = []
         try:
-            legacy_suffix = local_count < page_chunks and local.contains_any_exact(
+            legacy_suffix = local_count < page_chunks and local.contains_all_exact(
                 page_keys[local_count].split_layers(self.num_layers)
             )
             tail_start = local_count
@@ -2350,6 +2489,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return False
             planned = planner(kvcaches, slot_mapping, starts, ends, 1)
             if planned is None:
+                if cold_start_perf_enabled():
+                    rejection = getattr(
+                        self.gpu_connector,
+                        "direct_page_plan_rejection",
+                        None,
+                    )
+                    cold_start_perf_log(
+                        logger,
+                        "cold_compact_indexer_fallback",
+                        req_id=req_id,
+                        pages=len(pages),
+                        fallback="cpu_staged",
+                        reason=(
+                            rejection(1) or "unsupported_layout"
+                            if callable(rejection)
+                            else "unsupported_layout"
+                        ),
+                    )
                 return False
             ptrs, sizes, owners = planned
             if len(ptrs) != len(pages) or len(sizes) != len(pages):
@@ -2596,19 +2753,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             owners_by_layer.append(mem_objs_layer)
             tensors = []
             if not pointer_first:
-                for chunk_index, mem_obj in enumerate(mem_objs_layer):
-                    tensor = (
-                        mem_obj.layer_tensor(source.layer_id)
-                        if isinstance(source, LayerPageSource)
-                        and chunk_index < len(source.pages)
-                        else mem_obj.tensor
-                    )
-                    if tensor is None:
-                        raise ValueError(
-                            "Layerwise sparse retrieve resolved a chunk without "
-                            f"a tensor: layer_id={layer_id}, chunk={chunk_index}"
-                        )
-                    tensors.append(tensor)
+                tensors = [
+                    AscendLMCacheEngine._layer_memory_tensor(mem_obj, layer_id)
+                    for mem_obj in mem_objs_layer
+                ]
             tensors_by_layer.append(tensors)
 
         if not callable(group_append) or cached_chunk_dev_ptrs is None:
@@ -3224,7 +3372,11 @@ class AscendLMCacheEngine(LMCacheEngine):
 
                 keys_multi_layer = key.split_layers(self.num_layers)
                 if sampled_worker_retrieve:
-                    current_location = "mixed"
+                    current_location = (
+                        REMOTE_BACKEND_NAME
+                        if (retrieve_kwargs or {}).get("direct_external_pages")
+                        else "mixed"
+                    )
                 elif shared_rank0_retrieve:
                     locations_multi_layer: list[str] = []
                     for layer_key in keys_multi_layer:
@@ -3544,6 +3696,25 @@ class AscendLMCacheEngine(LMCacheEngine):
         prev_key = 0
         kv_group = kwargs.get("kv_group", 0)
         kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
+        page_store = bool(
+            mooncake_layer_pages_enabled(self.config)
+            and self.storage_manager.supports_batched_put_layer_pages(
+                self.store_location
+            )
+        )
+        page_shape = (
+            self.gpu_connector.get_shape(
+                int(self.config.chunk_size), kv_group=kv_group
+            )
+            if page_store
+            else None
+        )
+        local = self._shared_local_cpu_backend() if page_store else None
+        memory_format = self._memory_format_for_kv_group(kv_group)
+        force_store_wait = self.config.get_extra_config_value(
+            "force_store_wait", False
+        )
+        pending_chunks = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
             kv_group=kv_group,
@@ -3573,18 +3744,72 @@ class AscendLMCacheEngine(LMCacheEngine):
                     end,
                 )
                 continue
-            kv_shape_single_layer = self.gpu_connector.get_shape(
-                num_tokens, kv_group=kv_group
-            )
-            memory_format = self._memory_format_for_kv_group(kv_group)
+            pending_chunks.append((start, end, key, keys_multi_layer))
 
-            memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                kv_shape_single_layer,
-                kv_dtype,
-                batch_size=self.num_layers,
-                fmt=memory_format,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
+        page_batch = None
+        if pending_chunks and page_store:
+            assert local is not None and page_shape is not None
+            page_batch = local.batched_allocate_layer_pages(
+                [page_shape],
+                [kv_dtype],
+                len(pending_chunks),
+                self.num_layers,
+                memory_format,
+                busy_loop=False,
+                valid_tokens=[end - start for start, end, _, _ in pending_chunks],
+                full_tokens=int(self.config.chunk_size),
+                eviction=False,
             )
+            if page_batch is not None and len(page_batch) != len(pending_chunks):
+                for page in page_batch:
+                    page.ref_count_down()
+                raise RuntimeError("Layer-page allocation returned wrong page count")
+
+        legacy_suffix = False
+        for chunk_index, (start, end, key, keys_multi_layer) in enumerate(
+            pending_chunks
+        ):
+            num_tokens = end - start
+            kv_shape_single_layer = (
+                page_shape
+                if page_batch is not None
+                else self.gpu_connector.get_shape(num_tokens, kv_group=kv_group)
+            )
+            memory_objs_multi_layer = (
+                [page_batch[chunk_index]] * self.num_layers
+                if page_batch is not None
+                else None
+            )
+            if memory_objs_multi_layer is None and page_store and not legacy_suffix:
+                assert local is not None and page_shape is not None
+                page = local.batched_allocate_layer_pages(
+                    [page_shape],
+                    [kv_dtype],
+                    1,
+                    self.num_layers,
+                    memory_format,
+                    busy_loop=force_store_wait,
+                    valid_tokens=num_tokens,
+                    full_tokens=int(self.config.chunk_size),
+                )
+                if page is not None:
+                    if len(page) != 1:
+                        for item in page:
+                            item.ref_count_down()
+                        raise RuntimeError(
+                            "Layer-page allocation returned wrong page count"
+                        )
+                    memory_objs_multi_layer = [page[0]] * self.num_layers
+                else:
+                    legacy_suffix = True
+            if memory_objs_multi_layer is None:
+                memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    batch_size=self.num_layers,
+                    fmt=memory_format,
+                    busy_loop=force_store_wait,
+                )
 
             if memory_objs_multi_layer is None:
                 logger.warning(
@@ -3724,7 +3949,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             # Calculate total KV size for logging
             tot_kv_size = sum(
-                mo.get_size() for layer_objs in memory_objs for mo in layer_objs
+                obj.get_size() for obj in pending_store_release.values()
             )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
@@ -3784,7 +4009,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cache_chunk_indices == list(range(len(starts)))
                 )
                 use_group_store = (
-                    bool(kwargs.get("decode_window_save"))
+                    bool(
+                        kwargs.get("decode_window_save")
+                        or kwargs.get("all_layers_ready")
+                    )
                     and callable(group_store)
                     and callable(supports_group_store)
                     and supports_group_store(kv_group)
@@ -3793,9 +4021,27 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if use_group_store:
                     for _ in range(self.num_layers):
                         yield
+                    group_started = (
+                        cold_start_perf_now()
+                        if cold_start_perf_enabled()
+                        else None
+                    )
                     host_pointer_rows, layer_chunk_ptrs_npu = group_store(
                         memory_objs, starts, ends, **kwargs
                     )
+                    if group_started is not None:
+                        cold_start_perf_log(
+                            logger,
+                            "npu_group_submit_cpu",
+                            started=group_started,
+                            req_id=req_id,
+                            kv_group=kv_group,
+                            chunks=len(starts),
+                            tokens=sum(
+                                end - start
+                                for start, end in zip(starts, ends, strict=True)
+                            ),
+                        )
                     self._append_group_store_tensors(
                         memory_objs,
                         cached_tensors,
@@ -3846,19 +4092,72 @@ class AscendLMCacheEngine(LMCacheEngine):
                             pending_store_release.pop(id(mem_obj), None)
 
                 if page_first_store:
-                    flattened_keys = [key for layer_keys in keys for key in layer_keys]
-                    flattened_memory_objs = [
-                        obj for layer_objs in memory_objs for obj in layer_objs
-                    ]
-                    required_futures = self.storage_manager.batched_put(
-                        flattened_keys,
-                        flattened_memory_objs,
-                        location=self.store_location,
-                    )
+                    if page_store:
+                        page_indices = [
+                            index
+                            for index, obj in enumerate(memory_objs[0])
+                            if isinstance(obj, LayerPageMemoryObj)
+                        ]
+                        legacy_indices = [
+                            index
+                            for index, obj in enumerate(memory_objs[0])
+                            if not isinstance(obj, LayerPageMemoryObj)
+                        ]
+                        required_futures = []
+                        submitted_objs = []
+                        if page_indices:
+                            layer_pages = [
+                                memory_objs[0][index] for index in page_indices
+                            ]
+                            required_futures.extend(
+                                self.storage_manager.batched_put_layer_pages(
+                                    [
+                                        keys[0][index].without_layer()
+                                        for index in page_indices
+                                    ],
+                                    layer_pages,
+                                    location=self.store_location,
+                                    req_id=req_id,
+                                )
+                            )
+                            submitted_objs.extend(layer_pages)
+                            for page in layer_pages:
+                                pending_store_release.pop(id(page), None)
+                        if legacy_indices:
+                            legacy_keys = [
+                                layer_keys[index]
+                                for layer_keys in keys
+                                for index in legacy_indices
+                            ]
+                            legacy_objs = [
+                                layer_objs[index]
+                                for layer_objs in memory_objs
+                                for index in legacy_indices
+                            ]
+                            required_futures.extend(
+                                self.storage_manager.batched_put(
+                                    legacy_keys,
+                                    legacy_objs,
+                                    location=self.store_location,
+                                )
+                            )
+                            submitted_objs.extend(legacy_objs)
+                    else:
+                        flattened_keys = [
+                            key for layer_keys in keys for key in layer_keys
+                        ]
+                        submitted_objs = [
+                            obj for layer_objs in memory_objs for obj in layer_objs
+                        ]
+                        required_futures = self.storage_manager.batched_put(
+                            flattened_keys,
+                            submitted_objs,
+                            location=self.store_location,
+                        )
                     self._track_sync_store_futures(
                         required_futures, require_completion=True
                     )
-                    for mem_obj in flattened_memory_objs:
+                    for mem_obj in submitted_objs:
                         pending_store_release.pop(id(mem_obj), None)
 
                 tot_time = time.perf_counter() - t_start
@@ -4678,16 +4977,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             layer_keys[cached_prefix_chunks:]
             for layer_keys in retrieve_keys
         ]
-        direct_group1_load = False
-        if (
-            kv_group == 1
-            and not shared_sparse_retrieve
+        direct_group1_pages = bool(
+            direct_external_pages
             and not use_cached_retrieve
             and cached_prefix_chunks == 0
             and mooncake_layer_pages_enabled(self.config)
             and missing_keys
+            and missing_keys[0]
             and all(len(layer) == len(missing_keys[0]) for layer in missing_keys)
-        ):
+        )
+        direct_group1_load = False
+        if direct_group1_pages:
             direct_group1_load = self._try_direct_indexer_page_load(
                 req_id=kwargs.get("req_id", "unspecified"),
                 keys_layer_major=missing_keys,
@@ -4739,14 +5039,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert_layerwise_gpu_connector(self.gpu_connector)
 
         get_generator = None
-        if (
-            not use_cached_retrieve
-            and not shared_sparse_retrieve
-            and not direct_group1_load
-        ):
-            get_generator = self.storage_manager.layerwise_batched_get(
-                missing_keys, location=location
-            )
 
         if cached_tensors_cover and cached_tensors is not None:
             kwargs["cached_tensors"] = cached_tensors
@@ -4860,6 +5152,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "source_message": request_preflight_state.get("message"),
                     "source_details": request_preflight_state.get("details"),
                 },
+            )
+
+        if direct_group1_pages and not direct_group1_load:
+            (
+                pre_resolved_shared_mem_layers,
+                layer_page_chunks,
+            ) = self._resolve_shared_rank0_layer_pages(
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                kv_group=kv_group,
+                keys_layer_major=missing_keys,
+                page_chunks=len(missing_keys[0]),
             )
 
         sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
@@ -5238,6 +5542,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                         record_request_preflight_error()
 
+        if (
+            not use_cached_retrieve
+            and not shared_sparse_retrieve
+            and not direct_group1_load
+            and pre_resolved_shared_mem_layers is None
+        ):
+            get_generator = self.storage_manager.layerwise_batched_get(
+                missing_keys, location=location
+            )
+
         if preflight_error_envelope is None and request_preflight_failed_elsewhere():
             release_pre_resolved_shared_mem_layers()
             release_local_prefix_layers()
@@ -5321,6 +5635,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         self._fence_shared_cpu_store_publication()
             except Exception as exc:
+                if not shared_sparse_retrieve:
+                    release_pre_resolved_shared_mem_layers()
+                    raise
                 message = (
                     "Shared CPU sparse all-layer pointer preflight failed "
                     "before handle publication."
@@ -5349,8 +5666,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         pending_pre_resolved_release: List[MemoryObj] = []
         if (
-            shared_sparse_retrieve
-            and pre_resolved_shared_mem_layers is not None
+            pre_resolved_shared_mem_layers is not None
             and not use_cached_retrieve
         ):
             pending_pre_resolved_release = list(
@@ -5518,8 +5834,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 elif use_cached_retrieve:
                     mem_objs_layer = []
                 else:
-                    if shared_sparse_retrieve:
-                        assert pre_resolved_shared_mem_layers is not None
+                    if pre_resolved_shared_mem_layers is not None:
                         mem_objs_layer = pre_resolved_shared_mem_layers[layer_id]
                     else:
                         assert get_generator is not None

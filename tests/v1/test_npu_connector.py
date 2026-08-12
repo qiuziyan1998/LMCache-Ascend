@@ -21,6 +21,7 @@ from lmcache_tests.v1.test_gpu_connector import (
 from lmcache_tests.v1.test_gpu_connector import (
     test_vllm_paged_connector_v2_to_gpu_bench as original_test_vllm_paged_connector_v2_to_gpu_bench,
 )
+from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     PreparedSparseSourceLayer,
@@ -53,6 +54,8 @@ def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=8,
+        full_tokens=8,
     )
     suffix = allocator.allocate(
         torch.Size([4]),
@@ -89,6 +92,8 @@ def test_layer_page_pointer_resolution_uses_selected_layer(monkeypatch) -> None:
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=8,
+        full_tokens=8,
     )
     assert pages is not None
     monkeypatch.setattr(lmc_ops, "get_device_ptr", lambda address: address + 7)
@@ -110,6 +115,8 @@ def test_layer_page_pointer_resolution_validates_registered_span(monkeypatch) ->
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=8,
+        full_tokens=8,
     )
     assert pages is not None
     calls = []
@@ -227,6 +234,77 @@ def test_direct_page_planner_preserves_layer_plane_run_order() -> None:
     )
     assert relative is not None
     assert relative[:2] == planned[:2]
+
+
+def test_direct_page_planner_reports_layout_rejection() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.DSA_INDEX,
+        k_hidden_dims=0,
+        v_hidden_dims=0,
+        dsa_hidden_dims=2,
+    )
+    connector._group_layouts = {1: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    unsupported = [(torch.empty((4, 2), dtype=torch.float16),)]
+
+    assert (
+        connector.plan_direct_page_sources(
+            unsupported, torch.arange(4), [0], [4], kv_group=1
+        )
+        is None
+    )
+    assert connector.direct_page_plan_rejection(1) == "unsupported_tensor_layout"
+
+
+def test_direct_page_planner_rejects_ragged_layer_planes() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.MLA_LATENT,
+    )
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    tensor = torch.empty((2, 2, 1, 2), dtype=torch.float16)
+
+    assert not connector.direct_page_layout_supported(
+        [(tensor, tensor, tensor), (tensor,)], 0
+    )
+    assert connector.direct_page_plan_rejection(0) == "owner_layout_mismatch"
+
+
+def test_direct_store_preflight_rejects_metadata_byte_mismatch() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.DSA_INDEX,
+    )
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    connector.get_shape = lambda *_args, **_kwargs: torch.Size([3])
+    tensor = torch.empty((2, 2, 1, 2), dtype=torch.float16)
+
+    assert not connector.direct_page_layout_supported([(tensor,)], 1)
+    assert connector.direct_page_plan_rejection(1) == "page_byte_layout_mismatch"
+
+
+def test_direct_store_preflight_checks_each_group_layout_once() -> None:
+    calls = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.gpu_connector = SimpleNamespace(
+        direct_page_layout_supported=lambda caches, group: (
+            calls.append((caches, group)) or True
+        )
+    )
+
+    supported = engine.direct_prefill_plan_supported(
+        {0: ["latent"], 1: ["index"]},
+    )
+
+    assert supported is True
+    assert calls == [
+        (["latent"], 0),
+        (["index"], 1),
+    ]
 
 
 @pytest.mark.parametrize("slots", ([0, 1, 2, 3], [0, 1, 4]))
@@ -592,6 +670,89 @@ def test_direct_retry_rejects_unverified_gap_before_window() -> None:
 
     with pytest.raises(RuntimeError, match="unverified prefix gap"):
         engine.wait_for_direct_stores(("request",))
+
+
+def test_completed_layerwise_store_seeds_direct_progress() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine._direct_store_states = {}
+    result = LayerwiseStoreResult(
+        request_id="request",
+        kv_group=1,
+        starts=[0, 2, 4],
+        ends=[2, 4, 5],
+        keys=[
+            [
+                CacheEngineKey("model", 1, 0, 11, torch.float16, kv_group=1),
+                CacheEngineKey("model", 1, 0, 22, torch.float16, kv_group=1),
+                CacheEngineKey("model", 1, 0, 33, torch.float16, kv_group=1),
+            ]
+        ],
+        committed_end=5,
+    )
+
+    engine.adopt_completed_layerwise_store(result)
+
+    state = engine._direct_store_states["request"]
+    assert state.submitted_end == {1: 5}
+    assert state.committed_end == {1: 5}
+    assert (state.planned_end, state.planned_hash) == (4, 22)
+
+
+def test_adopted_layerwise_prefix_skips_direct_rehash() -> None:
+    class _TokenDatabase:
+        def process_tokens(self, **kwargs):
+            raise AssertionError("completed prefix must not be rehashed")
+
+        def process_tokens_from_prefix(self, *args, **kwargs):
+            raise AssertionError("completed prefix must not be rehashed")
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine.token_database = _TokenDatabase()
+    state = ascend_cache_engine._DirectStoreRequestState(
+        submitted_end={0: 4, 1: 4},
+        committed_end={0: 4, 1: 4},
+    )
+
+    plans = engine._direct_suffix_plans(
+        state, [1, 2, 3, 4], (0, 1), None
+    )
+
+    assert plans == {0: [], 1: []}
+
+
+def test_completed_layerwise_groups_require_matching_hash_frontier() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine._direct_store_states = {}
+
+    for group, chunk_hash in ((0, 11), (1, 12)):
+        result = LayerwiseStoreResult(
+            request_id="request",
+            kv_group=group,
+            starts=[0],
+            ends=[2],
+            keys=[
+                [
+                    CacheEngineKey(
+                        "model",
+                        1,
+                        0,
+                        chunk_hash,
+                        torch.float16,
+                        kv_group=group,
+                    )
+                ]
+            ],
+            committed_end=2,
+        )
+        if group == 0:
+            engine.adopt_completed_layerwise_store(result)
+        else:
+            with pytest.raises(RuntimeError, match="hash frontier"):
+                engine.adopt_completed_layerwise_store(result)
+    assert engine._direct_store_states["request"].committed_end == {0: 2}
 
 
 def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
@@ -1087,6 +1248,26 @@ def test_direct_cpu_fallback_rejects_unaddressable_prefix() -> None:
         )
 
 
+def test_direct_cpu_fallback_uses_all_layer_transfer() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    calls = []
+
+    def store_layer(_tokens, **kwargs):
+        calls.append(kwargs)
+        yield LayerwiseStoreResult(request_id="request", committed_end=4)
+
+    engine.store_layer = store_layer
+    engine.wait_for_pending_sync_stores = lambda: None
+    engine._require_store_completion = False
+
+    committed = engine._store_direct_cpu_group(
+        "request", [0] * 4, [object()], torch.arange(4), 1, 0, None
+    )
+
+    assert committed == 4
+    assert calls[0]["all_layers_ready"] is True
+
+
 def _make_layer_page_sources():
     allocator = TensorMemoryAllocator(torch.zeros(32768, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
@@ -1095,6 +1276,8 @@ def _make_layer_page_sources():
         batch_size=2,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=2,
+        full_tokens=2,
     )
     suffix = [
         allocator.allocate(
@@ -1147,6 +1330,48 @@ def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
     assert tensor_calls == 1
     for obj in [*pages, *suffix]:
         obj.ref_count_down()
+
+
+def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(32768, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=[2, 1],
+        full_tokens=2,
+    )
+    assert pages is not None
+    sources = [
+        LayerPageSource(tuple(pages), layer_id) for layer_id in range(2)
+    ]
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    calls = []
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda page, *, layer_id, chunk_index, required_bytes, **_kwargs: (
+            calls.append((page, layer_id, chunk_index, required_bytes))
+            or page.data_ptr
+        ),
+    )
+
+    host_rows = []
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, None)
+
+    assert calls == [
+        (page, 0, chunk_index, page.get_size())
+        for chunk_index, page in enumerate(pages)
+    ]
+    assert host_rows == [
+        [page.layer_data_ptr(layer_id) for page in pages]
+        for layer_id in range(2)
+    ]
+    for page in pages:
+        page.ref_count_down()
 
 
 def test_group_pointer_append_validates_complete_page_span(monkeypatch) -> None:
@@ -2316,6 +2541,8 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
         batch_size=1,
         num_layers=1,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=4,
+        full_tokens=4,
     )
     assert pages is not None
     page_gen = connector.batched_to_gpu_head_token_wise(

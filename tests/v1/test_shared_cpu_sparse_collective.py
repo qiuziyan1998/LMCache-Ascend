@@ -122,6 +122,97 @@ def test_cold_direct_indexer_failure_fences_before_cpu_fallback() -> None:
     assert calls == ["get", "record", ("consume", event)]
 
 
+def test_cold_direct_indexer_cpu_fallback_reuses_layer_pages(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "mooncake_layer_pages_enabled",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "mooncake_page_layout_enabled",
+        lambda _config: True,
+    )
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    page = _FakePinnedMemObj()
+    resolved = [[page], [page]]
+    resolve_calls = []
+    cached_memory_objs = []
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=True)
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine.storage_manager = SimpleNamespace(
+        layerwise_batched_get=lambda *_args, **_kwargs: pytest.fail(
+            "merged-page fallback must not enter legacy layerwise retrieval"
+        )
+    )
+    engine.gpu_connector = _FakeSparseConsumer()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: True
+    engine._has_retrieve_data_cache = lambda *_args: False
+    engine._retrieve_data_cache_covers = lambda *_args: False
+    def ensure_metadata(**kwargs):
+        kwargs["ret_mask"].fill_(True)
+        return (
+            "mixed",
+            [0],
+            [1],
+            [[layer_key] for layer_key in key.split_layers(2)],
+        )
+
+    engine._ensure_retrieve_chunk_metadata = ensure_metadata
+    engine._try_direct_indexer_page_load = lambda **_kwargs: False
+    engine._get_shared_config_value = lambda _name, default: default
+    engine._use_sampled_worker_retrieve = lambda _kv_group: True
+
+    def resolve_pages(**kwargs):
+        resolve_calls.append(kwargs)
+        return resolved, 1
+
+    engine._resolve_shared_rank0_layer_pages = resolve_pages
+
+    def append_group(sources, owners, *_args):
+        owners.extend([[*source.pages, *source.suffix] for source in sources])
+
+    engine._append_retrieve_group_cache = append_group
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kvcaches=[object(), object()],
+        slot_mapping=torch.tensor([0]),
+        direct_external_pages=True,
+        kv_group=1,
+        req_id="request",
+    )
+
+    next(retriever)
+    retriever.send(None)
+    result = retriever.send(None)
+    retriever.close()
+
+    assert result.tolist() == [True]
+    assert len(resolve_calls) == 1
+    assert resolve_calls[0]["page_chunks"] == 1
+    assert cached_memory_objs == resolved
+    assert page.release_count == 0
+    assert page.unpin_count == 0
+
+
 def test_rank0_partial_page_remains_one_layer_page_source(monkeypatch) -> None:
     key = CacheEngineKey("model", 1, 0, 7, torch.float16)
     keys = [[layer_key] for layer_key in key.split_layers(2)]
@@ -144,7 +235,7 @@ def test_rank0_partial_page_remains_one_layer_page_source(monkeypatch) -> None:
             requested_page_keys.extend(base_keys) or [page],
             1,
         ),
-        contains_any_exact=lambda layer_keys: False,
+        contains_all_exact=lambda layer_keys: False,
     )
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
@@ -184,7 +275,7 @@ def test_rank0_page_miss_expands_base_key_for_legacy_fallback() -> None:
     suffix = [[object()], [object()]]
     local = SimpleNamespace(
         batched_get_layer_page_prefix=lambda _keys: ([], 0),
-        contains_any_exact=lambda _keys: False,
+        contains_all_exact=lambda _keys: False,
     )
     remote = SimpleNamespace(
         batched_contains_layer_pages=lambda _keys: 0,
@@ -222,6 +313,56 @@ def test_rank0_page_miss_expands_base_key_for_legacy_fallback() -> None:
         for layer in fallback_keys
         for key in layer
     )
+
+
+def test_partial_legacy_state_does_not_hide_remote_layer_page(monkeypatch) -> None:
+    page_key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    page = SimpleNamespace(
+        valid_tokens=4,
+        num_layers=2,
+        get_shape=lambda: torch.Size([4, 4]),
+    )
+    local = SimpleNamespace(
+        batched_get_layer_page_prefix=lambda _keys: ([], 0),
+        contains_all_exact=lambda _keys: False,
+    )
+    remote = SimpleNamespace(
+        batched_contains_layer_pages=lambda keys: len(keys),
+        batched_get_layer_pages=lambda _keys: [page],
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.storage_manager = SimpleNamespace(
+        storage_backends={"RemoteBackend": remote}
+    )
+    engine._shared_local_cpu_backend = lambda: local
+    engine._expected_shared_cpu_chunk_metadata = (
+        lambda **kwargs: (torch.Size([kwargs["num_tokens"], 4]), torch.float16, None)
+    )
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+    engine._resolve_shared_rank0_page_first_layers = lambda **kwargs: pytest.fail(
+        "a valid merged remote page must win over partial legacy state"
+    )
+    monkeypatch.setattr(
+        ascend_cache_engine.LayerPageMemoryObj,
+        "pin_many",
+        lambda pages: True,
+    )
+
+    resolved, page_chunks = engine._resolve_shared_rank0_layer_pages(
+        req_id="request",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[
+            [page_key.get_layer(0)],
+            [page_key.get_layer(1)],
+        ],
+        page_chunks=1,
+        base_page_keys=[page_key],
+    )
+
+    assert page_chunks == 1
+    assert resolved == [[page], [page]]
 
 
 def test_live_import_commit_adopts_page_without_releasing_request_owner() -> None:
@@ -833,7 +974,13 @@ def test_metadata_warm_data_hot_repopulates_stale_ret_mask():
     assert ret_mask.tolist() == [False, True, True]
 
 
-def test_sampled_metadata_build_skips_per_chunk_contains():
+@pytest.mark.parametrize(
+    ("direct_external_pages", "expected_location"),
+    [(False, "mixed"), (True, "RemoteBackend")],
+)
+def test_sampled_metadata_build_skips_per_chunk_contains(
+    direct_external_pages, expected_location
+):
     key = _make_key()
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
@@ -855,10 +1002,13 @@ def test_sampled_metadata_build_skips_per_chunk_contains():
         cached_starts=[],
         cached_ends=[],
         ret_mask=ret_mask,
-        retrieve_kwargs={"kv_group": 0},
+        retrieve_kwargs={
+            "kv_group": 1,
+            "direct_external_pages": direct_external_pages,
+        },
     )
 
-    assert location == "mixed"
+    assert location == expected_location
     assert starts == [0]
     assert ends == [1]
     assert keys == [[key.split_layers(2)[0]], [key.split_layers(2)[1]]]

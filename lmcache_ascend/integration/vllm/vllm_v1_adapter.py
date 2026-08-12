@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -67,6 +68,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             else False
         )
         self._direct_store_observed_layers: set[str] = set()
+        self._direct_store_step_supported: Optional[bool] = None
+        self._completed_layerwise_stores: dict[
+            tuple[str, int], LayerwiseStoreResult
+        ] = {}
         self._scheduler_live_sources: dict[str, list[dict[str, Any]]] = {}
         if self._direct_store_requested:
             extra = self.config.extra_config or {}
@@ -135,6 +140,45 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return None
         return requests
 
+    def _consume_completed_layerwise_store(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+        completed: bool,
+        result: Optional[LayerwiseStoreResult],
+    ) -> None:
+        super()._consume_completed_layerwise_store(
+            request, kv_group, completed, result
+        )
+        if (
+            self._direct_store_requested
+            and completed
+            and result is not None
+            and result.committed_end > 0
+        ):
+            self._completed_layerwise_stores[(request.req_id, kv_group)] = result
+
+    def _abort_save_step(self, requests: Iterable[ReqMeta]) -> None:
+        requests = tuple(requests)
+        req_ids = {request.req_id for request in requests}
+        try:
+            super()._abort_save_step(requests)
+        finally:
+            self._direct_store_step_supported = None
+            self._direct_store_observed_layers.clear()
+            for key in list(self._completed_layerwise_stores):
+                if key[0] in req_ids:
+                    self._completed_layerwise_stores.pop(key, None)
+            if self.lmcache_engine is not None:
+                try:
+                    self.lmcache_engine.wait_for_direct_stores(req_ids)
+                except Exception:
+                    logger.exception(
+                        "Failed to drain direct stores while aborting %s",
+                        sorted(req_ids),
+                    )
+                self.lmcache_engine.drop_direct_store_states(req_ids)
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -153,6 +197,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if not expected:
             super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
             return
+        if self._direct_store_step_supported is None:
+            self._direct_store_step_supported = self._preflight_direct_store(
+                requests
+            )
+        if not self._direct_store_step_supported:
+            super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+            return
         if layer_name in expected:
             if layer_name in self._direct_store_observed_layers:
                 self._direct_store_observed_layers.clear()
@@ -163,45 +214,75 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._submit_direct_prefill_requests(requests)
         self._direct_store_observed_layers.clear()
 
-    def _submit_direct_prefill_requests(self, requests: list[ReqMeta]) -> None:
-        """Submit direct pages; also used by the wait-for-save fallback."""
-        assert self.lmcache_engine is not None
+    def _direct_group_caches(self) -> dict[int, list]:
         self._refresh_kvcaches_list()
-        group_caches = {0: self._kvcaches_for_group(0)}
+        groups = {0: self._kvcaches_for_group(0)}
         if self.config.dsa_two_groups:
-            group_caches[1] = self._kvcaches_for_group(1)
-        group_caches = {
-            group: caches for group, caches in group_caches.items() if caches
+            groups[1] = self._kvcaches_for_group(1)
+        return {group: caches for group, caches in groups.items() if caches}
+
+    def _direct_selected_groups(
+        self, request: ReqMeta, group_caches: dict[int, list]
+    ) -> dict[int, list]:
+        selected = dict(group_caches)
+        save_spec = request.save_spec
+        if save_spec is not None and self.config.dsa_two_groups:
+            if not save_spec.can_save_latent:
+                selected.pop(0, None)
+            if not save_spec.can_save_indexer:
+                selected.pop(1, None)
+        return selected
+
+    def _direct_request_inputs(
+        self, request: ReqMeta, group_caches: dict[int, list]
+    ) -> tuple[dict[int, list], dict[int, torch.Tensor], int]:
+        mapping_base = int(getattr(request, "save_slot_mapping_base", 0) or 0)
+        selected = self._direct_selected_groups(request, group_caches)
+        slot_mappings = {
+            group: self._windowed_sparse_save_mapping(request, group, mapping_base)
+            for group in selected
         }
-        for request in requests:
-            mapping_base = int(
-                getattr(request, "save_slot_mapping_base", 0) or 0
-            )
-            selected = dict(group_caches)
-            save_spec = request.save_spec
-            if save_spec is not None and self.config.dsa_two_groups:
-                if not save_spec.can_save_latent:
-                    selected.pop(0, None)
-                if not save_spec.can_save_indexer:
-                    selected.pop(1, None)
-            if not selected:
-                continue
+        if any(mapping is None for mapping in slot_mappings.values()):
+            mapping_base = 0
             slot_mappings = {
-                group: self._windowed_sparse_save_mapping(
-                    request, group, mapping_base
+                group: (
+                    request.indexer_slot_mapping[0]
+                    if group
+                    else request.slot_mapping[0]
                 )
                 for group in selected
             }
-            if any(mapping is None for mapping in slot_mappings.values()):
-                mapping_base = 0
-                slot_mappings = {
-                    group: (
-                        request.indexer_slot_mapping[0]
-                        if group
-                        else request.slot_mapping[0]
-                    )
-                    for group in selected
-                }
+        return selected, slot_mappings, mapping_base
+
+    def _preflight_direct_store(self, requests: list[ReqMeta]) -> bool:
+        assert self.lmcache_engine is not None
+        group_caches = self._direct_group_caches()
+        selected_groups = {
+            group
+            for request in requests
+            for group in self._direct_selected_groups(request, group_caches)
+        }
+        selected = {
+            group: group_caches[group] for group in sorted(selected_groups)
+        }
+        return not selected or self.lmcache_engine.direct_prefill_plan_supported(
+            selected
+        )
+
+    def _submit_direct_prefill_requests(
+        self,
+        requests: list[ReqMeta],
+        adopted_requests: Optional[set[str]] = None,
+    ) -> None:
+        """Submit direct pages; also used by the wait-for-save fallback."""
+        assert self.lmcache_engine is not None
+        group_caches = self._direct_group_caches()
+        for request in requests:
+            selected, slot_mappings, mapping_base = self._direct_request_inputs(
+                request, group_caches
+            )
+            if not selected:
+                continue
             load_spec = getattr(request, "load_spec", None)
             committed_prefix = getattr(load_spec, "dsa_committed_end", None)
             if committed_prefix is None:
@@ -215,6 +296,22 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 self.lmcache_engine.begin_live_source_descriptor(request.req_id)
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
             if direct_store:
+                if (
+                    live_source
+                    and adopted_requests is not None
+                    and request.req_id in adopted_requests
+                ):
+                    # The persistent write reused below has no missing direct
+                    # pages from which to build a live source descriptor.
+                    self.lmcache_engine.capture_live_source_step(
+                        request.req_id,
+                        request.token_ids,
+                        selected,
+                        slot_mappings,
+                        request.request_configs,
+                        mapping_base,
+                        request.is_last_prefill,
+                    )
                 self.lmcache_engine.store_direct_prefill(
                     request.req_id,
                     request.token_ids,
@@ -312,19 +409,27 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         }
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        self._direct_store_step_supported = None
+        self._direct_store_observed_layers.clear()
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
-            self.lmcache_engine.wait_for_pending_sync_stores()
+            try:
+                self.lmcache_engine.wait_for_pending_sync_stores()
+            finally:
+                completed = self._completed_layerwise_stores
+                self._completed_layerwise_stores = {}
             requests = self._direct_prefill_requests() or []
+            request_ids = {request.req_id for request in requests}
+            adopted_requests = set()
+            for (req_id, _), result in completed.items():
+                if req_id in request_ids:
+                    self.lmcache_engine.adopt_completed_layerwise_store(result)
+                    adopted_requests.add(req_id)
             if requests:
-                # Layer callbacks are not guaranteed to cover every registered
-                # cache in each chunked-prefill forward. Engine submission is
-                # incremental and idempotent, so fence every window here.
-                self._submit_direct_prefill_requests(requests)
-            final_requests = [
-                request for request in requests if request.is_last_prefill
-            ]
+                # Reuse completed layerwise progress before fencing a window
+                # whose callbacks did not cover every registered cache.
+                self._submit_direct_prefill_requests(requests, adopted_requests)
             final_ids = {
-                request.req_id for request in final_requests
+                request.req_id for request in requests if request.is_last_prefill
             }
             if final_ids:
                 self.lmcache_engine.wait_for_direct_stores(final_ids)

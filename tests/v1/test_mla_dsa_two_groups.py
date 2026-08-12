@@ -25,7 +25,11 @@ import torch
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryFormat
+from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
+    MemoryFormat,
+    TensorMemoryAllocator,
+)
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 # Local
@@ -483,6 +487,58 @@ def test_group_store_pointer_table_is_published_without_per_layer_copy() -> None
     assert torch.equal(cached_chunk_ptrs_npu[1], pointer_table[1])
 
 
+def test_group_store_page_publication_reuses_pointer_table_without_views() -> None:
+    page = MagicMock(spec=LayerPageMemoryObj)
+    memory_objs = [[page], [page]]
+    cached_tensors = [[], []]
+    cached_chunk_dev_ptrs: list[list[int]] = []
+    cached_chunk_ptrs_npu: list[torch.Tensor | None] = []
+    pointer_table = torch.tensor([[101], [202]], dtype=torch.long)
+
+    AscendLMCacheEngine._append_group_store_tensors(
+        SimpleNamespace(),
+        memory_objs,
+        cached_tensors,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+        [[101], [202]],
+        pointer_table,
+    )
+
+    assert cached_tensors == [[], []]
+    page.layer_tensor.assert_not_called()
+    assert cached_chunk_dev_ptrs == [[101], [202]]
+
+
+def test_retrieve_fallback_selects_page_layer_view() -> None:
+    tensor = torch.tensor([2])
+    page = MagicMock(spec=LayerPageMemoryObj)
+    page.layer_tensor.return_value = tensor
+    cached_memory_objs: list[list] = []
+    cached_tensors: list[list] = []
+    engine = SimpleNamespace(gpu_connector=SimpleNamespace(), num_layers=2)
+
+    AscendLMCacheEngine._append_retrieve_layer_cache(
+        engine,
+        1,
+        [page],
+        cached_memory_objs,
+        cached_tensors,
+        None,
+        None,
+    )
+
+    page.layer_tensor.assert_called_once_with(1)
+    assert cached_tensors[1] == [tensor]
+
+
+def test_layer_cache_publication_rejects_missing_tensor() -> None:
+    with pytest.raises(ValueError, match="Layerwise cache source has no tensor"):
+        AscendLMCacheEngine._layer_memory_tensor(
+            SimpleNamespace(tensor=None), 0
+        )
+
+
 class TestAscendStoreLayerCompletion:
     @staticmethod
     def _engine(*, stored: bool, allocation=None):
@@ -522,6 +578,207 @@ class TestAscendStoreLayerCompletion:
         result = list(AscendLMCacheEngine.store_layer(engine, [0] * 256))[-1]
 
         assert result.committed_end == 0
+
+    def test_layer_page_batch_failure_retries_pages_before_legacy(self):
+        engine = self._engine(stored=False)
+        engine.config.chunk_size = 256
+        engine.storage_manager.supports_batched_put_layer_pages.return_value = True
+        engine.storage_manager.batched_put_layer_pages.return_value = []
+        engine._shared_cpu_dtype_for_kv_group.return_value = torch.float16
+        engine._memory_format_for_kv_group.return_value = (
+            MemoryFormat.KV_DSA_INDEX_FMT
+        )
+        engine.gpu_connector.get_shape.return_value = torch.Size([256])
+        key = CacheEngineKey("model", 1, 0, 0, torch.float16, kv_group=1)
+        engine.token_database.process_tokens.return_value = iter(((0, 256, key),))
+        pages = TensorMemoryAllocator(
+            torch.zeros(4096, dtype=torch.uint8)
+        ).batched_allocate_layer_pages(
+            torch.Size([256]),
+            torch.float16,
+            batch_size=1,
+            num_layers=1,
+            fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+            valid_tokens=256,
+            full_tokens=256,
+        )
+        assert pages is not None
+        local = engine._shared_local_cpu_backend.return_value
+        local.batched_allocate_layer_pages.side_effect = [None, pages]
+
+        def transfer():
+            yield
+            yield
+
+        engine.gpu_connector.batched_from_gpu.return_value = transfer()
+        with (
+            patch(
+                "lmcache_ascend.v1.cache_engine.assert_layerwise_gpu_connector"
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_layer_pages_enabled",
+                return_value=True,
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_page_layout_enabled",
+                return_value=True,
+            ),
+        ):
+            result = list(
+                AscendLMCacheEngine.store_layer(engine, [0] * 256, kv_group=1)
+            )[-1]
+
+        assert result.committed_end == 256
+        allocations = local.batched_allocate_layer_pages.call_args_list
+        assert len(allocations) == 2
+        assert allocations[0].kwargs[
+            "eviction"
+        ] is False
+        assert "eviction" not in allocations[1].kwargs
+        engine.storage_manager.batched_allocate.assert_not_called()
+        engine.storage_manager.batched_put_layer_pages.assert_called_once()
+        pages[0].ref_count_down()
+
+    def test_layer_pages_allocate_full_chunks_and_tail_in_one_batch(self):
+        engine = self._engine(stored=False)
+        engine.config.chunk_size = 256
+        engine.storage_manager.supports_batched_put_layer_pages.return_value = True
+        engine.storage_manager.batched_put_layer_pages.return_value = []
+        engine._shared_cpu_dtype_for_kv_group.return_value = torch.float16
+        engine._memory_format_for_kv_group.return_value = (
+            MemoryFormat.KV_DSA_INDEX_FMT
+        )
+        engine.gpu_connector.get_shape.return_value = torch.Size([256])
+        keys = [
+            CacheEngineKey("model", 1, 0, index, torch.float16, kv_group=1)
+            for index in range(2)
+        ]
+        engine.token_database.process_tokens.return_value = iter(
+            ((0, 256, keys[0]), (256, 300, keys[1]))
+        )
+        pages = TensorMemoryAllocator(
+            torch.zeros(8192, dtype=torch.uint8)
+        ).batched_allocate_layer_pages(
+            torch.Size([256]),
+            torch.float16,
+            batch_size=2,
+            num_layers=1,
+            fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+            valid_tokens=[256, 44],
+            full_tokens=256,
+        )
+        assert pages is not None
+        local = engine._shared_local_cpu_backend.return_value
+        local.batched_allocate_layer_pages.return_value = pages
+
+        def transfer():
+            yield
+            yield
+
+        engine.gpu_connector.batched_from_gpu.return_value = transfer()
+        with (
+            patch(
+                "lmcache_ascend.v1.cache_engine.assert_layerwise_gpu_connector"
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_layer_pages_enabled",
+                return_value=True,
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_page_layout_enabled",
+                return_value=True,
+            ),
+        ):
+            result = list(
+                AscendLMCacheEngine.store_layer(engine, [0] * 300, kv_group=1)
+            )[-1]
+
+        assert result.committed_end == 300
+        allocation = local.batched_allocate_layer_pages.call_args
+        assert allocation.args[2] == 2
+        assert allocation.kwargs["valid_tokens"] == [256, 44]
+        engine.storage_manager.batched_allocate.assert_not_called()
+        engine.storage_manager.batched_put_layer_pages.assert_called_once()
+        for page in pages:
+            page.ref_count_down()
+
+    def test_page_allocation_failure_keeps_legacy_suffix(self):
+        engine = self._engine(stored=False)
+        engine.config.chunk_size = 256
+        engine.storage_manager.supports_batched_put_layer_pages.return_value = True
+        engine.storage_manager.batched_put_layer_pages.return_value = []
+        engine.storage_manager.batched_put.return_value = []
+        engine._shared_cpu_dtype_for_kv_group.return_value = torch.float16
+        engine._memory_format_for_kv_group.return_value = (
+            MemoryFormat.KV_DSA_INDEX_FMT
+        )
+        engine.gpu_connector.get_shape.return_value = torch.Size([256])
+        keys = [
+            CacheEngineKey("model", 1, 0, index, torch.float16, kv_group=1)
+            for index in range(3)
+        ]
+        engine.token_database.process_tokens.return_value = iter(
+            ((0, 256, keys[0]), (256, 512, keys[1]), (512, 600, keys[2]))
+        )
+        pages = TensorMemoryAllocator(
+            torch.zeros(4096, dtype=torch.uint8)
+        ).batched_allocate_layer_pages(
+            torch.Size([256]),
+            torch.float16,
+            batch_size=1,
+            num_layers=1,
+            fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+            valid_tokens=256,
+            full_tokens=256,
+        )
+        assert pages is not None
+        local = engine._shared_local_cpu_backend.return_value
+        local.batched_allocate_layer_pages.side_effect = [
+            None,
+            pages,
+            None,
+        ]
+        legacy = [MagicMock(), MagicMock()]
+        for memory_obj in legacy:
+            memory_obj.get_size.return_value = 1
+            memory_obj.tensor = torch.empty(1)
+        engine.storage_manager.batched_allocate.side_effect = (
+            [memory_obj] for memory_obj in legacy
+        )
+
+        def transfer():
+            yield
+            yield
+
+        engine.gpu_connector.batched_from_gpu.return_value = transfer()
+        with (
+            patch(
+                "lmcache_ascend.v1.cache_engine.assert_layerwise_gpu_connector"
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_layer_pages_enabled",
+                return_value=True,
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_page_layout_enabled",
+                return_value=True,
+            ),
+        ):
+            result = list(
+                AscendLMCacheEngine.store_layer(engine, [0] * 600, kv_group=1)
+            )[-1]
+
+        assert result.committed_end == 600
+        page_keys, submitted_pages = (
+            engine.storage_manager.batched_put_layer_pages.call_args.args[:2]
+        )
+        assert page_keys == [keys[0]]
+        assert submitted_pages == pages
+        legacy_keys, legacy_objs = engine.storage_manager.batched_put.call_args.args[:2]
+        assert legacy_keys == [keys[1].get_layer(0), keys[2].get_layer(0)]
+        assert legacy_objs == legacy
+        for page in pages:
+            page.ref_count_down()
 
     def test_reports_32_prefix_16_suffix_frontier_as_committed(self):
         memory_obj = MagicMock()
@@ -589,6 +846,39 @@ class TestAscendStoreLayerCompletion:
                     [0] * 256,
                     decode_window_save=True,
                     windowed_sparse_save=True,
+                )
+            )
+
+        engine.gpu_connector.batched_from_gpu_group.assert_called_once()
+        engine.gpu_connector.batched_from_gpu.assert_not_called()
+
+    def test_all_layers_ready_tail_uses_group_store(self):
+        full_obj = MagicMock()
+        full_obj.get_size.return_value = 1
+        tail_obj = MagicMock()
+        tail_obj.get_size.return_value = 1
+        full_key = MagicMock(spec=CacheEngineKey)
+        full_key.split_layers.return_value = [full_key]
+        tail_key = MagicMock(spec=CacheEngineKey)
+        tail_key.split_layers.return_value = [tail_key]
+        engine = self._dispatch_engine(
+            [(0, 256, full_key, full_obj), (256, 300, tail_key, tail_obj)]
+        )
+
+        with (
+            patch(
+                "lmcache_ascend.v1.cache_engine.assert_layerwise_gpu_connector"
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine.mooncake_page_layout_enabled",
+                return_value=False,
+            ),
+        ):
+            list(
+                AscendLMCacheEngine.store_layer(
+                    engine,
+                    [0] * 300,
+                    all_layers_ready=True,
                 )
             )
 
@@ -682,6 +972,43 @@ def test_sparse_window_store_cache_publishes_only_full_chunks() -> None:
     assert len(cached_tensors) == 1
     assert len(cached_tensors[0]) == 1
     assert cached_tensors[0][0] is full_tensor
+
+
+def test_page_store_pointer_cache_does_not_rebuild_layer_views() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=2,
+        num_layers=1,
+        fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+        valid_tokens=8,
+        full_tokens=8,
+    )
+    assert pages is not None
+    pointer_sources = []
+    engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            append_sparse_chunk_ptr_cache_for_layer=(
+                lambda _layer, sources, *_cache: pointer_sources.extend(sources)
+            )
+        )
+    )
+    cached_tensors: list[list] = []
+
+    AscendLMCacheEngine._append_layer_store_tensors(
+        engine,
+        0,
+        [pages],
+        cached_tensors,
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+    )
+
+    assert pointer_sources == pages
+    assert cached_tensors == []
+    for page in pages:
+        page.ref_count_down()
 
 
 def test_full_chunk_successor_truncates_cached_partial_pointer_slot() -> None:
@@ -1366,6 +1693,8 @@ def _ascend_adapter_fake(**attrs):
     fake = object.__new__(LMCacheAscendConnectorV1Impl)
     fake._finished_req_ids_waiting_for_save = set()
     fake._late_finished_sending = set()
+    fake._direct_store_observed_layers = set()
+    fake._direct_store_step_supported = None
     for name, value in attrs.items():
         setattr(fake, name, value)
     return fake
@@ -1423,6 +1752,7 @@ def test_direct_prefill_uses_window_relative_save_mappings() -> None:
     calls = []
     mapping_calls = []
     engine = SimpleNamespace(
+        direct_prefill_store_enabled=lambda: True,
         store_direct_prefill=lambda *args, **kwargs: calls.append((args, kwargs))
     )
     adapter = SimpleNamespace(
@@ -1498,17 +1828,158 @@ def test_direct_prefill_uses_window_relative_save_mappings() -> None:
 
 def test_finish_save_batch_submits_nonfinal_direct_window() -> None:
     request = SimpleNamespace(req_id="request", is_last_prefill=False)
-    submissions = []
+    result = LayerwiseStoreResult(
+        request_id="request", committed_end=128
+    )
+    calls = []
     adapter = SimpleNamespace(
         kv_role="kv_both",
-        lmcache_engine=SimpleNamespace(wait_for_pending_sync_stores=lambda: None),
+        lmcache_engine=SimpleNamespace(
+            wait_for_pending_sync_stores=lambda: calls.append("wait"),
+            adopt_completed_layerwise_store=lambda adopted: calls.append(adopted),
+        ),
+        _completed_layerwise_stores={("request", 0): result},
+        _direct_store_observed_layers=set(),
         _direct_prefill_requests=lambda: [request],
-        _submit_direct_prefill_requests=lambda requests: submissions.extend(requests),
+        _submit_direct_prefill_requests=lambda requests, adopted: calls.append(
+            (requests, adopted)
+        ),
     )
 
     _ascend_adapter_method("_finish_save_batch")(adapter, {})
 
-    assert submissions == [request]
+    assert calls == ["wait", result, ([request], {"request"})]
+    assert adapter._completed_layerwise_stores == {}
+
+
+def test_finish_save_batch_discards_adoption_after_store_failure() -> None:
+    def fail_wait():
+        raise RuntimeError("store failed")
+
+    adapter = SimpleNamespace(
+        kv_role="kv_both",
+        lmcache_engine=SimpleNamespace(
+            wait_for_pending_sync_stores=fail_wait
+        ),
+        _completed_layerwise_stores={
+            ("request", 0): LayerwiseStoreResult(
+                request_id="request", committed_end=128
+            )
+        },
+        _direct_store_observed_layers=set(),
+    )
+
+    with pytest.raises(RuntimeError, match="store failed"):
+        _ascend_adapter_method("_finish_save_batch")(adapter, {})
+
+    assert adapter._completed_layerwise_stores == {}
+
+
+def test_abort_save_step_drops_only_failed_direct_state(monkeypatch) -> None:
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    parent_calls = []
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "_abort_save_step",
+        lambda _self, requests: parent_calls.append(tuple(requests)),
+    )
+    engine_calls = []
+    adapter = _ascend_adapter_fake(
+        _completed_layerwise_stores={
+            ("failed", 0): object(),
+            ("failed", 1): object(),
+            ("other", 0): object(),
+        },
+        lmcache_engine=SimpleNamespace(
+            wait_for_direct_stores=lambda req_ids: engine_calls.append(
+                ("wait", set(req_ids))
+            ),
+            drop_direct_store_states=lambda req_ids: engine_calls.append(
+                ("drop", set(req_ids))
+            ),
+        ),
+    )
+    request = SimpleNamespace(req_id="failed")
+
+    adapter._abort_save_step((request,))
+
+    assert parent_calls == [(request,)]
+    assert set(adapter._completed_layerwise_stores) == {("other", 0)}
+    assert engine_calls == [
+        ("wait", {"failed"}),
+        ("drop", {"failed"}),
+    ]
+
+
+def test_adopted_direct_store_still_captures_live_source() -> None:
+    calls = []
+    engine = SimpleNamespace(
+        begin_live_source_descriptor=lambda req_id: calls.append(("begin", req_id)),
+        direct_prefill_store_enabled=lambda: True,
+        capture_live_source_step=lambda *args: calls.append(("capture", args[0])),
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            ("store", args[0])
+        ),
+    )
+    adapter = SimpleNamespace(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _refresh_kvcaches_list=lambda: None,
+        _kvcaches_for_group=lambda group: [f"cache-{group}"],
+        _windowed_sparse_save_mapping=lambda request, group, base: (
+            request.indexer_slot_mapping[0]
+            if group
+            else request.slot_mapping[0]
+        ),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=list(range(4)),
+        slot_mapping=["latent"],
+        indexer_slot_mapping=["index"],
+        save_slot_mapping_base=0,
+        save_spec=None,
+        request_configs=None,
+        load_spec=None,
+        live_source_requested=True,
+        is_last_prefill=False,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request], {"request"}
+    )
+
+    assert calls == [
+        ("begin", "request"),
+        ("capture", "request"),
+        ("store", "request"),
+    ]
+
+
+def test_failed_direct_preflight_uses_overlapped_layerwise_store(monkeypatch) -> None:
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    calls = []
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "save_kv_layer",
+        lambda _self, layer, *_args, **_kwargs: calls.append(layer),
+    )
+    request = SimpleNamespace(req_id="request")
+    adapter = _ascend_adapter_fake(
+        _direct_prefill_requests=lambda: [request],
+        _preflight_direct_store=lambda _requests: False,
+        _latent_layer_names=["layer.0"],
+        _indexer_layer_names=[],
+        config=SimpleNamespace(dsa_two_groups=False),
+    )
+
+    adapter.save_kv_layer("layer.0", None, None)
+
+    assert calls == ["layer.0"]
+    assert adapter._direct_store_step_supported is False
 
 
 class TestAdapterGroupSplit:
