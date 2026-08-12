@@ -1042,11 +1042,11 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
         direction=True,
     )
 
-    assert len(prepared) == 3
+    assert len(prepared) == 2
     assert len(fast_calls) == 3
     assert fast_calls[0][0][0] is prepared[0]
     assert fast_calls[1][0][0] is prepared[1]
-    assert fast_calls[2][0][0] is prepared[2]
+    assert fast_calls[2][0][0] is prepared[1]
     assert fast_calls[0][0][7] is False
     assert fast_calls[1][0][7] is True
     assert fast_calls[2][0][7] is True
@@ -2318,6 +2318,7 @@ def test_deferred_batched_from_gpu_rotates_mapping_and_reports_completion(
     connector.num_layers = 4
     connector.kvcaches = [object(), object(), object(), object()]
     connector.use_gpu = True
+    connector.kv_device = torch.device("cpu")
     connector.store_stream = _TrackingStream("store")
     compute_stream = _TrackingStream("compute")
     events = [
