@@ -1119,6 +1119,9 @@ class _RecordableTensor:
     def numel(self):
         return self._numel
 
+    def data_ptr(self):
+        return id(self)
+
     def record_stream(self, stream):
         self.recorded_streams.append(stream)
 

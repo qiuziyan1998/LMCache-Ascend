@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import deque
 from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import os
+import threading
+import time
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
@@ -121,6 +124,34 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
 _MTP_DW_DEEP_SEEN_LIMIT = 256
 _MTP_DW_CHECKSUM_LIMIT = 32
 _MTP_DW_UINT64_MASK = (1 << 64) - 1
+_DENSE_DIRECT_DIAG_RING_SIZE = 192
+_DENSE_DIRECT_DIAG_DUMP_BATCH_SIZE = 16
+_DENSE_DIRECT_DIAG_FIELDS = (
+    'seq',
+    'wall_time_ns',
+    'kv_group',
+    'layer_id',
+    'direction_to_cpu',
+    'total_tokens',
+    'slot_count',
+    'chunk_count',
+    'fixed_chunk_size',
+    'kernel',
+    'validate_inputs',
+    'thread_id',
+    'stream_object_id',
+    'stream_handle',
+    'slot_storage_ptr',
+    'chunk_ptrs_storage_ptr',
+    'offsets_storage_ptr',
+    'sizes_storage_ptr',
+    'pointer_source',
+    'source_device_ptr_count',
+    'source_device_ptr_min',
+    'source_device_ptr_max',
+    'source_device_ptr_checksum',
+    'destination_storage_ptrs',
+)
 
 
 def _bounded_stable_int_checksum(values: Any) -> int:
@@ -1553,12 +1584,191 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._direct_page_layout_cache: dict[
             int, tuple[tuple, list[tuple[int, int]]]
         ] = {}
+        self._dense_direct_diag = deque(maxlen=_DENSE_DIRECT_DIAG_RING_SIZE)
+        self._dense_direct_diag_seq = 0
+        self._dense_direct_diag_last_dumped_seq = -1
+        self._dense_direct_pointer_diag: dict[
+            tuple[int, int, int], tuple[int, int, int, int, int]
+        ] = {}
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
 
     def synchronize_dense_load_stream(self) -> None:
-        self.load_stream.synchronize()
+        try:
+            self.load_stream.synchronize()
+        except Exception as error:
+            try:
+                self._dump_dense_direct_diag(
+                    reason='dense_load_stream_synchronize_failed',
+                    error=error,
+                )
+            except Exception:
+                logger.exception(
+                    'Failed to dump dense-direct diagnostics; preserving the '
+                    'original stream synchronization error'
+                )
+            raise
+
+    @staticmethod
+    def _dense_direct_stream_handle(stream: Any) -> int:
+        for field in ('npu_stream', 'cuda_stream', 'stream_id'):
+            try:
+                value = getattr(stream, field)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    @classmethod
+    def _dense_direct_tensor_ptrs(cls, value: Any) -> list[int]:
+        if isinstance(value, torch.Tensor):
+            return [int(value.data_ptr())]
+        if isinstance(value, (list, tuple)):
+            pointers = []
+            for item in value:
+                pointers.extend(cls._dense_direct_tensor_ptrs(item))
+            return pointers
+        return []
+
+    def _remember_dense_direct_pointer_diag(
+        self,
+        *,
+        layer_id: int,
+        chunk_ptrs_npu: torch.Tensor,
+        source_device_ptrs: Optional[Sequence[int]],
+        pointer_source: int,
+    ) -> None:
+        pointer_diag = getattr(self, '_dense_direct_pointer_diag', None)
+        if pointer_diag is None:
+            pointer_diag = {}
+            self._dense_direct_pointer_diag = pointer_diag
+        source_ptr_values = tuple(
+            int(value) for value in (source_device_ptrs or ())
+        )
+        pointer_diag[
+            (threading.get_ident(), int(layer_id), int(chunk_ptrs_npu.data_ptr()))
+        ] = (
+            int(pointer_source),
+            len(source_ptr_values),
+            min(source_ptr_values, default=0),
+            max(source_ptr_values, default=0),
+            _bounded_stable_int_checksum(source_ptr_values),
+        )
+        if len(pointer_diag) > _DENSE_DIRECT_DIAG_RING_SIZE:
+            pointer_diag.pop(next(iter(pointer_diag)))
+
+    def _record_dense_direct_launch_diag(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        transfer_stream: Any,
+        slot_mapping_full: torch.Tensor,
+        chunk_ptrs_npu: torch.Tensor,
+        chunk_offsets_npu: torch.Tensor,
+        chunk_sizes_npu: torch.Tensor,
+        total_tokens: int,
+        fixed_chunk_size: int,
+        fast_path: bool,
+        validate_inputs: bool,
+        direction: bool,
+    ) -> None:
+        ring = getattr(self, '_dense_direct_diag', None)
+        if ring is None:
+            ring = deque(maxlen=_DENSE_DIRECT_DIAG_RING_SIZE)
+            self._dense_direct_diag = ring
+        seq = int(getattr(self, '_dense_direct_diag_seq', 0)) + 1
+        self._dense_direct_diag_seq = seq
+        pointer_diag = getattr(self, '_dense_direct_pointer_diag', {})
+        pointer_summary = pointer_diag.pop(
+            (
+                threading.get_ident(),
+                int(layer_id),
+                int(chunk_ptrs_npu.data_ptr()),
+            ),
+            (0, 0, 0, 0, 0),
+        )
+        destination_ptrs = self._dense_direct_tensor_ptrs(
+            kvcaches_ref[layer_id]
+        )
+        ring.append(
+            (
+                seq,
+                time.time_ns(),
+                int(kv_group),
+                int(layer_id),
+                int(direction),
+                int(total_tokens),
+                int(slot_mapping_full.numel()),
+                int(chunk_ptrs_npu.numel()),
+                int(fixed_chunk_size),
+                int(fast_path),
+                int(validate_inputs),
+                threading.get_ident(),
+                id(transfer_stream),
+                self._dense_direct_stream_handle(transfer_stream),
+                int(slot_mapping_full.data_ptr()),
+                int(chunk_ptrs_npu.data_ptr()),
+                int(chunk_offsets_npu.data_ptr()),
+                int(chunk_sizes_npu.data_ptr()),
+                *pointer_summary,
+                destination_ptrs,
+            )
+        )
+
+    def _dump_dense_direct_diag(self, *, reason: str, error: Exception) -> None:
+        ring = list(getattr(self, '_dense_direct_diag', ()))
+        latest_seq = int(ring[-1][0]) if ring else 0
+        if latest_seq == int(
+            getattr(self, '_dense_direct_diag_last_dumped_seq', -1)
+        ):
+            return
+        self._dense_direct_diag_last_dumped_seq = latest_seq
+        logger.error(
+            '[DENSE_DIRECT_DIAG] %s',
+            json.dumps(
+                {
+                    'schema_version': 1,
+                    'kind': 'header',
+                    'reason': reason,
+                    'error': str(error).splitlines()[0][:512],
+                    'pid': os.getpid(),
+                    'event_count': len(ring),
+                    'fields': _DENSE_DIRECT_DIAG_FIELDS,
+                    'enums': {
+                        'kernel': {'0': 'slow', '1': 'fast'},
+                        'pointer_source': {
+                            '0': 'unavailable',
+                            '1': 'cached_npu_table',
+                            '2': 'cached_source_device_ptrs',
+                            '3': 'fresh_source_device_ptrs',
+                        },
+                    },
+                },
+                separators=(',', ':'),
+            ),
+        )
+        for start in range(0, len(ring), _DENSE_DIRECT_DIAG_DUMP_BATCH_SIZE):
+            logger.error(
+                '[DENSE_DIRECT_DIAG] %s',
+                json.dumps(
+                    {
+                        'schema_version': 1,
+                        'kind': 'events',
+                        'rows': ring[
+                            start : start + _DENSE_DIRECT_DIAG_DUMP_BATCH_SIZE
+                        ],
+                    },
+                    separators=(',', ':'),
+                ),
+            )
 
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
@@ -2817,15 +3027,32 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         f"kernel launch at layer {layer_id}: "
                         f"device={cached.device}, expected={expected_device}."
                     )
+                host_ptrs = None
+                if (
+                    cached_chunk_dev_ptrs is not None
+                    and layer_id < len(cached_chunk_dev_ptrs)
+                ):
+                    host_ptrs = cached_chunk_dev_ptrs[layer_id]
+                try:
+                    self._remember_dense_direct_pointer_diag(
+                        layer_id=layer_id,
+                        chunk_ptrs_npu=cached,
+                        source_device_ptrs=host_ptrs,
+                        pointer_source=1,
+                    )
+                except Exception:
+                    pass
                 return cached
 
         dev_ptrs = None
+        pointer_source = 0
         if cached_chunk_dev_ptrs is not None and layer_id < len(
             cached_chunk_dev_ptrs
         ):
             cached_dev_ptrs = cached_chunk_dev_ptrs[layer_id]
             if len(cached_dev_ptrs) == num_chunks:
                 dev_ptrs = list(cached_dev_ptrs)
+                pointer_source = 2
 
         pointer_sources: Sequence[Union[torch.Tensor, MemoryObj]] = (
             source_objs if source_objs is not None else cpu_tensors
@@ -2846,7 +3073,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 for chunk_index, source in enumerate(pointer_sources)
             ]
+            pointer_source = 3
         chunk_ptrs_npu = torch.tensor(dev_ptrs, dtype=torch.long, device=self.kv_device)
+        try:
+            self._remember_dense_direct_pointer_diag(
+                layer_id=layer_id,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                source_device_ptrs=dev_ptrs,
+                pointer_source=pointer_source,
+            )
+        except Exception:
+            pass
         if cached_chunk_dev_ptrs is not None:
             while len(cached_chunk_dev_ptrs) <= layer_id:
                 cached_chunk_dev_ptrs.append([])
@@ -3041,11 +3278,44 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         with self._stream_context_or_null(transfer_stream):
             transfer_stream.wait_stream(current_stream)
-            if layer_state is not None:
-                validate_inputs = (
-                    getattr(self, "enable_npu_transfer_validation", True)
-                    and validate_key not in self._sparse_direct_validated_layers
+            validate_inputs = bool(
+                layer_state is not None
+                and getattr(self, "enable_npu_transfer_validation", True)
+                and validate_key not in self._sparse_direct_validated_layers
+            )
+
+            try:
+                self._record_dense_direct_launch_diag(
+                    kvcaches_ref=kvcaches_ref,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    transfer_stream=transfer_stream,
+                    slot_mapping_full=slot_mapping_full,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    chunk_offsets_npu=chunk_offsets_npu,
+                    chunk_sizes_npu=chunk_sizes_npu,
+                    total_tokens=total_tokens,
+                    fixed_chunk_size=fixed_chunk_size,
+                    fast_path=layer_state is not None,
+                    validate_inputs=validate_inputs,
+                    direction=direction,
                 )
+            except Exception:
+                pass
+
+            # The direct kernels consume these tensors through raw device
+            # pointers on transfer_stream. The caching allocator cannot infer
+            # that cross-stream use from the custom launch, so keep their
+            # storage out of the reuse pool until the transfer completes.
+            for transfer_input in (
+                slot_mapping_full,
+                chunk_ptrs_npu,
+                chunk_offsets_npu,
+                chunk_sizes_npu,
+            ):
+                transfer_input.record_stream(transfer_stream)
+
+            if layer_state is not None:
                 dense_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_full,
@@ -3080,17 +3350,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     fixed_chunk_size=fixed_chunk_size,
                 )
 
-            # The direct kernels consume these tensors through raw device
-            # pointers on transfer_stream. The caching allocator cannot infer
-            # that cross-stream use from the custom launch, so keep their
-            # storage out of the reuse pool until the transfer completes.
-            for transfer_input in (
-                slot_mapping_full,
-                chunk_ptrs_npu,
-                chunk_offsets_npu,
-                chunk_sizes_npu,
-            ):
-                transfer_input.record_stream(transfer_stream)
         current_stream.wait_stream(transfer_stream)
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:

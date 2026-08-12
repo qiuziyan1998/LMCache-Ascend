@@ -1607,6 +1607,37 @@ def test_dense_load_completion_api_synchronizes_the_load_stream() -> None:
     assert calls == [True]
 
 
+def test_dense_load_completion_failure_dumps_diagnostics_once(
+    monkeypatch,
+) -> None:
+    original_error = RuntimeError('dense load failed')
+
+    def fail_synchronize():
+        raise original_error
+
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.load_stream = SimpleNamespace(synchronize=fail_synchronize)
+    connector._dense_direct_diag = [(7,)]
+    connector._dense_direct_diag_last_dumped_seq = -1
+    dumps = []
+    monkeypatch.setattr(
+        connector,
+        '_dump_dense_direct_diag',
+        lambda **kwargs: dumps.append(kwargs),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        connector.synchronize_dense_load_stream()
+
+    assert caught.value is original_error
+    assert dumps == [
+        {
+            'reason': 'dense_load_stream_synchronize_failed',
+            'error': original_error,
+        }
+    ]
+
+
 def test_sparse_passive_appends_only_new_shared_view(monkeypatch):
     monkeypatch.setattr(
         ascend_cache_engine,
