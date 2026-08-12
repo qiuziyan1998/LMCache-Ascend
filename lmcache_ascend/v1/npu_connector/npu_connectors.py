@@ -2,6 +2,7 @@
 # Standard
 from contextlib import contextmanager, nullcontext
 import hashlib
+from itertools import pairwise
 import json
 import os
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
@@ -3300,7 +3301,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 boundaries = [0, *breaks.tolist(), page_slots.numel()]
                 runs = [
                     (int(page_slots[left]), right - left)
-                    for left, right in zip(boundaries, boundaries[1:], strict=True)
+                    for left, right in pairwise(boundaries)
                 ]
 
                 page_ptrs, page_sizes = [], []

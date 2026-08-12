@@ -330,8 +330,9 @@ def test_direct_page_planner_stream_matches_slot_order(
     for layer_id in range(connector.num_layers):
         tensors = []
         for plane in range(planes):
-            tensor = torch.arange(8 * (plane + 1), dtype=torch.float16).reshape(
-                2, 4, 1, plane + 1
+            width = plane + 1 if kv_group == 0 else 2
+            tensor = torch.arange(8 * width, dtype=torch.float16).reshape(
+                2, 4, 1, width
             )
             tensor.add_(100 * layer_id + 10 * plane)
             tensors.append(tensor)
