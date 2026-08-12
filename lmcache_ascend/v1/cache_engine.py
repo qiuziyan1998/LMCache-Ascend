@@ -2562,7 +2562,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         if not chunks:
             raise ValueError("Live split import has no token pages")
-        page_keys = [key.without_layer() for _, _, key in chunks]
+        page_keys = [
+            key.without_layer() if isinstance(key, LayerCacheEngineKey) else key
+            for _, _, key in chunks
+        ]
         if len(set(page_keys)) != len(page_keys):
             raise ValueError("Live split import contains duplicate page keys")
         starts = [start for start, _, _ in chunks]

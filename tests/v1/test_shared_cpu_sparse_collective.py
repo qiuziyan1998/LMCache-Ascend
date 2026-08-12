@@ -414,6 +414,36 @@ def test_live_import_commit_adopts_page_without_releasing_request_owner() -> Non
     engine._append_retrieve_group_cache.assert_called_once()
 
 
+@pytest.mark.parametrize("layer_scoped", [False, True])
+def test_live_import_accepts_page_and_layer_keys(layer_scoped: bool) -> None:
+    page_key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    key = page_key.get_layer(0) if layer_scoped else page_key
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine._dense_retrieve_token_results = lambda *_args: [(0, 4, key)]
+    engine.gpu_connector = SimpleNamespace(
+        plan_direct_page_destinations=lambda *_args: (
+            [[100]],
+            [[16]],
+            ("owner",),
+        )
+    )
+
+    plan, context = engine._prepare_live_split_import(
+        tokens=[1, 2, 3, 4],
+        indexer_slots=torch.arange(4),
+        indexer_kvcaches=[object()],
+        request_configs=None,
+        tp_rank=0,
+        dp_rank=0,
+        handled_groups=(1,),
+    )
+
+    assert context["keys"] == [page_key]
+    assert plan["group_byte_totals"] == (0, 16)
+    assert plan["segments"][0]["group_id"] == 1
+
+
 def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
     class _Owner:
         def __init__(self, base: int, size: int) -> None:
