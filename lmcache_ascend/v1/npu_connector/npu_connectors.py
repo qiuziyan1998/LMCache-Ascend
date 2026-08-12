@@ -687,12 +687,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         This function is a generator that moves the KV cache from the paged GPU
         memory to the memory objects. The first iteration will prepare some
         related metadata and initiate the transfer in the first layer. In each
-        of the following iterations, it will first wait until the storing of
-        previous layer finishes, and then initiate string the KV cache of the
-        current layer one. The storing process of the KV cache is paged GPU
-        memory -> GPU buffer -> memory objects. The last iteration simply waits
-        for the last layer to finish.
-        In total, this the generator will yield num_layers + 1 times.
+        of the following iterations, it waits for the previous layer and starts
+        the current layer transfer. The storing process is paged GPU memory ->
+        GPU buffer -> memory objects. The final iteration waits for the last
+        layer.
 
         :param memory_objs: The memory objects to store the KV cache. The first
             dimension is the number of layers, and the second dimension is the
@@ -3016,6 +3014,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_host_interleaved: bool,
         layer_tensors: List[torch.Tensor],
         direction: bool,
+        defer_consumer_wait: bool = False,
     ) -> None:
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
@@ -3095,7 +3094,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
-        current_stream.wait_stream(transfer_stream)
+        # A load must finish before its consumer runs on the compute stream.
+        # A store has the opposite lifetime: its source only needs to stay
+        # untouched until the D2H copy finishes.  Layerwise prefill protects
+        # that lifetime with rotating-bank events in batched_from_gpu(), so a
+        # reverse stream wait here would unnecessarily serialize every next
+        # layer behind the preceding store.
+        if not direction or not defer_consumer_wait:
+            current_stream.wait_stream(transfer_stream)
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
         return (
@@ -4721,13 +4727,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
         This function is a generator that moves the KV cache from the paged GPU
         memory to the memory objects. The first iteration will prepare some
-        related metadata and initiate the transfer in the first layer. In each
-        of the following iterations, it will first wait until the storing of
-        previous layer finishes, and then initiate string the KV cache of the
-        current layer one. The storing process of the KV cache is paged GPU
-        memory -> GPU buffer -> memory objects. The last iteration simply waits
-        for the last layer to finish.
-        In total, this the generator will yield num_layers + 1 times.
+        related metadata and initiate the transfer in the first layer. Normal
+        callers preserve the legacy per-layer wait. Deferred layerwise-prefill
+        callers rotate physical KV banks, overlap D2H with later layer compute,
+        and report a source layer complete when its bank is about to be reused.
+        The storing process is paged GPU memory -> GPU buffer -> memory objects.
+        Deferred callers may need multiple drain iterations for the remaining
+        bank events after the last layer.
 
         :param memory_objs: The memory objects to store the KV cache. The first
             dimension is the number of layers, and the second dimension is the
@@ -4876,8 +4882,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             )
 
-        current_stream = torch.npu.current_stream()
-
         def log_completed_store_layer(layer_id: int) -> None:
             if not (_mtp_dw_deep_diag_enabled() and layer_id == 0):
                 return
@@ -4924,15 +4928,48 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             deferred_layerwise_put = bool(
                 kwargs.get("deferred_layerwise_put", False)
             )
+            layerwise_prefill_bank_count = int(
+                kwargs.get("layerwise_prefill_bank_count", 1) or 1
+            )
+            if layerwise_prefill_bank_count <= 0:
+                raise ValueError(
+                    "layerwise_prefill_bank_count must be positive"
+                )
+            # The fallback path reuses one staging tensor for every layer, so
+            # it cannot safely pipeline three source banks. Keep its original
+            # one-layer fence; the MLA/DSA direct path has no shared staging
+            # tensor and can use the full bank rotation.
+            source_bank_count = (
+                layerwise_prefill_bank_count if dense_direct else 1
+            )
+            bank_done_events: list[Optional[Any]] = [
+                None
+            ] * source_bank_count
+            pending_layer_by_bank: list[Optional[int]] = [
+                None
+            ] * source_bank_count
             layer_request = None
             if deferred_layerwise_put:
                 layer_request = yield None
             for layer_id in range(self.num_layers):
+                # save_kv_layer resumes this generator from the active layer's
+                # attention callback.  Capture that stream per layer so graph
+                # or runtime stream changes do not attach dependencies to a
+                # stale stream from the first layer.
+                current_stream = torch.npu.current_stream()
                 completed_layer = None
-                if deferred_layerwise_put and layer_id > 0:
-                    self.store_stream.synchronize()
-                    store_transfer_pending = False
-                    completed_layer = layer_id - 1
+                bank = layer_id % source_bank_count
+                if deferred_layerwise_put:
+                    completed_layer = pending_layer_by_bank[bank]
+                if completed_layer is not None:
+                    # The compute stream was fenced before this bank's reuse.
+                    # Synchronize only that bank's old D2H event so its CPU
+                    # objects can be published without draining newer stores.
+                    completed_event = bank_done_events[bank]
+                    assert completed_event is not None
+                    completed_event.synchronize()
+                    pending_layer_by_bank[bank] = None
+                    bank_done_events[bank] = None
                     log_completed_store_layer(completed_layer)
 
                 layer_slot_mapping, layer_slot_mapping_base = (
@@ -5004,6 +5041,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         dense_host_interleaved=dense_host_interleaved,
                         layer_tensors=cpu_tensors,
                         direction=True,
+                        defer_consumer_wait=deferred_layerwise_put,
                     )
                     logger.debug("Finished offloading layer %d", layer_id)
                 else:
@@ -5053,6 +5091,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 )
                         logger.debug("Finished offloading layer %d", layer_id)
                 if deferred_layerwise_put:
+                    bank_done_event = torch.npu.Event()
+                    bank_done_event.record(self.store_stream)
+                    bank_done_events[bank] = bank_done_event
+                    pending_layer_by_bank[bank] = layer_id
+
+                    # The next layer may wrap around to a bank whose prior D2H
+                    # is still in flight.  Put the dependency at that future
+                    # reuse boundary, after this layer's compute and before the
+                    # next layer is submitted.  This is the actual three-bank
+                    # compute/store pipeline; waiting on store_stream here
+                    # would collapse it back to serialized execution.
+                    next_bank = (layer_id + 1) % source_bank_count
+                    if pending_layer_by_bank[next_bank] is not None:
+                        next_bank_event = bank_done_events[next_bank]
+                        assert next_bank_event is not None
+                        current_stream.wait_event(next_bank_event)
+                if deferred_layerwise_put:
                     layer_request = yield completed_layer
                 else:
                     yield
@@ -5063,16 +5118,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     log_completed_store_layer(layer_id)
 
             if deferred_layerwise_put:
-                self.store_stream.synchronize()
+                remaining_layers = sorted(
+                    layer_id
+                    for layer_id in pending_layer_by_bank
+                    if layer_id is not None
+                )
+                for completed_layer in remaining_layers:
+                    bank = completed_layer % source_bank_count
+                    completed_event = bank_done_events[bank]
+                    assert completed_event is not None
+                    completed_event.synchronize()
+                    pending_layer_by_bank[bank] = None
+                    bank_done_events[bank] = None
+                    log_completed_store_layer(completed_layer)
+                    yield completed_layer
                 store_transfer_pending = False
-                final_layer = self.num_layers - 1
-                log_completed_store_layer(final_layer)
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
                 tmp_gpu_buffer_obj.ref_count_down()
                 tmp_gpu_buffer_obj = None
-            yield final_layer if deferred_layerwise_put else None
+            if not deferred_layerwise_put:
+                yield None
         finally:
             if store_transfer_pending:
                 self.store_stream.synchronize()

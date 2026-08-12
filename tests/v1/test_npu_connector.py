@@ -478,6 +478,9 @@ class _TrackingEvent:
     def record(self, stream):
         self.records.append(stream.name)
 
+    def synchronize(self):
+        self.records.append("synchronize")
+
 
 class _DenseLayout:
     k_hidden_dims = 1
@@ -971,8 +974,8 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     connector._sparse_direct_layer_states = None
     connector._sparse_direct_validated_layers = set()
 
-    transfer_stream = _NoopStream()
-    current_stream = _NoopStream()
+    transfer_stream = _TrackingStream("transfer")
+    current_stream = _TrackingStream("compute")
     slot_mapping = _RecordableTensor(8)
     chunk_ptrs = _RecordableTensor(2)
     chunk_offsets = _RecordableTensor(2, dtype=torch.int32)
@@ -1032,14 +1035,30 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     connector._run_dense_direct_kv_transfer_layer(
         **common_kwargs,
         direction=True,
+        defer_consumer_wait=True,
+    )
+    connector._run_dense_direct_kv_transfer_layer(
+        **common_kwargs,
+        direction=True,
     )
 
-    assert len(prepared) == 2
-    assert len(fast_calls) == 2
+    assert len(prepared) == 3
+    assert len(fast_calls) == 3
     assert fast_calls[0][0][0] is prepared[0]
     assert fast_calls[1][0][0] is prepared[1]
+    assert fast_calls[2][0][0] is prepared[2]
     assert fast_calls[0][0][7] is False
     assert fast_calls[1][0][7] is True
+    assert fast_calls[2][0][7] is True
+    assert transfer_stream.events == [
+        ("wait_stream", "compute"),
+        ("wait_stream", "compute"),
+        ("wait_stream", "compute"),
+    ]
+    assert current_stream.events == [
+        ("wait_stream", "transfer"),
+        ("wait_stream", "transfer"),
+    ]
 
 
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
@@ -2296,19 +2315,34 @@ def test_deferred_batched_from_gpu_rotates_mapping_and_reports_completion(
     monkeypatch,
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.num_layers = 3
-    connector.kvcaches = [object(), object(), object()]
-    connector.use_gpu = False
+    connector.num_layers = 4
+    connector.kvcaches = [object(), object(), object(), object()]
+    connector.use_gpu = True
     connector.store_stream = _TrackingStream("store")
+    compute_stream = _TrackingStream("compute")
+    events = [
+        _TrackingEvent("layer-0"),
+        _TrackingEvent("layer-1"),
+        _TrackingEvent("layer-2"),
+        _TrackingEvent("layer-3"),
+    ]
+    event_index = 0
 
     class _Npu:
         @staticmethod
         def current_stream():
-            return _TrackingStream("compute")
+            return compute_stream
 
         @staticmethod
         def stream(_stream):
             return nullcontext()
+
+        @staticmethod
+        def Event():
+            nonlocal event_index
+            event = events[event_index]
+            event_index += 1
+            return event
 
     monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
     monkeypatch.setattr(
@@ -2320,7 +2354,7 @@ def test_deferred_batched_from_gpu_rotates_mapping_and_reports_completion(
         lambda *_args, **_kwargs: _DenseLayout(),
     )
     monkeypatch.setattr(
-        connector, "_is_mla_dsa_format", lambda _group=0: False
+        connector, "_is_mla_dsa_format", lambda _group=0: True
     )
     monkeypatch.setattr(
         connector,
@@ -2342,13 +2376,17 @@ def test_deferred_batched_from_gpu_rotates_mapping_and_reports_completion(
     )
     mappings = []
     monkeypatch.setattr(
-        lmc_ops,
-        "single_layer_kv_transfer",
-        lambda _cpu, _kv, mapping, *_args: mappings.append(
-            mapping.clone()
-        ),
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        lambda _layer_id, _cpu_tensors: torch.tensor([123]),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_run_dense_direct_kv_transfer_layer",
+        lambda **kwargs: mappings.append(kwargs["slot_mapping_full"].clone()),
     )
     memory_objs = [
+        [_MemoryObj(torch.zeros(1))],
         [_MemoryObj(torch.zeros(1))],
         [_MemoryObj(torch.zeros(1))],
         [_MemoryObj(torch.zeros(1))],
@@ -2360,26 +2398,108 @@ def test_deferred_batched_from_gpu_rotates_mapping_and_reports_completion(
         slot_mapping=torch.tensor([0]),
         sync=False,
         deferred_layerwise_put=True,
+        layerwise_prefill_bank_count=3,
+    )
+
+    assert next(generator) is None
+    assert generator.send({"slot_mapping": torch.tensor([10])}) is None
+    assert generator.send({"slot_mapping": torch.tensor([20])}) is None
+    assert generator.send({"slot_mapping": torch.tensor([30])}) is None
+    assert generator.send({"slot_mapping": torch.tensor([40])}) == 0
+    assert next(generator) == 1
+    assert next(generator) == 2
+    assert next(generator) == 3
+    with pytest.raises(StopIteration):
+        next(generator)
+
+    assert [mapping.tolist() for mapping in mappings] == [
+        [10],
+        [20],
+        [30],
+        [40],
+    ]
+    assert compute_stream.events == [
+        ("wait_event", "layer-0"),
+        ("wait_event", "layer-1"),
+    ]
+    assert events[0].records == ["store", "synchronize"]
+    assert events[1].records == ["store", "synchronize"]
+    assert events[2].records == ["store", "synchronize"]
+    assert events[3].records == ["store", "synchronize"]
+    assert "synchronize" not in connector.store_stream.events
+
+
+def test_deferred_staging_store_keeps_single_source_bank(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.kvcaches = [object(), object()]
+    connector.use_gpu = False
+    connector.store_stream = _TrackingStream("store")
+    compute_stream = _TrackingStream("compute")
+    events = [_TrackingEvent("layer-0"), _TrackingEvent("layer-1")]
+    event_index = 0
+
+    class _Npu:
+        @staticmethod
+        def current_stream():
+            return compute_stream
+
+        @staticmethod
+        def stream(_stream):
+            return nullcontext()
+
+        @staticmethod
+        def Event():
+            nonlocal event_index
+            event = events[event_index]
+            event_index += 1
+            return event
+
+    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda *_args, **_kwargs: _DenseLayout(),
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda _group=0: False)
+    monkeypatch.setattr(
+        connector,
+        "_expected_memory_format",
+        lambda _group=0: MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda _group=0: False)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda _group=0: False
+    )
+    monkeypatch.setattr(
+        connector, "_check_layerwise_transfer_invariants", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(lmc_ops, "single_layer_kv_transfer", lambda *_args: None)
+
+    generator = connector.batched_from_gpu(
+        [[_MemoryObj(torch.zeros(1))], [_MemoryObj(torch.zeros(1))]],
+        [0],
+        [1],
+        slot_mapping=torch.tensor([0]),
+        sync=False,
+        deferred_layerwise_put=True,
+        layerwise_prefill_bank_count=3,
     )
 
     assert next(generator) is None
     assert generator.send({"slot_mapping": torch.tensor([10])}) is None
     assert generator.send({"slot_mapping": torch.tensor([20])}) == 0
-    assert generator.send({"slot_mapping": torch.tensor([30])}) == 1
-    assert next(generator) == 2
+    assert next(generator) == 1
     with pytest.raises(StopIteration):
         next(generator)
 
-    assert [mapping.tolist() for mapping in mappings] == [[10], [20], [30]]
-    assert [
-        event
-        for event in connector.store_stream.events
-        if event == "synchronize"
-    ] == [
-        "synchronize",
-        "synchronize",
-        "synchronize",
+    assert compute_stream.events == [
+        ("wait_event", "layer-0"),
+        ("wait_event", "layer-1"),
     ]
+    assert events[0].records == ["store", "synchronize"]
+    assert events[1].records == ["store", "synchronize"]
 
 
 def test_dense_group_store_uses_one_host_dispatch(monkeypatch) -> None:
