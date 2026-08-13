@@ -348,7 +348,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
                 live_source = False
             if live_source:
-                self.lmcache_engine.begin_live_source_descriptor(request.req_id)
+                self.lmcache_engine.begin_live_source_descriptor(
+                    request.req_id, (1,)
+                )
                 self.lmcache_engine.capture_live_source_step(
                     request.req_id,
                     live_token_ids,

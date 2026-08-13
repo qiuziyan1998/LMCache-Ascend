@@ -2091,7 +2091,9 @@ def test_abort_save_step_drops_only_failed_direct_state(monkeypatch) -> None:
 def test_adopted_direct_store_still_captures_live_source() -> None:
     calls = []
     engine = SimpleNamespace(
-        begin_live_source_descriptor=lambda req_id: calls.append(("begin", req_id)),
+        begin_live_source_descriptor=lambda req_id, groups=(0, 1): calls.append(
+            ("begin", req_id, groups)
+        ),
         direct_prefill_store_enabled=lambda: True,
         capture_live_source_step=lambda *args: calls.append(("capture", args[0])),
         store_direct_prefill=lambda *args, **kwargs: calls.append(
@@ -2128,7 +2130,7 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
     )
 
     assert calls == [
-        ("begin", "request"),
+        ("begin", "request", (1,)),
         ("capture", "request"),
         ("store", "request"),
     ]
@@ -2137,7 +2139,7 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
 def test_live_source_captures_rank_that_skips_persistent_store() -> None:
     captured = []
     engine = SimpleNamespace(
-        begin_live_source_descriptor=lambda _req_id: None,
+        begin_live_source_descriptor=lambda _req_id, _groups=(0, 1): None,
         capture_live_source_step=lambda *args: captured.append(args),
         finalize_live_source_descriptor=lambda *_args: True,
         direct_prefill_store_enabled=lambda: True,

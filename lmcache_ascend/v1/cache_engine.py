@@ -771,12 +771,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         return future
 
-    def begin_live_source_descriptor(self, req_id: str) -> None:
+    def begin_live_source_descriptor(
+        self, req_id: str, groups: tuple[int, ...] = (0, 1)
+    ) -> None:
         self._live_source_builders.setdefault(
             req_id,
             {
                 "segments": [],
                 "ends": {},
+                "groups": groups,
                 "invalid": False,
                 "planned_end": 0,
                 "planned_hash": 0,
@@ -793,7 +796,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         owners: tuple[torch.Tensor, ...],
     ) -> None:
         builder = self._live_source_builders.get(req_id)
-        if builder is None:
+        if builder is None or kv_group not in builder["groups"]:
             return
         coverage_end = int(builder["ends"].get(kv_group, 0))
         if len(ranges) != len(ptrs) or len(ptrs) != len(sizes):
@@ -860,7 +863,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 reason=("missing_builder" if builder is None else "invalid_builder"),
             )
             return False
-        if any(builder["ends"].get(group, 0) != token_count for group in (0, 1)):
+        groups = builder["groups"]
+        if any(builder["ends"].get(group, 0) != token_count for group in groups):
             cold_start_perf_log(
                 logger,
                 "live_source_finalize_detail",
@@ -876,7 +880,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         totals = [0, 0]
         for segment in builder["segments"]:
             totals[segment["group_id"]] += segment["length"]
-        if not all(totals):
+        if any(not totals[group] for group in groups):
             cold_start_perf_log(
                 logger,
                 "live_source_finalize_detail",
@@ -930,7 +934,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._live_source_builders.pop(req_id, None)
             return
         try:
-            self.begin_live_source_descriptor(req_id)
+            self.begin_live_source_descriptor(req_id, (1,))
             builder = self._live_source_builders[req_id]
             target_end = (
                 len(tokens)
@@ -976,13 +980,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=1,
                 )
             )
-            plans = {
-                0: plan0,
-                1: [
-                    (latent[0], latent[1], indexer[2])
-                    for latent, indexer in zip(plan0, group1_keys, strict=True)
-                ],
-            }
+            plans = {1: [
+                (latent[0], latent[1], indexer[2])
+                for latent, indexer in zip(plan0, group1_keys, strict=True)
+            ]}
             for group, chunks in plans.items():
                 if not chunks:
                     continue

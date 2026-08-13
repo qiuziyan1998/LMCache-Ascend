@@ -544,11 +544,15 @@ def test_live_source_capture_defers_partial_tail_until_final_step() -> None:
     engine.capture_live_source_step(
         "request", [1] * 6, caches, slots, None, 0, final=False
     )
-    assert engine._live_source_builders["request"]["ends"] == {0: 4, 1: 4}
+    assert engine._live_source_builders["request"]["ends"] == {1: 4}
     engine.capture_live_source_step(
         "request", [1] * 6, caches, slots, None, 4, final=True
     )
-    assert engine._live_source_builders["request"]["ends"] == {0: 6, 1: 6}
+    assert engine._live_source_builders["request"]["ends"] == {1: 6}
+    assert engine.finalize_live_source_descriptor("request", 6, 0, 0)
+    descriptor = engine.drain_live_source_descriptors()["request"]
+    assert descriptor["group_byte_totals"] == [0, 6]
+    assert {segment["group_id"] for segment in descriptor["segments"]} == {1}
 
 
 def test_layout_probe_does_not_initialize_staging() -> None:
