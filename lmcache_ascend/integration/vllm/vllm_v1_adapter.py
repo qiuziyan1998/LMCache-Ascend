@@ -660,6 +660,18 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        cold_start_perf_log(
+            logger,
+            "live_source_lmcache_finish_entry",
+            req_id=request.request_id,
+            descriptor_count=len(
+                self._scheduler_live_sources.get(request.request_id, ())
+            ),
+            request_live_split=bool(
+                isinstance(getattr(request, "kv_transfer_params", None), dict)
+                and request.kv_transfer_params.get("request_live_split")
+            ),
+        )
         _, return_params = super().request_finished(request, block_ids)
         descriptors = self._scheduler_live_sources.pop(request.request_id, None)
         params = getattr(request, "kv_transfer_params", None)
