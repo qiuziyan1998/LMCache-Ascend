@@ -422,9 +422,11 @@ def test_live_import_accepts_page_and_layer_keys(layer_scoped: bool) -> None:
     engine.config = SimpleNamespace(chunk_size=4)
     engine._dense_retrieve_token_results = lambda *_args: [(0, 4, key)]
     engine.gpu_connector = SimpleNamespace(
-        plan_direct_page_destinations=lambda *_args: (
-            [[100]],
-            [[16]],
+        plan_compact_page_layout=lambda *_args: (
+            [{"layer_id": 0, "buffer_base": 100,
+              "token_bytes": 4, "slot_capacity": 4}],
+            [{"logical_token_start": 0, "physical_slot_start": 0,
+              "token_count": 4}],
             ("owner",),
         )
     )
@@ -441,7 +443,9 @@ def test_live_import_accepts_page_and_layer_keys(layer_scoped: bool) -> None:
 
     assert context["keys"] == [page_key]
     assert plan["group_byte_totals"] == (0, 16)
-    assert plan["segments"][0]["group_id"] == 1
+    assert plan["segments"] == []
+    assert plan["format"] == "layer_slot_runs_v1"
+    assert plan["compact_layout"]["group_id"] == 1
 
 
 def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
@@ -525,17 +529,20 @@ def test_live_source_capture_defers_partial_tail_until_final_step() -> None:
             assert (prefix_token_count, prefix_hash) == (4, 11)
             return iter(((4, 6, SimpleNamespace(chunk_hash=12)),))
 
-    def planner(_caches, _slots, starts, ends, group, **_kwargs):
+    def planner(_caches, _slots, starts, ends, _group, **_kwargs):
         return (
-            [[1000 + group * 40 + start] for start in starts],
-            [[end - start] for start, end in zip(starts, ends, strict=True)],
+            [{"layer_id": 0, "buffer_base": 1000,
+              "token_bytes": 1, "slot_capacity": 100}],
+            [{"logical_token_start": starts[0],
+              "physical_slot_start": starts[0],
+              "token_count": ends[-1] - starts[0]}],
             (_Owner(),),
         )
 
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(chunk_size=4)
     engine.token_database = _Tokens()
-    engine.gpu_connector = SimpleNamespace(plan_direct_page_sources=planner)
+    engine.gpu_connector = SimpleNamespace(plan_compact_page_layout=planner)
     engine._live_source_builders = {}
     engine._completed_live_sources = {}
     caches = {0: [object()], 1: [object()]}
@@ -552,7 +559,8 @@ def test_live_source_capture_defers_partial_tail_until_final_step() -> None:
     assert engine.finalize_live_source_descriptor("request", 6, 0, 0)
     descriptor = engine.drain_live_source_descriptors()["request"]
     assert descriptor["group_byte_totals"] == [0, 6]
-    assert {segment["group_id"] for segment in descriptor["segments"]} == {1}
+    assert descriptor["compact_layout"]["token_count"] == 6
+    assert len(descriptor["compact_layout"]["runs"]) == 2
 
 
 def test_layout_probe_does_not_initialize_staging() -> None:

@@ -8,7 +8,7 @@ import ctypes
 import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from weakref import WeakSet
 
 # Third Party
@@ -3799,3 +3799,37 @@ def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
 
     with patch(target_patch, new=VLLMPagedMemNPUConnectorV2):
         original_test_vllm_paged_connector_v2_to_gpu_bench(benchmark)
+
+
+def test_compact_page_layout_keeps_layers_and_runs_independent() -> None:
+    connector = VLLMPagedMemLayerwiseNPUConnector.__new__(
+        VLLMPagedMemLayerwiseNPUConnector
+    )
+    owners = (torch.empty(1), torch.empty(1))
+    connector._direct_page_tensor_layout = MagicMock(
+        return_value=([(1000, 8), (2000, 8)], owners, 32)
+    )
+
+    layers, runs, retained = connector.plan_compact_page_layout(
+        [], torch.tensor([2, 3, 7, 8]), [0], [4], 1
+    )
+
+    assert layers == [
+        {
+            "layer_id": 0,
+            "buffer_base": 1000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+        {
+            "layer_id": 1,
+            "buffer_base": 2000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+    ]
+    assert runs == [
+        {"logical_token_start": 0, "physical_slot_start": 2, "token_count": 2},
+        {"logical_token_start": 2, "physical_slot_start": 7, "token_count": 2},
+    ]
+    assert retained is owners

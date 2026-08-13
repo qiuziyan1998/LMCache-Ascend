@@ -395,6 +395,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 tp_rank=descriptor.get("tp_rank"),
                 dp_rank=descriptor.get("dp_rank"),
                 segments=len(descriptor.get("segments", ())),
+                compact_layers=len(
+                    descriptor.get("compact_layout", {}).get("layers", ())
+                ),
+                compact_runs=len(
+                    descriptor.get("compact_layout", {}).get("runs", ())
+                ),
                 group_byte_totals=descriptor.get("group_byte_totals"),
             )
         return (

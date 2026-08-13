@@ -778,6 +778,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             req_id,
             {
                 "segments": [],
+                "compact_layers": None,
+                "compact_runs": [],
                 "ends": {},
                 "groups": groups,
                 "invalid": False,
@@ -785,6 +787,44 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "planned_hash": 0,
             },
         )
+
+    def _record_live_source_layout(
+        self,
+        req_id: str,
+        kv_group: int,
+        start: int,
+        end: int,
+        layers: list[dict[str, int]],
+        runs: list[dict[str, int]],
+    ) -> None:
+        builder = self._live_source_builders.get(req_id)
+        if builder is None or kv_group not in builder["groups"]:
+            return
+        if builder["segments"]:
+            builder["invalid"] = True
+            return
+        coverage_end = int(builder["ends"].get(kv_group, 0))
+        if start != coverage_end or end <= start:
+            builder["invalid"] = True
+            return
+        if builder["compact_layers"] not in (None, layers):
+            builder["invalid"] = True
+            return
+        if (
+            not runs
+            or runs[0]["logical_token_start"] != start
+            or sum(run["token_count"] for run in runs) != end - start
+            or any(
+                left["logical_token_start"] + left["token_count"]
+                != right["logical_token_start"]
+                for left, right in zip(runs, runs[1:])
+            )
+        ):
+            builder["invalid"] = True
+            return
+        builder["compact_layers"] = layers
+        builder["compact_runs"].extend(runs)
+        builder["ends"][kv_group] = end
 
     def _record_live_source_pages(
         self,
@@ -797,6 +837,9 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         builder = self._live_source_builders.get(req_id)
         if builder is None or kv_group not in builder["groups"]:
+            return
+        if builder["compact_layers"] is not None:
+            builder["invalid"] = True
             return
         coverage_end = int(builder["ends"].get(kv_group, 0))
         if len(ranges) != len(ptrs) or len(ptrs) != len(sizes):
@@ -878,6 +921,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             return False
         totals = [0, 0]
+        compact_layers = builder["compact_layers"]
+        if compact_layers is not None:
+            totals[1] = token_count * sum(
+                layer["token_bytes"] for layer in compact_layers
+            )
         for segment in builder["segments"]:
             totals[segment["group_id"]] += segment["length"]
         if any(not totals[group] for group in groups):
@@ -893,12 +941,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                 group_byte_totals=totals,
             )
             return False
-        self._completed_live_sources[req_id] = {
-            "segments": builder["segments"],
+        descriptor = {
             "group_byte_totals": totals,
             "tp_rank": tp_rank,
             "dp_rank": dp_rank,
         }
+        if compact_layers is None:
+            descriptor["segments"] = builder["segments"]
+        else:
+            descriptor["format"] = "layer_slot_runs_v1"
+            descriptor["compact_layout"] = {
+                "group_id": 1,
+                "token_count": token_count,
+                "layers": compact_layers,
+                "runs": builder["compact_runs"],
+            }
+        self._completed_live_sources[req_id] = descriptor
         cold_start_perf_log(
             logger,
             "live_source_finalize_detail",
@@ -908,6 +966,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             dp_rank=dp_rank,
             finalized=True,
             segments=len(builder["segments"]),
+            compact_layers=len(compact_layers or ()),
+            compact_runs=len(builder["compact_runs"]),
             group_byte_totals=totals,
         )
         return True
@@ -929,8 +989,14 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         if req_id in self._completed_live_sources:
             return
-        planner = getattr(self.gpu_connector, "plan_direct_page_sources", None)
-        if not callable(planner) or set(group_caches) != {0, 1}:
+        planner = getattr(self.gpu_connector, "plan_compact_page_layout", None)
+        legacy_planner = getattr(
+            self.gpu_connector, "plan_direct_page_sources", None
+        )
+        if (
+            not callable(planner)
+            and not callable(legacy_planner)
+        ) or set(group_caches) != {0, 1}:
             self._live_source_builders.pop(req_id, None)
             return
         try:
@@ -989,24 +1055,43 @@ class AscendLMCacheEngine(LMCacheEngine):
                     continue
                 starts = [start for start, _, _ in chunks]
                 ends = [end for _, end, _ in chunks]
-                planned = planner(
-                    group_caches[group],
-                    slot_mappings[group],
-                    starts,
-                    ends,
-                    group,
-                    slot_mapping_base=slot_mapping_base,
+                planned = (
+                    planner(
+                        group_caches[group],
+                        slot_mappings[group],
+                        starts,
+                        ends,
+                        group,
+                        slot_mapping_base=slot_mapping_base,
+                    )
+                    if callable(planner)
+                    else None
                 )
+                if planned is None and callable(legacy_planner):
+                    planned = legacy_planner(
+                        group_caches[group],
+                        slot_mappings[group],
+                        starts,
+                        ends,
+                        group,
+                        slot_mapping_base=slot_mapping_base,
+                    )
+                    if planned is not None:
+                        ptrs, sizes, owners = planned
+                        self._record_live_source_pages(
+                            req_id,
+                            group,
+                            list(zip(starts, ends, strict=True)),
+                            ptrs,
+                            sizes,
+                            tuple(owners),
+                        )
+                        continue
                 if planned is None:
                     raise ValueError("direct page source layout is unsupported")
-                ptrs, sizes, owners = planned
-                self._record_live_source_pages(
-                    req_id,
-                    group,
-                    list(zip(starts, ends, strict=True)),
-                    ptrs,
-                    sizes,
-                    tuple(owners),
+                layers, runs, _owners = planned
+                self._record_live_source_layout(
+                    req_id, group, starts[0], ends[-1], layers, runs
                 )
             builder["planned_end"] = target_end
             builder["planned_hash"] = int(plan0[-1][2].chunk_hash)
@@ -2640,9 +2725,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             if allocated is None or not LayerPageMemoryObj.pin_many(allocated):
                 raise MemoryError("Live split shared-CPU page allocation failed")
             pages = allocated
+        compact_destination = handled_groups == (1,)
         destination_planner = getattr(
-            self.gpu_connector, "plan_direct_page_destinations", None
+            self.gpu_connector,
+            "plan_compact_page_layout" if compact_destination
+            else "plan_direct_page_destinations",
+            None,
         )
+        if not callable(destination_planner) and compact_destination:
+            destination_planner = getattr(
+                self.gpu_connector, "plan_direct_page_destinations", None
+            )
+            compact_destination = False
         if not callable(destination_planner):
             self._release_shared_retrieve_objs(list(pages), unpin=True)
             raise RuntimeError("Live split destination planner is unavailable")
@@ -2654,7 +2748,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             if destination1 is None:
                 raise ValueError("Live split destination layout is unsupported")
-            dst1_ptrs, dst1_sizes, dst1_owners = destination1
+            if compact_destination:
+                dst1_layers, dst1_runs, dst1_owners = destination1
+            else:
+                dst1_ptrs, dst1_sizes, dst1_owners = destination1
+                dst1_layers = dst1_runs = []
 
             segments: list[dict[str, Any]] = []
             totals = [0, 0]
@@ -2667,23 +2765,39 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "destination_kind": "cpu",
                 })
                 totals[0] += size
-            for dest_ptrs, dest_sizes in zip(
-                dst1_ptrs, dst1_sizes, strict=True
-            ):
-                for dst_ptr, size in zip(dest_ptrs, dest_sizes, strict=True):
-                    segments.append({
-                        "group_id": 1,
-                        "destination_address": dst_ptr,
-                        "length": size,
-                        "destination_kind": "npu",
-                    })
-                    totals[1] += size
+            if 1 in handled_groups:
+                if compact_destination:
+                    totals[1] = len(tokens) * sum(
+                        layer["token_bytes"] for layer in dst1_layers
+                    )
+                else:
+                    for dest_ptrs, dest_sizes in zip(
+                        dst1_ptrs, dst1_sizes, strict=True
+                    ):
+                        for dst_ptr, size in zip(
+                            dest_ptrs, dest_sizes, strict=True
+                        ):
+                            segments.append({
+                                "group_id": 1,
+                                "destination_address": dst_ptr,
+                                "length": size,
+                                "destination_kind": "npu",
+                            })
+                            totals[1] += size
             plan = {
                 "segments": segments,
                 "group_byte_totals": tuple(totals),
                 "tp_rank": tp_rank,
                 "dp_rank": dp_rank,
             }
+            if compact_destination:
+                plan["format"] = "layer_slot_runs_v1"
+                plan["compact_layout"] = {
+                    "group_id": 1,
+                    "token_count": len(tokens),
+                    "layers": dst1_layers,
+                    "runs": dst1_runs,
+                }
             context = {
                 "pages": pages,
                 "keys": page_keys,
