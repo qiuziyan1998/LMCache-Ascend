@@ -358,15 +358,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     0,
                     request.is_last_prefill,
                 )
-                cold_start_perf_log(
-                    logger,
-                    "live_source_capture",
-                    req_id=request.req_id,
-                    tp_rank=get_tensor_model_parallel_rank(),
-                    token_count=len(live_token_ids),
-                    groups=sorted(live_selected),
-                    final=bool(request.is_last_prefill),
-                )
             finalized_live = False
             if live_source and request.is_last_prefill:
                 finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
@@ -374,14 +365,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     len(live_token_ids),
                     get_tensor_model_parallel_rank(),
                     int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
-                )
-                cold_start_perf_log(
-                    logger,
-                    "live_source_finalize",
-                    req_id=request.req_id,
-                    tp_rank=get_tensor_model_parallel_rank(),
-                    token_count=len(live_token_ids),
-                    finalized=finalized_live,
                 )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
             if direct_store and selected:
@@ -660,18 +643,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        cold_start_perf_log(
-            logger,
-            "live_source_lmcache_finish_entry",
-            req_id=request.request_id,
-            descriptor_count=len(
-                self._scheduler_live_sources.get(request.request_id, ())
-            ),
-            request_live_split=bool(
-                isinstance(getattr(request, "kv_transfer_params", None), dict)
-                and request.kv_transfer_params.get("request_live_split")
-            ),
-        )
         _, return_params = super().request_finished(request, block_ids)
         descriptors = self._scheduler_live_sources.pop(request.request_id, None)
         params = getattr(request, "kv_transfer_params", None)
