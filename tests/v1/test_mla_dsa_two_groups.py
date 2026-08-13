@@ -2134,6 +2134,45 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
     ]
 
 
+def test_live_source_captures_rank_that_skips_persistent_store() -> None:
+    captured = []
+    engine = SimpleNamespace(
+        begin_live_source_descriptor=lambda _req_id: None,
+        capture_live_source_step=lambda *args: captured.append(args),
+        finalize_live_source_descriptor=lambda *_args: True,
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *_args, **_kwargs: pytest.fail(
+            "skip-save rank must not persist"
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: ({}, {}, 0),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[],
+        live_source_token_ids=[1, 2, 3],
+        live_source_slot_mapping=["live-latent"],
+        live_source_indexer_slot_mapping=["live-indexer"],
+        live_source_requested=True,
+        load_spec=None,
+        request_configs=None,
+        is_last_prefill=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+
+    assert captured[0][1] == [1, 2, 3]
+    assert captured[0][2] == {0: ["latent"], 1: ["indexer"]}
+    assert captured[0][3] == {0: "live-latent", 1: "live-indexer"}
+
+
 def test_live_source_fails_closed_for_context_parallel(caplog) -> None:
     calls = []
     engine = SimpleNamespace(

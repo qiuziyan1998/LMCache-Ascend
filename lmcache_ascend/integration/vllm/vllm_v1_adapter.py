@@ -131,6 +131,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
             or (
                 self.kv_role != "kv_producer"
+                and not request.live_source_requested
                 and (
                     request.save_spec is None
                     or not request.save_spec.can_save
@@ -288,10 +289,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return
         group_caches = self._direct_group_caches()
         for request in requests:
+            live_source = bool(getattr(request, "live_source_requested", False))
             selected, slot_mappings, mapping_base = self._direct_request_inputs(
                 request, group_caches
             )
-            if not selected:
+            live_selected = group_caches if live_source else selected
+            if not selected and not live_selected:
                 continue
             load_spec = getattr(request, "load_spec", None)
             committed_prefix = getattr(load_spec, "dsa_committed_end", None)
@@ -301,7 +304,36 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 mapping_base,
                 int(committed_prefix or 0),
             )
-            live_source = bool(getattr(request, "live_source_requested", False))
+            live_token_ids = (
+                getattr(request, "live_source_token_ids", None)
+                if live_source
+                and getattr(request, "live_source_token_ids", None)
+                else request.token_ids
+            )
+            live_latent_mapping = getattr(
+                request, "live_source_slot_mapping", None
+            )
+            live_indexer_mapping = getattr(
+                request, "live_source_indexer_slot_mapping", None
+            )
+            live_slot_mappings = slot_mappings
+            if live_source:
+                live_slot_mappings = (
+                    {
+                        group: (
+                            live_indexer_mapping[0]
+                            if group
+                            else live_latent_mapping[0]
+                        )
+                        for group in live_selected
+                    }
+                    if live_latent_mapping
+                    and (
+                        not self.config.dsa_two_groups
+                        or live_indexer_mapping
+                    )
+                    else slot_mappings
+                )
             parallel = self._vllm_config.parallel_config
             topology_supported = (
                 int(getattr(parallel, "pipeline_parallel_size", 1)) == 1
@@ -318,23 +350,23 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 self.lmcache_engine.begin_live_source_descriptor(request.req_id)
                 self.lmcache_engine.capture_live_source_step(
                     request.req_id,
-                    request.token_ids,
-                    selected,
-                    slot_mappings,
+                    live_token_ids,
+                    live_selected,
+                    live_slot_mappings,
                     request.request_configs,
-                    mapping_base,
+                    0,
                     request.is_last_prefill,
                 )
             finalized_live = False
             if live_source and request.is_last_prefill:
                 finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
                     request.req_id,
-                    len(request.token_ids),
+                    len(live_token_ids),
                     get_tensor_model_parallel_rank(),
                     int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
                 )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
-            if direct_store:
+            if direct_store and selected:
                 self.lmcache_engine.store_direct_prefill(
                     request.req_id,
                     request.token_ids,
@@ -345,7 +377,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     slot_mapping_base=mapping_base,
                     verified_prefix_end=verified_prefix_end,
                 )
-            if finalized_live and direct_store:
+            if finalized_live and direct_store and selected:
                 self._unfenced_live_stores[request.req_id] = request
 
     def build_connector_worker_meta(self) -> Optional[KVConnectorWorkerMetadata]:
