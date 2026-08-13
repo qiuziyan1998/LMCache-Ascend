@@ -10,6 +10,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     ReqMeta,
 )
 from lmcache.logging import init_logger
+from lmcache.v1.cold_start_perf import cold_start_perf_log
 from lmcache.v1.cache_engine import LayerwiseStoreResult
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -357,6 +358,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     0,
                     request.is_last_prefill,
                 )
+                cold_start_perf_log(
+                    logger,
+                    "live_source_capture",
+                    req_id=request.req_id,
+                    tp_rank=get_tensor_model_parallel_rank(),
+                    token_count=len(live_token_ids),
+                    groups=sorted(live_selected),
+                    final=bool(request.is_last_prefill),
+                )
             finalized_live = False
             if live_source and request.is_last_prefill:
                 finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
@@ -364,6 +374,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     len(live_token_ids),
                     get_tensor_model_parallel_rank(),
                     int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
+                )
+                cold_start_perf_log(
+                    logger,
+                    "live_source_finalize",
+                    req_id=request.req_id,
+                    tp_rank=get_tensor_model_parallel_rank(),
+                    token_count=len(live_token_ids),
+                    finalized=finalized_live,
                 )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
             if direct_store and selected:
@@ -384,6 +402,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.lmcache_engine is None:
             return None
         descriptors = self.lmcache_engine.drain_live_source_descriptors()
+        for req_id, descriptor in descriptors.items():
+            cold_start_perf_log(
+                logger,
+                "live_source_worker_emit",
+                req_id=req_id,
+                tp_rank=descriptor.get("tp_rank"),
+                dp_rank=descriptor.get("dp_rank"),
+                segments=len(descriptor.get("segments", ())),
+                group_byte_totals=descriptor.get("group_byte_totals"),
+            )
         return (
             LiveSourceWorkerMetadata(
                 {req_id: [descriptor] for req_id, descriptor in descriptors.items()}
@@ -400,7 +428,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     ) -> None:
         if isinstance(metadata, LiveSourceWorkerMetadata):
             for req_id, descriptors in metadata.descriptors.items():
-                if req_id not in active_req_ids:
+                active = req_id in active_req_ids
+                cold_start_perf_log(
+                    logger,
+                    "live_source_scheduler_ingest",
+                    req_id=req_id,
+                    active=active,
+                    descriptor_count=len(descriptors),
+                    ranks=[
+                        [item.get("tp_rank"), item.get("dp_rank")]
+                        for item in descriptors
+                    ],
+                )
+                if not active:
                     continue
                 self._scheduler_live_sources[req_id] = list(descriptors)
 
@@ -654,5 +694,25 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return_params["ascend_live_split_source_v1"] = {
                 "descriptors": descriptors
             }
+            cold_start_perf_log(
+                logger,
+                "live_source_attach",
+                req_id=request.request_id,
+                attached=True,
+                descriptor_count=len(descriptors),
+            )
+        elif isinstance(params, dict) and params.get("request_live_split", False):
+            cold_start_perf_log(
+                logger,
+                "live_source_attach",
+                req_id=request.request_id,
+                attached=False,
+                descriptor_count=len(descriptors or ()),
+                reason=(
+                    "missing_or_incomplete_descriptor"
+                    if not descriptors
+                    else "request_not_eligible"
+                ),
+            )
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params

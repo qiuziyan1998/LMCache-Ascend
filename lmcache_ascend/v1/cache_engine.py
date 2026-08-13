@@ -849,13 +849,45 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> bool:
         builder = self._live_source_builders.pop(req_id, None)
         if builder is None or builder["invalid"]:
+            cold_start_perf_log(
+                logger,
+                "live_source_finalize_detail",
+                req_id=req_id,
+                token_count=token_count,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                finalized=False,
+                reason=("missing_builder" if builder is None else "invalid_builder"),
+            )
             return False
         if any(builder["ends"].get(group, 0) != token_count for group in (0, 1)):
+            cold_start_perf_log(
+                logger,
+                "live_source_finalize_detail",
+                req_id=req_id,
+                token_count=token_count,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                finalized=False,
+                reason="incomplete_coverage",
+                group_ends=builder["ends"],
+            )
             return False
         totals = [0, 0]
         for segment in builder["segments"]:
             totals[segment["group_id"]] += segment["length"]
         if not all(totals):
+            cold_start_perf_log(
+                logger,
+                "live_source_finalize_detail",
+                req_id=req_id,
+                token_count=token_count,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                finalized=False,
+                reason="empty_group",
+                group_byte_totals=totals,
+            )
             return False
         self._completed_live_sources[req_id] = {
             "segments": builder["segments"],
@@ -863,6 +895,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             "tp_rank": tp_rank,
             "dp_rank": dp_rank,
         }
+        cold_start_perf_log(
+            logger,
+            "live_source_finalize_detail",
+            req_id=req_id,
+            token_count=token_count,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            finalized=True,
+            segments=len(builder["segments"]),
+            group_byte_totals=totals,
+        )
         return True
 
     def drain_live_source_descriptors(self) -> dict[str, dict[str, Any]]:
@@ -972,6 +1015,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Live source descriptor disabled for request %s: %s",
                 req_id,
                 error,
+            )
+            cold_start_perf_log(
+                logger,
+                "live_source_capture_failure",
+                req_id=req_id,
+                token_count=len(tokens),
+                groups=sorted(group_caches),
+                slot_mapping_base=slot_mapping_base,
+                final=final,
+                reason=type(error).__name__,
+                detail=str(error),
             )
 
     def _submit_direct_tail(
