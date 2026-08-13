@@ -549,6 +549,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if releasable_req_ids:
             self._release_finished_worker_requests(releasable_req_ids)
             self.lmcache_engine.drop_direct_store_states(releasable_req_ids)
+        for req_id in finished_req_ids - releasable_req_ids:
+            # Retrieval pins are request-owned, not async-store-owned. Storage
+            # submissions retain their own sources until their futures finish.
+            self._drop_worker_retrieve_state(req_id)
         return finished_sending
 
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
