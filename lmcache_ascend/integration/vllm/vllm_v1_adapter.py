@@ -690,8 +690,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             and isinstance(params, dict)
             and params.get("request_live_split", False)
         ):
-            return_params = return_params or {}
-            return_params["ascend_live_split_source_v1"] = {
+            # MultiConnector children share this request. Publish the source
+            # here so the following Mooncake child can canonicalize it even
+            # when the generic vLLM MultiConnector is selected.
+            params["ascend_live_split_source_v1"] = {
                 "descriptors": descriptors
             }
             cold_start_perf_log(
