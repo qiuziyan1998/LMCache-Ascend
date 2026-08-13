@@ -497,6 +497,39 @@ def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
     assert not engine.finalize_live_source_descriptor("missing", 6, 3, 1)
 
 
+def test_compact_live_source_ignores_rank0_direct_store_observation() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.begin_live_source_descriptor("request", (1,))
+    layers = [
+        {
+            "layer_id": 0,
+            "buffer_base": 1000,
+            "token_bytes": 4,
+            "slot_capacity": 16,
+        }
+    ]
+    runs = [
+        {
+            "logical_token_start": 0,
+            "physical_slot_start": 2,
+            "token_count": 4,
+        }
+    ]
+
+    engine._record_live_source_layout("request", 1, 0, 4, layers, runs)
+    engine._record_live_source_pages(
+        "request", 1, [(0, 4)], [[1008]], [[16]], ()
+    )
+
+    assert engine.finalize_live_source_descriptor("request", 4, 0, 0)
+    descriptor = engine.drain_live_source_descriptors()["request"]
+    assert descriptor["compact_layout"]["layers"] == layers
+    assert descriptor["compact_layout"]["runs"] == runs
+    assert descriptor["group_byte_totals"] == [0, 16]
+
+
 def test_live_source_capture_defers_partial_tail_until_final_step() -> None:
     class _Owner:
         def data_ptr(self) -> int:

@@ -839,7 +839,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         if builder is None or kv_group not in builder["groups"]:
             return
         if builder["compact_layers"] is not None:
-            builder["invalid"] = True
+            # Rank 0's persistent direct-store path observes the same source
+            # pages after compact live capture. The compact descriptor already
+            # owns complete logical coverage, so this duplicate representation
+            # must not invalidate it.
             return
         coverage_end = int(builder["ends"].get(kv_group, 0))
         if len(ranges) != len(ptrs) or len(ptrs) != len(sizes):
