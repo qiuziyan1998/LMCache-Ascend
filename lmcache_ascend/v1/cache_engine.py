@@ -2936,19 +2936,20 @@ class AscendLMCacheEngine(LMCacheEngine):
             segments: list[dict[str, Any]] = []
             latent_pages: list[dict[str, int]] = []
             totals = [0, 0]
-            for page, start, valid in zip(
-                pages, starts, valid_tokens, strict=True
-            ):
-                size = page.get_size()
-                latent_pages.append(
-                    {
-                        "logical_token_start": start,
-                        "destination_address": page.data_ptr,
-                        "length": size,
-                        "valid_tokens": valid,
-                    }
-                )
-                totals[0] += size
+            if 0 in handled_groups:
+                for page, start, valid in zip(
+                    pages, starts, valid_tokens, strict=True
+                ):
+                    size = page.get_size()
+                    latent_pages.append(
+                        {
+                            "logical_token_start": start,
+                            "destination_address": page.data_ptr,
+                            "length": size,
+                            "valid_tokens": valid,
+                        }
+                    )
+                    totals[0] += size
             if 1 in handled_groups:
                 if compact_destination:
                     totals[1] = len(tokens) * sum(

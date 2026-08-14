@@ -474,6 +474,8 @@ def test_live_import_accepts_page_and_layer_keys(layer_scoped: bool) -> None:
     assert plan["segments"] == []
     assert plan["format"] == "layer_slot_runs_v1"
     assert plan["compact_layout"]["group_id"] == 1
+    assert "latent_pages" not in plan
+    assert context["pages"] == []
 
 
 def test_live_import_hybrid_plan_uses_rank0_cpu_pages() -> None:
