@@ -2207,6 +2207,152 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
     ]
 
 
+def test_preferred_group0_store_is_fenced_before_group1_live_publish() -> None:
+    calls = []
+    engine = SimpleNamespace(
+        begin_live_source_descriptor=lambda req_id, groups=(0, 1): calls.append(
+            ("begin", req_id, groups)
+        ),
+        capture_live_source_step=lambda *args: calls.append(("capture", args[0])),
+        finalize_live_source_descriptor=lambda *_args: True,
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            ("store", args[0], kwargs["final"])
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["latent"], 1: ["indexer"]},
+            {0: "latent-slots", 1: "indexer-slots"},
+            0,
+        ),
+        _live_latent_split_requested=False,
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2, 3],
+        live_source_token_ids=[1, 2, 3],
+        live_source_slot_mapping=["live-latent"],
+        live_source_indexer_slot_mapping=["live-indexer"],
+        live_source_requested=True,
+        load_spec=None,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-tp0:12345"
+        },
+        is_last_prefill=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+
+    assert calls == [
+        ("begin", "request", (1,)),
+        ("capture", "request"),
+        ("store", "request", True),
+    ]
+    assert adapter._unfenced_live_stores == {}
+
+
+def test_group0_live_keeps_preferred_persistence_unfenced(monkeypatch) -> None:
+    calls = []
+    engine = SimpleNamespace(
+        begin_live_source_descriptor=lambda _req_id, _groups=(0, 1): None,
+        capture_live_source_step=lambda *_args: None,
+        finalize_live_source_descriptor=lambda *_args: True,
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            (args[0], kwargs["final"])
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["latent"], 1: ["indexer"]},
+            {0: "latent-slots", 1: "indexer-slots"},
+            0,
+        ),
+        _live_latent_split_requested=True,
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2, 3],
+        live_source_token_ids=[1, 2, 3],
+        live_source_slot_mapping=["live-latent"],
+        live_source_indexer_slot_mapping=["live-indexer"],
+        live_source_requested=True,
+        load_spec=None,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-tp0:12345"
+        },
+        is_last_prefill=True,
+    )
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+
+    assert calls == [("request", False)]
+    assert adapter._unfenced_live_stores == {"request": request}
+
+
+def test_group1_only_rank_does_not_fence_preferred_persistence() -> None:
+    calls = []
+    engine = SimpleNamespace(
+        begin_live_source_descriptor=lambda _req_id, _groups=(0, 1): None,
+        capture_live_source_step=lambda *_args: None,
+        finalize_live_source_descriptor=lambda *_args: True,
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            (args[0], kwargs["final"])
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {1: ["indexer"]},
+            {1: "indexer-slots"},
+            0,
+        ),
+        _live_latent_split_requested=False,
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2, 3],
+        live_source_token_ids=[1, 2, 3],
+        live_source_slot_mapping=["live-latent"],
+        live_source_indexer_slot_mapping=["live-indexer"],
+        live_source_requested=True,
+        load_spec=None,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-tp0:12345"
+        },
+        is_last_prefill=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+
+    assert calls == [("request", False)]
+    assert adapter._unfenced_live_stores == {"request": request}
+
+
 def test_enabled_live_latent_source_is_tp0_only(monkeypatch) -> None:
     calls = []
     engine = SimpleNamespace(

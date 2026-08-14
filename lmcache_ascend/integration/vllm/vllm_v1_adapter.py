@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_MOONCAKE_PREFERRED_SEGMENT_CONFIG = "lmcache.mooncake_preferred_segment"
+
 
 @dataclass
 class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
@@ -384,6 +386,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     0,
                     request.is_last_prefill,
                 )
+            else:
+                live_groups = ()
             finalized_live = False
             if live_source and request.is_last_prefill:
                 finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
@@ -393,6 +397,23 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
                 )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
+            preferred_segment = (
+                request.request_configs.get(_MOONCAKE_PREFERRED_SEGMENT_CONFIG)
+                if finalized_live
+                and 0 in selected
+                and isinstance(request.request_configs, dict)
+                else None
+            )
+            # A decoder-preferred group-0 object is the decoder's only source
+            # when the live transport carries group 1 alone.  Fence that final
+            # persistent write before the live descriptor can leave the worker;
+            # otherwise the decoder can race the asynchronous Mooncake Put.
+            # Preserve the existing unfenced path for unhinted requests and for
+            # true group-0 live transfer, where persistence is not on TTFT's
+            # critical correctness path.
+            fence_preferred_group0 = bool(
+                preferred_segment and 0 not in live_groups
+            )
             if direct_store and selected:
                 self.lmcache_engine.store_direct_prefill(
                     request.req_id,
@@ -400,11 +421,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     selected,
                     slot_mappings,
                     request.request_configs,
-                    final=request.is_last_prefill and not finalized_live,
+                    final=request.is_last_prefill
+                    and (not finalized_live or fence_preferred_group0),
                     slot_mapping_base=mapping_base,
                     verified_prefix_end=verified_prefix_end,
                 )
-            if finalized_live and direct_store and selected:
+            if (
+                finalized_live
+                and direct_store
+                and selected
+                and not fence_preferred_group0
+            ):
                 self._unfenced_live_stores[request.req_id] = request
 
     def build_connector_worker_meta(self) -> Optional[KVConnectorWorkerMetadata]:
