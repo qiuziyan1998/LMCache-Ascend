@@ -287,6 +287,20 @@ def test_direct_store_preflight_rejects_metadata_byte_mismatch() -> None:
     assert connector.direct_page_plan_rejection(1) == "page_byte_layout_mismatch"
 
 
+def test_direct_page_token_widths_preserve_plane_order() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.MLA_LATENT,
+    )
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    connector.get_shape = lambda *_args, **_kwargs: torch.Size([3])
+    k = torch.empty((2, 2, 1, 2), dtype=torch.float16)
+    v = torch.empty((2, 2, 1, 1), dtype=torch.float16)
+
+    assert connector.direct_page_token_widths([(k, v)], 0) == (4, 2)
+
+
 def test_direct_store_preflight_checks_each_group_layout_once() -> None:
     calls = []
     engine = object.__new__(AscendLMCacheEngine)
@@ -3831,5 +3845,64 @@ def test_compact_page_layout_keeps_layers_and_runs_independent() -> None:
     assert runs == [
         {"logical_token_start": 0, "physical_slot_start": 2, "token_count": 2},
         {"logical_token_start": 2, "physical_slot_start": 7, "token_count": 2},
+    ]
+    assert retained is owners
+
+
+def test_compact_latent_page_layout_preserves_page_run_boundaries() -> None:
+    connector = VLLMPagedMemLayerwiseNPUConnector.__new__(
+        VLLMPagedMemLayerwiseNPUConnector
+    )
+    owners = (torch.empty(1), torch.empty(1))
+    connector._direct_page_tensor_layout = MagicMock(
+        return_value=([(1000, 8), (2000, 8)], owners, 32)
+    )
+
+    layers, pages, retained = connector.plan_compact_latent_page_layout(
+        [], torch.tensor([2, 3, 7, 8, 9]), [0, 3], [3, 5]
+    )
+
+    assert layers == [
+        {
+            "layer_id": 0,
+            "buffer_base": 1000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+        {
+            "layer_id": 1,
+            "buffer_base": 2000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+    ]
+    assert pages == [
+        {
+            "logical_token_start": 0,
+            "token_count": 3,
+            "runs": [
+                {
+                    "logical_token_start": 0,
+                    "physical_slot_start": 2,
+                    "token_count": 2,
+                },
+                {
+                    "logical_token_start": 2,
+                    "physical_slot_start": 7,
+                    "token_count": 1,
+                },
+            ],
+        },
+        {
+            "logical_token_start": 3,
+            "token_count": 2,
+            "runs": [
+                {
+                    "logical_token_start": 3,
+                    "physical_slot_start": 8,
+                    "token_count": 2,
+                }
+            ],
+        },
     ]
     assert retained is owners

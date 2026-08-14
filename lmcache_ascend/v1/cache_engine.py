@@ -780,6 +780,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "segments": [],
                 "compact_layers": None,
                 "compact_runs": [],
+                "latent_layers": None,
+                "latent_pages": [],
                 "ends": {},
                 "groups": groups,
                 "invalid": False,
@@ -826,6 +828,62 @@ class AscendLMCacheEngine(LMCacheEngine):
         builder["compact_runs"].extend(runs)
         builder["ends"][kv_group] = end
 
+    def _record_live_latent_source_layout(
+        self,
+        req_id: str,
+        start: int,
+        end: int,
+        layers: list[dict[str, int]],
+        pages: list[dict[str, Any]],
+    ) -> None:
+        builder = self._live_source_builders.get(req_id)
+        if builder is None or 0 not in builder["groups"]:
+            return
+        coverage_end = int(builder["ends"].get(0, 0))
+        if start != coverage_end or end <= start:
+            builder["invalid"] = True
+            return
+        if builder["latent_layers"] not in (None, layers):
+            builder["invalid"] = True
+            return
+        logical = start
+        for page in pages:
+            page_start = int(page.get("logical_token_start", -1))
+            page_tokens = int(page.get("token_count", 0))
+            runs = page.get("runs", ())
+            if page_start != logical or page_tokens <= 0 or not runs:
+                builder["invalid"] = True
+                return
+            run_logical = page_start
+            for run in runs:
+                run_start = int(run.get("logical_token_start", -1))
+                run_tokens = int(run.get("token_count", 0))
+                if run_start != run_logical or run_tokens <= 0:
+                    builder["invalid"] = True
+                    return
+                run_logical += run_tokens
+            if run_logical != page_start + page_tokens:
+                builder["invalid"] = True
+                return
+            logical += page_tokens
+        if logical != end:
+            builder["invalid"] = True
+            return
+        builder["latent_layers"] = layers
+        builder["latent_pages"].extend(pages)
+        builder["ends"][0] = end
+
+    @staticmethod
+    def _disable_live_latent_group(builder: dict[str, Any]) -> None:
+        """Keep a valid group-1 descriptor when optional group 0 cannot plan."""
+        builder["groups"] = tuple(
+            group for group in builder["groups"] if group != 0
+        )
+        builder["ends"].pop(0, None)
+        builder["latent_layers"] = None
+        builder["latent_pages"].clear()
+        builder["invalid"] = False
+
     def _record_live_source_pages(
         self,
         req_id: str,
@@ -838,7 +896,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         builder = self._live_source_builders.get(req_id)
         if builder is None or kv_group not in builder["groups"]:
             return
-        if builder["compact_layers"] is not None:
+        if (
+            kv_group == 1 and builder["compact_layers"] is not None
+        ) or (
+            kv_group == 0 and builder["latent_layers"] is not None
+        ):
             # Rank 0's persistent direct-store path observes the same source
             # pages after compact live capture. The compact descriptor already
             # owns complete logical coverage, so this duplicate representation
@@ -925,6 +987,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             return False
         totals = [0, 0]
         compact_layers = builder["compact_layers"]
+        latent_layers = builder["latent_layers"]
+        if latent_layers is not None:
+            totals[0] = sum(
+                int(page["token_count"])
+                * sum(layer["token_bytes"] for layer in latent_layers)
+                for page in builder["latent_pages"]
+            )
         if compact_layers is not None:
             totals[1] = token_count * sum(
                 layer["token_bytes"] for layer in compact_layers
@@ -949,16 +1018,34 @@ class AscendLMCacheEngine(LMCacheEngine):
             "tp_rank": tp_rank,
             "dp_rank": dp_rank,
         }
-        if compact_layers is None:
+        if compact_layers is None and latent_layers is None:
             descriptor["segments"] = builder["segments"]
         else:
-            descriptor["format"] = "layer_slot_runs_v1"
-            descriptor["compact_layout"] = {
-                "group_id": 1,
-                "token_count": token_count,
-                "layers": compact_layers,
-                "runs": builder["compact_runs"],
-            }
+            if compact_layers is not None:
+                descriptor["format"] = "layer_slot_runs_v1"
+                descriptor["compact_layout"] = {
+                    "group_id": 1,
+                    "token_count": token_count,
+                    "layers": compact_layers,
+                    "runs": builder["compact_runs"],
+                }
+            if latent_layers is not None:
+                # Keep the established group-1 carrier format.  The latent
+                # layout is an optional extension: older peers ignore it and
+                # can still execute group-1 P2P. Keep the base totals valid
+                # for that established schema and carry the group-0 total in
+                # its own extension field; a new peer validates and promotes
+                # it before constructing a hybrid plan.
+                descriptor["format"] = "layer_slot_runs_v1"
+                latent_total = totals[0]
+                descriptor["group_byte_totals"][0] = 0
+                descriptor["latent_group_byte_total"] = latent_total
+                descriptor["latent_layout"] = {
+                    "group_id": 0,
+                    "token_count": token_count,
+                    "layers": latent_layers,
+                    "pages": builder["latent_pages"],
+                }
         self._completed_live_sources[req_id] = descriptor
         cold_start_perf_log(
             logger,
@@ -971,6 +1058,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             segments=len(builder["segments"]),
             compact_layers=len(compact_layers or ()),
             compact_runs=len(builder["compact_runs"]),
+            latent_layers=len(latent_layers or ()),
+            latent_pages=len(builder["latent_pages"]),
             group_byte_totals=totals,
         )
         return True
@@ -993,6 +1082,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         if req_id in self._completed_live_sources:
             return
         planner = getattr(self.gpu_connector, "plan_compact_page_layout", None)
+        latent_planner = getattr(
+            self.gpu_connector, "plan_compact_latent_page_layout", None
+        )
         legacy_planner = getattr(
             self.gpu_connector, "plan_direct_page_sources", None
         )
@@ -1053,11 +1145,55 @@ class AscendLMCacheEngine(LMCacheEngine):
                 (latent[0], latent[1], indexer[2])
                 for latent, indexer in zip(plan0, group1_keys, strict=True)
             ]}
+            if 0 in builder["groups"]:
+                plans[0] = plan0
             for group, chunks in plans.items():
                 if not chunks:
                     continue
                 starts = [start for start, _, _ in chunks]
                 ends = [end for _, end, _ in chunks]
+                if group == 0:
+                    if builder["segments"]:
+                        # The v1 wire format supports either legacy segments
+                        # or compact layouts, not a mixture. Preserve the
+                        # already valid legacy group-1 source instead of
+                        # adding a latent layout that would make the entire
+                        # descriptor fail decoder validation.
+                        self._disable_live_latent_group(builder)
+                        continue
+                    try:
+                        if not callable(latent_planner):
+                            raise ValueError(
+                                "compact latent source layout is unsupported"
+                            )
+                        latent_planned = latent_planner(
+                            group_caches[group],
+                            slot_mappings[group],
+                            starts,
+                            ends,
+                            slot_mapping_base=slot_mapping_base,
+                        )
+                        if latent_planned is None:
+                            raise ValueError(
+                                "compact latent source layout is unsupported"
+                            )
+                        layers, pages, _owners = latent_planned
+                        self._record_live_latent_source_layout(
+                            req_id, starts[0], ends[-1], layers, pages
+                        )
+                        if builder["invalid"]:
+                            raise ValueError(
+                                "compact latent source coverage is invalid"
+                            )
+                    except Exception as error:
+                        self._disable_live_latent_group(builder)
+                        logger.warning(
+                            "Live latent source disabled for request %s; "
+                            "preserving group-1 P2P: %s",
+                            req_id,
+                            error,
+                        )
+                    continue
                 planned = (
                     planner(
                         group_caches[group],
@@ -1089,6 +1225,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                             sizes,
                             tuple(owners),
                         )
+                        if builder["invalid"]:
+                            raise ValueError(
+                                "live group-1 source coverage is invalid"
+                            )
                         continue
                 if planned is None:
                     raise ValueError("direct page source layout is unsupported")
@@ -1096,6 +1236,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._record_live_source_layout(
                     req_id, group, starts[0], ends[-1], layers, runs
                 )
+                if builder["invalid"]:
+                    raise ValueError(
+                        "live group-1 source coverage is invalid"
+                    )
             builder["planned_end"] = target_end
             builder["planned_hash"] = int(plan0[-1][2].chunk_hash)
         except Exception as error:
@@ -2691,6 +2835,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         tokens: list[int],
         indexer_slots: torch.Tensor,
         indexer_kvcaches: list,
+        latent_kvcaches: Optional[list] = None,
         request_configs: Optional[dict],
         tp_rank: int,
         dp_rank: int,
@@ -2716,6 +2861,24 @@ class AscendLMCacheEngine(LMCacheEngine):
         valid_tokens = [end - start for start, end, _ in chunks]
         pages: list[LayerPageMemoryObj] = []
         if 0 in handled_groups:
+            if self._is_passive():
+                raise RuntimeError(
+                    "Passive ranks cannot allocate live group-0 destinations"
+                )
+            token_width_planner = getattr(
+                self.gpu_connector, "direct_page_token_widths", None
+            )
+            latent_token_bytes = (
+                token_width_planner(latent_kvcaches, 0)
+                if latent_kvcaches and callable(token_width_planner)
+                else None
+            )
+            if not latent_token_bytes:
+                raise ValueError("Live split latent destination layout is unsupported")
+            self._ensure_layerwise_connector_layout(
+                kvcaches=latent_kvcaches,
+                kv_group=0,
+            )
             shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
                 kv_group=0, num_tokens=self.config.chunk_size
             )
@@ -2724,11 +2887,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                 [shape], [dtype], len(chunks), self.num_layers, fmt,
                 valid_tokens=valid_tokens,
                 full_tokens=self.config.chunk_size,
+                busy_loop=False,
             )
-            if allocated is None or not LayerPageMemoryObj.pin_many(allocated):
+            if allocated is None:
                 raise MemoryError("Live split shared-CPU page allocation failed")
+            try:
+                pinned = LayerPageMemoryObj.pin_many(allocated)
+            except BaseException:
+                self._release_shared_retrieve_objs(
+                    list(allocated), unpin=False
+                )
+                raise
+            if not pinned:
+                self._release_shared_retrieve_objs(
+                    list(allocated), unpin=False
+                )
+                raise MemoryError("Live split shared-CPU page pin failed")
             pages = allocated
-        compact_destination = handled_groups == (1,)
+        compact_destination = 1 in handled_groups
         destination_planner = getattr(
             self.gpu_connector,
             "plan_compact_page_layout" if compact_destination
@@ -2758,15 +2934,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 dst1_layers = dst1_runs = []
 
             segments: list[dict[str, Any]] = []
+            latent_pages: list[dict[str, int]] = []
             totals = [0, 0]
-            for page in pages:
+            for page, start, valid in zip(
+                pages, starts, valid_tokens, strict=True
+            ):
                 size = page.get_size()
-                segments.append({
-                    "group_id": 0,
-                    "destination_address": page.data_ptr,
-                    "length": size,
-                    "destination_kind": "cpu",
-                })
+                latent_pages.append(
+                    {
+                        "logical_token_start": start,
+                        "destination_address": page.data_ptr,
+                        "length": size,
+                        "valid_tokens": valid,
+                    }
+                )
                 totals[0] += size
             if 1 in handled_groups:
                 if compact_destination:
@@ -2794,13 +2975,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "dp_rank": dp_rank,
             }
             if compact_destination:
-                plan["format"] = "layer_slot_runs_v1"
+                plan["format"] = (
+                    "hybrid_compact_v1" if latent_pages else "layer_slot_runs_v1"
+                )
                 plan["compact_layout"] = {
                     "group_id": 1,
                     "token_count": len(tokens),
                     "layers": dst1_layers,
                     "runs": dst1_runs,
                 }
+            if latent_pages:
+                plan["latent_pages"] = latent_pages
+                plan["latent_token_bytes"] = list(latent_token_bytes)
             context = {
                 "pages": pages,
                 "keys": page_keys,
@@ -2813,39 +2999,35 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._release_shared_retrieve_objs(list(pages), unpin=True)
             raise
 
-    def _commit_live_split_import(self, context: dict[str, Any]) -> dict[str, Any]:
-        """Publish and return request-owned group-0 sparse source metadata."""
+    def admit_live_split_pages(self, context: dict[str, Any]) -> None:
+        """Admit completed group-0 pages for the existing shared bootstrap.
+
+        The LocalCPU cache takes its own references synchronously.  The live
+        import's temporary pins and allocator references are then released so
+        the ordinary rank-0 bootstrap can acquire the pages and publish the
+        existing shared-handle collective without a second ownership model.
+        """
         pages = context["pages"]
         if not pages:
-            raise RuntimeError("Live split import has no latent pages to commit")
-        self._shared_local_cpu_backend().batched_submit_layer_pages(
-            context["keys"], pages
-        )
-        cache: dict[str, Any] = {
-            "cached_keys": [
-                [key.get_layer(layer_id) for key in context["keys"]]
-                for layer_id in range(self.num_layers)
-            ],
-            "cached_starts": list(context["starts"]),
-            "cached_ends": list(context["ends"]),
-            "cached_memory_objs": [],
-            "cached_tensors": [],
-            "cached_chunk_dev_ptrs": [],
-            "cached_chunk_ptrs_npu": [],
-            "cached_shared_handles": [],
-        }
-        self._append_retrieve_group_cache(
-            [
-                LayerPageSource(tuple(pages), layer_id)
-                for layer_id in range(self.num_layers)
-            ],
-            cache["cached_memory_objs"],
-            cache["cached_tensors"],
-            cache["cached_chunk_dev_ptrs"],
-            cache["cached_chunk_ptrs_npu"],
-        )
+            raise RuntimeError("Live split import has no latent pages to admit")
         context["pages"] = []
-        return cache
+        local = self._shared_local_cpu_backend()
+        try:
+            local.batched_submit_layer_pages(context["keys"], pages)
+            compatible = getattr(
+                local, "contains_compatible_layer_pages_exact", None
+            )
+            if not callable(compatible) or not compatible(
+                context["keys"], pages
+            ):
+                raise RuntimeError(
+                    "Live split pages lost admission to incompatible cache entries"
+                )
+        finally:
+            # Existing entries may win the atomic cache admission race. The
+            # cache owns a reference for every newly admitted page; duplicate
+            # imports retain no cache reference and are released here as well.
+            self._release_shared_retrieve_objs(list(pages), unpin=True)
 
     def _release_live_split_import(self, context: dict[str, Any]) -> None:
         """Release an unacknowledged live-import allocation."""

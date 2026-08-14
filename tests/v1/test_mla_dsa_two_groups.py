@@ -1748,6 +1748,77 @@ class TestAscendAdapterInitialization:
         with pytest.raises(ValueError, match="not supported with async store"):
             self._construct(KVConnectorRole.WORKER, "kv_producer")
 
+    def test_old_base_without_latent_capability_fails_closed(self):
+        from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+            LMCacheAscendConnectorV1Impl,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorRole,
+        )
+
+        def base_init(adapter, *_args, **_kwargs):
+            adapter.config = SimpleNamespace(
+                store_async=True,
+                get_extra_config_value=lambda *_args: False,
+            )
+            adapter.use_layerwise = True
+            adapter.kv_role = "kv_consumer"
+
+        generic_base = LMCacheAscendConnectorV1Impl.__mro__[1]
+        with (
+            patch.object(generic_base, "__init__", base_init),
+            patch.object(
+                LMCacheAscendConnectorV1Impl,
+                "supports_dsa_live_latent_split",
+                None,
+            ),
+        ):
+            adapter = LMCacheAscendConnectorV1Impl(
+                SimpleNamespace(),
+                KVConnectorRole.WORKER,
+                SimpleNamespace(),
+            )
+
+        assert adapter._live_latent_split_requested is False
+
+    def test_latent_source_requires_explicit_transport_negotiation(self):
+        from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+            LMCacheAscendConnectorV1Impl,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorRole,
+        )
+
+        def base_init(adapter, *_args, **_kwargs):
+            adapter.config = SimpleNamespace(
+                store_async=True,
+                get_extra_config_value=lambda *_args: False,
+            )
+            adapter.use_layerwise = True
+            adapter.kv_role = "kv_consumer"
+
+        generic_base = LMCacheAscendConnectorV1Impl.__mro__[1]
+        with (
+            patch.object(generic_base, "__init__", base_init),
+            patch.object(
+                LMCacheAscendConnectorV1Impl,
+                "supports_dsa_live_latent_split",
+                return_value=True,
+            ),
+        ):
+            adapter = LMCacheAscendConnectorV1Impl(
+                SimpleNamespace(),
+                KVConnectorRole.WORKER,
+                SimpleNamespace(),
+            )
+            assert adapter._live_latent_split_requested is False
+
+            adapter.configure_live_latent_source(True)
+            assert adapter._live_latent_split_requested is True
+
+            adapter.configure_live_latent_source(False)
+            assert adapter._live_latent_split_requested is False
+
 
 def test_direct_prefill_uses_window_relative_save_mappings() -> None:
     calls = []
@@ -2134,6 +2205,63 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
         ("capture", "request"),
         ("store", "request"),
     ]
+
+
+def test_enabled_live_latent_source_is_tp0_only(monkeypatch) -> None:
+    calls = []
+    engine = SimpleNamespace(
+        begin_live_source_descriptor=lambda req_id, groups=(0, 1): calls.append(
+            (req_id, groups)
+        ),
+        direct_prefill_store_enabled=lambda: False,
+        capture_live_source_step=lambda *_args: None,
+    )
+    adapter = SimpleNamespace(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _refresh_kvcaches_list=lambda: None,
+        _kvcaches_for_group=lambda group: [f"cache-{group}"],
+        _windowed_sparse_save_mapping=lambda request, group, _base: (
+            request.indexer_slot_mapping[0]
+            if group
+            else request.slot_mapping[0]
+        ),
+        _live_latent_split_requested=True,
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=list(range(4)),
+        slot_mapping=["latent"],
+        indexer_slot_mapping=["index"],
+        save_slot_mapping_base=0,
+        save_spec=None,
+        request_configs=None,
+        load_spec=None,
+        live_source_requested=True,
+        is_last_prefill=False,
+    )
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+    assert calls == [("request", (0, 1))]
+
+    calls.clear()
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "get_tensor_model_parallel_rank",
+        lambda: 1,
+    )
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+    assert calls == [("request", (1,))]
 
 
 def test_live_source_captures_rank_that_skips_persistent_store() -> None:

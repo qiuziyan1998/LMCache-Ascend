@@ -68,6 +68,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if callable(get_extra)
             else False
         )
+        # The provider must not self-activate the hybrid wire format.  A new
+        # LMCache provider can be paired with an older vLLM/Mooncake consumer;
+        # in that case an unnegotiated latent extension could discard the
+        # otherwise valid group-1 source descriptor. AscendMultiConnector enables this
+        # only after both sides of the in-process transport negotiate support.
+        self._live_latent_split_requested = False
         self._direct_store_observed_layers: set[str] = set()
         self._direct_store_step_supported: Optional[bool] = None
         self._completed_layerwise_stores: dict[
@@ -75,6 +81,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         ] = {}
         self._scheduler_live_sources: dict[str, list[dict[str, Any]]] = {}
         self._unfenced_live_stores: dict[str, ReqMeta] = {}
+
         if self._direct_store_requested:
             extra = self.config.extra_config or {}
             valid = (
@@ -107,6 +114,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "Layerwise storing is not supported with async store"
             )
         logger.debug("store_async: %s", self.store_async)
+
+    def configure_live_latent_source(self, enabled: bool) -> None:
+        """Apply the two-sided hybrid-transport capability decision."""
+        configure = getattr(super(), "configure_live_latent_source", None)
+        if callable(configure):
+            configure(enabled)
+            return
+        # Preserve startup compatibility with an older LMCache-NPU base.  It
+        # has no hybrid transport hook, so fail closed without affecting the
+        # established group-1 path.
+        self._live_latent_split_requested = False
 
     def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
         if (
@@ -348,8 +366,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
                 live_source = False
             if live_source:
+                live_groups = (
+                    (0, 1)
+                    if getattr(self, "_live_latent_split_requested", False)
+                    and get_tensor_model_parallel_rank() == 0
+                    else (1,)
+                )
                 self.lmcache_engine.begin_live_source_descriptor(
-                    request.req_id, (1,)
+                    request.req_id, live_groups
                 )
                 self.lmcache_engine.capture_live_source_step(
                     request.req_id,
@@ -400,6 +424,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 ),
                 compact_runs=len(
                     descriptor.get("compact_layout", {}).get("runs", ())
+                ),
+                latent_layers=len(
+                    descriptor.get("latent_layout", {}).get("layers", ())
+                ),
+                latent_pages=len(
+                    descriptor.get("latent_layout", {}).get("pages", ())
                 ),
                 group_byte_totals=descriptor.get("group_byte_totals"),
             )

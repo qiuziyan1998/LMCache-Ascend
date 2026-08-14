@@ -3271,6 +3271,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Check direct-store eligibility without scanning request slot mappings."""
         return self._direct_page_tensor_layout(kvcaches, kv_group) is not None
 
+    def direct_page_token_widths(
+        self, kvcaches: list, kv_group: int
+    ) -> Optional[tuple[int, ...]]:
+        """Return the ordered per-plane byte layout used by a direct page."""
+        layout = self._direct_page_tensor_layout(kvcaches, kv_group)
+        if layout is None:
+            return None
+        tensor_meta, _owners, _slot_capacity = layout
+        return tuple(token_bytes for _base, token_bytes in tensor_meta)
+
     def plan_compact_page_layout(
         self,
         kvcaches: list,
@@ -3335,6 +3345,98 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ]
             getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
             return layers, runs, owners
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return self._reject_direct_page_plan(
+                kv_group, f"{type(exc).__name__}:{exc}"
+            )
+
+    def plan_compact_latent_page_layout(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[
+            list[dict[str, int]],
+            list[dict[str, Any]],
+            tuple[torch.Tensor, ...],
+        ]
+    ]:
+        """Describe group-0 buffers and page-scoped logical slot runs.
+
+        Unlike the group-1 compact layout, the page boundaries are retained
+        because one decoder destination is an all-layer shared-CPU page.  The
+        receiving worker can therefore reconstruct the exact byte order used
+        by :meth:`plan_direct_page_sources` without transporting the Cartesian
+        product of pages, layer planes, and slot runs.
+        """
+        kv_group = 0
+        try:
+            direct_layout = self._direct_page_tensor_layout(kvcaches, kv_group)
+            if direct_layout is None:
+                return None
+            tensor_meta, owners, slot_capacity = direct_layout
+            if not starts or len(starts) != len(ends) or len(slot_mapping) == 0:
+                return self._reject_direct_page_plan(kv_group, "invalid_ranges")
+            logical_start, logical_end = min(starts), max(ends)
+            local_start = logical_start - slot_mapping_base
+            local_end = logical_end - slot_mapping_base
+            if (
+                local_start < 0
+                or local_end > len(slot_mapping)
+                or any(left != right for left, right in zip(ends[:-1], starts[1:]))
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "noncontiguous_slot_window"
+                )
+            slots = slot_mapping[local_start:local_end].detach().to(
+                device="cpu", dtype=torch.long
+            )
+            if bool(((slots < 0) | (slots >= slot_capacity)).any()):
+                return self._reject_direct_page_plan(
+                    kv_group, "slot_value_out_of_bounds"
+                )
+
+            pages: list[dict[str, Any]] = []
+            for start, end in zip(starts, ends, strict=True):
+                page_start = start - logical_start
+                page_end = end - logical_start
+                if page_start < 0 or page_end <= page_start or page_end > len(slots):
+                    return self._reject_direct_page_plan(
+                        kv_group, "page_range_out_of_bounds"
+                    )
+                page_slots = slots[page_start:page_end]
+                breaks = torch.where(page_slots[1:] != page_slots[:-1] + 1)[0] + 1
+                boundaries = [0, *breaks.tolist(), page_slots.numel()]
+                runs = [
+                    {
+                        "logical_token_start": start + left,
+                        "physical_slot_start": int(page_slots[left]),
+                        "token_count": right - left,
+                    }
+                    for left, right in pairwise(boundaries)
+                ]
+                pages.append(
+                    {
+                        "logical_token_start": start,
+                        "token_count": end - start,
+                        "runs": runs,
+                    }
+                )
+
+            layers = [
+                {
+                    "layer_id": layer_id,
+                    "buffer_base": base,
+                    "token_bytes": token_bytes,
+                    "slot_capacity": slot_capacity,
+                }
+                for layer_id, (base, token_bytes) in enumerate(tensor_meta)
+            ]
+            getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
+            return layers, pages, owners
         except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
             return self._reject_direct_page_plan(
                 kv_group, f"{type(exc).__name__}:{exc}"

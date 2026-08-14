@@ -4,7 +4,7 @@
 # Standard
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Third Party
 import pytest
@@ -16,7 +16,7 @@ from lmcache.v1.cache_engine import (
     _SHARED_SPARSE_DEFER_COMMIT,
     _SHARED_SPARSE_PREPARE_ONLY,
 )
-from lmcache.v1.memory_management import LayerPageSource
+from lmcache.v1.memory_management import LayerPageMemoryObj, LayerPageSource
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch, SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
@@ -365,7 +365,7 @@ def test_partial_legacy_state_does_not_hide_remote_layer_page(monkeypatch) -> No
     assert resolved == [[page], [page]]
 
 
-def test_live_import_commit_adopts_page_without_releasing_request_owner() -> None:
+def test_live_import_admission_transfers_temporary_page_ownership() -> None:
     class _Page:
         def __init__(self) -> None:
             self.is_pinned = True
@@ -382,36 +382,64 @@ def test_live_import_commit_adopts_page_without_releasing_request_owner() -> Non
         def ref_count_down(self) -> None:
             self.releases += 1
 
-    submissions = []
     page = _Page()
-    engine = object.__new__(AscendLMCacheEngine)
-    engine.num_layers = 2
-    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
-        batched_submit_layer_pages=lambda keys, pages: submissions.append(
-            (keys, list(pages))
-        )
-    )
-    engine._append_retrieve_group_cache = MagicMock()
+    submissions = []
     key = CacheEngineKey("model", 1, 0, 7, torch.float16)
-    context = {
-        "keys": [key],
-        "pages": [page],
-        "starts": [0],
-        "ends": [3],
-    }
+    local = SimpleNamespace(
+        batched_submit_layer_pages=lambda keys, pages: submissions.append(
+            (list(keys), list(pages))
+        ),
+        contains_compatible_layer_pages_exact=lambda keys, pages: (
+            list(keys) == [key] and list(pages) == [page]
+        ),
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._shared_local_cpu_backend = lambda: local
+    context = {"keys": [key], "pages": [page]}
 
-    cache = engine._commit_live_split_import(context)
-    with pytest.raises(RuntimeError, match="no latent pages"):
-        engine._commit_live_split_import(context)
-    engine._release_live_split_import(context)
+    engine.admit_live_split_pages(context)
 
     assert submissions == [([key], [page])]
     assert context["pages"] == []
-    assert cache["cached_starts"] == [0]
-    assert cache["cached_ends"] == [3]
-    assert page.unpins == 0
-    assert page.releases == 0
-    engine._append_retrieve_group_cache.assert_called_once()
+    assert page.unpins == 1
+    assert page.releases == 1
+    with pytest.raises(RuntimeError, match="no latent pages"):
+        engine.admit_live_split_pages(context)
+
+
+def test_live_import_admission_releases_duplicate_import() -> None:
+    class _Page:
+        is_pinned = True
+
+        def __init__(self) -> None:
+            self.unpins = 0
+            self.releases = 0
+
+        def unpin(self) -> None:
+            self.is_pinned = False
+            self.unpins += 1
+
+        def is_valid(self) -> bool:
+            return True
+
+        def ref_count_down(self) -> None:
+            self.releases += 1
+
+    page = _Page()
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        # A pre-existing exact key wins; LocalCPU deliberately takes no ref
+        # from the duplicate page supplied here.
+        batched_submit_layer_pages=lambda _keys, _pages: None,
+        contains_compatible_layer_pages_exact=lambda _keys, _pages: True,
+    )
+    context = {"keys": [key], "pages": [page]}
+
+    engine.admit_live_split_pages(context)
+
+    assert context["pages"] == []
+    assert (page.unpins, page.releases) == (1, 1)
 
 
 @pytest.mark.parametrize("layer_scoped", [False, True])
@@ -446,6 +474,165 @@ def test_live_import_accepts_page_and_layer_keys(layer_scoped: bool) -> None:
     assert plan["segments"] == []
     assert plan["format"] == "layer_slot_runs_v1"
     assert plan["compact_layout"]["group_id"] == 1
+
+
+def test_live_import_hybrid_plan_uses_rank0_cpu_pages() -> None:
+    class _Page:
+        data_ptr = 3000
+        is_pinned = False
+        valid_tokens = 3
+
+        def get_size(self) -> int:
+            return 96
+
+    page_key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine.num_layers = 2
+    engine._is_passive = lambda: False
+    engine._dense_retrieve_token_results = lambda *_args: [(0, 3, page_key)]
+    engine._ensure_layerwise_connector_layout = MagicMock()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([3, 4]),
+        torch.float16,
+        object(),
+    )
+    local = SimpleNamespace(
+        batched_allocate_layer_pages=MagicMock(return_value=[_Page()])
+    )
+    engine._shared_local_cpu_backend = lambda: local
+    engine.gpu_connector = SimpleNamespace(
+        direct_page_token_widths=lambda caches, group: (
+            (8, 24) if caches == ["latent"] and group == 0 else None
+        ),
+        plan_compact_page_layout=lambda *_args: (
+            [
+                {
+                    "layer_id": 0,
+                    "buffer_base": 100,
+                    "token_bytes": 4,
+                    "slot_capacity": 4,
+                }
+            ],
+            [
+                {
+                    "logical_token_start": 0,
+                    "physical_slot_start": 0,
+                    "token_count": 3,
+                }
+            ],
+            ("owner",),
+        ),
+    )
+
+    with patch.object(LayerPageMemoryObj, "pin_many", return_value=True):
+        plan, context = engine._prepare_live_split_import(
+            tokens=[1, 2, 3],
+            latent_kvcaches=["latent"],
+            indexer_slots=torch.arange(3),
+            indexer_kvcaches=[object()],
+            request_configs=None,
+            tp_rank=0,
+            dp_rank=0,
+            handled_groups=(0, 1),
+        )
+
+    assert plan["format"] == "hybrid_compact_v1"
+    assert plan["segments"] == []
+    assert plan["group_byte_totals"] == (96, 12)
+    assert plan["latent_pages"] == [
+        {
+            "logical_token_start": 0,
+            "destination_address": 3000,
+            "length": 96,
+            "valid_tokens": 3,
+        }
+    ]
+    assert plan["latent_token_bytes"] == [8, 24]
+    assert context["pages"][0].data_ptr == 3000
+    engine._ensure_layerwise_connector_layout.assert_called_once_with(
+        kvcaches=["latent"], kv_group=0
+    )
+    assert (
+        local.batched_allocate_layer_pages.call_args.kwargs["busy_loop"]
+        is False
+    )
+
+
+def test_live_import_passive_rank_rejects_group0_before_allocation() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine._is_passive = lambda: True
+    engine._dense_retrieve_token_results = lambda *_args: [
+        (0, 1, CacheEngineKey("model", 1, 0, 7, torch.float16))
+    ]
+    engine._shared_local_cpu_backend = lambda: pytest.fail(
+        "passive rank must not access rank-0 LocalCPU allocation"
+    )
+
+    with pytest.raises(RuntimeError, match="Passive ranks"):
+        engine._prepare_live_split_import(
+            tokens=[1],
+            latent_kvcaches=[object()],
+            indexer_slots=torch.arange(1),
+            indexer_kvcaches=[object()],
+            request_configs=None,
+            tp_rank=1,
+            dp_rank=0,
+            handled_groups=(0, 1),
+        )
+
+
+def test_live_import_pin_failure_releases_allocated_page_owner() -> None:
+    class _Page:
+        is_pinned = False
+        releases = 0
+
+        def is_valid(self) -> bool:
+            return True
+
+        def ref_count_down(self) -> None:
+            self.releases += 1
+
+    page = _Page()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine.num_layers = 1
+    engine._is_passive = lambda: False
+    engine._dense_retrieve_token_results = lambda *_args: [
+        (0, 1, CacheEngineKey("model", 1, 0, 7, torch.float16))
+    ]
+    engine._ensure_layerwise_connector_layout = MagicMock()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([1, 1]), torch.float16, object()
+    )
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        batched_allocate_layer_pages=MagicMock(return_value=[page])
+    )
+    engine.gpu_connector = SimpleNamespace(
+        direct_page_token_widths=lambda *_args: (2, 2)
+    )
+
+    with (
+        patch.object(
+            LayerPageMemoryObj,
+            "pin_many",
+            side_effect=RuntimeError("monitor failure"),
+        ),
+        pytest.raises(RuntimeError, match="monitor failure"),
+    ):
+        engine._prepare_live_split_import(
+            tokens=[1],
+            latent_kvcaches=[object()],
+            indexer_slots=torch.arange(1),
+            indexer_kvcaches=[object()],
+            request_configs=None,
+            tp_rank=0,
+            dp_rank=0,
+            handled_groups=(0, 1),
+        )
+
+    assert page.releases == 1
 
 
 def test_live_source_record_is_cumulative_deduplicated_and_exact() -> None:
@@ -594,6 +781,216 @@ def test_live_source_capture_defers_partial_tail_until_final_step() -> None:
     assert descriptor["group_byte_totals"] == [0, 6]
     assert descriptor["compact_layout"]["token_count"] == 6
     assert len(descriptor["compact_layout"]["runs"]) == 2
+
+
+def test_hybrid_live_source_emits_compact_latent_pages() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.begin_live_source_descriptor("request", (0, 1))
+    latent_layers = [
+        {
+            "layer_id": 0,
+            "buffer_base": 1000,
+            "token_bytes": 8,
+            "slot_capacity": 16,
+        }
+    ]
+    latent_pages = [
+        {
+            "logical_token_start": 0,
+            "token_count": 3,
+            "runs": [
+                {
+                    "logical_token_start": 0,
+                    "physical_slot_start": 2,
+                    "token_count": 3,
+                }
+            ],
+        },
+        {
+            "logical_token_start": 3,
+            "token_count": 1,
+            "runs": [
+                {
+                    "logical_token_start": 3,
+                    "physical_slot_start": 9,
+                    "token_count": 1,
+                }
+            ],
+        },
+    ]
+    index_layers = [
+        {
+            "layer_id": 0,
+            "buffer_base": 2000,
+            "token_bytes": 4,
+            "slot_capacity": 16,
+        }
+    ]
+    index_runs = [
+        {
+            "logical_token_start": 0,
+            "physical_slot_start": 4,
+            "token_count": 4,
+        }
+    ]
+
+    engine._record_live_latent_source_layout(
+        "request", 0, 4, latent_layers, latent_pages
+    )
+    engine._record_live_source_layout(
+        "request", 1, 0, 4, index_layers, index_runs
+    )
+
+    assert engine.finalize_live_source_descriptor("request", 4, 0, 0)
+    descriptor = engine.drain_live_source_descriptors()["request"]
+    assert descriptor["format"] == "layer_slot_runs_v1"
+    assert descriptor["group_byte_totals"] == [0, 16]
+    assert descriptor["latent_group_byte_total"] == 32
+    assert descriptor["latent_layout"] == {
+        "group_id": 0,
+        "token_count": 4,
+        "layers": latent_layers,
+        "pages": latent_pages,
+    }
+    assert descriptor["compact_layout"]["group_id"] == 1
+
+
+def test_latent_plan_failure_preserves_group1_live_source() -> None:
+    class _Tokens:
+        @staticmethod
+        def process_tokens(*, tokens=None, hashes=None, **kwargs):
+            if hashes is not None:
+                return iter(
+                    (0, size, SimpleNamespace(chunk_hash=value))
+                    for value, size in zip(
+                        hashes, kwargs["offsets"], strict=True
+                    )
+                )
+            return iter(((0, len(tokens), SimpleNamespace(chunk_hash=11)),))
+
+    def index_planner(_caches, _slots, starts, ends, _group, **_kwargs):
+        return (
+            [{"layer_id": 0, "buffer_base": 2000,
+              "token_bytes": 4, "slot_capacity": 16}],
+            [{"logical_token_start": starts[0],
+              "physical_slot_start": 2,
+              "token_count": ends[-1] - starts[0]}],
+            (),
+        )
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine.token_database = _Tokens()
+    engine.gpu_connector = SimpleNamespace(
+        plan_compact_page_layout=index_planner,
+        plan_compact_latent_page_layout=lambda *_args, **_kwargs: None,
+    )
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.begin_live_source_descriptor("request", (0, 1))
+
+    engine.capture_live_source_step(
+        "request",
+        [1, 2, 3, 4],
+        {0: [object()], 1: [object()]},
+        {0: object(), 1: object()},
+        None,
+        0,
+        final=True,
+    )
+
+    assert engine.finalize_live_source_descriptor("request", 4, 0, 0)
+    descriptor = engine.drain_live_source_descriptors()["request"]
+    assert descriptor["format"] == "layer_slot_runs_v1"
+    assert descriptor["group_byte_totals"] == [0, 16]
+    assert "latent_layout" not in descriptor
+
+
+def test_legacy_group1_source_disables_incompatible_latent_extension() -> None:
+    class _Tokens:
+        @staticmethod
+        def process_tokens(*, tokens=None, hashes=None, **kwargs):
+            if hashes is not None:
+                return iter(
+                    (0, size, SimpleNamespace(chunk_hash=value))
+                    for value, size in zip(
+                        hashes, kwargs["offsets"], strict=True
+                    )
+                )
+            return iter(((0, len(tokens), SimpleNamespace(chunk_hash=11)),))
+
+    owner = MagicMock()
+    owner.data_ptr.return_value = 2000
+    owner.numel.return_value = 16
+    owner.element_size.return_value = 1
+    latent_planner = MagicMock()
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine.token_database = _Tokens()
+    engine.gpu_connector = SimpleNamespace(
+        plan_compact_page_layout=lambda *_args, **_kwargs: None,
+        plan_compact_latent_page_layout=latent_planner,
+        plan_direct_page_sources=lambda *_args, **_kwargs: (
+            [[2000]], [[16]], (owner,)
+        ),
+    )
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.begin_live_source_descriptor("request", (0, 1))
+
+    engine.capture_live_source_step(
+        "request",
+        [1, 2, 3, 4],
+        {0: [object()], 1: [object()]},
+        {0: object(), 1: object()},
+        None,
+        0,
+        final=True,
+    )
+
+    assert engine.finalize_live_source_descriptor("request", 4, 0, 0)
+    descriptor = engine.drain_live_source_descriptors()["request"]
+    assert descriptor["segments"] == [{
+        "group_id": 1,
+        "source_buffer_index": 0,
+        "source_buffer_base": 2000,
+        "source_offset": 0,
+        "length": 16,
+    }]
+    assert descriptor["group_byte_totals"] == [0, 16]
+    assert "latent_layout" not in descriptor
+    latent_planner.assert_not_called()
+
+
+def test_group1_only_live_source_keeps_original_wire_format() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.begin_live_source_descriptor("request", (1,))
+    layers = [
+        {
+            "layer_id": 0,
+            "buffer_base": 2000,
+            "token_bytes": 4,
+            "slot_capacity": 16,
+        }
+    ]
+    runs = [
+        {
+            "logical_token_start": 0,
+            "physical_slot_start": 4,
+            "token_count": 4,
+        }
+    ]
+    engine._record_live_source_layout("request", 1, 0, 4, layers, runs)
+
+    assert engine.finalize_live_source_descriptor("request", 4, 1, 0)
+    descriptor = engine.drain_live_source_descriptors()["request"]
+    assert descriptor["format"] == "layer_slot_runs_v1"
+    assert "latent_layout" not in descriptor
 
 
 def test_layout_probe_does_not_initialize_staging() -> None:
