@@ -477,18 +477,28 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if isinstance(metadata, LiveSourceWorkerMetadata):
             for req_id, descriptors in metadata.descriptors.items():
                 active = req_id in active_req_ids
+                tracked = req_id in self._unfinished_requests
                 cold_start_perf_log(
                     logger,
                     "live_source_scheduler_ingest",
                     req_id=req_id,
                     active=active,
+                    tracked=tracked,
                     descriptor_count=len(descriptors),
                     ranks=[
                         [item.get("tp_rank"), item.get("dp_rank")]
                         for item in descriptors
                     ],
                 )
-                if not active:
+                # The final prefiller token may set the request status to
+                # finished before this worker metadata is consumed.  The
+                # scheduler still calls request_finished() later in the same
+                # output-processing pass, and _unfinished_requests remains the
+                # authoritative LMCache lifetime fence until then. Dropping a
+                # descriptor solely because active is false loses the live
+                # split offer; supported topologies then fall back to the
+                # ordinary persistent-transfer path.
+                if not tracked:
                     continue
                 self._scheduler_live_sources[req_id] = list(descriptors)
 

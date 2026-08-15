@@ -1812,7 +1812,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     except FutureTimeoutError:
                         logger.warning(
                             "Direct NPU page store exceeded the blocking timeout "
-                            "for %s; waiting for the uncancellable native read "
+                            "for %s; waiting for the uncancellable native transfer "
                             "before releasing KV blocks",
                             req_id,
                         )

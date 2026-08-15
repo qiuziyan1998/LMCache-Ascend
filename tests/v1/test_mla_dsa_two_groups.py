@@ -2502,7 +2502,8 @@ def test_early_live_metadata_filters_stale_and_reuse_clears_offer(
     stale = {"tp_rank": 0, "dp_rank": 0}
     fresh = {"tp_rank": 1, "dp_rank": 0}
     adapter = _ascend_adapter_fake(
-        _scheduler_live_sources={}, _unfinished_requests={}
+        _scheduler_live_sources={},
+        _unfinished_requests={"request": SimpleNamespace()},
     )
     metadata_cls = _ascend_adapter_method(
         "update_connector_worker_metadata"
@@ -2514,6 +2515,17 @@ def test_early_live_metadata_filters_stale_and_reuse_clears_offer(
         {"request"},
     )
     assert adapter._scheduler_live_sources == {"request": [fresh]}
+
+    # The final prefiller output can mark the request finished before worker
+    # metadata is ingested.  LMCache still tracks it until request_finished(),
+    # so retain its descriptor even when vLLM's active set is already empty.
+    late = {"tp_rank": 2, "dp_rank": 0}
+    _ascend_adapter_method("update_connector_worker_metadata")(
+        adapter,
+        metadata_cls({"request": [late]}),
+        set(),
+    )
+    assert adapter._scheduler_live_sources == {"request": [late]}
 
     request = SimpleNamespace(request_id="request")
     adapter._scheduler_live_sources["request"] = [stale]
