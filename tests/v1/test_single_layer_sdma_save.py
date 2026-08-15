@@ -485,19 +485,22 @@ def _measure_overlap_sample(
     dma_end = torch.npu.Event(enable_timing=True)
 
     # Record a completed common origin so timestamps from the two independent
-    # streams share the same reference.  Submit compute first, then DMA: this
-    # queues both before either stream is synchronized and gives DMA the whole
-    # target compute window in which to complete.
+    # streams share the same reference.  Production submits the previous
+    # layer's save before launching the next layer's compute, so preserve that
+    # order here.  Submitting compute first is misleading for a short compute
+    # window: Python may still be enqueueing its operators after the device has
+    # already completed them, leaving no opportunity for the later DMA launch
+    # to overlap.
     origin.record()
     origin.synchronize()
-    with torch.npu.stream(compute_stream):
-        compute_start.record()
-        launch_compute()
-        compute_end.record()
     with torch.npu.stream(dma_stream):
         dma_start.record()
         launch_dma()
         dma_end.record()
+    with torch.npu.stream(compute_stream):
+        compute_start.record()
+        launch_compute()
+        compute_end.record()
     compute_end.synchronize()
     dma_end.synchronize()
 
@@ -1008,6 +1011,7 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
         )
         assert trace_path.is_file()
 
+        overlap_failures = []
         for target_ms in (1.0, 2.0):
             iterations, calibrated_ms = _calibrate_compute_iterations(
                 target_ms=target_ms,
@@ -1065,14 +1069,17 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
                 f"DMA_tail={dma_tail_ms:.3f} ms"
             )
 
-            assert overlap_ratio >= 0.50, (
-                "SDMA did not execute concurrently with AIC+AIV compute: "
-                f"target={target_ms} ms, overlap_ratio={overlap_ratio:.1%}"
-            )
-            assert dma_tail_ms <= 0.05, (
-                "the compute window did not cover the SDMA layer save: "
-                f"target={target_ms} ms, median DMA tail={dma_tail_ms:.3f} ms"
-            )
+            if overlap_ratio < 0.50:
+                overlap_failures.append(
+                    "SDMA did not execute concurrently with AIC+AIV compute: "
+                    f"target={target_ms} ms, overlap_ratio={overlap_ratio:.1%}"
+                )
+            if dma_tail_ms > 0.05:
+                overlap_failures.append(
+                    "the compute window did not cover the SDMA layer save: "
+                    f"target={target_ms} ms, median DMA tail={dma_tail_ms:.3f} ms"
+                )
+        assert not overlap_failures, "; ".join(overlap_failures)
     finally:
         if _npu_available():
             torch.npu.synchronize()
