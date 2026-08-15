@@ -3,8 +3,10 @@
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
-#include <pybind11/pybind11.h>
+#include <cerrno>
+#include <cstdlib>
 #include <limits>
+#include <pybind11/pybind11.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/npu/Module.h>
@@ -577,6 +579,27 @@ static uint32_t direct_aiv_num(int32_t num_tokens) {
   return std::min(hardware_cores, token_cores);
 }
 
+static uint32_t dense_direct_aiv_num(int32_t num_tokens) {
+  uint32_t available_cores = direct_aiv_num(num_tokens);
+  const char *limit_raw =
+      std::getenv("LMCACHE_ASCEND_DENSE_DIRECT_AIV_CORE_LIMIT");
+  if (limit_raw != nullptr && limit_raw[0] != '\0') {
+    errno = 0;
+    char *limit_end = nullptr;
+    const unsigned long parsed_limit =
+        std::strtoul(limit_raw, &limit_end, 10);
+    TORCH_CHECK(errno == 0 && limit_end != limit_raw && *limit_end == '\0' &&
+                    parsed_limit > 0 &&
+                    parsed_limit <= std::numeric_limits<uint32_t>::max(),
+                "LMCACHE_ASCEND_DENSE_DIRECT_AIV_CORE_LIMIT must be a positive "
+                "uint32, got '",
+                limit_raw, "'.");
+    available_cores =
+        std::min(available_cores, static_cast<uint32_t>(parsed_limit));
+  }
+  return available_cores;
+}
+
 } // namespace
 
 void sparse_mla_dsa_batched_direct_kv_transfer(
@@ -921,7 +944,7 @@ void dense_mla_dsa_batched_direct_kv_transfer(
       token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
       v_hidden_dims, dsa_hidden_dims);
   config.dims.num_tokens = num_tokens;
-  config.ub_params.aiv_num = direct_aiv_num(num_tokens);
+  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
 
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
@@ -971,7 +994,7 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
 
   SingleLayerKVConfig config = layer_state.config;
   config.dims.num_tokens = num_tokens;
-  config.ub_params.aiv_num = direct_aiv_num(num_tokens);
+  config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
   config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
   config.ptrs.slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
@@ -1057,7 +1080,7 @@ void dense_mla_dsa_group_direct_kv_transfer_fast(
   for (const auto &layer_state : layer_states) {
     SingleLayerKVConfig config = layer_state.config;
     config.dims.num_tokens = num_tokens;
-    config.ub_params.aiv_num = direct_aiv_num(num_tokens);
+    config.ub_params.aiv_num = dense_direct_aiv_num(num_tokens);
     config.ub_params.stream = stream;
     config.ptrs.slot_mapping_ptr = slot_mapping_ptr;
     configs.push_back(config);
