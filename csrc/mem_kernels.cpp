@@ -583,21 +583,22 @@ static uint32_t dense_direct_aiv_num(int32_t num_tokens) {
   uint32_t available_cores = direct_aiv_num(num_tokens);
   const char *limit_raw =
       std::getenv("LMCACHE_ASCEND_DENSE_DIRECT_AIV_CORE_LIMIT");
-  if (limit_raw != nullptr && limit_raw[0] != '\0') {
-    errno = 0;
-    char *limit_end = nullptr;
-    const unsigned long parsed_limit =
-        std::strtoul(limit_raw, &limit_end, 10);
-    TORCH_CHECK(errno == 0 && limit_end != limit_raw && *limit_end == '\0' &&
-                    parsed_limit > 0 &&
-                    parsed_limit <= std::numeric_limits<uint32_t>::max(),
-                "LMCACHE_ASCEND_DENSE_DIRECT_AIV_CORE_LIMIT must be a positive "
-                "uint32, got '",
-                limit_raw, "'.");
-    available_cores =
-        std::min(available_cores, static_cast<uint32_t>(parsed_limit));
+  if (limit_raw == nullptr || limit_raw[0] == '\0') {
+    return std::min(available_cores, 8U);
   }
-  return available_cores;
+  errno = 0;
+  char *limit_end = nullptr;
+  const unsigned long parsed_limit = std::strtoul(limit_raw, &limit_end, 10);
+  TORCH_CHECK(limit_raw[0] >= '0' && limit_raw[0] <= '9' && errno == 0 &&
+                  limit_end != limit_raw && *limit_end == '\0' &&
+                  parsed_limit <= std::numeric_limits<uint32_t>::max(),
+              "LMCACHE_ASCEND_DENSE_DIRECT_AIV_CORE_LIMIT must be a uint32 "
+              "(0 means unlimited), got '",
+              limit_raw, "'.");
+  if (parsed_limit == 0) {
+    return available_cores;
+  }
+  return std::min(available_cores, static_cast<uint32_t>(parsed_limit));
 }
 
 } // namespace

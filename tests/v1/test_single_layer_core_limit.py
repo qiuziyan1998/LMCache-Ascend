@@ -3,7 +3,8 @@
 
 This is an Ascend hardware performance test, not a CPU unit test.  It uses the
 same two-group MLA-latent and DSA-index calls as layerwise prefill and verifies
-that limiting the launch to eight AIV blocks preserves the exact output.
+that its default eight-AIV launch preserves the exact output.  Setting the
+core-limit environment variable to zero restores the uncapped control path.
 
 Run with::
 
@@ -230,15 +231,15 @@ def test_single_layer_save_all_aivs_vs_eight_aivs(total_tokens: int) -> None:
                     host_chunk_size,
                 )
 
-        # Warm both launch configurations before collecting interleaved samples.
-        launch("all", None)
-        launch("eight", 8)
+        # Warm the uncapped control and the default production configuration.
+        launch("all", 0)
+        launch("eight", None)
         torch.npu.synchronize()
 
         device_samples: dict[str, list[float]] = {"all": [], "eight": []}
         wall_samples: dict[str, list[float]] = {"all": [], "eight": []}
         for _ in range(samples):
-            for mode, limit in (("all", None), ("eight", 8)):
+            for mode, limit in (("all", 0), ("eight", None)):
                 start = torch.npu.Event(enable_timing=True)
                 end = torch.npu.Event(enable_timing=True)
                 wall_start_ns = time.perf_counter_ns()
