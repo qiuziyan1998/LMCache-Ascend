@@ -27,7 +27,6 @@ import math
 import os
 from pathlib import Path
 import statistics
-import threading
 import time
 from typing import Callable, Sequence
 
@@ -489,26 +488,21 @@ def _measure_overlap_sample(
     dma_end = torch.npu.Event(enable_timing=True)
 
     # Record a completed common origin so timestamps from the two independent
-    # streams share the same reference.  A persistent worker submits the
-    # previous layer's DMA calls while the main thread immediately launches the
-    # next layer's compute.  ctypes.CDLL calls release the GIL, so the 48-copy
-    # fragmented workload can be enqueued concurrently with PyTorch operators.
+    # streams share the same reference.  The main thread enqueues the previous
+    # layer's save job to a persistent worker and immediately launches the next
+    # layer's compute; it does not wait for a worker acknowledgement.  The
+    # worker submits the fragmented DMA workload independently.
     origin.record()
     origin.synchronize()
-
-    dma_submission_started = threading.Event()
 
     def submit_dma() -> None:
         torch.npu.set_device(device_index)
         with torch.npu.stream(dma_stream):
             dma_start.record()
-            dma_submission_started.set()
             launch_dma()
             dma_end.record()
 
     dma_future = dma_executor.submit(submit_dma)
-    if not dma_submission_started.wait(timeout=5.0):
-        raise RuntimeError("background DMA submission thread did not start")
     with torch.npu.stream(compute_stream):
         compute_start.record()
         launch_compute()
