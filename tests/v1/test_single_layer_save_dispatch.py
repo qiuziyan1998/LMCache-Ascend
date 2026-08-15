@@ -100,19 +100,11 @@ class _LayerTiming:
 @dataclass(frozen=True)
 class _ProfiledKernel:
     name: str
+    launch_marker: str
     stream_id: str
     start_us: float
     duration_us: float
     launch_to_start_us: float
-
-
-def _flow_key(event: dict[str, Any]) -> tuple[str, str] | None:
-    flow_id = event.get("id", event.get("id2"))
-    if flow_id is None:
-        return None
-    if isinstance(flow_id, dict):
-        flow_id = json.dumps(flow_id, sort_keys=True)
-    return str(event.get("name", "")), str(flow_id)
 
 
 def _event_timestamp_us(event: dict[str, Any]) -> float:
@@ -120,7 +112,7 @@ def _event_timestamp_us(event: dict[str, Any]) -> float:
 
 
 def _load_profiled_save_kernels(trace_path: Path) -> list[_ProfiledKernel]:
-    """Read exact host-flow -> hardware-kernel delays from a trace view."""
+    """Pair explicit CPU launch markers with hardware kernels in submit order."""
     raw_trace = json.loads(trace_path.read_text(encoding="utf-8"))
     events = (
         raw_trace.get("traceEvents", []) if isinstance(raw_trace, dict) else raw_trace
@@ -136,19 +128,18 @@ def _load_profiled_save_kernels(trace_path: Path) -> list[_ProfiledKernel]:
         and event.get("name") == "process_name"
         and event.get("args", {}).get("name") == "Ascend Hardware"
     }
-    flow_starts: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    flow_ends: list[dict[str, Any]] = []
+    launch_events = []
     kernel_events = []
     for event in events:
         if not isinstance(event, dict):
             continue
         phase = event.get("ph")
-        if phase == "s":
-            key = _flow_key(event)
-            if key is not None:
-                flow_starts.setdefault(key, []).append(event)
-        elif phase == "f":
-            flow_ends.append(event)
+        if (
+            phase == "X"
+            and str(event.get("name", "")).startswith("lmcache_save_submit::")
+            and event.get("pid") not in hardware_pids
+        ):
+            launch_events.append(event)
         elif (
             phase == "X"
             and "single_layer_paged_kv_copy" in str(event.get("name", ""))
@@ -156,63 +147,38 @@ def _load_profiled_save_kernels(trace_path: Path) -> list[_ProfiledKernel]:
         ):
             kernel_events.append(event)
 
-    flow_pairs = []
-    for flow_end in flow_ends:
-        key = _flow_key(flow_end)
-        if key is None:
-            continue
-        end_us = _event_timestamp_us(flow_end)
-        candidates = [
-            flow_start
-            for flow_start in flow_starts.get(key, [])
-            if _event_timestamp_us(flow_start) <= end_us
-        ]
-        if candidates:
-            flow_start = max(candidates, key=_event_timestamp_us)
-            flow_pairs.append((flow_start, flow_end))
-
+    launch_events.sort(key=_event_timestamp_us)
+    kernel_events.sort(key=_event_timestamp_us)
+    if len(launch_events) != len(kernel_events):
+        raise AssertionError(
+            f"found {len(launch_events)} CPU save launch markers but "
+            f"{len(kernel_events)} hardware save kernels in {trace_path}"
+        )
     profiled = []
-    for kernel in sorted(kernel_events, key=_event_timestamp_us):
+    for launch, kernel in zip(launch_events, kernel_events, strict=True):
+        launch_us = _event_timestamp_us(launch)
         kernel_start_us = _event_timestamp_us(kernel)
         kernel_tid = str(kernel.get("tid", ""))
-        matching_pairs = [
-            pair
-            for pair in flow_pairs
-            if abs(_event_timestamp_us(pair[1]) - kernel_start_us) <= 5.0
-            and str(pair[1].get("tid", "")) == kernel_tid
-        ]
-        if not matching_pairs:
-            matching_pairs = [
-                pair
-                for pair in flow_pairs
-                if abs(_event_timestamp_us(pair[1]) - kernel_start_us) <= 5.0
-            ]
-        if not matching_pairs:
+        if kernel_start_us < launch_us:
             raise AssertionError(
-                "could not find the CPU-to-NPU flow ending at save kernel "
-                f"{kernel.get('name')!r}, ts={kernel_start_us}, tid={kernel_tid}; "
-                f"inspect {trace_path}"
+                f"hardware kernel {kernel.get('name')!r} started before its "
+                f"paired CPU launch marker {launch.get('name')!r}; inspect "
+                f"{trace_path}"
             )
-
-        # Nested framework/runtime flows can end at the same task.  The latest
-        # start is the closest representation of the runtime kernel launch.
-        flow_start, _ = max(
-            matching_pairs,
-            key=lambda pair: _event_timestamp_us(pair[0]),
-        )
         profiled.append(
             _ProfiledKernel(
                 name=str(kernel.get("name", "")),
+                launch_marker=str(launch.get("name", "")),
                 stream_id=kernel_tid,
                 start_us=kernel_start_us,
                 duration_us=float(kernel.get("dur", 0.0)),
-                launch_to_start_us=(kernel_start_us - _event_timestamp_us(flow_start)),
+                launch_to_start_us=kernel_start_us - launch_us,
             )
         )
     return profiled
 
 
-def test_profile_flow_parser_uses_actual_hardware_kernel_start(
+def test_profile_launch_marker_parser_uses_actual_hardware_kernel_start(
     tmp_path: Path,
 ) -> None:
     trace_path = tmp_path / "trace_view.json"
@@ -227,20 +193,12 @@ def test_profile_flow_parser_uses_actual_hardware_kernel_start(
                     "args": {"name": "Ascend Hardware"},
                 },
                 {
-                    "ph": "s",
-                    "name": "async_npu",
-                    "id": 17,
+                    "ph": "X",
+                    "name": "lmcache_save_submit::immediate::layer_0",
                     "pid": 1,
                     "tid": 9,
                     "ts": 100.0,
-                },
-                {
-                    "ph": "f",
-                    "name": "async_npu",
-                    "id": 17,
-                    "pid": 4,
-                    "tid": 38,
-                    "ts": 250.0,
+                    "dur": 5.0,
                 },
                 {
                     "ph": "X",
@@ -269,6 +227,7 @@ def test_profile_flow_parser_uses_actual_hardware_kernel_start(
     kernels = _load_profiled_save_kernels(trace_path)
 
     assert len(kernels) == 1
+    assert kernels[0].launch_marker.endswith("immediate::layer_0")
     assert kernels[0].stream_id == "38"
     assert kernels[0].start_us == pytest.approx(250.0)
     assert kernels[0].duration_us == pytest.approx(25.0)
@@ -317,6 +276,7 @@ def _print_pipeline(label: str, timings: list[_LayerTiming]) -> None:
 
 def _run_pipeline(
     *,
+    scenario: str,
     layer_count: int,
     bank_count: int,
     compute_iters: int,
@@ -365,7 +325,10 @@ def _run_pipeline(
             compute_done_at_kernel_call = bool(compute_end.query())
             host_kernel_call_ns = time.perf_counter_ns()
             save_start.record()
-            launch_save(layer, bank)
+            with torch.profiler.record_function(
+                f"lmcache_save_submit::{scenario}::layer_{layer}"
+            ):
+                launch_save(layer, bank)
             host_return_ns = time.perf_counter_ns()
             save_end.record()
         save_done_at_return = bool(save_end.query())
@@ -574,6 +537,12 @@ def test_single_layer_paged_kv_copy_submission_to_execution_delay() -> None:
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
+            schedule=torch_npu.profiler.schedule(
+                wait=0,
+                warmup=0,
+                active=1,
+                repeat=1,
+            ),
             with_stack=False,
             profile_memory=False,
             with_modules=False,
@@ -581,6 +550,7 @@ def test_single_layer_paged_kv_copy_submission_to_execution_delay() -> None:
         )
         with profiler:
             immediate = _run_pipeline(
+                scenario="immediate",
                 layer_count=layer_count,
                 bank_count=bank_count,
                 compute_iters=compute_iters,
@@ -593,6 +563,7 @@ def test_single_layer_paged_kv_copy_submission_to_execution_delay() -> None:
                 synchronize_before_submit=False,
             )
             late_control = _run_pipeline(
+                scenario="late",
                 layer_count=layer_count,
                 bank_count=bank_count,
                 compute_iters=compute_iters,
@@ -630,8 +601,9 @@ def test_single_layer_paged_kv_copy_submission_to_execution_delay() -> None:
             f"{immediate_early_count}/{layer_count}"
         )
         print(
-            "launch_to_actual_kernel_ms comes from the profiler flow ending "
-            "at the hardware kernel, not from Python wall-clock timing. If "
+            "launch_to_actual_kernel_ms is the trace timestamp difference "
+            "between the explicit CPU launch marker and the hardware kernel "
+            "start, not a Python/device clock estimate. If "
             "done@kernel_call is False, Python called the op before compute "
             "finished. If it is True only after host_prepare_ms, the delay "
             "occurred on the host before the op call."
