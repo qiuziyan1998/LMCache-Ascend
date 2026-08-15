@@ -11,9 +11,10 @@ Run on an Ascend host with::
     python -m pytest -q -s tests/v1/test_single_layer_sdma_save.py
 
 The NPU test compares the experimental result with the current
-``single_layer_paged_kv_copy`` implementation for both GLM two-group layouts,
-then reports current-AIV versus SDMA save latency and checks whether a 2048
-token save is hidden by approximately 1 ms and 2 ms of independent compute.
+``single_layer_paged_kv_copy`` implementation for both GLM two-group layouts.
+For 2048- and 16384-token saves it then compares current-AIV and SDMA with
+inline and background-thread submission, including end-to-end makespan so an
+apparently concurrent optimization cannot pass while slower than the original.
 """
 
 from __future__ import annotations
@@ -526,6 +527,79 @@ class _OverlapSample:
     dma_tail_ms: float
 
 
+def _median_overlap_sample(samples: Sequence[_OverlapSample]) -> _OverlapSample:
+    return _OverlapSample(
+        compute_ms=statistics.median(sample.compute_ms for sample in samples),
+        dma_ms=statistics.median(sample.dma_ms for sample in samples),
+        makespan_ms=statistics.median(sample.makespan_ms for sample in samples),
+        overlap_ms=statistics.median(sample.overlap_ms for sample in samples),
+        dma_tail_ms=statistics.median(sample.dma_tail_ms for sample in samples),
+    )
+
+
+def _measure_callable_save_sample(
+    *,
+    launch_compute: Callable[[], None],
+    launch_save: Callable[[], None],
+    compute_stream: object,
+    save_stream: object,
+    source_ready_event: object,
+    executor: ThreadPoolExecutor | None,
+) -> _OverlapSample:
+    """Measure a save callable submitted inline or by the persistent worker."""
+    torch.npu.synchronize()
+    origin = torch.npu.Event(enable_timing=True)
+    compute_start = torch.npu.Event(enable_timing=True)
+    compute_end = torch.npu.Event(enable_timing=True)
+    save_start = torch.npu.Event(enable_timing=True)
+    save_end = torch.npu.Event(enable_timing=True)
+    origin.record()
+    origin.synchronize()
+
+    def submit_save() -> None:
+        with torch.npu.stream(save_stream):
+            save_stream.wait_event(source_ready_event)
+            save_start.record()
+            launch_save()
+            save_end.record()
+
+    if executor is None:
+        submit_save()
+        save_future = None
+    else:
+        save_future = executor.submit(submit_save)
+    with torch.npu.stream(compute_stream):
+        compute_start.record()
+        launch_compute()
+        compute_end.record()
+    if save_future is not None:
+        save_future.result()
+    compute_end.synchronize()
+    save_end.synchronize()
+
+    compute_start_ms = float(origin.elapsed_time(compute_start))
+    compute_end_ms = float(origin.elapsed_time(compute_end))
+    save_start_ms = float(origin.elapsed_time(save_start))
+    save_end_ms = float(origin.elapsed_time(save_end))
+    compute_ms = compute_end_ms - compute_start_ms
+    save_ms = save_end_ms - save_start_ms
+    overlap_ms = max(
+        0.0,
+        min(compute_end_ms, save_end_ms) - max(compute_start_ms, save_start_ms),
+    )
+    makespan_ms = max(compute_end_ms, save_end_ms) - min(
+        compute_start_ms,
+        save_start_ms,
+    )
+    return _OverlapSample(
+        compute_ms=compute_ms,
+        dma_ms=save_ms,
+        makespan_ms=makespan_ms,
+        overlap_ms=overlap_ms,
+        dma_tail_ms=save_end_ms - compute_end_ms,
+    )
+
+
 def _measure_overlap_sample(
     *,
     launch_compute: Callable[[], None],
@@ -709,7 +783,12 @@ def _profile_sdma_only(
     not _npu_available(),
     reason="exact SDMA layer-save experiment requires an Ascend NPU",
 )
-def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
+@pytest.mark.parametrize(
+    "total_tokens",
+    (2048, 16384),
+    ids=("tokens-2048", "tokens-16384"),
+)
+def test_exact_two_group_sdma_save_and_compute_overlap(total_tokens: int) -> None:
     """Compare exact semantics, then test 1/2 ms compute-window coverage."""
     import torch_npu  # noqa: F401
 
@@ -916,7 +995,6 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
             torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
         # Now measure the real GLM per-rank payload for one 2048-token layer.
-        total_tokens = _env_int("LMCACHE_SDMA_TOKENS", 2048)
         chunk_size = _env_int("LMCACHE_SDMA_HOST_CHUNK", 256)
         if total_tokens % chunk_size:
             raise ValueError(
@@ -1097,7 +1175,7 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
         )
         assert trace_path.is_file()
 
-        overlap_failures = []
+        comparison_failures = []
         device_index = torch.npu.current_device()
         source_ready_event = torch.npu.Event()
         with torch.npu.stream(compute_stream):
@@ -1106,10 +1184,11 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
         with ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="lmcache-sdma-submit",
-        ) as dma_executor:
+        ) as save_executor:
             # Establish the thread-local Ascend context once before measuring.
-            dma_executor.submit(torch.npu.set_device, device_index).result()
-            for target_ms in (1.0, 2.0):
+            save_executor.submit(torch.npu.set_device, device_index).result()
+            compute_scale = total_tokens / 2048
+            for target_ms in (1.0 * compute_scale, 2.0 * compute_scale):
                 iterations, calibrated_ms = _calibrate_compute_iterations(
                     target_ms=target_ms,
                     stream=compute_stream,
@@ -1127,59 +1206,114 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
                         iterations=iterations,
                     )
 
-                # Warm the calibrated iteration count before collecting samples.
-                launch_compute()
-                launch_sdma()
-                torch.npu.synchronize()
-                overlap_samples = [
-                    _measure_overlap_sample(
-                        launch_compute=launch_compute,
-                        compute_stream=compute_stream,
-                        dma_plan=dma_plan,
-                        source_ready_event=source_ready_event,
-                        runtime=runtime,
-                        dma_executor=dma_executor,
-                    )
-                    for _ in range(samples)
-                ]
-                compute_ms = statistics.median(
-                    sample.compute_ms for sample in overlap_samples
-                )
-                dma_overlap_ms = statistics.median(
-                    sample.dma_ms for sample in overlap_samples
-                )
-                makespan_ms = statistics.median(
-                    sample.makespan_ms for sample in overlap_samples
-                )
-                overlap_ms = statistics.median(
-                    sample.overlap_ms for sample in overlap_samples
-                )
-                dma_tail_ms = statistics.median(
-                    sample.dma_tail_ms for sample in overlap_samples
-                )
-                overlap_ratio = overlap_ms / max(dma_overlap_ms, 1e-6)
-                serial_estimate_ms = compute_ms + dma_overlap_ms
-                print(
-                    f"target_compute={target_ms:.1f} ms iterations={iterations} "
-                    f"calibrated={calibrated_ms:.3f} ms "
-                    f"submission=background_thread compute={compute_ms:.3f} ms "
-                    f"DMA={dma_overlap_ms:.3f} ms serial_estimate="
-                    f"{serial_estimate_ms:.3f} ms parallel={makespan_ms:.3f} ms "
-                    f"overlap={overlap_ms:.3f} ms ({overlap_ratio:.1%}) "
-                    f"DMA_tail={dma_tail_ms:.3f} ms"
-                )
+                def measure_mode(mode: str) -> _OverlapSample:
+                    if mode == "aiv_same_thread":
+                        return _measure_callable_save_sample(
+                            launch_compute=launch_compute,
+                            launch_save=launch_aiv,
+                            compute_stream=compute_stream,
+                            save_stream=aiv_stream,
+                            source_ready_event=source_ready_event,
+                            executor=None,
+                        )
+                    if mode == "aiv_background_thread":
+                        return _measure_callable_save_sample(
+                            launch_compute=launch_compute,
+                            launch_save=launch_aiv,
+                            compute_stream=compute_stream,
+                            save_stream=aiv_stream,
+                            source_ready_event=source_ready_event,
+                            executor=save_executor,
+                        )
+                    if mode == "sdma_same_thread":
+                        return _measure_callable_save_sample(
+                            launch_compute=launch_compute,
+                            launch_save=launch_sdma,
+                            compute_stream=compute_stream,
+                            save_stream=dma_stream,
+                            source_ready_event=source_ready_event,
+                            executor=None,
+                        )
+                    if mode == "sdma_background_thread":
+                        return _measure_overlap_sample(
+                            launch_compute=launch_compute,
+                            compute_stream=compute_stream,
+                            dma_plan=dma_plan,
+                            source_ready_event=source_ready_event,
+                            runtime=runtime,
+                            dma_executor=save_executor,
+                        )
+                    raise ValueError(f"unknown save submission mode: {mode}")
 
-                if overlap_ratio < 0.50:
-                    overlap_failures.append(
-                        "SDMA did not execute concurrently with AIC+AIV compute: "
-                        f"target={target_ms} ms, overlap_ratio={overlap_ratio:.1%}"
+                modes = (
+                    "aiv_same_thread",
+                    "aiv_background_thread",
+                    "sdma_same_thread",
+                    "sdma_background_thread",
+                )
+                # Warm every submission route, then interleave samples so all
+                # four modes see comparable device temperature and clock state.
+                for mode in modes:
+                    measure_mode(mode)
+                measurements: dict[str, list[_OverlapSample]] = {
+                    mode: [] for mode in modes
+                }
+                for _ in range(samples):
+                    for mode in modes:
+                        measurements[mode].append(measure_mode(mode))
+                medians = {
+                    mode: _median_overlap_sample(mode_samples)
+                    for mode, mode_samples in measurements.items()
+                }
+
+                print(
+                    f"\nSubmission comparison: tokens={total_tokens} "
+                    f"target_compute={target_ms:.1f} ms iterations={iterations} "
+                    f"calibrated={calibrated_ms:.3f} ms"
+                )
+                print(
+                    "mode compute_ms save_ms makespan_ms overlap_ms "
+                    "overlap_ratio save_tail_ms"
+                )
+                for mode in modes:
+                    result = medians[mode]
+                    overlap_ratio = result.overlap_ms / max(result.dma_ms, 1e-6)
+                    print(
+                        f"{mode} {result.compute_ms:.3f} {result.dma_ms:.3f} "
+                        f"{result.makespan_ms:.3f} {result.overlap_ms:.3f} "
+                        f"{overlap_ratio:.1%} {result.dma_tail_ms:.3f}"
                     )
-                if dma_tail_ms > 0.05:
-                    overlap_failures.append(
-                        "the compute window did not cover the SDMA layer save: "
-                        f"target={target_ms} ms, median DMA tail={dma_tail_ms:.3f} ms"
+
+                candidate = medians["sdma_background_thread"]
+                original = medians["aiv_same_thread"]
+                candidate_overlap_ratio = candidate.overlap_ms / max(
+                    candidate.dma_ms,
+                    1e-6,
+                )
+                if candidate_overlap_ratio < 0.50:
+                    comparison_failures.append(
+                        "background SDMA did not overlap compute: "
+                        f"tokens={total_tokens}, target={target_ms} ms, "
+                        f"overlap={candidate_overlap_ratio:.1%}"
                     )
-        assert not overlap_failures, "; ".join(overlap_failures)
+                if candidate.dma_tail_ms > 0.05:
+                    comparison_failures.append(
+                        "compute did not cover background SDMA: "
+                        f"tokens={total_tokens}, target={target_ms} ms, "
+                        f"tail={candidate.dma_tail_ms:.3f} ms"
+                    )
+                allowed_makespan = original.makespan_ms + max(
+                    0.05,
+                    original.makespan_ms * 0.05,
+                )
+                if candidate.makespan_ms > allowed_makespan:
+                    comparison_failures.append(
+                        "background SDMA is slower than the original inline AIV "
+                        f"path: tokens={total_tokens}, target={target_ms} ms, "
+                        f"SDMA={candidate.makespan_ms:.3f} ms, "
+                        f"AIV={original.makespan_ms:.3f} ms"
+                    )
+        assert not comparison_failures, "; ".join(comparison_failures)
     finally:
         if _npu_available():
             torch.npu.synchronize()
