@@ -206,6 +206,33 @@ class _AclRuntime:
             )
 
 
+@dataclass(frozen=True)
+class _DmaSavePlan:
+    """Immutable data needed to save one real layer from one buffer bank."""
+
+    latent_chunks: tuple[torch.Tensor, ...]
+    index_chunks: tuple[torch.Tensor, ...]
+    latent_cache: tuple[torch.Tensor, ...]
+    index_cache: tuple[torch.Tensor, ...]
+    runs: tuple[_DenseRun, ...]
+    total_tokens: int
+    chunk_size: int
+    stream: object
+    expected_copy_count: int
+    # A production bank lease owns these objects until completion_event fires.
+    owners: tuple[object, ...]
+
+
+@dataclass(frozen=True)
+class _DmaSaveJob:
+    """One queue item produced by the model thread for the DMA worker."""
+
+    plan: _DmaSavePlan
+    source_ready_event: object
+    start_event: object
+    completion_event: object
+
+
 def _launch_sdma_group_save(
     runtime: _AclRuntime,
     *,
@@ -302,6 +329,34 @@ def _launch_sdma_two_group_save(
         stream=stream,
     )
     return latent_copies + index_copies
+
+
+def _submit_sdma_save_job(runtime: _AclRuntime, job: _DmaSaveJob) -> int:
+    """Consume an immutable save job without consulting model-thread state."""
+    plan = job.plan
+    with torch.npu.stream(plan.stream):
+        # In production this event is recorded after the source layer writes
+        # its assigned bank.  The DMA stream must not read the bank earlier.
+        plan.stream.wait_event(job.source_ready_event)
+        job.start_event.record()
+        copies = _launch_sdma_two_group_save(
+            runtime,
+            latent_chunks=plan.latent_chunks,
+            index_chunks=plan.index_chunks,
+            latent_cache=plan.latent_cache,
+            index_cache=plan.index_cache,
+            runs=plan.runs,
+            total_tokens=plan.total_tokens,
+            chunk_size=plan.chunk_size,
+            stream=plan.stream,
+        )
+        job.completion_event.record()
+    if copies != plan.expected_copy_count:
+        raise RuntimeError(
+            f"DMA job submitted {copies} copies, expected "
+            f"{plan.expected_copy_count}"
+        )
+    return copies
 
 
 def test_sdma_group_save_uses_exact_planar_offsets_for_every_run() -> None:
@@ -474,11 +529,11 @@ class _OverlapSample:
 def _measure_overlap_sample(
     *,
     launch_compute: Callable[[], None],
-    launch_dma: Callable[[], None],
     compute_stream: object,
-    dma_stream: object,
+    dma_plan: _DmaSavePlan,
+    source_ready_event: object,
+    runtime: _AclRuntime,
     dma_executor: ThreadPoolExecutor,
-    device_index: int,
 ) -> _OverlapSample:
     torch.npu.synchronize()
     origin = torch.npu.Event(enable_timing=True)
@@ -495,19 +550,22 @@ def _measure_overlap_sample(
     origin.record()
     origin.synchronize()
 
-    def submit_dma() -> None:
-        torch.npu.set_device(device_index)
-        with torch.npu.stream(dma_stream):
-            dma_start.record()
-            launch_dma()
-            dma_end.record()
-
-    dma_future = dma_executor.submit(submit_dma)
+    job = _DmaSaveJob(
+        plan=dma_plan,
+        source_ready_event=source_ready_event,
+        start_event=dma_start,
+        completion_event=dma_end,
+    )
+    # This is the production handoff: the main/model thread publishes a
+    # complete immutable job, then immediately continues model execution.
+    dma_future = dma_executor.submit(_submit_sdma_save_job, runtime, job)
     with torch.npu.stream(compute_stream):
         compute_start.record()
         launch_compute()
         compute_end.record()
-    dma_future.result()
+    submitted_copies = dma_future.result()
+    if submitted_copies != dma_plan.expected_copy_count:
+        raise RuntimeError("background DMA worker returned an invalid copy count")
     compute_end.synchronize()
     dma_end.synchronize()
 
@@ -885,22 +943,22 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
                 device=device,
             ),
         )
-        host_latent, objects = _allocate_chunks(
+        host_latent, host_latent_objects = _allocate_chunks(
             allocator,
             total_tokens=total_tokens,
             chunk_size=chunk_size,
             plane_dims=latent_dims,
             dtype=dtype,
         )
-        memory_objects.extend(objects)
-        host_index, objects = _allocate_chunks(
+        memory_objects.extend(host_latent_objects)
+        host_index, host_index_objects = _allocate_chunks(
             allocator,
             total_tokens=total_tokens,
             chunk_size=chunk_size,
             plane_dims=index_dims,
             dtype=dtype,
         )
-        memory_objects.extend(objects)
+        memory_objects.extend(host_index_objects)
         runs = _coalesce_dense_runs(
             mapping,
             chunk_size=chunk_size,
@@ -909,6 +967,27 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
         expected_dma_calls = len(runs) * (len(latent_dims) + len(index_dims))
         dma_stream = torch.npu.Stream()
         aiv_stream = torch.npu.Stream()
+        dma_plan = _DmaSavePlan(
+            latent_chunks=tuple(host_latent),
+            index_chunks=tuple(host_index),
+            latent_cache=tuple(latent_cache),
+            index_cache=tuple(index_cache),
+            runs=tuple(runs),
+            total_tokens=total_tokens,
+            chunk_size=chunk_size,
+            stream=dma_stream,
+            expected_copy_count=expected_dma_calls,
+            owners=tuple(
+                [
+                    *host_latent,
+                    *host_index,
+                    *latent_cache,
+                    *index_cache,
+                    *host_latent_objects,
+                    *host_index_objects,
+                ]
+            ),
+        )
 
         def launch_sdma() -> None:
             copies = _launch_sdma_two_group_save(
@@ -1020,6 +1099,10 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
 
         overlap_failures = []
         device_index = torch.npu.current_device()
+        source_ready_event = torch.npu.Event()
+        with torch.npu.stream(compute_stream):
+            source_ready_event.record()
+        source_ready_event.synchronize()
         with ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="lmcache-sdma-submit",
@@ -1051,11 +1134,11 @@ def test_exact_two_group_sdma_save_and_compute_overlap() -> None:
                 overlap_samples = [
                     _measure_overlap_sample(
                         launch_compute=launch_compute,
-                        launch_dma=launch_sdma,
                         compute_stream=compute_stream,
-                        dma_stream=dma_stream,
+                        dma_plan=dma_plan,
+                        source_ready_event=source_ready_event,
+                        runtime=runtime,
                         dma_executor=dma_executor,
-                        device_index=device_index,
                     )
                     for _ in range(samples)
                 ]
