@@ -3523,7 +3523,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else:
                     envelope = None
                     if compact_batch is None:
-                        envelope = self._receive_shared_envelope()
+                        envelope = self._receive_matching_shared_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                        )
                         self._validate_shared_layerwise_envelope(
                             envelope,
                             req_id=req_id,
@@ -3794,7 +3800,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 yield ret_mask
             if compact_batch is not None:
                 compact_final_receive_attempted = True
-                final_envelope = self._receive_shared_envelope()
+                final_envelope = self._receive_matching_shared_envelope(
+                    req_id=req_id,
+                    phase=phase,
+                    request_ordinal=request_ordinal,
+                    layer_id=self.num_layers,
+                    kv_group=kv_group,
+                )
                 self._validate_shared_layerwise_envelope(
                     final_envelope,
                     req_id=req_id,
@@ -3822,7 +3834,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             if compact_batch is not None and not compact_final_receive_attempted:
                 compact_final_receive_attempted = True
                 try:
-                    self._receive_shared_envelope()
+                    self._receive_matching_shared_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=self.num_layers,
+                        kv_group=kv_group,
+                    )
                 except BaseException:
                     logger.exception(
                         "Failed to drain compact shared batch final sentinel "
