@@ -37,6 +37,13 @@ def setup_npu_backend():
             from torch_npu.contrib import transfer_to_npu  # noqa: F401
             import torch
 
+            # torchrun imports conftest before individual distributed tests can
+            # bind their process to LOCAL_RANK.  Bind here first so every rank
+            # does not create its sanity-check context on NPU 0.
+            local_rank = os.environ.get("LOCAL_RANK")
+            if local_rank is not None:
+                torch.npu.set_device(int(local_rank))
+
             # Sanity check
             _ = torch.randn((10), device="npu")
             print("   ✅ NPU Backend initialized successfully.")
