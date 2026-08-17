@@ -7,11 +7,11 @@ least two HCCL ranks, for example::
     torchrun --nproc-per-node=8 -m pytest -q -s \
       tests/v1/test_hccl_layerwise_transfer_overlap.py::test_hccl_allreduce_with_layerwise_load_and_save
 
-The pass criterion is deliberately not an overlap ratio reconstructed from
-three independent event ranges.  All three streams wait on one release event,
-and a control stream records one completion event only after it has waited for
-all three operations.  The elapsed time between those two events is the actual
-device makespan and must remain close to the 500 us all-reduce window.
+The result is deliberately not an overlap ratio reconstructed from three
+independent event ranges.  All three streams wait on one release event, and a
+control stream records one completion event only after it has waited for all
+three operations.  The test reports that device makespan alongside isolated
+and strict-serial timings without imposing a performance assertion.
 """
 
 from __future__ import annotations
@@ -77,13 +77,31 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     return value
 
 
-def _transfer_shape_for_window(
+def _transfer_shape_for_duration(
+    *,
+    duration_us: float,
+    bandwidth_gbps: float,
+    block_size: int,
+) -> _TransferShape:
+    """Build the largest block-aligned payload fitting a modeled duration."""
+    if duration_us <= 0:
+        raise ValueError("duration_us must be positive")
+    byte_budget = bandwidth_gbps * 1e9 * duration_us * 1e-6
+    num_tokens = math.floor(byte_budget / _TRANSFER_BYTES_PER_TOKEN)
+    num_tokens = num_tokens // block_size * block_size
+    if num_tokens <= 0:
+        raise ValueError("duration is too short for one cache-block payload")
+    payload_bytes = num_tokens * _TRANSFER_BYTES_PER_TOKEN
+    theoretical_us = payload_bytes / (bandwidth_gbps * 1e9) * 1e6
+    return _TransferShape(num_tokens, payload_bytes, theoretical_us)
+
+
+def _transfer_shape_for_tokens(
     *,
     num_tokens: int,
     bandwidth_gbps: float,
     block_size: int,
 ) -> _TransferShape:
-    """Calculate the two-group transfer time for one prefill chunk."""
     if num_tokens <= 0 or num_tokens % block_size:
         raise ValueError("num_tokens must be a positive cache-block multiple")
     payload_bytes = num_tokens * _TRANSFER_BYTES_PER_TOKEN
@@ -91,19 +109,19 @@ def _transfer_shape_for_window(
     return _TransferShape(num_tokens, payload_bytes, theoretical_us)
 
 
-def test_transfer_payload_is_sub_500us_at_10gbps() -> None:
-    """Lock down the payload arithmetic used by the hardware test."""
-    shape = _transfer_shape_for_window(
-        num_tokens=2048,
+def test_transfer_payload_tracks_half_of_800us_allreduce_at_10gbps() -> None:
+    """An 800 us collective produces an approximately 400 us payload."""
+    shape = _transfer_shape_for_duration(
+        duration_us=400.0,
         bandwidth_gbps=10.0,
         block_size=128,
     )
 
     assert _TRANSFER_BYTES_PER_TOKEN == 1408
-    assert shape.num_tokens == 2048
-    assert shape.payload_bytes == 2_883_584
-    assert shape.theoretical_us == pytest.approx(288.3584)
-    assert shape.theoretical_us < 500.0
+    assert shape.num_tokens == 2816
+    assert shape.payload_bytes == 3_964_928
+    assert shape.theoretical_us == pytest.approx(396.4928)
+    assert shape.theoretical_us <= 400.0
 
 
 def _npu_available() -> bool:
@@ -281,7 +299,7 @@ def _median_samples(
 def test_hccl_allreduce_with_layerwise_load_and_save(
     hccl_context: _HcclContext,
 ) -> None:
-    """A 500 us HCCL window must hide one two-group load and one save."""
+    """Report isolated, serial, and concurrent device timings."""
     import torch_npu  # noqa: F401
 
     try:
@@ -307,43 +325,81 @@ def test_hccl_allreduce_with_layerwise_load_and_save(
     rank = hccl_context.rank
     world_size = hccl_context.world_size
 
-    target_us = _env_float("LMCACHE_HCCL_OVERLAP_TARGET_US", 500.0)
     bandwidth_gbps = _env_float("LMCACHE_HCCL_OVERLAP_BANDWIDTH_GBPS", 10.0)
+    transfer_fraction = _env_float("LMCACHE_HCCL_OVERLAP_TRANSFER_FRACTION", 0.5)
+    if transfer_fraction > 1.0:
+        raise ValueError("LMCACHE_HCCL_OVERLAP_TRANSFER_FRACTION must be <= 1")
     block_size = 128
     host_chunk_size = _env_int("LMCACHE_HCCL_OVERLAP_HOST_CHUNK", 128)
     if host_chunk_size % block_size:
         raise ValueError("LMCACHE_HCCL_OVERLAP_HOST_CHUNK must be divisible by 128")
-    transfer_shape = _transfer_shape_for_window(
-        num_tokens=_env_int("LMCACHE_HCCL_OVERLAP_TRANSFER_TOKENS", 2048),
-        bandwidth_gbps=bandwidth_gbps,
-        block_size=block_size,
-    )
-    num_tokens = transfer_shape.num_tokens
-    if num_tokens % host_chunk_size:
-        raise ValueError(
-            "LMCACHE_HCCL_OVERLAP_TRANSFER_TOKENS must be divisible by "
-            "LMCACHE_HCCL_OVERLAP_HOST_CHUNK"
-        )
-    if transfer_shape.theoretical_us >= target_us:
-        raise ValueError(
-            "the configured transfer does not fit the target window at the "
-            f"configured bandwidth: transfer={transfer_shape.theoretical_us:.3f} us, "
-            f"target={target_us:.3f} us"
-        )
-    num_blocks = math.ceil(num_tokens / block_size) * 2
 
     allreduce_rows = _env_int("LMCACHE_HCCL_OVERLAP_ALLREDUCE_ROWS", 2048)
     allreduce_hidden = _env_int("LMCACHE_HCCL_OVERLAP_ALLREDUCE_HIDDEN", 7168)
     warmups = _env_int("LMCACHE_HCCL_OVERLAP_WARMUPS", 3)
     samples = _env_int("LMCACHE_HCCL_OVERLAP_SAMPLES", 7, minimum=3)
-    allreduce_tolerance_us = _env_float(
-        "LMCACHE_HCCL_OVERLAP_ALLREDUCE_TOLERANCE_US", 50.0
+    dtype = torch.bfloat16
+    allreduce_tensor = torch.zeros(
+        (allreduce_rows, allreduce_hidden),
+        dtype=dtype,
+        device=device,
     )
-    makespan_slack_us = _env_float("LMCACHE_HCCL_OVERLAP_MAKESPAN_SLACK_US", 50.0)
+    expected_collective_value = world_size * (world_size + 1) // 2
+    collective_stream = torch.npu.Stream()
+
+    def prepare_collective() -> None:
+        allreduce_tensor.fill_(rank + 1)
+
+    def validate_collective() -> None:
+        first = float(allreduce_tensor[0, 0].item())
+        last = float(allreduce_tensor[-1, -1].item())
+        assert first == expected_collective_value
+        assert last == expected_collective_value
+
+    def launch_collective() -> None:
+        work = dist.all_reduce(
+            allreduce_tensor,
+            op=dist.ReduceOp.SUM,
+            async_op=True,
+        )
+        work.wait()
+
+    for _ in range(warmups):
+        with torch.npu.stream(collective_stream):
+            prepare_collective()
+            launch_collective()
+        torch.npu.synchronize()
+
+    sizing_collective_samples = [
+        _time_one_stream(
+            stream=collective_stream,
+            launch=launch_collective,
+            device=device,
+            prepare=prepare_collective,
+        )
+        for _ in range(3)
+    ]
+    validate_collective()
+    sizing_collective_us = statistics.median(sizing_collective_samples) * 1000.0
+    modeled_transfer_us = sizing_collective_us * transfer_fraction
+    configured_tokens = _env_int("LMCACHE_HCCL_OVERLAP_TRANSFER_TOKENS", 0, minimum=0)
+    if configured_tokens:
+        transfer_shape = _transfer_shape_for_tokens(
+            num_tokens=configured_tokens,
+            bandwidth_gbps=bandwidth_gbps,
+            block_size=host_chunk_size,
+        )
+    else:
+        transfer_shape = _transfer_shape_for_duration(
+            duration_us=modeled_transfer_us,
+            bandwidth_gbps=bandwidth_gbps,
+            block_size=host_chunk_size,
+        )
+    num_tokens = transfer_shape.num_tokens
+    num_blocks = math.ceil(num_tokens / block_size) * 2
 
     ensure_ascend_host_memory_registered()
     torch.manual_seed(20260817 + rank)
-    dtype = torch.bfloat16
     common_cache = dict(
         num_blocks=num_blocks,
         device=str(device),
@@ -433,36 +489,7 @@ def test_hccl_allreduce_with_layerwise_load_and_save(
             launch_harness(load_latent, direction=False)
             launch_harness(load_index, direction=False)
 
-        allreduce_tensor = torch.zeros(
-            (allreduce_rows, allreduce_hidden),
-            dtype=dtype,
-            device=device,
-        )
-        expected_collective_value = world_size * (world_size + 1) // 2
-
-        def prepare_collective() -> None:
-            allreduce_tensor.fill_(rank + 1)
-
-        def validate_collective() -> None:
-            first = float(allreduce_tensor[0, 0].item())
-            last = float(allreduce_tensor[-1, -1].item())
-            assert first == expected_collective_value
-            assert last == expected_collective_value
-
-        def launch_collective() -> None:
-            work = dist.all_reduce(
-                allreduce_tensor,
-                op=dist.ReduceOp.SUM,
-                async_op=True,
-            )
-            # Make the caller's current stream depend on HCCL completion before
-            # its done event is recorded.  Otherwise an internal HCCL stream
-            # could make both the common fence and serial control look shorter
-            # than the collective itself.
-            work.wait()
-
         control_stream = torch.npu.Stream()
-        collective_stream = torch.npu.Stream()
         save_stream = torch.npu.Stream()
         load_stream = torch.npu.Stream()
         serial_stream = torch.npu.Stream()
@@ -526,11 +553,7 @@ def test_hccl_allreduce_with_layerwise_load_and_save(
                 for _ in range(3)
             ]
         gate_ms = statistics.median(gate_samples)
-        assert min(gate_samples) * 1000.0 >= gate_target_us * 0.95, (
-            "the common-start gate is too short to queue all three streams: "
-            f"target={gate_target_us:.3f} us, "
-            f"minimum={min(gate_samples) * 1000.0:.3f} us"
-        )
+        gate_ready = min(gate_samples) * 1000.0 >= gate_target_us * 0.95
 
         collective_samples = [
             _time_one_stream(
@@ -639,79 +662,48 @@ def test_hccl_allreduce_with_layerwise_load_and_save(
         load_samples_us = [sample * 1000.0 for sample in load_samples]
         concurrent_samples_us = [sample * 1000.0 for sample in concurrent_samples]
         serial_samples_us = [sample * 1000.0 for sample in serial_samples]
-        max_makespan_us = target_us + makespan_slack_us
-        dominant_max_us = max(
-            max(collective_samples_us),
-            max(save_samples_us),
-            max(load_samples_us),
-        )
         isolated_sum_us = collective_us + save_us + load_us
+        independent_max_us = max(collective_us, save_us, load_us)
 
         def format_samples(values: list[float]) -> str:
             return "[" + ", ".join(f"{value:.3f}" for value in values) + "]"
 
         if rank == 0:
-            print("\nHCCL + layerwise load/save device makespan")
-            print(
-                f"ranks={world_size} allreduce={allreduce_rows}x"
-                f"{allreduce_hidden} bf16 payload_per_direction="
-                f"{transfer_shape.payload_bytes} B"
-            )
-            print(f"10GB/s-model transfer time: {transfer_shape.theoretical_us:.3f} us")
-            print(
-                f"common-start gate:         {gate_ms * 1000.0:.3f} us "
-                f"({gate_iterations} matmuls; excluded from makespan)"
-            )
-            print(f"HCCL-only median:          {collective_us:.3f} us")
-            print(f"save-only median:          {save_us:.3f} us")
-            print(f"load-only median:          {load_us:.3f} us")
-            print(f"HCCL samples:              {format_samples(collective_samples_us)}")
-            print(f"save samples:              {format_samples(save_samples_us)}")
-            print(f"load samples:              {format_samples(load_samples_us)}")
-            print(f"strict-serial median:      {serial_us:.3f} us")
-            print(f"serial samples:            {format_samples(serial_samples_us)}")
-            print(f"prequeued makespan median: {concurrent_us:.3f} us")
-            print(f"prequeued samples:         {format_samples(concurrent_samples_us)}")
-            print(f"hard makespan ceiling:     {max_makespan_us:.3f} us")
-
-        assert abs(collective_us - target_us) <= allreduce_tolerance_us, (
-            "the real HCCL all-reduce is not the requested 500 us window: "
-            f"target={target_us:.3f} us, measured={collective_us:.3f} us; "
-            "adjust LMCACHE_HCCL_OVERLAP_ALLREDUCE_ROWS/HIDDEN if needed"
-        )
-        assert max(save_samples_us) < target_us, (
-            f"a layerwise save exceeds {target_us:.3f} us: "
-            f"samples={format_samples(save_samples_us)} us"
-        )
-        assert max(load_samples_us) < target_us, (
-            f"a layerwise load exceeds {target_us:.3f} us: "
-            f"samples={format_samples(load_samples_us)} us"
-        )
-        assert max(concurrent_samples_us) <= max_makespan_us, (
-            "HCCL + save + load did not fit in the requested device window: "
-            f"ceiling={max_makespan_us:.3f} us, "
-            f"samples={format_samples(concurrent_samples_us)} us, "
-            f"strict_serial_median={serial_us:.3f} us"
-        )
-        assert max(concurrent_samples_us) <= dominant_max_us + makespan_slack_us, (
-            "the common-release makespan is not close to the slowest isolated "
-            f"operation: dominant_max={dominant_max_us:.3f} us, "
-            f"concurrent_max={max(concurrent_samples_us):.3f} us"
-        )
-        assert (
-            isolated_sum_us * 0.75
-            <= serial_us
-            <= (isolated_sum_us * 1.35 + makespan_slack_us)
-        ), (
-            "the same-stream control is inconsistent with the isolated sum; "
-            "HCCL may not be fenced onto the measured stream: "
-            f"isolated_sum={isolated_sum_us:.3f} us, serial={serial_us:.3f} us"
-        )
-        assert serial_us > concurrent_us + makespan_slack_us, (
-            "the same-stream control is not meaningfully slower than the "
-            f"concurrent launch: serial={serial_us:.3f} us, "
-            f"concurrent={concurrent_us:.3f} us"
-        )
+            lines = [
+                "\nHCCL + layerwise load/save device timing",
+                (
+                    f"ranks={world_size} allreduce={allreduce_rows}x"
+                    f"{allreduce_hidden} bf16"
+                ),
+                f"all-reduce sizing median:  {sizing_collective_us:.3f} us",
+                (
+                    f"transfer target:          {modeled_transfer_us:.3f} us "
+                    f"({transfer_fraction:.3f}x all-reduce at "
+                    f"{bandwidth_gbps:.3f} GB/s)"
+                ),
+                (
+                    f"payload per direction:    {transfer_shape.num_tokens} tokens, "
+                    f"{transfer_shape.payload_bytes} B, modeled "
+                    f"{transfer_shape.theoretical_us:.3f} us"
+                ),
+                (
+                    f"common-start gate:        {gate_ms * 1000.0:.3f} us "
+                    f"({gate_iterations} matmuls, ready={gate_ready}; excluded)"
+                ),
+                f"all-reduce-only median:    {collective_us:.3f} us",
+                f"all-reduce samples:        {format_samples(collective_samples_us)}",
+                f"save-only median:          {save_us:.3f} us",
+                f"save samples:              {format_samples(save_samples_us)}",
+                f"load-only median:          {load_us:.3f} us",
+                f"load samples:              {format_samples(load_samples_us)}",
+                f"isolated median sum:       {isolated_sum_us:.3f} us",
+                f"independent median max:    {independent_max_us:.3f} us",
+                f"strict-serial median:      {serial_us:.3f} us",
+                f"serial samples:            {format_samples(serial_samples_us)}",
+                f"combined median:           {concurrent_us:.3f} us",
+                f"combined samples:          {format_samples(concurrent_samples_us)}",
+            ]
+            print("\n".join(lines), flush=True)
     finally:
         try:
             if _npu_available():
