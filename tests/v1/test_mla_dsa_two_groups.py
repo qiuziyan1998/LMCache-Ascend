@@ -2461,6 +2461,7 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
 
 def test_preferred_group0_store_is_fenced_before_group1_live_publish() -> None:
     calls = []
+    source_ready_event = object()
     engine = SimpleNamespace(
         begin_live_source_descriptor=lambda req_id, groups=(0, 1): calls.append(
             ("begin", req_id, groups)
@@ -2469,7 +2470,12 @@ def test_preferred_group0_store_is_fenced_before_group1_live_publish() -> None:
         finalize_live_source_descriptor=lambda *_args: True,
         direct_prefill_store_enabled=lambda: True,
         store_direct_prefill=lambda *args, **kwargs: calls.append(
-            ("store", args[0], kwargs["final"])
+            (
+                "store",
+                args[0],
+                kwargs["final"],
+                kwargs["source_ready_event"],
+            )
         ),
     )
     adapter = _ascend_adapter_fake(
@@ -2499,13 +2505,16 @@ def test_preferred_group0_store_is_fenced_before_group1_live_publish() -> None:
     )
 
     _ascend_adapter_method("_submit_direct_prefill_requests")(
-        adapter, [request], source_ready_event=object()
+        adapter,
+        [request],
+        source_ready_event=source_ready_event,
+        source_ready_event_source="reshape_cache_event",
     )
 
     assert calls == [
         ("begin", "request", (1,)),
         ("capture", "request"),
-        ("store", "request", True),
+        ("store", "request", True, source_ready_event),
     ]
     assert adapter._unfenced_live_stores == {}
     assert adapter._finalized_live_source_submissions == {"request"}

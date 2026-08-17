@@ -505,6 +505,7 @@ def queue_group1_first_consume(
     num_actual_tokens: int | None = None,
     attn_state: Any = None,
     decode_valid_rows_all: bool | None = None,
+    group1_connector_wait_called: bool | None = None,
 ) -> None:
     """Queue exact Group-1 rows consumed by the first decoder forward.
 
@@ -657,9 +658,18 @@ def queue_group1_first_consume(
                     if decode_valid_rows_all is not None
                     else None
                 ),
+                "group1_connector_wait_called": (
+                    bool(group1_connector_wait_called)
+                    if group1_connector_wait_called is not None
+                    else None
+                ),
                 "dtype": str(indexer_cache.dtype),
                 "snapshot_monotonic_ms": round(time.perf_counter() * 1000, 3),
-                "capture_order": ("after_group1_wait_before_current_token_scatter"),
+                "capture_order": (
+                    "after_group1_connector_wait_call_before_current_token_scatter"
+                    if group1_connector_wait_called
+                    else "before_current_token_scatter_without_group1_connector_wait"
+                ),
             },
             values=rows,
             physical_slots=physical_slots,

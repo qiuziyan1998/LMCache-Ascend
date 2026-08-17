@@ -606,6 +606,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     and (not finalized_live or fence_preferred_group0),
                     slot_mapping_base=mapping_base,
                     verified_prefix_end=verified_prefix_end,
+                    source_ready_event=source_ready_event,
+                    source_ready_event_source=source_ready_event_source,
                 )
             if (
                 finalized_live

@@ -62,6 +62,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.content_diagnostics import (
     fingerprint_compact_group1,
+    log_npu_content_diagnostic_event,
     npu_content_diagnostics_enabled,
 )
 
@@ -113,6 +114,9 @@ class _DirectStoreRequestState:
     submitted_legacy_objects: int = 0
     submitted_bytes: int = 0
     fallback_reasons: dict[int, str] = field(default_factory=dict)
+    source_ready_event: Any = None
+    source_ready_event_source: str = "missing"
+    source_ready_token_end: int = 0
     finalized: bool = False
 
 
@@ -781,6 +785,45 @@ class AscendLMCacheEngine(LMCacheEngine):
             keys=key_strings: self._direct_store_done(req_id, keys, done)
         )
         return future
+
+    @staticmethod
+    def _remember_direct_source_readiness(
+        state: _DirectStoreRequestState,
+        token_end: int,
+        event: Any,
+        event_source: str,
+    ) -> None:
+        """Retain the producer dependency needed by a deferred final tail."""
+        if event is None:
+            return
+        if token_end < state.source_ready_token_end:
+            return
+        state.source_ready_event = event
+        state.source_ready_event_source = (
+            event_source
+            if event_source and event_source != "missing"
+            else "caller_supplied"
+        )
+        state.source_ready_token_end = token_end
+
+    @staticmethod
+    def _direct_source_ready_event(
+        state: _DirectStoreRequestState,
+        token_end: int,
+    ) -> tuple[Any, str]:
+        """Return an event that covers every source byte through ``token_end``."""
+        if (
+            state.source_ready_event is not None
+            and state.source_ready_token_end >= token_end
+        ):
+            return state.source_ready_event, state.source_ready_event_source
+
+        event = torch.npu.Event()
+        event.record()
+        state.source_ready_event = event
+        state.source_ready_event_source = "engine_current_stream_fallback"
+        state.source_ready_token_end = token_end
+        return event, state.source_ready_event_source
 
     def begin_live_source_descriptor(
         self, req_id: str, groups: tuple[int, ...] = (0, 1)
@@ -1463,8 +1506,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 slot_mapping_base=slot_mapping_base,
                 format="partial_page",
             )
-        ready_event = torch.npu.Event()
-        ready_event.record()
+        ready_event, ready_event_source = self._direct_source_ready_event(
+            state, len(tokens)
+        )
+        if 1 in group_ends and npu_content_diagnostics_enabled():
+            log_npu_content_diagnostic_event(
+                "group1_persistent_store_ready_dependency",
+                req_id=req_id,
+                token_count=len(tokens),
+                event_source=ready_event_source,
+                source_ready_token_end=state.source_ready_token_end,
+                format="partial_page",
+            )
         batch = _DirectPageBatch(
             req_id,
             keys,
@@ -1497,6 +1550,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         final: bool = False,
         slot_mapping_base: int = 0,
         verified_prefix_end: int = 0,
+        source_ready_event: Any = None,
+        source_ready_event_source: str = "missing",
     ) -> bool:
         """Publish newly completed pages and the final tail directly from NPU."""
         if not self._direct_store_enabled or not group_caches:
@@ -1517,6 +1572,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
         if final and state.finalized:
             return True
+        self._remember_direct_source_readiness(
+            state,
+            len(tokens),
+            source_ready_event,
+            source_ready_event_source,
+        )
         for group in group_caches:
             if group not in state.submitted_end:
                 state.submitted_end[group] = verified_prefix_end
@@ -1746,8 +1807,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 committed_ends=dict(state.committed_end),
             )
         if keys:
-            ready_event = torch.npu.Event()
-            ready_event.record()
+            ready_event, ready_event_source = self._direct_source_ready_event(
+                state, len(tokens)
+            )
+            if 1 in group_ends and npu_content_diagnostics_enabled():
+                log_npu_content_diagnostic_event(
+                    "group1_persistent_store_ready_dependency",
+                    req_id=req_id,
+                    token_count=len(tokens),
+                    event_source=ready_event_source,
+                    source_ready_token_end=state.source_ready_token_end,
+                    format="page",
+                )
             batch = _DirectPageBatch(
                 req_id,
                 keys,

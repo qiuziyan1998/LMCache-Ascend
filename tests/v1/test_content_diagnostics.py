@@ -253,6 +253,7 @@ def test_first_consume_and_topk_readback_are_deferred(
         num_actual_tokens=1,
         attn_state="DecodeOnly",
         decode_valid_rows_all=False,
+        group1_connector_wait_called=True,
     )
     diagnostics.queue_selected_topk_fingerprint(
         req_ids=["request"],
@@ -277,8 +278,9 @@ def test_first_consume_and_topk_readback_are_deferred(
     assert consume["all_expected_rows_match"] is True
     assert consume["readback_mode"] == "deferred_after_model_forward"
     assert consume["capture_order"] == (
-        "after_group1_wait_before_current_token_scatter"
+        "after_group1_connector_wait_call_before_current_token_scatter"
     )
+    assert consume["group1_connector_wait_called"] is True
     assert consume["request_seq_len"] == 3
     assert consume["request_row_count"] == 1
     assert consume["row_owners"] == [0, -1]

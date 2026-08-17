@@ -857,16 +857,24 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
     engine.storage_manager = _StorageManager()
     engine.gpu_connector = _GPUConnector()
     slots = torch.arange(4)
+    producer_event = object()
 
     assert engine.store_direct_prefill(
         "request",
         [1, 2, 3, 4],
         {0: [object()], 1: [object()]},
         {0: slots, 1: slots},
+        source_ready_event=producer_event,
+        source_ready_event_source="reshape_cache_event",
     )
 
     assert len(engine.storage_manager.submissions) == 1
     assert len(engine.storage_manager.submissions[0][0]) == 2
+    assert engine.storage_manager.submissions[0][4] is producer_event
+    assert (
+        engine._direct_store_states["request"].source_ready_event_source
+        == "reshape_cache_event"
+    )
     assert engine.token_database.calls[1] == (1, [11, 22], [2, 2])
     engine.wait_for_direct_stores(("request",))
     assert engine._direct_store_states["request"].committed_end == {0: 4, 1: 4}
@@ -996,9 +1004,14 @@ def test_direct_tail_uses_one_merged_partial_page_per_group(monkeypatch) -> None
     engine.begin_live_source_descriptor("request")
     engine.token_database = _TokenDatabase()
     engine.storage_manager = _StorageManager()
+    producer_event = object()
     engine._direct_store_states = {
         "request": ascend_cache_engine._DirectStoreRequestState(
-            planned_end=4, planned_hash=22
+            planned_end=4,
+            planned_hash=22,
+            source_ready_event=producer_event,
+            source_ready_event_source="reshape_cache_event",
+            source_ready_token_end=5,
         )
     }
     engine._direct_store_jobs = deque()
@@ -1045,6 +1058,7 @@ def test_direct_tail_uses_one_merged_partial_page_per_group(monkeypatch) -> None
         [owner_base, owner_base + 4],
     ]
     assert submission[2] == [[4, 4], [4, 4]]
+    assert submission[4] is producer_event
     assert submission[-1] == "request"
     engine.wait_for_direct_stores(("request",))
     assert engine._direct_store_states["request"].committed_end == {0: 5, 1: 5}
