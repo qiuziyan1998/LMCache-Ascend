@@ -1696,6 +1696,10 @@ def _ascend_adapter_fake(**attrs):
     fake._direct_store_observed_layers = set()
     fake._direct_store_step_supported = None
     fake._unfenced_live_stores = {}
+    fake._latest_live_source_ready_event = None
+    fake._latest_live_source_ready_event_source = "missing"
+    fake._live_source_ready_fences = {}
+    fake._finalized_live_source_submissions = set()
     for name, value in attrs.items():
         setattr(fake, name, value)
     return fake
@@ -1962,7 +1966,7 @@ def test_final_live_store_is_not_resubmitted_by_finish_batch() -> None:
     )
 
     _ascend_adapter_method("_submit_direct_prefill_requests")(
-        adapter, [request]
+        adapter, [request], source_ready_event=object()
     )
 
 
@@ -2001,6 +2005,254 @@ def test_live_final_metadata_is_built_before_persistent_final_fence() -> None:
     )
 
     assert calls[:2] == ["metadata", "store-final-True"]
+
+
+def test_live_source_event_is_fenced_before_descriptor_drain(monkeypatch) -> None:
+    calls = []
+
+    class FakeEvent:
+        ready = False
+
+        def query(self):
+            calls.append(("query", self.ready))
+            return self.ready
+
+        def synchronize(self):
+            calls.append("event-synchronize")
+            self.ready = True
+
+    event = FakeEvent()
+    descriptor = {"tp_rank": 0, "dp_rank": 0}
+
+    class FakeEngine:
+        def finalize_live_source_readiness(self, req_ids):
+            calls.append(("post-fence-fingerprint", list(req_ids), event.ready))
+
+        def drain_live_source_descriptors(self):
+            calls.append(("drain", event.ready))
+            return {"request": descriptor}
+
+    module = __import__(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter",
+        fromlist=["_LiveSourceReadyFence"],
+    )
+    monkeypatch.setattr(module, "npu_content_diagnostics_enabled", lambda: True)
+    diagnostic_events = []
+    monkeypatch.setattr(
+        module,
+        "log_npu_content_diagnostic_event",
+        lambda name, **fields: diagnostic_events.append((name, fields)),
+    )
+    fence = module._LiveSourceReadyFence(
+        event=event,
+        event_source="attn_metadata.reshape_cache_event",
+        ready_at_finalize=False,
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=FakeEngine(),
+        _live_source_ready_fences={"request": fence},
+    )
+
+    metadata = _ascend_adapter_method("build_connector_worker_meta")(adapter)
+
+    assert calls == [
+        ("query", False),
+        "event-synchronize",
+        ("post-fence-fingerprint", ["request"], True),
+        ("drain", True),
+    ]
+    assert metadata.descriptors == {"request": [descriptor]}
+    assert adapter._live_source_ready_fences == {}
+    assert diagnostic_events[0][0] == "group1_source_ready_fence"
+    assert diagnostic_events[0][1]["ready_at_finalize"] is False
+    assert diagnostic_events[0][1]["query_precedes_device_readback"] is True
+    assert diagnostic_events[0][1]["ready_after_fence"] is True
+
+
+def test_source_readiness_query_precedes_descriptor_finalize(monkeypatch) -> None:
+    calls = []
+
+    class FakeEvent:
+        def query(self):
+            calls.append("query")
+            return False
+
+    event = FakeEvent()
+    engine = SimpleNamespace(
+        begin_live_source_descriptor=lambda *_args: calls.append("begin"),
+        capture_live_source_step=lambda *_args: calls.append("capture"),
+        finalize_live_source_descriptor=lambda *_args: (
+            calls.append("finalize") or True
+        ),
+        direct_prefill_store_enabled=lambda: False,
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {},
+            {1: "live-indexer-slots"},
+            0,
+        ),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[],
+        live_source_token_ids=[1, 2, 3],
+        live_source_slot_mapping=None,
+        live_source_indexer_slot_mapping=["live-indexer-slots"],
+        live_source_requested=True,
+        load_spec=None,
+        request_configs=None,
+        is_last_prefill=True,
+    )
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "npu_content_diagnostics_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter,
+        [request],
+        source_ready_event=event,
+        source_ready_event_source="test",
+    )
+
+    assert calls == ["begin", "capture", "query", "finalize"]
+    assert adapter._live_source_ready_fences["request"].ready_at_finalize is False
+
+
+def test_post_fence_source_fingerprint_is_attached_to_wire_descriptor(
+    monkeypatch,
+) -> None:
+    calls = []
+    fingerprint = {"content_hash": "post-fence"}
+
+    def fake_fingerprint(**kwargs):
+        calls.append(kwargs)
+        return fingerprint
+
+    monkeypatch.setattr(
+        "lmcache_ascend.v1.cache_engine.fingerprint_compact_group1",
+        fake_fingerprint,
+    )
+    descriptor = {"tp_rank": 0, "dp_rank": 1}
+    pending = {
+        "request": {
+            "owners": [object()],
+            "layers": [object()],
+            "runs": [object()],
+            "token_count": 17,
+            "chunk_size": 4,
+            "tp_rank": 0,
+            "dp_rank": 1,
+        }
+    }
+    engine = SimpleNamespace(
+        _pending_live_source_diagnostics=pending,
+        _completed_live_sources={"request": descriptor},
+    )
+
+    AscendLMCacheEngine.finalize_live_source_readiness(engine, ["request"])
+
+    assert calls[0]["event"] == "group1_source_post_fence_fingerprint"
+    assert calls[0]["token_count"] == 17
+    assert calls[0]["dp_rank"] == 1
+    assert descriptor["content_diagnostics"] is fingerprint
+    assert pending == {}
+
+
+def test_descriptor_drain_rejects_unfenced_diagnostic_source() -> None:
+    descriptor = {"tp_rank": 0, "dp_rank": 0}
+    engine = SimpleNamespace(
+        _pending_live_source_diagnostics={"request": {}},
+        _completed_live_sources={"request": descriptor},
+    )
+
+    with pytest.raises(RuntimeError, match="before their post-fence"):
+        AscendLMCacheEngine.drain_live_source_descriptors(engine)
+
+    engine._pending_live_source_diagnostics.clear()
+    assert AscendLMCacheEngine.drain_live_source_descriptors(engine) == {
+        "request": descriptor
+    }
+
+
+def test_save_layer_carries_final_indexer_producer_event() -> None:
+    event = object()
+    submitted = []
+    request = SimpleNamespace(req_id="request")
+    adapter = _ascend_adapter_fake(
+        config=SimpleNamespace(dsa_two_groups=True),
+        _latent_layer_names=("model.layers.0.self_attn",),
+        _indexer_layer_names=("model.layers.0.self_attn.indexer.k_cache",),
+        _direct_prefill_requests=lambda: [request],
+        _preflight_direct_store=lambda _requests: True,
+        _submit_direct_prefill_requests=lambda requests, **kwargs: submitted.append(
+            (requests, kwargs)
+        ),
+        _latest_live_source_ready_event=None,
+        _latest_live_source_ready_event_source="missing",
+    )
+    metadata = SimpleNamespace(reshape_cache_event=event)
+
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "model.layers.0.self_attn",
+        object(),
+        metadata,
+    )
+    assert submitted == []
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "model.layers.0.self_attn.indexer.k_cache",
+        object(),
+        metadata,
+    )
+
+    assert submitted[0][0] == [request]
+    assert submitted[0][1]["source_ready_event"] is event
+    assert submitted[0][1]["source_ready_event_source"] == (
+        "attn_metadata.reshape_cache_event"
+    )
+    assert adapter._latest_live_source_ready_event is None
+
+
+def test_source_ready_event_uses_matching_layer_metadata() -> None:
+    expected = object()
+    metadata = {
+        "layer.0": SimpleNamespace(reshape_cache_event=object()),
+        "layer.1": SimpleNamespace(reshape_cache_event=expected),
+    }
+
+    source_event = _ascend_adapter_method("_source_ready_event")
+    assert source_event("layer.1", metadata) is expected
+    assert source_event("missing", metadata) is None
+
+
+def test_save_batch_does_not_rebuild_completed_live_descriptor() -> None:
+    request = SimpleNamespace(req_id="request")
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=SimpleNamespace(),
+        _unfenced_live_stores={},
+        _live_source_ready_fences={},
+        _finalized_live_source_submissions={"request"},
+        _direct_group_caches=lambda: pytest.fail(
+            "completed live request was submitted twice"
+        ),
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request], source_ready_event=object()
+    )
 
 
 def test_deferred_live_store_failure_does_not_block_other_requests() -> None:
@@ -2247,7 +2499,7 @@ def test_preferred_group0_store_is_fenced_before_group1_live_publish() -> None:
     )
 
     _ascend_adapter_method("_submit_direct_prefill_requests")(
-        adapter, [request]
+        adapter, [request], source_ready_event=object()
     )
 
     assert calls == [
@@ -2256,6 +2508,7 @@ def test_preferred_group0_store_is_fenced_before_group1_live_publish() -> None:
         ("store", "request", True),
     ]
     assert adapter._unfenced_live_stores == {}
+    assert adapter._finalized_live_source_submissions == {"request"}
 
 
 def test_group0_live_keeps_preferred_persistence_unfenced(monkeypatch) -> None:
@@ -2301,7 +2554,7 @@ def test_group0_live_keeps_preferred_persistence_unfenced(monkeypatch) -> None:
     )
 
     _ascend_adapter_method("_submit_direct_prefill_requests")(
-        adapter, [request]
+        adapter, [request], source_ready_event=object()
     )
 
     assert calls == [("request", False)]
@@ -2346,7 +2599,7 @@ def test_group1_only_rank_does_not_fence_preferred_persistence() -> None:
     )
 
     _ascend_adapter_method("_submit_direct_prefill_requests")(
-        adapter, [request]
+        adapter, [request], source_ready_event=object()
     )
 
     assert calls == [("request", False)]
@@ -2441,7 +2694,7 @@ def test_live_source_captures_rank_that_skips_persistent_store() -> None:
     )
 
     _ascend_adapter_method("_submit_direct_prefill_requests")(
-        adapter, [request]
+        adapter, [request], source_ready_event=object()
     )
 
     assert captured[0][1] == [1, 2, 3]

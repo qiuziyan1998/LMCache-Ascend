@@ -345,6 +345,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._direct_completed_futures: WeakSet[Future] = WeakSet()
         self._live_source_builders: dict[str, dict[str, Any]] = {}
         self._completed_live_sources: dict[str, dict[str, Any]] = {}
+        # Diagnostic tensor owners are retained only while the opt-in content
+        # diagnostic is enabled.  Fingerprinting is deliberately deferred
+        # until the adapter has fenced the producer event, so diagnostic host
+        # readback cannot hide whether that event was initially incomplete.
+        self._pending_live_source_diagnostics: dict[str, dict[str, Any]] = {}
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
         if self.is_store_async:
             self._store_queue: Optional[queue.Queue] = None
@@ -1020,30 +1025,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 group_byte_totals=totals,
             )
             return False
-        content_diagnostics = None
-        if (
-            compact_layers is not None
-            and npu_content_diagnostics_enabled()
-            and builder.get("compact_owners")
-        ):
-            content_diagnostics = fingerprint_compact_group1(
-                event="group1_source_fingerprint",
-                req_id=req_id,
-                owners=builder["compact_owners"],
-                layers=compact_layers,
-                runs=builder["compact_runs"],
-                token_count=token_count,
-                chunk_size=int(self.config.chunk_size),
-                tp_rank=tp_rank,
-                dp_rank=dp_rank,
-            )
         descriptor = {
             "group_byte_totals": totals,
             "tp_rank": tp_rank,
             "dp_rank": dp_rank,
         }
-        if content_diagnostics is not None:
-            descriptor["content_diagnostics"] = content_diagnostics
         if compact_layers is None and latent_layers is None:
             descriptor["segments"] = builder["segments"]
         else:
@@ -1073,6 +1059,26 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "pages": builder["latent_pages"],
                 }
         self._completed_live_sources[req_id] = descriptor
+        if (
+            compact_layers is not None
+            and npu_content_diagnostics_enabled()
+            and builder.get("compact_owners")
+        ):
+            pending_diagnostics = getattr(
+                self, "_pending_live_source_diagnostics", None
+            )
+            if pending_diagnostics is None:
+                pending_diagnostics = {}
+                self._pending_live_source_diagnostics = pending_diagnostics
+            pending_diagnostics[req_id] = {
+                "owners": builder["compact_owners"],
+                "layers": compact_layers,
+                "runs": builder["compact_runs"],
+                "token_count": token_count,
+                "chunk_size": int(self.config.chunk_size),
+                "tp_rank": tp_rank,
+                "dp_rank": dp_rank,
+            }
         cold_start_perf_log(
             logger,
             "live_source_finalize_detail",
@@ -1090,7 +1096,49 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         return True
 
+    def finalize_live_source_readiness(self, req_ids: Iterable[str]) -> None:
+        """Fingerprint live Group-1 sources after their producer fence.
+
+        The adapter calls this only after synchronizing the final NPU producer
+        event.  Keeping the device-to-host readback here preserves the causal
+        evidence captured by the adapter's pre-readback event query.
+        """
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", {}
+        )
+        for req_id in req_ids:
+            pending = pending_diagnostics.pop(req_id, None)
+            if pending is None:
+                continue
+            descriptor = self._completed_live_sources.get(req_id)
+            if descriptor is None:
+                continue
+            fingerprint = fingerprint_compact_group1(
+                event="group1_source_post_fence_fingerprint",
+                req_id=req_id,
+                owners=pending["owners"],
+                layers=pending["layers"],
+                runs=pending["runs"],
+                token_count=pending["token_count"],
+                chunk_size=pending["chunk_size"],
+                tp_rank=pending["tp_rank"],
+                dp_rank=pending["dp_rank"],
+            )
+            if fingerprint is not None:
+                descriptor["content_diagnostics"] = fingerprint
+
     def drain_live_source_descriptors(self) -> dict[str, dict[str, Any]]:
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", {}
+        )
+        unfinished = self._completed_live_sources.keys() & (
+            pending_diagnostics.keys()
+        )
+        if unfinished:
+            raise RuntimeError(
+                "Live source descriptors reached publication before their "
+                f"post-fence diagnostics completed: {sorted(unfinished)}"
+            )
         descriptors = self._completed_live_sources
         self._completed_live_sources = {}
         return descriptors
@@ -1977,6 +2025,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._direct_store_states.pop(req_id, None)
             self._live_source_builders.pop(req_id, None)
             self._completed_live_sources.pop(req_id, None)
+            pending_diagnostics = getattr(
+                self, "_pending_live_source_diagnostics", None
+            )
+            if pending_diagnostics is not None:
+                pending_diagnostics.pop(req_id, None)
 
     def direct_store_committed_ends(self, req_id: str) -> dict[int, int]:
         """Return a snapshot of successfully persisted group frontiers."""
@@ -6894,6 +6947,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._direct_store_states.clear()
         self._live_source_builders.clear()
         self._completed_live_sources.clear()
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", None
+        )
+        if pending_diagnostics is not None:
+            pending_diagnostics.clear()
         # Push poison pill first so any in-flight work drains before
         # ``storage_manager.close()`` runs inside ``super().close()``.
         if self._store_queue is not None:

@@ -136,6 +136,16 @@ def _content_log(event: str, **fields: Any) -> None:
     )
 
 
+def log_npu_content_diagnostic_event(event: str, **fields: Any) -> None:
+    """Emit a metadata-only diagnostic event behind the single opt-in gate.
+
+    Callers must not pass tensors.  This helper exists for causal-order
+    diagnostics (for example NPU event readiness) that do not require device
+    readback and therefore cannot themselves repair a missing synchronization.
+    """
+    _content_log(event, **fields)
+
+
 def _nonfatal_diagnostic(
     event: str,
 ) -> Callable[[Callable[..., None]], Callable[..., None]]:
@@ -450,6 +460,37 @@ def _request_row_counts(row_request_indices: Any, request_count: int) -> list[in
     return [max(value, 1) for value in counts]
 
 
+def _cpu_int_list(values: Any) -> list[int] | None:
+    if values is None:
+        return None
+    if isinstance(values, torch.Tensor):
+        if values.device.type != "cpu":
+            return None
+        values = values.detach().reshape(-1).tolist()
+    return [int(value) for value in values]
+
+
+def _log_snapshot_skip_once(
+    *,
+    requested_event: str,
+    req_ids: Sequence[str],
+    layer_name: str,
+    reason: str,
+    **fields: Any,
+) -> None:
+    for req_id in req_ids:
+        if not _claim_once(f"skip:{requested_event}", str(req_id), reason):
+            continue
+        _content_log(
+            "content_diagnostic_snapshot_skipped",
+            requested_event=requested_event,
+            req_id=str(req_id),
+            layer_name=str(layer_name),
+            reason=reason,
+            **fields,
+        )
+
+
 @_nonfatal_diagnostic("group1_first_decode_consume")
 def queue_group1_first_consume(
     *,
@@ -460,35 +501,77 @@ def queue_group1_first_consume(
     seq_lens_cpu: Any,
     block_size: int,
     row_request_indices: Any = None,
+    num_decode_tokens: int | None = None,
+    num_actual_tokens: int | None = None,
+    attn_state: Any = None,
+    decode_valid_rows_all: bool | None = None,
 ) -> None:
     """Queue exact Group-1 rows consumed by the first decoder forward.
 
     The selected rows are copied device-to-device on the current stream.  Host
     readback and hashing are deferred until :func:`flush_deferred_diagnostics`.
     """
-    if (
-        not _ENABLED
-        or not req_ids
-        or indexer_block_table is None
-        or seq_lens_cpu is None
-        or block_size <= 0
-    ):
+    if not _ENABLED or not req_ids:
+        return
+    request_ids = [str(req_id) for req_id in req_ids]
+    if indexer_block_table is None or seq_lens_cpu is None or block_size <= 0:
+        _log_snapshot_skip_once(
+            requested_event="group1_first_decode_consume",
+            req_ids=request_ids,
+            layer_name=layer_name,
+            reason="missing_attention_metadata",
+            has_indexer_block_table=indexer_block_table is not None,
+            has_seq_lens=seq_lens_cpu is not None,
+            block_size=int(block_size),
+        )
         return
     layer_id = _layer_id(layer_name)
     if layer_id is None:
+        _log_snapshot_skip_once(
+            requested_event="group1_first_decode_consume",
+            req_ids=request_ids,
+            layer_name=layer_name,
+            reason="unrecognized_indexer_layer_name",
+        )
         return
-    if isinstance(seq_lens_cpu, torch.Tensor):
-        if seq_lens_cpu.device.type != "cpu":
-            return
-        seq_lens = [int(value) for value in seq_lens_cpu.reshape(-1).tolist()]
-    else:
-        seq_lens = [int(value) for value in seq_lens_cpu]
+    seq_lens = _cpu_int_list(seq_lens_cpu)
+    if seq_lens is None:
+        _log_snapshot_skip_once(
+            requested_event="group1_first_decode_consume",
+            req_ids=request_ids,
+            layer_name=layer_name,
+            reason="sequence_lengths_not_on_cpu",
+        )
+        return
+    row_owners = _cpu_int_list(row_request_indices)
+    request_count = len(request_ids)
+    block_table_rows = int(indexer_block_table.shape[0])
+    if len(seq_lens) < request_count or block_table_rows < request_count:
+        _log_snapshot_skip_once(
+            requested_event="group1_first_decode_consume",
+            req_ids=request_ids,
+            layer_name=str(layer_name),
+            reason="incomplete_request_index_metadata",
+            request_count=request_count,
+            seq_len_count=len(seq_lens),
+            block_table_rows=block_table_rows,
+            row_owners=row_owners,
+        )
+        return
     row_counts = _request_row_counts(row_request_indices, len(req_ids))
     flat = indexer_cache.reshape(-1, *indexer_cache.shape[2:])
-    for req_index, req_id in enumerate(req_ids):
+    for req_index, req_id in enumerate(request_ids):
         with _STATE_LOCK:
             spec = _REQUEST_SPECS.get(str(req_id))
-        if not spec or layer_id not in spec.get("sample_layer_ids", ()):
+        if not spec:
+            _log_snapshot_skip_once(
+                requested_event="group1_first_decode_consume",
+                req_ids=[req_id],
+                layer_name=layer_name,
+                reason="source_fingerprint_not_registered",
+            )
+            continue
+        if layer_id not in spec.get("sample_layer_ids", ()):
             continue
         context_tokens = max(seq_lens[req_index] - row_counts[req_index], 0)
         logical_tokens = [
@@ -527,6 +610,53 @@ def queue_group1_first_consume(
                 "layer_id": layer_id,
                 "logical_tokens": logical_tokens,
                 "context_tokens": context_tokens,
+                "request_seq_len": seq_lens[req_index],
+                "request_row_count": row_counts[req_index],
+                "seq_lens": seq_lens,
+                "row_owners": row_owners,
+                "valid_row_indices": (
+                    [
+                        index
+                        for index, owner in enumerate(row_owners)
+                        if 0 <= owner < request_count
+                    ]
+                    if row_owners is not None
+                    else None
+                ),
+                "padding_row_indices": (
+                    [
+                        index
+                        for index, owner in enumerate(row_owners)
+                        if owner < 0
+                    ]
+                    if row_owners is not None
+                    else None
+                ),
+                "invalid_row_indices": (
+                    [
+                        index
+                        for index, owner in enumerate(row_owners)
+                        if owner >= request_count
+                    ]
+                    if row_owners is not None
+                    else None
+                ),
+                "num_decode_tokens": (
+                    int(num_decode_tokens)
+                    if num_decode_tokens is not None
+                    else None
+                ),
+                "num_actual_tokens": (
+                    int(num_actual_tokens)
+                    if num_actual_tokens is not None
+                    else None
+                ),
+                "attn_state": str(attn_state),
+                "decode_valid_rows_all": (
+                    bool(decode_valid_rows_all)
+                    if decode_valid_rows_all is not None
+                    else None
+                ),
                 "dtype": str(indexer_cache.dtype),
                 "snapshot_monotonic_ms": round(time.perf_counter() * 1000, 3),
                 "capture_order": ("after_group1_wait_before_current_token_scatter"),
@@ -545,6 +675,11 @@ def queue_selected_topk_fingerprint(
     layer_name: str,
     topk_indices: torch.Tensor,
     row_request_indices: Any = None,
+    seq_lens_cpu: Any = None,
+    num_decode_tokens: int | None = None,
+    num_actual_tokens: int | None = None,
+    attn_state: Any = None,
+    decode_valid_rows_all: bool | None = None,
 ) -> None:
     """Queue selected top-k token rows per request for deferred hashing.
 
@@ -560,11 +695,26 @@ def queue_selected_topk_fingerprint(
         return
     request_ids = [str(req_id) for req_id in req_ids]
     eligible: set[int] = set()
+    registered: set[int] = set()
     for req_index, req_id in enumerate(request_ids):
         with _STATE_LOCK:
             spec = _REQUEST_SPECS.get(req_id)
-        if spec and layer_id in spec.get("sample_layer_ids", ()):
-            eligible.add(req_index)
+        if spec:
+            registered.add(req_index)
+            if layer_id in spec.get("sample_layer_ids", ()):
+                eligible.add(req_index)
+    missing = [
+        req_id
+        for req_index, req_id in enumerate(request_ids)
+        if req_index not in registered
+    ]
+    if missing:
+        _log_snapshot_skip_once(
+            requested_event="group1_selected_topk_fingerprint",
+            req_ids=missing,
+            layer_name=layer_name,
+            reason="source_fingerprint_not_registered",
+        )
     if not eligible:
         return
     row_owners: list[int]
@@ -586,7 +736,24 @@ def queue_selected_topk_fingerprint(
         ]
     else:
         row_owners = [int(value) for value in row_request_indices]
+    seq_lens = _cpu_int_list(seq_lens_cpu)
     row_limit = min(len(row_owners), int(topk_indices.shape[0]))
+    valid_row_indices = [
+        index
+        for index, owner in enumerate(row_owners[:row_limit])
+        if 0 <= owner < len(request_ids)
+    ]
+    padding_row_indices = [
+        index for index, owner in enumerate(row_owners[:row_limit]) if owner < 0
+    ]
+    invalid_row_indices = [
+        index
+        for index, owner in enumerate(row_owners[:row_limit])
+        if owner >= len(request_ids)
+    ]
+    unowned_topk_row_indices = list(
+        range(row_limit, int(topk_indices.shape[0]))
+    )
     for req_index in sorted(eligible):
         req_id = request_ids[req_index]
         row_indices = [
@@ -612,6 +779,35 @@ def queue_selected_topk_fingerprint(
                     "layer_name": str(layer_name),
                     "layer_id": layer_id,
                     "row_indices": row_indices,
+                    "request_seq_len": (
+                        seq_lens[req_index]
+                        if seq_lens is not None and req_index < len(seq_lens)
+                        else None
+                    ),
+                    "seq_lens": seq_lens,
+                    "row_owners": row_owners[:row_limit],
+                    "valid_row_indices": valid_row_indices,
+                    "padding_row_indices": padding_row_indices,
+                    "invalid_row_indices": invalid_row_indices,
+                    "unowned_topk_row_indices": unowned_topk_row_indices,
+                    "topk_row_count": int(topk_indices.shape[0]),
+                    "row_owner_count": len(row_owners),
+                    "num_decode_tokens": (
+                        int(num_decode_tokens)
+                        if num_decode_tokens is not None
+                        else None
+                    ),
+                    "num_actual_tokens": (
+                        int(num_actual_tokens)
+                        if num_actual_tokens is not None
+                        else None
+                    ),
+                    "attn_state": str(attn_state),
+                    "decode_valid_rows_all": (
+                        bool(decode_valid_rows_all)
+                        if decode_valid_rows_all is not None
+                        else None
+                    ),
                     "shape": list(rows.shape),
                     "dtype": str(topk_indices.dtype),
                     "snapshot_monotonic_ms": round(time.perf_counter() * 1000, 3),
@@ -703,6 +899,43 @@ def flush_deferred_diagnostics() -> None:
                 fields["value_preview"] = [
                     int(value) for value in flat[:preview_count].tolist()
                 ]
+                if snapshot.event == "group1_selected_topk_fingerprint":
+                    rows = values_cpu.reshape(values_cpu.shape[0], -1)
+                    sequence_length = fields.get("request_seq_len")
+                    row_summaries: list[dict[str, Any]] = []
+                    for offset, row in enumerate(rows):
+                        row_flat = row.reshape(-1)
+                        count = int(row_flat.numel())
+                        row_index = int(fields["row_indices"][offset])
+                        summary: dict[str, Any] = {
+                            "row_index": row_index,
+                            "value_count": count,
+                            "content_hash": _hash_cpu_tensor(row_flat),
+                            "min": int(row_flat.min().item()) if count else None,
+                            "max": int(row_flat.max().item()) if count else None,
+                            "unique_count": (
+                                int(torch.unique(row_flat).numel()) if count else 0
+                            ),
+                            "identity_prefix": bool(
+                                count
+                                and torch.equal(
+                                    row_flat,
+                                    torch.arange(
+                                        count,
+                                        dtype=row_flat.dtype,
+                                    ),
+                                )
+                            ),
+                        }
+                        if sequence_length is not None:
+                            valid = (row_flat >= 0) & (
+                                row_flat < int(sequence_length)
+                            )
+                            summary["out_of_range_count"] = int(
+                                count - int(valid.sum().item())
+                            )
+                        row_summaries.append(summary)
+                    fields["row_summaries"] = row_summaries
             _content_log(
                 snapshot.event,
                 **fields,

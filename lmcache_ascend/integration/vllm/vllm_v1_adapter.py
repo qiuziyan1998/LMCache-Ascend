@@ -2,6 +2,7 @@
 # Standard
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -20,6 +21,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 import torch
+
+# First Party
+from lmcache_ascend.v1.content_diagnostics import (
+    log_npu_content_diagnostic_event,
+    npu_content_diagnostics_enabled,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -43,6 +50,13 @@ class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
         for req_id, items in other.descriptors.items():
             merged.setdefault(req_id, []).extend(items)
         return LiveSourceWorkerMetadata(merged)
+
+
+@dataclass(slots=True)
+class _LiveSourceReadyFence:
+    event: Any
+    event_source: str
+    ready_at_finalize: Optional[bool]
 
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
@@ -83,6 +97,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         ] = {}
         self._scheduler_live_sources: dict[str, list[dict[str, Any]]] = {}
         self._unfenced_live_stores: dict[str, ReqMeta] = {}
+        self._latest_live_source_ready_event: Any = None
+        self._latest_live_source_ready_event_source = "missing"
+        self._live_source_ready_fences: dict[str, _LiveSourceReadyFence] = {}
+        self._finalized_live_source_submissions: set[str] = set()
 
         if self._direct_store_requested:
             extra = self.config.extra_config or {}
@@ -189,6 +207,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         finally:
             self._direct_store_step_supported = None
             self._direct_store_observed_layers.clear()
+            self._latest_live_source_ready_event = None
+            self._latest_live_source_ready_event_source = "missing"
             for key in list(self._completed_layerwise_stores):
                 if key[0] in req_ids:
                     self._completed_layerwise_stores.pop(key, None)
@@ -202,7 +222,99 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     )
                 for req_id in req_ids:
                     self._unfenced_live_stores.pop(req_id, None)
+                    fences = getattr(self, "_live_source_ready_fences", None)
+                    if fences is not None:
+                        fences.pop(req_id, None)
+                    finalized = getattr(
+                        self, "_finalized_live_source_submissions", None
+                    )
+                    if finalized is not None:
+                        finalized.discard(req_id)
                 self.lmcache_engine.drop_direct_store_states(req_ids)
+
+    @staticmethod
+    def _source_ready_event(layer_name: str, attn_metadata: Any) -> Any:
+        metadata = attn_metadata
+        if isinstance(attn_metadata, dict):
+            metadata = attn_metadata.get(layer_name)
+        return getattr(metadata, "reshape_cache_event", None)
+
+    @staticmethod
+    def _query_source_ready_event(event: Any) -> Optional[bool]:
+        query = getattr(event, "query", None)
+        if not callable(query):
+            return None
+        try:
+            return bool(query())
+        except Exception:
+            logger.warning("Failed to query live-source NPU event", exc_info=True)
+            return None
+
+    @staticmethod
+    def _fallback_source_ready_event() -> Any:
+        npu = getattr(torch, "npu", None)
+        if npu is None:
+            # CPU-only unit tests cannot construct an NPU event.  A real Ascend
+            # worker always has torch.npu and must either reuse or record one.
+            return None
+        event = npu.Event()
+        event.record()
+        return event
+
+    def _fence_live_source_descriptors(self) -> None:
+        fences = getattr(self, "_live_source_ready_fences", None)
+        if not fences:
+            return
+        assert self.lmcache_engine is not None
+
+        by_event: dict[int, tuple[Any, list[tuple[str, _LiveSourceReadyFence]]]] = {}
+        for req_id, fence in fences.items():
+            entry = by_event.setdefault(id(fence.event), (fence.event, []))
+            entry[1].append((req_id, fence))
+
+        completed: list[str] = []
+        for event, requests in by_event.values():
+            ready_before_publish = (
+                self._query_source_ready_event(event)
+                if npu_content_diagnostics_enabled()
+                else None
+            )
+            started = time.perf_counter()
+            # This is an event-local producer fence.  It does not drain
+            # unrelated NPU streams or invoke torch.npu.synchronize().
+            event.synchronize()
+            wait_ms = (time.perf_counter() - started) * 1000
+            req_ids = [req_id for req_id, _ in requests]
+            finalize_readiness = getattr(
+                self.lmcache_engine, "finalize_live_source_readiness", None
+            )
+            if callable(finalize_readiness):
+                finalize_readiness(req_ids)
+            for req_id, fence in requests:
+                cold_start_perf_log(
+                    logger,
+                    "live_source_ready_fence",
+                    req_id=req_id,
+                    event_source=fence.event_source,
+                    ready_at_finalize=fence.ready_at_finalize,
+                    ready_before_publish=ready_before_publish,
+                    wait_ms=round(wait_ms, 3),
+                    fence_scope="producer_event",
+                )
+                log_npu_content_diagnostic_event(
+                    "group1_source_ready_fence",
+                    req_id=req_id,
+                    event_source=fence.event_source,
+                    ready_at_finalize=fence.ready_at_finalize,
+                    ready_before_publish=ready_before_publish,
+                    ready_after_fence=True,
+                    wait_ms=round(wait_ms, 3),
+                    query_precedes_device_readback=True,
+                    fence_scope="producer_event",
+                )
+                completed.append(req_id)
+        for req_id in completed:
+            fences.pop(req_id, None)
 
     def save_kv_layer(
         self,
@@ -232,12 +344,30 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if layer_name in expected:
             if layer_name in self._direct_store_observed_layers:
                 self._direct_store_observed_layers.clear()
+                self._latest_live_source_ready_event = None
+                self._latest_live_source_ready_event_source = "missing"
             self._direct_store_observed_layers.add(layer_name)
+            source_ready_event = LMCacheAscendConnectorV1Impl._source_ready_event(
+                layer_name, attn_metadata
+            )
+            if source_ready_event is not None:
+                self._latest_live_source_ready_event = source_ready_event
+                self._latest_live_source_ready_event_source = (
+                    "attn_metadata.reshape_cache_event"
+                )
         if not expected.issubset(self._direct_store_observed_layers):
             return
 
-        self._submit_direct_prefill_requests(requests)
+        self._submit_direct_prefill_requests(
+            requests,
+            source_ready_event=self._latest_live_source_ready_event,
+            source_ready_event_source=(
+                self._latest_live_source_ready_event_source
+            ),
+        )
         self._direct_store_observed_layers.clear()
+        self._latest_live_source_ready_event = None
+        self._latest_live_source_ready_event_source = "missing"
 
     def _direct_group_caches(self) -> dict[int, list]:
         self._refresh_kvcaches_list()
@@ -298,13 +428,24 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self,
         requests: list[ReqMeta],
         adopted_requests: Optional[set[str]] = None,
+        *,
+        source_ready_event: Any = None,
+        source_ready_event_source: str = "missing",
     ) -> None:
         """Submit direct pages; also used by the wait-for-save fallback."""
         assert self.lmcache_engine is not None
+        live_source_ready_fences = getattr(
+            self, "_live_source_ready_fences", {}
+        )
+        finalized_live_sources = getattr(
+            self, "_finalized_live_source_submissions", set()
+        )
         requests = [
             request
             for request in requests
             if request.req_id not in self._unfenced_live_stores
+            and request.req_id not in live_source_ready_fences
+            and request.req_id not in finalized_live_sources
         ]
         if not requests:
             return
@@ -390,12 +531,52 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 live_groups = ()
             finalized_live = False
             if live_source and request.is_last_prefill:
+                if source_ready_event is None:
+                    source_ready_event = (
+                        LMCacheAscendConnectorV1Impl._fallback_source_ready_event()
+                    )
+                    if source_ready_event is not None:
+                        source_ready_event_source = "adapter_current_stream_fallback"
+                ready_at_finalize = (
+                    LMCacheAscendConnectorV1Impl._query_source_ready_event(
+                        source_ready_event
+                    )
+                    if source_ready_event is not None
+                    and npu_content_diagnostics_enabled()
+                    else None
+                )
                 finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
                     request.req_id,
                     len(live_token_ids),
                     get_tensor_model_parallel_rank(),
                     int(getattr(parallel, "data_parallel_index", 0) or 0),
                 )
+                if finalized_live:
+                    finalized = getattr(
+                        self, "_finalized_live_source_submissions", None
+                    )
+                    if finalized is None:
+                        finalized = set()
+                        self._finalized_live_source_submissions = finalized
+                    finalized.add(request.req_id)
+                if finalized_live and source_ready_event is not None:
+                    fences = getattr(self, "_live_source_ready_fences", None)
+                    if fences is None:
+                        fences = {}
+                        self._live_source_ready_fences = fences
+                    fences[request.req_id] = _LiveSourceReadyFence(
+                        event=source_ready_event,
+                        event_source=source_ready_event_source,
+                        ready_at_finalize=ready_at_finalize,
+                    )
+                elif finalized_live:
+                    # This is reachable only in CPU-only tests.  Fail loudly
+                    # on an actual Ascend worker instead of publishing an
+                    # unfenced remote-readable source.
+                    if getattr(torch, "npu", None) is not None:
+                        raise RuntimeError(
+                            "Final live Group-1 descriptor has no producer NPU event"
+                        )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
             preferred_segment = (
                 request.request_configs.get(_MOONCAKE_PREFERRED_SEGMENT_CONFIG)
@@ -437,6 +618,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     def build_connector_worker_meta(self) -> Optional[KVConnectorWorkerMetadata]:
         if self.lmcache_engine is None:
             return None
+        self._fence_live_source_descriptors()
         descriptors = self.lmcache_engine.drain_live_source_descriptors()
         for req_id, descriptor in descriptors.items():
             cold_start_perf_log(
@@ -550,6 +732,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
         self._direct_store_step_supported = None
         self._direct_store_observed_layers.clear()
+        self._latest_live_source_ready_event = None
+        self._latest_live_source_ready_event_source = "missing"
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
             try:
                 self.lmcache_engine.wait_for_pending_sync_stores()
@@ -679,6 +863,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if releasable_req_ids:
             self._release_finished_worker_requests(releasable_req_ids)
             self.lmcache_engine.drop_direct_store_states(releasable_req_ids)
+            finalized = getattr(
+                self, "_finalized_live_source_submissions", None
+            )
+            if finalized is not None:
+                finalized.difference_update(releasable_req_ids)
         for req_id in finished_req_ids - releasable_req_ids:
             # Retrieval pins are request-owned, not async-store-owned. Storage
             # submissions retain their own sources until their futures finish.
@@ -706,6 +895,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         for req_id in preempted_req_ids:
             self._unfenced_live_stores.pop(req_id, None)
+            fences = getattr(self, "_live_source_ready_fences", None)
+            if fences is not None:
+                fences.pop(req_id, None)
+            finalized = getattr(
+                self, "_finalized_live_source_submissions", None
+            )
+            if finalized is not None:
+                finalized.discard(req_id)
         self.lmcache_engine.drop_direct_store_states(preempted_req_ids)
         if waited_req_ids:
             logger.info(

@@ -83,6 +83,26 @@ def test_content_fingerprint_is_strictly_disabled_by_default() -> None:
     )
 
 
+def test_metadata_only_event_uses_same_diagnostic_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    diagnostics.log_npu_content_diagnostic_event("ready", req_id="request")
+    assert events == []
+
+    diagnostics.configure_npu_content_diagnostics(True)
+    diagnostics.log_npu_content_diagnostic_event(
+        "ready", req_id="request", ready=False
+    )
+    assert events[-1] == ("ready", {"req_id": "request", "ready": False})
+
+
 def test_configure_installs_and_clears_vllm_callback_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -228,13 +248,22 @@ def test_first_consume_and_topk_readback_are_deferred(
         indexer_block_table=torch.tensor([[0, 1]]),
         seq_lens_cpu=torch.tensor([3]),
         block_size=4,
-        row_request_indices=torch.tensor([0]),
+        row_request_indices=torch.tensor([0, -1]),
+        num_decode_tokens=1,
+        num_actual_tokens=1,
+        attn_state="DecodeOnly",
+        decode_valid_rows_all=False,
     )
     diagnostics.queue_selected_topk_fingerprint(
         req_ids=["request"],
         layer_name="model.layers.0.self_attn.indexer.k_cache",
         topk_indices=torch.tensor([[7, 3, 1]]),
-        row_request_indices=torch.tensor([0]),
+        row_request_indices=torch.tensor([0, -1]),
+        seq_lens_cpu=torch.tensor([3]),
+        num_decode_tokens=1,
+        num_actual_tokens=1,
+        attn_state="DecodeOnly",
+        decode_valid_rows_all=False,
     )
     assert [event for event, _ in events] == [
         "content_diagnostics_enabled",
@@ -250,10 +279,111 @@ def test_first_consume_and_topk_readback_are_deferred(
     assert consume["capture_order"] == (
         "after_group1_wait_before_current_token_scatter"
     )
+    assert consume["request_seq_len"] == 3
+    assert consume["request_row_count"] == 1
+    assert consume["row_owners"] == [0, -1]
+    assert consume["valid_row_indices"] == [0]
+    assert consume["padding_row_indices"] == [1]
+    assert consume["invalid_row_indices"] == []
+    assert consume["num_decode_tokens"] == 1
+    assert consume["num_actual_tokens"] == 1
+    assert consume["attn_state"] == "DecodeOnly"
+    assert consume["decode_valid_rows_all"] is False
     topk = by_event["group1_selected_topk_fingerprint"]
     assert topk["value_preview"] == [7, 3, 1]
     assert topk["readback_mode"] == "deferred_after_model_forward"
     assert topk["capture_order"] == ("after_topk_selection_before_compact_remap")
+    assert topk["request_seq_len"] == 3
+    assert topk["row_owners"] == [0]
+    assert topk["valid_row_indices"] == [0]
+    assert topk["padding_row_indices"] == []
+    assert topk["invalid_row_indices"] == []
+    assert topk["topk_row_count"] == 1
+    assert topk["row_owner_count"] == 2
+    assert topk["unowned_topk_row_indices"] == []
+    assert topk["decode_valid_rows_all"] is False
+    summary = topk["row_summaries"][0]
+    assert summary["row_index"] == 0
+    assert summary["value_count"] == 3
+    assert len(summary["content_hash"]) == 32
+    assert summary["min"] == 1
+    assert summary["max"] == 7
+    assert summary["unique_count"] == 3
+    assert summary["identity_prefix"] is False
+    assert summary["out_of_range_count"] == 2
+
+
+def test_first_consume_reports_incomplete_request_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    diagnostics.configure_npu_content_diagnostics(True)
+
+    diagnostics.queue_group1_first_consume(
+        req_ids=["request-0", "request-1"],
+        layer_name="model.layers.0.self_attn.indexer.k_cache",
+        indexer_cache=torch.zeros(2, 4, 1),
+        indexer_block_table=torch.tensor([[0]]),
+        seq_lens_cpu=torch.tensor([4]),
+        block_size=4,
+        row_request_indices=torch.tensor([0, 1]),
+    )
+
+    skipped = events[-1]
+    assert skipped[0] == "content_diagnostic_snapshot_skipped"
+    assert skipped[1]["requested_event"] == "group1_first_decode_consume"
+    assert skipped[1]["reason"] == "incomplete_request_index_metadata"
+    assert skipped[1]["request_count"] == 2
+    assert skipped[1]["seq_len_count"] == 1
+    assert skipped[1]["block_table_rows"] == 1
+
+
+def test_attention_probe_reports_missing_wire_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    diagnostics.configure_npu_content_diagnostics(True)
+
+    diagnostics.queue_group1_first_consume(
+        req_ids=["request"],
+        layer_name="model.layers.0.self_attn.indexer.k_cache",
+        indexer_cache=torch.zeros((1, 4, 1, 2)),
+        indexer_block_table=torch.tensor([[0]]),
+        seq_lens_cpu=[1],
+        block_size=4,
+        row_request_indices=[0],
+    )
+    diagnostics.queue_selected_topk_fingerprint(
+        req_ids=["request"],
+        layer_name="model.layers.0.self_attn.indexer.k_cache",
+        topk_indices=torch.tensor([[0]]),
+        row_request_indices=[0],
+        seq_lens_cpu=[1],
+    )
+
+    skipped = [
+        fields
+        for event, fields in events
+        if event == "content_diagnostic_snapshot_skipped"
+    ]
+    assert [fields["requested_event"] for fields in skipped] == [
+        "group1_first_decode_consume",
+        "group1_selected_topk_fingerprint",
+    ]
+    assert all(
+        fields["reason"] == "source_fingerprint_not_registered"
+        for fields in skipped
+    )
 
 
 def test_attention_diagnostic_metadata_error_is_nonfatal(
@@ -278,9 +408,9 @@ def test_attention_diagnostic_metadata_error_is_nonfatal(
     diagnostics.queue_group1_first_consume(
         req_ids=["request"],
         layer_name="model.layers.0.self_attn.indexer.k_cache",
-        indexer_cache=torch.zeros((1, 4, 1, 2)),
+        indexer_cache=object(),
         indexer_block_table=torch.tensor([[0]]),
-        seq_lens_cpu=[],
+        seq_lens_cpu=[1],
         block_size=4,
         row_request_indices=[0],
     )
