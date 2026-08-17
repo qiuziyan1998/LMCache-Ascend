@@ -394,7 +394,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request.req_id,
                     len(live_token_ids),
                     get_tensor_model_parallel_rank(),
-                    int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
+                    int(getattr(parallel, "data_parallel_index", 0) or 0),
                 )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
             preferred_segment = (
@@ -725,7 +725,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             parallel = self._vllm_config.parallel_config
             tp_size = int(parallel.tensor_parallel_size)
             dp_rank = int(
-                getattr(parallel, "data_parallel_rank_local", None) or 0
+                getattr(parallel, "data_parallel_index", None) or 0
             )
             expected = {
                 (tp_rank, dp_rank) for tp_rank in range(tp_size)

@@ -2737,6 +2737,123 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._release_shared_retrieve_objs(owned, unpin=False)
             raise
 
+    def prefetch_shared_layer_pages(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        retrieve_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> Optional[str]:
+        """Fetch shared Group-1 pages without collectives or NPU writes.
+
+        Args:
+            tokens: Token IDs whose Group-1 pages should be prefetched.
+            mask: Optional token-selection mask.
+            retrieve_kwargs: Mutable retrieve state to populate in place. This
+                avoids regenerating metadata or masks during materialization.
+            **kwargs: Layerwise retrieve state. The cache lists are updated in
+                place only after complete page coverage has been validated.
+
+        Returns:
+            The resolved storage location, or ``None`` when this rank or
+            configuration cannot use the shared page-prefetch path.
+
+        Raises:
+            ValueError: If retrieve metadata or returned page coverage is
+                incomplete.
+            RuntimeError: If the configured backend cannot retrieve pages.
+        """
+        if retrieve_kwargs is not None:
+            if kwargs:
+                raise ValueError(
+                    "Pass Group-1 prefetch state either as retrieve_kwargs "
+                    "or keyword fields, not both"
+                )
+            kwargs = retrieve_kwargs
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        if (
+            kv_group != 1
+            or not self._should_use_shared_layerwise_retrieve(kv_group)
+            or self._is_shared_retrieve_passive(kv_group)
+            or not mooncake_layer_pages_enabled(self.config)
+        ):
+            return None
+        self._ensure_layerwise_connector_layout(**kwargs)
+        cached_keys = kwargs["cached_keys"]
+        cached_starts = kwargs["cached_starts"]
+        cached_ends = kwargs["cached_ends"]
+        cached_memory_objs = kwargs["cached_memory_objs"]
+        if self._has_retrieve_data_cache(
+            kwargs.get("cached_tensors"),
+            cached_memory_objs,
+            self.num_layers,
+        ):
+            return kwargs.get("cached_retrieve_location")
+        ret_mask = kwargs.get("ret_mask")
+        if ret_mask is None or ret_mask.numel() != len(tokens):
+            ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+            kwargs["ret_mask"] = ret_mask
+        started = cold_start_perf_now()
+        location, _, _, retrieve_keys = self._ensure_retrieve_chunk_metadata(
+            tokens=tokens,
+            mask=mask,
+            request_configs=kwargs.get("request_configs"),
+            cached_keys=cached_keys,
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+            ret_mask=ret_mask,
+            retrieve_kwargs=kwargs,
+        )
+        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        if (
+            len(retrieve_keys) != self.num_layers
+            or not required_chunks
+            or any(
+                len(layer) != required_chunks for layer in retrieve_keys
+            )
+        ):
+            raise ValueError("Group-1 prefetch metadata is incomplete")
+        memory_objs, layer_page_chunks = self._resolve_shared_rank0_layer_pages(
+            req_id=kwargs.get("req_id", "unspecified"),
+            phase="persistent_parallel_prefetch",
+            kv_group=kv_group,
+            keys_layer_major=retrieve_keys,
+            page_chunks=required_chunks,
+        )
+        if len(memory_objs) != self.num_layers or any(
+            len(layer) != required_chunks for layer in memory_objs
+        ):
+            unique = {
+                id(obj): obj for layer in memory_objs for obj in layer
+            }
+            self._release_shared_retrieve_objs(
+                list(unique.values()), unpin=True
+            )
+            raise ValueError("Group-1 prefetch page coverage is incomplete")
+        try:
+            cold_start_perf_log(
+                logger,
+                "group1_persistent_prefetch_complete",
+                started=started,
+                req_id=kwargs.get("req_id", "unspecified"),
+                pages=required_chunks,
+                layers=self.num_layers,
+                location=location,
+            )
+            cached_memory_objs[:] = memory_objs
+            # Preserve the physical page layout for the later materialization
+            # pass. Without this marker the cached page is treated as one
+            # independent object per layer, which both builds the wrong NPU
+            # source view and can retain/pin the same page once per layer.
+            kwargs["_cached_layer_page_chunks"] = layer_page_chunks
+        except BaseException:
+            unique = {id(obj): obj for layer in memory_objs for obj in layer}
+            self._release_shared_retrieve_objs(
+                list(unique.values()), unpin=True
+            )
+            raise
+        return location
+
     def _try_direct_indexer_page_load(
         self,
         *,
@@ -5481,6 +5598,30 @@ class AscendLMCacheEngine(LMCacheEngine):
         shared_chunk_locations_layer_major: list[list[str]] = []
         pre_resolved_shared_mem_layers: Optional[List[List[MemoryObj]]] = None
         layer_page_chunks = 0
+        prefetched_layer_page_cache = False
+        cached_layer_page_chunks = kwargs.get("_cached_layer_page_chunks", 0)
+        try:
+            cached_layer_page_chunks = int(cached_layer_page_chunks or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Cached layer-page chunk count must be an integer."
+            ) from exc
+        if cached_layer_page_chunks:
+            if (
+                cached_layer_page_chunks < 0
+                or cached_layer_page_chunks > required_chunks
+                or cached_mem_layers is None
+                or not use_cached_retrieve
+            ):
+                raise ValueError(
+                    "Cached layer-page layout does not cover the current "
+                    "retrieve metadata: "
+                    f"page_chunks={cached_layer_page_chunks}, "
+                    f"required_chunks={required_chunks}, "
+                    f"cached={cached_mem_layers is not None}."
+                )
+            layer_page_chunks = cached_layer_page_chunks
+            prefetched_layer_page_cache = True
         local_prefix_layers: List[Optional[LocalCPUPrefixGetResult]] = []
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         preflight_error_envelope: Optional[SharedHandleEnvelope] = None
@@ -6080,9 +6221,85 @@ class AscendLMCacheEngine(LMCacheEngine):
                 preflight_error = ValueError(f"{message} error={exc}")
                 record_request_preflight_error()
 
+        if (
+            preflight_error_envelope is None
+            and prefetched_layer_page_cache
+            and publish_shared_handles
+        ):
+            try:
+                if cached_handle_chunks != 0:
+                    raise ValueError(
+                        "Prefetched layer pages require an empty shared-handle "
+                        "cache before compact publication."
+                    )
+                assert cached_mem_layers is not None
+                compact_handle_batch = self._make_shared_handle_batch(
+                    cached_mem_layers,
+                    retrieve_keys,
+                )
+                if compact_handle_batch is None:
+                    raise ValueError(
+                        "Prefetched layer pages cannot be represented by one "
+                        "compact shared-handle batch."
+                    )
+                if (
+                    len(compact_handle_batch.page_offsets)
+                    != layer_page_chunks
+                ):
+                    raise ValueError(
+                        "Prefetched layer-page marker does not match the "
+                        "validated compact batch: "
+                        f"marker={layer_page_chunks}, "
+                        f"batch_pages={len(compact_handle_batch.page_offsets)}."
+                    )
+                if cached_memory_objs is None:
+                    raise ValueError(
+                        "Compact shared publication requires retained MemoryObjs."
+                    )
+                compact_publish_mem_objs = []
+                for layer_id in range(self.num_layers):
+                    publish_mem_objs = cached_memory_objs[layer_id]
+                    if len(publish_mem_objs) != compact_handle_batch.num_chunks:
+                        raise ValueError(
+                            "Prefetched compact publication has incomplete "
+                            f"layer coverage: layer={layer_id}, "
+                            f"objects={len(publish_mem_objs)}, "
+                            f"chunks={compact_handle_batch.num_chunks}"
+                        )
+                    compact_publish_mem_objs.append(publish_mem_objs)
+                    self._append_shared_handle_cache(
+                        layer_id,
+                        [None] * len(publish_mem_objs),
+                        cached_shared_handles,
+                    )
+                self._fence_shared_cpu_store_publication()
+            except Exception as exc:
+                message = (
+                    "Prefetched shared CPU layer-page preflight failed before "
+                    "handle publication."
+                )
+                preflight_error_envelope = self._shared_layerwise_error_envelope(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    request_ordinal=request_ordinal,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    message=message,
+                    details={"error": str(exc)},
+                )
+                preflight_error = ValueError(f"{message} error={exc}")
+                record_request_preflight_error()
+
         if preflight_error_envelope is not None:
             release_pre_resolved_shared_mem_layers()
             release_local_prefix_layers()
+            # Compact preflight can append placeholder handle entries before a
+            # later layer exposes incomplete coverage.  This branch executes
+            # before the main generator try/finally below, so restore every
+            # append-only cache to its entry snapshot explicitly.
+            append.rollback()
             yield ret_mask
             self._broadcast_shared_envelope(preflight_error_envelope)
             assert preflight_error is not None
@@ -6328,7 +6545,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                             # can never outrun a direct-to-host store.
                             self._fence_shared_cpu_store_publication()
                             shared_store_publication_fenced = True
-                        if cached_mem_layers is not None:
+                        if (
+                            cached_mem_layers is not None
+                            and not prefetched_layer_page_cache
+                        ):
                             claim_cached_shared_mem_objs_for_publication(
                                 publish_mem_objs
                             )

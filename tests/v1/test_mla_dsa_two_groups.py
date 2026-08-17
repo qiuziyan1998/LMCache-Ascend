@@ -2549,13 +2549,14 @@ def test_duplicate_live_source_rank_falls_back(monkeypatch) -> None:
         "request_finished",
         lambda *_args: (False, {"persistent": True}),
     )
-    descriptor = {"tp_rank": 0, "dp_rank": 0}
+    descriptor = {"tp_rank": 0, "dp_rank": 1}
     adapter = _ascend_adapter_fake(
         _scheduler_live_sources={"request": [descriptor, dict(descriptor)]},
         _vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(
                 tensor_parallel_size=1,
                 data_parallel_rank_local=0,
+                data_parallel_index=1,
             )
         ),
         store_async=True,

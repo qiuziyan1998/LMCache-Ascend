@@ -36,6 +36,108 @@ def test_direct_indexer_and_cpu_fallback_never_enter_shared_collectives() -> Non
     assert engine._cold_retrieve_collective_mode(1, False) == (True, True)
 
 
+def test_group1_prefetch_fetches_pages_without_collective_or_npu_write() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    engine.config = SimpleNamespace(
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata",
+        extra_config={
+            "save_only_first_rank": True,
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+        },
+    )
+    engine._should_use_shared_layerwise_retrieve = lambda group: group == 1
+    engine._is_shared_retrieve_passive = lambda _group: False
+    engine._ensure_layerwise_connector_layout = MagicMock()
+    page = object()
+    collective = MagicMock()
+    npu_write = MagicMock()
+    engine.gpu_connector = SimpleNamespace(write=npu_write)
+
+    def ensure_metadata(**kwargs):
+        kwargs["cached_keys"][:] = [["key"]]
+        kwargs["cached_starts"][:] = [0]
+        kwargs["cached_ends"][:] = [4]
+        return "RemoteBackend", [0], [4], [["key"]]
+
+    engine._ensure_retrieve_chunk_metadata = MagicMock(
+        side_effect=ensure_metadata)
+    engine._resolve_shared_rank0_layer_pages = MagicMock(
+        return_value=([[page]], 1))
+    cache = {
+        "cached_keys": [],
+        "cached_starts": [],
+        "cached_ends": [],
+        "cached_memory_objs": [],
+        "cached_tensors": [],
+        "kv_group": 1,
+        "req_id": "request",
+        "request_configs": None,
+        "collective": collective,
+    }
+
+    location = engine.prefetch_shared_layer_pages(
+        [1, 2, 3, 4],
+        torch.ones(4, dtype=torch.bool),
+        retrieve_kwargs=cache,
+    )
+
+    assert location == "RemoteBackend"
+    assert cache["cached_memory_objs"] == [[page]]
+    assert cache["_cached_layer_page_chunks"] == 1
+    collective.assert_not_called()
+    npu_write.assert_not_called()
+
+
+def test_group1_prefetch_releases_incomplete_layer_coverage() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata",
+        extra_config={
+            "save_only_first_rank": True,
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+        },
+    )
+    engine._should_use_shared_layerwise_retrieve = lambda group: group == 1
+    engine._is_shared_retrieve_passive = lambda _group: False
+    engine._ensure_layerwise_connector_layout = MagicMock()
+    engine._ensure_retrieve_chunk_metadata = MagicMock(
+        return_value=("RemoteBackend", [0], [4], [["key-0"], ["key-1"]])
+    )
+    page = object()
+    engine._resolve_shared_rank0_layer_pages = MagicMock(
+        return_value=([[page]], 1)
+    )
+    engine._release_shared_retrieve_objs = MagicMock()
+    cache = {
+        "cached_keys": [],
+        "cached_starts": [],
+        "cached_ends": [],
+        "cached_memory_objs": [],
+        "cached_tensors": [],
+    }
+
+    with pytest.raises(ValueError, match="page coverage"):
+        engine.prefetch_shared_layer_pages(
+            [1, 2, 3, 4],
+            torch.ones(4, dtype=torch.bool),
+            kv_group=1,
+            **cache,
+        )
+
+    engine._release_shared_retrieve_objs.assert_called_once_with(
+        [page], unpin=True
+    )
+    assert cache["cached_memory_objs"] == []
+
+
 def test_direct_indexer_missing_readiness_uses_cpu_fallback() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.gpu_connector = SimpleNamespace(
@@ -3114,7 +3216,8 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "exit_mode", ["success", "deferred", "exception", "close"]
+    "exit_mode",
+    ["success", "deferred", "exception", "close", "preflight_fence"],
 )
 def test_compact_batch_uses_exactly_one_final_status(
     monkeypatch, exit_mode
@@ -3168,6 +3271,10 @@ def test_compact_batch_uses_exactly_one_final_status(
     )
     engine._make_shared_handle_batch = lambda *_args: batch
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+    if exit_mode == "preflight_fence":
+        engine._fence_shared_cpu_store_publication = MagicMock(
+            side_effect=RuntimeError("injected fence failure")
+        )
     cached_shared_handles = []
     retriever = engine.retrieve_layer_head_token_wise(
         [1],
@@ -3185,6 +3292,15 @@ def test_compact_batch_uses_exactly_one_final_status(
     )
 
     next(retriever)
+    if exit_mode == "preflight_fence":
+        # Request-level compact preflight runs before the generator's main
+        # try/finally. It must still roll back placeholder handle appends.
+        assert cached_shared_handles == []
+        with pytest.raises(ValueError, match="preflight failed"):
+            retriever.send(([0], 0))
+        assert len(broadcasts) == 1
+        assert broadcasts[0].status == "error"
+        return
     if exit_mode == "deferred":
         retriever.send({_SHARED_SPARSE_PREPARE_ONLY: True})
     retriever.send(([0], 0))
