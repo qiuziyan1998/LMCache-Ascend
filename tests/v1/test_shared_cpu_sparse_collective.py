@@ -3705,6 +3705,84 @@ def test_sparse_per_rank_retrieves_missing_suffix_without_shared_handles(
     assert cached_shared_handles == []
 
 
+def test_sparse_per_rank_short_later_layer_aborts_and_fences(monkeypatch):
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    layer_keys = _make_key().split_layers(2)
+    first_layer_obj = _FakeTensorMemObj(torch.empty(1))
+
+    def layerwise_batched_get(keys, *, location):
+        assert location == "MooncakeStore"
+        assert keys == [[layer_keys[0]], [layer_keys[1]]]
+        yield SimpleNamespace(result=lambda: [first_layer_obj])
+        yield SimpleNamespace(result=lambda: [])
+
+    class _FailureSparseConsumer:
+        def __init__(self):
+            self.sync_calls = 0
+            self.closed = False
+
+        def batched_to_gpu_head_token_wise(self, **_kwargs):
+            try:
+                yield
+                while True:
+                    yield
+            finally:
+                self.closed = True
+
+        def synchronize_dense_load_stream(self):
+            self.sync_calls += 1
+
+    connector = _FailureSparseConsumer()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(
+        experimental_sampled_layerwise_lookup=False
+    )
+    engine.storage_manager = SimpleNamespace(
+        layerwise_batched_get=layerwise_batched_get
+    )
+    engine.gpu_connector = connector
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "MooncakeStore",
+        [0],
+        [1],
+        [[layer_keys[0]], [layer_keys[1]]],
+    )
+    cached_memory_objs = []
+
+    retriever = engine.retrieve_layer_head_token_wise(
+        [1],
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=cached_memory_objs,
+        cached_tensors=[],
+        cached_chunk_dev_ptrs=[],
+        cached_chunk_ptrs_npu=[],
+        cached_shared_handles=[],
+        kv_group=1,
+        req_id="req-short",
+    )
+
+    next(retriever)
+    retriever.send(([0], 0))
+    with pytest.raises(RuntimeError, match="incomplete layer data"):
+        retriever.send(([0], 0))
+
+    assert connector.sync_calls == 1
+    assert connector.closed is True
+    assert first_layer_obj.release_count == 1
+    assert cached_memory_objs == []
+
+
 def test_sparse_shared_extension_still_requires_complete_handles():
     key0 = _make_key(chunk_hash=1)
     key1 = _make_key(chunk_hash=2)

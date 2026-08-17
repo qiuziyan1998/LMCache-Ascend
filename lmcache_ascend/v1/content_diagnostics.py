@@ -50,9 +50,11 @@ _REQUEST_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict()
 class _DeferredSnapshot:
     event: str
     fields: dict[str, Any]
-    values: torch.Tensor
+    values: torch.Tensor | None = None
     physical_slots: torch.Tensor | None = None
     expected_rows: dict[tuple[int, int], str] | None = None
+    components: dict[str, torch.Tensor] | None = None
+    comparison_components: dict[str, torch.Tensor] | None = None
 
 
 def configure_npu_content_diagnostics(enabled: bool) -> None:
@@ -101,6 +103,7 @@ def _configure_vllm_diagnostic_bridge(enabled: bool) -> None:
                     fingerprint_compact_group1=fingerprint_compact_group1,
                     register_group1_source=register_group1_source_fingerprint,
                     queue_group1_first_consume=queue_group1_first_consume,
+                    queue_cache_tail=queue_cache_tail_fingerprint,
                     queue_selected_topk=queue_selected_topk_fingerprint,
                 )
             )
@@ -491,6 +494,165 @@ def _log_snapshot_skip_once(
         )
 
 
+@_nonfatal_diagnostic("cache_tail_fingerprint")
+def queue_cache_tail_fingerprint(
+    *,
+    req_ids: Sequence[str] | None,
+    layer_name: str,
+    kv_group: int,
+    stage: str,
+    cache_parts: dict[str, torch.Tensor],
+    slot_mapping: torch.Tensor | None,
+    query_start_loc_cpu: Any,
+    seq_lens_cpu: Any,
+    produced_parts: dict[str, torch.Tensor] | None = None,
+    num_actual_tokens: int | None = None,
+    attn_state: Any = None,
+) -> None:
+    """Queue each request's cached-prefix boundary row.
+
+    The snapshot is device-to-device only. Host hashing is deferred until the
+    complete model forward returns, so the diagnostic cannot insert a sync
+    between attention layers. ``produced_parts`` records the freshly computed
+    row beside the cache row, allowing the log to prove whether scatter wrote
+    the intended value to the intended physical slot.
+    """
+    if not _ENABLED or not req_ids:
+        return
+    request_ids = [str(req_id) for req_id in req_ids]
+    query_starts = _cpu_int_list(query_start_loc_cpu)
+    seq_lens = _cpu_int_list(seq_lens_cpu)
+    if (
+        slot_mapping is None
+        or query_starts is None
+        or seq_lens is None
+        or len(query_starts) < len(request_ids) + 1
+        or len(seq_lens) < len(request_ids)
+        or not cache_parts
+    ):
+        _log_snapshot_skip_once(
+            requested_event="cache_tail_fingerprint",
+            req_ids=request_ids,
+            layer_name=layer_name,
+            reason="missing_cache_boundary_metadata",
+            kv_group=int(kv_group),
+            stage=str(stage),
+            has_slot_mapping=slot_mapping is not None,
+            query_start_count=(
+                len(query_starts) if query_starts is not None else None
+            ),
+            seq_len_count=len(seq_lens) if seq_lens is not None else None,
+            cache_components=sorted(cache_parts),
+        )
+        return
+    layer_id = _layer_id(layer_name)
+    if layer_id is None:
+        _log_snapshot_skip_once(
+            requested_event="cache_tail_fingerprint",
+            req_ids=request_ids,
+            layer_name=layer_name,
+            reason="unrecognized_cache_layer_name",
+            kv_group=int(kv_group),
+            stage=str(stage),
+        )
+        return
+    actual_limit = (
+        min(int(num_actual_tokens), int(slot_mapping.shape[0]))
+        if num_actual_tokens is not None
+        else int(slot_mapping.shape[0])
+    )
+    for req_index, req_id in enumerate(request_ids):
+        query_start = int(query_starts[req_index])
+        query_end = min(int(query_starts[req_index + 1]), actual_limit)
+        if query_end <= query_start:
+            continue
+        if not _claim_once(
+            f"tail:{int(kv_group)}:{stage}", req_id, layer_name
+        ):
+            continue
+        query_length = int(query_starts[req_index + 1]) - query_start
+        sequence_length = int(seq_lens[req_index])
+        cached_prefix_tokens = max(sequence_length - query_length, 0)
+        # On a prefix hit, the first query row is the mandatory boundary token
+        # that replaces the final cached row. On a full prefill there is no
+        # cached boundary, so sample the final prompt row for cross-run/source
+        # comparison instead.
+        row_index = query_start if cached_prefix_tokens else query_end - 1
+        row_index_device = torch.tensor(
+            [row_index], dtype=torch.long, device=slot_mapping.device
+        )
+        physical_slot = slot_mapping.index_select(
+            0, row_index_device
+        ).long()
+        selected_cache: dict[str, torch.Tensor] = {}
+        for name, cache in cache_parts.items():
+            flat = cache.reshape(-1, *cache.shape[2:])
+            selected_cache[str(name)] = flat.index_select(
+                0, physical_slot
+            ).reshape(1, -1)
+        selected_produced: dict[str, torch.Tensor] | None = None
+        if produced_parts is not None:
+            selected_produced = {}
+            for name, produced in produced_parts.items():
+                produced_flat = produced.reshape(produced.shape[0], -1)
+                selected_produced[str(name)] = produced_flat.index_select(
+                    0, row_index_device.to(produced.device)
+                )
+            if set(selected_cache) != set(selected_produced):
+                raise ValueError(
+                    "Cache and produced diagnostic components differ: "
+                    f"cache={sorted(selected_cache)}, "
+                    f"produced={sorted(selected_produced)}"
+                )
+        logical_token = (
+            cached_prefix_tokens
+            if cached_prefix_tokens
+            else sequence_length - 1
+        )
+        _queue_snapshot(
+            _DeferredSnapshot(
+                event="cache_tail_fingerprint",
+                fields={
+                    "req_id": req_id,
+                    "layer_name": str(layer_name),
+                    "layer_id": layer_id,
+                    "kv_group": int(kv_group),
+                    "stage": str(stage),
+                    "logical_tokens": [logical_token],
+                    "request_seq_len": sequence_length,
+                    "query_start": query_start,
+                    "query_end": int(query_starts[req_index + 1]),
+                    "query_length": query_length,
+                    "selected_row_index": row_index,
+                    "cached_prefix_tokens": cached_prefix_tokens,
+                    "prefix_hit": bool(cached_prefix_tokens),
+                    "selection_reason": (
+                        "first_query_row_at_cached_prefix_boundary"
+                        if cached_prefix_tokens
+                        else "last_full_prefill_row"
+                    ),
+                    "num_actual_tokens": (
+                        int(num_actual_tokens)
+                        if num_actual_tokens is not None
+                        else None
+                    ),
+                    "attn_state": str(attn_state),
+                    "cache_components": sorted(selected_cache),
+                    "has_produced_comparison": (
+                        selected_produced is not None
+                    ),
+                    "snapshot_monotonic_ms": round(
+                        time.perf_counter() * 1000, 3
+                    ),
+                    "capture_order": str(stage),
+                },
+                physical_slots=physical_slot,
+                components=selected_cache,
+                comparison_components=selected_produced,
+            )
+        )
+
+
 @_nonfatal_diagnostic("group1_first_decode_consume")
 def queue_group1_first_consume(
     *,
@@ -867,10 +1029,66 @@ def flush_deferred_diagnostics() -> None:
     for snapshot in pending:
         started = time.perf_counter()
         try:
-            values_cpu = snapshot.values.detach().to("cpu").contiguous()
             fields = dict(snapshot.fields)
-            fields["content_hash"] = _hash_cpu_tensor(values_cpu)
-            fields["value_count"] = int(values_cpu.numel())
+            if snapshot.components is not None:
+                components_cpu = {
+                    name: value.detach().to("cpu").contiguous()
+                    for name, value in snapshot.components.items()
+                }
+                comparison_cpu = (
+                    {
+                        name: value.detach().to("cpu").contiguous()
+                        for name, value in snapshot.comparison_components.items()
+                    }
+                    if snapshot.comparison_components is not None
+                    else None
+                )
+                component_summaries: dict[str, dict[str, Any]] = {}
+                for name, value in components_cpu.items():
+                    comparison = (
+                        comparison_cpu.get(name)
+                        if comparison_cpu is not None
+                        else None
+                    )
+                    summary: dict[str, Any] = {
+                        "content_hash": _hash_cpu_tensor(value),
+                        "shape": list(value.shape),
+                        "dtype": str(value.dtype),
+                        "value_count": int(value.numel()),
+                    }
+                    if comparison is not None:
+                        summary["produced_hash"] = _hash_cpu_tensor(comparison)
+                        summary["matches_produced"] = torch.equal(
+                            value, comparison
+                        )
+                        if value.shape == comparison.shape:
+                            delta = value.to(torch.float32) - comparison.to(
+                                torch.float32
+                            )
+                            summary["max_abs_delta"] = float(
+                                delta.abs().max().item()
+                            ) if delta.numel() else 0.0
+                            summary["differing_element_count"] = int(
+                                torch.count_nonzero(delta).item()
+                            )
+                    component_summaries[name] = summary
+                fields["component_summaries"] = component_summaries
+                matches = [
+                    summary.get("matches_produced")
+                    for summary in component_summaries.values()
+                    if "matches_produced" in summary
+                ]
+                fields["all_components_match_produced"] = (
+                    all(value is True for value in matches)
+                    if matches
+                    else None
+                )
+            else:
+                if snapshot.values is None:
+                    raise ValueError("Deferred snapshot has no values")
+                values_cpu = snapshot.values.detach().to("cpu").contiguous()
+                fields["content_hash"] = _hash_cpu_tensor(values_cpu)
+                fields["value_count"] = int(values_cpu.numel())
             if snapshot.physical_slots is not None:
                 slots = [
                     int(value)
@@ -880,30 +1098,37 @@ def flush_deferred_diagnostics() -> None:
                     .tolist()
                 ]
                 fields["physical_slots"] = slots
-                logical_tokens = fields.get("logical_tokens", ())
-                row_hashes: dict[str, str] = {}
-                expected_matches: dict[str, bool | None] = {}
-                for index, logical_token in enumerate(logical_tokens):
-                    digest = _hash_cpu_tensor(values_cpu[index])
-                    key = f"{fields['layer_id']}:{int(logical_token)}"
-                    row_hashes[key] = digest
-                    expected = (
-                        snapshot.expected_rows.get(
-                            (int(fields["layer_id"]), int(logical_token))
+                if snapshot.components is None:
+                    logical_tokens = fields.get("logical_tokens", ())
+                    row_hashes: dict[str, str] = {}
+                    expected_matches: dict[str, bool | None] = {}
+                    for index, logical_token in enumerate(logical_tokens):
+                        digest = _hash_cpu_tensor(values_cpu[index])
+                        key = f"{fields['layer_id']}:{int(logical_token)}"
+                        row_hashes[key] = digest
+                        expected = (
+                            snapshot.expected_rows.get(
+                                (int(fields["layer_id"]), int(logical_token))
+                            )
+                            if snapshot.expected_rows
+                            else None
                         )
-                        if snapshot.expected_rows
+                        expected_matches[key] = (
+                            digest == expected if expected else None
+                        )
+                    fields["row_hashes"] = row_hashes
+                    fields["expected_matches"] = expected_matches
+                    comparable = [
+                        value
+                        for value in expected_matches.values()
+                        if value is not None
+                    ]
+                    fields["all_expected_rows_match"] = (
+                        all(value is True for value in comparable)
+                        if comparable
                         else None
                     )
-                    expected_matches[key] = digest == expected if expected else None
-                fields["row_hashes"] = row_hashes
-                fields["expected_matches"] = expected_matches
-                comparable = [
-                    value for value in expected_matches.values() if value is not None
-                ]
-                fields["all_expected_rows_match"] = (
-                    all(value is True for value in comparable) if comparable else None
-                )
-            else:
+            elif snapshot.components is None:
                 flat = values_cpu.reshape(-1)
                 preview_count = min(8, int(flat.numel()))
                 fields["value_preview"] = [

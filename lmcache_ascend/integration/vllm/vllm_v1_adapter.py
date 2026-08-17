@@ -250,17 +250,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             logger.warning("Failed to query live-source NPU event", exc_info=True)
             return None
 
-    @staticmethod
-    def _fallback_source_ready_event() -> Any:
-        npu = getattr(torch, "npu", None)
-        if npu is None:
-            # CPU-only unit tests cannot construct an NPU event.  A real Ascend
-            # worker always has torch.npu and must either reuse or record one.
-            return None
-        event = npu.Event()
-        event.record()
-        return event
-
     def _fence_live_source_descriptors(self) -> None:
         fences = getattr(self, "_live_source_ready_fences", None)
         if not fences:
@@ -508,6 +497,40 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request.req_id,
                 )
                 live_source = False
+            if (
+                live_source
+                and request.is_last_prefill
+                and source_ready_event is None
+            ):
+                # The descriptor exposes model-cache addresses to a remote
+                # reader.  A current-stream event is not a valid substitute
+                # for the attention producer's reshape_cache_event: Group 1
+                # may have been restored or scattered on another stream.
+                # Fail closed to the persistent path instead of publishing
+                # bytes whose producer ordering is unknown.
+                self.lmcache_engine.discard_live_source_descriptor(
+                    request.req_id
+                )
+                logger.warning(
+                    "Live split disabled for %s: final Group-1 source has "
+                    "no producer NPU event",
+                    request.req_id,
+                )
+                cold_start_perf_log(
+                    logger,
+                    "live_source_missing_producer_event",
+                    req_id=request.req_id,
+                    event_source=source_ready_event_source,
+                    action="persistent_only",
+                )
+                log_npu_content_diagnostic_event(
+                    "group1_source_missing_producer_event",
+                    req_id=request.req_id,
+                    event_source=source_ready_event_source,
+                    action="persistent_only",
+                    fallback_event_created=False,
+                )
+                live_source = False
             if live_source:
                 live_groups = (
                     (0, 1)
@@ -531,12 +554,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 live_groups = ()
             finalized_live = False
             if live_source and request.is_last_prefill:
-                if source_ready_event is None:
-                    source_ready_event = (
-                        LMCacheAscendConnectorV1Impl._fallback_source_ready_event()
-                    )
-                    if source_ready_event is not None:
-                        source_ready_event_source = "adapter_current_stream_fallback"
                 ready_at_finalize = (
                     LMCacheAscendConnectorV1Impl._query_source_ready_event(
                         source_ready_event
@@ -570,13 +587,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         ready_at_finalize=ready_at_finalize,
                     )
                 elif finalized_live:
-                    # This is reachable only in CPU-only tests.  Fail loudly
-                    # on an actual Ascend worker instead of publishing an
-                    # unfenced remote-readable source.
-                    if getattr(torch, "npu", None) is not None:
-                        raise RuntimeError(
-                            "Final live Group-1 descriptor has no producer NPU event"
-                        )
+                    raise RuntimeError(
+                        "Final live Group-1 descriptor has no producer NPU event"
+                    )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
             preferred_segment = (
                 request.request_configs.get(_MOONCAKE_PREFERRED_SEGMENT_CONFIG)
@@ -732,6 +745,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         }
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        # Preserve the final attention producer dependency before resetting
+        # per-step bookkeeping.  Prefix-hit/cold-resume steps can reach this
+        # deferred path when not every registered cache callback fires.  The
+        # previous reset silently discarded reshape_cache_event and caused a
+        # live descriptor to be fenced by an unrelated current-stream event.
+        source_ready_event = getattr(
+            self, "_latest_live_source_ready_event", None
+        )
+        source_ready_event_source = getattr(
+            self, "_latest_live_source_ready_event_source", "missing"
+        )
         self._direct_store_step_supported = None
         self._direct_store_observed_layers.clear()
         self._latest_live_source_ready_event = None
@@ -752,7 +776,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if requests:
                 # Reuse completed layerwise progress before fencing a window
                 # whose callbacks did not cover every registered cache.
-                self._submit_direct_prefill_requests(requests, adopted_requests)
+                self._submit_direct_prefill_requests(
+                    requests,
+                    adopted_requests,
+                    source_ready_event=source_ready_event,
+                    source_ready_event_source=source_ready_event_source,
+                )
             final_ids = {
                 request.req_id for request in requests if request.is_last_prefill
             }

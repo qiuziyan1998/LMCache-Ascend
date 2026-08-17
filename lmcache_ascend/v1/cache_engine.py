@@ -810,6 +810,8 @@ class AscendLMCacheEngine(LMCacheEngine):
     def _direct_source_ready_event(
         state: _DirectStoreRequestState,
         token_end: int,
+        *,
+        require_producer_event: bool = False,
     ) -> tuple[Any, str]:
         """Return an event that covers every source byte through ``token_end``."""
         if (
@@ -817,11 +819,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             and state.source_ready_token_end >= token_end
         ):
             return state.source_ready_event, state.source_ready_event_source
+        if require_producer_event:
+            raise RuntimeError(
+                "Direct DSA NPU store has no attention producer event "
+                f"covering token_end={token_end}; refusing an unsafe "
+                "current-stream fallback"
+            )
 
         event = torch.npu.Event()
         event.record()
         state.source_ready_event = event
-        state.source_ready_event_source = "engine_current_stream_fallback"
+        state.source_ready_event_source = (
+            "engine_current_stream_fallback_non_dsa"
+        )
         state.source_ready_token_end = token_end
         return event, state.source_ready_event_source
 
@@ -844,6 +854,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "planned_hash": 0,
             },
         )
+
+    def discard_live_source_descriptor(self, req_id: str) -> None:
+        """Discard only live-P2P state while retaining persistent-store state."""
+        self._live_source_builders.pop(req_id, None)
+        self._completed_live_sources.pop(req_id, None)
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", None
+        )
+        if pending_diagnostics is not None:
+            pending_diagnostics.pop(req_id, None)
 
     def _record_live_source_layout(
         self,
@@ -874,7 +894,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             or any(
                 left["logical_token_start"] + left["token_count"]
                 != right["logical_token_start"]
-                for left, right in zip(runs, runs[1:])
+                for left, right in zip(runs, runs[1:], strict=False)
             )
         ):
             builder["invalid"] = True
@@ -1507,7 +1527,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 format="partial_page",
             )
         ready_event, ready_event_source = self._direct_source_ready_event(
-            state, len(tokens)
+            state,
+            len(tokens),
+            require_producer_event=bool(
+                getattr(self.config, "dsa_two_groups", False)
+            ),
         )
         if 1 in group_ends and npu_content_diagnostics_enabled():
             log_npu_content_diagnostic_event(
@@ -1808,7 +1832,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         if keys:
             ready_event, ready_event_source = self._direct_source_ready_event(
-                state, len(tokens)
+                state,
+                len(tokens),
+                require_producer_event=bool(
+                    getattr(self.config, "dsa_two_groups", False)
+                ),
             )
             if 1 in group_ends and npu_content_diagnostics_enabled():
                 log_npu_content_diagnostic_event(
@@ -6551,6 +6579,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             published_cached_shared_mem_objs.clear()
 
         sparse_memory_objs_notified = False
+        backend_fetched_objs: List[MemoryObj] = []
 
         def ensure_mem_obj_consumer():
             nonlocal mem_obj_consumer, sparse_memory_objs_notified
@@ -6573,6 +6602,75 @@ class AscendLMCacheEngine(LMCacheEngine):
                 sparse_memory_objs_notified = True
             next(mem_obj_consumer)
             return mem_obj_consumer
+
+        def release_failed_backend_results() -> None:
+            """Fence failed NPU submissions before dropping backend owners."""
+            if not backend_fetched_objs:
+                if mem_obj_consumer is not None:
+                    try:
+                        mem_obj_consumer.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close sparse bootstrap consumer after "
+                            "retrieval failure"
+                        )
+                return
+            if mem_obj_consumer is not None:
+                synchronize = getattr(
+                    self.gpu_connector,
+                    "synchronize_dense_load_stream",
+                    None,
+                )
+                try:
+                    fenced = False
+                    if callable(synchronize):
+                        synchronize()
+                        fenced = True
+                    else:
+                        load_stream = getattr(
+                            self.gpu_connector, "load_stream", None
+                        )
+                        stream_synchronize = getattr(
+                            load_stream, "synchronize", None
+                        )
+                        if callable(stream_synchronize):
+                            stream_synchronize()
+                            fenced = True
+                    if not fenced:
+                        logger.critical(
+                            "Aborted sparse prefix load has no NPU stream "
+                            "fence API; retaining backend MemoryObjs"
+                        )
+                        return
+                except BaseException:
+                    # Retaining the owners is safer than freeing storage while
+                    # an NPU DMA may still be reading it.
+                    logger.critical(
+                        "Failed to fence an aborted sparse prefix load; "
+                        "retaining backend MemoryObjs",
+                        exc_info=True,
+                    )
+                    return
+                try:
+                    mem_obj_consumer.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to close sparse bootstrap consumer after "
+                        "retrieval failure"
+                    )
+            unique = {id(mem_obj): mem_obj for mem_obj in backend_fetched_objs}
+            for mem_obj in reversed(unique.values()):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release sparse bootstrap backend object "
+                        "after retrieval failure"
+                    )
+            backend_fetched_objs.clear()
 
         def attempt_compact_final_error(error: BaseException) -> None:
             nonlocal compact_final_status_attempted, compact_final_status_sent
@@ -6644,6 +6742,31 @@ class AscendLMCacheEngine(LMCacheEngine):
                         task = next(get_generator)
                         assert task is not None
                         mem_objs_layer = task.result()
+                        if mem_objs_layer is not None:
+                            backend_fetched_objs.extend(mem_objs_layer)
+                    expected_missing_chunks = (
+                        required_chunks - cached_prefix_chunks
+                    )
+                    retrieved_chunks = (
+                        len(mem_objs_layer)
+                        if mem_objs_layer is not None
+                        else 0
+                    )
+                    if retrieved_chunks != expected_missing_chunks:
+                        # Metadata lookup already filled ret_mask, but a
+                        # backend short read means those tokens are not safe
+                        # to expose. Fail before submitting any stale/missing
+                        # row to the model-visible cache. Pre-resolved shared
+                        # objects are released by the generator's common
+                        # finally path; direct backend results are owned here.
+                        raise RuntimeError(
+                            "Layerwise sparse retrieve returned incomplete "
+                            "layer data; refusing the prefix success mask: "
+                            f"req_id={kwargs.get('req_id', 'unspecified')}, "
+                            f"kv_group={kv_group}, layer_id={layer_id}, "
+                            f"expected_chunks={expected_missing_chunks}, "
+                            f"retrieved_chunks={retrieved_chunks}"
+                        )
                     if mem_objs_layer is not None and not group_cache_prepared:
                         if cached_prefix_chunks < required_chunks:
                             self._append_retrieve_layer_cache(
@@ -6900,6 +7023,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             attempt_compact_final_error(
                 GeneratorExit("compact shared batch generator exited")
             )
+            if not append.committed:
+                release_failed_backend_results()
             release_unowned_cached_publication_objs()
             release_pending_pre_resolved()
             append.rollback()

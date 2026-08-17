@@ -146,6 +146,10 @@ def test_configure_installs_and_clears_vllm_callback_bridge(
         is diagnostics.queue_group1_first_consume
     )
     assert (
+        callbacks["queue_cache_tail"]
+        is diagnostics.queue_cache_tail_fingerprint
+    )
+    assert (
         callbacks["queue_selected_topk"]
         is diagnostics.queue_selected_topk_fingerprint
     )
@@ -313,6 +317,61 @@ def test_first_consume_and_topk_readback_are_deferred(
     assert summary["unique_count"] == 3
     assert summary["identity_prefix"] is False
     assert summary["out_of_range_count"] == 2
+
+
+def test_cache_tail_fingerprint_reports_scatter_integrity_and_prefix_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    diagnostics.configure_npu_content_diagnostics(True)
+    cache = torch.zeros((2, 4, 1, 2), dtype=torch.float32)
+    cache.reshape(8, 1, 2)[5] = torch.tensor([[3.0, 4.0]])
+    produced = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    diagnostics.queue_cache_tail_fingerprint(
+        req_ids=["request"],
+        layer_name="model.layers.17.self_attn.indexer.k_cache",
+        kv_group=1,
+        stage="group1_after_current_scatter",
+        cache_parts={"index": cache},
+        produced_parts={"index": produced},
+        slot_mapping=torch.tensor([2, 5]),
+        query_start_loc_cpu=[0, 2],
+        seq_lens_cpu=[6],
+        num_actual_tokens=2,
+        attn_state="DecodeOnly",
+    )
+    assert [event for event, _ in events] == [
+        "content_diagnostics_enabled"
+    ]
+
+    diagnostics.flush_deferred_diagnostics()
+
+    tail = next(
+        fields
+        for event, fields in events
+        if event == "cache_tail_fingerprint"
+    )
+    assert tail["layer_id"] == 17
+    assert tail["kv_group"] == 1
+    assert tail["logical_tokens"] == [4]
+    assert tail["physical_slots"] == [2]
+    assert tail["query_length"] == 2
+    assert tail["cached_prefix_tokens"] == 4
+    assert tail["prefix_hit"] is True
+    assert tail["selection_reason"] == (
+        "first_query_row_at_cached_prefix_boundary"
+    )
+    assert tail["all_components_match_produced"] is False
+    summary = tail["component_summaries"]["index"]
+    assert summary["matches_produced"] is False
+    assert summary["max_abs_delta"] == 2.0
+    assert summary["differing_element_count"] == 2
 
 
 def test_first_consume_reports_incomplete_request_metadata(

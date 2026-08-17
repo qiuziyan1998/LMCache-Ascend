@@ -1917,15 +1917,77 @@ def test_finish_save_batch_submits_nonfinal_direct_window() -> None:
         _completed_layerwise_stores={("request", 0): result},
         _direct_store_observed_layers=set(),
         _direct_prefill_requests=lambda: [request],
-        _submit_direct_prefill_requests=lambda requests, adopted: calls.append(
-            (requests, adopted)
+        _submit_direct_prefill_requests=(
+            lambda requests, adopted, **kwargs: calls.append(
+                (requests, adopted, kwargs)
+            )
         ),
     )
 
     _ascend_adapter_method("_finish_save_batch")(adapter, {})
 
-    assert calls == ["wait", result, ([request], {"request"})]
+    assert calls == [
+        "wait",
+        result,
+        (
+            [request],
+            {"request"},
+            {
+                "source_ready_event": None,
+                "source_ready_event_source": "missing",
+            },
+        ),
+    ]
     assert adapter._completed_layerwise_stores == {}
+
+
+def test_finish_save_batch_preserves_final_attention_producer_event() -> None:
+    request = SimpleNamespace(req_id="request", is_last_prefill=True)
+    event = object()
+    submitted = []
+    waited = []
+    marked = []
+    adapter = _ascend_adapter_fake(
+        kv_role="kv_both",
+        lmcache_engine=SimpleNamespace(
+            wait_for_pending_sync_stores=lambda: None,
+            wait_for_direct_stores=lambda req_ids: waited.append(
+                set(req_ids)
+            ),
+            direct_store_committed_ends=lambda _req_id: {},
+        ),
+        _completed_layerwise_stores={},
+        _direct_prefill_requests=lambda: [request],
+        _submit_direct_prefill_requests=(
+            lambda requests, adopted, **kwargs: submitted.append(
+                (requests, adopted, kwargs)
+            )
+        ),
+        _latest_live_source_ready_event=event,
+        _latest_live_source_ready_event_source=(
+            "attn_metadata.reshape_cache_event"
+        ),
+        _mark_prefill_committed=lambda req: marked.append(req.req_id),
+    )
+
+    _ascend_adapter_method("_finish_save_batch")(adapter, {})
+
+    assert submitted == [
+        (
+            [request],
+            set(),
+            {
+                "source_ready_event": event,
+                "source_ready_event_source": (
+                    "attn_metadata.reshape_cache_event"
+                ),
+            },
+        )
+    ]
+    assert adapter._latest_live_source_ready_event is None
+    assert adapter._latest_live_source_ready_event_source == "missing"
+    assert waited == [{"request"}]
+    assert marked == ["request"]
 
 
 @pytest.mark.parametrize("live", [False, True])
@@ -2186,6 +2248,38 @@ def test_descriptor_drain_rejects_unfenced_diagnostic_source() -> None:
     }
 
 
+def test_discard_live_source_keeps_persistent_store_state() -> None:
+    direct_state = object()
+    engine = SimpleNamespace(
+        _live_source_builders={"request": object()},
+        _completed_live_sources={"request": object()},
+        _pending_live_source_diagnostics={"request": object()},
+        _direct_store_states={"request": direct_state},
+    )
+
+    AscendLMCacheEngine.discard_live_source_descriptor(engine, "request")
+
+    assert engine._live_source_builders == {}
+    assert engine._completed_live_sources == {}
+    assert engine._pending_live_source_diagnostics == {}
+    assert engine._direct_store_states == {"request": direct_state}
+
+
+def test_group1_direct_store_rejects_current_stream_event_fallback() -> None:
+    state = SimpleNamespace(
+        source_ready_event=None,
+        source_ready_event_source="missing",
+        source_ready_token_end=0,
+    )
+
+    with pytest.raises(RuntimeError, match="no attention producer event"):
+        AscendLMCacheEngine._direct_source_ready_event(
+            state,
+            128,
+            require_producer_event=True,
+        )
+
+
 def test_save_layer_carries_final_indexer_producer_event() -> None:
     event = object()
     submitted = []
@@ -2253,6 +2347,75 @@ def test_save_batch_does_not_rebuild_completed_live_descriptor() -> None:
     _ascend_adapter_method("_submit_direct_prefill_requests")(
         adapter, [request], source_ready_event=object()
     )
+
+
+def test_final_live_source_without_producer_event_fails_to_persistent_only(
+    monkeypatch,
+) -> None:
+    calls = []
+    engine = SimpleNamespace(
+        discard_live_source_descriptor=lambda req_id: calls.append(
+            ("discard", req_id)
+        ),
+        begin_live_source_descriptor=lambda *_args: pytest.fail(
+            "unfenced live descriptor was started"
+        ),
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            (
+                "store",
+                args[0],
+                kwargs["final"],
+                kwargs["source_ready_event"],
+            )
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["latent"], 1: ["indexer"]},
+            {0: "latent-slots", 1: "indexer-slots"},
+            0,
+        ),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2, 3],
+        live_source_requested=True,
+        load_spec=None,
+        request_configs=None,
+        is_last_prefill=True,
+    )
+    diagnostic_events = []
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "log_npu_content_diagnostic_event",
+        lambda event, **fields: diagnostic_events.append((event, fields)),
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter, [request]
+    )
+
+    assert calls == [
+        ("discard", "request"),
+        ("store", "request", True, None),
+    ]
+    assert adapter._finalized_live_source_submissions == set()
+    assert diagnostic_events == [
+        (
+            "group1_source_missing_producer_event",
+            {
+                "req_id": "request",
+                "event_source": "missing",
+                "action": "persistent_only",
+                "fallback_event_created": False,
+            },
+        )
+    ]
 
 
 def test_deferred_live_store_failure_does_not_block_other_requests() -> None:
