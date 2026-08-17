@@ -3,6 +3,8 @@
 
 # Standard
 from collections.abc import Iterator
+import sys
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -79,6 +81,57 @@ def test_content_fingerprint_is_strictly_disabled_by_default() -> None:
         )
         is None
     )
+
+
+def test_configure_installs_and_clears_vllm_callback_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleared: list[bool] = []
+
+    class CallbackBundle:
+        def __init__(self, **callbacks: object) -> None:
+            self.callbacks = callbacks
+
+    installed: list[CallbackBundle] = []
+
+    fake_bridge = SimpleNamespace(
+        NPUContentDiagnosticCallbacks=CallbackBundle,
+        install_npu_content_diagnostic_callbacks=installed.append,
+        clear_npu_content_diagnostic_callbacks=lambda: cleared.append(True),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.lmcache_diagnostics",
+        fake_bridge,
+    )
+
+    diagnostics.configure_npu_content_diagnostics(True)
+    assert len(installed) == 1
+    callbacks = installed[0].callbacks
+    assert (
+        callbacks["begin_deferred_step"]
+        is diagnostics.begin_deferred_diagnostic_step
+    )
+    assert callbacks["flush_deferred"] is diagnostics.flush_deferred_diagnostics
+    assert (
+        callbacks["fingerprint_compact_group1"]
+        is diagnostics.fingerprint_compact_group1
+    )
+    assert (
+        callbacks["register_group1_source"]
+        is diagnostics.register_group1_source_fingerprint
+    )
+    assert (
+        callbacks["queue_group1_first_consume"]
+        is diagnostics.queue_group1_first_consume
+    )
+    assert (
+        callbacks["queue_selected_topk"]
+        is diagnostics.queue_selected_topk_fingerprint
+    )
+
+    diagnostics.configure_npu_content_diagnostics(False)
+    assert cleared == [True]
 
 
 def test_fingerprint_uses_logical_not_physical_slot_identity() -> None:

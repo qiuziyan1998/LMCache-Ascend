@@ -16,9 +16,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
 import hashlib
+import importlib
 import json
 import os
 import re
+import sys
 import threading
 import time
 from typing import Any, Iterable, Sequence
@@ -71,6 +73,7 @@ def configure_npu_content_diagnostics(enabled: bool) -> None:
             _PENDING.clear()
             _SEEN.clear()
             _REQUEST_SPECS.clear()
+    _configure_vllm_diagnostic_bridge(_ENABLED)
     if _ENABLED:
         _content_log(
             "content_diagnostics_enabled",
@@ -83,6 +86,34 @@ def configure_npu_content_diagnostics(enabled: bool) -> None:
 def npu_content_diagnostics_enabled() -> bool:
     """Return whether content diagnostics are enabled in this worker."""
     return _ENABLED
+
+
+def _configure_vllm_diagnostic_bridge(enabled: bool) -> None:
+    """Install callbacks without importing LMCache from vLLM model modules."""
+    module_name = "vllm_ascend.lmcache_diagnostics"
+    try:
+        if enabled:
+            bridge = importlib.import_module(module_name)
+            bridge.install_npu_content_diagnostic_callbacks(
+                bridge.NPUContentDiagnosticCallbacks(
+                    begin_deferred_step=begin_deferred_diagnostic_step,
+                    flush_deferred=flush_deferred_diagnostics,
+                    fingerprint_compact_group1=fingerprint_compact_group1,
+                    register_group1_source=register_group1_source_fingerprint,
+                    queue_group1_first_consume=queue_group1_first_consume,
+                    queue_selected_topk=queue_selected_topk_fingerprint,
+                )
+            )
+        else:
+            bridge = sys.modules.get(module_name)
+            if bridge is not None:
+                bridge.clear_npu_content_diagnostic_callbacks()
+    except Exception:
+        # Diagnostics are optional and must never prevent worker startup.
+        logger.warning(
+            "Failed to configure optional vLLM-Ascend content diagnostics",
+            exc_info=True,
+        )
 
 
 def _field(item: Any, name: str) -> Any:
