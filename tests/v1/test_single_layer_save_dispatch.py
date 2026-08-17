@@ -19,13 +19,13 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
 import json
 import math
 import os
-from pathlib import Path
 import sys
 import time
-from typing import Any, Callable
 
 # Third Party
 import pytest
@@ -334,8 +334,8 @@ def _run_pipeline(
         save_done_at_return = bool(save_end.query())
         bank_done_events[bank] = save_end
 
-        # Match the three-bank lifetime rule in batched_from_gpu(): after a
-        # layer save is queued, protect the bank that the next layer will use.
+        # Model the two-bank lifetime rule: after a layer save is queued,
+        # protect the bank that the next layer will use.
         next_bank = (bank + 1) % bank_count
         next_bank_done = bank_done_events[next_bank]
         if next_bank_done is not None:
@@ -402,6 +402,7 @@ def test_single_layer_paged_kv_copy_submission_to_execution_delay() -> None:
         build_chunk_ptrs_npu,
         ensure_ascend_host_memory_registered,
     )
+
     from lmcache_ascend.v1.npu_connector.utils import (
         dense_mla_dsa_batched_direct_kv_transfer,
     )
@@ -409,7 +410,7 @@ def test_single_layer_paged_kv_copy_submission_to_execution_delay() -> None:
     ensure_ascend_host_memory_registered()
 
     layer_count = _env_int("LMCACHE_SAVE_DISPATCH_LAYERS", 6, minimum=4)
-    bank_count = 3
+    bank_count = 2
     total_tokens = _env_int("LMCACHE_SAVE_DISPATCH_TOKENS", 2048)
     host_chunk_size = _env_int("LMCACHE_SAVE_DISPATCH_HOST_CHUNK", 256)
     matmul_size = _env_int("LMCACHE_SAVE_DISPATCH_MATMUL_SIZE", 4096, minimum=256)

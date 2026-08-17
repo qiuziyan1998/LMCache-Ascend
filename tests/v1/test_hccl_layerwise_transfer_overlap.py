@@ -18,18 +18,17 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
 import math
 import os
-from pathlib import Path
 import statistics
 import sys
-from typing import Callable
 
 # Third Party
 import pytest
 import torch
 import torch.distributed as dist
-
 
 _BF16_BYTES = 2
 _MLA_LATENT_ELEMENTS_PER_TOKEN = 512 + 64
@@ -422,8 +421,8 @@ def test_hccl_allreduce_with_layerwise_load_and_save(
             **common_cache,
         )
 
-    # Four non-overlapping registered-host slices model a true three-bank
-    # transition: save N-1 and load N+1 never alias each other's host buffers.
+    # Four non-overlapping registered-host slices model simultaneous save/load:
+    # their host buffers must not alias even though the device uses two banks.
     slab_owner = PinMemoryAllocator(64 * 1024 * 1024)
     slab_slice_bytes = 16 * 1024 * 1024
     harnesses = []
