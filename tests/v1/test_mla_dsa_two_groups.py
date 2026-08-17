@@ -549,6 +549,87 @@ class TestAscendStoreLayerCompletion:
 
         assert result.committed_end == 48 * 256
 
+    def test_deferred_prefill_store_keeps_pre_and_post_hcom_phases_split(
+        self,
+    ):
+        engine = self._engine(stored=False)
+        engine.num_layers = 3
+        layer_keys = [MagicMock(spec=CacheEngineKey) for _ in range(3)]
+        key = MagicMock(spec=CacheEngineKey)
+        key.split_layers.return_value = layer_keys
+        engine.token_database.process_tokens.return_value = iter(
+            [(0, 256, key)]
+        )
+        memory_objs = [MagicMock() for _ in range(3)]
+        for memory_obj in memory_objs:
+            memory_obj.get_size.return_value = 1
+            memory_obj.is_valid.return_value = True
+        engine.storage_manager.batched_allocate.return_value = memory_objs
+        engine.storage_manager.batched_put.return_value = []
+        commands = []
+
+        def transfer():
+            command = yield None
+            commands.append(command)
+            command = yield None
+            commands.append(command)
+            command = yield None
+            commands.append(command)
+            yield 0
+            yield 1
+            yield 2
+
+        engine.gpu_connector.batched_from_gpu.return_value = transfer()
+        requests = [
+            {"slot_mapping": torch.tensor([layer])}
+            for layer in range(3)
+        ]
+
+        with (
+            patch(
+                "lmcache_ascend.v1.cache_engine."
+                "assert_layerwise_gpu_connector"
+            ),
+            patch(
+                "lmcache_ascend.v1.cache_engine."
+                "mooncake_page_layout_enabled",
+                return_value=False,
+            ),
+        ):
+            storer = AscendLMCacheEngine.store_layer(
+                engine,
+                [0] * 256,
+                deferred_layerwise_put=True,
+                req_id="req-p",
+            )
+            # Preparation/allocation is complete before model forward.
+            assert next(storer) is None
+            for layer, request in enumerate(requests):
+                # Pre-HCOM: submit exactly this layer with its dynamic bank
+                # mapping, without publishing completed CPU objects.
+                assert storer.send(request) is None
+                assert commands == requests[: layer + 1]
+                assert engine.storage_manager.batched_put.call_count == 0
+
+                # Post-HCOM: publish only a source buffer that the two-bank
+                # connector has explicitly reported complete.
+                assert next(storer) is None
+
+            assert engine.storage_manager.batched_put.call_count == 1
+            result = next(storer)
+
+        assert isinstance(result, LayerwiseStoreResult)
+        assert result.request_id == "req-p"
+        assert engine.storage_manager.batched_put.call_count == 3
+        assert [
+            call.args[0][0]
+            for call in engine.storage_manager.batched_put.call_args_list
+        ] == layer_keys
+        assert [
+            call.args[0]
+            for call in engine._append_layer_store_tensors.call_args_list
+        ] == [0, 1, 2]
+
     @staticmethod
     def _dispatch_engine(chunks):
         engine = TestAscendStoreLayerCompletion._engine(stored=False)
