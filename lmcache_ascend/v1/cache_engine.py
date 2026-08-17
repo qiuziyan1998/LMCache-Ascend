@@ -59,6 +59,12 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.token_database import TokenDatabase
 import torch
 
+# First Party
+from lmcache_ascend.v1.content_diagnostics import (
+    fingerprint_compact_group1,
+    npu_content_diagnostics_enabled,
+)
+
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
@@ -780,6 +786,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "segments": [],
                 "compact_layers": None,
                 "compact_runs": [],
+                "compact_owners": None,
                 "latent_layers": None,
                 "latent_pages": [],
                 "ends": {},
@@ -1013,11 +1020,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                 group_byte_totals=totals,
             )
             return False
+        content_diagnostics = None
+        if (
+            compact_layers is not None
+            and npu_content_diagnostics_enabled()
+            and builder.get("compact_owners")
+        ):
+            content_diagnostics = fingerprint_compact_group1(
+                event="group1_source_fingerprint",
+                req_id=req_id,
+                owners=builder["compact_owners"],
+                layers=compact_layers,
+                runs=builder["compact_runs"],
+                token_count=token_count,
+                chunk_size=int(self.config.chunk_size),
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+            )
         descriptor = {
             "group_byte_totals": totals,
             "tp_rank": tp_rank,
             "dp_rank": dp_rank,
         }
+        if content_diagnostics is not None:
+            descriptor["content_diagnostics"] = content_diagnostics
         if compact_layers is None and latent_layers is None:
             descriptor["segments"] = builder["segments"]
         else:
@@ -1232,10 +1258,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                         continue
                 if planned is None:
                     raise ValueError("direct page source layout is unsupported")
-                layers, runs, _owners = planned
+                layers, runs, owners = planned
                 self._record_live_source_layout(
                     req_id, group, starts[0], ends[-1], layers, runs
                 )
+                if npu_content_diagnostics_enabled():
+                    existing_owners = builder.get("compact_owners")
+                    owner_identity = tuple(
+                        int(owner.data_ptr()) for owner in owners
+                    )
+                    if existing_owners is not None and tuple(
+                        int(owner.data_ptr()) for owner in existing_owners
+                    ) != owner_identity:
+                        raise ValueError(
+                            "live group-1 diagnostic owners changed across steps"
+                        )
+                    builder["compact_owners"] = tuple(owners)
                 if builder["invalid"]:
                     raise ValueError(
                         "live group-1 source coverage is invalid"
