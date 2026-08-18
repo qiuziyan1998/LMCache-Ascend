@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -20,6 +20,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
 )
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import is_forward_context_available
+from vllm_ascend.live_source_handoff import (
+    LIVE_SOURCE_EVENT_HANDOFF_KEY,
+)
 import torch
 
 # First Party
@@ -146,6 +151,85 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # established group-1 path.
         self._live_latent_split_requested = False
 
+    @staticmethod
+    def _live_source_handoff_request_ids(
+        requests: Iterable[ReqMeta],
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted({
+                request.req_id
+                for request in requests
+                if request.live_source_requested and request.is_last_prefill
+            })
+        )
+
+    def start_load_kv(
+        self,
+        forward_context: ForwardContext,
+        **kwargs: Any,
+    ) -> None:
+        """Start loads and arm a real producer-event handoff when required."""
+
+        super().start_load_kv(forward_context, **kwargs)
+        if forward_context.attn_metadata is None or not self.config.dsa_two_groups:
+            return
+        requests = self._direct_prefill_requests() or []
+        request_ids = self._live_source_handoff_request_ids(requests)
+        if not request_ids or not self._latent_layer_names:
+            return
+        existing = forward_context.additional_kwargs.setdefault(
+            LIVE_SOURCE_EVENT_HANDOFF_KEY, request_ids
+        )
+        if existing != request_ids:
+            forward_context.additional_kwargs.pop(
+                LIVE_SOURCE_EVENT_HANDOFF_KEY, None
+            )
+            logger.warning(
+                "Conflicting live-source event handoff; using persistent fallback"
+            )
+
+    def capture_live_source_event_handoff(
+        self,
+        forward_context: ForwardContext,
+    ) -> bool:
+        """Retain the published event across deferred MTP finalization."""
+
+        arm = forward_context.additional_kwargs.pop(
+            LIVE_SOURCE_EVENT_HANDOFF_KEY, None
+        )
+        if arm is None:
+            return False
+        requests = self._direct_prefill_requests() or ()
+        request_ids = self._live_source_handoff_request_ids(requests)
+        if arm != request_ids:
+            return False
+        attn_metadata = forward_context.attn_metadata
+        # A single event cannot fence multiple DBO microbatch streams.
+        if not isinstance(attn_metadata, Mapping):
+            return False
+
+        for producer_layer_name in reversed(self._latent_layer_names):
+            source_ready_event = self._source_ready_event(
+                producer_layer_name, attn_metadata
+            )
+            if source_ready_event is not None:
+                break
+        else:
+            return False
+
+        metadata = self._parent._get_connector_metadata()
+        if getattr(metadata, "_live_source_event_handoff", None) is not None:
+            delattr(metadata, "_live_source_event_handoff")
+            logger.warning(
+                "Duplicate live-source event handoff; using persistent fallback"
+            )
+            return False
+        metadata._live_source_event_handoff = (  # type: ignore[attr-defined]
+            request_ids,
+            source_ready_event,
+        )
+        return True
+
     def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
         if (
             not getattr(self, "_direct_store_requested", False)
@@ -205,6 +289,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         try:
             super()._abort_save_step(requests)
         finally:
+            if is_forward_context_available():
+                get_forward_context().additional_kwargs.pop(
+                    LIVE_SOURCE_EVENT_HANDOFF_KEY, None
+                )
+            metadata = getattr(self._parent, "_connector_metadata", None)
+            if metadata is not None and hasattr(
+                metadata, "_live_source_event_handoff"
+            ):
+                delattr(metadata, "_live_source_event_handoff")
             self._direct_store_step_supported = None
             self._direct_store_observed_layers.clear()
             self._latest_live_source_ready_event = None
@@ -767,6 +860,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 completed = self._completed_layerwise_stores
                 self._completed_layerwise_stores = {}
             requests = self._direct_prefill_requests() or []
+            metadata = self._parent._get_connector_metadata()
+            handoff = getattr(metadata, "_live_source_event_handoff", None)
+            if hasattr(metadata, "_live_source_event_handoff"):
+                delattr(metadata, "_live_source_event_handoff")
+            expected_ids = self._live_source_handoff_request_ids(requests)
+            if (
+                source_ready_event is None
+                and isinstance(handoff, tuple)
+                and len(handoff) == 2
+                and handoff[0] == expected_ids
+            ):
+                request_ids, source_ready_event = handoff
+                source_ready_event_source = (
+                    "forward_context.sfa_reshape_cache_event"
+                )
             request_ids = {request.req_id for request in requests}
             adopted_requests = set()
             for (req_id, _), result in completed.items():
