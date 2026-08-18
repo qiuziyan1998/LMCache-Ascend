@@ -404,7 +404,7 @@ def test_first_consume_reports_incomplete_request_metadata(
     assert skipped[1]["block_table_rows"] == 1
 
 
-def test_attention_probe_reports_missing_wire_fingerprint(
+def test_attention_probe_observes_persistent_request_without_wire_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[str, dict[str, object]]] = []
@@ -420,31 +420,31 @@ def test_attention_probe_reports_missing_wire_fingerprint(
         layer_name="model.layers.0.self_attn.indexer.k_cache",
         indexer_cache=torch.zeros((1, 4, 1, 2)),
         indexer_block_table=torch.tensor([[0]]),
-        seq_lens_cpu=[1],
+        seq_lens_cpu=[3],
         block_size=4,
         row_request_indices=[0],
+        num_hidden_layers=1,
     )
     diagnostics.queue_selected_topk_fingerprint(
         req_ids=["request"],
         layer_name="model.layers.0.self_attn.indexer.k_cache",
         topk_indices=torch.tensor([[0]]),
         row_request_indices=[0],
-        seq_lens_cpu=[1],
+        seq_lens_cpu=[3],
+        num_hidden_layers=1,
     )
 
-    skipped = [
-        fields
-        for event, fields in events
-        if event == "content_diagnostic_snapshot_skipped"
-    ]
-    assert [fields["requested_event"] for fields in skipped] == [
-        "group1_first_decode_consume",
-        "group1_selected_topk_fingerprint",
-    ]
-    assert all(
-        fields["reason"] == "source_fingerprint_not_registered"
-        for fields in skipped
-    )
+    diagnostics.flush_deferred_diagnostics()
+
+    by_event = {event: fields for event, fields in events}
+    consume = by_event["group1_first_decode_consume"]
+    assert consume["logical_tokens"] == [0, 1]
+    assert consume["source_fingerprint_registered"] is False
+    assert consume["comparison_mode"] == "persistent_observed_only"
+    assert consume["all_expected_rows_match"] is None
+    topk = by_event["group1_selected_topk_fingerprint"]
+    assert topk["source_fingerprint_registered"] is False
+    assert topk["comparison_mode"] == "persistent_observed_only"
 
 
 def test_attention_diagnostic_metadata_error_is_nonfatal(

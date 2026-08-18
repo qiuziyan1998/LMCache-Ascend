@@ -463,6 +463,51 @@ def _request_row_counts(row_request_indices: Any, request_count: int) -> list[in
     return [max(value, 1) for value in counts]
 
 
+def _persistent_observation_spec(
+    *, num_hidden_layers: int | None, context_tokens: int
+) -> dict[str, Any] | None:
+    """Build a bounded sample spec when no live source fingerprint exists.
+
+    Persistent-only and live-to-persistent-fallback requests have no wire
+    fingerprint to register.  They still need observable prefix rows and
+    top-k choices so two hosts/runs can be compared.  This function selects a
+    deterministic first/middle/last layer set and prefix positions while
+    intentionally leaving expected hashes empty.
+    """
+    if (
+        num_hidden_layers is None
+        or isinstance(num_hidden_layers, bool)
+        or not isinstance(num_hidden_layers, int)
+        or num_hidden_layers <= 0
+        or context_tokens <= 0
+    ):
+        return None
+    layers = _ordered_sample(
+        (0, num_hidden_layers // 2, num_hidden_layers - 1),
+        MAX_LAYER_SAMPLES,
+    )
+    tokens = _ordered_sample(
+        (
+            value
+            for value in (
+                0,
+                1,
+                context_tokens // 2,
+                context_tokens - 2,
+                context_tokens - 1,
+            )
+            if 0 <= value < context_tokens
+        ),
+        MAX_LOGICAL_TOKEN_SAMPLES,
+    )
+    return {
+        "sample_layer_ids": layers,
+        "sample_logical_tokens": tokens,
+        "row_hashes": {},
+        "diagnostic_origin": "persistent_observed_only",
+    }
+
+
 def _cpu_int_list(values: Any) -> list[int] | None:
     if values is None:
         return None
@@ -668,6 +713,7 @@ def queue_group1_first_consume(
     attn_state: Any = None,
     decode_valid_rows_all: bool | None = None,
     group1_connector_wait_called: bool | None = None,
+    num_hidden_layers: int | None = None,
 ) -> None:
     """Queue exact Group-1 rows consumed by the first decoder forward.
 
@@ -726,17 +772,24 @@ def queue_group1_first_consume(
     for req_index, req_id in enumerate(request_ids):
         with _STATE_LOCK:
             spec = _REQUEST_SPECS.get(str(req_id))
+        context_tokens = max(seq_lens[req_index] - row_counts[req_index], 0)
         if not spec:
-            _log_snapshot_skip_once(
-                requested_event="group1_first_decode_consume",
-                req_ids=[req_id],
-                layer_name=layer_name,
-                reason="source_fingerprint_not_registered",
+            spec = _persistent_observation_spec(
+                num_hidden_layers=num_hidden_layers,
+                context_tokens=context_tokens,
             )
-            continue
+            if spec is None:
+                _log_snapshot_skip_once(
+                    requested_event="group1_first_decode_consume",
+                    req_ids=[req_id],
+                    layer_name=layer_name,
+                    reason="missing_persistent_observation_metadata",
+                    num_hidden_layers=num_hidden_layers,
+                    context_tokens=context_tokens,
+                )
+                continue
         if layer_id not in spec.get("sample_layer_ids", ()):
             continue
-        context_tokens = max(seq_lens[req_index] - row_counts[req_index], 0)
         logical_tokens = [
             int(value)
             for value in spec.get("sample_logical_tokens", ())
@@ -825,6 +878,13 @@ def queue_group1_first_consume(
                     if group1_connector_wait_called is not None
                     else None
                 ),
+                "source_fingerprint_registered": (
+                    spec.get("diagnostic_origin")
+                    != "persistent_observed_only"
+                ),
+                "comparison_mode": spec.get(
+                    "diagnostic_origin", "live_source_expected"
+                ),
                 "dtype": str(indexer_cache.dtype),
                 "snapshot_monotonic_ms": round(time.perf_counter() * 1000, 3),
                 "capture_order": (
@@ -852,6 +912,7 @@ def queue_selected_topk_fingerprint(
     num_actual_tokens: int | None = None,
     attn_state: Any = None,
     decode_valid_rows_all: bool | None = None,
+    num_hidden_layers: int | None = None,
 ) -> None:
     """Queue selected top-k token rows per request for deferred hashing.
 
@@ -866,27 +927,25 @@ def queue_selected_topk_fingerprint(
     if layer_id is None:
         return
     request_ids = [str(req_id) for req_id in req_ids]
+    seq_lens = _cpu_int_list(seq_lens_cpu)
+    row_counts = _request_row_counts(row_request_indices, len(request_ids))
     eligible: set[int] = set()
-    registered: set[int] = set()
+    comparison_modes: dict[int, str] = {}
     for req_index, req_id in enumerate(request_ids):
         with _STATE_LOCK:
             spec = _REQUEST_SPECS.get(req_id)
-        if spec:
-            registered.add(req_index)
-            if layer_id in spec.get("sample_layer_ids", ()):
-                eligible.add(req_index)
-    missing = [
-        req_id
-        for req_index, req_id in enumerate(request_ids)
-        if req_index not in registered
-    ]
-    if missing:
-        _log_snapshot_skip_once(
-            requested_event="group1_selected_topk_fingerprint",
-            req_ids=missing,
-            layer_name=layer_name,
-            reason="source_fingerprint_not_registered",
-        )
+        if not spec and seq_lens is not None and req_index < len(seq_lens):
+            spec = _persistent_observation_spec(
+                num_hidden_layers=num_hidden_layers,
+                context_tokens=max(
+                    seq_lens[req_index] - row_counts[req_index], 0
+                ),
+            )
+        if spec and layer_id in spec.get("sample_layer_ids", ()):
+            eligible.add(req_index)
+            comparison_modes[req_index] = str(
+                spec.get("diagnostic_origin", "live_source_expected")
+            )
     if not eligible:
         return
     row_owners: list[int]
@@ -908,7 +967,6 @@ def queue_selected_topk_fingerprint(
         ]
     else:
         row_owners = [int(value) for value in row_request_indices]
-    seq_lens = _cpu_int_list(seq_lens_cpu)
     row_limit = min(len(row_owners), int(topk_indices.shape[0]))
     valid_row_indices = [
         index
@@ -980,6 +1038,11 @@ def queue_selected_topk_fingerprint(
                         if decode_valid_rows_all is not None
                         else None
                     ),
+                    "source_fingerprint_registered": (
+                        comparison_modes[req_index]
+                        != "persistent_observed_only"
+                    ),
+                    "comparison_mode": comparison_modes[req_index],
                     "shape": list(rows.shape),
                     "dtype": str(topk_indices.dtype),
                     "snapshot_monotonic_ms": round(time.perf_counter() * 1000, 3),
