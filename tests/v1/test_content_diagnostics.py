@@ -153,6 +153,10 @@ def test_configure_installs_and_clears_vllm_callback_bridge(
         callbacks["queue_selected_topk"]
         is diagnostics.queue_selected_topk_fingerprint
     )
+    assert (
+        callbacks["queue_staged_graph_stage"]
+        is diagnostics.queue_staged_graph_stage_fingerprint
+    )
 
     diagnostics.configure_npu_content_diagnostics(False)
     assert cleared == [True]
@@ -445,6 +449,49 @@ def test_attention_probe_observes_persistent_request_without_wire_fingerprint(
     topk = by_event["group1_selected_topk_fingerprint"]
     assert topk["source_fingerprint_registered"] is False
     assert topk["comparison_mode"] == "persistent_observed_only"
+
+
+def test_staged_graph_stage_snapshot_is_deferred_and_immutable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    diagnostics.configure_npu_content_diagnostics(True)
+    values = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+
+    diagnostics.queue_staged_graph_stage_fingerprint(
+        req_ids=["request"],
+        layer_name="model.layers.0.self_attn.attn",
+        stage="after_graph_pre_before_retrieve",
+        components={"row_req_indices": values},
+        row_request_indices=[0, 0],
+        seq_lens_cpu=[3],
+        num_decode_tokens=2,
+        num_actual_tokens=2,
+        attn_state="SpecDecoding",
+        num_hidden_layers=1,
+        graph_key="spec-2",
+    )
+    values.fill_(9)
+    assert [event for event, _ in events] == [
+        "content_diagnostics_enabled"
+    ]
+
+    diagnostics.flush_deferred_diagnostics()
+
+    event, fields = events[-1]
+    assert event == "staged_sfa_graph_fingerprint"
+    assert fields["stage"] == "after_graph_pre_before_retrieve"
+    assert fields["row_owners"] == [0, 0]
+    assert fields["graph_key"] == "spec-2"
+    assert fields["device_snapshot_may_perturb_timing"] is True
+    component = fields["component_summaries"]["row_req_indices"]
+    assert component["value_preview"] == [1, 2, 3, 4]
+    assert fields["readback_mode"] == "deferred_after_sampling_workflow"
 
 
 def test_attention_diagnostic_metadata_error_is_nonfatal(

@@ -6,8 +6,8 @@ diagnostics.  All public entry points in this module are therefore guarded by
 ``enable_npu_content_diagnostics`` and are no-ops until the LMCache connector
 configures that single knob.  Inline fingerprints explicitly report that the
 host readback may synchronize the NPU.  Attention-side snapshots are cloned on
-the current NPU stream and read back only after the model forward returns so a
-diagnostic does not introduce a host synchronization between attention layers.
+the current NPU stream and read back only after sampling, draft proposal, and
+async state updates, so diagnostics cannot synchronize the serving workflow.
 """
 
 # Standard
@@ -105,6 +105,9 @@ def _configure_vllm_diagnostic_bridge(enabled: bool) -> None:
                     queue_group1_first_consume=queue_group1_first_consume,
                     queue_cache_tail=queue_cache_tail_fingerprint,
                     queue_selected_topk=queue_selected_topk_fingerprint,
+                    queue_staged_graph_stage=(
+                        queue_staged_graph_stage_fingerprint
+                    ),
                 )
             )
         else:
@@ -1053,6 +1056,124 @@ def queue_selected_topk_fingerprint(
         )
 
 
+@_nonfatal_diagnostic("staged_sfa_graph_fingerprint")
+def queue_staged_graph_stage_fingerprint(
+    *,
+    req_ids: Sequence[str] | None,
+    layer_name: str,
+    stage: str,
+    components: dict[str, torch.Tensor],
+    row_request_indices: Any = None,
+    seq_lens_cpu: Any = None,
+    num_decode_tokens: int | None = None,
+    num_actual_tokens: int | None = None,
+    attn_state: Any = None,
+    num_hidden_layers: int | None = None,
+    graph_key: Any = None,
+) -> None:
+    """Queue a bounded snapshot at a staged-SFA replay boundary.
+
+    Callers provide tensors that already represent the small row/slot sample
+    relevant to the boundary.  Cloning happens on the current NPU stream, so
+    the captured values cannot be overwritten by a later graph island.  Host
+    readback remains deferred until behavior-critical sampling work is queued.
+    """
+    if not _ENABLED or not req_ids or not components:
+        return
+    layer_id = _layer_id(layer_name)
+    if layer_id is None:
+        return
+    request_ids = [str(req_id) for req_id in req_ids]
+    seq_lens = _cpu_int_list(seq_lens_cpu)
+    row_counts = _request_row_counts(
+        row_request_indices,
+        len(request_ids),
+    )
+    sampled = False
+    for req_index, req_id in enumerate(request_ids):
+        with _STATE_LOCK:
+            spec = _REQUEST_SPECS.get(req_id)
+        if not spec and seq_lens is not None and req_index < len(seq_lens):
+            spec = _persistent_observation_spec(
+                num_hidden_layers=num_hidden_layers,
+                context_tokens=max(
+                    int(seq_lens[req_index]) - row_counts[req_index],
+                    0,
+                ),
+            )
+        if spec and layer_id in spec.get("sample_layer_ids", ()):
+            sampled = True
+            break
+    if not sampled:
+        return
+    request_key = "|".join(request_ids)
+    if not _claim_once(
+        f"staged_graph:{stage}",
+        request_key,
+        layer_name,
+    ):
+        return
+    snapshots = {
+        str(name): value.detach().clone()
+        for name, value in components.items()
+        if isinstance(value, torch.Tensor)
+    }
+    if not snapshots:
+        return
+    row_owners = _cpu_int_list(row_request_indices)
+    _queue_snapshot(
+        _DeferredSnapshot(
+            event="staged_sfa_graph_fingerprint",
+            fields={
+                "request_ids": request_ids,
+                "layer_name": str(layer_name),
+                "layer_id": layer_id,
+                "stage": str(stage),
+                "graph_key": str(graph_key),
+                "seq_lens": seq_lens,
+                "row_owners": row_owners,
+                "valid_row_indices": (
+                    [
+                        index
+                        for index, owner in enumerate(row_owners)
+                        if 0 <= owner < len(request_ids)
+                    ]
+                    if row_owners is not None
+                    else None
+                ),
+                "padding_row_indices": (
+                    [
+                        index
+                        for index, owner in enumerate(row_owners)
+                        if owner < 0
+                    ]
+                    if row_owners is not None
+                    else None
+                ),
+                "num_decode_tokens": (
+                    int(num_decode_tokens)
+                    if num_decode_tokens is not None
+                    else None
+                ),
+                "num_actual_tokens": (
+                    int(num_actual_tokens)
+                    if num_actual_tokens is not None
+                    else None
+                ),
+                "attn_state": str(attn_state),
+                "component_names": sorted(snapshots),
+                "snapshot_monotonic_ms": round(
+                    time.perf_counter() * 1000,
+                    3,
+                ),
+                "capture_order": str(stage),
+                "device_snapshot_may_perturb_timing": True,
+            },
+            components=snapshots,
+        )
+    )
+
+
 def _queue_snapshot(snapshot: _DeferredSnapshot) -> None:
     dropped: _DeferredSnapshot | None = None
     with _STATE_LOCK:
@@ -1083,7 +1204,7 @@ def begin_deferred_diagnostic_step() -> None:
 
 
 def flush_deferred_diagnostics() -> None:
-    """Read queued NPU snapshots after model forward and emit fingerprints."""
+    """Read snapshots after behavior-critical work and log fingerprints."""
     if not _ENABLED:
         return
     with _STATE_LOCK:
@@ -1119,6 +1240,16 @@ def flush_deferred_diagnostics() -> None:
                         "dtype": str(value.dtype),
                         "value_count": int(value.numel()),
                     }
+                    if (
+                        snapshot.event == "staged_sfa_graph_fingerprint"
+                        and not value.is_floating_point()
+                        and not value.is_complex()
+                    ):
+                        flat = value.reshape(-1)
+                        summary["value_preview"] = [
+                            int(item)
+                            for item in flat[: min(8, int(flat.numel()))].tolist()
+                        ]
                     if comparison is not None:
                         summary["produced_hash"] = _hash_cpu_tensor(comparison)
                         summary["matches_produced"] = torch.equal(
@@ -1237,7 +1368,11 @@ def flush_deferred_diagnostics() -> None:
             _content_log(
                 snapshot.event,
                 **fields,
-                readback_mode="deferred_after_model_forward",
+                readback_mode=(
+                    "deferred_after_sampling_workflow"
+                    if snapshot.event == "staged_sfa_graph_fingerprint"
+                    else "deferred_after_model_forward"
+                ),
                 readback_may_synchronize=True,
                 explicit_device_synchronize=False,
                 elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
@@ -1248,6 +1383,10 @@ def flush_deferred_diagnostics() -> None:
                 requested_event=snapshot.event,
                 error_type=type(error).__name__,
                 error=str(error),
-                readback_mode="deferred_after_model_forward",
+                readback_mode=(
+                    "deferred_after_sampling_workflow"
+                    if snapshot.event == "staged_sfa_graph_fingerprint"
+                    else "deferred_after_model_forward"
+                ),
                 readback_may_synchronize=True,
             )
