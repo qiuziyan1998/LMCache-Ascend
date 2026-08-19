@@ -44,6 +44,23 @@ _ENABLED = False
 _PENDING: list["_DeferredSnapshot"] = []
 _SEEN: OrderedDict[tuple[str, str, str], None] = OrderedDict()
 _REQUEST_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_GROUP0_SOURCE_PROBES: OrderedDict[
+    tuple[str, int], "_Group0SourceProbe"
+] = OrderedDict()
+
+
+@dataclass(slots=True)
+class _Group0SourceProbe:
+    req_id: str
+    layer_id: int
+    source_chunks: tuple[torch.Tensor, ...]
+    selected_tokens: torch.Tensor
+    selected_count: torch.Tensor | None
+    chunk_size: int
+    total_tokens: int
+    token_major: bool
+    plane_widths: tuple[int, ...]
+    destination_stride: int
 
 
 @dataclass(slots=True)
@@ -55,6 +72,7 @@ class _DeferredSnapshot:
     expected_rows: dict[tuple[int, int], str] | None = None
     components: dict[str, torch.Tensor] | None = None
     comparison_components: dict[str, torch.Tensor] | None = None
+    group0_source_probes: tuple[_Group0SourceProbe, ...] | None = None
 
 
 def configure_npu_content_diagnostics(enabled: bool) -> None:
@@ -75,6 +93,7 @@ def configure_npu_content_diagnostics(enabled: bool) -> None:
             _PENDING.clear()
             _SEEN.clear()
             _REQUEST_SPECS.clear()
+            _GROUP0_SOURCE_PROBES.clear()
     _configure_vllm_diagnostic_bridge(_ENABLED)
     if _ENABLED:
         _content_log(
@@ -430,6 +449,101 @@ def register_group1_source_fingerprint(
         _REQUEST_SPECS.move_to_end(str(req_id))
         while len(_REQUEST_SPECS) > MAX_TRACKED_REQUEST_LAYERS:
             _REQUEST_SPECS.popitem(last=False)
+
+
+@_nonfatal_diagnostic("group0_source_payload")
+def register_group0_source_probe(
+    *,
+    req_id: str | None,
+    layer_id: int,
+    num_layers: int,
+    source_chunks: Sequence[torch.Tensor],
+    selected_tokens: torch.Tensor,
+    selected_count: torch.Tensor | None,
+    chunk_size: int,
+    total_tokens: int,
+    token_major: bool,
+    layer_cache: Any,
+) -> None:
+    """Retain a bounded Group-0 source observation for post-join comparison.
+
+    Only device-to-device clones of at most two integer indices are queued
+    here. Source extraction and every device-to-host read happen later in
+    :func:`flush_deferred_diagnostics`, after behavior-critical sampling.
+    """
+    if (
+        not _ENABLED
+        or req_id is None
+        or int(num_layers) <= 0
+        or int(layer_id) not in (0, int(num_layers) // 2)
+        or not source_chunks
+        or int(chunk_size) <= 0
+        or int(total_tokens) <= 0
+    ):
+        return
+    planes = (
+        tuple(layer_cache)
+        if isinstance(layer_cache, (tuple, list))
+        else (layer_cache,)
+    )
+    if not planes or not all(isinstance(plane, torch.Tensor) for plane in planes):
+        return
+    slot_capacity = int(planes[0].shape[0]) * int(planes[0].shape[1])
+    if slot_capacity <= 0:
+        return
+    plane_widths: list[int] = []
+    for plane in planes:
+        if (
+            plane.ndim < 2
+            or int(plane.shape[0]) * int(plane.shape[1]) != slot_capacity
+        ):
+            return
+        plane_widths.append(int(plane.numel()) // slot_capacity)
+    selected_snapshot = selected_tokens.detach().reshape(-1)[:2].clone()
+    count_snapshot = (
+        selected_count.detach().reshape(-1)[:1].clone()
+        if isinstance(selected_count, torch.Tensor) and selected_count.numel()
+        else None
+    )
+    probe = _Group0SourceProbe(
+        req_id=str(req_id),
+        layer_id=int(layer_id),
+        source_chunks=tuple(source_chunks),
+        selected_tokens=selected_snapshot,
+        selected_count=count_snapshot,
+        chunk_size=int(chunk_size),
+        total_tokens=int(total_tokens),
+        token_major=bool(token_major),
+        plane_widths=tuple(plane_widths),
+        destination_stride=min(
+            8,
+            int(selected_tokens.shape[-1])
+            if selected_tokens.ndim
+            else int(selected_tokens.numel()),
+        ),
+    )
+    key = (probe.req_id, probe.layer_id)
+    with _STATE_LOCK:
+        _GROUP0_SOURCE_PROBES[key] = probe
+        _GROUP0_SOURCE_PROBES.move_to_end(key)
+        while len(_GROUP0_SOURCE_PROBES) > MAX_TRACKED_REQUEST_LAYERS:
+            _GROUP0_SOURCE_PROBES.popitem(last=False)
+
+
+def _take_group0_source_probes(
+    request_ids: Sequence[str], layer_id: int
+) -> tuple[_Group0SourceProbe, ...] | None:
+    probes: list[_Group0SourceProbe | None] = []
+    with _STATE_LOCK:
+        for req_id in request_ids:
+            probes.append(
+                _GROUP0_SOURCE_PROBES.pop(
+                    (str(req_id), int(layer_id)), None
+                )
+            )
+    if not probes or any(probe is None for probe in probes):
+        return None
+    return tuple(probe for probe in probes if probe is not None)
 
 
 def _claim_once(stage: str, req_id: str, layer_name: str) -> bool:
@@ -1121,6 +1235,11 @@ def queue_staged_graph_stage_fingerprint(
     if not snapshots:
         return
     row_owners = _cpu_int_list(row_request_indices)
+    group0_source_probes = (
+        _take_group0_source_probes(request_ids, layer_id)
+        if stage == "after_selective_retrieve_before_graph_post"
+        else None
+    )
     _queue_snapshot(
         _DeferredSnapshot(
             event="staged_sfa_graph_fingerprint",
@@ -1170,6 +1289,7 @@ def queue_staged_graph_stage_fingerprint(
                 "device_snapshot_may_perturb_timing": True,
             },
             components=snapshots,
+            group0_source_probes=group0_source_probes,
         )
     )
 
@@ -1195,12 +1315,128 @@ def begin_deferred_diagnostic_step() -> None:
     with _STATE_LOCK:
         stale = len(_PENDING)
         _PENDING.clear()
+        _GROUP0_SOURCE_PROBES.clear()
     if stale:
         _content_log(
             "content_diagnostic_snapshot_dropped",
             dropped_count=stale,
             reason="previous_forward_did_not_flush",
         )
+
+
+def _materialize_group0_source_samples(
+    probes: Sequence[_Group0SourceProbe],
+) -> tuple[
+    dict[str, torch.Tensor], list[dict[str, Any]], list[int]
+]:
+    """Gather the registered LocalCPU records after sampling has completed."""
+    plane_rows: list[list[torch.Tensor]] = []
+    details: list[dict[str, Any]] = []
+    destination_rows: list[int] = []
+    destination_offset = 0
+    expected_plane_count: int | None = None
+    for probe in probes:
+        selected = [
+            int(value)
+            for value in probe.selected_tokens.detach()
+            .to("cpu")
+            .reshape(-1)
+            .tolist()
+        ]
+        selected_count = (
+            int(probe.selected_count.detach().to("cpu").reshape(-1)[0])
+            if probe.selected_count is not None
+            else len(selected)
+        )
+        sample_count = min(len(selected), max(selected_count, 0))
+        source_chunks = tuple(probe.source_chunks)
+        detail: dict[str, Any] = {
+            "req_id": probe.req_id,
+            "layer_id": probe.layer_id,
+            "selected_token_preview": selected[:sample_count],
+            "selected_count": selected_count,
+            "sample_count": sample_count,
+            "source_chunk_count": len(source_chunks),
+            "source_chunk_data_ptr_preview": [
+                int(tensor.data_ptr()) for tensor in source_chunks[:2]
+            ],
+            "token_major": probe.token_major,
+        }
+        if expected_plane_count is None:
+            expected_plane_count = len(probe.plane_widths)
+            plane_rows = [[] for _ in range(expected_plane_count)]
+        if len(probe.plane_widths) != expected_plane_count:
+            detail.update(supported=False, reason="plane_count_mismatch")
+            details.append(detail)
+            destination_offset += probe.destination_stride
+            continue
+        if any(tensor.device.type != "cpu" for tensor in source_chunks):
+            detail.update(supported=False, reason="source_not_cpu")
+            details.append(detail)
+            destination_offset += probe.destination_stride
+            continue
+        record_width = sum(probe.plane_widths)
+        if record_width <= 0:
+            detail.update(supported=False, reason="invalid_record_width")
+            details.append(detail)
+            destination_offset += probe.destination_stride
+            continue
+        gathered: list[list[torch.Tensor]] = [
+            [] for _ in range(expected_plane_count)
+        ]
+        reason = None
+        for source_token in selected[:sample_count]:
+            if source_token < 0 or source_token >= probe.total_tokens:
+                reason = "source_token_oob"
+                break
+            chunk_index, local_token = divmod(source_token, probe.chunk_size)
+            if chunk_index >= len(source_chunks):
+                reason = "source_chunk_oob"
+                break
+            flat = source_chunks[chunk_index].detach().reshape(-1)
+            if int(flat.numel()) % record_width:
+                reason = "source_chunk_layout_mismatch"
+                break
+            chunk_tokens = int(flat.numel()) // record_width
+            if local_token >= chunk_tokens:
+                reason = "source_local_token_oob"
+                break
+            plane_offset = 0
+            for plane_index, width in enumerate(probe.plane_widths):
+                start = (
+                    local_token * record_width + plane_offset
+                    if probe.token_major
+                    else plane_offset * chunk_tokens + local_token * width
+                )
+                gathered[plane_index].append(flat[start : start + width])
+                plane_offset += width
+        if reason is not None:
+            detail.update(supported=False, reason=reason)
+            details.append(detail)
+            destination_offset += probe.destination_stride
+            continue
+        for plane_index, rows in enumerate(gathered):
+            plane_rows[plane_index].extend(rows)
+        destination_rows.extend(
+            range(destination_offset, destination_offset + sample_count)
+        )
+        destination_offset += probe.destination_stride
+        detail.update(supported=True)
+        details.append(detail)
+    names = (
+        ("retrieved_nope_sample", "retrieved_pe_sample")
+        if len(plane_rows) == 2
+        else tuple(
+            f"retrieved_plane_{index}_sample"
+            for index in range(len(plane_rows))
+        )
+    )
+    components = {
+        name: torch.stack(rows)
+        for name, rows in zip(names, plane_rows, strict=True)
+        if rows
+    }
+    return components, details, destination_rows
 
 
 def flush_deferred_diagnostics() -> None:
@@ -1277,6 +1513,92 @@ def flush_deferred_diagnostics() -> None:
                     if matches
                     else None
                 )
+                if snapshot.group0_source_probes is not None:
+                    try:
+                        (
+                            source_components,
+                            source_details,
+                            destination_rows,
+                        ) = _materialize_group0_source_samples(
+                            snapshot.group0_source_probes
+                        )
+                        source_summaries: dict[str, dict[str, Any]] = {}
+                        source_matches: list[bool] = []
+                        for name, source in source_components.items():
+                            summary = {
+                                "content_hash": _hash_cpu_tensor(source),
+                                "shape": list(source.shape),
+                                "dtype": str(source.dtype),
+                                "value_count": int(source.numel()),
+                            }
+                            destination = components_cpu.get(name)
+                            if (
+                                destination is not None
+                                and destination_rows
+                                and max(destination_rows)
+                                < int(destination.shape[0])
+                            ):
+                                row_index = torch.tensor(
+                                    destination_rows, dtype=torch.long
+                                )
+                                destination = destination.index_select(
+                                    0, row_index
+                                )
+                                if int(destination.numel()) == int(
+                                    source.numel()
+                                ):
+                                    source_view = source.reshape(
+                                        destination.shape
+                                    )
+                                    matches_destination = torch.equal(
+                                        source_view, destination
+                                    )
+                                    summary.update(
+                                        destination_hash=_hash_cpu_tensor(
+                                            destination
+                                        ),
+                                        matches_destination=(
+                                            matches_destination
+                                        ),
+                                    )
+                                    delta = source_view.to(
+                                        torch.float32
+                                    ) - destination.to(torch.float32)
+                                    summary["max_abs_delta"] = (
+                                        float(delta.abs().max().item())
+                                        if delta.numel()
+                                        else 0.0
+                                    )
+                                    summary["differing_element_count"] = int(
+                                        torch.count_nonzero(delta).item()
+                                    )
+                                    source_matches.append(matches_destination)
+                            source_summaries[name] = summary
+                        _content_log(
+                            "group0_source_destination_fingerprint",
+                            request_ids=fields.get("request_ids"),
+                            layer_name=fields.get("layer_name"),
+                            layer_id=fields.get("layer_id"),
+                            graph_key=fields.get("graph_key"),
+                            source_details=source_details,
+                            component_summaries=source_summaries,
+                            all_components_match=(
+                                all(source_matches)
+                                if source_matches
+                                else None
+                            ),
+                            readback_mode="deferred_after_sampling_workflow",
+                            readback_may_synchronize=True,
+                            explicit_device_synchronize=False,
+                        )
+                    except Exception as error:
+                        _content_log(
+                            "group0_source_probe_error",
+                            request_ids=fields.get("request_ids"),
+                            layer_id=fields.get("layer_id"),
+                            error_type=type(error).__name__,
+                            error=str(error),
+                        )
             else:
                 if snapshot.values is None:
                     raise ValueError("Deferred snapshot has no values")

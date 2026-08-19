@@ -34,6 +34,10 @@ from lmcache.v1.metadata import LMCacheMetadata
 import torch
 
 # First Party
+from lmcache_ascend.v1.content_diagnostics import (
+    npu_content_diagnostics_enabled,
+    register_group0_source_probe,
+)
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_sparse_single_layer_kv_transfer,
@@ -4583,6 +4587,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         chunk_size = self.lmcache_chunk_size
+        content_diag_enabled = (
+            kv_group == 0 and npu_content_diagnostics_enabled()
+        )
         chunk_token_counts = source.chunk_token_counts
         if chunk_token_counts and (
             any(count != chunk_size for count in chunk_token_counts[:-1])
@@ -4666,6 +4673,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 sparse_host_interleaved=sparse_host_interleaved,
                 selected_token_counts=selected_token_counts,
             )
+            if content_diag_enabled and layer_id in (0, self.num_layers // 2):
+                diagnostic_source_tensors = list(source_layer.tensors)
+                for memory_obj in (
+                    source_layer.memory_objs
+                    if not diagnostic_source_tensors
+                    else ()
+                ):
+                    diagnostic_source_tensors.append(
+                        _layer_memory_tensor(memory_obj, layer_id)
+                    )
+                register_group0_source_probe(
+                    req_id=req_id,
+                    layer_id=layer_id,
+                    num_layers=self.num_layers,
+                    source_chunks=diagnostic_source_tensors,
+                    selected_tokens=selected_token_idx,
+                    selected_count=selected_token_counts,
+                    chunk_size=chunk_size,
+                    total_tokens=source.total_tokens,
+                    token_major=self._layerwise_token_major(kv_group),
+                    layer_cache=kvcaches_snapshot[layer_id],
+                )
             if capture_content and layer_id == 0:
                 source_tensors = list(source_layer.tensors)
                 for memory_obj in (
@@ -4777,6 +4806,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         sparse_vllm_two_major = layout.vllm_two_major
+        content_diag_enabled = (
+            kv_group == 0 and npu_content_diagnostics_enabled()
+        )
         bootstrap_destination_plan = None
         if self._is_mla_dsa_format(kv_group):
             bootstrap_destination_plan = self._get_or_create_sparse_destination_plan(
@@ -4996,6 +5028,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     ),
                     cpu_tensors=cpu_tensors,
                     selected_token_counts=selected_token_counts,
+                )
+            if content_diag_enabled and layer_id in (0, self.num_layers // 2):
+                diagnostic_cpu_tensors = cpu_tensors
+                if pointer_first:
+                    diagnostic_cpu_tensors = [
+                        _layer_memory_tensor(memory_obj, layer_id)
+                        for memory_obj in layer_memory_objs
+                    ]
+                register_group0_source_probe(
+                    req_id=req_id,
+                    layer_id=layer_id,
+                    num_layers=self.num_layers,
+                    source_chunks=diagnostic_cpu_tensors,
+                    selected_tokens=selected_token_idx,
+                    selected_count=selected_token_counts,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    token_major=sparse_token_major,
+                    layer_cache=kvcaches_snapshot[layer_id],
                 )
             capture_content_probe = (
                 deep_diag_enabled

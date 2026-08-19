@@ -494,6 +494,78 @@ def test_staged_graph_stage_snapshot_is_deferred_and_immutable(
     assert fields["readback_mode"] == "deferred_after_sampling_workflow"
 
 
+def test_staged_graph_snapshot_compares_group0_local_cpu_source_after_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    diagnostics.configure_npu_content_diagnostics(True)
+    # Two plane-stacked chunks with two tokens each: nope width=2, pe width=1.
+    source_chunks = (
+        torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.bfloat16),
+        torch.tensor([7, 8, 9, 10, 11, 12], dtype=torch.bfloat16),
+    )
+    diagnostics.register_group0_source_probe(
+        req_id="request",
+        layer_id=0,
+        num_layers=2,
+        source_chunks=source_chunks,
+        selected_tokens=torch.tensor([0, 2], dtype=torch.int32),
+        selected_count=torch.tensor([2], dtype=torch.int32),
+        chunk_size=2,
+        total_tokens=4,
+        token_major=False,
+        layer_cache=(
+            torch.zeros((4, 1, 2), dtype=torch.bfloat16),
+            torch.zeros((4, 1, 1), dtype=torch.bfloat16),
+        ),
+    )
+    destination_nope = torch.tensor(
+        [[[1, 2]], [[7, 8]]], dtype=torch.bfloat16
+    )
+    destination_pe = torch.tensor([[[5]], [[11]]], dtype=torch.bfloat16)
+    diagnostics.queue_staged_graph_stage_fingerprint(
+        req_ids=["request"],
+        layer_name="model.layers.0.self_attn.attn",
+        stage="after_selective_retrieve_before_graph_post",
+        components={
+            "retrieved_nope_sample": destination_nope,
+            "retrieved_pe_sample": destination_pe,
+        },
+        row_request_indices=[0, 0],
+        seq_lens_cpu=[4],
+        num_decode_tokens=2,
+        num_actual_tokens=2,
+        attn_state="SpecDecoding",
+        num_hidden_layers=2,
+        graph_key="spec-2",
+    )
+
+    assert [event for event, _ in events] == [
+        "content_diagnostics_enabled"
+    ]
+    diagnostics.flush_deferred_diagnostics()
+
+    fields = next(
+        fields
+        for event, fields in events
+        if event == "group0_source_destination_fingerprint"
+    )
+    assert fields["all_components_match"] is True
+    assert fields["source_details"][0]["selected_token_preview"] == [0, 2]
+    source_summaries = fields["component_summaries"]
+    assert source_summaries["retrieved_nope_sample"][
+        "matches_destination"
+    ] is True
+    assert source_summaries["retrieved_pe_sample"][
+        "matches_destination"
+    ] is True
+
+
 def test_attention_diagnostic_metadata_error_is_nonfatal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
