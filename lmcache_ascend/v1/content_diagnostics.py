@@ -184,13 +184,27 @@ def _nonfatal_diagnostic(
             try:
                 function(*args, **kwargs)
             except Exception as error:
+                error_event = (
+                    "group0_source_probe_error"
+                    if event == "group0_source_payload"
+                    else "group1_fingerprint_error"
+                )
+                context = (
+                    {
+                        "req_id": kwargs.get("req_id"),
+                        "layer_id": kwargs.get("layer_id"),
+                    }
+                    if event == "group0_source_payload"
+                    else {}
+                )
                 _content_log(
-                    "group1_fingerprint_error",
+                    error_event,
                     requested_event=event,
                     error_type=type(error).__name__,
                     error=str(error),
                     readback_mode="deferred_after_model_forward",
                     readback_may_synchronize=False,
+                    **context,
                 )
 
         return wrapped
@@ -471,15 +485,37 @@ def register_group0_source_probe(
     here. Source extraction and every device-to-host read happen later in
     :func:`flush_deferred_diagnostics`, after behavior-critical sampling.
     """
-    if (
-        not _ENABLED
-        or req_id is None
-        or int(num_layers) <= 0
-        or int(layer_id) not in (0, int(num_layers) // 2)
-        or not source_chunks
-        or int(chunk_size) <= 0
-        or int(total_tokens) <= 0
-    ):
+    if not _ENABLED:
+        return
+    if int(num_layers) <= 0:
+        _content_log(
+            "group0_source_probe_error",
+            req_id=req_id,
+            layer_id=int(layer_id),
+            reason="invalid_num_layers",
+            num_layers=int(num_layers),
+        )
+        return
+    if int(layer_id) not in (0, int(num_layers) // 2):
+        return
+    if req_id is None:
+        _content_log(
+            "group0_source_probe_error",
+            req_id=None,
+            layer_id=int(layer_id),
+            reason="missing_req_id",
+        )
+        return
+    if not source_chunks or int(chunk_size) <= 0 or int(total_tokens) <= 0:
+        _content_log(
+            "group0_source_probe_error",
+            req_id=str(req_id),
+            layer_id=int(layer_id),
+            reason="invalid_source_context",
+            source_chunk_count=len(source_chunks),
+            chunk_size=int(chunk_size),
+            total_tokens=int(total_tokens),
+        )
         return
     planes = (
         tuple(layer_cache)
@@ -487,16 +523,41 @@ def register_group0_source_probe(
         else (layer_cache,)
     )
     if not planes or not all(isinstance(plane, torch.Tensor) for plane in planes):
+        _content_log(
+            "group0_source_probe_error",
+            req_id=str(req_id),
+            layer_id=int(layer_id),
+            reason="invalid_destination_cache",
+        )
+        return
+    if any(plane.ndim < 2 for plane in planes):
+        _content_log(
+            "group0_source_probe_error",
+            req_id=str(req_id),
+            layer_id=int(layer_id),
+            reason="invalid_destination_cache_shape",
+            shapes=[list(plane.shape) for plane in planes],
+        )
         return
     slot_capacity = int(planes[0].shape[0]) * int(planes[0].shape[1])
     if slot_capacity <= 0:
+        _content_log(
+            "group0_source_probe_error",
+            req_id=str(req_id),
+            layer_id=int(layer_id),
+            reason="invalid_destination_capacity",
+            slot_capacity=slot_capacity,
+        )
         return
     plane_widths: list[int] = []
     for plane in planes:
-        if (
-            plane.ndim < 2
-            or int(plane.shape[0]) * int(plane.shape[1]) != slot_capacity
-        ):
+        if int(plane.shape[0]) * int(plane.shape[1]) != slot_capacity:
+            _content_log(
+                "group0_source_probe_error",
+                req_id=str(req_id),
+                layer_id=int(layer_id),
+                reason="inconsistent_destination_planes",
+            )
             return
         plane_widths.append(int(plane.numel()) // slot_capacity)
     selected_snapshot = selected_tokens.detach().reshape(-1)[:2].clone()
@@ -528,6 +589,14 @@ def register_group0_source_probe(
         _GROUP0_SOURCE_PROBES.move_to_end(key)
         while len(_GROUP0_SOURCE_PROBES) > MAX_TRACKED_REQUEST_LAYERS:
             _GROUP0_SOURCE_PROBES.popitem(last=False)
+    _content_log(
+        "group0_source_probe_registered",
+        req_id=probe.req_id,
+        layer_id=probe.layer_id,
+        source_chunk_count=len(probe.source_chunks),
+        total_tokens=probe.total_tokens,
+        selected_shape=list(selected_tokens.shape),
+    )
 
 
 def _take_group0_source_probes(

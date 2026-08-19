@@ -2767,6 +2767,89 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
         generator.close()
 
 
+def test_prepared_sparse_group0_registers_request_source_probe(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.lmcache_chunk_size = 4
+    connector.kv_device = torch.device("cpu")
+    connector._group_layouts = {
+        0: SimpleNamespace(
+            k_hidden_dims=2,
+            v_hidden_dims=1,
+            dsa_hidden_dims=0,
+            kv_format=SimpleNamespace(value=0),
+            vllm_two_major=False,
+            kv_device=torch.device("cpu"),
+        )
+    }
+    connector._layerwise_token_major = lambda _group: False
+    connector._sparse_lmc_host_interleaved = lambda _group: False
+    connector._get_or_create_sparse_destination_plan = lambda **_kwargs: object()
+    connector._run_prepared_sparse_direct_kv_transfer_layer = (
+        lambda **_kwargs: None
+    )
+
+    source_tensor = torch.arange(12, dtype=torch.bfloat16)
+    source_layer = PreparedSparseSourceLayer(
+        tensors=(source_tensor,),
+        chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+    )
+    source = PreparedSparseSource(
+        layers=(source_layer,),
+        total_tokens=4,
+        chunk_token_counts=(4,),
+    )
+    layer_cache = (
+        torch.zeros((1, 4, 1, 2), dtype=torch.bfloat16),
+        torch.zeros((1, 4, 1, 1), dtype=torch.bfloat16),
+    )
+    probe_calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "npu_content_diagnostics_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "register_group0_source_probe",
+        lambda **kwargs: probe_calls.append(kwargs),
+    )
+
+    generator = connector.batched_to_gpu_head_token_wise(
+        prepared_sparse_source=source,
+        kvcaches=[layer_cache],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+        req_id="request-1",
+        lmcache_cached_tokens=4,
+    )
+    next(generator)
+    selected = torch.tensor([[0, 2]], dtype=torch.int32)
+    selected_count = torch.tensor([2], dtype=torch.int32)
+    generator.send(
+        {
+            "selected_token_ids": selected,
+            "target_slot_mapping": torch.tensor([[8, 9]], dtype=torch.long),
+            "selected_token_counts": selected_count,
+        }
+    )
+
+    assert len(probe_calls) == 1
+    probe = probe_calls[0]
+    assert probe["req_id"] == "request-1"
+    assert probe["layer_id"] == 0
+    assert len(probe["source_chunks"]) == 1
+    assert probe["source_chunks"][0] is source_tensor
+    assert torch.equal(probe["selected_tokens"], selected)
+    assert torch.equal(probe["selected_count"], selected_count)
+    assert probe["total_tokens"] == 4
+    assert probe["layer_cache"] is layer_cache
+    generator.close()
+
+
 def test_prepared_sparse_rejects_nonstandard_chunk_coverage() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.lmcache_chunk_size = 4

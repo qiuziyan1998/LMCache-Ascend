@@ -546,8 +546,13 @@ def test_staged_graph_snapshot_compares_group0_local_cpu_source_after_join(
     )
 
     assert [event for event, _ in events] == [
-        "content_diagnostics_enabled"
+        "content_diagnostics_enabled",
+        "group0_source_probe_registered",
     ]
+    registered = events[-1][1]
+    assert registered["req_id"] == "request"
+    assert registered["layer_id"] == 0
+    assert registered["total_tokens"] == 4
     diagnostics.flush_deferred_diagnostics()
 
     fields = next(
@@ -564,6 +569,39 @@ def test_staged_graph_snapshot_compares_group0_local_cpu_source_after_join(
     assert source_summaries["retrieved_pe_sample"][
         "matches_destination"
     ] is True
+
+
+def test_group0_source_probe_reports_missing_request_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    diagnostics.configure_npu_content_diagnostics(True)
+
+    diagnostics.register_group0_source_probe(
+        req_id=None,
+        layer_id=0,
+        num_layers=2,
+        source_chunks=(torch.zeros(4, dtype=torch.bfloat16),),
+        selected_tokens=torch.tensor([0], dtype=torch.int32),
+        selected_count=torch.tensor([1], dtype=torch.int32),
+        chunk_size=1,
+        total_tokens=1,
+        token_major=False,
+        layer_cache=(torch.zeros((1, 1, 4), dtype=torch.bfloat16),),
+    )
+
+    event, fields = events[-1]
+    assert event == "group0_source_probe_error"
+    assert fields == {
+        "req_id": None,
+        "layer_id": 0,
+        "reason": "missing_req_id",
+    }
 
 
 def test_attention_diagnostic_metadata_error_is_nonfatal(
