@@ -4662,17 +4662,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 seen=deep_seen,
             )
 
-            self._run_prepared_sparse_direct_kv_transfer_layer(
-                plan=destination_plan,
-                chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
-                layer_id=layer_id,
-                slot_mapping_packed=slot_mapping_packed,
-                selected_token_idx=selected_token_idx,
-                chunk_size=chunk_size,
-                total_tokens=source.total_tokens,
-                sparse_host_interleaved=sparse_host_interleaved,
-                selected_token_counts=selected_token_counts,
-            )
             if content_diag_enabled and layer_id in (0, self.num_layers // 2):
                 diagnostic_source_tensors = list(source_layer.tensors)
                 for memory_obj in (
@@ -4695,6 +4684,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     token_major=self._layerwise_token_major(kv_group),
                     layer_cache=kvcaches_snapshot[layer_id],
                 )
+            self._run_prepared_sparse_direct_kv_transfer_layer(
+                plan=destination_plan,
+                chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
+                layer_id=layer_id,
+                slot_mapping_packed=slot_mapping_packed,
+                selected_token_idx=selected_token_idx,
+                chunk_size=chunk_size,
+                total_tokens=source.total_tokens,
+                sparse_host_interleaved=sparse_host_interleaved,
+                selected_token_counts=selected_token_counts,
+            )
             if capture_content and layer_id == 0:
                 source_tensors = list(source_layer.tensors)
                 for memory_obj in (

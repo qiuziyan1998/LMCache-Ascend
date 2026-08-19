@@ -2787,8 +2787,9 @@ def test_prepared_sparse_group0_registers_request_source_probe(
     connector._layerwise_token_major = lambda _group: False
     connector._sparse_lmc_host_interleaved = lambda _group: False
     connector._get_or_create_sparse_destination_plan = lambda **_kwargs: object()
+    operation_order = []
     connector._run_prepared_sparse_direct_kv_transfer_layer = (
-        lambda **_kwargs: None
+        lambda **_kwargs: operation_order.append("transfer")
     )
 
     source_tensor = torch.arange(12, dtype=torch.bfloat16)
@@ -2806,6 +2807,11 @@ def test_prepared_sparse_group0_registers_request_source_probe(
         torch.zeros((1, 4, 1, 1), dtype=torch.bfloat16),
     )
     probe_calls = []
+
+    def register_probe(**kwargs):
+        operation_order.append("probe")
+        probe_calls.append(kwargs)
+
     monkeypatch.setattr(
         npu_connectors,
         "npu_content_diagnostics_enabled",
@@ -2814,7 +2820,7 @@ def test_prepared_sparse_group0_registers_request_source_probe(
     monkeypatch.setattr(
         npu_connectors,
         "register_group0_source_probe",
-        lambda **kwargs: probe_calls.append(kwargs),
+        register_probe,
     )
 
     generator = connector.batched_to_gpu_head_token_wise(
@@ -2847,6 +2853,7 @@ def test_prepared_sparse_group0_registers_request_source_probe(
     assert torch.equal(probe["selected_count"], selected_count)
     assert probe["total_tokens"] == 4
     assert probe["layer_cache"] is layer_cache
+    assert operation_order == ["probe", "transfer"]
     generator.close()
 
 
