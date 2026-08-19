@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Third Party
+from typing import Any, Optional
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
@@ -42,5 +44,20 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             and getattr(config, "dsa_two_groups", False)
         )
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole) -> None:
-        super().__init__(vllm_config=vllm_config, role=role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional[Any] = None,
+    ) -> None:
+        # DSA replay P1: forward the third constructor argument to the parent
+        # Dynamic connector, which already implements the v0.23 3-arg
+        # compatibility layer (passes kv_cache_config to KVConnectorBase_V1
+        # when provided). The 2-arg override here previously shadowed the
+        # parent's signature and tripped the v0.23 factory's
+        # supports_kw(kv_cache_config) hard check.
+        super().__init__(
+            vllm_config=vllm_config,
+            role=role,
+            kv_cache_config=kv_cache_config,
+        )
