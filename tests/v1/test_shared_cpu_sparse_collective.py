@@ -19,6 +19,7 @@ from lmcache.v1.cache_engine import (
 from lmcache.v1.memory_management import LayerPageMemoryObj, LayerPageSource
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch, SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
+import lmcache.v1.cache_engine as core_cache_engine
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
@@ -465,6 +466,114 @@ def test_partial_legacy_state_does_not_hide_remote_layer_page(monkeypatch) -> No
 
     assert page_chunks == 1
     assert resolved == [[page], [page]]
+
+
+def test_remote_fill_exact_page_plan_does_not_reselect_local(monkeypatch) -> None:
+    class _Page:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.num_layers = 2
+            self.is_pinned = False
+            self.unpin_count = 0
+            self.release_count = 0
+
+        @classmethod
+        def pin_many(cls, pages) -> bool:
+            for page in pages:
+                page.is_pinned = True
+            return True
+
+        def get_shape(self):
+            return torch.Size([4, 4])
+
+        def unpin(self) -> None:
+            self.is_pinned = False
+            self.unpin_count += 1
+
+        def ref_count_down(self) -> None:
+            self.release_count += 1
+
+    monkeypatch.setattr(core_cache_engine, "LayerPageMemoryObj", _Page)
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    local_page = _Page("isolated-local")
+    remote_page = _Page("paired-remote")
+    local_calls = []
+    remote_calls = []
+    local = SimpleNamespace(
+        batched_get_layer_page_prefix=lambda keys: (
+            local_calls.append(list(keys)) or [local_page],
+            1,
+        )
+    )
+    remote = SimpleNamespace(
+        batched_get_layer_pages=lambda keys: (
+            remote_calls.append(list(keys)) or [remote_page]
+        )
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine.storage_manager = SimpleNamespace(
+        storage_backends={"RemoteBackend": remote}
+    )
+    engine._shared_local_cpu_backend = lambda: local
+    engine._expected_shared_cpu_chunk_metadata = (
+        lambda **_kwargs: (torch.Size([4, 4]), torch.float16, None)
+    )
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    resolved, page_chunks = engine._resolve_shared_rank0_layer_pages(
+        req_id="request",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[
+            [key.get_layer(0)],
+            [key.get_layer(1)],
+        ],
+        page_chunks=1,
+        base_page_keys=[key],
+        exact_chunk_locations=["RemoteBackend"],
+    )
+
+    assert resolved == [[remote_page], [remote_page]]
+    assert page_chunks == 1
+    assert local_calls == []
+    assert remote_calls == [[key]]
+    assert remote_page.is_pinned
+
+
+def test_remote_fill_exact_legacy_plan_does_not_reselect_local() -> None:
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16).get_layer(0)
+    remote_obj = _FakeClaimableMemObj()
+    local = SimpleNamespace(
+        get_blocking=lambda _key: pytest.fail(
+            "an exact remote plan must not probe LocalCPU"
+        )
+    )
+    fetches = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.storage_manager = SimpleNamespace(
+        batched_get=lambda keys, location=None: (
+            fetches.append((list(keys), location)) or [remote_obj]
+        )
+    )
+    engine._shared_local_cpu_backend = lambda: local
+    engine._is_rank0_shared_mem_obj = lambda obj: obj is remote_obj
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    resolved = engine._resolve_shared_rank0_layer_mem_objs(
+        req_id="request",
+        phase="dense_prefix",
+        layer_id=0,
+        kv_group=0,
+        keys_layer=[key],
+        chunk_locations=["RemoteBackend"],
+        enforce_planned_location=True,
+    )
+
+    assert resolved == [remote_obj]
+    assert fetches == [([key], "RemoteBackend")]
+    assert remote_obj.pin_count == 1
 
 
 def test_live_import_admission_transfers_temporary_page_ownership() -> None:

@@ -1869,6 +1869,7 @@ def test_direct_prefill_uses_window_relative_save_mappings() -> None:
     }
     assert calls[0][1]["slot_mapping_base"] == 256
     assert calls[0][1]["verified_prefix_end"] == 0
+    assert calls[0][1]["accepted_store_end"] == 512
 
     request.load_spec = SimpleNamespace(lmcache_cached_tokens=256)
     _ascend_adapter_method("_submit_direct_prefill_requests")(
@@ -3034,6 +3035,266 @@ def test_live_source_is_published_to_following_connector(monkeypatch) -> None:
     assert request.kv_transfer_params["ascend_live_split_source_v1"] == {
         "descriptors": [descriptor]
     }
+
+
+def test_remote_fill_terminal_is_returned_without_private_capabilities(
+    monkeypatch,
+) -> None:
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "request_finished",
+        lambda *_args: (False, {"first_tok": 7}),
+    )
+    terminal = {
+        "transfer_id": "transfer",
+        "outcome": "LOCAL_FULL",
+        "persistent_common_end": 4096,
+        "required_store_end": 4096,
+    }
+    adapter = _ascend_adapter_fake(
+        _scheduler_live_sources={},
+        _scheduler_remote_fill_results={"request": terminal},
+        _vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=8,
+                data_parallel_index=1,
+            )
+        ),
+        store_async=True,
+        kv_role="kv_producer",
+    )
+    request = SimpleNamespace(
+        request_id="request",
+        kv_transfer_params={
+            "do_remote_decode": True,
+            "remote_engine_id": "decoder",
+            "lmcache.remote_fill": {
+                "transfer_id": "transfer",
+                "request_attempt": 1,
+                "source_engine_id": "prefiller",
+                "destination_engine_id": "decoder",
+                "destination_engine_epoch": 2,
+                "control_endpoint": "tcp://private:19001",
+                "destination_dp_rank": 1,
+                "shared_cache_generation": 3,
+                "destination_tp_size": 8,
+                "destination_dp_size": 2,
+                "global_te_push": True,
+                "token_hash_algorithm": "sha256",
+                "python_hash_seed": "",
+                "capability_mac": "must-not-leak",
+                "destination_ptr": 1234,
+            },
+        },
+    )
+
+    delay_free, returned = _ascend_adapter_method("request_finished")(
+        adapter, request, []
+    )
+
+    assert delay_free is True
+    assert returned["first_tok"] == 7
+    assert returned["do_remote_decode"] is True
+    assert returned["remote_engine_id"] == "decoder"
+    public = returned["lmcache.remote_fill"]
+    assert public["terminal"] == terminal
+    assert "control_endpoint" not in public
+    assert "capability_mac" not in public
+    assert "destination_ptr" not in public
+
+
+def _adapter_remote_fill_request_configs() -> dict:
+    return {
+        "lmcache.remote_fill": {
+            "transfer_id": "transfer",
+            "request_attempt": 1,
+            "source_engine_id": "prefiller",
+            "destination_engine_id": "decoder",
+            "destination_engine_epoch": 7,
+            "control_endpoint": "tcp://decoder:19001",
+            "destination_dp_rank": 0,
+            "shared_cache_generation": 3,
+            "destination_tp_size": 8,
+            "destination_dp_size": 1,
+            "global_te_push": True,
+            "token_hash_algorithm": "sha256",
+            "python_hash_seed": "",
+        }
+    }
+
+
+def test_remote_fill_persistence_uses_prefiller_local_default(monkeypatch) -> None:
+    from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
+
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        _prepare_remote_fill_persistent_placement,
+    )
+    monkeypatch.setenv(
+        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
+        DIRECT_PUSH_H0_QUALIFICATION_V1,
+    )
+    request_configs = _adapter_remote_fill_request_configs()
+    request_configs["lmcache.mooncake_preferred_segment"] = "decoder-host"
+
+    assert _prepare_remote_fill_persistent_placement(request_configs) is True
+    assert "lmcache.mooncake_preferred_segment" not in request_configs
+
+    ordinary = {"lmcache.mooncake_preferred_segment": "decoder-host"}
+    assert _prepare_remote_fill_persistent_placement(ordinary) is False
+    assert ordinary["lmcache.mooncake_preferred_segment"] == "decoder-host"
+
+
+def test_remote_fill_h0_off_preserves_legacy_placement_and_group_selection(
+    monkeypatch,
+) -> None:
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        _prepare_remote_fill_persistent_placement,
+    )
+
+    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
+    request_configs = _adapter_remote_fill_request_configs()
+    request_configs["lmcache.remote_fill"]["transfer_id"] = "stale-transfer"
+    request_configs["lmcache.mooncake_preferred_segment"] = (
+        "legacy-decoder-host"
+    )
+    adapter = _ascend_adapter_fake(_remote_store_requested=True)
+    request = SimpleNamespace(
+        request_configs=request_configs,
+        save_spec=SimpleNamespace(
+            can_save_latent=False,
+            can_save_indexer=False,
+        ),
+    )
+
+    assert _prepare_remote_fill_persistent_placement(request_configs) is False
+    assert (
+        request_configs["lmcache.mooncake_preferred_segment"]
+        == "legacy-decoder-host"
+    )
+    assert _ascend_adapter_method("_direct_selected_groups")(
+        adapter,
+        request,
+        {0: ["latent"], 1: ["indexer"]},
+    ) == {}
+
+
+def test_remote_fill_h0_off_stale_handoff_does_not_disable_live_source(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    calls = []
+    engine = SimpleNamespace(
+        discard_live_source_descriptor=lambda *_args: pytest.fail(
+            "an unqualified remote-fill hint must not disable legacy live source"
+        ),
+        begin_live_source_descriptor=lambda *args: calls.append(("begin", args)),
+        capture_live_source_step=lambda *args: calls.append(("capture", args)),
+        finalize_live_source_descriptor=lambda *args: (
+            calls.append(("finalize", args)) or True
+        ),
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            ("store", args, kwargs)
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _remote_store_requested=True,
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["latent"], 1: ["indexer"]},
+            {0: "latent-slots", 1: "indexer-slots"},
+            0,
+        ),
+    )
+    request_configs = _adapter_remote_fill_request_configs()
+    request_configs["lmcache.mooncake_preferred_segment"] = "legacy-decoder"
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2, 3],
+        slot_mapping=["latent-slots"],
+        indexer_slot_mapping=["indexer-slots"],
+        save_slot_mapping_base=0,
+        save_spec=None,
+        load_spec=None,
+        request_configs=request_configs,
+        live_source_requested=True,
+        is_last_prefill=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter,
+        [request],
+        source_ready_event=object(),
+    )
+
+    assert [item[0] for item in calls] == [
+        "begin",
+        "capture",
+        "finalize",
+        "store",
+    ]
+    assert calls[-1][2]["final"] is True
+    assert request_configs["lmcache.mooncake_preferred_segment"] == (
+        "legacy-decoder"
+    )
+
+
+def test_remote_fill_selects_both_authoritative_groups(monkeypatch) -> None:
+    from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
+
+    monkeypatch.setenv(
+        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
+        DIRECT_PUSH_H0_QUALIFICATION_V1,
+    )
+    adapter = _ascend_adapter_fake(_remote_store_requested=True)
+    request = SimpleNamespace(
+        request_configs=_adapter_remote_fill_request_configs(),
+        save_spec=SimpleNamespace(
+            can_save_latent=False,
+            can_save_indexer=False,
+        ),
+    )
+    groups = {0: ["latent"], 1: ["indexer"]}
+
+    selected = _ascend_adapter_method("_direct_selected_groups")(
+        adapter, request, groups
+    )
+
+    assert selected == groups
+
+
+def test_remote_fill_rebuilds_probe_keys_for_full_prefix_hit() -> None:
+    class _TokenDatabase:
+        def process_tokens(self, **kwargs):
+            group = kwargs["kv_group"]
+            if group == 0:
+                assert len(kwargs["tokens"]) == 1024
+            else:
+                assert kwargs["hashes"] == [91]
+                assert kwargs["offsets"] == [1024]
+            return [(0, 1024, SimpleNamespace(chunk_hash=91, kv_group=group))]
+
+    engine = SimpleNamespace(token_database=_TokenDatabase())
+    plans = AscendLMCacheEngine._remote_fill_prefix_plans(
+        engine,
+        list(range(1024)),
+        {"lmcache.remote_fill": {"transfer_id": "transfer"}},
+        1024,
+    )
+
+    assert set(plans) == {0, 1}
+    assert plans[0][0][:2] == (0, 1024)
+    assert plans[1][0][:2] == (0, 1024)
 
 
 def test_failed_direct_preflight_uses_overlapped_layerwise_store(monkeypatch) -> None:

@@ -32,6 +32,8 @@ from lmcache_ascend.v1.content_diagnostics import (
     log_npu_content_diagnostic_event,
     npu_content_diagnostics_enabled,
 )
+from lmcache_ascend.v1.remote_fill import remote_fill_h0_qualified
+from lmcache_ascend.v1.remote_fill_producer import parse_remote_fill_handoff
 
 if TYPE_CHECKING:
     # Third Party
@@ -40,11 +42,101 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _MOONCAKE_PREFERRED_SEGMENT_CONFIG = "lmcache.mooncake_preferred_segment"
+_REMOTE_FILL_ROUTING_KEYS = (
+    "do_remote_decode",
+    "do_remote_prefill",
+    "last_token_id",
+    "live_split_capabilities",
+    "live_split_transfer_id",
+    "num_prompt_blocks",
+    "remote_block_ids",
+    "remote_dcp_size",
+    "remote_dp_rank",
+    "remote_engine_id",
+    "remote_host",
+    "remote_multi_nodes_meta_mapping",
+    "remote_pcp_size",
+    "remote_port",
+    "remote_ptp_size",
+    "remote_request_id",
+)
+_REMOTE_FILL_PUBLIC_HANDOFF_KEYS = (
+    "transfer_id",
+    "request_attempt",
+    "source_engine_id",
+    "destination_engine_id",
+    "destination_engine_epoch",
+    "destination_dp_rank",
+    "shared_cache_generation",
+    "destination_tp_size",
+    "destination_dp_size",
+    "global_te_push",
+    "token_hash_algorithm",
+    "python_hash_seed",
+)
+
+
+def _remote_fill_response_params(
+    params: Mapping[str, Any],
+    terminal: Mapping[str, str | int],
+    base: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the pointer-free producer response returned through vLLM."""
+
+    result = dict(base or {})
+    for key in _REMOTE_FILL_ROUTING_KEYS:
+        if key in params:
+            result[key] = params[key]
+    raw_handoff = params.get("lmcache.remote_fill")
+    public_handoff: dict[str, Any] = {}
+    if isinstance(raw_handoff, Mapping):
+        for key in _REMOTE_FILL_PUBLIC_HANDOFF_KEYS:
+            if key in raw_handoff:
+                public_handoff[key] = raw_handoff[key]
+    public_handoff["terminal"] = dict(terminal)
+    result["lmcache.remote_fill"] = public_handoff
+    return result
+
+
+def _remote_fill_handoff_qualified(request_configs: Any) -> bool:
+    """Return whether this request may activate direct remote fill."""
+    if not remote_fill_h0_qualified():
+        return False
+    try:
+        handoff = parse_remote_fill_handoff(request_configs)
+    except ValueError:
+        return False
+    return bool(handoff is not None and handoff.global_te_push)
+
+
+def _remote_fill_request_qualified(request: Any) -> bool:
+    """Cache handoff qualification on one worker request metadata object."""
+
+    cached = getattr(request, "_lmcache_remote_fill_qualified", None)
+    if cached is None:
+        cached = _remote_fill_handoff_qualified(request.request_configs)
+        request._lmcache_remote_fill_qualified = cached
+    return bool(cached)
+
+
+def _prepare_remote_fill_persistent_placement(
+    request_configs: Any,
+) -> bool:
+    """Select the validated prefiller-local Mooncake default for persistence."""
+
+    if not _remote_fill_handoff_qualified(request_configs):
+        return False
+    assert isinstance(request_configs, dict)
+    request_configs.pop(_MOONCAKE_PREFERRED_SEGMENT_CONFIG, None)
+    return True
 
 
 @dataclass
 class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
     descriptors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    remote_fill_results: dict[str, dict[str, str | int]] = field(
+        default_factory=dict
+    )
 
     def aggregate(
         self, other: KVConnectorWorkerMetadata
@@ -54,7 +146,15 @@ class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
         merged = {req_id: list(items) for req_id, items in self.descriptors.items()}
         for req_id, items in other.descriptors.items():
             merged.setdefault(req_id, []).extend(items)
-        return LiveSourceWorkerMetadata(merged)
+        results = dict(self.remote_fill_results)
+        for req_id, result in other.remote_fill_results.items():
+            existing = results.get(req_id)
+            if existing is not None and existing != result:
+                raise ValueError(
+                    "Tensor-parallel ranks reported different remote-fill outcomes"
+                )
+            results[req_id] = dict(result)
+        return LiveSourceWorkerMetadata(merged, results)
 
 
 @dataclass(slots=True)
@@ -84,10 +184,18 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         self.store_async = self.config.store_async
         get_extra = getattr(self.config, "get_extra_config_value", None)
+        self._remote_store_requested = bool(
+            getattr(self.config, "enable_remote_lmcache_store", False)
+            and getattr(self.config, "pd_role", None) != "receiver"
+            and remote_fill_h0_qualified()
+        )
         self._direct_store_requested = bool(
-            get_extra("mooncake_direct_npu_prefill_store", False)
-            if callable(get_extra)
-            else False
+            self._remote_store_requested
+            or (
+                get_extra("mooncake_direct_npu_prefill_store", False)
+                if callable(get_extra)
+                else False
+            )
         )
         # The provider must not self-activate the hybrid wire format.  A new
         # LMCache provider can be paired with an older vLLM/Mooncake consumer;
@@ -101,6 +209,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             tuple[str, int], LayerwiseStoreResult
         ] = {}
         self._scheduler_live_sources: dict[str, list[dict[str, Any]]] = {}
+        self._scheduler_remote_fill_results: dict[
+            str, dict[str, str | int]
+        ] = {}
         self._unfenced_live_stores: dict[str, ReqMeta] = {}
         self._latest_live_source_ready_event: Any = None
         self._latest_live_source_ready_event_source = "missing"
@@ -114,7 +225,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 and self.config.store_async_max_queue_size == 2
                 and str(self.config.remote_url).startswith("mooncakestore://")
                 and self.use_layerwise
-                and self.config.enable_shared_cpu_cache
+                and (
+                    self._remote_store_requested
+                    or self.config.enable_shared_cpu_cache
+                )
                 and extra.get("mooncake_page_first_multi_buffer", False)
                 and extra.get("mooncake_layer_merged_page_objects", False)
                 and extra.get("save_only_first_rank", False)
@@ -124,9 +238,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if not valid:
                 raise ValueError(
                     "mooncake_direct_npu_prefill_store requires store_async=true, "
-                    "store_async_max_queue_size=2, shared layerwise merged Mooncake "
-                    "pages, save_only_first_rank, use_ascend_direct, and "
+                    "store_async_max_queue_size=2, layerwise merged Mooncake pages, "
+                    "save_only_first_rank, use_ascend_direct, and "
                     "save_chunk_meta=false"
+                )
+            if self._remote_store_requested and not extra.get(
+                "mooncake_prefer_local_alloc", False
+            ):
+                raise ValueError(
+                    "direct remote LMCache store requires "
+                    "mooncake_prefer_local_alloc=true so mandatory persistence "
+                    "uses the prefiller-local Mooncake segment"
                 )
         if (
             role != KVConnectorRole.SCHEDULER
@@ -410,6 +532,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if requests is None:
             super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
             return
+        if self._remote_store_requested:
+            for request in requests:
+                if _remote_fill_request_qualified(request):
+                    request.request_configs.pop(
+                        _MOONCAKE_PREFERRED_SEGMENT_CONFIG, None
+                    )
         expected = set(self._latent_layer_names)
         if self.config.dsa_two_groups:
             expected.update(self._indexer_layer_names)
@@ -462,6 +590,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self, request: ReqMeta, group_caches: dict[int, list]
     ) -> dict[int, list]:
         selected = dict(group_caches)
+        if (
+            getattr(self, "_remote_store_requested", False)
+            and _remote_fill_request_qualified(request)
+        ):
+            # Persistent SaveSpec flags describe which immutable pages still
+            # need Mooncake puts.  The direct destination has an independent
+            # LocalCPU prefix, so it needs both authoritative source groups;
+            # the engine's persistent existence probe still suppresses
+            # duplicate Mooncake writes.
+            return selected
         save_spec = request.save_spec
         if save_spec is not None and self.config.dsa_two_groups:
             if not save_spec.can_save_latent:
@@ -584,6 +722,20 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 and int(getattr(parallel, "prefill_context_parallel_size", 1)) == 1
                 and int(getattr(parallel, "decode_context_parallel_size", 1)) == 1
             )
+            remote_fill_request = bool(
+                self._remote_store_requested
+                and _remote_fill_request_qualified(request)
+            )
+            if remote_fill_request:
+                # Mandatory persistence is independent of decoder placement.
+                # Removing an old decoder hint makes Mooncake use the startup-
+                # validated prefiller-local default. Direct LocalCPU fill also
+                # supersedes the legacy live NPU source for this request.
+                request.request_configs.pop(
+                    _MOONCAKE_PREFERRED_SEGMENT_CONFIG, None
+                )
+                live_source = False
+                self.lmcache_engine.discard_live_source_descriptor(request.req_id)
             if live_source and not topology_supported:
                 logger.warning(
                     "Live split disabled for %s: PP/PCP/DCP must all equal 1",
@@ -712,6 +864,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     and (not finalized_live or fence_preferred_group0),
                     slot_mapping_base=mapping_base,
                     verified_prefix_end=verified_prefix_end,
+                    # ReqMeta.token_ids is the scheduler-accepted store range
+                    # after chunked-prefill and final-token policy.
+                    accepted_store_end=len(request.token_ids),
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
                 )
@@ -728,6 +883,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return None
         self._fence_live_source_descriptors()
         descriptors = self.lmcache_engine.drain_live_source_descriptors()
+        remote_fill_results = (
+            self.lmcache_engine.drain_remote_fill_terminal_results()
+        )
         for req_id, descriptor in descriptors.items():
             cold_start_perf_log(
                 logger,
@@ -752,9 +910,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
         return (
             LiveSourceWorkerMetadata(
-                {req_id: [descriptor] for req_id, descriptor in descriptors.items()}
+                {req_id: [descriptor] for req_id, descriptor in descriptors.items()},
+                remote_fill_results,
             )
-            if descriptors
+            if descriptors or remote_fill_results
             else None
         )
 
@@ -791,12 +950,24 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 if not tracked:
                     continue
                 self._scheduler_live_sources[req_id] = list(descriptors)
+            for req_id, result in metadata.remote_fill_results.items():
+                if req_id in self._unfinished_requests:
+                    results = getattr(
+                        self, "_scheduler_remote_fill_results", None
+                    )
+                    if results is None:
+                        results = {}
+                        self._scheduler_remote_fill_results = results
+                    results[req_id] = dict(result)
 
     def update_state_after_alloc(
         self, request: "Request", num_external_tokens: int, blocks: Any = None
     ) -> None:
         if request.request_id not in self._unfinished_requests:
             self._scheduler_live_sources.pop(request.request_id, None)
+            getattr(self, "_scheduler_remote_fill_results", {}).pop(
+                request.request_id, None
+            )
         super().update_state_after_alloc(request, num_external_tokens, blocks)
 
     def _effective_skip_leading_tokens(
@@ -958,6 +1129,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                             request.request_configs,
                             final=True,
                             slot_mapping_base=mapping_base,
+                            accepted_store_end=len(request.token_ids),
                         )
                     except Exception as error:
                         self._handle_save_request_error(request, error)
@@ -1032,7 +1204,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
             preempted_req_ids
         )
+        self.lmcache_engine.wait_for_direct_stores(preempted_req_ids)
         for req_id in preempted_req_ids:
+            getattr(self, "_scheduler_remote_fill_results", {}).pop(
+                req_id, None
+            )
             self._unfenced_live_stores.pop(req_id, None)
             fences = getattr(self, "_live_source_ready_fences", None)
             if fences is not None:
@@ -1056,7 +1232,39 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         _, return_params = super().request_finished(request, block_ids)
         descriptors = self._scheduler_live_sources.pop(request.request_id, None)
+        remote_fill_result = getattr(
+            self, "_scheduler_remote_fill_results", {}
+        ).pop(request.request_id, None)
         params = getattr(request, "kv_transfer_params", None)
+        if remote_fill_result is not None and isinstance(params, dict):
+            handoff = params.get("lmcache.remote_fill")
+            if (
+                isinstance(handoff, dict)
+                and handoff.get("transfer_id")
+                == remote_fill_result.get("transfer_id")
+            ):
+                handoff["terminal"] = dict(remote_fill_result)
+                return_params = _remote_fill_response_params(
+                    params, remote_fill_result, return_params
+                )
+                cold_start_perf_log(
+                    logger,
+                    "remote_fill_scheduler_attach",
+                    req_id=request.request_id,
+                    outcome=remote_fill_result.get("outcome"),
+                    persistent_common_end=remote_fill_result.get(
+                        "persistent_common_end"
+                    ),
+                    required_store_end=remote_fill_result.get(
+                        "required_store_end"
+                    ),
+                )
+            else:
+                logger.warning(
+                    "Remote-fill result identity mismatch for request %s; "
+                    "leaving direct destination unpublished",
+                    request.request_id,
+                )
         if descriptors:
             parallel = self._vllm_config.parallel_config
             tp_size = int(parallel.tensor_parallel_size)

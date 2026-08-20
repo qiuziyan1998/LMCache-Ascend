@@ -7,12 +7,18 @@ LMCacheEngine for Ascend NPU.
 # Standard
 from bisect import bisect_right
 from collections import deque
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError, wait
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait,
+)
 from dataclasses import dataclass, field
 from weakref import WeakSet
 import json
 import os
 import queue
+import secrets
 import threading
 import time
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
@@ -49,14 +55,26 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
+    mooncake_payload_layout,
     mooncake_page_layout_enabled,
+)
+from lmcache.v1.remote_fill import ControlPage, ProtocolLimits
+from lmcache.v1.remote_fill.native import (
+    DIRECT_PUSH_H0_QUALIFICATION_V1,
+    DirectPushPageSource,
+    DirectPushSourcePlan,
+    NativeDirectPushActivation,
 )
 from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
     SharedHandleEnvelope,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
-from lmcache.v1.token_database import TokenDatabase
+from lmcache.v1.token_database import (
+    DSA_INDEX_CACHE_SCHEMA,
+    DSA_INDEX_CACHE_SCHEMA_TAG,
+    TokenDatabase,
+)
 import torch
 
 # First Party
@@ -64,6 +82,25 @@ from lmcache_ascend.v1.content_diagnostics import (
     fingerprint_compact_group1,
     log_npu_content_diagnostic_event,
     npu_content_diagnostics_enabled,
+)
+from lmcache_ascend.v1.remote_fill import (
+    RemoteFillDecoderLayout,
+    DecoderRemoteFillRuntime,
+    build_decoder_layout,
+    create_decoder_remote_fill_runtime,
+    remote_fill_h0_qualified,
+)
+from lmcache_ascend.v1.remote_fill_producer import (
+    REMOTE_FILL_H0_QUALIFICATION_ENV,
+    RemoteFillFatalError,
+    RemoteFillHandoff,
+    RemoteFillProducerMetrics,
+    RemoteFillProducerSession,
+    RemoteFillStaticSpec,
+    RemoteFillTerminalResult,
+    create_remote_fill_client,
+    load_remote_fill_hmac_secret,
+    parse_remote_fill_handoff,
 )
 
 logger = init_logger(__name__)
@@ -109,6 +146,7 @@ class _DirectStoreRequestState:
     committed_end: dict[int, int] = field(default_factory=dict)
     planned_end: int = 0
     planned_hash: int = 0
+    accepted_store_end: Optional[int] = None
     submitted_jobs: int = 0
     submitted_pages: int = 0
     submitted_legacy_objects: int = 0
@@ -118,6 +156,22 @@ class _DirectStoreRequestState:
     source_ready_event_source: str = "missing"
     source_ready_token_end: int = 0
     finalized: bool = False
+    remote_fill_handoff: Optional[RemoteFillHandoff] = None
+    remote_fill_session: Optional[RemoteFillProducerSession] = None
+    remote_fill_futures: deque[Future] = field(default_factory=deque)
+    remote_fill_last_future: Optional[Future] = None
+    remote_fill_next_window_id: int = 0
+    remote_fill_source_generation: int = 0
+    remote_fill_probe_end: int = 0
+    remote_fill_queued_bytes: int = 0
+    remote_fill_queued_windows: int = 0
+    remote_fill_terminal: Optional[RemoteFillTerminalResult] = None
+    remote_fill_disabled_reason: str = ""
+    remote_fill_metrics_started: bool = False
+    remote_fill_viable_counted: bool = False
+    remote_fill_active_counted: bool = False
+    remote_fill_submitted_bytes: int = 0
+    remote_fill_persistent_started_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -129,6 +183,7 @@ class _DirectPageBatch:
     owners: tuple[torch.Tensor, ...]
     ready_event: Any
     group_ends: dict[int, int]
+    ranges: tuple[tuple[int, int], ...] = ()
 
 
 
@@ -335,8 +390,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._require_store_completion = False
         self._direct_store_enabled = bool(
             self.is_store_async
-            and self.config.get_extra_config_value(
-                "mooncake_direct_npu_prefill_store", False
+            and self.config.pd_role != "receiver"
+            and (
+                self.config.get_extra_config_value(
+                    "mooncake_direct_npu_prefill_store", False
+                )
+                or bool(
+                    self.config.enable_remote_lmcache_store
+                    and remote_fill_h0_qualified()
+                )
             )
             and self._is_passive() is False
             and mooncake_layer_pages_enabled(self.config)
@@ -349,6 +411,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._direct_completed_futures: WeakSet[Future] = WeakSet()
         self._live_source_builders: dict[str, dict[str, Any]] = {}
         self._completed_live_sources: dict[str, dict[str, Any]] = {}
+        self._remote_fill_runtime: Optional[DecoderRemoteFillRuntime] = None
+        self._remote_fill_decoder_initialized = False
+        self._remote_fill_fatal_transfers: tuple[str, ...] = ()
+        self._remote_fill_fatal_lock = threading.Lock()
+        self._remote_fill_shared_group1_supported = metadata.world_size <= 1
         # Diagnostic tensor owners are retained only while the opt-in content
         # diagnostic is enabled.  Fingerprinting is deliberately deferred
         # until the adapter has fenced the producer event, so diagnostic host
@@ -392,6 +459,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def post_init(self, **kwargs) -> None:
         super().post_init(**kwargs)
+        self._initialize_decoder_remote_fill()
         if self.is_store_async and not self._direct_store_enabled:
             self._device_id = torch.npu.current_device()
             self._ensure_store_worker()
@@ -406,6 +474,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Direct NPU prefill store enabled: max_queue_size=%d",
                 self._store_queue_maxsize,
             )
+
+    def get_remote_fill_placement_info(self) -> dict[str, int | str | bool] | None:
+        """Return pointer-free decoder placement or ``None`` when unavailable."""
+
+        runtime = self._remote_fill_runtime
+        if runtime is None or not runtime.available or not self.is_healthy():
+            return None
+        return runtime.placement.to_dict()
+
+    def get_remote_fill_metrics(self) -> dict[str, int] | None:
+        """Return fixed-cardinality decoder metrics when remote fill is active."""
+
+        runtime = self._remote_fill_runtime
+        return None if runtime is None else runtime.metrics_snapshot()
+
+    def remote_fill_requires_paired_restart(self) -> bool:
+        """Return whether an armed remote fill made this process unsafe."""
+
+        return bool(self._remote_fill_fatal_transfers)
 
     def direct_prefill_store_enabled(self) -> bool:
         """Return whether this worker can use direct NPU page publication."""
@@ -439,6 +526,1009 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                 return False
         return True
+
+    def configure_remote_fill_producer(
+        self,
+        *,
+        client_factory: Optional[Callable[..., Any]] = None,
+        direct_submitter: Optional[Callable[..., Future]] = None,
+        activation_factory: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        """Inject producer boundaries for hardware-independent tests.
+
+        Args:
+            client_factory: Optional ``(handoff, limits) -> RemoteFillClient``
+                factory. Production uses the existing LMCache ZMQ transport.
+            direct_submitter: Optional armed native submission callable.
+                Production forwards to ``StorageManager``.
+            activation_factory: Optional armed-attempt activation builder.
+                Production requires the explicit H0 environment value.
+        """
+
+        if client_factory is not None:
+            self._remote_fill_client_factory = client_factory
+        if direct_submitter is not None:
+            self._remote_fill_direct_submitter = direct_submitter
+        if activation_factory is not None:
+            self._remote_fill_activation_factory = activation_factory
+
+    def close_remote_fill_producer(self) -> None:
+        """Drain producer work and close lazily created control resources."""
+
+        states = getattr(self, "_direct_store_states", {})
+        for state in states.values():
+            while state.remote_fill_futures:
+                state.remote_fill_futures.popleft().result()
+            if state.remote_fill_session is not None:
+                state.remote_fill_session.close()
+        executor = getattr(self, "_remote_fill_producer_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+            self._remote_fill_producer_executor = None
+
+    def drain_remote_fill_terminal_results(
+        self,
+    ) -> dict[str, dict[str, str | int]]:
+        """Drain sanitized completed outcomes for scheduler/proxy handoff."""
+
+        completed = getattr(self, "_completed_remote_fill_results", {})
+        self._completed_remote_fill_results = {}
+        return {
+            req_id: terminal.as_dict()
+            for req_id, terminal in completed.items()
+        }
+
+    def remote_fill_producer_metrics_snapshot(self) -> dict[str, Any]:
+        """Return enabled-path producer aggregates without request identities."""
+
+        metrics = getattr(self, "_remote_fill_producer_metrics", None)
+        return {} if metrics is None else metrics.snapshot()
+
+    def _get_remote_fill_producer_metrics(self) -> RemoteFillProducerMetrics:
+        metrics = getattr(self, "_remote_fill_producer_metrics", None)
+        if metrics is None:
+            metrics = RemoteFillProducerMetrics()
+            self._remote_fill_producer_metrics = metrics
+        return metrics
+
+    def _latch_remote_fill_producer_fatal(
+        self,
+        state: _DirectStoreRequestState,
+    ) -> None:
+        """Expose a producer-side armed ambiguity to the worker supervisor."""
+
+        handoff = state.remote_fill_handoff
+        if handoff is None:
+            raise RuntimeError("remote-fill fatal state lacks a transfer identity")
+        self._remote_fill_require_paired_restart((handoff.transfer_id,))
+
+    def _record_remote_fill_window_metrics(
+        self,
+        state: _DirectStoreRequestState,
+        result: Any,
+    ) -> None:
+        metrics = self._get_remote_fill_producer_metrics()
+        metrics.observe("reserve_seconds", float(result.reserve_seconds))
+        metrics.existing_pages(int(result.existing_pages))
+        submitted_bytes = int(result.submitted_bytes)
+        if submitted_bytes:
+            metrics.observe(
+                "source_event_wait_seconds",
+                float(result.source_event_wait_seconds),
+            )
+            metrics.observe("native_seconds", float(result.native_seconds))
+            metrics.add_bytes("submitted_bytes", submitted_bytes)
+            state.remote_fill_submitted_bytes += submitted_bytes
+        if not result.direct_satisfied:
+            allocation = result.reason in (
+                "direct destination hole",
+                "reservation rejected",
+                "producer backpressure",
+            )
+            metrics.abandon(result.reason, allocation=allocation)
+            if result.armed or result.reason == "native transfer failed":
+                metrics.failure(result.reason)
+            cold_start_perf_log(
+                logger,
+                "remote_fill_direct_abandoned",
+                reason=result.reason,
+                armed=bool(result.armed),
+                fatal_restart_required=bool(result.fatal_restart_required),
+            )
+
+    def _remote_fill_prepare_request(
+        self,
+        req_id: str,
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+    ) -> bool:
+        if not bool(getattr(self.config, "enable_remote_lmcache_store", False)):
+            return False
+        if state.remote_fill_handoff is not None:
+            return not state.remote_fill_disabled_reason
+        try:
+            handoff = parse_remote_fill_handoff(request_configs)
+        except ValueError as error:
+            state.remote_fill_disabled_reason = type(error).__name__
+            logger.warning(
+                "Remote fill disabled for request %s: malformed handoff", req_id
+            )
+            return False
+        if handoff is None:
+            state.remote_fill_disabled_reason = "missing_handoff"
+            return False
+        state.remote_fill_handoff = handoff
+        metrics = self._get_remote_fill_producer_metrics()
+        if not state.remote_fill_metrics_started:
+            metrics.start_attempt()
+            state.remote_fill_metrics_started = True
+        if (
+            not handoff.global_te_push
+            or os.environ.get(REMOTE_FILL_H0_QUALIFICATION_ENV, "")
+            != DIRECT_PUSH_H0_QUALIFICATION_V1
+        ):
+            state.remote_fill_disabled_reason = "native_not_qualified"
+            return False
+        if handoff.destination_dp_rank >= handoff.destination_dp_size:
+            state.remote_fill_disabled_reason = "invalid_dp_mapping"
+            return False
+        if handoff.destination_tp_size != int(self.metadata.world_size):
+            state.remote_fill_disabled_reason = "incompatible_tp_mapping"
+            return False
+        if not self._remote_fill_circuit_allows():
+            state.remote_fill_disabled_reason = "circuit_open"
+            return False
+        state.remote_fill_source_generation = secrets.randbits(63) or 1
+        metrics.add_gauge("direct_viable", 1)
+        state.remote_fill_viable_counted = True
+        cold_start_perf_log(
+            logger,
+            "remote_fill_producer_decision",
+            req_id=req_id,
+            enabled=True,
+            destination_dp_rank=handoff.destination_dp_rank,
+            destination_tp_size=handoff.destination_tp_size,
+        )
+        return True
+
+    def _remote_fill_circuit_allows(self) -> bool:
+        if not bool(self.config.remote_fill_circuit_breaker_enabled):
+            return True
+        lock = getattr(self, "_remote_fill_circuit_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._remote_fill_circuit_lock = lock
+        with lock:
+            now = time.monotonic()
+            open_until = float(
+                getattr(self, "_remote_fill_circuit_open_until", 0.0)
+            )
+            if now < open_until:
+                return False
+            if open_until:
+                self._remote_fill_circuit_open_until = 0.0
+                self._remote_fill_circuit_failures = 0
+                metrics = getattr(self, "_remote_fill_producer_metrics", None)
+                if metrics is not None:
+                    metrics.set_gauge("circuit_breaker_state", 0)
+            return True
+
+    def _remote_fill_record_failure(self) -> None:
+        if not bool(self.config.remote_fill_circuit_breaker_enabled):
+            return
+        lock = getattr(self, "_remote_fill_circuit_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._remote_fill_circuit_lock = lock
+        with lock:
+            failures = int(
+                getattr(self, "_remote_fill_circuit_failures", 0)
+            ) + 1
+            self._remote_fill_circuit_failures = failures
+            if failures >= int(
+                self.config.remote_fill_circuit_breaker_failure_threshold
+            ):
+                self._remote_fill_circuit_open_until = (
+                    time.monotonic()
+                    + float(self.config.remote_fill_circuit_breaker_cooldown_sec)
+                )
+                self._get_remote_fill_producer_metrics().set_gauge(
+                    "circuit_breaker_state", 1
+                )
+
+    def _remote_fill_record_success(self) -> None:
+        lock = getattr(self, "_remote_fill_circuit_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._remote_fill_circuit_failures = 0
+            self._remote_fill_circuit_open_until = 0.0
+            self._get_remote_fill_producer_metrics().set_gauge(
+                "circuit_breaker_state", 0
+            )
+
+    def _remote_fill_acquire_queue_capacity(
+        self,
+        state: _DirectStoreRequestState,
+        byte_count: int,
+    ) -> bool:
+        """Acquire bounded producer admission before retaining queued work."""
+
+        if byte_count < 0 or byte_count > int(
+            self.config.remote_fill_max_inflight_bytes
+        ):
+            return False
+        condition = getattr(self, "_remote_fill_queue_condition", None)
+        if condition is None:
+            condition = threading.Condition()
+            self._remote_fill_queue_condition = condition
+        with condition:
+            request_byte_limit = min(
+                int(self.config.remote_fill_max_bytes_per_request),
+                int(self.config.remote_fill_max_inflight_bytes)
+                * int(self.config.remote_fill_max_inflight_windows_per_request),
+            )
+            # Producer source retention is independent of the decoder's
+            # hidden LocalCPU reservation budget. Bound all requests by the
+            # dedicated producer inflight-byte cap.
+            global_byte_limit = int(self.config.remote_fill_max_inflight_bytes)
+            if byte_count > request_byte_limit:
+                return False
+            global_bytes = int(getattr(self, "_remote_fill_queued_bytes", 0))
+            if (
+                state.remote_fill_queued_windows
+                >= int(self.config.remote_fill_max_inflight_windows_per_request)
+                or state.remote_fill_queued_bytes + byte_count > request_byte_limit
+                or global_bytes + byte_count > global_byte_limit
+            ):
+                return False
+            state.remote_fill_queued_windows += 1
+            state.remote_fill_queued_bytes += byte_count
+            self._remote_fill_queued_bytes = global_bytes + byte_count
+            metrics = self._get_remote_fill_producer_metrics()
+            metrics.add_gauge("inflight_windows", 1)
+            metrics.add_gauge("inflight_bytes", byte_count)
+            return True
+
+    def _remote_fill_release_queue_capacity(
+        self,
+        state: _DirectStoreRequestState,
+        byte_count: int,
+    ) -> None:
+        condition = getattr(self, "_remote_fill_queue_condition", None)
+        if condition is None:
+            return
+        with condition:
+            state.remote_fill_queued_windows = max(
+                0, state.remote_fill_queued_windows - 1
+            )
+            state.remote_fill_queued_bytes = max(
+                0, state.remote_fill_queued_bytes - byte_count
+            )
+            self._remote_fill_queued_bytes = max(
+                0,
+                int(getattr(self, "_remote_fill_queued_bytes", 0)) - byte_count,
+            )
+            metrics = self._get_remote_fill_producer_metrics()
+            metrics.add_gauge("inflight_windows", -1)
+            metrics.add_gauge("inflight_bytes", -byte_count)
+
+    def _remote_fill_protocol_limits(self) -> ProtocolLimits:
+        return ProtocolLimits(
+            max_rpc_message_bytes=int(
+                self.config.remote_fill_max_rpc_message_bytes
+            ),
+            max_control_pages_per_window=int(
+                self.config.remote_fill_max_control_pages_per_window
+            ),
+            max_window_bytes=int(self.config.remote_fill_max_inflight_bytes),
+            max_active_transactions=int(
+                self.config.remote_fill_max_active_transactions
+            ),
+            max_inflight_windows_per_transaction=int(
+                self.config.remote_fill_max_inflight_windows_per_request
+            ),
+            max_reserved_bytes=int(self.config.remote_fill_max_reserved_bytes),
+            max_bytes_per_transaction=int(
+                self.config.remote_fill_max_bytes_per_request
+            ),
+        )
+
+    def _remote_fill_immutable_layout(self) -> tuple[str, RemoteFillDecoderLayout]:
+        """Build the startup-immutable source layout once after opt-in."""
+
+        cached = getattr(self, "_remote_fill_layout_cache", None)
+        if cached is not None:
+            return cached
+        with self._engine_state_lock:
+            cached = getattr(self, "_remote_fill_layout_cache", None)
+            if cached is None:
+                layout_tag, _ = mooncake_payload_layout(self.config, self.metadata)
+                layout = build_decoder_layout(
+                    self.config,
+                    self.metadata,
+                    layout_tag=layout_tag,
+                    num_layers=int(self.num_layers),
+                )
+                cached = (layout_tag, layout)
+                self._remote_fill_layout_cache = cached
+            return cached
+
+    def _remote_fill_immutable_secret(self) -> bytes:
+        """Read and bind the deployment secret once per qualified P engine."""
+
+        secret = getattr(self, "_remote_fill_hmac_secret", None)
+        if secret is not None:
+            return secret
+        with self._engine_state_lock:
+            secret = getattr(self, "_remote_fill_hmac_secret", None)
+            if secret is None:
+                secret = load_remote_fill_hmac_secret()
+                self._remote_fill_hmac_secret = secret
+            return secret
+
+    def _remote_fill_static_spec(
+        self,
+        handoff: RemoteFillHandoff,
+    ) -> RemoteFillStaticSpec:
+        layout_tag, layout = self._remote_fill_immutable_layout()
+        token_hash_algorithm = str(self.config.pre_caching_hash_algorithm)
+        python_hash_seed = (
+            os.environ.get("PYTHONHASHSEED", "")
+            if token_hash_algorithm == "builtin"
+            else ""
+        )
+        if (
+            token_hash_algorithm != handoff.token_hash_algorithm
+            or python_hash_seed != handoff.python_hash_seed
+        ):
+            raise ValueError("remote-fill token hashing identity changed")
+        return RemoteFillStaticSpec(
+            cache_namespace_tag=layout.cache_namespace_tag,
+            layout_tag=layout.layout_tag,
+            model_artifact_id=layout.model_artifact_id,
+            chunk_size=layout.chunk_size,
+            model_layout="mla-dsa-layer-page-v3",
+            group_dimensions=layout.group_dimensions,
+            layer_count=layout.num_layers,
+            save_only_first_rank=True,
+            shared_group1=True,
+            tp_size=int(self.metadata.world_size),
+            dp_size=handoff.destination_dp_size,
+            global_te_push=handoff.global_te_push,
+            token_hash_algorithm=token_hash_algorithm,
+            python_hash_seed=python_hash_seed,
+        )
+
+    def _remote_fill_create_session(
+        self,
+        req_id: str,
+        state: _DirectStoreRequestState,
+        required_store_end_hint: int,
+    ) -> RemoteFillProducerSession:
+        handoff = state.remote_fill_handoff
+        if handoff is None:
+            raise RuntimeError("remote-fill handoff is unavailable")
+        limits = self._remote_fill_protocol_limits()
+        secret = self._remote_fill_immutable_secret()
+        static_spec = self._remote_fill_static_spec(handoff)
+        factory = getattr(self, "_remote_fill_client_factory", None)
+        client = (
+            factory(handoff, limits)
+            if callable(factory)
+            else create_remote_fill_client(
+                handoff.control_endpoint,
+                timeout_ms=max(
+                    int(self.config.remote_fill_open_timeout_ms),
+                    int(self.config.remote_fill_reserve_timeout_ms),
+                    int(self.config.remote_fill_arm_timeout_ms),
+                    int(self.config.remote_fill_finish_timeout_ms),
+                ),
+                limits=limits,
+            )
+        )
+        planned_windows = (
+            required_store_end_hint
+            + int(self.config.remote_fill_window_tokens)
+            - 1
+        ) // int(self.config.remote_fill_window_tokens)
+        session = RemoteFillProducerSession(
+            request_id=req_id,
+            handoff=handoff,
+            static_spec=static_spec,
+            client=client,
+            secret=secret,
+            planned_window_count_hint=planned_windows,
+            required_store_end_hint=required_store_end_hint,
+            native_hard_timeout_seconds=(
+                float(self.config.remote_fill_native_hard_timeout_ms) / 1000.0
+            ),
+        )
+        if not state.remote_fill_active_counted:
+            self._get_remote_fill_producer_metrics().add_gauge(
+                "active_transactions", 1
+            )
+            state.remote_fill_active_counted = True
+        return session
+
+    def _remote_fill_control_pages(
+        self,
+        batch: _DirectPageBatch,
+    ) -> tuple[ControlPage, ...]:
+        if len(batch.keys) != len(batch.sizes) or len(batch.keys) != len(
+            batch.ranges
+        ):
+            raise ValueError("remote-fill source page metadata is incomplete")
+        layout_tag, layout = self._remote_fill_immutable_layout()
+        pages = [
+            ControlPage(
+                canonical_key=key.to_string(),
+                kv_group=int(key.kv_group),
+                chunk_index=start // int(self.config.chunk_size),
+                chunk_start=start,
+                chunk_end=end,
+                valid_tokens=end - start,
+                destination_tp_rank=0,
+                expected_bytes=sum(page_sizes),
+                layer_count=int(self.num_layers),
+                layout_tag=layout_tag,
+            )
+            for key, page_sizes, (start, end) in zip(
+                batch.keys, batch.sizes, batch.ranges, strict=True
+            )
+        ]
+        pages.sort(key=lambda page: (page.chunk_index, page.kv_group))
+        for page in pages:
+            expected = layout.group(page.kv_group).expected_bytes(
+                page.valid_tokens, layout.num_layers
+            )
+            if page.expected_bytes != expected:
+                raise ValueError("remote-fill source page byte layout changed")
+        self._remote_fill_validate_page_pairs(tuple(pages))
+        return tuple(pages)
+
+    def _remote_fill_pages_per_window(self) -> int:
+        """Return the bounded two-group control-page capacity of one window."""
+
+        by_tokens = (
+            int(self.config.remote_fill_window_tokens)
+            // int(self.config.chunk_size)
+            * 2
+        )
+        maximum = min(
+            int(self.config.remote_fill_max_control_pages_per_window),
+            by_tokens,
+        )
+        return maximum - maximum % 2
+
+    @staticmethod
+    def _remote_fill_select_batch_pages(
+        batch: _DirectPageBatch,
+        pages: tuple[ControlPage, ...],
+    ) -> _DirectPageBatch:
+        """Select one bounded control window from an existing source batch."""
+
+        sources = {
+            (key.to_string(), int(key.kv_group)): (
+                key,
+                page_ptrs,
+                page_sizes,
+                page_range,
+            )
+            for key, page_ptrs, page_sizes, page_range in zip(
+                batch.keys,
+                batch.ptrs,
+                batch.sizes,
+                batch.ranges,
+                strict=True,
+            )
+        }
+        if len(sources) != len(batch.keys):
+            raise ValueError("remote-fill source page identity is duplicated")
+        selected = [
+            sources[(page.canonical_key, page.kv_group)] for page in pages
+        ]
+        group_ends: dict[int, int] = {}
+        for page, (_, _, _, (_, end)) in zip(pages, selected, strict=True):
+            group_ends[page.kv_group] = max(
+                group_ends.get(page.kv_group, 0), end
+            )
+        return _DirectPageBatch(
+            req_id=batch.req_id,
+            keys=[item[0] for item in selected],
+            ptrs=[item[1] for item in selected],
+            sizes=[item[2] for item in selected],
+            owners=batch.owners,
+            ready_event=batch.ready_event,
+            group_ends=group_ends,
+            ranges=tuple(item[3] for item in selected),
+        )
+
+    @staticmethod
+    def _remote_fill_validate_page_pairs(
+        pages: tuple[ControlPage, ...],
+    ) -> None:
+        by_chunk: dict[int, set[int]] = {}
+        for page in pages:
+            groups = by_chunk.setdefault(page.chunk_index, set())
+            if page.kv_group in groups:
+                raise ValueError("remote-fill page identity is duplicated")
+            groups.add(page.kv_group)
+        if not by_chunk or any(groups != {0, 1} for groups in by_chunk.values()):
+            raise ValueError("remote fill requires an exact two-group page pair")
+
+    def _remote_fill_probe_control_pages(
+        self,
+        plans: dict[int, list[tuple[int, int, CacheEngineKey]]],
+        probe_start: int,
+        probe_end: int,
+    ) -> tuple[ControlPage, ...]:
+        """Build pointer-free cached-prefix manifests from canonical plans."""
+
+        _, layout = self._remote_fill_immutable_layout()
+        pages: list[ControlPage] = []
+        for group in (0, 1):
+            for start, end, key in plans.get(group, ()):
+                if end <= probe_start or end > probe_end:
+                    continue
+                valid_tokens = end - start
+                pages.append(
+                    ControlPage(
+                        canonical_key=key.to_string(),
+                        kv_group=group,
+                        chunk_index=start // layout.chunk_size,
+                        chunk_start=start,
+                        chunk_end=end,
+                        valid_tokens=valid_tokens,
+                        destination_tp_rank=0,
+                        expected_bytes=layout.group(group).expected_bytes(
+                            valid_tokens, layout.num_layers
+                        ),
+                        layer_count=layout.num_layers,
+                        layout_tag=layout.layout_tag,
+                    )
+                )
+        pages.sort(key=lambda page: (page.chunk_index, page.kv_group))
+        result = tuple(pages)
+        if result:
+            self._remote_fill_validate_page_pairs(result)
+        return result
+
+    def _remote_fill_prefix_plans(
+        self,
+        tokens: list[int],
+        request_configs: Optional[dict],
+        prefix_end: int,
+    ) -> dict[int, list[tuple[int, int, CacheEngineKey]]]:
+        """Rebuild canonical keys when a full hit has no suffix plan."""
+
+        prefix_tokens = tokens[:prefix_end]
+        latent = list(
+            self.token_database.process_tokens(
+                tokens=prefix_tokens,
+                request_configs=request_configs,
+                kv_group=0,
+            )
+        )
+        hashes = [int(key.chunk_hash) for _, _, key in latent]
+        offsets = [end - start for start, end, _ in latent]
+        indexer = list(
+            self.token_database.process_tokens(
+                hashes=hashes,
+                offsets=offsets,
+                request_configs=request_configs,
+                kv_group=1,
+            )
+        )
+        if len(indexer) != len(latent) or any(
+            (left[0], left[1], left[2].chunk_hash)
+            != (right[0], right[1], right[2].chunk_hash)
+            for left, right in zip(latent, indexer, strict=True)
+        ):
+            raise RuntimeError(
+                "Remote-fill KV groups produced different prefix plans"
+            )
+        return {0: latent, 1: indexer}
+
+    def _schedule_remote_fill_probe_pages(
+        self,
+        req_id: str,
+        state: _DirectStoreRequestState,
+        pages: tuple[ControlPage, ...],
+        required_store_end_hint: int,
+    ) -> None:
+        """Queue bounded, ordered cached-prefix probes before direct writes."""
+
+        if not pages or state.remote_fill_handoff is None:
+            return
+        maximum = self._remote_fill_pages_per_window()
+        if maximum <= 0:
+            state.remote_fill_disabled_reason = "invalid_control_page_limit"
+            self._get_remote_fill_producer_metrics().abandon(
+                "invalid control page limit", allocation=True
+            )
+            return
+        executor = getattr(self, "_remote_fill_producer_executor", None)
+        if executor is None:
+            try:
+                executor = ThreadPoolExecutor(
+                    max_workers=int(self.config.remote_fill_direct_worker_count),
+                    thread_name_prefix="lmcache-remote-fill-producer",
+                )
+            except Exception as error:
+                state.remote_fill_disabled_reason = type(error).__name__
+                self._remote_fill_record_failure()
+                return
+            self._remote_fill_producer_executor = executor
+        control_windows = tuple(
+            pages[offset : offset + maximum]
+            for offset in range(0, len(pages), maximum)
+        )
+        metrics = self._get_remote_fill_producer_metrics()
+        queued_at = time.perf_counter()
+        if not self._remote_fill_acquire_queue_capacity(state, 0):
+            state.remote_fill_disabled_reason = "producer_backpressure"
+            metrics.abandon("producer backpressure", allocation=True)
+            return
+        metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
+        first_window_id = state.remote_fill_next_window_id
+        state.remote_fill_next_window_id += len(control_windows)
+        previous = state.remote_fill_last_future
+
+        def run() -> Any:
+            try:
+                if previous is not None:
+                    previous.result()
+                if state.remote_fill_session is None:
+                    state.remote_fill_session = self._remote_fill_create_session(
+                        req_id,
+                        state,
+                        required_store_end_hint,
+                    )
+                session = state.remote_fill_session
+                if not session.direct_viable:
+                    return None
+                results = []
+                for window_offset, control_pages in enumerate(control_windows):
+                    window_id = first_window_id + window_offset
+                    result = session.probe_window(
+                        window_id=window_id,
+                        source_generation=state.remote_fill_source_generation,
+                        control_pages=control_pages,
+                    )
+                    results.append(result)
+                    if not result.direct_satisfied:
+                        state.remote_fill_disabled_reason = result.reason
+                        if result.reason != "cached-prefix hole":
+                            self._remote_fill_record_failure()
+                    self._record_remote_fill_window_metrics(state, result)
+                    cold_start_perf_log(
+                        logger,
+                        "remote_fill_probe_complete",
+                        req_id=session.request_id,
+                        window_id=window_id,
+                        page_count=len(control_pages),
+                        direct_satisfied=result.direct_satisfied,
+                        reason=result.reason,
+                    )
+                    if not result.direct_satisfied:
+                        break
+                return tuple(results)
+            except RemoteFillFatalError:
+                self._latch_remote_fill_producer_fatal(state)
+                raise
+            except Exception as error:
+                state.remote_fill_disabled_reason = type(error).__name__
+                if state.remote_fill_session is not None:
+                    state.remote_fill_session.direct_viable = False
+                self._remote_fill_record_failure()
+                return None
+            finally:
+                self._remote_fill_release_queue_capacity(state, 0)
+
+        try:
+            future = executor.submit(run)
+        except Exception as error:
+            self._remote_fill_release_queue_capacity(state, 0)
+            state.remote_fill_disabled_reason = type(error).__name__
+            self._remote_fill_record_failure()
+            return
+        state.remote_fill_futures.append(future)
+        state.remote_fill_last_future = future
+
+    @staticmethod
+    def _remote_fill_source_plan(batch: _DirectPageBatch) -> DirectPushSourcePlan:
+        pages = tuple(
+            DirectPushPageSource(
+                canonical_key=key.to_string(),
+                kv_group=int(key.kv_group),
+                source_ptrs=tuple(page_ptrs),
+                source_lengths=tuple(page_sizes),
+            )
+            for key, page_ptrs, page_sizes in zip(
+                batch.keys, batch.ptrs, batch.sizes, strict=True
+            )
+        )
+        if batch.ready_event is None:
+            raise ValueError("remote fill requires a real producer event")
+        return DirectPushSourcePlan(
+            pages=pages,
+            owners=batch.owners,
+            producer_events=(batch.ready_event,),
+        )
+
+    def _schedule_remote_fill_batch(
+        self,
+        state: _DirectStoreRequestState,
+        batch: _DirectPageBatch,
+        required_store_end_hint: int,
+    ) -> None:
+        if state.remote_fill_handoff is None or state.remote_fill_disabled_reason:
+            return
+        try:
+            control_pages = self._remote_fill_control_pages(batch)
+        except Exception as error:
+            state.remote_fill_disabled_reason = type(error).__name__
+            self._remote_fill_record_failure()
+            return
+        maximum = self._remote_fill_pages_per_window()
+        if maximum <= 0:
+            state.remote_fill_disabled_reason = "invalid_control_page_limit"
+            self._get_remote_fill_producer_metrics().abandon(
+                "invalid control page limit", allocation=True
+            )
+            return
+        control_windows = tuple(
+            control_pages[offset : offset + maximum]
+            for offset in range(0, len(control_pages), maximum)
+        )
+        byte_count = sum(sum(page_sizes) for page_sizes in batch.sizes)
+        queued_at = time.perf_counter()
+        if not self._remote_fill_acquire_queue_capacity(state, byte_count):
+            state.remote_fill_disabled_reason = "producer_backpressure"
+            metrics = self._get_remote_fill_producer_metrics()
+            metrics.abandon("producer backpressure", allocation=True)
+            cold_start_perf_log(
+                logger,
+                "remote_fill_batch_skipped",
+                req_id=batch.req_id,
+                reason="producer_backpressure",
+                bytes=byte_count,
+            )
+            return
+        self._get_remote_fill_producer_metrics().observe(
+            "queue_wait_seconds", time.perf_counter() - queued_at
+        )
+        try:
+            source_plan = self._remote_fill_source_plan(batch)
+        except Exception as error:
+            self._remote_fill_release_queue_capacity(state, byte_count)
+            state.remote_fill_disabled_reason = type(error).__name__
+            self._remote_fill_record_failure()
+            return
+        cold_start_perf_log(
+            logger,
+            "remote_fill_source_ready",
+            req_id=batch.req_id,
+            page_count=len(control_pages),
+            bytes=byte_count,
+        )
+        executor = getattr(self, "_remote_fill_producer_executor", None)
+        if executor is None:
+            try:
+                executor = ThreadPoolExecutor(
+                    max_workers=int(self.config.remote_fill_direct_worker_count),
+                    thread_name_prefix="lmcache-remote-fill-producer",
+                )
+            except Exception as error:
+                self._remote_fill_release_queue_capacity(state, byte_count)
+                state.remote_fill_disabled_reason = type(error).__name__
+                self._remote_fill_record_failure()
+                return
+            self._remote_fill_producer_executor = executor
+        first_window_id = state.remote_fill_next_window_id
+        state.remote_fill_next_window_id += len(control_windows)
+        source_generation = state.remote_fill_source_generation
+        previous = state.remote_fill_last_future
+
+        def run() -> Any:
+            try:
+                if previous is not None:
+                    previous.result()
+                if state.remote_fill_session is None:
+                    state.remote_fill_session = self._remote_fill_create_session(
+                        batch.req_id, state, required_store_end_hint
+                    )
+                session = state.remote_fill_session
+                if not session.direct_viable:
+                    return None
+                submitter = getattr(
+                    self,
+                    "_remote_fill_direct_submitter",
+                    self.storage_manager.submit_remote_fill_direct_push,
+                )
+                activation_factory = getattr(
+                    self,
+                    "_remote_fill_activation_factory",
+                    lambda attempt_id: NativeDirectPushActivation(
+                        h0_qualification=os.environ.get(
+                            REMOTE_FILL_H0_QUALIFICATION_ENV, ""
+                        ),
+                        native_transfer_attempt_id=attempt_id,
+                        arm_acknowledged=True,
+                    ),
+                )
+                results = []
+                for window_offset, window_pages in enumerate(control_windows):
+                    window_id = first_window_id + window_offset
+                    result = session.transfer_window(
+                        window_id=window_id,
+                        source_generation=source_generation,
+                        control_pages=window_pages,
+                        source_plan=source_plan,
+                        submitter=submitter,
+                        activation_factory=activation_factory,
+                    )
+                    results.append(result)
+                    if not result.direct_satisfied:
+                        state.remote_fill_disabled_reason = result.reason
+                        if result.reason not in (
+                            "cached-prefix hole",
+                            "direct destination hole",
+                        ):
+                            self._remote_fill_record_failure()
+                    self._record_remote_fill_window_metrics(state, result)
+                    cold_start_perf_log(
+                        logger,
+                        "remote_fill_window_complete",
+                        req_id=batch.req_id,
+                        window_id=window_id,
+                        page_count=len(window_pages),
+                        bytes=sum(
+                            page.expected_bytes for page in window_pages
+                        ),
+                        armed=result.armed,
+                        direct_satisfied=result.direct_satisfied,
+                        reason=result.reason,
+                    )
+                    if not result.direct_satisfied:
+                        break
+                return tuple(results)
+            except Exception as error:
+                if isinstance(error, RemoteFillFatalError):
+                    self._latch_remote_fill_producer_fatal(state)
+                    metrics = self._get_remote_fill_producer_metrics()
+                    metrics.failure("fatal restart")
+                    metrics.abandon("fatal restart")
+                    cold_start_perf_log(
+                        logger,
+                        "remote_fill_fatal_restart",
+                        req_id=batch.req_id,
+                        phase="native_or_control_terminal",
+                    )
+                    raise
+                state.remote_fill_disabled_reason = type(error).__name__
+                if state.remote_fill_session is not None:
+                    state.remote_fill_session.direct_viable = False
+                logger.warning(
+                    "Remote fill abandoned before a fatal native state for "
+                    "request %s: %s",
+                    batch.req_id,
+                    type(error).__name__,
+                )
+                self._remote_fill_record_failure()
+                metrics = self._get_remote_fill_producer_metrics()
+                metrics.failure("prearm failure")
+                metrics.abandon("prearm failure")
+                return None
+            finally:
+                self._remote_fill_release_queue_capacity(state, byte_count)
+
+        try:
+            future = executor.submit(run)
+        except Exception as error:
+            self._remote_fill_release_queue_capacity(state, byte_count)
+            state.remote_fill_disabled_reason = type(error).__name__
+            self._remote_fill_record_failure()
+            return
+        state.remote_fill_futures.append(future)
+        state.remote_fill_last_future = future
+
+    def _wait_remote_fill_windows(self, state: _DirectStoreRequestState) -> None:
+        try:
+            while state.remote_fill_futures:
+                state.remote_fill_futures.popleft().result()
+        except RemoteFillFatalError:
+            self._latch_remote_fill_producer_fatal(state)
+            raise
+
+    def _finish_remote_fill(
+        self,
+        req_id: str,
+        state: _DirectStoreRequestState,
+        required_store_end: int,
+    ) -> None:
+        if state.remote_fill_handoff is None:
+            return
+        if state.remote_fill_terminal is not None:
+            return
+        self._wait_remote_fill_windows(state)
+        persistent_common_end = min(
+            state.committed_end.get(group, 0) for group in (0, 1)
+        )
+        cold_start_perf_log(
+            logger,
+            "remote_fill_persistent_complete",
+            req_id=req_id,
+            persistent_common_end=persistent_common_end,
+            required_store_end=required_store_end,
+        )
+        try:
+            if state.remote_fill_session is None:
+                terminal = RemoteFillTerminalResult(
+                    transfer_id=state.remote_fill_handoff.transfer_id,
+                    outcome="PERSISTENT_ONLY",
+                    persistent_common_end=persistent_common_end,
+                    required_store_end=required_store_end,
+                )
+            else:
+                terminal = state.remote_fill_session.finish(
+                    required_store_end=required_store_end,
+                    persistent_common_end=persistent_common_end,
+                    final_partial_valid_tokens=(
+                        required_store_end % int(self.config.chunk_size)
+                    ),
+                )
+        except RemoteFillFatalError:
+            self._latch_remote_fill_producer_fatal(state)
+            raise
+        if terminal.outcome == "FATAL_RESTART":
+            self._latch_remote_fill_producer_fatal(state)
+        state.remote_fill_terminal = terminal
+        metrics = self._get_remote_fill_producer_metrics()
+        if state.remote_fill_persistent_started_at:
+            metrics.observe(
+                "persistent_seconds",
+                time.perf_counter() - state.remote_fill_persistent_started_at,
+            )
+        metrics.finish_attempt(
+            terminal.outcome,
+            state.remote_fill_disabled_reason or "none",
+        )
+        if state.remote_fill_viable_counted:
+            metrics.add_gauge("direct_viable", -1)
+            state.remote_fill_viable_counted = False
+        if state.remote_fill_active_counted:
+            metrics.add_gauge("active_transactions", -1)
+            state.remote_fill_active_counted = False
+        if terminal.outcome == "LOCAL_FULL":
+            metrics.add_bytes(
+                "published_bytes", state.remote_fill_submitted_bytes
+            )
+        else:
+            metrics.add_bytes(
+                "discarded_bytes", state.remote_fill_submitted_bytes
+            )
+        if terminal.outcome == "LOCAL_FULL":
+            self._remote_fill_record_success()
+        cold_start_perf_log(
+            logger,
+            "remote_fill_producer_terminal",
+            req_id=req_id,
+            outcome=terminal.outcome,
+            persistent_common_end=persistent_common_end,
+            required_store_end=required_store_end,
+        )
+        completed = getattr(self, "_completed_remote_fill_results", None)
+        if completed is None:
+            completed = {}
+            self._completed_remote_fill_results = completed
+        completed[req_id] = terminal
+        cold_start_perf_log(
+            logger,
+            "remote_fill_producer_metrics_snapshot",
+            metrics=metrics.snapshot(),
+        )
 
     def _wait_direct_backpressure(self) -> None:
         limit = self._store_queue_maxsize or 2
@@ -485,6 +1575,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         state = self._direct_store_states.setdefault(
             batch.req_id, _DirectStoreRequestState()
         )
+        if (
+            state.remote_fill_metrics_started
+            and not state.remote_fill_persistent_started_at
+        ):
+            state.remote_fill_persistent_started_at = time.perf_counter()
         key_strings = {key.to_string() for key in batch.keys}
         state.pending_keys.update(key_strings)
         with self._store_cv:
@@ -612,11 +1707,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         state: _DirectStoreRequestState,
         tokens: list[int],
     ) -> int:
-        return (
-            len(tokens)
-            if bool(getattr(self.config, "save_unfull_chunk", True))
-            else state.planned_end
-        )
+        del tokens
+        if state.accepted_store_end is None:
+            raise RuntimeError("direct store has no authoritative accepted end")
+        return state.accepted_store_end
 
     def _finalize_direct_store(
         self,
@@ -640,6 +1734,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise RuntimeError(
                 "Direct prefill store published an invalid final frontier: "
                 f"req_id={req_id} committed={invalid} required={required_end}"
+            )
+        self._finish_remote_fill(req_id, state, required_end)
+        if (
+            state.remote_fill_terminal is not None
+            and state.remote_fill_terminal.outcome
+            in ("PERSISTENCE_FAILED", "FATAL_RESTART")
+        ):
+            raise RuntimeError(
+                "Remote-fill finalization rejected request forwarding: "
+                f"outcome={state.remote_fill_terminal.outcome}"
             )
         state.finalized = True
         logger.info(
@@ -1426,11 +2530,18 @@ class AscendLMCacheEngine(LMCacheEngine):
         start = state.planned_end
         if start >= len(tokens):
             return True
-        group_caches = {
-            group: caches
-            for group, caches in group_caches.items()
-            if state.submitted_end.get(group, 0) < len(tokens)
-        }
+        remote_fill = self._remote_fill_prepare_request(
+            req_id, request_configs, state
+        )
+        if remote_fill and set(group_caches) != {0, 1}:
+            state.remote_fill_disabled_reason = "incomplete_groups"
+            remote_fill = False
+        if not remote_fill:
+            group_caches = {
+                group: caches
+                for group, caches in group_caches.items()
+                if state.submitted_end.get(group, 0) < len(tokens)
+            }
         if not group_caches:
             return True
         plan0 = list(
@@ -1455,6 +2566,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         sizes: List[List[int]] = []
         owners: dict[int, torch.Tensor] = {}
         group_ends: dict[int, int] = {}
+        remote_keys: List[CacheEngineKey] = []
+        remote_ptrs: List[List[int]] = []
+        remote_sizes: List[List[int]] = []
+        remote_owners: dict[int, torch.Tensor] = {}
+        remote_group_ends: dict[int, int] = {}
+        remote_probe_plans: dict[
+            int, list[tuple[int, int, CacheEngineKey]]
+        ] = {0: [], 1: []}
         max_buffers = int(
             self.config.get_extra_config_value(
                 "mooncake_direct_max_buffers_per_page", 4096
@@ -1474,10 +2593,25 @@ class AscendLMCacheEngine(LMCacheEngine):
             present = self.storage_manager.batched_external_pages_exist([key])
             if len(present) != 1:
                 return False
-            if present[0]:
+            persistent_missing = not present[0]
+            if not persistent_missing:
                 state.submitted_end[group] = end
                 if not state.futures:
                     state.committed_end[group] = end
+                if not remote_fill:
+                    continue
+            if remote_fill and start < slot_mapping_base:
+                if persistent_missing:
+                    state.remote_fill_disabled_reason = (
+                        "unaddressable_partial_source"
+                    )
+                    remote_fill = False
+                else:
+                    # A full prefix hit may recompute only the final token, so
+                    # the already-committed partial page is not addressable in
+                    # this forward. Register it as probe-only coverage; never
+                    # build a native source from an unrelated slot window.
+                    remote_probe_plans[group].append((start, end, key))
                 continue
             planned = planner(
                 kvcaches,
@@ -1488,28 +2622,63 @@ class AscendLMCacheEngine(LMCacheEngine):
                 slot_mapping_base=slot_mapping_base,
             )
             if planned is None:
-                return False
+                if remote_fill:
+                    state.remote_fill_disabled_reason = "tail_planner_fallback"
+                    remote_fill = False
+                if persistent_missing:
+                    return False
+                continue
             group_ptrs, group_sizes, group_owners = planned
             if (
                 len(group_ptrs) != 1
                 or len(group_sizes) != 1
                 or any(len(item) > max_buffers for item in group_ptrs)
             ):
-                return False
-            keys.append(key)
-            self._record_live_source_pages(
-                req_id,
-                group,
-                [(start, end)],
-                group_ptrs,
-                group_sizes,
-                tuple(group_owners),
+                if remote_fill:
+                    state.remote_fill_disabled_reason = "tail_buffer_limit"
+                    remote_fill = False
+                if persistent_missing:
+                    return False
+                continue
+            if remote_fill:
+                remote_keys.append(key)
+                remote_ptrs.extend(group_ptrs)
+                remote_sizes.extend(group_sizes)
+                remote_owners.update(
+                    (id(owner), owner) for owner in group_owners
+                )
+                remote_group_ends[group] = end
+            if persistent_missing:
+                keys.append(key)
+                self._record_live_source_pages(
+                    req_id,
+                    group,
+                    [(start, end)],
+                    group_ptrs,
+                    group_sizes,
+                    tuple(group_owners),
+                )
+                ptrs.extend(group_ptrs)
+                sizes.extend(group_sizes)
+                owners.update((id(owner), owner) for owner in group_owners)
+                group_ends[group] = end
+        if remote_fill and any(remote_probe_plans.values()):
+            probe_pages = self._remote_fill_probe_control_pages(
+                remote_probe_plans,
+                start,
+                end,
             )
-            ptrs.extend(group_ptrs)
-            sizes.extend(group_sizes)
-            owners.update((id(owner), owner) for owner in group_owners)
-            group_ends[group] = end
-        if not keys:
+            if len(probe_pages) == 2:
+                self._schedule_remote_fill_probe_pages(
+                    req_id,
+                    state,
+                    probe_pages,
+                    len(tokens),
+                )
+            else:
+                state.remote_fill_disabled_reason = "incomplete_partial_probe"
+                remote_fill = False
+        if not keys and not (remote_fill and remote_keys):
             return True
         if started is not None:
             cold_start_perf_log(
@@ -1533,7 +2702,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 getattr(self.config, "dsa_two_groups", False)
             ),
         )
-        if 1 in group_ends and npu_content_diagnostics_enabled():
+        if (
+            1 in (remote_group_ends if remote_fill else group_ends)
+            and npu_content_diagnostics_enabled()
+        ):
             log_npu_content_diagnostic_event(
                 "group1_persistent_store_ready_dependency",
                 req_id=req_id,
@@ -1542,26 +2714,50 @@ class AscendLMCacheEngine(LMCacheEngine):
                 source_ready_token_end=state.source_ready_token_end,
                 format="partial_page",
             )
-        batch = _DirectPageBatch(
-            req_id,
-            keys,
-            ptrs,
-            sizes,
-            tuple(owners.values()),
-            ready_event,
-            group_ends,
+        shared_sink_owners = (
+            tuple(remote_owners.values())
+            if remote_fill and remote_keys
+            else tuple(owners.values())
         )
-        self._track_direct_batch(
-            batch,
-            (
+        if keys:
+            batch = _DirectPageBatch(
                 req_id,
-                tokens,
-                group_caches,
-                slot_mappings,
-                request_configs,
-                slot_mapping_base,
-            ),
-        )
+                keys,
+                ptrs,
+                sizes,
+                shared_sink_owners,
+                ready_event,
+                group_ends,
+                tuple((start, end) for _ in keys),
+            )
+            self._track_direct_batch(
+                batch,
+                (
+                    req_id,
+                    tokens,
+                    group_caches,
+                    slot_mappings,
+                    request_configs,
+                    slot_mapping_base,
+                ),
+            )
+        if remote_fill and remote_keys:
+            if {int(key.kv_group) for key in remote_keys} == {0, 1}:
+                remote_batch = _DirectPageBatch(
+                    req_id,
+                    remote_keys,
+                    remote_ptrs,
+                    remote_sizes,
+                    shared_sink_owners,
+                    ready_event,
+                    remote_group_ends,
+                    tuple((start, end) for _ in remote_keys),
+                )
+                self._schedule_remote_fill_batch(
+                    state, remote_batch, len(tokens)
+                )
+            else:
+                state.remote_fill_disabled_reason = "incomplete_partial_pair"
         return True
 
     def store_direct_prefill(
@@ -1574,12 +2770,21 @@ class AscendLMCacheEngine(LMCacheEngine):
         final: bool = False,
         slot_mapping_base: int = 0,
         verified_prefix_end: int = 0,
+        accepted_store_end: Optional[int] = None,
         source_ready_event: Any = None,
         source_ready_event_source: str = "missing",
     ) -> bool:
         """Publish newly completed pages and the final tail directly from NPU."""
         if not self._direct_store_enabled or not group_caches:
             return False
+        if accepted_store_end is None:
+            accepted_store_end = len(tokens)
+        if not 0 <= accepted_store_end <= len(tokens):
+            raise ValueError(
+                "Direct prefill accepted store end is outside the token range: "
+                f"accepted={accepted_store_end}, tokens={len(tokens)}"
+            )
+        tokens = tokens[:accepted_store_end]
         if not 0 <= slot_mapping_base <= len(tokens):
             raise ValueError(
                 "Direct prefill slot-mapping base is outside the token range: "
@@ -1594,8 +2799,24 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
         state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
+        if (
+            state.accepted_store_end is not None
+            and accepted_store_end < state.accepted_store_end
+        ):
+            raise RuntimeError(
+                "Direct prefill accepted store frontier moved backwards: "
+                f"req_id={req_id} previous={state.accepted_store_end} "
+                f"accepted={accepted_store_end}"
+            )
+        state.accepted_store_end = accepted_store_end
         if final and state.finalized:
             return True
+        remote_fill = self._remote_fill_prepare_request(
+            req_id, request_configs, state
+        )
+        if remote_fill and set(group_caches) != {0, 1}:
+            state.remote_fill_disabled_reason = "incomplete_groups"
+            remote_fill = False
         self._remember_direct_source_readiness(
             state,
             len(tokens),
@@ -1611,12 +2832,61 @@ class AscendLMCacheEngine(LMCacheEngine):
         plans = self._direct_suffix_plans(
             state, tokens, group_caches, request_configs
         )
+        if remote_fill:
+            probe_target = verified_prefix_end // int(self.config.chunk_size) * int(
+                self.config.chunk_size
+            )
+            if state.remote_fill_probe_end < probe_target:
+                probe_pages = self._remote_fill_probe_control_pages(
+                    plans,
+                    state.remote_fill_probe_end,
+                    probe_target,
+                )
+                expected_pages = (
+                    (probe_target - state.remote_fill_probe_end)
+                    // int(self.config.chunk_size)
+                    * 2
+                )
+                if len(probe_pages) != expected_pages:
+                    prefix_plans = self._remote_fill_prefix_plans(
+                        tokens,
+                        request_configs,
+                        probe_target,
+                    )
+                    if prefix_plans[0]:
+                        state.planned_end = prefix_plans[0][-1][1]
+                        state.planned_hash = int(
+                            prefix_plans[0][-1][2].chunk_hash
+                        )
+                    probe_pages = self._remote_fill_probe_control_pages(
+                        prefix_plans,
+                        state.remote_fill_probe_end,
+                        probe_target,
+                    )
+                if len(probe_pages) != expected_pages:
+                    state.remote_fill_disabled_reason = "incomplete_probe_plan"
+                    remote_fill = False
+                else:
+                    self._schedule_remote_fill_probe_pages(
+                        req_id,
+                        state,
+                        probe_pages,
+                        len(tokens),
+                    )
+                    state.remote_fill_probe_end = probe_target
 
         keys: List[CacheEngineKey] = []
         ptrs: List[List[int]] = []
         sizes: List[List[int]] = []
+        ranges: list[tuple[int, int]] = []
         owners: dict[int, torch.Tensor] = {}
         group_ends: dict[int, int] = {}
+        remote_keys: List[CacheEngineKey] = []
+        remote_ptrs: List[List[int]] = []
+        remote_sizes: List[List[int]] = []
+        remote_ranges: list[tuple[int, int]] = []
+        remote_owners: dict[int, torch.Tensor] = {}
+        remote_group_ends: dict[int, int] = {}
         merged_runs = 0
         chunk_size = int(self.config.chunk_size)
         planner = getattr(self.gpu_connector, "plan_direct_page_sources", None)
@@ -1676,6 +2946,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             return True
         if len(exists) != len(candidate_refs):
             raise RuntimeError("Direct page lookup returned an invalid result count")
+        authoritative_candidates = {
+            group: list(group_candidates)
+            for group, group_candidates in candidates.items()
+        }
         candidates = {group: [] for group in group_caches}
         missing_by_group: set[int] = set()
         for (group, item), present in zip(candidate_refs, exists, strict=True):
@@ -1708,13 +2982,24 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         for group, kvcaches in group_caches.items():
             submitted = state.committed_end.get(group, 0)
-            full = candidates[group]
-            full = [
+            persistent_full = candidates[group]
+            persistent_full = [
                 item
-                for item in full
+                for item in persistent_full
                 if item[2].to_string() not in state.pending_keys
             ]
+            full = (
+                authoritative_candidates[group]
+                if remote_fill
+                else persistent_full
+            )
             if full:
+                if remote_fill and any(
+                    start < slot_mapping_base for start, _, _ in full
+                ):
+                    state.remote_fill_disabled_reason = "unaddressable_source"
+                    remote_fill = False
+                    full = persistent_full
                 starts = [start for start, _, _ in full]
                 ends = [end for _, end, _ in full]
                 planned = planner(
@@ -1747,6 +3032,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ):
                         fallback_reason = "buffer_limit_exceeded"
                 if fallback_reason is not None:
+                    if remote_fill:
+                        state.remote_fill_disabled_reason = fallback_reason
+                        remote_fill = False
+                    if not persistent_full:
+                        continue
                     if state.fallback_reasons.get(group) != fallback_reason:
                         logger.warning(
                             "Direct NPU prefill store is using CPU fallback: "
@@ -1787,25 +3077,55 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     continue
                 assert planned is not None
+                if len(group_ptrs) != len(full) or len(group_sizes) != len(full):
+                    raise RuntimeError(
+                        "Direct page planner returned an invalid page count"
+                    )
                 merged_runs += sum(
                     len(page_ptrs) // len(group_owners)
                     for page_ptrs in group_ptrs
                 )
-                self._record_live_source_pages(
-                    req_id,
-                    group,
-                    list(zip(starts, ends, strict=True)),
-                    group_ptrs,
-                    group_sizes,
-                    tuple(group_owners),
-                )
-                keys.extend(key for _, _, key in full)
-                ptrs.extend(group_ptrs)
-                sizes.extend(group_sizes)
-                owners.update((id(owner), owner) for owner in group_owners)
-                # Existing pages between missing pages are part of the same
-                # contiguous committed prefix once this batch succeeds.
-                group_ends[group] = candidate_ends[group]
+                persistent_key_strings = {
+                    item[2].to_string() for item in persistent_full
+                }
+                persistent_ranges: list[tuple[int, int]] = []
+                persistent_ptrs: List[List[int]] = []
+                persistent_sizes: List[List[int]] = []
+                for item, page_ptrs, page_sizes in zip(
+                    full, group_ptrs, group_sizes, strict=True
+                ):
+                    start, end, key = item
+                    if remote_fill:
+                        remote_keys.append(key)
+                        remote_ptrs.append(page_ptrs)
+                        remote_sizes.append(page_sizes)
+                        remote_ranges.append((start, end))
+                    if key.to_string() in persistent_key_strings:
+                        keys.append(key)
+                        persistent_ptrs.append(page_ptrs)
+                        persistent_sizes.append(page_sizes)
+                        persistent_ranges.append((start, end))
+                if persistent_ranges:
+                    self._record_live_source_pages(
+                        req_id,
+                        group,
+                        persistent_ranges,
+                        persistent_ptrs,
+                        persistent_sizes,
+                        tuple(group_owners),
+                    )
+                    ptrs.extend(persistent_ptrs)
+                    sizes.extend(persistent_sizes)
+                    ranges.extend(persistent_ranges)
+                    owners.update((id(owner), owner) for owner in group_owners)
+                    # Existing pages between missing pages are part of the same
+                    # contiguous committed prefix once this batch succeeds.
+                    group_ends[group] = candidate_ends[group]
+                if remote_fill:
+                    remote_owners.update(
+                        (id(owner), owner) for owner in group_owners
+                    )
+                    remote_group_ends[group] = full[-1][1]
 
         if started is not None:
             elapsed_s = cold_start_perf_now() - started
@@ -1830,7 +3150,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 submitted_ends=dict(state.submitted_end),
                 committed_ends=dict(state.committed_end),
             )
-        if keys:
+        ready_event = None
+        ready_event_source = "missing"
+        if keys or (remote_fill and remote_keys):
             ready_event, ready_event_source = self._direct_source_ready_event(
                 state,
                 len(tokens),
@@ -1838,7 +3160,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     getattr(self.config, "dsa_two_groups", False)
                 ),
             )
-            if 1 in group_ends and npu_content_diagnostics_enabled():
+            if (
+                1 in (remote_group_ends if remote_fill else group_ends)
+                and npu_content_diagnostics_enabled()
+            ):
                 log_npu_content_diagnostic_event(
                     "group1_persistent_store_ready_dependency",
                     req_id=req_id,
@@ -1847,14 +3172,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                     source_ready_token_end=state.source_ready_token_end,
                     format="page",
                 )
+        shared_sink_owners = (
+            tuple(remote_owners.values())
+            if remote_fill and remote_keys
+            else tuple(owners.values())
+        )
+        if keys:
             batch = _DirectPageBatch(
                 req_id,
                 keys,
                 ptrs,
                 sizes,
-                tuple(owners.values()),
+                shared_sink_owners,
                 ready_event,
                 group_ends,
+                tuple(ranges),
             )
             try:
                 self._track_direct_batch(
@@ -1893,6 +3225,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                     req_id, tokens, group_caches, state, final
                 )
                 return True
+        if remote_fill and remote_keys:
+            if {int(key.kv_group) for key in remote_keys} != {0, 1}:
+                state.remote_fill_disabled_reason = "incomplete_page_pair"
+            else:
+                remote_batch = _DirectPageBatch(
+                    req_id,
+                    remote_keys,
+                    remote_ptrs,
+                    remote_sizes,
+                    shared_sink_owners,
+                    ready_event,
+                    remote_group_ends,
+                    tuple(remote_ranges),
+                )
+                self._schedule_remote_fill_batch(
+                    state, remote_batch, len(tokens)
+                )
 
         # Final publication is also the chunked-prefill correctness fence.
         if final:
@@ -1983,6 +3332,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             state = self._direct_store_states.get(req_id)
             if state is None:
                 continue
+            remote_wait_started = (
+                time.perf_counter() if state.remote_fill_metrics_started else None
+            )
             started = cold_start_perf_now() if cold_start_perf_enabled() else None
             outstanding = len(state.futures)
             failed: list[tuple[Future, tuple[Any, ...], Exception]] = []
@@ -2105,6 +3457,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                     state.committed_end[group] = max(
                         state.committed_end.get(group, 0), end
                     )
+            # The same source owners may also be retained by the optional
+            # remote-fill sink. Drain it before vLLM can release NPU blocks.
+            metrics = (
+                self._get_remote_fill_producer_metrics()
+                if remote_wait_started is not None
+                else None
+            )
+            self._wait_remote_fill_windows(state)
+            if metrics is not None:
+                metrics.observe(
+                    "final_wait_seconds",
+                    time.perf_counter() - remote_wait_started,
+                )
             waited.add(req_id)
             if started is not None:
                 cold_start_perf_log(
@@ -2120,7 +3485,60 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Forget completed request bookkeeping after vLLM releases ownership."""
         for req_id in req_ids:
             state = self._direct_store_states.get(req_id)
-            if state is not None and not state.futures and not state.pending_keys:
+            if (
+                state is not None
+                and not state.futures
+                and not state.pending_keys
+                and not state.remote_fill_futures
+                and (
+                    state.remote_fill_last_future is None
+                    or state.remote_fill_last_future.done()
+                )
+            ):
+                if state.remote_fill_session is not None:
+                    if state.remote_fill_terminal is None:
+                        try:
+                            state.remote_fill_session.abort(
+                                "prefiller released request before FINISH"
+                            )
+                            cold_start_perf_log(
+                                logger,
+                                "remote_fill_abort",
+                                req_id=req_id,
+                                reason="request_released_before_finish",
+                            )
+                        except RemoteFillFatalError:
+                            self._latch_remote_fill_producer_fatal(state)
+                            raise
+                        except Exception:
+                            logger.warning(
+                                "Failed to release hidden remote-fill state for %s",
+                                req_id,
+                                exc_info=True,
+                            )
+                    state.remote_fill_session.close()
+                    cold_start_perf_log(
+                        logger,
+                        "remote_fill_release",
+                        req_id=req_id,
+                        terminal=state.remote_fill_terminal is not None,
+                    )
+                if (
+                    state.remote_fill_metrics_started
+                    and state.remote_fill_terminal is None
+                ):
+                    metrics = self._get_remote_fill_producer_metrics()
+                    metrics.finish_attempt("ABORTED", "request aborted")
+                    metrics.abandon("request aborted")
+                    if state.remote_fill_viable_counted:
+                        metrics.add_gauge("direct_viable", -1)
+                        state.remote_fill_viable_counted = False
+                    if state.remote_fill_active_counted:
+                        metrics.add_gauge("active_transactions", -1)
+                        state.remote_fill_active_counted = False
+                    metrics.add_bytes(
+                        "discarded_bytes", state.remote_fill_submitted_bytes
+                    )
                 self._direct_store_states.pop(req_id, None)
             self._live_source_builders.pop(req_id, None)
             self._completed_live_sources.pop(req_id, None)
@@ -2818,6 +4236,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         keys_layer_major: list[list[CacheEngineKey]],
         page_chunks: int,
         base_page_keys: Optional[list[CacheEngineKey]] = None,
+        exact_chunk_locations: Optional[list[str]] = None,
     ) -> tuple[list[list[MemoryObj]], int]:
         """Resolve exact-size full or partial layer pages with legacy fallback."""
         if not 0 < page_chunks <= len(keys_layer_major[0]):
@@ -2833,6 +4252,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         if len(page_keys) != page_chunks:
             raise ValueError("Layer-page retrieval requires one base key per page")
+        if exact_chunk_locations is not None:
+            return self._resolve_shared_rank0_exact_layer_pages(
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                keys_layer_major=keys_layer_major,
+                page_chunks=page_chunks,
+                base_page_keys=page_keys,
+                chunk_locations=exact_chunk_locations,
+            )
 
         local = self._shared_local_cpu_backend()
         assert self.storage_manager is not None
@@ -7137,8 +8566,493 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         # lmcache-ascend end ---------------------
 
+    def _remote_fill_group1_startup_identity(
+        self,
+        layout: RemoteFillDecoderLayout,
+        payload_descriptor: dict[str, object],
+    ) -> dict[str, object]:
+        """Return the rank-local Group-1 shared-page ABI identity."""
+
+        shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+            kv_group=1,
+            num_tokens=1,
+        )
+        group = layout.group(1)
+        if (
+            dtype != group.dtype
+            or fmt != group.fmt
+            or int(shape.numel()) != group.raw_token_dim
+        ):
+            raise ValueError(
+                "remote-fill Group-1 shared-page metadata disagrees with "
+                "the negotiated decoder layout"
+            )
+        return {
+            "model_layout": "mla-dsa-layer-page-v3",
+            "layout_tag": layout.layout_tag,
+            "cache_namespace_tag": layout.cache_namespace_tag,
+            "model_artifact_id": layout.model_artifact_id,
+            "payload_layout_version": int(payload_descriptor.get("version", 0)),
+            "group1_payload_schema": str(
+                payload_descriptor.get("group1_schema_version", "")
+            ),
+            "dsa_index_key_schema": DSA_INDEX_CACHE_SCHEMA,
+            "num_layers": layout.num_layers,
+            "valid_tokens": 1,
+            "shape": [int(dimension) for dimension in shape],
+            "dtype": str(dtype),
+            "format": fmt.name,
+            "logical_bytes": group.expected_bytes(1, layout.num_layers),
+            "shared_cache_generation": int(self.shared_cpu_cache_generation),
+        }
+
+    def _validate_remote_fill_decoder_layout(
+        self,
+        layout: RemoteFillDecoderLayout,
+    ) -> None:
+        """Match both negotiated groups to the model-visible cache layout."""
+
+        for kv_group in (0, 1):
+            shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+                kv_group=kv_group,
+                num_tokens=1,
+            )
+            group = layout.group(kv_group)
+            if (
+                dtype != group.dtype
+                or fmt != group.fmt
+                or int(shape.numel()) != group.raw_token_dim
+            ):
+                raise ValueError(
+                    "remote-fill negotiated group layout disagrees with "
+                    f"decoder cache metadata: kv_group={kv_group}"
+                )
+
+    def _preflight_remote_fill_shared_group1(
+        self,
+        layout: RemoteFillDecoderLayout,
+        payload_descriptor: dict[str, object],
+    ) -> None:
+        """Prove every TP rank can map one real Group-1 layer page.
+
+        This collective is startup-only. Rank 0 allocates and pins a hidden
+        one-token page, broadcasts its compact shared-slab descriptor, and
+        every passive rank creates and validates its ordinary passive view.
+        Every rank then broadcasts one pointer-free acknowledgement. The
+        remote-fill service is advertised only after all acknowledgements
+        succeed.
+        """
+
+        if self.metadata.world_size <= 1:
+            self._remote_fill_shared_group1_supported = True
+            return
+        first_rank = int(self.metadata.first_rank)
+        worker_id = int(self.metadata.worker_id)
+        ranks = tuple(
+            range(first_rank, first_rank + int(self.metadata.world_size))
+        )
+        if worker_id not in ranks:
+            raise ValueError("remote-fill worker rank is outside its TP group")
+
+        rank0_page: Optional[LayerPageMemoryObj] = None
+        rank0_pinned = False
+        payload: Optional[dict[str, object]] = None
+        if self.metadata.is_first_rank():
+            try:
+                local_backend = self._shared_local_cpu_backend()
+                group = layout.group(1)
+                pages = local_backend.batched_allocate_layer_pages(
+                    [group.full_shape(layout.chunk_size)],
+                    [group.dtype],
+                    1,
+                    layout.num_layers,
+                    group.fmt,
+                    busy_loop=False,
+                    valid_tokens=[1],
+                    full_tokens=layout.chunk_size,
+                    eviction=False,
+                )
+                if pages is None or len(pages) != 1:
+                    if pages:
+                        for page in pages:
+                            page.ref_count_down()
+                    raise MemoryError(
+                        "remote-fill Group-1 startup page allocation failed"
+                    )
+                rank0_page = pages[0]
+                if not LayerPageMemoryObj.pin_many([rank0_page]):
+                    raise MemoryError("remote-fill Group-1 startup page pin failed")
+                rank0_pinned = True
+                if (
+                    rank0_page.num_layers != layout.num_layers
+                    or rank0_page.valid_tokens != 1
+                    or rank0_page.get_size()
+                    != group.expected_bytes(1, layout.num_layers)
+                    or rank0_page.get_dtype() != group.dtype
+                    or rank0_page.get_memory_format() != group.fmt
+                ):
+                    raise ValueError(
+                        "remote-fill Group-1 startup allocation layout mismatch"
+                    )
+                self._validate_rank0_shared_mem_obj(
+                    rank0_page,
+                    req_id="remote-fill-startup",
+                    phase="group1-capability",
+                    layer_id=0,
+                    kv_group=1,
+                    chunk_index=0,
+                )
+                startup_key = CacheEngineKey(
+                    layout.model_name,
+                    layout.key_world_size,
+                    0,
+                    0,
+                    group.dtype,
+                    {
+                        "lmcache.tag.payload_v3": layout.layout_tag,
+                        DSA_INDEX_CACHE_SCHEMA_TAG: DSA_INDEX_CACHE_SCHEMA,
+                    },
+                    kv_group=1,
+                )
+                keys = [[startup_key] for _ in range(layout.num_layers)]
+                batch = self._make_shared_handle_batch(
+                    [[rank0_page] for _ in range(layout.num_layers)],
+                    keys,
+                )
+                if batch is None:
+                    raise ValueError(
+                        "remote-fill Group-1 startup page cannot be shared"
+                    )
+                payload = {
+                    "status": "ok",
+                    "identity": self._remote_fill_group1_startup_identity(
+                        layout,
+                        payload_descriptor,
+                    ),
+                    "key": startup_key.to_string(),
+                    "batch": batch.to_dict(),
+                }
+            except Exception as exc:
+                payload = {
+                    "status": "error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+
+        passive_views: list[MemoryObj] = []
+        try:
+            received = self.broadcast_object_fn(payload, first_rank)
+            if self.metadata.is_first_rank():
+                received = payload
+            local_ack: dict[str, object] = {
+                "rank": worker_id,
+                "status": "error",
+                "message": "startup payload was not validated",
+            }
+            try:
+                if not isinstance(received, dict):
+                    raise ValueError("startup payload is not a dictionary")
+                if received.get("status") != "ok":
+                    raise ValueError(
+                        "rank0 Group-1 capability setup failed: "
+                        f"{received.get('message')}"
+                    )
+                expected_identity = self._remote_fill_group1_startup_identity(
+                    layout,
+                    payload_descriptor,
+                )
+                if received.get("identity") != expected_identity:
+                    raise ValueError(
+                        "remote-fill Group-1 startup ABI identity mismatch"
+                    )
+                key_raw = received.get("key")
+                batch_raw = received.get("batch")
+                if not isinstance(key_raw, str) or not isinstance(batch_raw, dict):
+                    raise ValueError("startup shared-page descriptor is incomplete")
+                startup_key = CacheEngineKey.from_string(key_raw)
+                if (
+                    startup_key.kv_group != 1
+                    or startup_key.worker_id != 0
+                    or startup_key.model_name != layout.model_name
+                    or startup_key.world_size != layout.key_world_size
+                    or startup_key.dtype != layout.group(1).dtype
+                ):
+                    raise ValueError("startup shared-page key identity is invalid")
+                batch = SharedHandleBatch.from_dict(batch_raw)
+                if self.metadata.is_first_rank():
+                    if rank0_page is None:
+                        raise ValueError("rank0 startup page owner is missing")
+                    if (
+                        batch.num_layers != layout.num_layers
+                        or batch.num_chunks != 1
+                        or batch.page_offsets
+                        != [int(rank0_page.metadata.address)]
+                        or batch.physical_sizes != [int(rank0_page.layer_size)]
+                        or batch.page_physical_sizes
+                        != [int(rank0_page.metadata.phy_size)]
+                    ):
+                        raise ValueError("rank0 startup shared descriptor is invalid")
+                else:
+                    views = self._make_passive_layer_page_views(
+                        batch,
+                        starts=[0],
+                        ends=[1],
+                        keys_layer_major=[
+                            [startup_key] for _ in range(layout.num_layers)
+                        ],
+                        kv_group=1,
+                    )
+                    passive_views.extend(views)
+                    if len(views) != 1:
+                        raise ValueError(
+                            "passive Group-1 startup mapping returned wrong count"
+                        )
+                    view = views[0]
+                    shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+                        kv_group=1,
+                        num_tokens=1,
+                    )
+                    if (
+                        view.num_layers != layout.num_layers
+                        or view.valid_tokens != 1
+                        or view.get_shape() != shape
+                        or view.get_dtype() != dtype
+                        or view.get_memory_format() != fmt
+                        or view.get_size()
+                        != layout.group(1).expected_bytes(1, layout.num_layers)
+                        or int(view.metadata.address) != batch.page_offsets[0]
+                        or int(view.metadata.phy_size)
+                        != batch.page_physical_sizes[0]
+                    ):
+                        raise ValueError(
+                            "passive Group-1 startup page validation failed"
+                        )
+                local_ack = {"rank": worker_id, "status": "ok", "message": ""}
+            except Exception as exc:
+                local_ack = {
+                    "rank": worker_id,
+                    "status": "error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+
+            acknowledgements: list[dict[str, object]] = []
+            for source_rank in ranks:
+                outbound = local_ack if worker_id == source_rank else None
+                acknowledgement = self.broadcast_object_fn(outbound, source_rank)
+                if worker_id == source_rank and acknowledgement is None:
+                    acknowledgement = outbound
+                if not isinstance(acknowledgement, dict):
+                    acknowledgement = {
+                        "rank": source_rank,
+                        "status": "error",
+                        "message": "invalid acknowledgement",
+                    }
+                acknowledgements.append(acknowledgement)
+            failures = [
+                acknowledgement
+                for source_rank, acknowledgement in zip(
+                    ranks, acknowledgements, strict=True
+                )
+                if acknowledgement.get("rank") != source_rank
+                or acknowledgement.get("status") != "ok"
+            ]
+            if failures:
+                raise ValueError(
+                    "remote-fill Group-1 shared startup capability failed: "
+                    + "; ".join(
+                        f"rank={failure.get('rank')} "
+                        f"error={failure.get('message')}"
+                        for failure in failures
+                    )
+                )
+            self._remote_fill_shared_group1_supported = True
+        finally:
+            self._release_shared_retrieve_objs(passive_views, unpin=False)
+            if rank0_page is not None:
+                if rank0_pinned and rank0_page.is_pinned:
+                    rank0_page.unpin()
+                if rank0_page.is_valid():
+                    rank0_page.ref_count_down()
+
+    def _initialize_decoder_remote_fill(self) -> None:
+        if self._remote_fill_decoder_initialized:
+            return
+        if not bool(self.config.enable_remote_lmcache_store):
+            return
+        if self.metadata.role == "scheduler" or self.config.pd_role == "sender":
+            return
+        if not remote_fill_h0_qualified():
+            # Enabling the prototype configuration before the hardware gate is
+            # qualified must leave the deployed legacy P/D path untouched.
+            self._remote_fill_decoder_initialized = True
+            logger.info(
+                "Remote-fill decoder service remains disabled until Gate H0 "
+                "is explicitly qualified"
+            )
+            return
+        control_host = str(self.config.remote_fill_control_host or "").strip()
+        base_port = self.config.remote_fill_control_port_start
+        is_decoder = self.config.pd_role == "receiver" or bool(
+            control_host and base_port is not None
+        )
+        if not is_decoder:
+            return
+        if not (self.save_only_first_rank and self.save_indexer_only_first_rank):
+            raise ValueError(
+                "remote-fill decoder requires TP0 ownership for both DSA groups"
+            )
+        tp_shared = self.metadata.world_size > 1
+        if tp_shared and not (
+            self.enable_shared_cpu_cache and self.shared_cpu_cache_strict
+        ):
+            raise ValueError(
+                "remote-fill TP>1 decoder requires strict shared LocalCPU storage"
+            )
+        if tp_shared and self.shared_cpu_cache_generation <= 0:
+            raise ValueError(
+                "remote-fill TP>1 decoder requires a completed shared-cache preflight"
+            )
+        if not control_host or base_port is None:
+            raise ValueError("remote-fill decoder control endpoint is not configured")
+        layout_tag, payload_descriptor = mooncake_payload_layout(
+            self.config,
+            self.metadata,
+        )
+        layout = build_decoder_layout(
+            self.config,
+            self.metadata,
+            layout_tag=layout_tag,
+            num_layers=int(self.num_layers),
+        )
+        self._validate_remote_fill_decoder_layout(layout)
+        if tp_shared:
+            self._preflight_remote_fill_shared_group1(
+                layout,
+                payload_descriptor,
+            )
+        if not self.metadata.is_first_rank():
+            if self.shared_cpu_cache_mapping is None:
+                raise ValueError(
+                    "remote-fill passive rank lacks the shared-cache mapping"
+                )
+            self._remote_fill_decoder_initialized = True
+            return
+        if self.storage_manager is None:
+            raise ValueError("remote-fill decoder requires StorageManager on TP0")
+        extra = self.metadata.kv_connector_extra_config or {}
+        dp_rank = int(extra.get("lmcache_remote_fill_destination_dp_rank", 0))
+        dp_size = int(extra.get("lmcache_remote_fill_destination_dp_size", 1))
+        control_port = int(base_port) + dp_rank
+        if dp_size <= 0 or not 0 <= dp_rank < dp_size:
+            raise ValueError("remote-fill decoder DP topology is invalid")
+        if not 0 < control_port < 65536:
+            raise ValueError("remote-fill decoder DP control port is invalid")
+        native_session = self.storage_manager.get_remote_fill_destination_session()
+        if not native_session:
+            raise ValueError(
+                "remote-fill decoder requires a registered GlobalTE session"
+            )
+        local_backend = self._shared_local_cpu_backend()
+        if not callable(getattr(local_backend, "get_allocator_capacity_bytes", None)):
+            raise ValueError(
+                "remote-fill decoder requires constant-time LocalCPU capacity"
+            )
+        if not self._remote_fill_shared_group1_supported:
+            raise ValueError("remote-fill Group-1 shared capability is unavailable")
+        epoch = secrets.randbits(63) or 1
+        runtime = create_decoder_remote_fill_runtime(
+            config=self.config,
+            metadata=self.metadata,
+            local_backend=local_backend,
+            layout=layout,
+            destination_engine_epoch=epoch,
+            destination_dp_rank=dp_rank,
+            destination_dp_size=dp_size,
+            destination_remote_session=native_session,
+            control_host=control_host,
+            control_port=control_port,
+            shared_cache_generation=int(self.shared_cpu_cache_generation),
+            capacity_available=self._remote_fill_capacity_available,
+            fatal_restart=self._remote_fill_require_paired_restart,
+            global_te_push=True,
+            save_only_first_rank=self.save_only_first_rank,
+            save_indexer_only_first_rank=self.save_indexer_only_first_rank,
+            shared_cpu_cache_strict=self.shared_cpu_cache_strict,
+        )
+        runtime.start()
+        self._remote_fill_runtime = runtime
+        self._remote_fill_decoder_initialized = True
+        logger.info(
+            "Remote-fill decoder service started: endpoint=%s dp_rank=%d "
+            "generation=%d native_qualified=%s",
+            runtime.placement.control_endpoint,
+            dp_rank,
+            self.shared_cpu_cache_generation,
+            True,
+        )
+
+    def _remote_fill_capacity_available(self, requested_bytes: int) -> bool:
+        if requested_bytes < 0:
+            return False
+        try:
+            free_bytes, heap_bytes = (
+                self._shared_local_cpu_backend().get_allocator_capacity_bytes()
+            )
+        except (NotImplementedError, RuntimeError):
+            return False
+        reserve = max(
+            int(self.config.remote_fill_min_free_bytes),
+            int(heap_bytes * float(self.config.remote_fill_min_free_ratio)),
+        )
+        return free_bytes - requested_bytes >= reserve
+
+    def _remote_fill_require_paired_restart(
+        self,
+        transfer_ids: tuple[str, ...],
+    ) -> None:
+        normalized = tuple(sorted({item for item in transfer_ids if item}))
+        if not normalized:
+            return
+        lock = getattr(self, "_remote_fill_fatal_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._remote_fill_fatal_lock = lock
+        with lock:
+            previous = self._remote_fill_fatal_transfers
+            self._remote_fill_fatal_transfers = tuple(
+                sorted(set(previous).union(normalized))
+            )
+            first_report = not previous
+        if first_report:
+            self.mark_init_failed(
+                "remote-fill armed transfer requires paired P+D restart"
+            )
+        logger.critical(
+            "Remote-fill process requires paired restart: transfer_count=%d",
+            len(self._remote_fill_fatal_transfers),
+        )
+        logger.critical(
+            '[LMCACHE_REMOTE_FILL] {"schema":1,'
+            '"event":"remote_fill_fatal_restart","count":%d}',
+            len(self._remote_fill_fatal_transfers),
+        )
+
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
+        runtime = self._remote_fill_runtime
+        if runtime is not None:
+            runtime.close()
+            if self._remote_fill_fatal_transfers:
+                # An ARMED/FATAL_UNKNOWN native writer may still target these
+                # registered addresses. Deliberately retain the runtime and
+                # allocator ownership until the supervisor terminates both P
+                # and D; normal LocalCPU teardown could otherwise free/reuse
+                # memory while a remote DMA is still in flight.
+                raise RuntimeError(
+                    "remote-fill shutdown requires paired P+D restart; "
+                    "LocalCPU memory was deliberately retained"
+                )
+            self._remote_fill_runtime = None
+        self.close_remote_fill_producer()
         self.wait_for_direct_stores(tuple(self._direct_store_states))
         self._direct_store_states.clear()
         self._live_source_builders.clear()
