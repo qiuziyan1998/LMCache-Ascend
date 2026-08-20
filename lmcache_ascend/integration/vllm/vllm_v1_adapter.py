@@ -131,6 +131,26 @@ def _prepare_remote_fill_persistent_placement(
     return True
 
 
+def _validate_remote_fill_sleep_mode(config: Any, vllm_config: Any) -> None:
+    """Reject an allocator lifecycle that cannot yet drain armed writes."""
+
+    if (
+        getattr(config, "enable_remote_lmcache_store", False)
+        and remote_fill_h0_qualified()
+        and bool(
+            getattr(
+                getattr(vllm_config, "model_config", None),
+                "enable_sleep_mode",
+                False,
+            )
+        )
+    ):
+        raise ValueError(
+            "direct remote LMCache store is incompatible with vLLM sleep mode "
+            "until armed transfers can be drained before allocator changes"
+        )
+
+
 @dataclass
 class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
     descriptors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -184,6 +204,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         self.store_async = self.config.store_async
         get_extra = getattr(self.config, "get_extra_config_value", None)
+        _validate_remote_fill_sleep_mode(self.config, vllm_config)
         self._remote_store_requested = bool(
             getattr(self.config, "enable_remote_lmcache_store", False)
             and getattr(self.config, "pd_role", None) != "receiver"
@@ -215,6 +236,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._unfenced_live_stores: dict[str, ReqMeta] = {}
         self._latest_live_source_ready_event: Any = None
         self._latest_live_source_ready_event_source = "missing"
+        self._latest_direct_source_ready_events: dict[str, Any] = {}
         self._live_source_ready_fences: dict[str, _LiveSourceReadyFence] = {}
         self._finalized_live_source_submissions: set[str] = set()
 
@@ -424,6 +446,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             self._direct_store_observed_layers.clear()
             self._latest_live_source_ready_event = None
             self._latest_live_source_ready_event_source = "missing"
+            getattr(self, "_latest_direct_source_ready_events", {}).clear()
             for key in list(self._completed_layerwise_stores):
                 if key[0] in req_ids:
                     self._completed_layerwise_stores.pop(key, None)
@@ -552,15 +575,23 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
             return
         if layer_name in expected:
+            direct_ready_events = getattr(
+                self, "_latest_direct_source_ready_events", None
+            )
+            if direct_ready_events is None:
+                direct_ready_events = {}
+                self._latest_direct_source_ready_events = direct_ready_events
             if layer_name in self._direct_store_observed_layers:
                 self._direct_store_observed_layers.clear()
                 self._latest_live_source_ready_event = None
                 self._latest_live_source_ready_event_source = "missing"
+                direct_ready_events.clear()
             self._direct_store_observed_layers.add(layer_name)
             source_ready_event = LMCacheAscendConnectorV1Impl._source_ready_event(
                 layer_name, attn_metadata
             )
             if source_ready_event is not None:
+                direct_ready_events[layer_name] = source_ready_event
                 self._latest_live_source_ready_event = source_ready_event
                 self._latest_live_source_ready_event_source = (
                     "attn_metadata.reshape_cache_event"
@@ -568,16 +599,27 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if not expected.issubset(self._direct_store_observed_layers):
             return
 
+        complete_events = getattr(
+            self, "_latest_direct_source_ready_events", {}
+        )
+        source_ready_events: tuple[Any, ...] = ()
+        if expected.issubset(complete_events):
+            unique_events: dict[int, Any] = {}
+            for producer_event in complete_events.values():
+                unique_events.setdefault(id(producer_event), producer_event)
+            source_ready_events = tuple(unique_events.values())
         self._submit_direct_prefill_requests(
             requests,
             source_ready_event=self._latest_live_source_ready_event,
             source_ready_event_source=(
                 self._latest_live_source_ready_event_source
             ),
+            source_ready_events=source_ready_events,
         )
         self._direct_store_observed_layers.clear()
         self._latest_live_source_ready_event = None
         self._latest_live_source_ready_event_source = "missing"
+        getattr(self, "_latest_direct_source_ready_events", {}).clear()
 
     def _direct_group_caches(self) -> dict[int, list]:
         self._refresh_kvcaches_list()
@@ -651,6 +693,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         *,
         source_ready_event: Any = None,
         source_ready_event_source: str = "missing",
+        source_ready_events: tuple[Any, ...] = (),
     ) -> None:
         """Submit direct pages; also used by the wait-for-save fallback."""
         assert self.lmcache_engine is not None
@@ -869,6 +912,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     accepted_store_end=len(request.token_ids),
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
+                    source_ready_events=source_ready_events,
                 )
             if (
                 finalized_live
@@ -1020,10 +1064,25 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         source_ready_event_source = getattr(
             self, "_latest_live_source_ready_event_source", "missing"
         )
+        direct_ready_events = dict(
+            getattr(self, "_latest_direct_source_ready_events", {})
+        )
+        expected_direct_layers = set(self._latent_layer_names)
+        if self.config.dsa_two_groups:
+            expected_direct_layers.update(self._indexer_layer_names)
+        source_ready_events: tuple[Any, ...] = ()
+        if expected_direct_layers and expected_direct_layers.issubset(
+            direct_ready_events
+        ):
+            unique_events: dict[int, Any] = {}
+            for producer_event in direct_ready_events.values():
+                unique_events.setdefault(id(producer_event), producer_event)
+            source_ready_events = tuple(unique_events.values())
         self._direct_store_step_supported = None
         self._direct_store_observed_layers.clear()
         self._latest_live_source_ready_event = None
         self._latest_live_source_ready_event_source = "missing"
+        getattr(self, "_latest_direct_source_ready_events", {}).clear()
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
             try:
                 self.lmcache_engine.wait_for_pending_sync_stores()
@@ -1060,6 +1119,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     adopted_requests,
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
+                    source_ready_events=source_ready_events,
                 )
             final_ids = {
                 request.req_id for request in requests if request.is_last_prefill

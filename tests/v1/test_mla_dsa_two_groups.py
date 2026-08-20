@@ -2318,7 +2318,45 @@ def test_save_layer_carries_final_indexer_producer_event() -> None:
     assert submitted[0][1]["source_ready_event_source"] == (
         "attn_metadata.reshape_cache_event"
     )
+    assert submitted[0][1]["source_ready_events"] == (event,)
     assert adapter._latest_live_source_ready_event is None
+
+
+def test_save_layer_preserves_distinct_group_producer_fences() -> None:
+    latent_event = object()
+    index_event = object()
+    submitted = []
+    request = SimpleNamespace(req_id="request")
+    adapter = _ascend_adapter_fake(
+        config=SimpleNamespace(dsa_two_groups=True),
+        _latent_layer_names=("latent",),
+        _indexer_layer_names=("index",),
+        _direct_prefill_requests=lambda: [request],
+        _preflight_direct_store=lambda _requests: True,
+        _submit_direct_prefill_requests=lambda requests, **kwargs: submitted.append(
+            (requests, kwargs)
+        ),
+        _latest_live_source_ready_event=None,
+        _latest_live_source_ready_event_source="missing",
+    )
+
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "latent",
+        object(),
+        SimpleNamespace(reshape_cache_event=latent_event),
+    )
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "index",
+        object(),
+        SimpleNamespace(reshape_cache_event=index_event),
+    )
+
+    assert submitted[0][1]["source_ready_events"] == (
+        latent_event,
+        index_event,
+    )
 
 
 def test_source_ready_event_uses_matching_layer_metadata() -> None:

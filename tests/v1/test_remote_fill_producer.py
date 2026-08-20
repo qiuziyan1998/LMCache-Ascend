@@ -55,6 +55,7 @@ from lmcache_ascend.v1.remote_fill_producer import (
     RemoteFillHandoff,
     RemoteFillProducerMetrics,
     RemoteFillProducerSession,
+    RemoteFillNegotiationCache,
     RemoteFillStaticSpec,
     RemoteFillTerminalResult,
     parse_remote_fill_handoff,
@@ -65,6 +66,24 @@ _SECRET = b"s" * 32
 _EPOCH = 17
 _GENERATION = 23
 _SESSION = "decoder-global-te"
+
+
+def test_remote_fill_rejects_vllm_sleep_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lmcache_ascend.integration.vllm import vllm_v1_adapter
+
+    monkeypatch.setattr(vllm_v1_adapter, "remote_fill_h0_qualified", lambda: True)
+    config = SimpleNamespace(enable_remote_lmcache_store=True)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enable_sleep_mode=True)
+    )
+
+    with pytest.raises(ValueError, match="incompatible with vLLM sleep mode"):
+        vllm_v1_adapter._validate_remote_fill_sleep_mode(config, vllm_config)
+
+    vllm_config.model_config.enable_sleep_mode = False
+    vllm_v1_adapter._validate_remote_fill_sleep_mode(config, vllm_config)
 
 
 def _handoff(**overrides: Any) -> RemoteFillHandoff:
@@ -147,6 +166,7 @@ class _ScriptedClient:
         fail_reserve: bool = False,
         fail_report_replies: int = 0,
         report_status_native_state: DestinationNativeState | None = None,
+        fail_finish_replies: int = 0,
         fatal_on: type | None = None,
     ) -> None:
         self.reserve_dispositions = reserve_dispositions
@@ -157,6 +177,8 @@ class _ScriptedClient:
         self.fail_reserve = fail_reserve
         self.fail_report_replies = fail_report_replies
         self.report_status_native_state = report_status_native_state
+        self.fail_finish_replies = fail_finish_replies
+        self.finish_committed = False
         self.fatal_on = fatal_on
         self.requests: list[Any] = []
         self.closed = False
@@ -270,6 +292,12 @@ class _ScriptedClient:
                 raise TimeoutError("ARM response lost")
             return self._response(request, ResultCode.OK)
         if isinstance(request, StatusRequest):
+            if request.window_id < 0 and self.finish_committed:
+                return self._response(
+                    request,
+                    ResultCode.OK,
+                    terminal_outcome=TerminalOutcome.LOCAL_FULL,
+                )
             armed = self.arm_status_armed
             native_state = self.report_status_native_state or (
                 DestinationNativeState.ARMED
@@ -298,6 +326,10 @@ class _ScriptedClient:
                 raise ReplyLostError("REPORT_TRANSFER_COMPLETE reply lost")
             return self._response(request, ResultCode.OK)
         if isinstance(request, FinishRequest):
+            self.finish_committed = True
+            if self.fail_finish_replies > 0:
+                self.fail_finish_replies -= 1
+                raise ReplyLostError("FINISH reply lost")
             return self._response(
                 request,
                 ResultCode.OK,
@@ -315,6 +347,7 @@ def _session(
     client: _ScriptedClient,
     *,
     native_hard_timeout_seconds: float = 120.0,
+    negotiation_cache: RemoteFillNegotiationCache | None = None,
 ) -> RemoteFillProducerSession:
     return RemoteFillProducerSession(
         request_id="request-1",
@@ -325,7 +358,30 @@ def _session(
         planned_window_count_hint=1,
         required_store_end_hint=1024,
         native_hard_timeout_seconds=native_hard_timeout_seconds,
+        negotiation_cache=negotiation_cache,
     )
+
+
+def test_static_negotiation_is_cached_for_decoder_epoch() -> None:
+    cache = RemoteFillNegotiationCache()
+    first_client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+    )
+    second_client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+    )
+
+    assert _session(first_client, negotiation_cache=cache).open()
+    assert _session(second_client, negotiation_cache=cache).open()
+
+    assert (
+        sum(isinstance(item, NegotiateRequest) for item in first_client.requests)
+        == 1
+    )
+    assert not any(
+        isinstance(item, NegotiateRequest) for item in second_client.requests
+    )
+    assert sum(isinstance(item, OpenRequest) for item in second_client.requests) == 1
 
 
 def _source_plan() -> DirectPushSourcePlan:
@@ -412,6 +468,32 @@ def test_transfer_arms_only_allocated_descriptor_subset() -> None:
     )
     assert terminal.outcome == "LOCAL_FULL"
     assert any(isinstance(item, FinishRequest) for item in client.requests)
+
+
+def test_lost_finish_reply_recovers_committed_local_full_with_status() -> None:
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING),
+        fail_finish_replies=2,
+    )
+    session = _session(client)
+    result = session.probe_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=_pages(),
+    )
+    assert result.direct_satisfied
+
+    terminal = session.finish(
+        required_store_end=1024,
+        persistent_common_end=1024,
+    )
+
+    assert terminal.outcome == "LOCAL_FULL"
+    assert sum(isinstance(item, FinishRequest) for item in client.requests) == 2
+    assert any(
+        isinstance(item, StatusRequest) and item.window_id == -1
+        for item in client.requests
+    )
 
 
 def test_probe_hole_latches_persistent_only_without_arm() -> None:
@@ -1098,7 +1180,7 @@ def test_remote_fill_layout_and_secret_are_bound_once_per_engine(monkeypatch) ->
     assert calls == {"layout_tag": 1, "layout": 1, "secret": 1}
 
 
-def test_direct_page_batch_retains_same_owner_and_producer_event() -> None:
+def test_direct_page_batch_retains_same_owner_and_all_producer_events() -> None:
     class _Key:
         kv_group = 0
 
@@ -1117,6 +1199,7 @@ def test_direct_page_batch_retains_same_owner_and_producer_event() -> None:
 
     owner = object()
     event = object()
+    second_event = object()
     batch = _DirectPageBatch(
         req_id="request",
         keys=[_Key()],
@@ -1126,6 +1209,7 @@ def test_direct_page_batch_retains_same_owner_and_producer_event() -> None:
         ready_event=event,
         group_ends={0: 1024},
         ranges=((0, 1024),),
+        ready_events=(event, second_event),
     )
     storage = _Storage()
     engine = object.__new__(AscendLMCacheEngine)
@@ -1144,7 +1228,7 @@ def test_direct_page_batch_retains_same_owner_and_producer_event() -> None:
     assert storage.args[3] is batch.owners
     assert storage.args[4] is event
     assert direct_plan.owners is batch.owners
-    assert direct_plan.producer_events == (event,)
+    assert direct_plan.producer_events == (event, second_event)
     storage.future.set_result(None)
 
 
@@ -1235,3 +1319,29 @@ def test_ambiguous_armed_window_blocks_finalize_and_release() -> None:
         )
     with pytest.raises(RemoteFillFatalError):
         engine.drop_direct_store_states(("request",))
+
+
+@pytest.mark.parametrize(
+    ("token_end", "slot_mapping_base", "chunk_size", "expected"),
+    [
+        (0, 0, 1024, False),
+        (18878, 18877, 1024, False),
+        (18878, 18432, 1024, True),
+        (18878, 18000, 1024, True),
+        (18878, 0, 0, False),
+    ],
+)
+def test_remote_fill_requires_one_complete_source_page(
+    token_end: int,
+    slot_mapping_base: int,
+    chunk_size: int,
+    expected: bool,
+) -> None:
+    assert (
+        AscendLMCacheEngine._remote_fill_has_addressable_source_page(
+            token_end,
+            slot_mapping_base,
+            chunk_size,
+        )
+        is expected
+    )

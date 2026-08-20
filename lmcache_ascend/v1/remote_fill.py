@@ -4,6 +4,7 @@
 # Standard
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -49,6 +50,42 @@ REMOTE_FILL_SECRET_FILE_ENV = "LMCACHE_REMOTE_FILL_HMAC_SECRET_FILE"
 REMOTE_FILL_H0_QUALIFICATION_ENV = "LMCACHE_REMOTE_FILL_H0_QUALIFICATION"
 REMOTE_FILL_MODEL_LAYOUT = "mla-dsa-layer-page-v3"
 _MAX_SECRET_FILE_BYTES = 4096
+
+
+def _format_tcp_host(host: str) -> str:
+    """Bracket literal IPv6 addresses for ZeroMQ TCP endpoints."""
+
+    host = host.strip()
+    normalized = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return (
+            f"[{normalized}]"
+            if ipaddress.ip_address(normalized).version == 6
+            else normalized
+        )
+    except ValueError:
+        return host
+
+
+def _validate_advertised_control_host(host: str) -> str:
+    """Reject bind-only or local-only addresses from placement metadata."""
+
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if not host or host in {"*", "0.0.0.0", "::", "localhost"}:
+        raise ValueError(
+            "remote-fill advertised control host must be a routable address"
+        )
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.is_unspecified or address.is_loopback:
+        raise ValueError(
+            "remote-fill advertised control host must not be wildcard or loopback"
+        )
+    return host
 
 
 def _log_remote_fill_event(event: str, **fields: object) -> None:
@@ -1120,6 +1157,7 @@ def create_decoder_remote_fill_runtime(
     destination_dp_size: int,
     destination_remote_session: str,
     control_host: str,
+    control_advertise_host: str | None = None,
     control_port: int,
     shared_cache_generation: int,
     capacity_available: Callable[[int], bool],
@@ -1142,7 +1180,9 @@ def create_decoder_remote_fill_runtime(
         destination_dp_rank: Selected data-parallel rank.
         destination_dp_size: Deployment data-parallel size.
         destination_remote_session: Registered decoder GlobalTE session.
-        control_host: Private interface advertised to the prefiller.
+        control_host: Interface on which the decoder service binds.
+        control_advertise_host: Routable host advertised to the prefiller. If
+            omitted, ``control_host`` must itself be routable.
         control_port: Dedicated control port for this decoder DP rank.
         shared_cache_generation: Current registered shared-slab generation.
         capacity_available: Nonblocking ordinary-cache headroom check.
@@ -1187,6 +1227,9 @@ def create_decoder_remote_fill_runtime(
         raise ValueError("remote-fill destination DP rank is out of range")
     if not control_host or not 0 < control_port < 65536:
         raise ValueError("remote-fill control endpoint is invalid")
+    advertised_host = _validate_advertised_control_host(
+        control_advertise_host or control_host
+    )
     engine_id = str(metadata.engine_id or "").strip()
     if not engine_id:
         raise ValueError("remote-fill decoder requires destination engine_id")
@@ -1235,10 +1278,11 @@ def create_decoder_remote_fill_runtime(
         terminal_record_ttl_sec=float(config.remote_fill_terminal_record_ttl_sec),
     )
     service = RemoteFillService(state, limits)
-    endpoint = f"{control_host}:{control_port}"
+    bind_endpoint = f"{_format_tcp_host(control_host)}:{control_port}"
+    advertised_endpoint = f"{_format_tcp_host(advertised_host)}:{control_port}"
     if server_factory is None:
         transport = ZmqRouterServerTransport(
-            endpoint,
+            bind_endpoint,
             recv_timeout_ms=100,
             protocol="tcp",
             max_frame_bytes=limits.max_rpc_message_bytes + 16,
@@ -1256,7 +1300,7 @@ def create_decoder_remote_fill_runtime(
         enabled=True,
         destination_engine_id=engine_id,
         destination_engine_epoch=destination_engine_epoch,
-        control_endpoint=f"tcp://{endpoint}",
+        control_endpoint=f"tcp://{advertised_endpoint}",
         shared_cache_generation=shared_cache_generation,
         protocol_version=PROTOCOL_VERSION,
         layout_tag=layout.layout_tag,

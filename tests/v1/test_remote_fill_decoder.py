@@ -27,7 +27,10 @@ import pytest
 import torch
 
 # First Party
-from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
+from lmcache_ascend.v1.cache_engine import (
+    AscendLMCacheEngine,
+    _validate_remote_fill_control_port,
+)
 from lmcache_ascend.v1.remote_fill import (
     AscendRemoteFillPageLifecycle,
     DecoderRemoteFillRuntime,
@@ -1028,6 +1031,7 @@ def _config(*, shared: bool) -> SimpleNamespace:
         remote_fill_max_reserved_bytes=4096,
         remote_fill_max_bytes_per_request=4096,
         remote_fill_reservation_ttl_sec=30,
+        remote_fill_descriptor_ttl_sec=10,
         remote_fill_native_hard_timeout_ms=120000,
         remote_fill_terminal_record_ttl_sec=300,
     )
@@ -1055,6 +1059,7 @@ def test_runtime_requires_tp0_and_strict_shared_storage_for_tp_gt_one(
         destination_dp_size=1,
         destination_remote_session="decoder:1234",
         control_host="127.0.0.1",
+        control_advertise_host="10.0.0.2",
         control_port=19000,
         shared_cache_generation=11,
         capacity_available=lambda size: True,
@@ -1095,6 +1100,7 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
         destination_dp_size=1,
         destination_remote_session="decoder:1234",
         control_host="127.0.0.1",
+        control_advertise_host="10.0.0.2",
         control_port=19000,
         shared_cache_generation=0,
         capacity_available=lambda size: True,
@@ -1113,8 +1119,100 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
     assert placement["destination_tp_size"] == 1
     assert placement["destination_dp_size"] == 1
     assert placement["global_te_push"] is True
+    assert placement["control_endpoint"] == "tcp://10.0.0.2:19000"
     assert placement["token_hash_algorithm"] == "builtin"
     assert placement["python_hash_seed"] == "0"
     assert all("ptr" not in key and "secret" not in key for key in placement)
     runtime.close()
     assert server.closed
+
+
+def test_runtime_separates_bind_and_ipv6_advertised_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    runtime = create_decoder_remote_fill_runtime(
+        config=_config(shared=False),
+        metadata=_metadata(world_size=1),
+        local_backend=_FakeLocalBackend(),
+        layout=_layout(),
+        destination_engine_epoch=7,
+        destination_dp_rank=0,
+        destination_dp_size=1,
+        destination_remote_session="decoder:1234",
+        control_host="0.0.0.0",
+        control_advertise_host="2001:db8::7",
+        control_port=19000,
+        shared_cache_generation=0,
+        capacity_available=lambda size: True,
+        fatal_restart=lambda transfers: None,
+        global_te_push=True,
+        save_only_first_rank=True,
+        save_indexer_only_first_rank=True,
+        shared_cpu_cache_strict=False,
+        deployment_secret=b"x" * 32,
+        server_factory=lambda service: _FakeServer(),
+    )
+
+    assert runtime.placement.control_endpoint == "tcp://[2001:db8::7]:19000"
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    "host", ["0.0.0.0", "::", "[::]", "127.0.0.1", "localhost"]
+)
+def test_runtime_rejects_nonroutable_advertised_host(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    with pytest.raises(ValueError, match="advertised control host"):
+        create_decoder_remote_fill_runtime(
+            config=_config(shared=False),
+            metadata=_metadata(world_size=1),
+            local_backend=_FakeLocalBackend(),
+            layout=_layout(),
+            destination_engine_epoch=7,
+            destination_dp_rank=0,
+            destination_dp_size=1,
+            destination_remote_session="decoder:1234",
+            control_host=host,
+            control_port=19000,
+            shared_cache_generation=0,
+            capacity_available=lambda size: True,
+            fatal_restart=lambda transfers: None,
+            global_te_push=True,
+            save_only_first_rank=True,
+            save_indexer_only_first_rank=True,
+            shared_cpu_cache_strict=False,
+            deployment_secret=b"x" * 32,
+            server_factory=lambda service: _FakeServer(),
+        )
+
+
+def test_remote_fill_control_port_range_rejects_overflow_and_collision() -> None:
+    assert (
+        _validate_remote_fill_control_port(
+            19000,
+            1,
+            2,
+            internal_api_enabled=True,
+            internal_api_port_start=6999,
+        )
+        == 19001
+    )
+    with pytest.raises(ValueError, match="control port"):
+        _validate_remote_fill_control_port(
+            65535,
+            0,
+            2,
+            internal_api_enabled=False,
+            internal_api_port_start=6999,
+        )
+    with pytest.raises(ValueError, match="overlap"):
+        _validate_remote_fill_control_port(
+            6998,
+            0,
+            2,
+            internal_api_enabled=True,
+            internal_api_port_start=6999,
+        )

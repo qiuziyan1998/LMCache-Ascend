@@ -109,6 +109,41 @@ class RemoteFillStaticSpec:
     python_hash_seed: str
 
 
+class RemoteFillNegotiationCache:
+    """Process-local cache for immutable decoder-epoch negotiation."""
+
+    def __init__(self, max_entries: int = 128) -> None:
+        if max_entries <= 0:
+            raise ValueError("negotiation cache bound must be positive")
+        self._lock = Lock()
+        self._max_entries = max_entries
+        self._accepted: set[tuple[Any, ...]] = set()
+
+    @staticmethod
+    def key(
+        handoff: RemoteFillHandoff,
+        spec: RemoteFillStaticSpec,
+    ) -> tuple[Any, ...]:
+        return (
+            handoff.control_endpoint,
+            handoff.destination_engine_id,
+            handoff.destination_engine_epoch,
+            handoff.shared_cache_generation,
+            handoff.destination_dp_rank,
+            spec,
+        )
+
+    def contains(self, key: tuple[Any, ...]) -> bool:
+        with self._lock:
+            return key in self._accepted
+
+    def record(self, key: tuple[Any, ...]) -> None:
+        with self._lock:
+            if key not in self._accepted and len(self._accepted) >= self._max_entries:
+                self._accepted.pop()
+            self._accepted.add(key)
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteFillWindowResult:
     """Terminal producer knowledge for one bounded control window."""
@@ -426,14 +461,14 @@ def load_remote_fill_hmac_secret() -> bytes:
 def create_remote_fill_client(
     endpoint: str,
     *,
-    timeout_ms: int,
+    operation_timeouts_ms: Mapping[OperationKind, int],
     limits: ProtocolLimits,
 ) -> RemoteFillClient:
     """Create a one-rank client over LMCache's existing RPC transport.
 
     Args:
         endpoint: Decoder endpoint in ``protocol://address`` form.
-        timeout_ms: Bounded request/reply timeout.
+        operation_timeouts_ms: Positive request/reply timeout per operation.
         limits: Shared protocol codec bounds.
 
     Returns:
@@ -446,13 +481,19 @@ def create_remote_fill_client(
     if "://" not in endpoint:
         raise ValueError("remote-fill endpoint must include its protocol")
     protocol, socket_path = endpoint.split("://", 1)
-    if not protocol or not socket_path or timeout_ms <= 0:
+    timeouts = dict(operation_timeouts_ms)
+    if not protocol or not socket_path or not timeouts or any(
+        timeout <= 0 for timeout in timeouts.values()
+    ):
         raise ValueError("remote-fill endpoint or timeout is invalid")
     transport = ZmqReqRepClientTransport(
         [SocketParams(socket_path, 0, protocol)],
-        timeout_ms=timeout_ms,
+        timeout_ms=max(timeouts.values()),
     )
-    return RemoteFillClient(RpcRemoteFillByteTransport(transport, limits))
+    return RemoteFillClient(
+        RpcRemoteFillByteTransport(transport, limits),
+        operation_timeouts_ms=timeouts,
+    )
 
 
 class RemoteFillProducerSession:
@@ -469,6 +510,7 @@ class RemoteFillProducerSession:
         planned_window_count_hint: int,
         required_store_end_hint: int,
         native_hard_timeout_seconds: float = 120.0,
+        negotiation_cache: RemoteFillNegotiationCache | None = None,
     ) -> None:
         """Create a request-local session without issuing network traffic."""
 
@@ -482,6 +524,7 @@ class RemoteFillProducerSession:
         if native_hard_timeout_seconds <= 0:
             raise ValueError("native hard timeout must be positive")
         self.native_hard_timeout_seconds = float(native_hard_timeout_seconds)
+        self.negotiation_cache = negotiation_cache
         self.direct_viable = True
         self.opened = False
         self.closed = False
@@ -513,34 +556,44 @@ class RemoteFillProducerSession:
         ):
             self.direct_viable = False
             return False
-        negotiate = NegotiateRequest(
-            common=self._common(),
-            cache_namespace_tag=self.static_spec.cache_namespace_tag,
-            layout_tag=self.static_spec.layout_tag,
-            model_artifact_id=self.static_spec.model_artifact_id,
-            chunk_size=self.static_spec.chunk_size,
-            model_layout=self.static_spec.model_layout,
-            group_dimensions=self.static_spec.group_dimensions,
-            layer_count=self.static_spec.layer_count,
-            save_only_first_rank=self.static_spec.save_only_first_rank,
-            shared_group1=self.static_spec.shared_group1,
-            tp_size=self.static_spec.tp_size,
-            dp_size=self.static_spec.dp_size,
-            global_te_push=self.static_spec.global_te_push,
-            token_hash_algorithm=self.static_spec.token_hash_algorithm,
-            python_hash_seed=self.static_spec.python_hash_seed,
+        negotiation_key = RemoteFillNegotiationCache.key(
+            self.handoff, self.static_spec
         )
-        try:
-            negotiated = self._execute(negotiate)
-        except RemoteFillFatalError:
-            raise
-        except Exception:
-            self.prearm_control_unknown = True
-            self.direct_viable = False
-            return False
-        if not self._accepted(negotiated):
-            self.direct_viable = False
-            return False
+        negotiation_cached = bool(
+            self.negotiation_cache is not None
+            and self.negotiation_cache.contains(negotiation_key)
+        )
+        if not negotiation_cached:
+            negotiate = NegotiateRequest(
+                common=self._common(),
+                cache_namespace_tag=self.static_spec.cache_namespace_tag,
+                layout_tag=self.static_spec.layout_tag,
+                model_artifact_id=self.static_spec.model_artifact_id,
+                chunk_size=self.static_spec.chunk_size,
+                model_layout=self.static_spec.model_layout,
+                group_dimensions=self.static_spec.group_dimensions,
+                layer_count=self.static_spec.layer_count,
+                save_only_first_rank=self.static_spec.save_only_first_rank,
+                shared_group1=self.static_spec.shared_group1,
+                tp_size=self.static_spec.tp_size,
+                dp_size=self.static_spec.dp_size,
+                global_te_push=self.static_spec.global_te_push,
+                token_hash_algorithm=self.static_spec.token_hash_algorithm,
+                python_hash_seed=self.static_spec.python_hash_seed,
+            )
+            try:
+                negotiated = self._execute(negotiate)
+            except RemoteFillFatalError:
+                raise
+            except Exception:
+                self.prearm_control_unknown = True
+                self.direct_viable = False
+                return False
+            if not self._accepted(negotiated):
+                self.direct_viable = False
+                return False
+            if self.negotiation_cache is not None:
+                self.negotiation_cache.record(negotiation_key)
         try:
             opened = self._execute(
                 OpenRequest(
@@ -1070,11 +1123,10 @@ class RemoteFillProducerSession:
             except RemoteFillFatalError:
                 raise
             except Exception:
-                # All native attempts are already terminal. An unknown atomic
-                # publish reply is safe to route as persistent-only: any local
-                # pages are either validly committed or remain invisible.
-                self.direct_viable = False
-                outcome = TerminalOutcome.PERSISTENT_ONLY.value
+                # FINISH may have committed before its reply was lost. Resolve
+                # the transaction-level terminal state instead of discarding
+                # valid decoder-local pages and under-reporting LOCAL_FULL.
+                outcome = self._resolve_ambiguous_finish()
             else:
                 if response.fatal_restart_required:
                     outcome = TerminalOutcome.FATAL_RESTART.value
@@ -1092,6 +1144,61 @@ class RemoteFillProducerSession:
         )
         self.closed = True
         return self._terminal
+
+    def _resolve_ambiguous_finish(self) -> str:
+        """Resolve a lost FINISH reply without resubmitting publication."""
+
+        try:
+            response = self._execute(
+                StatusRequest(common=self._common(), window_id=-1)
+            )
+        except RemoteFillFatalError:
+            raise
+        except Exception:
+            self.direct_viable = False
+            return TerminalOutcome.PERSISTENT_ONLY.value
+        if response.fatal_restart_required or (
+            response.terminal_outcome is TerminalOutcome.FATAL_RESTART
+        ):
+            self.fatal_restart_required = True
+            raise RemoteFillFatalError(
+                "decoder reported fatal state while resolving FINISH"
+            )
+        if any(
+            window.native_state
+            in (
+                DestinationNativeState.ARMED,
+                DestinationNativeState.FATAL_UNKNOWN,
+            )
+            for window in response.windows
+        ):
+            self.fatal_restart_required = True
+            raise RemoteFillFatalError(
+                "decoder still owns an ambiguous native attempt after FINISH"
+            )
+        if response.terminal_outcome in (
+            TerminalOutcome.LOCAL_FULL,
+            TerminalOutcome.PERSISTENT_ONLY,
+            TerminalOutcome.PERSISTENCE_FAILED,
+            TerminalOutcome.CANCELLED,
+        ):
+            return response.terminal_outcome.value
+        # All native operations were terminal before FINISH. If publication
+        # did not happen, explicitly abort the still-hidden transaction so it
+        # cannot retain decoder pages indefinitely.
+        try:
+            self._execute(
+                AbortRequest(
+                    common=self._common(),
+                    reason="FINISH terminal state could not be confirmed",
+                )
+            )
+        except RemoteFillFatalError:
+            raise
+        except Exception:
+            pass
+        self.direct_viable = False
+        return TerminalOutcome.PERSISTENT_ONLY.value
 
     def abort(self, reason: str) -> None:
         """Release a nonfatal hidden transaction that will not be finished."""

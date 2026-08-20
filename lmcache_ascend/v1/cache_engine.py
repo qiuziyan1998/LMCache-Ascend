@@ -58,7 +58,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_payload_layout,
     mooncake_page_layout_enabled,
 )
-from lmcache.v1.remote_fill import ControlPage, ProtocolLimits
+from lmcache.v1.remote_fill import ControlPage, OperationKind, ProtocolLimits
 from lmcache.v1.remote_fill.native import (
     DIRECT_PUSH_H0_QUALIFICATION_V1,
     DirectPushPageSource,
@@ -95,6 +95,7 @@ from lmcache_ascend.v1.remote_fill_producer import (
     RemoteFillFatalError,
     RemoteFillHandoff,
     RemoteFillProducerMetrics,
+    RemoteFillNegotiationCache,
     RemoteFillProducerSession,
     RemoteFillStaticSpec,
     RemoteFillTerminalResult,
@@ -104,6 +105,35 @@ from lmcache_ascend.v1.remote_fill_producer import (
 )
 
 logger = init_logger(__name__)
+
+
+def _validate_remote_fill_control_port(
+    base_port: int,
+    dp_rank: int,
+    dp_size: int,
+    *,
+    internal_api_enabled: bool,
+    internal_api_port_start: int,
+) -> int:
+    """Validate the complete DP port range and return this rank's port."""
+
+    control_port = int(base_port) + dp_rank
+    last_control_port = int(base_port) + dp_size - 1
+    if dp_size <= 0 or not 0 <= dp_rank < dp_size:
+        raise ValueError("remote-fill decoder DP topology is invalid")
+    if not 0 < int(base_port) < 65536 or last_control_port >= 65536:
+        raise ValueError("remote-fill decoder DP control port is invalid")
+    if internal_api_enabled:
+        internal_start = int(internal_api_port_start)
+        internal_end = internal_start + dp_size - 1
+        if max(int(base_port), internal_start) <= min(
+            last_control_port, internal_end
+        ):
+            raise ValueError(
+                "remote-fill decoder control ports overlap the internal API "
+                "port range"
+            )
+    return control_port
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 REMOTE_BACKEND_NAME = "RemoteBackend"
@@ -155,6 +185,8 @@ class _DirectStoreRequestState:
     source_ready_event: Any = None
     source_ready_event_source: str = "missing"
     source_ready_token_end: int = 0
+    source_ready_events: tuple[Any, ...] = ()
+    source_ready_events_token_end: int = 0
     finalized: bool = False
     remote_fill_handoff: Optional[RemoteFillHandoff] = None
     remote_fill_session: Optional[RemoteFillProducerSession] = None
@@ -165,6 +197,8 @@ class _DirectStoreRequestState:
     remote_fill_probe_end: int = 0
     remote_fill_queued_bytes: int = 0
     remote_fill_queued_windows: int = 0
+    remote_fill_oldest_enqueued_at: float = 0.0
+    remote_fill_backlog_logged: bool = False
     remote_fill_terminal: Optional[RemoteFillTerminalResult] = None
     remote_fill_disabled_reason: str = ""
     remote_fill_metrics_started: bool = False
@@ -184,6 +218,7 @@ class _DirectPageBatch:
     ready_event: Any
     group_ends: dict[int, int]
     ranges: tuple[tuple[int, int], ...] = ()
+    ready_events: tuple[Any, ...] = ()
 
 
 
@@ -376,6 +411,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        collective_all_true_fn: Optional[Callable[[bool], bool]] = None,
     ):
         super().__init__(
             config,
@@ -384,6 +420,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             gpu_connector,
             broadcast_fn,
             broadcast_object_fn,
+            collective_all_true_fn,
         )
         self.is_store_async = self.config.store_async
         self._pending_sync_store_futures: set[Future] = set()
@@ -784,6 +821,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return False
             state.remote_fill_queued_windows += 1
             state.remote_fill_queued_bytes += byte_count
+            if state.remote_fill_queued_windows == 1:
+                state.remote_fill_oldest_enqueued_at = time.perf_counter()
             self._remote_fill_queued_bytes = global_bytes + byte_count
             metrics = self._get_remote_fill_producer_metrics()
             metrics.add_gauge("inflight_windows", 1)
@@ -805,6 +844,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.remote_fill_queued_bytes = max(
                 0, state.remote_fill_queued_bytes - byte_count
             )
+            if state.remote_fill_queued_windows == 0:
+                state.remote_fill_oldest_enqueued_at = 0.0
             self._remote_fill_queued_bytes = max(
                 0,
                 int(getattr(self, "_remote_fill_queued_bytes", 0)) - byte_count,
@@ -918,12 +959,32 @@ class AscendLMCacheEngine(LMCacheEngine):
             if callable(factory)
             else create_remote_fill_client(
                 handoff.control_endpoint,
-                timeout_ms=max(
-                    int(self.config.remote_fill_open_timeout_ms),
-                    int(self.config.remote_fill_reserve_timeout_ms),
-                    int(self.config.remote_fill_arm_timeout_ms),
-                    int(self.config.remote_fill_finish_timeout_ms),
-                ),
+                operation_timeouts_ms={
+                    OperationKind.NEGOTIATE: int(
+                        self.config.remote_fill_open_timeout_ms
+                    ),
+                    OperationKind.OPEN: int(
+                        self.config.remote_fill_open_timeout_ms
+                    ),
+                    OperationKind.RESERVE_WINDOW: int(
+                        self.config.remote_fill_reserve_timeout_ms
+                    ),
+                    OperationKind.ARM_WINDOW: int(
+                        self.config.remote_fill_arm_timeout_ms
+                    ),
+                    OperationKind.REPORT_TRANSFER_COMPLETE: int(
+                        self.config.remote_fill_reserve_timeout_ms
+                    ),
+                    OperationKind.STATUS: int(
+                        self.config.remote_fill_reserve_timeout_ms
+                    ),
+                    OperationKind.ABORT: int(
+                        self.config.remote_fill_arm_timeout_ms
+                    ),
+                    OperationKind.FINISH: int(
+                        self.config.remote_fill_finish_timeout_ms
+                    ),
+                },
                 limits=limits,
             )
         )
@@ -932,6 +993,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             + int(self.config.remote_fill_window_tokens)
             - 1
         ) // int(self.config.remote_fill_window_tokens)
+        negotiation_cache = getattr(self, "_remote_fill_negotiation_cache", None)
+        if negotiation_cache is None:
+            with self._engine_state_lock:
+                negotiation_cache = getattr(
+                    self, "_remote_fill_negotiation_cache", None
+                )
+                if negotiation_cache is None:
+                    negotiation_cache = RemoteFillNegotiationCache()
+                    self._remote_fill_negotiation_cache = negotiation_cache
         session = RemoteFillProducerSession(
             request_id=req_id,
             handoff=handoff,
@@ -943,6 +1013,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             native_hard_timeout_seconds=(
                 float(self.config.remote_fill_native_hard_timeout_ms) / 1000.0
             ),
+            negotiation_cache=negotiation_cache,
         )
         if not state.remote_fill_active_counted:
             self._get_remote_fill_producer_metrics().add_gauge(
@@ -1042,6 +1113,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             ready_event=batch.ready_event,
             group_ends=group_ends,
             ranges=tuple(item[3] for item in selected),
+            ready_events=batch.ready_events,
         )
 
     @staticmethod
@@ -1249,12 +1321,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 batch.keys, batch.ptrs, batch.sizes, strict=True
             )
         )
-        if batch.ready_event is None:
-            raise ValueError("remote fill requires a real producer event")
+        if not batch.ready_events:
+            raise ValueError("remote fill requires complete producer fences")
         return DirectPushSourcePlan(
             pages=pages,
             owners=batch.owners,
-            producer_events=(batch.ready_event,),
+            producer_events=batch.ready_events,
         )
 
     def _schedule_remote_fill_batch(
@@ -1896,19 +1968,35 @@ class AscendLMCacheEngine(LMCacheEngine):
         token_end: int,
         event: Any,
         event_source: str,
+        events: tuple[Any, ...] = (),
     ) -> None:
         """Retain the producer dependency needed by a deferred final tail."""
-        if event is None:
-            return
-        if token_end < state.source_ready_token_end:
-            return
-        state.source_ready_event = event
-        state.source_ready_event_source = (
-            event_source
-            if event_source and event_source != "missing"
-            else "caller_supplied"
-        )
-        state.source_ready_token_end = token_end
+        if event is not None and token_end >= state.source_ready_token_end:
+            state.source_ready_event = event
+            state.source_ready_event_source = (
+                event_source
+                if event_source and event_source != "missing"
+                else "caller_supplied"
+            )
+            state.source_ready_token_end = token_end
+        if events and token_end >= state.source_ready_events_token_end:
+            unique: dict[int, Any] = {}
+            for producer_event in events:
+                if producer_event is not None:
+                    unique.setdefault(id(producer_event), producer_event)
+            state.source_ready_events = tuple(unique.values())
+            state.source_ready_events_token_end = token_end
+
+    @staticmethod
+    def _direct_source_ready_events(
+        state: _DirectStoreRequestState,
+        token_end: int,
+    ) -> tuple[Any, ...]:
+        """Return the complete direct-push fence set through ``token_end``."""
+
+        if state.source_ready_events_token_end < token_end:
+            return ()
+        return state.source_ready_events
 
     @staticmethod
     def _direct_source_ready_event(
@@ -1938,6 +2026,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         state.source_ready_token_end = token_end
         return event, state.source_ready_event_source
+
+    @staticmethod
+    def _remote_fill_has_addressable_source_page(
+        token_end: int,
+        slot_mapping_base: int,
+        chunk_size: int,
+    ) -> bool:
+        """Whether P owns every row of at least one final payload page."""
+
+        if token_end <= 0 or chunk_size <= 0:
+            return False
+        last_page_start = (token_end - 1) // chunk_size * chunk_size
+        return last_page_start >= slot_mapping_base
 
     def begin_live_source_descriptor(
         self, req_id: str, groups: tuple[int, ...] = (0, 1)
@@ -2536,6 +2637,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         if remote_fill and set(group_caches) != {0, 1}:
             state.remote_fill_disabled_reason = "incomplete_groups"
             remote_fill = False
+        remote_ready_events = self._direct_source_ready_events(
+            state, len(tokens)
+        )
+        if remote_fill and not remote_ready_events:
+            state.remote_fill_disabled_reason = "incomplete_producer_fence"
+            self._get_remote_fill_producer_metrics().abandon(
+                "incomplete producer fence"
+            )
+            remote_fill = False
         if not remote_fill:
             group_caches = {
                 group: caches
@@ -2752,6 +2862,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ready_event,
                     remote_group_ends,
                     tuple((start, end) for _ in remote_keys),
+                    remote_ready_events,
                 )
                 self._schedule_remote_fill_batch(
                     state, remote_batch, len(tokens)
@@ -2773,6 +2884,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         accepted_store_end: Optional[int] = None,
         source_ready_event: Any = None,
         source_ready_event_source: str = "missing",
+        source_ready_events: tuple[Any, ...] = (),
     ) -> bool:
         """Publish newly completed pages and the final tail directly from NPU."""
         if not self._direct_store_enabled or not group_caches:
@@ -2811,18 +2923,55 @@ class AscendLMCacheEngine(LMCacheEngine):
         state.accepted_store_end = accepted_store_end
         if final and state.finalized:
             return True
+        self._remember_direct_source_readiness(
+            state,
+            len(tokens),
+            source_ready_event,
+            source_ready_event_source,
+            source_ready_events,
+        )
         remote_fill = self._remote_fill_prepare_request(
             req_id, request_configs, state
         )
         if remote_fill and set(group_caches) != {0, 1}:
             state.remote_fill_disabled_reason = "incomplete_groups"
             remote_fill = False
-        self._remember_direct_source_readiness(
-            state,
-            len(tokens),
-            source_ready_event,
-            source_ready_event_source,
+        previous_remote_work = bool(
+            state.remote_fill_session is not None
+            or state.remote_fill_futures
+            or state.remote_fill_probe_end
         )
+        if (
+            remote_fill
+            and not previous_remote_work
+            and not self._remote_fill_has_addressable_source_page(
+                len(tokens),
+                slot_mapping_base,
+                int(self.config.chunk_size),
+            )
+        ):
+            state.remote_fill_disabled_reason = "no_addressable_source_page"
+            self._get_remote_fill_producer_metrics().abandon(
+                "no addressable source page"
+            )
+            cold_start_perf_log(
+                logger,
+                "remote_fill_direct_abandoned",
+                req_id=req_id,
+                reason="no_addressable_source_page",
+                slot_mapping_base=slot_mapping_base,
+                accepted_store_end=len(tokens),
+            )
+            remote_fill = False
+        remote_ready_events = self._direct_source_ready_events(
+            state, len(tokens)
+        )
+        if remote_fill and not remote_ready_events:
+            state.remote_fill_disabled_reason = "incomplete_producer_fence"
+            self._get_remote_fill_producer_metrics().abandon(
+                "incomplete producer fence"
+            )
+            remote_fill = False
         for group in group_caches:
             if group not in state.submitted_end:
                 state.submitted_end[group] = verified_prefix_end
@@ -3238,6 +3387,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ready_event,
                     remote_group_ends,
                     tuple(remote_ranges),
+                    remote_ready_events,
                 )
                 self._schedule_remote_fill_batch(
                     state, remote_batch, len(tokens)
@@ -3336,6 +3486,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                 time.perf_counter() if state.remote_fill_metrics_started else None
             )
             started = cold_start_perf_now() if cold_start_perf_enabled() else None
+            if (
+                started is not None
+                and state.remote_fill_metrics_started
+                and not state.remote_fill_backlog_logged
+            ):
+                now = time.perf_counter()
+                cold_start_perf_log(
+                    logger,
+                    "remote_fill_backlog_at_prefill_end",
+                    req_id=req_id,
+                    remaining_windows=state.remote_fill_queued_windows,
+                    remaining_bytes=state.remote_fill_queued_bytes,
+                    oldest_window_age_ms=round(
+                        max(
+                            now - state.remote_fill_oldest_enqueued_at,
+                            0.0,
+                        )
+                        * 1000,
+                        3,
+                    )
+                    if state.remote_fill_oldest_enqueued_at
+                    else 0.0,
+                )
+                state.remote_fill_backlog_logged = True
             outstanding = len(state.futures)
             failed: list[tuple[Future, tuple[Any, ...], Exception]] = []
             completed: list[tuple[tuple[Any, ...], Optional[Exception]]] = []
@@ -8890,6 +9064,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             return
         control_host = str(self.config.remote_fill_control_host or "").strip()
+        control_advertise_host = str(
+            getattr(self.config, "remote_fill_control_advertise_host", None)
+            or control_host
+        ).strip()
         base_port = self.config.remote_fill_control_port_start
         is_decoder = self.config.pd_role == "receiver" or bool(
             control_host and base_port is not None
@@ -8941,11 +9119,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         extra = self.metadata.kv_connector_extra_config or {}
         dp_rank = int(extra.get("lmcache_remote_fill_destination_dp_rank", 0))
         dp_size = int(extra.get("lmcache_remote_fill_destination_dp_size", 1))
-        control_port = int(base_port) + dp_rank
-        if dp_size <= 0 or not 0 <= dp_rank < dp_size:
-            raise ValueError("remote-fill decoder DP topology is invalid")
-        if not 0 < control_port < 65536:
-            raise ValueError("remote-fill decoder DP control port is invalid")
+        control_port = _validate_remote_fill_control_port(
+            int(base_port),
+            dp_rank,
+            dp_size,
+            internal_api_enabled=bool(
+                getattr(self.config, "internal_api_server_enabled", False)
+            ),
+            internal_api_port_start=int(
+                getattr(self.config, "internal_api_server_port_start", 6999)
+            ),
+        )
         native_session = self.storage_manager.get_remote_fill_destination_session()
         if not native_session:
             raise ValueError(
@@ -8969,6 +9153,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             destination_dp_size=dp_size,
             destination_remote_session=native_session,
             control_host=control_host,
+            control_advertise_host=control_advertise_host,
             control_port=control_port,
             shared_cache_generation=int(self.shared_cpu_cache_generation),
             capacity_available=self._remote_fill_capacity_available,
@@ -8982,12 +9167,26 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._remote_fill_runtime = runtime
         self._remote_fill_decoder_initialized = True
         logger.info(
-            "Remote-fill decoder service started: endpoint=%s dp_rank=%d "
-            "generation=%d native_qualified=%s",
+            "Remote-fill decoder service started: feature_enabled=%s "
+            "transport_qualified=%s cache_namespace=%s model_artifact_id=%s "
+            "control_endpoint=%s destination_engine_epoch=%d "
+            "destination_dp_rank=%d shared_cache_generation=%d "
+            "group0_dim=%d group1_dim=%d tp_size=%d dp_size=%d "
+            "source_hash_identity=%s:%s",
+            True,
+            True,
+            layout.cache_namespace_tag,
+            layout.model_artifact_id,
             runtime.placement.control_endpoint,
+            runtime.placement.destination_engine_epoch,
             dp_rank,
             self.shared_cpu_cache_generation,
-            True,
+            layout.groups[0].raw_token_dim,
+            layout.groups[1].raw_token_dim,
+            self.metadata.world_size,
+            dp_size,
+            runtime.placement.token_hash_algorithm,
+            runtime.placement.python_hash_seed,
         )
 
     def _remote_fill_capacity_available(self, requested_bytes: int) -> bool:
