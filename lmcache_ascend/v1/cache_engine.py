@@ -9017,7 +9017,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         ):
             raise ValueError(
                 "remote-fill Group-1 shared-page metadata disagrees with "
-                "the negotiated decoder layout"
+                "the negotiated decoder layout: "
+                f"shape={tuple(shape)}, elements={int(shape.numel())}, "
+                f"dtype={dtype}, format={fmt.name}, "
+                f"negotiated_elements={group.raw_token_dim}, "
+                f"negotiated_dtype={group.dtype}, "
+                f"negotiated_format={group.fmt.name}"
             )
         return {
             "model_layout": "mla-dsa-layer-page-v3",
@@ -9044,12 +9049,39 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         """Match both negotiated groups to the model-visible cache layout."""
 
+        layer_groups = tuple(
+            getattr(
+                getattr(self.metadata, "kv_layer_groups_manager", None),
+                "kv_layer_groups",
+                (),
+            )
+        )
+        if layer_groups and len(layer_groups) != 2:
+            raise ValueError(
+                "remote-fill requires exactly two registered decoder cache "
+                f"groups, found {len(layer_groups)}"
+            )
+
         for kv_group in (0, 1):
             shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
                 kv_group=kv_group,
                 num_tokens=1,
             )
             group = layout.group(kv_group)
+            registered_layers = (
+                layer_groups[kv_group].num_layers if layer_groups else None
+            )
+            if (
+                registered_layers is not None
+                and registered_layers != layout.num_layers
+            ):
+                raise ValueError(
+                    "remote-fill requires identical cache-bearing layer "
+                    "coverage for both groups: "
+                    f"kv_group={kv_group}, "
+                    f"registered_layers={registered_layers}, "
+                    f"negotiated_layers={layout.num_layers}"
+                )
             if (
                 dtype != group.dtype
                 or fmt != group.fmt
@@ -9432,7 +9464,20 @@ class AscendLMCacheEngine(LMCacheEngine):
             save_indexer_only_first_rank=self.save_indexer_only_first_rank,
             shared_cpu_cache_strict=self.shared_cpu_cache_strict,
         )
-        runtime.start()
+        try:
+            runtime.start()
+            if not runtime.available:
+                raise RuntimeError(
+                    "remote-fill decoder control service exited during startup"
+                )
+        except Exception:
+            try:
+                runtime.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close remote-fill runtime after startup failure"
+                )
+            raise
         self._remote_fill_runtime = runtime
         self._remote_fill_decoder_initialized = True
         logger.info(

@@ -142,14 +142,17 @@ def test_decoder_layout_validation_uses_registered_groups_before_lazy_connector(
     )
     metadata.kv_layer_groups_manager.kv_layer_groups = [
         KVLayerGroupInfo(
-            ["model.layers.0.self_attn.attn"],
-            [0],
+            [f"model.layers.{index}.self_attn.attn" for index in range(79)],
+            list(range(79)),
             torch.Size([1946, 128, 576]),
             torch.bfloat16,
         ),
         KVLayerGroupInfo(
-            ["model.layers.0.self_attn.indexer.k_cache"],
-            [0],
+            [
+                f"model.layers.{index}.self_attn.indexer.k_cache"
+                for index in range(79)
+            ],
+            list(range(79)),
             torch.Size([8757, 128, 128]),
             torch.bfloat16,
         ),
@@ -184,6 +187,61 @@ def test_decoder_layout_validation_uses_registered_groups_before_lazy_connector(
         torch.bfloat16,
         MemoryFormat.KV_DSA_INDEX_FMT,
     )
+
+
+def test_decoder_layout_validation_rejects_unequal_group_layer_coverage(
+    tmp_path,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        '{"kv_lora_rank":512,"qk_rope_head_dim":64,"dsa_head_dim":128}',
+        encoding="utf-8",
+    )
+    config = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    config.dsa_two_groups = True
+    config.remote_fill_cache_namespace = "test-deployment"
+    config.remote_fill_model_artifact_id = "test-serving-bundle"
+    config.extra_config = {"save_only_first_rank": True}
+    metadata = LMCacheMetadata(
+        model_name=str(model_dir),
+        world_size=8,
+        local_world_size=8,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(81, 1, 1024, 1, 576),
+        use_mla=True,
+        chunk_size=1024,
+    )
+    metadata.kv_layer_groups_manager.kv_layer_groups = [
+        KVLayerGroupInfo(
+            [f"latent.{index}" for index in range(81)],
+            list(range(81)),
+            torch.Size([1946, 128, 576]),
+            torch.bfloat16,
+        ),
+        KVLayerGroupInfo(
+            [f"indexer.{index}" for index in range(79)],
+            list(range(79)),
+            torch.Size([8757, 128, 128]),
+            torch.bfloat16,
+        ),
+    ]
+    layout = build_decoder_layout(
+        config,
+        metadata,
+        layout_tag="payload-v3",
+        num_layers=81,
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.metadata = metadata
+    engine.config = config
+    engine.dsa_two_groups = True
+    engine.gpu_connector = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="registered_layers=79"):
+        engine._validate_remote_fill_decoder_layout(layout)
 
 
 class _FakeLocalBackend:
@@ -1021,6 +1079,27 @@ def test_close_before_start_drains_safe_service_without_fatal_restart() -> None:
     assert server.closed
 
 
+def test_service_thread_start_failure_closes_control_transport() -> None:
+    service = _FakeService()
+    server = _FakeServer()
+    host = DecoderRemoteFillServiceHost(
+        service=service,
+        server=server,
+        fatal_restart=lambda transfers: None,
+    )
+    host._thread = SimpleNamespace(
+        start=Mock(side_effect=RuntimeError("thread start failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        host.start()
+
+    assert service.shutdown_calls == 1
+    assert server.closed
+    assert host._closed.is_set()
+    assert host.available is False
+
+
 def test_service_host_emits_only_changed_fixed_cardinality_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1291,6 +1370,40 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
     assert all("ptr" not in key and "secret" not in key for key in placement)
     runtime.close()
     assert server.closed
+
+
+def test_nonbuiltin_hash_ignores_unrelated_python_hash_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    config = _config(shared=False)
+    config.pre_caching_hash_algorithm = "sha256_cbor_64bit"
+    runtime = create_decoder_remote_fill_runtime(
+        config=config,
+        metadata=_metadata(world_size=1),
+        local_backend=_FakeLocalBackend(),
+        layout=_layout(),
+        destination_engine_epoch=7,
+        destination_dp_rank=0,
+        destination_dp_size=1,
+        destination_remote_session="decoder:1234",
+        control_host="127.0.0.1",
+        control_advertise_host="10.0.0.2",
+        control_port=19000,
+        shared_cache_generation=0,
+        capacity_available=lambda required: True,
+        fatal_restart=lambda transfers: None,
+        global_te_push=True,
+        save_only_first_rank=True,
+        save_indexer_only_first_rank=True,
+        shared_cpu_cache_strict=False,
+        descriptor_verification_capability=b"x" * 32,
+        server_factory=lambda service: _FakeServer(),
+    )
+
+    assert runtime.placement.token_hash_algorithm == "sha256_cbor_64bit"
+    assert runtime.placement.python_hash_seed == ""
+    runtime.close()
 
 
 def test_runtime_rotates_verification_capability_per_incarnation(

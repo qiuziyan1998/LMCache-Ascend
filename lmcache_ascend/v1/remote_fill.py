@@ -402,9 +402,11 @@ def build_remote_fill_negotiation_spec(
     if dp_size <= 0 or not 0 <= destination_dp_rank < dp_size:
         raise ValueError("remote-fill destination DP rank is out of range")
     hash_algorithm = str(config.pre_caching_hash_algorithm).strip()
-    python_hash_seed = os.getenv("PYTHONHASHSEED", "")
     if not hash_algorithm:
         raise ValueError("remote-fill token hash algorithm must not be empty")
+    python_hash_seed = (
+        os.getenv("PYTHONHASHSEED", "") if hash_algorithm == "builtin" else ""
+    )
     if hash_algorithm == "builtin" and not python_hash_seed:
         raise ValueError("builtin token hashing requires an explicit PYTHONHASHSEED")
     return NegotiationSpec(
@@ -1010,7 +1012,12 @@ class DecoderRemoteFillServiceHost:
             if self._closed.is_set():
                 raise RuntimeError("remote-fill service host is already closed")
             self._started = True
-            self._thread.start()
+            try:
+                self._thread.start()
+            except BaseException:
+                self._started = False
+                self._shutdown_service_and_server()
+                raise
 
     @property
     def available(self) -> bool:
