@@ -17,6 +17,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
 from lmcache.v1.remote_fill import (
     ControlPage,
     PageDisposition,
@@ -110,6 +111,79 @@ def test_decoder_layout_infers_dsa_dimensions_without_manual_config(
     )
 
     assert layout.group_dimensions == (576, 128)
+
+
+def test_decoder_layout_validation_uses_registered_groups_before_lazy_connector(
+    tmp_path,
+) -> None:
+    """Startup must not use the connector's stale pre-forward group layout."""
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        '{"kv_lora_rank":512,"qk_rope_head_dim":64,"dsa_head_dim":128}',
+        encoding="utf-8",
+    )
+    config = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    config.dsa_two_groups = True
+    config.remote_fill_cache_namespace = "test-deployment"
+    config.remote_fill_model_artifact_id = "test-serving-bundle"
+    config.extra_config = {"save_only_first_rank": True}
+    metadata = LMCacheMetadata(
+        model_name=str(model_dir),
+        world_size=8,
+        local_world_size=8,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(79, 1, 1024, 1, 576),
+        use_mla=True,
+        chunk_size=1024,
+    )
+    metadata.kv_layer_groups_manager.kv_layer_groups = [
+        KVLayerGroupInfo(
+            ["model.layers.0.self_attn.attn"],
+            [0],
+            torch.Size([1946, 128, 576]),
+            torch.bfloat16,
+        ),
+        KVLayerGroupInfo(
+            ["model.layers.0.self_attn.indexer.k_cache"],
+            [0],
+            torch.Size([8757, 128, 128]),
+            torch.bfloat16,
+        ),
+    ]
+    layout = build_decoder_layout(
+        config,
+        metadata,
+        layout_tag="payload-v3",
+        num_layers=79,
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.metadata = metadata
+    engine.config = config
+    engine.dsa_two_groups = True
+    engine.gpu_connector = SimpleNamespace(
+        get_shape=Mock(side_effect=AssertionError("lazy layout is unavailable"))
+    )
+
+    engine._validate_remote_fill_decoder_layout(layout)
+
+    assert engine._expected_shared_cpu_chunk_metadata(
+        kv_group=0, num_tokens=1
+    ) == (
+        torch.Size([576]),
+        torch.bfloat16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert engine._expected_shared_cpu_chunk_metadata(
+        kv_group=1, num_tokens=1
+    ) == (
+        torch.Size([128]),
+        torch.bfloat16,
+        MemoryFormat.KV_DSA_INDEX_FMT,
+    )
 
 
 class _FakeLocalBackend:

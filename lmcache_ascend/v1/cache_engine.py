@@ -5663,10 +5663,32 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Use Ascend's group-aware connector shape for shared view checks.
 
         DSA index chunks are allocated with ``gpu_connector.get_shape(...,
-        kv_group=1)``.  Generic LMCache metadata can still describe only the
-        latent group in some startup/passive paths, so using it first makes
-        passive ranks reject valid index handles as latent-shaped objects.
+        kv_group=1)``.  Once vLLM has registered both cache groups, its
+        ``KVLayerGroupsManager`` is the authoritative startup description.
+        Prefer it here because the NPU connector's per-group layout is lazy:
+        querying ``get_shape`` before the first model input can otherwise
+        mirror the wrong active group and reject a valid decoder layout.
+
+        Generic LMCache metadata can still describe only the latent group in
+        older startup/passive paths, so retain the connector fallback.
         """
+        layer_groups = getattr(
+            self.metadata.kv_layer_groups_manager,
+            "kv_layer_groups",
+            (),
+        )
+        if (
+            self.metadata.use_mla
+            and getattr(self, "dsa_two_groups", False)
+            and 0 <= kv_group < len(layer_groups)
+        ):
+            layer_group = layer_groups[kv_group]
+            return (
+                torch.Size([num_tokens * layer_group.hidden_dim_size]),
+                layer_group.dtype,
+                self._memory_format_for_kv_group(kv_group),
+            )
+
         get_shape = getattr(self.gpu_connector, "get_shape", None)
         shape = None
         if callable(get_shape):
@@ -9035,7 +9057,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             ):
                 raise ValueError(
                     "remote-fill negotiated group layout disagrees with "
-                    f"decoder cache metadata: kv_group={kv_group}"
+                    "decoder cache metadata: "
+                    f"kv_group={kv_group}, "
+                    f"decoder_shape={tuple(shape)}, "
+                    f"decoder_elements_per_token={int(shape.numel())}, "
+                    f"decoder_dtype={dtype}, decoder_format={fmt.name}, "
+                    f"negotiated_elements_per_token={group.raw_token_dim}, "
+                    f"negotiated_dtype={group.dtype}, "
+                    f"negotiated_format={group.fmt.name}"
                 )
 
     def _preflight_remote_fill_shared_group1(
