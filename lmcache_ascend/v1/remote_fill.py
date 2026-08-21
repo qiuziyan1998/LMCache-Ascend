@@ -24,6 +24,7 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
+    resolve_mooncake_dsa_raw_token_dims,
     resolve_remote_fill_identity,
 )
 from lmcache.v1.remote_fill import (
@@ -269,26 +270,16 @@ class _HiddenPage:
             self.released = True
 
 
-def _parse_raw_token_dimensions(config: LMCacheEngineConfig) -> tuple[int, int]:
-    raw = (config.extra_config or {}).get("mooncake_dsa_raw_token_dims")
-    if isinstance(raw, Mapping):
-        try:
-            dimensions = (
-                int(raw.get(0, raw.get("0"))),
-                int(raw.get(1, raw.get("1"))),
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "mooncake_dsa_raw_token_dims must define integer groups 0 and 1"
-            ) from exc
-    elif isinstance(raw, (list, tuple)) and len(raw) == 2:
-        dimensions = (int(raw[0]), int(raw[1]))
-    else:
-        raise ValueError(
-            "remote fill requires mooncake_dsa_raw_token_dims for groups 0 and 1"
-        )
+def _parse_raw_token_dimensions(
+    config: LMCacheEngineConfig,
+    metadata: LMCacheMetadata,
+) -> tuple[int, int]:
+    resolved, source = resolve_mooncake_dsa_raw_token_dims(config, metadata)
+    dimensions = (int(resolved.get(0, 0)), int(resolved.get(1, 0)))
     if any(dimension <= 0 for dimension in dimensions):
-        raise ValueError("remote-fill raw token dimensions must be positive")
+        raise ValueError(
+            "remote-fill raw token dimensions could not be resolved: " + source
+        )
     return dimensions
 
 
@@ -314,7 +305,7 @@ def build_decoder_layout(
         ValueError: If required identity or layout metadata is missing.
     """
 
-    dimensions = _parse_raw_token_dimensions(config)
+    dimensions = _parse_raw_token_dimensions(config, metadata)
     namespace, artifact_id = resolve_remote_fill_identity(config, metadata)
     if not layout_tag or not artifact_id or not namespace:
         raise ValueError("remote-fill layout identity must not be empty")

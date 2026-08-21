@@ -13,8 +13,10 @@ import logging
 
 # Third Party
 from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryFormat
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.remote_fill import (
     ControlPage,
     PageDisposition,
@@ -40,6 +42,7 @@ from lmcache_ascend.v1.remote_fill import (
     DecoderRemoteFillServiceHost,
     RemoteFillDecoderLayout,
     RemoteFillGroupLayout,
+    build_decoder_layout,
     create_decoder_remote_fill_runtime,
 )
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
@@ -71,6 +74,42 @@ class _FakePage:
         if self.pins <= 0:
             raise RuntimeError("page pin underflow")
         self.pins -= 1
+
+
+def test_decoder_layout_infers_dsa_dimensions_without_manual_config(
+    tmp_path,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        '{"kv_lora_rank":512,"qk_rope_head_dim":64,"dsa_head_dim":128}',
+        encoding="utf-8",
+    )
+    config = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    config.dsa_two_groups = True
+    config.remote_fill_cache_namespace = "test-deployment"
+    config.remote_fill_model_artifact_id = "test-serving-bundle"
+    config.extra_config = {"save_only_first_rank": True}
+    metadata = LMCacheMetadata(
+        model_name=str(model_dir),
+        world_size=8,
+        local_world_size=8,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(79, 1, 1024, 1, 576),
+        use_mla=True,
+        chunk_size=1024,
+    )
+
+    layout = build_decoder_layout(
+        config,
+        metadata,
+        layout_tag="payload-v3",
+        num_layers=79,
+    )
+
+    assert layout.group_dimensions == (576, 128)
 
 
 class _FakeLocalBackend:
