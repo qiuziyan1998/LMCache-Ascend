@@ -646,6 +646,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         metrics = self._get_remote_fill_producer_metrics()
         metrics.observe("reserve_seconds", float(result.reserve_seconds))
+        metrics.observe("arm_seconds", float(result.arm_seconds))
         metrics.existing_pages(int(result.existing_pages))
         submitted_bytes = int(result.submitted_bytes)
         if submitted_bytes:
@@ -653,7 +654,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "source_event_wait_seconds",
                 float(result.source_event_wait_seconds),
             )
+            metrics.observe(
+                "source_registration_seconds",
+                float(result.source_registration_seconds),
+            )
+            metrics.observe(
+                "native_slot_wait_seconds",
+                float(result.native_slot_wait_seconds),
+            )
             metrics.observe("native_seconds", float(result.native_seconds))
+            metrics.observe("report_seconds", float(result.report_seconds))
             metrics.add_bytes("submitted_bytes", submitted_bytes)
             state.remote_fill_submitted_bytes += submitted_bytes
         if not result.direct_satisfied:
@@ -1433,6 +1443,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 results = []
                 for window_offset, window_pages in enumerate(control_windows):
                     window_id = first_window_id + window_offset
+                    chunk_start = min(page.chunk_start for page in window_pages)
+                    chunk_end = max(page.chunk_end for page in window_pages)
+                    window_tokens = chunk_end - chunk_start
                     result = session.transfer_window(
                         window_id=window_id,
                         source_generation=source_generation,
@@ -1454,14 +1467,41 @@ class AscendLMCacheEngine(LMCacheEngine):
                         logger,
                         "remote_fill_window_complete",
                         req_id=batch.req_id,
+                        transfer_id=state.remote_fill_handoff.transfer_id,
                         window_id=window_id,
                         page_count=len(window_pages),
+                        chunk_start=chunk_start,
+                        chunk_end=chunk_end,
+                        window_tokens=window_tokens,
+                        full_window=(
+                            window_tokens
+                            == int(self.config.remote_fill_window_tokens)
+                        ),
                         bytes=sum(
                             page.expected_bytes for page in window_pages
                         ),
                         armed=result.armed,
                         direct_satisfied=result.direct_satisfied,
                         reason=result.reason,
+                        reserve_ms=round(result.reserve_seconds * 1000, 3),
+                        arm_ms=round(result.arm_seconds * 1000, 3),
+                        source_event_wait_ms=round(
+                            result.source_event_wait_seconds * 1000, 3
+                        ),
+                        source_registration_ms=round(
+                            result.source_registration_seconds * 1000, 3
+                        ),
+                        native_slot_wait_ms=round(
+                            result.native_slot_wait_seconds * 1000, 3
+                        ),
+                        native_ms=round(result.native_seconds * 1000, 3),
+                        report_ms=round(result.report_seconds * 1000, 3),
+                        native_started_monotonic_ms=round(
+                            result.native_started_monotonic * 1000, 3
+                        ),
+                        native_ended_monotonic_ms=round(
+                            result.native_ended_monotonic * 1000, 3
+                        ),
                     )
                     if not result.direct_satisfied:
                         break
@@ -1532,9 +1572,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger,
             "remote_fill_persistent_complete",
             req_id=req_id,
+            transfer_id=state.remote_fill_handoff.transfer_id,
             persistent_common_end=persistent_common_end,
             required_store_end=required_store_end,
         )
+        finish_control_seconds = 0.0
         try:
             if state.remote_fill_session is None:
                 terminal = RemoteFillTerminalResult(
@@ -1544,13 +1586,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                     required_store_end=required_store_end,
                 )
             else:
-                terminal = state.remote_fill_session.finish(
-                    required_store_end=required_store_end,
-                    persistent_common_end=persistent_common_end,
-                    final_partial_valid_tokens=(
-                        required_store_end % int(self.config.chunk_size)
-                    ),
-                )
+                finish_started = time.perf_counter()
+                try:
+                    terminal = state.remote_fill_session.finish(
+                        required_store_end=required_store_end,
+                        persistent_common_end=persistent_common_end,
+                        final_partial_valid_tokens=(
+                            required_store_end % int(self.config.chunk_size)
+                        ),
+                    )
+                finally:
+                    finish_control_seconds = time.perf_counter() - finish_started
+                    self._get_remote_fill_producer_metrics().observe(
+                        "finish_control_seconds",
+                        finish_control_seconds,
+                    )
         except RemoteFillFatalError:
             self._latch_remote_fill_producer_fatal(state)
             raise
@@ -1587,9 +1637,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger,
             "remote_fill_producer_terminal",
             req_id=req_id,
+            transfer_id=state.remote_fill_handoff.transfer_id,
             outcome=terminal.outcome,
             persistent_common_end=persistent_common_end,
             required_store_end=required_store_end,
+            finish_control_ms=round(finish_control_seconds * 1000, 3),
         )
         completed = getattr(self, "_completed_remote_fill_results", None)
         if completed is None:

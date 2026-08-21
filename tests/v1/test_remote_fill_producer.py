@@ -436,6 +436,11 @@ def test_transfer_arms_only_allocated_descriptor_subset() -> None:
                 vector_count=1,
                 transferred_bytes=64,
                 elapsed_ms=1.0,
+                source_event_wait_ms=2.0,
+                source_registration_ms=1.0,
+                native_slot_wait_ms=3.0,
+                native_started_monotonic=10.0,
+                native_ended_monotonic=10.001,
             )
         )
         return future
@@ -452,7 +457,14 @@ def test_transfer_arms_only_allocated_descriptor_subset() -> None:
     assert result.submitted_bytes == 64
     assert result.existing_pages == 1
     assert result.reserve_seconds >= 0
-    assert result.native_seconds >= 0
+    assert result.arm_seconds >= 0
+    assert result.source_event_wait_seconds == pytest.approx(0.002)
+    assert result.source_registration_seconds == pytest.approx(0.001)
+    assert result.native_slot_wait_seconds == pytest.approx(0.003)
+    assert result.native_seconds == pytest.approx(0.001)
+    assert result.report_seconds >= 0
+    assert result.native_started_monotonic == 10.0
+    assert result.native_ended_monotonic == 10.001
     assert submitted[0][0] == _SESSION
     assert [page.kv_group for page in submitted[0][1].pages] == [1]
     assert [descriptor.kv_group for descriptor in submitted[0][2]] == [1]
@@ -1011,6 +1023,10 @@ def test_producer_metrics_are_bounded_and_pointer_free() -> None:
     metrics = RemoteFillProducerMetrics()
     metrics.start_attempt()
     metrics.observe("reserve_seconds", 0.25)
+    metrics.observe("arm_seconds", 0.01)
+    metrics.observe("native_slot_wait_seconds", 0.02)
+    metrics.observe("report_seconds", 0.03)
+    metrics.observe("finish_control_seconds", 0.04)
     metrics.add_gauge("inflight_windows", 1)
     metrics.add_bytes("submitted_bytes", 192)
     metrics.existing_pages(1)
@@ -1023,6 +1039,10 @@ def test_producer_metrics_are_bounded_and_pointer_free() -> None:
     assert snapshot["attempts_total"]["LOCAL_FULL:none"] == 1
     assert snapshot["direct_abandoned_total"] == {"other": 1}
     assert snapshot["timers"]["reserve_seconds"]["total_seconds"] == 0.25
+    assert snapshot["timers"]["arm_seconds"]["total_seconds"] == 0.01
+    assert snapshot["timers"]["native_slot_wait_seconds"]["total_seconds"] == 0.02
+    assert snapshot["timers"]["report_seconds"]["total_seconds"] == 0.03
+    assert snapshot["timers"]["finish_control_seconds"]["total_seconds"] == 0.04
     assert snapshot["bytes"]["submitted_bytes"] == 192
     assert "0x1234" not in rendered
     assert "request-specific" not in rendered

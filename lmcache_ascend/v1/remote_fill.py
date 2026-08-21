@@ -15,6 +15,7 @@ from typing import Any, Protocol
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.cold_start_perf import cold_start_perf_log
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -740,7 +741,21 @@ class AscendRemoteFillPageLifecycle:
             are released after cache ownership has been acquired.
         """
 
-        del transfer_id
+        commit_started = monotonic()
+
+        def log_commit(**fields: object) -> None:
+            payload = {
+                **fields,
+                "elapsed_ms": round((monotonic() - commit_started) * 1000, 3),
+            }
+            _log_remote_fill_event("remote_fill_local_commit", **payload)
+            cold_start_perf_log(
+                logger,
+                "remote_fill_local_commit",
+                transfer_id=transfer_id,
+                **payload,
+            )
+
         group0_keys, group1_keys = self._validate_required_prefix(
             required_pages,
             finish,
@@ -772,8 +787,7 @@ class AscendRemoteFillPageLifecycle:
                 ready,
             )
         except LayerPageAdmissionRollbackError as error:
-            _log_remote_fill_event(
-                "remote_fill_local_commit",
+            log_commit(
                 committed=False,
                 error=True,
                 rollback_safe=False,
@@ -784,8 +798,7 @@ class AscendRemoteFillPageLifecycle:
                 "remote-fill LocalCPU admission rollback was incomplete"
             ) from error
         except Exception:
-            _log_remote_fill_event(
-                "remote_fill_local_commit",
+            log_commit(
                 committed=False,
                 error=True,
                 rollback_safe=True,
@@ -794,23 +807,25 @@ class AscendRemoteFillPageLifecycle:
             )
             raise
         if not bool(result.committed):
-            _log_remote_fill_event(
-                "remote_fill_local_commit",
+            log_commit(
                 committed=False,
                 error=False,
                 required_pairs=len(group0_keys),
                 ready_pages=len(ready),
+                lock_wait_ms=round(result.lock_wait_seconds * 1000, 3),
+                lock_hold_ms=round(result.lock_hold_seconds * 1000, 3),
             )
             return False
         for handle in handles:
             handle.release()
-        _log_remote_fill_event(
-            "remote_fill_local_commit",
+        log_commit(
             committed=True,
             error=False,
             required_pairs=len(group0_keys),
             ready_pages=len(ready),
             published_bytes=sum(page.get_size() for page in ready.values()),
+            lock_wait_ms=round(result.lock_wait_seconds * 1000, 3),
+            lock_hold_ms=round(result.lock_hold_seconds * 1000, 3),
         )
         return True
 

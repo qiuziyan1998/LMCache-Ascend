@@ -1,0 +1,43 @@
+{
+  "kind": "direct_remote_lmcache_c1_report",
+  "schema": 1,
+  "production_components": {"ascend_multi_connector": true, "dp2_routing": true, "lmcache": true, "mooncake": true, "mtp": true, "tp8_shared_local_cpu": true, "vllm": true},
+  "comparisons": {
+    "direct_to_persistent": {"evidence": ["raw/direct-persistent.json"], "status": "PASS"},
+    "eager_graph": {"evidence": ["raw/eager-graph.json"], "status": "PASS"},
+    "first_resume_hidden_logits": {"evidence": ["raw/first-resume.json"], "status": "PASS"},
+    "selected_topk": {"evidence": ["raw/topk.json"], "status": "PASS"},
+    "source_to_decoder_local_group0": {"evidence": ["raw/group0.json"], "status": "PASS"},
+    "source_to_decoder_local_group1": {"evidence": ["raw/group1.json"], "status": "PASS"}
+  },
+  "diagnostics": {"bounded": true, "diagnosed_requests": 9},
+  "dp_equivalence": {
+    "cross_dp_reuse_qualified": false,
+    "execution_identity_namespaced": true,
+    "measured": true
+  },
+  "integrity": {
+    "committed_key_overwrites": 0,
+    "cross_rank_frontier_disagreements": 0,
+    "destination_reuse_during_possible_dma": 0,
+    "false_persistent_completions": 0,
+    "invalid_partial_page_interpretations": 0,
+    "mtp_store_frontier_disagreements": 0,
+    "one_group_only_uses": 0,
+    "stale_epoch_generation_publications": 0,
+    "stale_source_reads": 0
+  },
+  "qualification_manifest_sha256": "REPLACE_WITH_MANIFEST_PAYLOAD_SHA256",
+  "scenarios": {
+    "cold_miss": {"evidence": ["raw/cold-miss.json"], "persistent_common_end": 131072, "required_store_end": 131072, "status": "PASS", "terminal_outcome": "LOCAL_FULL"},
+    "decoder_local_first_hole": {"abandoned_before_arm": true, "evidence": ["raw/first-hole.json"], "no_suffix_publication": true, "persistent_authoritative": true, "status": "PASS"},
+    "dp2_routing": {"evidence": ["raw/dp2.json"], "mappings": ["P0-D0", "P0-D1", "P1-D0", "P1-D1"], "nonselected_destination_allocated_pages": 0, "status": "PASS"},
+    "final_partial_page": {"both_groups_verified": true, "evidence": ["raw/final-partial.json"], "mtp_frontier_verified": true, "persistence_verified": true, "status": "PASS", "valid_tokens_verified": true},
+    "full_persistent_prefix_hit": {"evidence": ["raw/full-hit.json"], "native_calls": 0, "retained_source_bytes": 0, "status": "PASS", "transactions": 0},
+    "joinable_partial_prefix": {"both_groups_common_frontier": true, "evidence": ["raw/partial-prefix.json"], "paired_local_prefix_used": true, "persistent_boundary_used": true, "status": "PASS"},
+    "mtp_first_resume": {"cache_selection_verified": true, "computed_token_count_verified": true, "evidence": ["raw/mtp-resume.json"], "execution_route_verified": true, "final_token_recompute_verified": true, "required_store_end_verified": true, "speculative_row_ownership_verified": true, "status": "PASS"},
+    "repeated_prefix_and_eviction": {"evidence": ["raw/repeated-evicted.json"], "evicted_persistent_fallback_verified": true, "immediate_retained_hit_verified": true, "model_output_acceptable": true, "status": "PASS"},
+    "tp8_passive_materialization": {"computed_token_counts_agree": true, "evidence": ["raw/tp8-passive.json"], "group0_failure_collective_fallback": true, "group1_failure_collective_fallback": true, "status": "PASS"}
+  },
+  "topology": {"dp": 2, "num_speculative_tokens": 1, "tp": 8}
+}

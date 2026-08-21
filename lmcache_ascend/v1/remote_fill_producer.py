@@ -154,8 +154,14 @@ class RemoteFillWindowResult:
     fatal_restart_required: bool = False
     reason: str = ""
     reserve_seconds: float = 0.0
+    arm_seconds: float = 0.0
     source_event_wait_seconds: float = 0.0
+    source_registration_seconds: float = 0.0
+    native_slot_wait_seconds: float = 0.0
     native_seconds: float = 0.0
+    report_seconds: float = 0.0
+    native_started_monotonic: float = 0.0
+    native_ended_monotonic: float = 0.0
     submitted_bytes: int = 0
     existing_pages: int = 0
 
@@ -197,9 +203,14 @@ class RemoteFillProducerMetrics:
         {
             "queue_wait_seconds",
             "reserve_seconds",
+            "arm_seconds",
             "source_event_wait_seconds",
+            "source_registration_seconds",
+            "native_slot_wait_seconds",
             "native_seconds",
+            "report_seconds",
             "persistent_seconds",
+            "finish_control_seconds",
             "final_wait_seconds",
         }
     )
@@ -791,6 +802,7 @@ class RemoteFillProducerSession:
                 existing_pages=existing_pages,
             )
 
+        arm_started = time.perf_counter()
         try:
             armed = self._execute(
                 ArmWindowRequest(
@@ -815,18 +827,24 @@ class RemoteFillProducerSession:
                     "ARM_WINDOW acknowledgement is ambiguous and STATUS "
                     "could not prove the armed attempt"
                 ) from status_error
+        arm_seconds = time.perf_counter() - arm_started
         if armed.code is not ResultCode.OK:
             self.direct_viable = False
             return self._abandoned_window(
                 window_id,
                 "arm rejected",
                 reserve_seconds=reserve_seconds,
+                arm_seconds=arm_seconds,
                 existing_pages=existing_pages,
             )
 
         attempt_id = reserved.native_transfer_attempt_id
         native_seconds = 0.0
         source_event_wait_seconds = 0.0
+        source_registration_seconds = 0.0
+        native_slot_wait_seconds = 0.0
+        native_started_monotonic = 0.0
+        native_ended_monotonic = 0.0
         submitted_bytes = sum(
             descriptor.destination_length for descriptor in descriptors
         )
@@ -906,9 +924,23 @@ class RemoteFillProducerSession:
                 raise RemoteFillFatalError(
                     "armed native transfer returned an invalid terminal result"
                 )
-            native_total_seconds = time.perf_counter() - native_wait_started
             native_seconds = max(0.0, float(native_result.elapsed_ms) / 1000.0)
-            source_event_wait_seconds = max(0.0, native_total_seconds - native_seconds)
+            source_event_wait_seconds = max(
+                0.0, float(native_result.source_event_wait_ms) / 1000.0
+            )
+            source_registration_seconds = max(
+                0.0, float(native_result.source_registration_ms) / 1000.0
+            )
+            native_slot_wait_seconds = max(
+                0.0, float(native_result.native_slot_wait_ms) / 1000.0
+            )
+            native_started_monotonic = max(
+                0.0, float(native_result.native_started_monotonic)
+            )
+            native_ended_monotonic = max(
+                native_started_monotonic,
+                float(native_result.native_ended_monotonic),
+            )
             return_code = int(native_result.return_code)
             completed_bytes = int(native_result.transferred_bytes)
             if (
@@ -925,13 +957,32 @@ class RemoteFillProducerSession:
             )
             return_code = int(getattr(result, "return_code", -1))
             completed_bytes = int(getattr(result, "transferred_bytes", 0))
-            native_total_seconds = time.perf_counter() - native_wait_started
             native_seconds = max(
                 0.0, float(getattr(result, "elapsed_ms", 0.0)) / 1000.0
             )
-            source_event_wait_seconds = max(0.0, native_total_seconds - native_seconds)
+            source_event_wait_seconds = max(
+                0.0,
+                float(getattr(result, "source_event_wait_ms", 0.0)) / 1000.0,
+            )
+            source_registration_seconds = max(
+                0.0,
+                float(getattr(result, "source_registration_ms", 0.0)) / 1000.0,
+            )
+            native_slot_wait_seconds = max(
+                0.0,
+                float(getattr(result, "native_slot_wait_ms", 0.0)) / 1000.0,
+            )
+            native_started_monotonic = max(
+                0.0,
+                float(getattr(result, "native_started_monotonic", 0.0)),
+            )
+            native_ended_monotonic = max(
+                native_started_monotonic,
+                float(getattr(result, "native_ended_monotonic", 0.0)),
+            )
 
         report_succeeded: bool
+        report_started = time.perf_counter()
         try:
             reported = self._execute(
                 ReportTransferCompleteRequest(
@@ -959,6 +1010,7 @@ class RemoteFillProducerSession:
                     "terminal native report is ambiguous and STATUS could not "
                     "prove the reported result"
                 ) from status_error
+        report_seconds = time.perf_counter() - report_started
         if return_code != 0 or not report_succeeded:
             self.direct_viable = False
             return self._abandoned_window(
@@ -966,8 +1018,14 @@ class RemoteFillProducerSession:
                 "native transfer failed",
                 True,
                 reserve_seconds=reserve_seconds,
+                arm_seconds=arm_seconds,
                 source_event_wait_seconds=source_event_wait_seconds,
+                source_registration_seconds=source_registration_seconds,
+                native_slot_wait_seconds=native_slot_wait_seconds,
                 native_seconds=native_seconds,
+                report_seconds=report_seconds,
+                native_started_monotonic=native_started_monotonic,
+                native_ended_monotonic=native_ended_monotonic,
                 submitted_bytes=submitted_bytes,
                 existing_pages=existing_pages,
             )
@@ -976,8 +1034,14 @@ class RemoteFillProducerSession:
             True,
             True,
             reserve_seconds=reserve_seconds,
+            arm_seconds=arm_seconds,
             source_event_wait_seconds=source_event_wait_seconds,
+            source_registration_seconds=source_registration_seconds,
+            native_slot_wait_seconds=native_slot_wait_seconds,
             native_seconds=native_seconds,
+            report_seconds=report_seconds,
+            native_started_monotonic=native_started_monotonic,
+            native_ended_monotonic=native_ended_monotonic,
             submitted_bytes=submitted_bytes,
             existing_pages=existing_pages,
         )

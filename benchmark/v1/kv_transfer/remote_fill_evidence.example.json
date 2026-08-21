@@ -1,0 +1,56 @@
+{
+  "V1": {
+    "evidence": [
+      "vllm-ascend/tests/ut/kv_connector/test_dsa_index_connector.py",
+      "PENDING: deployed AscendMultiConnector construction"
+    ],
+    "status": "PENDING_HARDWARE"
+  },
+  "V2": {
+    "evidence": [
+      "LMCache-Ascend/tests/v1/test_remote_fill_producer.py::test_direct_page_batch_retains_same_owner_and_all_producer_events",
+      "PENDING: NPU stream-coverage campaign"
+    ],
+    "status": "PENDING_HARDWARE"
+  },
+  "V3": {
+    "evidence": [
+      "LMCache-NPU/tests/v1/storage_backend/test_mooncake_store_completion.py::test_duplicate_single_key_put_joins_real_pending_future",
+      "LMCache-NPU/tests/v1/storage_backend/test_mooncake_store_completion.py::test_duplicate_batched_put_joins_real_physical_writer"
+    ],
+    "status": "PASS_UNIT"
+  },
+  "V4": {
+    "evidence": [
+      "LMCache-NPU/tests/v1/remote_fill/test_state.py",
+      "LMCache-NPU/tests/v1/remote_fill/test_transport.py"
+    ],
+    "status": "PASS_UNIT"
+  },
+  "V5": {
+    "evidence": [
+      "LMCache-NPU/tests/v1/storage_backend/connector/test_mooncake_remote_fill_direct_push.py::test_incomplete_producer_fence_does_not_hold_native_operation_slot"
+    ],
+    "status": "PASS_UNIT"
+  },
+  "V6": {
+    "evidence": [
+      "LMCache-NPU/tests/v1/test_remote_fill_actual_load.py::test_remote_fill_materialization_consensus_uses_all_rank_result",
+      "PENDING: real TP8 passive-rank failure campaign"
+    ],
+    "status": "PENDING_HARDWARE"
+  },
+  "V7": {
+    "evidence": [
+      "LMCache-NPU/tests/v1/storage_backend/test_local_cpu_layer_page_contract.py"
+    ],
+    "status": "PASS_UNIT"
+  },
+  "V8": {
+    "evidence": [
+      "LMCache-Ascend/tests/v1/test_remote_fill_producer.py::test_remote_fill_requires_one_complete_source_page",
+      "LMCache-NPU/tests/v1/remote_fill/test_state.py::test_required_byte_capacity_hole_rejects_later_allocations"
+    ],
+    "status": "PASS_UNIT"
+  }
+}

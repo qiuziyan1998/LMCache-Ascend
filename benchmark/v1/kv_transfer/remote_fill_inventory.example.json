@@ -1,0 +1,56 @@
+{
+  "artifacts": {
+    "container_image_digest": "",
+    "mooncake_build": "",
+    "mooncake_checksum": ""
+  },
+  "cache": {
+    "cache_layer_count": 0,
+    "chunk_size": 0,
+    "group_dimensions": [],
+    "layout_tag": "",
+    "mtp": {},
+    "namespace": "",
+    "page_abi": "",
+    "python_hash_seed": 0,
+    "remote_fill_window_size": 0,
+    "token_hash_algorithm": ""
+  },
+  "clock": {
+    "max_observed_host_offset_us": -1,
+    "source": ""
+  },
+  "model": {
+    "custom_code_identity": "",
+    "quantization_identity": "",
+    "serving_bundle_artifact_id": "",
+    "tokenizer_identity": "",
+    "weights_identity": ""
+  },
+  "network": {
+    "cpu_socket": "",
+    "global_te_session": "",
+    "link_state": "",
+    "memory_placement": "",
+    "mooncake_segment_placement": "",
+    "mtu": 0,
+    "nic": "",
+    "numa_policy": "",
+    "routing": ""
+  },
+  "software": {
+    "cann": "",
+    "driver": "",
+    "firmware": "",
+    "python": "",
+    "pytorch": "",
+    "torch_npu": ""
+  },
+  "topology": {
+    "dp": 0,
+    "ep": 0,
+    "flashcomm": false,
+    "graph_mode": "",
+    "tp": 0
+  }
+}
