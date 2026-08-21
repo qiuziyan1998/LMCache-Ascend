@@ -196,7 +196,11 @@ class _DirectStoreRequestState:
     submitted_end: dict[int, int] = field(default_factory=dict)
     committed_end: dict[int, int] = field(default_factory=dict)
     planned_end: int = 0
-    planned_hash: int = 0
+    # Hash-chain frontier: int for builtin/64-bit algorithms, raw digest
+    # bytes for digest-based algorithms (e.g. sha256_cbor in this vLLM fork).
+    # Must round-trip the exact hash_func output to keep incremental hashing
+    # consistent with batch hashing.
+    planned_hash: Union[int, bytes] = 0
     accepted_store_end: Optional[int] = None
     submitted_jobs: int = 0
     submitted_pages: int = 0
@@ -1310,7 +1314,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kv_group=0,
             )
         )
-        hashes = [int(key.chunk_hash) for _, _, key in latent]
+        hashes = [key.chunk_hash for _, _, key in latent]
         offsets = [end - start for start, end, _ in latent]
         indexer = list(
             self.token_database.process_tokens(
@@ -2103,7 +2107,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=0,
                 )
             )
-        hashes = [int(key.chunk_hash) for _, _, key in plan0]
+        hashes = [key.chunk_hash for _, _, key in plan0]
         offsets = [end - start for start, end, _ in plan0]
         plans = {0: plan0}
         for group in groups:
@@ -2132,7 +2136,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
         if plan0:
             state.planned_end = plan0[-1][1]
-            state.planned_hash = int(plan0[-1][2].chunk_hash)
+            state.planned_hash = plan0[-1][2].chunk_hash
         return plans
 
     def adopt_completed_layerwise_store(
@@ -2152,7 +2156,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 result.starts, result.ends, result.keys[0], strict=True
             ):
                 if end - start == chunk_size:
-                    latest_full = (end, int(key.chunk_hash))
+                    latest_full = (end, key.chunk_hash)
             if latest_full is not None:
                 end, chunk_hash = latest_full
                 if end == state.planned_end and chunk_hash != state.planned_hash:
@@ -2682,7 +2686,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self.token_database.process_tokens_from_prefix(
                     target_tokens,
                     prefix_token_count=planned_end,
-                    prefix_hash=int(builder["planned_hash"]),
+                    prefix_hash=builder["planned_hash"],
                     request_configs=request_configs,
                     kv_group=0,
                 )
@@ -2699,7 +2703,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 or plan0[-1][1] != target_end
             ):
                 raise ValueError("live source token plan is not contiguous")
-            hashes = [int(key.chunk_hash) for _, _, key in plan0]
+            hashes = [key.chunk_hash for _, _, key in plan0]
             offsets = [end - start for start, end, _ in plan0]
             group1_keys = list(
                 self.token_database.process_tokens(
@@ -2821,7 +2825,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         "live group-1 source coverage is invalid"
                     )
             builder["planned_end"] = target_end
-            builder["planned_hash"] = int(plan0[-1][2].chunk_hash)
+            builder["planned_hash"] = plan0[-1][2].chunk_hash
         except Exception as error:
             self._live_source_builders.pop(req_id, None)
             logger.warning(
@@ -2920,7 +2924,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             if group:
                 key = next(
                     self.token_database.process_tokens(
-                        hashes=[int(latent_key.chunk_hash)],
+                        hashes=[latent_key.chunk_hash],
                         offsets=[end - start],
                         request_configs=request_configs,
                         kv_group=group,
@@ -3230,7 +3234,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     if prefix_plans[0]:
                         state.planned_end = prefix_plans[0][-1][1]
-                        state.planned_hash = int(
+                        state.planned_hash = (
                             prefix_plans[0][-1][2].chunk_hash
                         )
                     probe_pages = self._remote_fill_probe_control_pages(
