@@ -58,7 +58,12 @@ from lmcache.v1.mooncake_layout import (
     mooncake_payload_layout,
     mooncake_page_layout_enabled,
 )
-from lmcache.v1.remote_fill import ControlPage, OperationKind, ProtocolLimits
+from lmcache.v1.remote_fill import (
+    ControlPage,
+    OperationKind,
+    ProtocolLimits,
+    log_remote_fill_validation_failure,
+)
 from lmcache.v1.remote_fill.native import (
     DIRECT_PUSH_H0_QUALIFICATION_V1,
     DirectPushPageSource,
@@ -496,7 +501,22 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def post_init(self, **kwargs) -> None:
         super().post_init(**kwargs)
-        self._initialize_decoder_remote_fill()
+        try:
+            self._initialize_decoder_remote_fill()
+        except Exception as error:
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-D-000",
+                stage="decoder_startup_validation",
+                action="STARTUP_ABORT",
+                reason=(
+                    "RemoteFill was enabled but its decoder invariants were "
+                    "not satisfied; the endpoint was not advertised"
+                ),
+                error=error,
+                severity="critical",
+            )
+            raise
         if self.is_store_async and not self._direct_store_enabled:
             self._device_id = torch.npu.current_device()
             self._ensure_store_worker()
@@ -639,6 +659,30 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise RuntimeError("remote-fill fatal state lacks a transfer identity")
         self._remote_fill_require_paired_restart((handoff.transfer_id,))
 
+    @staticmethod
+    def _log_remote_fill_prearm_failure(
+        state: _DirectStoreRequestState,
+        *,
+        req_id: str,
+        stage: str,
+        reason: str,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Make a safe direct-fill fallback immediately operator-visible."""
+
+        handoff = state.remote_fill_handoff
+        log_remote_fill_validation_failure(
+            logger,
+            code="RF-P-004",
+            stage=stage,
+            action="PERSISTENT_ONLY",
+            req_id=req_id,
+            transfer_id=handoff.transfer_id if handoff is not None else None,
+            reason=reason,
+            error=error,
+            severity="warning",
+        )
+
     def _record_remote_fill_window_metrics(
         self,
         state: _DirectStoreRequestState,
@@ -682,6 +726,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 armed=bool(result.armed),
                 fatal_restart_required=bool(result.fatal_restart_required),
             )
+            fatal = bool(result.fatal_restart_required)
+            handoff = state.remote_fill_handoff
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-P-900" if fatal else "RF-P-004",
+                stage="window_terminal",
+                action=(
+                    "PAIRED_RESTART_REQUIRED" if fatal else "PERSISTENT_ONLY"
+                ),
+                transfer_id=(handoff.transfer_id if handoff is not None else None),
+                reason=str(result.reason),
+                memory_safety_uncertain=fatal,
+                severity="critical" if fatal else "warning",
+            )
 
     def _remote_fill_prepare_request(
         self,
@@ -697,8 +755,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             handoff = parse_remote_fill_handoff(request_configs)
         except ValueError as error:
             state.remote_fill_disabled_reason = type(error).__name__
-            logger.warning(
-                "Remote fill disabled for request %s: malformed handoff", req_id
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-P-001",
+                stage="handoff_validation",
+                action="PERSISTENT_ONLY",
+                req_id=req_id,
+                reason="malformed handoff",
+                error=error,
+                severity="warning",
             )
             return False
         if handoff is None:
@@ -715,15 +780,55 @@ class AscendLMCacheEngine(LMCacheEngine):
             != DIRECT_PUSH_H0_QUALIFICATION_V1
         ):
             state.remote_fill_disabled_reason = "native_not_qualified"
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-P-002",
+                stage="handoff_validation",
+                action="LEGACY_PATH",
+                req_id=req_id,
+                transfer_id=handoff.transfer_id,
+                reason=state.remote_fill_disabled_reason,
+                severity="warning",
+            )
             return False
         if handoff.destination_dp_rank >= handoff.destination_dp_size:
             state.remote_fill_disabled_reason = "invalid_dp_mapping"
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-P-002",
+                stage="handoff_validation",
+                action="PERSISTENT_ONLY",
+                req_id=req_id,
+                transfer_id=handoff.transfer_id,
+                reason=state.remote_fill_disabled_reason,
+                severity="warning",
+            )
             return False
         if handoff.destination_tp_size != int(self.metadata.world_size):
             state.remote_fill_disabled_reason = "incompatible_tp_mapping"
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-P-002",
+                stage="handoff_validation",
+                action="PERSISTENT_ONLY",
+                req_id=req_id,
+                transfer_id=handoff.transfer_id,
+                reason=state.remote_fill_disabled_reason,
+                severity="warning",
+            )
             return False
         if not self._remote_fill_circuit_allows():
             state.remote_fill_disabled_reason = "circuit_open"
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-P-003",
+                stage="producer_admission",
+                action="PERSISTENT_ONLY",
+                req_id=req_id,
+                transfer_id=handoff.transfer_id,
+                reason=state.remote_fill_disabled_reason,
+                severity="warning",
+            )
             return False
         state.remote_fill_source_generation = secrets.randbits(63) or 1
         metrics.add_gauge("direct_viable", 1)
@@ -1351,11 +1456,24 @@ class AscendLMCacheEngine(LMCacheEngine):
             control_pages = self._remote_fill_control_pages(batch)
         except Exception as error:
             state.remote_fill_disabled_reason = type(error).__name__
+            self._log_remote_fill_prearm_failure(
+                state,
+                req_id=batch.req_id,
+                stage="control_page_planning",
+                reason=state.remote_fill_disabled_reason,
+                error=error,
+            )
             self._remote_fill_record_failure()
             return
         maximum = self._remote_fill_pages_per_window()
         if maximum <= 0:
             state.remote_fill_disabled_reason = "invalid_control_page_limit"
+            self._log_remote_fill_prearm_failure(
+                state,
+                req_id=batch.req_id,
+                stage="control_page_planning",
+                reason=state.remote_fill_disabled_reason,
+            )
             self._get_remote_fill_producer_metrics().abandon(
                 "invalid control page limit", allocation=True
             )
@@ -1368,6 +1486,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         queued_at = time.perf_counter()
         if not self._remote_fill_acquire_queue_capacity(state, byte_count):
             state.remote_fill_disabled_reason = "producer_backpressure"
+            self._log_remote_fill_prearm_failure(
+                state,
+                req_id=batch.req_id,
+                stage="producer_admission",
+                reason=state.remote_fill_disabled_reason,
+            )
             metrics = self._get_remote_fill_producer_metrics()
             metrics.abandon("producer backpressure", allocation=True)
             cold_start_perf_log(
@@ -1386,6 +1510,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         except Exception as error:
             self._remote_fill_release_queue_capacity(state, byte_count)
             state.remote_fill_disabled_reason = type(error).__name__
+            self._log_remote_fill_prearm_failure(
+                state,
+                req_id=batch.req_id,
+                stage="source_plan_validation",
+                reason=state.remote_fill_disabled_reason,
+                error=error,
+            )
             self._remote_fill_record_failure()
             return
         cold_start_perf_log(
@@ -1405,6 +1536,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             except Exception as error:
                 self._remote_fill_release_queue_capacity(state, byte_count)
                 state.remote_fill_disabled_reason = type(error).__name__
+                self._log_remote_fill_prearm_failure(
+                    state,
+                    req_id=batch.req_id,
+                    stage="producer_executor_creation",
+                    reason=state.remote_fill_disabled_reason,
+                    error=error,
+                )
                 self._remote_fill_record_failure()
                 return
             self._remote_fill_producer_executor = executor
@@ -1522,11 +1660,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 state.remote_fill_disabled_reason = type(error).__name__
                 if state.remote_fill_session is not None:
                     state.remote_fill_session.direct_viable = False
-                logger.warning(
-                    "Remote fill abandoned before a fatal native state for "
-                    "request %s: %s",
-                    batch.req_id,
-                    type(error).__name__,
+                self._log_remote_fill_prearm_failure(
+                    state,
+                    req_id=batch.req_id,
+                    stage="producer_window_execution",
+                    reason=state.remote_fill_disabled_reason,
+                    error=error,
                 )
                 self._remote_fill_record_failure()
                 metrics = self._get_remote_fill_producer_metrics()
@@ -1541,6 +1680,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         except Exception as error:
             self._remote_fill_release_queue_capacity(state, byte_count)
             state.remote_fill_disabled_reason = type(error).__name__
+            self._log_remote_fill_prearm_failure(
+                state,
+                req_id=batch.req_id,
+                stage="producer_executor_submission",
+                reason=state.remote_fill_disabled_reason,
+                error=error,
+            )
             self._remote_fill_record_failure()
             return
         state.remote_fill_futures.append(future)
@@ -1633,6 +1779,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         if terminal.outcome == "LOCAL_FULL":
             self._remote_fill_record_success()
+        elif terminal.outcome == "PERSISTENT_ONLY":
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-P-004",
+                stage="producer_terminal",
+                action="PERSISTENT_ONLY",
+                req_id=req_id,
+                transfer_id=state.remote_fill_handoff.transfer_id,
+                reason=state.remote_fill_disabled_reason or terminal.outcome,
+                severity="warning",
+            )
         cold_start_perf_log(
             logger,
             "remote_fill_producer_terminal",
@@ -9285,6 +9442,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             '[LMCACHE_REMOTE_FILL] {"schema":1,'
             '"event":"remote_fill_fatal_restart","count":%d}',
             len(self._remote_fill_fatal_transfers),
+        )
+        log_remote_fill_validation_failure(
+            logger,
+            code="RF-D-900",
+            stage="armed_native_lifecycle",
+            action="PAIRED_RESTART_REQUIRED",
+            transfer_id=normalized[0] if len(normalized) == 1 else None,
+            reason=(
+                "destination memory may still be targeted; allocator teardown "
+                "is intentionally blocked"
+            ),
+            memory_safety_uncertain=True,
+            severity="critical",
         )
 
     def close(self) -> None:

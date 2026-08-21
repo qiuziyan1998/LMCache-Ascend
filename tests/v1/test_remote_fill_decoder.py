@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from threading import Event
 from types import SimpleNamespace
 from typing import Any
+import logging
 
 # Third Party
 from lmcache.v1.cache_engine import LMCacheEngine
@@ -809,6 +810,7 @@ def test_service_host_propagates_only_maintenance_fatal_evidence() -> None:
 def test_service_loop_failure_reports_only_real_shutdown_fatal_evidence(
     shutdown_result: tuple[str, ...],
     expected_fatal: list[tuple[str, ...]],
+    caplog,
 ) -> None:
     service = _FakeService(shutdown=shutdown_result)
     server = _FailingServer()
@@ -819,13 +821,16 @@ def test_service_loop_failure_reports_only_real_shutdown_fatal_evidence(
         fatal_restart=fatal.append,
     )
 
-    host.start()
-    assert host._closed.wait(timeout=1.0)
+    with caplog.at_level(logging.ERROR):
+        host.start()
+        assert host._closed.wait(timeout=1.0)
     host.close()
 
     assert fatal == expected_fatal
     assert service.shutdown_calls == 1
     assert server.closed
+    assert '"code":"RF-D-005"' in caplog.text
+    assert '"action":"DISABLE_DIRECT_SERVICE_AND_AUDIT_ARMED_STATE"' in caplog.text
 
 
 def test_unarmed_service_failure_stops_decoder_placement_advertisement() -> None:

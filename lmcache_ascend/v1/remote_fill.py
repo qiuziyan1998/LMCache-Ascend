@@ -36,6 +36,7 @@ from lmcache.v1.remote_fill import (
     RemoteFillStateCore,
     ReservedPageView,
     UnsafePageLifecycleError,
+    log_remote_fill_validation_failure,
 )
 from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
 from lmcache.v1.rpc.zmq_transport import ZmqRouterServerTransport
@@ -1066,8 +1067,19 @@ class DecoderRemoteFillServiceHost:
                     self._fatal_reported = True
                     self._fatal_restart(fatal)
                     self._stop.set()
-        except Exception:
-            logger.exception("Remote-fill decoder service loop failed")
+        except Exception as error:
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-D-005",
+                stage="decoder_control_service",
+                action="DISABLE_DIRECT_SERVICE_AND_AUDIT_ARMED_STATE",
+                reason=(
+                    "the endpoint is no longer advertised; ordinary LMCache "
+                    "serving continues only if shutdown finds no armed transfer"
+                ),
+                error=error,
+                severity="error",
+            )
             self._stop.set()
         finally:
             self._shutdown_service_and_server()

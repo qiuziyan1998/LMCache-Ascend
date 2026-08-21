@@ -8,6 +8,7 @@ from dataclasses import asdict
 from threading import Condition, RLock
 from types import SimpleNamespace
 from typing import Any
+import logging
 import time
 
 import pytest
@@ -1019,6 +1020,24 @@ def test_disabled_engine_path_creates_no_remote_work() -> None:
     assert not hasattr(engine, "_remote_fill_client_factory")
 
 
+def test_malformed_handoff_is_visible_and_uses_persistent_fallback(caplog) -> None:
+    state = _DirectStoreRequestState()
+    engine = SimpleNamespace(config=SimpleNamespace(enable_remote_lmcache_store=True))
+
+    with caplog.at_level(logging.WARNING):
+        enabled = AscendLMCacheEngine._remote_fill_prepare_request(
+            engine,
+            "request",
+            {"lmcache.remote_fill": {"transfer_id": 7}},
+            state,
+        )
+
+    assert enabled is False
+    assert state.remote_fill_handoff is None
+    assert '"code":"RF-P-001"' in caplog.text
+    assert '"action":"PERSISTENT_ONLY"' in caplog.text
+
+
 def test_producer_metrics_are_bounded_and_pointer_free() -> None:
     metrics = RemoteFillProducerMetrics()
     metrics.start_attempt()
@@ -1073,7 +1092,9 @@ def test_global_producer_inflight_bytes_are_bounded_across_requests() -> None:
     )
 
 
-def test_one_produced_batch_uses_one_bounded_executor_task_for_all_splits() -> None:
+def test_one_produced_batch_uses_one_bounded_executor_task_for_all_splits(
+    caplog,
+) -> None:
     class _RecordingExecutor:
         def __init__(self) -> None:
             self.functions = []
@@ -1138,10 +1159,13 @@ def test_one_produced_batch_uses_one_bounded_executor_task_for_all_splits() -> N
     engine._remote_fill_release_queue_capacity(state, 30)
     engine.config.remote_fill_max_bytes_per_request = 20
     rejected = _DirectStoreRequestState(remote_fill_handoff=_handoff())
-    engine._schedule_remote_fill_batch(rejected, batch, 3072)
+    with caplog.at_level(logging.WARNING):
+        engine._schedule_remote_fill_batch(rejected, batch, 3072)
     assert len(executor.functions) == 1
     assert source_plan_calls == [batch]
     assert rejected.remote_fill_disabled_reason == "producer_backpressure"
+    assert '"code":"RF-P-004"' in caplog.text
+    assert '"stage":"producer_admission"' in caplog.text
 
 
 def test_direct_required_end_uses_authoritative_accepted_store_frontier() -> None:
