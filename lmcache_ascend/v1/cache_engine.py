@@ -70,6 +70,7 @@ from lmcache.v1.remote_fill.native import (
     DirectPushPageSource,
     DirectPushSourcePlan,
     NativeDirectPushActivation,
+    NativeExternalPageTransferUnknownError,
 )
 from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
@@ -628,9 +629,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Drain producer work and close lazily created control resources."""
 
         states = getattr(self, "_direct_store_states", {})
+        deadline = time.perf_counter() + (
+            float(self.config.remote_fill_native_hard_timeout_ms) / 1000.0
+        )
         for state in states.values():
             while state.remote_fill_futures:
-                state.remote_fill_futures.popleft().result()
+                future = state.remote_fill_futures.popleft()
+                try:
+                    future.result(timeout=max(0.0, deadline - time.perf_counter()))
+                except FutureTimeoutError as error:
+                    self._latch_remote_fill_producer_fatal(state)
+                    raise RemoteFillFatalError(
+                        "remote-fill producer shutdown exceeded its hard deadline"
+                    ) from error
             if state.remote_fill_session is not None:
                 state.remote_fill_session.close()
         executor = getattr(self, "_remote_fill_producer_executor", None)
@@ -1593,6 +1604,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         source_plan=source_plan,
                         submitter=submitter,
                         activation_factory=activation_factory,
+                        preparer=self.storage_manager.prepare_remote_fill_source,
                     )
                     results.append(result)
                     if not result.direct_satisfied:
@@ -1878,7 +1890,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 batch.ptrs,
                 batch.sizes,
                 batch.owners,
-                batch.ready_event,
+                batch.ready_events,
                 batch.req_id,
             )
         except Exception:
@@ -3744,6 +3756,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                         future.result()
                 except Exception as caught:
                     error = caught
+                if isinstance(error, NativeExternalPageTransferUnknownError):
+                    self._latch_remote_fill_producer_fatal(state)
+                    raise RemoteFillFatalError(
+                        "persistent external-page DMA exceeded its hard deadline"
+                    ) from error
                 retry = self._direct_retry_args.pop(future, None)
                 if retry is None:
                     if error is not None:
@@ -4932,6 +4949,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 consume(record())
             return True
         except Exception as exc:
+            if isinstance(exc, NativeExternalPageTransferUnknownError):
+                self._remote_fill_require_paired_restart((req_id,))
+                raise RemoteFillFatalError(
+                    "decoder external-page DMA exceeded its hard deadline"
+                ) from exc
             if direct_load_submitted:
                 # A backend failure can be reported after some direct writes
                 # have already been queued.  Fence those writes, while their
@@ -9471,17 +9493,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         runtime = self._remote_fill_runtime
         if runtime is not None:
             runtime.close()
-            if self._remote_fill_fatal_transfers:
-                # An ARMED/FATAL_UNKNOWN native writer may still target these
-                # registered addresses. Deliberately retain the runtime and
-                # allocator ownership until the supervisor terminates both P
-                # and D; normal LocalCPU teardown could otherwise free/reuse
-                # memory while a remote DMA is still in flight.
-                raise RuntimeError(
-                    "remote-fill shutdown requires paired P+D restart; "
-                    "LocalCPU memory was deliberately retained"
-                )
-            self._remote_fill_runtime = None
+        if self._remote_fill_fatal_transfers:
+            # An unknown native writer may still target registered P or D
+            # storage. Deliberately retain runtime and allocator ownership
+            # until the supervisor terminates the paired deployment.
+            raise RuntimeError(
+                "remote-fill shutdown requires paired P+D restart; "
+                "native-owned memory was deliberately retained"
+            )
+        self._remote_fill_runtime = None
         self.close_remote_fill_producer()
         self.wait_for_direct_stores(tuple(self._direct_store_states))
         self._direct_store_states.clear()

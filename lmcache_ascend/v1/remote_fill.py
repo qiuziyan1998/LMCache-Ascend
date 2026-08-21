@@ -249,6 +249,8 @@ class _HiddenPage:
 
     key: CacheEngineKey
     page: LayerPageMemoryObj
+    unpinned: bool = False
+    reference_released: bool = False
     released: bool = False
     lock: Lock = field(default_factory=Lock)
 
@@ -258,11 +260,13 @@ class _HiddenPage:
         with self.lock:
             if self.released:
                 return
+            if not self.unpinned:
+                self.page.unpin()
+                self.unpinned = True
+            if not self.reference_released:
+                self.page.ref_count_down()
+                self.reference_released = True
             self.released = True
-        try:
-            self.page.unpin()
-        finally:
-            self.page.ref_count_down()
 
 
 def _parse_raw_token_dimensions(config: LMCacheEngineConfig) -> tuple[int, int]:
@@ -799,8 +803,20 @@ class AscendRemoteFillPageLifecycle:
                 lock_hold_ms=round(result.lock_hold_seconds * 1000, 3),
             )
             return False
-        for handle in handles:
-            handle.release()
+        try:
+            for handle in handles:
+                handle.release()
+        except Exception as error:
+            log_commit(
+                committed=True,
+                error=True,
+                rollback_safe=False,
+                required_pairs=len(group0_keys),
+                ready_pages=len(ready),
+            )
+            raise UnsafePageLifecycleError(
+                "remote-fill reservation ownership transfer failed after publish"
+            ) from error
         log_commit(
             committed=True,
             error=False,

@@ -43,6 +43,7 @@ from lmcache.v1.remote_fill.native import (
     NativeDirectPushPreSubmitError,
     NativeDirectPushResult,
     NativeDirectPushTerminalError,
+    PreparedDirectPushSource,
 )
 
 # First Party
@@ -496,6 +497,61 @@ def test_transfer_arms_only_allocated_descriptor_subset() -> None:
     )
     assert terminal.outcome == "LOCAL_FULL"
     assert any(isinstance(item, FinishRequest) for item in client.requests)
+
+
+def test_transfer_prepares_source_before_reserve_and_arm() -> None:
+    client = _ScriptedClient()
+    session = _session(client)
+    source_plan = _source_plan()
+    prepared_calls = 0
+
+    def preparer(plan: DirectPushSourcePlan) -> Future:
+        nonlocal prepared_calls
+        prepared_calls += 1
+        assert plan is source_plan
+        assert not any(
+            isinstance(request, (ReserveWindowRequest, ArmWindowRequest))
+            for request in client.requests
+        )
+        future: Future = Future()
+        future.set_result(
+            PreparedDirectPushSource(
+                source_plan=plan,
+                source_event_wait_ms=2.0,
+                source_fences_ready_monotonic=9.0,
+                source_registration_ms=1.0,
+            )
+        )
+        return future
+
+    def submitter(**kwargs: Any) -> Future:
+        assert isinstance(kwargs["source_plan"], PreparedDirectPushSource)
+        future: Future = Future()
+        future.set_result(
+            NativeDirectPushResult(
+                native_transfer_attempt_id="native-attempt",
+                return_code=0,
+                vector_count=2,
+                transferred_bytes=96,
+                elapsed_ms=1.0,
+                source_event_wait_ms=2.0,
+                source_registration_ms=1.0,
+            )
+        )
+        return future
+
+    result = session.transfer_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=_pages(),
+        source_plan=source_plan,
+        submitter=submitter,
+        activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+        preparer=preparer,
+    )
+
+    assert result.direct_satisfied
+    assert prepared_calls == 1
 
 
 def test_lost_finish_reply_recovers_committed_local_full_with_status() -> None:
@@ -1279,7 +1335,7 @@ def test_direct_page_batch_retains_same_owner_and_all_producer_events() -> None:
 
     assert persistent_future is storage.future
     assert storage.args[3] is batch.owners
-    assert storage.args[4] is event
+    assert storage.args[4] == (event, second_event)
     assert direct_plan.owners is batch.owners
     assert direct_plan.producer_events == (event, second_event)
     storage.future.set_result(None)

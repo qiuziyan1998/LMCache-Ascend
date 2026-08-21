@@ -46,7 +46,10 @@ from lmcache.v1.rpc.zmq_transport import (
     SocketParams,
     ZmqReqRepClientTransport,
 )
-from lmcache.v1.remote_fill.native import DirectPushSourcePlan
+from lmcache.v1.remote_fill.native import (
+    DirectPushSourcePlan,
+    PreparedDirectPushSource,
+)
 
 
 REMOTE_FILL_REQUEST_CONFIG_KEY = "lmcache.remote_fill"
@@ -66,6 +69,13 @@ class DirectPushSubmitter(Protocol):
         activation: Any,
     ) -> Future:
         """Return a future for the terminal aggregate native result."""
+
+
+class DirectPushPreparer(Protocol):
+    """Callable that fences and registers source pages before destination ARM."""
+
+    def __call__(self, source_plan: Any) -> Future:
+        """Return a future for prepared source ownership evidence."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,6 +563,9 @@ class RemoteFillProducerSession:
         )
         self._operation_sequence = 0
         self._terminal: RemoteFillTerminalResult | None = None
+        self._prepared_sources: dict[
+            int, tuple[Any, PreparedDirectPushSource]
+        ] = {}
 
     def open(self) -> bool:
         """Negotiate static layout and open the destination transaction."""
@@ -723,11 +736,43 @@ class RemoteFillProducerSession:
         source_plan: Any,
         submitter: DirectPushSubmitter,
         activation_factory: Callable[[str], Any],
+        preparer: DirectPushPreparer | None = None,
     ) -> RemoteFillWindowResult:
         """Reserve, arm, transfer, and report one authoritative page window."""
 
         if not self.direct_viable or not self.open():
             return self._abandoned_window(window_id, "open rejected")
+        source_by_identity = {
+            (page.canonical_key, page.kv_group): page for page in source_plan.pages
+        }
+        if any(
+            (page.canonical_key, page.kv_group) not in source_by_identity
+            for page in control_pages
+        ):
+            self.direct_viable = False
+            return self._abandoned_window(window_id, "source coverage mismatch")
+        prepared_source: PreparedDirectPushSource | None = None
+        if preparer is not None:
+            try:
+                cached_prepared = self._prepared_sources.get(id(source_plan))
+                if cached_prepared is not None and cached_prepared[0] is source_plan:
+                    prepared_source = cached_prepared[1]
+                else:
+                    prepared_source = preparer(source_plan).result(
+                        timeout=self.native_hard_timeout_seconds
+                    )
+                if not isinstance(prepared_source, PreparedDirectPushSource):
+                    raise TypeError("source preparer returned invalid evidence")
+                self._prepared_sources[id(source_plan)] = (
+                    source_plan,
+                    prepared_source,
+                )
+            except Exception:
+                # No decoder address has been reserved or armed. Persistent
+                # storage remains authoritative and owns its independent hard
+                # timeout/fatal policy.
+                self.direct_viable = False
+                return self._abandoned_window(window_id, "source preparation failed")
         digest = manifest_digest(control_pages)
         reserve_started = time.perf_counter()
         try:
@@ -793,6 +838,36 @@ class RemoteFillProducerSession:
             descriptor_digest = destination_descriptor_digest(descriptors)
             if descriptor_digest != reserved.destination_descriptor_digest:
                 raise ValueError("destination descriptor digest changed")
+            selected_sources = tuple(
+                source_by_identity[(descriptor.canonical_key, descriptor.kv_group)]
+                for descriptor in descriptors
+            )
+            if any(
+                sum(source.source_lengths) != descriptor.destination_length
+                for source, descriptor in zip(
+                    selected_sources, descriptors, strict=True
+                )
+            ):
+                raise ValueError("source and destination page lengths differ")
+            native_source_plan = DirectPushSourcePlan(
+                pages=selected_sources,
+                owners=source_plan.owners,
+                producer_events=source_plan.producer_events,
+            )
+            native_source: DirectPushSourcePlan | PreparedDirectPushSource = (
+                PreparedDirectPushSource(
+                    source_plan=native_source_plan,
+                    source_event_wait_ms=prepared_source.source_event_wait_ms,
+                    source_fences_ready_monotonic=(
+                        prepared_source.source_fences_ready_monotonic
+                    ),
+                    source_registration_ms=(
+                        prepared_source.source_registration_ms
+                    ),
+                )
+                if prepared_source is not None
+                else native_source_plan
+            )
         except Exception:
             self.direct_viable = False
             return self._abandoned_window(
@@ -854,21 +929,9 @@ class RemoteFillProducerSession:
         native_result = None
         native_error: Exception | None = None
         try:
-            source_by_identity = {
-                (page.canonical_key, page.kv_group): page for page in source_plan.pages
-            }
-            selected_sources = tuple(
-                source_by_identity[(descriptor.canonical_key, descriptor.kv_group)]
-                for descriptor in descriptors
-            )
-            native_source_plan = DirectPushSourcePlan(
-                pages=selected_sources,
-                owners=source_plan.owners,
-                producer_events=source_plan.producer_events,
-            )
             future = submitter(
                 remote_session=self.remote_session,
-                source_plan=native_source_plan,
+                source_plan=native_source,
                 destination_descriptors=descriptors,
                 activation=activation_factory(attempt_id),
             )
@@ -1300,6 +1363,7 @@ class RemoteFillProducerSession:
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
+        self._prepared_sources.clear()
         self.closed = True
 
     def _common(self) -> OperationIdentity:

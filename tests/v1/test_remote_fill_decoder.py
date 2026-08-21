@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from threading import Event
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 import logging
 
 # Third Party
@@ -50,6 +51,7 @@ class _FakePage:
     data_ptr: int
     refs: int = 1
     pins: int = 0
+    ref_failures: int = 0
 
     def get_size(self) -> int:
         return self.size
@@ -58,6 +60,9 @@ class _FakePage:
         self.refs += 1
 
     def ref_count_down(self) -> None:
+        if self.ref_failures:
+            self.ref_failures -= 1
+            raise RuntimeError("injected ref release failure")
         if self.refs <= 0:
             raise RuntimeError("page reference underflow")
         self.refs -= 1
@@ -657,6 +662,31 @@ def test_local_commit_distinguishes_safe_and_unsafe_rollback(
     lifecycle.release_pages(views, "test cleanup")
 
 
+def test_post_commit_release_is_retry_safe_and_fatal() -> None:
+    local = _FakeLocalBackend()
+    lifecycle = _lifecycle(local)
+    controls = (_control_page(0, 0), _control_page(0, 1))
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+    handle = prepared[0].handle
+    handle.page.ref_failures = 1
+    with pytest.raises(UnsafePageLifecycleError, match="after publish"):
+        lifecycle.commit_pages(
+            "transfer",
+            controls,
+            _views(controls, prepared),
+            _finish(4),
+        )
+
+    assert set(local.hot) == {_key(0, 0), _key(0, 1)}
+    assert handle.unpinned is True
+    assert handle.reference_released is False
+    assert handle.released is False
+    handle.release()
+    assert handle.page.pins == 0
+    assert handle.page.refs == 1
+    assert handle.released is True
+
+
 def test_missing_group_manifest_cannot_publish_any_page() -> None:
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(local)
@@ -1008,6 +1038,21 @@ def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(
 
     assert base_close_calls == 1
     assert engine._remote_fill_runtime is None
+
+
+def test_prefiller_fatal_close_retains_native_owned_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    base_close = Mock()
+    monkeypatch.setattr(LMCacheEngine, "close", base_close)
+    engine._remote_fill_runtime = None
+    engine._remote_fill_fatal_transfers = ("producer-transfer",)
+
+    with pytest.raises(RuntimeError, match="paired P\+D restart"):
+        engine.close()
+
+    base_close.assert_not_called()
 
 
 def test_decoder_remote_fill_startup_is_idempotent_after_success() -> None:
