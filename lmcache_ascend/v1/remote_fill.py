@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 import ipaddress
 import json
 import os
-from pathlib import Path
+import secrets
 from threading import Event, Lock, Thread
 from time import monotonic
 from typing import Any, Protocol
@@ -22,7 +22,10 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
 )
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.mooncake_layout import mooncake_valid_tokens
+from lmcache.v1.mooncake_layout import (
+    mooncake_valid_tokens,
+    resolve_remote_fill_identity,
+)
 from lmcache.v1.remote_fill import (
     PROTOCOL_VERSION,
     ControlPage,
@@ -48,10 +51,9 @@ import torch
 
 logger = init_logger(__name__)
 
-REMOTE_FILL_SECRET_FILE_ENV = "LMCACHE_REMOTE_FILL_HMAC_SECRET_FILE"
 REMOTE_FILL_H0_QUALIFICATION_ENV = "LMCACHE_REMOTE_FILL_H0_QUALIFICATION"
 REMOTE_FILL_MODEL_LAYOUT = "mla-dsa-layer-page-v3"
-_MAX_SECRET_FILE_BYTES = 4096
+_DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES = 32
 
 
 def _format_tcp_host(host: str) -> str:
@@ -213,6 +215,7 @@ class RemoteFillPlacementInfo:
     global_te_push: bool
     token_hash_algorithm: str
     python_hash_seed: str
+    descriptor_verification_capability: str = field(repr=False)
 
     def to_dict(self) -> dict[str, int | str | bool]:
         """Return a transport-safe discovery record."""
@@ -234,6 +237,9 @@ class RemoteFillPlacementInfo:
             "global_te_push": self.global_te_push,
             "token_hash_algorithm": self.token_hash_algorithm,
             "python_hash_seed": self.python_hash_seed,
+            "descriptor_verification_capability": (
+                self.descriptor_verification_capability
+            ),
         }
 
 
@@ -305,8 +311,7 @@ def build_decoder_layout(
     """
 
     dimensions = _parse_raw_token_dimensions(config)
-    artifact_id = str(config.remote_fill_model_artifact_id or "").strip()
-    namespace = str(config.remote_fill_cache_namespace).strip()
+    namespace, artifact_id = resolve_remote_fill_identity(config, metadata)
     if not layout_tag or not artifact_id or not namespace:
         raise ValueError("remote-fill layout identity must not be empty")
     if num_layers <= 0:
@@ -349,43 +354,20 @@ def build_decoder_layout(
     )
 
 
-def load_deployment_secret(
-    environment: Mapping[str, str] | None = None,
-) -> bytes:
-    """Read the deployment-scoped HMAC secret from a private file.
+def _descriptor_verification_capability(value: bytes | None) -> bytes:
+    """Return one exact decoder-incarnation descriptor verification key."""
 
-    Args:
-        environment: Environment mapping containing only the secret-file path,
-            defaulting to ``os.environ``.
-
-    Returns:
-        Raw secret bytes with one trailing line ending removed.
-
-    Raises:
-        ValueError: If the path is absent or its file is unsafe in size.
-        OSError: If the configured file cannot be read.
-    """
-
-    env = os.environ if environment is None else environment
-    configured_path = env.get(REMOTE_FILL_SECRET_FILE_ENV, "").strip()
-    if not configured_path:
-        raise ValueError(
-            f"{REMOTE_FILL_SECRET_FILE_ENV} must name a private secret file"
-        )
-    secret_path = Path(configured_path)
-    stat = secret_path.stat()
-    if not secret_path.is_file() or not 32 <= stat.st_size <= _MAX_SECRET_FILE_BYTES:
-        raise ValueError("remote-fill secret file must contain 32-4096 bytes")
-    secret = secret_path.read_bytes().rstrip(b"\r\n")
-    if not 32 <= len(secret) <= _MAX_SECRET_FILE_BYTES:
-        raise ValueError("remote-fill HMAC secret must contain 32-4096 bytes")
-    return secret
-
-
-def _validate_deployment_secret(secret: bytes) -> bytes:
-    if not isinstance(secret, bytes) or not 32 <= len(secret) <= _MAX_SECRET_FILE_BYTES:
-        raise ValueError("remote-fill HMAC secret must contain 32-4096 bytes")
-    return secret
+    capability = (
+        secrets.token_bytes(_DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES)
+        if value is None
+        else value
+    )
+    if (
+        not isinstance(capability, bytes)
+        or len(capability) != _DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES
+    ):
+        raise ValueError("remote-fill verification capability must contain 32 bytes")
+    return capability
 
 
 def build_remote_fill_negotiation_spec(
@@ -1193,7 +1175,7 @@ def create_decoder_remote_fill_runtime(
     save_only_first_rank: bool,
     save_indexer_only_first_rank: bool,
     shared_cpu_cache_strict: bool,
-    deployment_secret: bytes | None = None,
+    descriptor_verification_capability: bytes | None = None,
     server_factory: Callable[[RemoteFillService], RemoteFillServer] | None = None,
 ) -> DecoderRemoteFillRuntime:
     """Create a TP0 decoder runtime without starting its thread.
@@ -1218,7 +1200,8 @@ def create_decoder_remote_fill_runtime(
         save_only_first_rank: Resolved physical Group 0 ownership policy.
         save_indexer_only_first_rank: Resolved Group 1 ownership policy.
         shared_cpu_cache_strict: Whether every passive view passed preflight.
-        deployment_secret: Optional injected HMAC secret for tests.
+        descriptor_verification_capability: Optional injected decoder-runtime
+            descriptor verification key for tests. Production generates one.
         server_factory: Optional RPC server factory for tests.
 
     Returns:
@@ -1288,12 +1271,13 @@ def create_decoder_remote_fill_runtime(
         layout=layout,
         capacity_available=capacity_available,
     )
+    verification_capability = _descriptor_verification_capability(
+        descriptor_verification_capability
+    )
     state = RemoteFillStateCore(
         destination_engine_epoch=destination_engine_epoch,
         shared_cache_generation=shared_cache_generation,
-        deployment_secret=_validate_deployment_secret(
-            load_deployment_secret() if deployment_secret is None else deployment_secret
-        ),
+        descriptor_verification_key=verification_capability,
         negotiation=negotiation,
         page_lifecycle=lifecycle,
         limits=limits,
@@ -1340,6 +1324,7 @@ def create_decoder_remote_fill_runtime(
         global_te_push=global_te_push,
         token_hash_algorithm=negotiation.token_hash_algorithm,
         python_hash_seed=negotiation.python_hash_seed,
+        descriptor_verification_capability=verification_capability.hex(),
     )
     return DecoderRemoteFillRuntime(
         lifecycle=lifecycle,

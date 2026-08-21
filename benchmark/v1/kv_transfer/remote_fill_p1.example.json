@@ -1,4 +1,5 @@
 {
+  "example_only": true,
   "kind": "direct_remote_lmcache_p1_report",
   "schema": 1,
   "active_decoder_profile": "REPLACE_WITH_REPLAY_PROFILE",
@@ -11,14 +12,19 @@
   "disabled_throughput_regression_percent": 0,
   "disabled_ttft_regression_percent": 0,
   "full_window_native_overlap_percent": 0,
+  "failed_measured_requests": 0,
+  "local_full_rate_percent": 0,
+  "local_full_sample_count": 0,
   "median_ttft_gain_ci_low_ms": 0,
   "median_ttft_gain_ms": 0,
   "modes": {
-    "A": {"cache_state": "cold", "cold_trial_isolation": "clear_all_tiers_before_each_measured_batch", "diagnostics_enabled": false, "measured_repetitions": 10, "mode_contract": "existing_production_path", "qualification_manifest_sha256": "REPLACE_WITH_MANIFEST_PAYLOAD_SHA256", "warmups_separate": true, "workload_spec_sha256": "REPLACE_WITH_WORKLOAD_SHA256"},
-    "B": {"cache_state": "cold", "cold_trial_isolation": "clear_all_tiers_before_each_measured_batch", "diagnostics_enabled": false, "measured_repetitions": 10, "mode_contract": "new_code_feature_disabled", "qualification_manifest_sha256": "REPLACE_WITH_MANIFEST_PAYLOAD_SHA256", "warmups_separate": true, "workload_spec_sha256": "REPLACE_WITH_WORKLOAD_SHA256"},
-    "C": {"cache_state": "cold", "cold_trial_isolation": "clear_all_tiers_before_each_measured_batch", "diagnostics_enabled": false, "measured_repetitions": 10, "mode_contract": "conservative_remote_fill", "qualification_manifest_sha256": "REPLACE_WITH_MANIFEST_PAYLOAD_SHA256", "warmups_separate": true, "workload_spec_sha256": "REPLACE_WITH_WORKLOAD_SHA256"}
+    "A": {"cache_state": "cold", "cold_trial_isolation": "clear_all_tiers_before_each_measured_batch", "diagnostics_enabled": false, "independent_batches": 10, "measured_repetitions": 10, "mode_contract": "existing_production_path", "qualification_manifest_sha256": "REPLACE_WITH_MANIFEST_PAYLOAD_SHA256", "warmups_separate": true, "workload_spec_sha256": "REPLACE_WITH_WORKLOAD_SHA256"},
+    "B": {"cache_state": "cold", "cold_trial_isolation": "clear_all_tiers_before_each_measured_batch", "diagnostics_enabled": false, "independent_batches": 10, "measured_repetitions": 10, "mode_contract": "new_code_feature_disabled", "qualification_manifest_sha256": "REPLACE_WITH_MANIFEST_PAYLOAD_SHA256", "warmups_separate": true, "workload_spec_sha256": "REPLACE_WITH_WORKLOAD_SHA256"},
+    "C": {"cache_state": "cold", "cold_trial_isolation": "clear_all_tiers_before_each_measured_batch", "diagnostics_enabled": false, "independent_batches": 10, "measured_repetitions": 10, "mode_contract": "conservative_remote_fill", "qualification_manifest_sha256": "REPLACE_WITH_MANIFEST_PAYLOAD_SHA256", "warmups_separate": true, "workload_spec_sha256": "REPLACE_WITH_WORKLOAD_SHA256"}
   },
   "native_gap_material_to_ttft": false,
+  "missing_traces": 0,
+  "normal_path_fatal_restarts": 0,
   "p50_native_duration_ms": 0,
   "p95_native_gap_ms": 0,
   "post_prefill_tail_ms": 0,
@@ -27,6 +33,6 @@
   "raw_evidence": ["raw/p1-a.jsonl", "raw/p1-b.jsonl", "raw/p1-c.jsonl"],
   "release_claim": false,
   "retained_at_load_percent": 0,
-  "retention_assessed_as_usable": false,
+  "unmatched_request_ids": 0,
   "workload_tiers": {"tier1": "PASS", "tier2": "PASS", "tier3": "PASS", "tier4": "PENDING_TARGETED_ABLATION"}
 }

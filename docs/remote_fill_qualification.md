@@ -5,6 +5,37 @@ that native direct placement has passed H0, C1, or production qualification.
 The production default remains disabled, and the conservative wire protocol is
 unchanged.
 
+## Minimal feature configuration
+
+RemoteFill now derives its cache namespace, serving-bundle fingerprint,
+two-group control-page bound, decoder bind address/port, advertised decoder
+host, borrowed GlobalTE mode, and prefiller-local persistence placement. The
+only new LMCache setting required on P and D is:
+
+```yaml
+enable_remote_lmcache_store: true
+```
+
+The feature flag internally selects DSA two-group page layout, rank0 ownership,
+strict shared publication on D, asynchronous direct storage on P, final-only
+publication, and non-evicting reservations. The deployment still needs its
+ordinary Mooncake URL, P/D role, decoder LocalCPU capacity, and already working
+cold-compact model settings. An operator may
+still override `remote_fill_model_artifact_id` with an immutable build ID when
+its artifact store can replace unsampled weight contents in place, and may
+override `remote_fill_cache_namespace` for deliberate isolation. Decoder
+control address/port overrides are needed only when the GlobalTE-advertised
+host or port range beginning at 19000 is unsuitable.
+
+D generates one random 32-byte descriptor-verification capability when its
+RemoteFill runtime starts. The decoder placement response carries it only to
+the trusted proxy, which forwards it only to the selected P and removes it
+before decoder dispatch or API egress. A decoder restart rotates the value, so
+stale placement cannot verify newly issued destination descriptors. No secret
+file or environment variable is required. This assumes the proxy and private
+control network are trusted; it is not protection against an active network
+attacker.
+
 ## Freeze one exact run
 
 Copy `benchmark/v1/kv_transfer/remote_fill_inventory.example.json`, replace
@@ -26,6 +57,12 @@ Maintain V1--V8 evidence in a copy of
 python benchmark/v1/kv_transfer/remote_fill_qualification.py \
   inventory.json qualification-record.json --evidence evidence.json
 ```
+
+Every raw evidence file must contain a JSON/JSONL
+`qualification_evidence_identity` record carrying the same producing host,
+clock domain, trial ID, manifest SHA-256, adapter-module SHA-256, and command as
+its evidence record. Validation hashes both the artifact and adapter and rejects
+an external record whose binding header is absent or different.
 
 Add `--require-hardware` only for a C1-exit or release record. It rejects every
 remaining `PENDING_HARDWARE` item and requires V1, V2, and V6 to carry
@@ -67,8 +104,9 @@ to `FIXED_AND_PASS` or used to activate serving.
 
 ## Client-observed TTFT
 
-Prepare JSONL prompts with exactly `case_id` and `prompt`, then run each clean
-A/B/C deployment separately:
+Prepare JSONL prompts with exactly `case_id`, `prompt`, and the tokenizer-
+verified `expected_prompt_tokens`, then run each clean A/B/C deployment
+separately:
 
 ```bash
 python benchmark/v1/kv_transfer/remote_fill_workload.py \
@@ -76,13 +114,18 @@ python benchmark/v1/kv_transfer/remote_fill_workload.py \
   --mode C --trial-id c-128k-01 --workload-id cold-128k-v1 \
   --qualification-manifest qualification-manifest.json --cache-state cold \
   --prompts prompts.jsonl --output c-128k-01.jsonl \
-  --repetitions 10 --warmups 1 --concurrency 1 --max-tokens 1
+  --repetitions 10 --warmups 0 --concurrency 1 --max-tokens 1
 ```
 
 The runner finishes every warmup before admitting measured work and binds each
-row to the canonical workload plus exact qualification manifest. The proxy
-returns its internal request identity in `X-Request-Id`; the runner records it
-beside authoritative client TTFT. Cold-performance events now carry
+row to the canonical workload plus exact qualification manifest. The client
+parses SSE until the first nonempty completion text/chat delta and records it
+as TTFT; first HTTP byte remains a separate TTFB metric. The proxy returns its
+internal request identity in `X-Request-Id`; missing identities or stream-level
+errors fail the trial. Streaming usage is required and a prompt-token mismatch
+fails the trial. Each row records `run_id`, `batch_id`, and `repetition_id`; TTFT
+confidence bounds resample independent repetition batches rather than
+correlated concurrent requests. Cold-performance events now carry
 host, wall time, and a boot-scoped clock domain. Use monotonic differences only
 within one clock domain and use the manifest's measured PTP/NTP offset for
 cross-host ordering. Never subtract P monotonic time from D monotonic time.
@@ -103,6 +146,13 @@ of the experimental gate. It deliberately leaves `proceed_gate_complete=false`
 until decoder critical-path reduction and active-load interference evidence are
 joined from stage traces.
 
+Use two measurement passes. The attribution pass may enable cold-performance
+per-window events at concurrency 1 for selected requests. The definitive TTFT
+pass must disable per-window cold-performance logging, NPU content diagnostics,
+exact-key traces, and profilers; retain only bounded aggregate metrics and the
+client first-generated-token record. Do not use an instrumented TTFT sample as
+the definitive A/B/C result.
+
 Build a request-local stage trace without cross-host monotonic subtraction:
 
 ```bash
@@ -114,9 +164,10 @@ python benchmark/v1/kv_transfer/remote_fill_trace.py --trace REQUEST_UUID \
 Per-window and commit timings are explanatory children of the prefiller round
 trip. The trace labels them explicitly so they are not added to TTFT twice.
 Source-event fence wait and GlobalTE source-registration time are measured
-separately. TP0 prefiller chunk events provide summed model-forward CPU time,
-the first-to-last prefill span, full-window native overlap, and the remaining
-post-prefill native tail without cross-host clock subtraction.
+separately. The last required producer-fence-ready timestamp is the
+authoritative KV-production frontier for overlap/tail analysis. TP0 model
+forward timing remains a CPU submission metric and is not treated as NPU
+completion.
 
 Before declaring C1 complete, fill
 `remote_fill_c1.example.json`, or run the fixed production-topology adapter:

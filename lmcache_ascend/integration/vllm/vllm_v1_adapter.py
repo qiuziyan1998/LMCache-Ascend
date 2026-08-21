@@ -264,14 +264,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     "save_only_first_rank, use_ascend_direct, and "
                     "save_chunk_meta=false"
                 )
-            if self._remote_store_requested and not extra.get(
-                "mooncake_prefer_local_alloc", False
-            ):
-                raise ValueError(
-                    "direct remote LMCache store requires "
-                    "mooncake_prefer_local_alloc=true so mandatory persistence "
-                    "uses the prefiller-local Mooncake segment"
-                )
         if (
             role != KVConnectorRole.SCHEDULER
             and self.kv_role != "kv_consumer"

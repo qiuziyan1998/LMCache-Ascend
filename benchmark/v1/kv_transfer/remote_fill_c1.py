@@ -48,6 +48,7 @@ def run_c1(
 
     qualification = _qualification_module()
     try:
+        qualification.validate_manifest(manifest, allow_dirty=False)
         report = {
             "schema": qualification.SCHEMA_VERSION,
             "kind": "direct_remote_lmcache_c1_report",

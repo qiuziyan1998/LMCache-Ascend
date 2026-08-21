@@ -69,6 +69,7 @@ def test_window_components_are_explanatory_not_double_counted() -> None:
             "reserve_ms": 1,
             "arm_ms": 2,
             "source_event_wait_ms": 3,
+            "source_fences_ready_monotonic_ms": 25 + index * 15,
             "source_registration_ms": 1,
             "native_slot_wait_ms": 4,
             "native_ms": 5,
@@ -93,8 +94,19 @@ def test_window_components_are_explanatory_not_double_counted() -> None:
     ]
     trace = module.build_trace(windows + chunks, trace="request")
     assert trace["remote_fill_window_totals_ms"]["native_ms"] == 10
-    assert trace["native_gap_ms"] == [5.0]
+    assert trace["native_idle_gap_ms"] == [5.0]
+    assert trace["native_overlap_ms"] == [0.0]
     assert trace["prefiller_model"]["model_forward_cpu_ms"] == 20
     assert trace["prefiller_model"]["model_prefill_span_ms"] == 30
     assert trace["full_window_native_overlap_percent"] == 100
     assert "not additional" in trace["double_counting_note"]
+
+
+def test_trace_matching_is_exact_and_interval_union_avoids_double_counting() -> None:
+    module = _module()
+    assert module._matches_trace({"req_id": "req-1"}, "req-1") is True
+    assert module._matches_trace({"req_id": "req-10"}, "req-1") is False
+    assert module._merge_intervals([(1, 5), (3, 7), (9, 10)]) == [
+        (1, 7),
+        (9, 10),
+    ]

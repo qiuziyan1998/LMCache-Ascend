@@ -102,6 +102,7 @@ def _handoff(**overrides: Any) -> RemoteFillHandoff:
         global_te_push=True,
         token_hash_algorithm="sha256",
         python_hash_seed="",
+        descriptor_verification_capability=_SECRET.hex(),
     )
     values.update(overrides)
     return RemoteFillHandoff(**values)
@@ -412,6 +413,20 @@ def test_parse_handoff_preserves_tp_dp_and_hash_identity() -> None:
     assert parsed == handoff
     assert parsed.destination_dp_rank == 1
     assert parsed.destination_tp_size == 8
+
+
+@pytest.mark.parametrize(
+    "capability",
+    ("", "not-hex", "AB" * 32, "ab" * 31),
+)
+def test_parse_handoff_rejects_noncanonical_verification_capability(
+    capability: str,
+) -> None:
+    raw = asdict(_handoff())
+    raw["descriptor_verification_capability"] = capability
+
+    with pytest.raises(ValueError, match="verification capability"):
+        parse_remote_fill_handoff({"lmcache.remote_fill": raw})
 
 
 def test_transfer_arms_only_allocated_descriptor_subset() -> None:
@@ -1181,8 +1196,10 @@ def test_direct_required_end_uses_authoritative_accepted_store_frontier() -> Non
         )
 
 
-def test_remote_fill_layout_and_secret_are_bound_once_per_engine(monkeypatch) -> None:
-    calls = {"layout_tag": 0, "layout": 0, "secret": 0}
+def test_remote_fill_layout_is_bound_once_and_capability_is_request_scoped(
+    monkeypatch,
+) -> None:
+    calls = {"layout_tag": 0, "layout": 0}
     layout = object()
 
     def payload_layout(*_args: Any) -> tuple[str, dict]:
@@ -1193,12 +1210,6 @@ def test_remote_fill_layout_and_secret_are_bound_once_per_engine(monkeypatch) ->
         calls["layout"] += 1
         return layout
 
-    secrets = iter((b"a" * 32, b"b" * 32))
-
-    def load_secret() -> bytes:
-        calls["secret"] += 1
-        return next(secrets)
-
     monkeypatch.setattr(
         "lmcache_ascend.v1.cache_engine.mooncake_payload_layout",
         payload_layout,
@@ -1206,10 +1217,6 @@ def test_remote_fill_layout_and_secret_are_bound_once_per_engine(monkeypatch) ->
     monkeypatch.setattr(
         "lmcache_ascend.v1.cache_engine.build_decoder_layout",
         decoder_layout,
-    )
-    monkeypatch.setattr(
-        "lmcache_ascend.v1.cache_engine.load_remote_fill_hmac_secret",
-        load_secret,
     )
     engine = object.__new__(AscendLMCacheEngine)
     engine._engine_state_lock = RLock()
@@ -1219,9 +1226,11 @@ def test_remote_fill_layout_and_secret_are_bound_once_per_engine(monkeypatch) ->
 
     assert engine._remote_fill_immutable_layout() == ("payload-v3", layout)
     assert engine._remote_fill_immutable_layout() == ("payload-v3", layout)
-    assert engine._remote_fill_immutable_secret() == b"a" * 32
-    assert engine._remote_fill_immutable_secret() == b"a" * 32
-    assert calls == {"layout_tag": 1, "layout": 1, "secret": 1}
+    assert _handoff().descriptor_verification_key == _SECRET
+    assert _handoff(
+        descriptor_verification_capability=(b"d" * 32).hex()
+    ).descriptor_verification_key == b"d" * 32
+    assert calls == {"layout_tag": 1, "layout": 1}
 
 
 def test_direct_page_batch_retains_same_owner_and_all_producer_events() -> None:

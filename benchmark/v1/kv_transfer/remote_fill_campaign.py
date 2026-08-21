@@ -108,9 +108,10 @@ def run_campaign(
     """Run cold-isolated A/B/C trials in alternated order and validate identity."""
 
     qualification = _qualification_module()
-    manifest_hash = qualification.payload_sha256(manifest)
     records = []
     try:
+        qualification.validate_manifest(manifest, allow_dirty=False)
+        manifest_hash = qualification.payload_sha256(manifest)
         for index, case in enumerate(build_cases(max_supported_tokens, tiers=tiers)):
             order = tuple("ABC"[(index + offset) % 3] for offset in range(3))
             modes: dict[str, dict[str, Any]] = {}
@@ -130,8 +131,11 @@ def run_campaign(
                     or result.get("concurrency") != case["concurrency"]
                     or result.get("decoder_load") != case["decoder_load"]
                     or result.get("measured_repetitions", 0) < 10
+                    or result.get("independent_batches", 0) < 10
                     or not qualification.is_sha256(result.get("workload_spec_sha256"))
-                    or not qualification.valid_evidence(result.get("raw_evidence"))
+                    or not qualification.evidence_matches_manifest(
+                        result.get("raw_evidence"), manifest_hash
+                    )
                 ):
                     raise ValueError(
                         f"invalid P1 result for {case['case_id']} mode {mode}"

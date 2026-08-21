@@ -4,7 +4,9 @@
 # Standard
 from pathlib import Path
 import importlib.util
+import json
 import sys
+import tempfile
 
 # Third Party
 import pytest
@@ -74,6 +76,7 @@ def _inventory() -> dict:
             "remote_fill_window_size": 4096,
             "group_dimensions": [576, 128],
             "cache_layer_count": 79,
+            "dtype": "bfloat16",
             "mtp": {"enabled": True, "num_speculative_tokens": 1},
         },
         "topology": {
@@ -98,6 +101,95 @@ def _inventory() -> dict:
     }
 
 
+def _complete_manifest() -> dict:
+    return {
+        "schema": 1,
+        "repositories": {
+            name: {
+                "path": "/repo",
+                "branch": "branch",
+                "sha": "1" * 40,
+                "tree_sha": "2" * 40,
+                "remote_origin": "https://example.invalid/repository.git",
+                "submodules": [],
+                "dirty": False,
+            }
+            for name in ("LMCache-NPU", "LMCache-Ascend", "vllm", "vllm-ascend")
+        },
+        "inventory": _inventory(),
+    }
+
+
+def _evidence(module, manifest_hash: str) -> list[dict]:
+    adapter_path = Path(__file__).resolve()
+    adapter_digest = module.file_sha256(adapter_path)
+    command = ["pytest", adapter_path.name]
+    identity = {
+        "producing_host": "test-host",
+        "clock_domain": "test-host:boot",
+        "trial_id": "test-trial",
+        "manifest_sha256": manifest_hash,
+        "adapter_module_sha256": adapter_digest,
+        "command": command,
+    }
+    path = Path(tempfile.gettempdir()) / f"remote-fill-{manifest_hash}.jsonl"
+    path.write_text(
+        json.dumps({"qualification_evidence_identity": identity}) + "\n",
+        encoding="utf-8",
+    )
+    return [
+        {
+            "path": str(path),
+            "sha256": module.file_sha256(path),
+            "size_bytes": path.stat().st_size,
+            **{key: identity[key] for key in identity if key != "command"},
+            "adapter_module_path": str(adapter_path),
+            "adapter_module_sha256": adapter_digest,
+            "adapter_module_size_bytes": adapter_path.stat().st_size,
+            "command": command,
+            "example_only": False,
+        }
+    ]
+
+
+def test_evidence_requires_identity_inside_hashed_artifact(tmp_path) -> None:
+    module = _module()
+    artifact = tmp_path / "raw.jsonl"
+    adapter = Path(__file__).resolve()
+    adapter_digest = module.file_sha256(adapter)
+    command = ["pytest", "identity"]
+    identity = {
+        "producing_host": "host",
+        "clock_domain": "host:boot",
+        "trial_id": "trial",
+        "manifest_sha256": "a" * 64,
+        "adapter_module_sha256": adapter_digest,
+        "command": command,
+    }
+    artifact.write_text('{"event":"unbound"}\n', encoding="utf-8")
+    record = {
+        "path": str(artifact),
+        "sha256": module.file_sha256(artifact),
+        "size_bytes": artifact.stat().st_size,
+        **{key: identity[key] for key in identity if key != "command"},
+        "adapter_module_path": str(adapter),
+        "adapter_module_sha256": adapter_digest,
+        "adapter_module_size_bytes": adapter.stat().st_size,
+        "command": command,
+        "example_only": False,
+    }
+
+    assert module.valid_evidence([record]) is False
+
+    artifact.write_text(
+        json.dumps({"qualification_evidence_identity": identity}) + "\n",
+        encoding="utf-8",
+    )
+    record["sha256"] = module.file_sha256(artifact)
+    record["size_bytes"] = artifact.stat().st_size
+    assert module.valid_evidence([record]) is True
+
+
 def test_manifest_requires_complete_runtime_inventory() -> None:
     module = _module()
     manifest = {
@@ -107,6 +199,9 @@ def test_manifest_requires_complete_runtime_inventory() -> None:
                 "path": "/repo",
                 "branch": "branch",
                 "sha": "1" * 40,
+                "tree_sha": "2" * 40,
+                "remote_origin": "https://example.invalid/repository.git",
+                "submodules": [],
                 "dirty": False,
             }
             for name in module.REPOSITORY_NAMES
@@ -128,6 +223,9 @@ def test_dirty_repository_is_explicitly_nonqualifying() -> None:
                 "path": "/repo",
                 "branch": "branch",
                 "sha": "1" * 40,
+                "tree_sha": "2" * 40,
+                "remote_origin": "https://example.invalid/repository.git",
+                "submodules": [],
                 "dirty": False,
             }
             for name in module.REPOSITORY_NAMES
@@ -188,8 +286,9 @@ def test_not_applicable_status_requires_proof() -> None:
 
 
 def _h0_report(module) -> dict:
+    manifest_hash = "a" * 64
     cases = {
-        name: {"status": "PASS", "evidence": [f"raw/{name}.json"]}
+        name: {"status": "PASS", "evidence": _evidence(module, manifest_hash)}
         for name in module.H0_CASES
     }
     cases["H0-A"].update(
@@ -252,14 +351,29 @@ def _h0_report(module) -> dict:
         concurrency_efficiency=1,
         persistent_slowdown=1,
         direct_slowdown=1,
+        persistent_verified=True,
+        direct_verified=True,
+        same_source_generation=True,
+        same_manifest_digest=True,
+        persistent_byte_count=4096,
+        direct_byte_count=4096,
+        source_byte_count=4096,
     )
     return {
         "schema": 1,
         "kind": "direct_remote_lmcache_h0_report",
         "activation": "mooncake-sync-write-visible-v1",
-        "qualification_manifest_sha256": "a" * 64,
+        "qualification_manifest_sha256": manifest_hash,
         "production_components": {
             name: True for name in module.H0_PRODUCTION_COMPONENTS
+        },
+        "observed_layout": {
+            "chunk_size": 256,
+            "window_tokens": 4096,
+            "group_dimensions": [576, 128],
+            "cache_layer_count": 79,
+            "dtype": "bfloat16",
+            "page_abi": "abi",
         },
         "cases": cases,
     }
@@ -291,9 +405,22 @@ def test_h0_report_is_bound_to_exact_manifest() -> None:
     manifest = {
         "schema": 1,
         "identity": "exact-run",
-        "inventory": {"cache": {"chunk_size": 256}},
+        "inventory": {
+            "cache": {
+                "chunk_size": 256,
+                "remote_fill_window_size": 4096,
+                "group_dimensions": [576, 128],
+                "cache_layer_count": 79,
+                "dtype": "bfloat16",
+                "page_abi": "abi",
+            }
+        },
     }
     report["qualification_manifest_sha256"] = module.payload_sha256(manifest)
+    for case in report["cases"].values():
+        case["evidence"] = _evidence(
+            module, report["qualification_manifest_sha256"]
+        )
     module.validate_h0_report(report, manifest=manifest)
     with pytest.raises(ValueError, match="different manifest"):
         module.validate_h0_report(
@@ -301,7 +428,7 @@ def test_h0_report_is_bound_to_exact_manifest() -> None:
             manifest={
                 "schema": 1,
                 "identity": "other",
-                "inventory": {"cache": {"chunk_size": 256}},
+                "inventory": manifest["inventory"],
             },
         )
 
@@ -315,8 +442,9 @@ def test_h0_report_rejects_nested_native_capabilities() -> None:
 
 
 def _c1_report(module, manifest) -> dict:
+    manifest_hash = module.payload_sha256(manifest)
     scenarios = {
-        name: {"status": "PASS", "evidence": [f"raw/{name}.json"]}
+        name: {"status": "PASS", "evidence": _evidence(module, manifest_hash)}
         for name in module.C1_SCENARIOS
     }
     scenarios["tp8_passive_materialization"].update(
@@ -373,7 +501,7 @@ def _c1_report(module, manifest) -> dict:
     return {
         "schema": 1,
         "kind": "direct_remote_lmcache_c1_report",
-        "qualification_manifest_sha256": module.payload_sha256(manifest),
+        "qualification_manifest_sha256": manifest_hash,
         "production_components": {
             name: True for name in module.C1_PRODUCTION_COMPONENTS
         },
@@ -382,7 +510,7 @@ def _c1_report(module, manifest) -> dict:
         "integrity": {name: 0 for name in module.C1_ZERO_INVARIANTS},
         "diagnostics": {"bounded": True, "diagnosed_requests": 9},
         "comparisons": {
-            name: {"status": "PASS", "evidence": [f"raw/{name}.json"]}
+            name: {"status": "PASS", "evidence": _evidence(module, manifest_hash)}
             for name in module.C1_COMPARISONS
         },
         "dp_equivalence": {
@@ -410,7 +538,7 @@ def test_c1_report_requires_full_topology_and_zero_integrity_failures() -> None:
 def test_c1_runner_owns_fixed_scenario_order_and_cleanup() -> None:
     qualification = _module()
     runner = _c1_module()
-    manifest = {"schema": 1, "identity": "manifest"}
+    manifest = _complete_manifest()
     expected = _c1_report(qualification, manifest)
     calls: list[str] = []
 
@@ -459,6 +587,7 @@ def test_p1_evaluation_applies_gates_without_enabling_o2() -> None:
                 "diagnostics_enabled": False,
                 "mode_contract": module.P1_MODE_CONTRACTS[name],
                 "measured_repetitions": 30,
+                "independent_batches": 30,
                 "warmups_separate": True,
                 "cache_state": "cold",
                 "cold_trial_isolation": ("clear_all_tiers_before_each_measured_batch"),
@@ -477,16 +606,21 @@ def test_p1_evaluation_applies_gates_without_enabling_o2() -> None:
         "decoder_p99_regression_percent": 4,
         "publication_efficiency_percent": 97,
         "retained_at_load_percent": 95,
+        "local_full_sample_count": 30,
+        "local_full_rate_percent": 95,
+        "normal_path_fatal_restarts": 0,
+        "failed_measured_requests": 0,
+        "missing_traces": 0,
+        "unmatched_request_ids": 0,
         "p95_native_gap_ms": 12,
         "p50_native_duration_ms": 100,
         "post_prefill_tail_ms": 100,
         "full_window_native_overlap_percent": 90,
         "native_gap_material_to_ttft": True,
-        "retention_assessed_as_usable": True,
         "clock_safe_traces": True,
         "client_ttft_authoritative": True,
         "active_decoder_profile": "moderate-production-replay",
-        "raw_evidence": ["raw/p1.jsonl"],
+        "raw_evidence": _evidence(module, module.payload_sha256(manifest)),
         "workload_tiers": {
             "tier1": "PASS",
             "tier2": "PASS",
@@ -508,3 +642,13 @@ def test_p1_evaluation_applies_gates_without_enabling_o2() -> None:
     decision = module.evaluate_p1_report(report, manifest=manifest)
     assert decision["proceed_with_experimental_architecture"] is False
     assert decision["healthy_discarded_bytes_gate_pass"] is False
+
+    report["publication_efficiency_percent"] = 97
+    report["retained_at_load_percent"] = 89
+    decision = module.evaluate_p1_report(report, manifest=manifest)
+    assert decision["retention_gate_pass"] is False
+
+    report["retained_at_load_percent"] = 95
+    report["failed_measured_requests"] = 1
+    decision = module.evaluate_p1_report(report, manifest=manifest)
+    assert decision["clean_execution_gate_pass"] is False

@@ -35,7 +35,7 @@ def _matches_trace(payload: dict[str, Any], trace: str) -> bool:
         payload.get("remote_fill_transfer_id"),
     ]
     identities.extend(payload.get("request_ids") or ())
-    return any(trace in str(identity) for identity in identities if identity)
+    return any(trace == str(identity) for identity in identities if identity)
 
 
 def load_events(role: str, path: Path, trace: str) -> list[dict[str, Any]]:
@@ -62,7 +62,28 @@ def load_events(role: str, path: Path, trace: str) -> list[dict[str, Any]]:
 
 
 def _first(events: Iterable[dict[str, Any]], name: str) -> dict[str, Any] | None:
-    return next((event for event in events if event.get("event") == name), None)
+    matching = [event for event in events if event.get("event") == name]
+    if not matching:
+        return None
+    domains = {event["clock_domain"] for event in matching}
+    if len(domains) != 1:
+        raise ValueError(f"{name} crossed clock domains")
+    return min(matching, key=lambda event: float(event["monotonic_ms"]))
+
+
+def _merge_intervals(
+    intervals: Iterable[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Return a disjoint union of valid monotonic intervals."""
+
+    ordered = sorted((start, end) for start, end in intervals if end >= start)
+    merged: list[tuple[float, float]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
 
 
 def _local_delta(
@@ -137,30 +158,34 @@ def build_trace(
     prefiller_model = _prefiller_model_summary(rows)
     windows = sorted(
         (row for row in rows if row.get("event") == "remote_fill_window_complete"),
-        key=lambda row: int(row.get("window_id", 0)),
+        key=lambda row: float(row["monotonic_ms"]),
     )
-    native_gaps = []
+    idle_gaps = []
+    native_overlaps = []
     for previous, current in zip(windows, windows[1:], strict=False):
         if previous["clock_domain"] != current["clock_domain"]:
             raise ValueError("RemoteFill windows crossed clock domains")
         if previous.get("native_ended_monotonic_ms") and current.get(
             "native_started_monotonic_ms"
         ):
-            native_gaps.append(
-                round(
-                    float(current["native_started_monotonic_ms"])
-                    - float(previous["native_ended_monotonic_ms"]),
-                    3,
-                )
+            delta = float(current["native_started_monotonic_ms"]) - float(
+                previous["native_ended_monotonic_ms"]
             )
+            idle_gaps.append(round(max(0.0, delta), 3))
+            native_overlaps.append(round(max(0.0, -delta), 3))
     commits = [row for row in rows if row.get("event") == "remote_fill_local_commit"]
     actual_loads = [
         row for row in rows if row.get("event") == "remote_fill_actual_load"
     ]
     client = [
-        row for row in client_trials if trace in str(row.get("proxy_request_id", ""))
+        row for row in client_trials if trace == str(row.get("proxy_request_id", ""))
     ]
-    client_ttft = [float(row["ttft_ms"]) for row in client if row.get("ok")]
+    client_ttft = [
+        float(row["first_generated_token_ms"])
+        for row in client
+        if row.get("ok")
+        and isinstance(row.get("first_generated_token_ms"), (int, float))
+    ]
     request_received = _first(proxy, "proxy_request_received")
     prefill_dispatch = _first(proxy, "proxy_prefiller_dispatch")
     prefill_response = _first(proxy, "proxy_prefill_response_received")
@@ -177,7 +202,18 @@ def build_trace(
             if value
         }
     )
-    model_end = prefiller_model.get("model_ended_monotonic_ms")
+    if len(transfer_ids) > 1:
+        raise ValueError(
+            "one qualification trace matched multiple RemoteFill transfer attempts"
+        )
+    source_ready_values = [
+        float(row["source_fences_ready_monotonic_ms"])
+        for row in windows
+        if row.get("direct_satisfied")
+        and isinstance(row.get("source_fences_ready_monotonic_ms"), (int, float))
+        and float(row["source_fences_ready_monotonic_ms"]) > 0
+    ]
+    production_frontier = max(source_ready_values) if source_ready_values else None
     model_start = prefiller_model.get("model_started_monotonic_ms")
     model_domain = prefiller_model.get("clock_domain")
     native_intervals = [
@@ -211,13 +247,19 @@ def build_trace(
         and row.get("native_started_monotonic_ms")
         and row.get("native_ended_monotonic_ms")
     ]
+    native_intervals = _merge_intervals(native_intervals)
+    full_intervals = _merge_intervals(full_intervals)
     full_native_ms = sum(end - start for start, end in full_intervals)
     full_overlap_ms = (
         sum(
-            max(0.0, min(end, float(model_end)) - max(start, float(model_start)))
+            max(
+                0.0,
+                min(end, float(production_frontier))
+                - max(start, float(model_start)),
+            )
             for start, end in full_intervals
         )
-        if model_start is not None and model_end is not None
+        if model_start is not None and production_frontier is not None
         else 0.0
     )
     return {
@@ -250,9 +292,17 @@ def build_trace(
             )
         },
         "prefiller_model": prefiller_model,
+        "kv_production_frontier_monotonic_ms": production_frontier,
+        "kv_production_frontier_basis": "producer_fences_ready",
         "post_prefill_native_tail_ms": (
-            round(max(0.0, max(end for _, end in native_intervals) - model_end), 3)
-            if native_intervals and model_end is not None
+            round(
+                max(
+                    0.0,
+                    max(end for _, end in native_intervals) - production_frontier,
+                ),
+                3,
+            )
+            if native_intervals and production_frontier is not None
             else None
         ),
         "full_window_native_overlap_percent": (
@@ -260,10 +310,11 @@ def build_trace(
             if full_native_ms > 0
             else None
         ),
-        "native_gap_ms": native_gaps,
+        "native_idle_gap_ms": idle_gaps,
+        "native_overlap_ms": native_overlaps,
         "native_gap_p95_ms": (
-            sorted(native_gaps)[max(0, math.ceil(0.95 * len(native_gaps)) - 1)]
-            if native_gaps
+            sorted(idle_gaps)[max(0, math.ceil(0.95 * len(idle_gaps)) - 1)]
+            if idle_gaps
             else None
         ),
         "finish_control_ms": [
@@ -380,6 +431,11 @@ def main() -> None:
         )
         if value
     }
+    if len(transfer_ids) > 1:
+        raise ValueError(
+            "trace matched multiple transfer attempts; select one exact "
+            "request identity"
+        )
     events.extend(
         event
         for transfer_id in transfer_ids

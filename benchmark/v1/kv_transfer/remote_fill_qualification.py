@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 import importlib.metadata
 import json
+import math
 import subprocess
 import sys
 
@@ -100,6 +101,7 @@ REQUIRED_INVENTORY_PATHS = (
     "cache.namespace",
     "cache.layout_tag",
     "cache.page_abi",
+    "cache.dtype",
     "cache.token_hash_algorithm",
     "cache.python_hash_seed",
     "cache.chunk_size",
@@ -140,10 +142,20 @@ def repository_snapshot(root: Path) -> dict[str, Any]:
     """Return exact Git identity for one qualification repository."""
 
     resolved = root.resolve(strict=True)
+    submodules = [
+        line
+        for line in _run_git(
+            resolved, "submodule", "status", "--recursive"
+        ).splitlines()
+        if line
+    ]
     return {
         "path": str(resolved),
         "branch": _run_git(resolved, "branch", "--show-current") or "<detached>",
         "sha": _run_git(resolved, "rev-parse", "HEAD"),
+        "tree_sha": _run_git(resolved, "rev-parse", "HEAD^{tree}"),
+        "remote_origin": _run_git(resolved, "config", "--get", "remote.origin.url"),
+        "submodules": submodules,
         "dirty": bool(_run_git(resolved, "status", "--porcelain")),
     }
 
@@ -186,7 +198,7 @@ def _usable(value: Any) -> bool:
     if isinstance(value, bool):
         return True
     if isinstance(value, (int, float)):
-        return value >= 0
+        return math.isfinite(float(value)) and value >= 0
     return True
 
 
@@ -201,14 +213,120 @@ def is_sha256(value: Any, *, prefixed: bool = False) -> bool:
     )
 
 
-def valid_evidence(value: Any) -> bool:
-    return (
-        isinstance(value, list)
-        and bool(value)
-        and all(
-            isinstance(reference, str) and bool(reference.strip())
-            for reference in value
+def _finite_number(value: Any, *, minimum: float | None = None) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    converted = float(value)
+    return math.isfinite(converted) and (
+        minimum is None or converted >= minimum
+    )
+
+
+def _evidence_artifact_contains_identity(
+    path: Path,
+    record: Mapping[str, Any],
+) -> bool:
+    """Verify an evidence artifact contains its own immutable binding header."""
+
+    decoder = json.JSONDecoder()
+    expected = {
+        field: record.get(field)
+        for field in (
+            "producing_host",
+            "clock_domain",
+            "trial_id",
+            "manifest_sha256",
+            "adapter_module_sha256",
         )
+    }
+    try:
+        with path.open(encoding="utf-8", errors="strict") as stream:
+            for line in stream:
+                if len(line) > 1024 * 1024:
+                    continue
+                start = line.find("{")
+                if start < 0:
+                    continue
+                try:
+                    payload, _ = decoder.raw_decode(line[start:])
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, Mapping):
+                    continue
+                identity = payload.get("qualification_evidence_identity", payload)
+                if not isinstance(identity, Mapping):
+                    continue
+                if all(
+                    identity.get(field) == value
+                    for field, value in expected.items()
+                ):
+                    return identity.get("command") == record.get("command")
+    except (OSError, UnicodeError):
+        return False
+    return False
+
+
+def valid_evidence(value: Any) -> bool:
+    """Return whether evidence uses verified, immutable artifact records."""
+
+    if not isinstance(value, list) or not value:
+        return False
+    for record in value:
+        if not isinstance(record, Mapping) or record.get("example_only") is not False:
+            return False
+        path_value = record.get("path")
+        adapter_path_value = record.get("adapter_module_path")
+        if not isinstance(path_value, str) or not isinstance(
+            adapter_path_value, str
+        ):
+            return False
+        path = Path(path_value)
+        adapter_path = Path(adapter_path_value)
+        if not path.is_absolute() or not adapter_path.is_absolute():
+            return False
+        try:
+            stat = path.stat()
+            adapter_stat = adapter_path.stat()
+        except OSError:
+            return False
+        if (
+            not path.is_file()
+            or not adapter_path.is_file()
+            or record.get("size_bytes") != stat.st_size
+            or record.get("adapter_module_size_bytes") != adapter_stat.st_size
+            or not is_sha256(record.get("sha256"))
+            or not is_sha256(record.get("adapter_module_sha256"))
+            or file_sha256(path) != record["sha256"]
+            or file_sha256(adapter_path) != record["adapter_module_sha256"]
+        ):
+            return False
+        for field in (
+            "producing_host",
+            "clock_domain",
+            "trial_id",
+            "manifest_sha256",
+        ):
+            if not isinstance(record.get(field), str) or not record[field].strip():
+                return False
+        if not is_sha256(record.get("manifest_sha256")):
+            return False
+        command = record.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(part, str) or not part for part in command)
+        ):
+            return False
+        if not _evidence_artifact_contains_identity(path, record):
+            return False
+    return True
+
+
+def evidence_matches_manifest(value: Any, manifest_sha256: str) -> bool:
+    """Verify evidence records and bind each one to the exact manifest."""
+
+    return valid_evidence(value) and all(
+        record["manifest_sha256"] == manifest_sha256 for record in value
     )
 
 
@@ -226,16 +344,23 @@ def validate_manifest(
         raise ValueError("manifest must contain exactly the four repositories")
     for name, snapshot in repositories.items():
         if not isinstance(snapshot, Mapping) or not all(
-            snapshot.get(field) for field in ("path", "branch", "sha")
+            snapshot.get(field)
+            for field in ("path", "branch", "sha", "tree_sha", "remote_origin")
         ):
             raise ValueError(f"repository identity is incomplete: {name}")
-        sha = snapshot["sha"]
-        if (
-            not isinstance(sha, str)
-            or len(sha) not in (40, 64)
-            or any(character not in "0123456789abcdef" for character in sha.lower())
-        ):
-            raise ValueError(f"repository SHA is invalid: {name}")
+        for field in ("sha", "tree_sha"):
+            sha = snapshot[field]
+            if (
+                not isinstance(sha, str)
+                or len(sha) not in (40, 64)
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in sha.lower()
+                )
+            ):
+                raise ValueError(f"repository {field} is invalid: {name}")
+        if not isinstance(snapshot.get("submodules"), list):
+            raise ValueError(f"repository submodule state is invalid: {name}")
         if snapshot.get("dirty") and not allow_dirty:
             raise ValueError(f"qualification repository is dirty: {name}")
     inventory = manifest.get("inventory")
@@ -274,7 +399,12 @@ def validate_manifest(
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{path} must be a positive integer")
     offset = _value_at(inventory, "clock.max_observed_host_offset_us")
-    if isinstance(offset, bool) or not isinstance(offset, (int, float)) or offset < 0:
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, (int, float))
+        or not math.isfinite(float(offset))
+        or offset < 0
+    ):
         raise ValueError("clock.max_observed_host_offset_us must be nonnegative")
     python_hash_seed = _value_at(inventory, "cache.python_hash_seed")
     if (
@@ -388,6 +518,8 @@ def validate_h0_report(
     deliberately accepts no raw pointer or capability fields.
     """
 
+    if report.get("example_only") is True:
+        raise ValueError("example H0 reports cannot qualify production")
     if report.get("schema") != SCHEMA_VERSION or report.get("kind") != (
         "direct_remote_lmcache_h0_report"
     ):
@@ -403,6 +535,26 @@ def validate_h0_report(
         payload_sha256(manifest)
     ):
         raise ValueError("H0 report was produced for a different manifest")
+    observed_layout = report.get("observed_layout")
+    if not isinstance(observed_layout, Mapping):
+        raise ValueError("H0 report lacks the observed production layout")
+    if manifest is not None:
+        expected_layout = {
+            "chunk_size": _value_at(manifest, "inventory.cache.chunk_size"),
+            "window_tokens": _value_at(
+                manifest, "inventory.cache.remote_fill_window_size"
+            ),
+            "group_dimensions": _value_at(
+                manifest, "inventory.cache.group_dimensions"
+            ),
+            "cache_layer_count": _value_at(
+                manifest, "inventory.cache.cache_layer_count"
+            ),
+            "dtype": _value_at(manifest, "inventory.cache.dtype"),
+            "page_abi": _value_at(manifest, "inventory.cache.page_abi"),
+        }
+        if dict(observed_layout) != expected_layout:
+            raise ValueError("H0 observed layout differs from the manifest")
     components = report.get("production_components")
     if not isinstance(components, Mapping) or any(
         components.get(component) is not True for component in H0_PRODUCTION_COMPONENTS
@@ -414,7 +566,9 @@ def validate_h0_report(
     for case_name, case in cases.items():
         if not isinstance(case, Mapping) or case.get("status") != "PASS":
             raise ValueError(f"{case_name} did not pass")
-        if not valid_evidence(case.get("evidence")):
+        if not evidence_matches_manifest(
+            case.get("evidence"), report["qualification_manifest_sha256"]
+        ):
             raise ValueError(f"{case_name} has no raw evidence reference")
     full = cases["H0-A"]
     if not all(
@@ -542,8 +696,31 @@ def validate_h0_report(
         "direct_slowdown",
     ):
         value = dual.get(field)
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
+        if not _finite_number(value, minimum=0.0):
             raise ValueError(f"H0-G is missing {field}")
+    if not all(
+        dual.get(field) is True
+        for field in (
+            "persistent_verified",
+            "direct_verified",
+            "same_source_generation",
+            "same_manifest_digest",
+        )
+    ):
+        raise ValueError("H0-G did not prove dual-sink data integrity")
+    for field in (
+        "persistent_byte_count",
+        "direct_byte_count",
+        "source_byte_count",
+    ):
+        if not _finite_number(dual.get(field), minimum=1.0):
+            raise ValueError(f"H0-G is missing {field}")
+    if not (
+        dual["persistent_byte_count"]
+        == dual["direct_byte_count"]
+        == dual["source_byte_count"]
+    ):
+        raise ValueError("H0-G sink byte counts differ")
 
 
 def validate_c1_report(
@@ -551,6 +728,8 @@ def validate_c1_report(
 ) -> None:
     """Validate the complete production-topology C1 correctness record."""
 
+    if report.get("example_only") is True:
+        raise ValueError("example C1 reports cannot qualify production")
     if report.get("schema") != SCHEMA_VERSION or report.get("kind") != (
         "direct_remote_lmcache_c1_report"
     ):
@@ -576,7 +755,9 @@ def validate_c1_report(
     for name, scenario in scenarios.items():
         if not isinstance(scenario, Mapping) or scenario.get("status") != "PASS":
             raise ValueError(f"C1 scenario did not pass: {name}")
-        if not valid_evidence(scenario.get("evidence")):
+        if not evidence_matches_manifest(
+            scenario.get("evidence"), report["qualification_manifest_sha256"]
+        ):
             raise ValueError(f"C1 scenario has no evidence: {name}")
     cold = scenarios["cold_miss"]
     if cold.get("terminal_outcome") not in {"LOCAL_FULL", "PERSISTENT_ONLY"}:
@@ -677,7 +858,9 @@ def validate_c1_report(
             "NOT_APPLICABLE_WITH_PROOF",
         }:
             raise ValueError(f"C1 comparison did not pass: {name}")
-        if not valid_evidence(comparison.get("evidence")):
+        if not evidence_matches_manifest(
+            comparison.get("evidence"), report["qualification_manifest_sha256"]
+        ):
             raise ValueError(f"C1 comparison lacks evidence: {name}")
         if comparison["status"] == "NOT_APPLICABLE_WITH_PROOF" and not comparison.get(
             "proof"
@@ -699,6 +882,8 @@ def evaluate_p1_report(
 ) -> dict[str, Any]:
     """Validate a P1 aggregate and evaluate only the documented gates."""
 
+    if report.get("example_only") is True:
+        raise ValueError("example P1 reports cannot qualify production")
     if report.get("schema") != SCHEMA_VERSION or report.get("kind") != (
         "direct_remote_lmcache_p1_report"
     ):
@@ -730,6 +915,11 @@ def evaluate_p1_report(
             raise ValueError(
                 f"P1 mode {name} has fewer than {minimum_repetitions} repetitions"
             )
+        if mode.get("independent_batches", 0) < minimum_repetitions:
+            raise ValueError(
+                f"P1 mode {name} has fewer than {minimum_repetitions} "
+                "independent repetition batches"
+            )
         if mode.get("warmups_separate") is not True:
             raise ValueError(f"P1 mode {name} mixed warmup and measured trials")
         if mode.get("qualification_manifest_sha256") != manifest_hash:
@@ -750,9 +940,7 @@ def evaluate_p1_report(
     if (
         not isinstance(active_profile, str)
         or not active_profile.strip()
-        or not isinstance(raw_evidence, list)
-        or not raw_evidence
-        or any(not isinstance(item, str) or not item.strip() for item in raw_evidence)
+        or not evidence_matches_manifest(raw_evidence, manifest_hash)
     ):
         raise ValueError("P1 lacks active-load or raw evidence")
     workload_tiers = report.get("workload_tiers")
@@ -771,6 +959,12 @@ def evaluate_p1_report(
         "decoder_p99_regression_percent",
         "publication_efficiency_percent",
         "retained_at_load_percent",
+        "local_full_sample_count",
+        "local_full_rate_percent",
+        "normal_path_fatal_restarts",
+        "failed_measured_requests",
+        "missing_traces",
+        "unmatched_request_ids",
         "p95_native_gap_ms",
         "p50_native_duration_ms",
         "post_prefill_tail_ms",
@@ -779,24 +973,37 @@ def evaluate_p1_report(
     values = {}
     for field in required_numbers:
         value = report.get(field)
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
+        if not _finite_number(value):
             raise ValueError(f"P1 is missing numeric field: {field}")
         values[field] = float(value)
-    if not isinstance(
-        report.get("native_gap_material_to_ttft"), bool
-    ) or not isinstance(report.get("retention_assessed_as_usable"), bool):
-        raise ValueError("P1 materiality/retention decisions must be boolean")
+    if not isinstance(report.get("native_gap_material_to_ttft"), bool):
+        raise ValueError("P1 native-gap materiality decision must be boolean")
     disabled_gate = (
         values["disabled_ttft_regression_percent"] <= 1
         and values["disabled_throughput_regression_percent"] <= 1
     )
     fallback_gate = values["clean_prearm_fallback_ttft_regression_percent"] <= 1
     publication_gate = values["publication_efficiency_percent"] >= 95
+    retention_gate = (
+        values["retained_at_load_percent"] >= 90
+        and values["local_full_sample_count"] >= 30
+        and values["local_full_rate_percent"] >= 90
+    )
+    clean_execution_gate = all(
+        values[field] == 0
+        for field in (
+            "normal_path_fatal_restarts",
+            "failed_measured_requests",
+            "missing_traces",
+            "unmatched_request_ids",
+        )
+    )
     proceed = (
         disabled_gate
         and fallback_gate
         and publication_gate
-        and report.get("retention_assessed_as_usable") is True
+        and retention_gate
+        and clean_execution_gate
         and values["decoder_cache_ready_reduction_percent"] >= 70
         and values["median_ttft_gain_ms"] >= 500
         and values["median_ttft_gain_ci_low_ms"] > 0
@@ -819,6 +1026,8 @@ def evaluate_p1_report(
         "disabled_path_gate_pass": disabled_gate,
         "clean_fallback_gate_pass": fallback_gate,
         "healthy_discarded_bytes_gate_pass": publication_gate,
+        "retention_gate_pass": retention_gate,
+        "clean_execution_gate_pass": clean_execution_gate,
         "o1_lookahead_eligible": lookahead,
         "o2_advance_eligible": False,
         "o2_reason": "evaluate only after an O1 hardware result",

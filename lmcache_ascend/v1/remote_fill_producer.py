@@ -4,13 +4,11 @@
 # Standard
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Protocol
 from uuid import uuid4
 import asyncio
-import os
 import time
 
 # Third Party
@@ -52,8 +50,8 @@ from lmcache.v1.remote_fill.native import DirectPushSourcePlan
 
 
 REMOTE_FILL_REQUEST_CONFIG_KEY = "lmcache.remote_fill"
-REMOTE_FILL_HMAC_SECRET_FILE_ENV = "LMCACHE_REMOTE_FILL_HMAC_SECRET_FILE"
 REMOTE_FILL_H0_QUALIFICATION_ENV = "LMCACHE_REMOTE_FILL_H0_QUALIFICATION"
+_DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES = 32
 
 
 class DirectPushSubmitter(Protocol):
@@ -87,6 +85,13 @@ class RemoteFillHandoff:
     global_te_push: bool
     token_hash_algorithm: str
     python_hash_seed: str
+    descriptor_verification_capability: str = field(repr=False)
+
+    @property
+    def descriptor_verification_key(self) -> bytes:
+        """Return the validated decoder-incarnation descriptor HMAC key."""
+
+        return bytes.fromhex(self.descriptor_verification_capability)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +161,7 @@ class RemoteFillWindowResult:
     reserve_seconds: float = 0.0
     arm_seconds: float = 0.0
     source_event_wait_seconds: float = 0.0
+    source_fences_ready_monotonic: float = 0.0
     source_registration_seconds: float = 0.0
     native_slot_wait_seconds: float = 0.0
     native_seconds: float = 0.0
@@ -426,6 +432,22 @@ def parse_remote_fill_handoff(
         raise ValueError(
             "lmcache.remote_fill.python_hash_seed is required for builtin hashing"
         )
+    verification_capability = required_text(
+        "descriptor_verification_capability"
+    )
+    try:
+        verification_key = bytes.fromhex(verification_capability)
+    except ValueError as error:
+        raise ValueError(
+            "lmcache.remote_fill descriptor verification capability is invalid"
+        ) from error
+    if (
+        len(verification_key) != _DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES
+        or verification_key.hex() != verification_capability
+    ):
+        raise ValueError(
+            "lmcache.remote_fill descriptor verification capability is invalid"
+        )
 
     return RemoteFillHandoff(
         transfer_id=required_text("transfer_id"),
@@ -443,30 +465,8 @@ def parse_remote_fill_handoff(
         global_te_push=global_te_push,
         token_hash_algorithm=token_hash_algorithm,
         python_hash_seed=python_hash_seed,
+        descriptor_verification_capability=verification_capability,
     )
-
-
-def load_remote_fill_hmac_secret() -> bytes:
-    """Read the deployment HMAC secret from the dedicated secret file.
-
-    Returns:
-        Nonempty secret bytes.
-
-    Raises:
-        RuntimeError: If no secret file is configured or it is invalid.
-    """
-
-    raw_path = os.environ.get(REMOTE_FILL_HMAC_SECRET_FILE_ENV, "")
-    if not raw_path:
-        raise RuntimeError("remote-fill HMAC secret file is not configured")
-    try:
-        secret = Path(raw_path).read_bytes()
-    except OSError as error:
-        raise RuntimeError("remote-fill HMAC secret file is unreadable") from error
-    secret = secret.rstrip(b"\r\n")
-    if not 32 <= len(secret) <= 4096:
-        raise RuntimeError("remote-fill HMAC secret length is invalid")
-    return secret
 
 
 def create_remote_fill_client(
@@ -841,6 +841,7 @@ class RemoteFillProducerSession:
         attempt_id = reserved.native_transfer_attempt_id
         native_seconds = 0.0
         source_event_wait_seconds = 0.0
+        source_fences_ready_monotonic = 0.0
         source_registration_seconds = 0.0
         native_slot_wait_seconds = 0.0
         native_started_monotonic = 0.0
@@ -928,6 +929,9 @@ class RemoteFillProducerSession:
             source_event_wait_seconds = max(
                 0.0, float(native_result.source_event_wait_ms) / 1000.0
             )
+            source_fences_ready_monotonic = max(
+                0.0, float(native_result.source_fences_ready_monotonic)
+            )
             source_registration_seconds = max(
                 0.0, float(native_result.source_registration_ms) / 1000.0
             )
@@ -963,6 +967,10 @@ class RemoteFillProducerSession:
             source_event_wait_seconds = max(
                 0.0,
                 float(getattr(result, "source_event_wait_ms", 0.0)) / 1000.0,
+            )
+            source_fences_ready_monotonic = max(
+                0.0,
+                float(getattr(result, "source_fences_ready_monotonic", 0.0)),
             )
             source_registration_seconds = max(
                 0.0,
@@ -1020,6 +1028,7 @@ class RemoteFillProducerSession:
                 reserve_seconds=reserve_seconds,
                 arm_seconds=arm_seconds,
                 source_event_wait_seconds=source_event_wait_seconds,
+                source_fences_ready_monotonic=source_fences_ready_monotonic,
                 source_registration_seconds=source_registration_seconds,
                 native_slot_wait_seconds=native_slot_wait_seconds,
                 native_seconds=native_seconds,
@@ -1036,6 +1045,7 @@ class RemoteFillProducerSession:
             reserve_seconds=reserve_seconds,
             arm_seconds=arm_seconds,
             source_event_wait_seconds=source_event_wait_seconds,
+            source_fences_ready_monotonic=source_fences_ready_monotonic,
             source_registration_seconds=source_registration_seconds,
             native_slot_wait_seconds=native_slot_wait_seconds,
             native_seconds=native_seconds,

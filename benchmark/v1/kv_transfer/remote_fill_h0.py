@@ -20,6 +20,8 @@ class H0Adapter(Protocol):
 
     def production_components(self) -> Mapping[str, bool]: ...
 
+    def observed_layout(self) -> Mapping[str, Any]: ...
+
     def full_pages(self) -> Mapping[str, Any]: ...
 
     def partial_pages(self, valid_tokens: tuple[int, ...]) -> Mapping[str, Any]: ...
@@ -58,7 +60,7 @@ def run_h0(
 ) -> dict[str, Any]:
     """Run all H0 cases and return a manifest-bound validated report."""
 
-    if chunk_size < 4 or window_tokens < 4096 or soak_iterations < 100:
+    if chunk_size < 8 or window_tokens < 4096 or soak_iterations < 100:
         raise ValueError("H0 dimensions or soak length are invalid")
     if guard_seconds <= 0:
         raise ValueError("H0 terminal-visibility guard must be positive")
@@ -67,12 +69,22 @@ def run_h0(
     )
     qualification = _qualification_module()
     try:
+        qualification.validate_manifest(manifest, allow_dirty=False)
+        cache_inventory = manifest["inventory"]["cache"]
+        if (
+            chunk_size != int(cache_inventory["chunk_size"])
+            or window_tokens != int(cache_inventory["remote_fill_window_size"])
+        ):
+            raise ValueError(
+                "H0 chunk/window dimensions must exactly match the manifest"
+            )
         report = {
             "schema": 1,
             "kind": "direct_remote_lmcache_h0_report",
             "activation": "mooncake-sync-write-visible-v1",
             "qualification_manifest_sha256": qualification.payload_sha256(manifest),
             "production_components": dict(adapter.production_components()),
+            "observed_layout": dict(adapter.observed_layout()),
             "cases": {},
         }
         cases = report["cases"]

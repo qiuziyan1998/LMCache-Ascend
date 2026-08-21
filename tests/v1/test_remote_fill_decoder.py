@@ -30,6 +30,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.cache_engine import (
     AscendLMCacheEngine,
+    _remote_fill_advertise_host_from_session,
     _validate_remote_fill_control_port,
 )
 from lmcache_ascend.v1.remote_fill import (
@@ -1073,7 +1074,7 @@ def test_runtime_requires_tp0_and_strict_shared_storage_for_tp_gt_one(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=True,
-        deployment_secret=b"x" * 32,
+        descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: _FakeServer(),
     )
     with pytest.raises(ValueError, match="physical TP0"):
@@ -1114,7 +1115,7 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=False,
-        deployment_secret=b"x" * 32,
+        descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: server,
     )
 
@@ -1127,9 +1128,51 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
     assert placement["control_endpoint"] == "tcp://10.0.0.2:19000"
     assert placement["token_hash_algorithm"] == "builtin"
     assert placement["python_hash_seed"] == "0"
+    assert placement["descriptor_verification_capability"] == (b"x" * 32).hex()
+    assert "descriptor_verification_capability" not in repr(runtime.placement)
     assert all("ptr" not in key and "secret" not in key for key in placement)
     runtime.close()
     assert server.closed
+
+
+def test_runtime_rotates_verification_capability_per_incarnation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    capabilities = iter((b"a" * 32, b"b" * 32))
+    monkeypatch.setattr(
+        "lmcache_ascend.v1.remote_fill.secrets.token_bytes",
+        lambda size: next(capabilities),
+    )
+    common = dict(
+        config=_config(shared=False),
+        metadata=_metadata(world_size=1),
+        local_backend=_FakeLocalBackend(),
+        layout=_layout(),
+        destination_engine_epoch=7,
+        destination_dp_rank=0,
+        destination_dp_size=1,
+        destination_remote_session="decoder:1234",
+        control_host="127.0.0.1",
+        control_advertise_host="10.0.0.2",
+        control_port=19000,
+        shared_cache_generation=0,
+        capacity_available=lambda size: True,
+        fatal_restart=lambda transfers: None,
+        global_te_push=True,
+        save_only_first_rank=True,
+        save_indexer_only_first_rank=True,
+        shared_cpu_cache_strict=False,
+        server_factory=lambda service: _FakeServer(),
+    )
+
+    first = create_decoder_remote_fill_runtime(**common)
+    second = create_decoder_remote_fill_runtime(**common)
+
+    assert first.placement.descriptor_verification_capability == (b"a" * 32).hex()
+    assert second.placement.descriptor_verification_capability == (b"b" * 32).hex()
+    first.close()
+    second.close()
 
 
 def test_runtime_separates_bind_and_ipv6_advertised_host(
@@ -1155,7 +1198,7 @@ def test_runtime_separates_bind_and_ipv6_advertised_host(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=False,
-        deployment_secret=b"x" * 32,
+        descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: _FakeServer(),
     )
 
@@ -1189,7 +1232,7 @@ def test_runtime_rejects_nonroutable_advertised_host(
             save_only_first_rank=True,
             save_indexer_only_first_rank=True,
             shared_cpu_cache_strict=False,
-            deployment_secret=b"x" * 32,
+            descriptor_verification_capability=b"x" * 32,
             server_factory=lambda service: _FakeServer(),
         )
 
@@ -1221,3 +1264,13 @@ def test_remote_fill_control_port_range_rejects_overflow_and_collision() -> None
             internal_api_enabled=True,
             internal_api_port_start=6999,
         )
+
+
+@pytest.mark.parametrize(
+    ("session", "host"),
+    (("decoder.example:1234", "decoder.example"), ("tcp://10.0.0.8:9", "10.0.0.8")),
+)
+def test_remote_fill_control_host_uses_existing_global_te_identity(
+    session: str, host: str
+) -> None:
+    assert _remote_fill_advertise_host_from_session(session) == host

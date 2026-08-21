@@ -1,4 +1,5 @@
 {
+  "example_only": true,
   "kind": "direct_remote_lmcache_c1_report",
   "schema": 1,
   "production_components": {"ascend_multi_connector": true, "dp2_routing": true, "lmcache": true, "mooncake": true, "mtp": true, "tp8_shared_local_cpu": true, "vllm": true},

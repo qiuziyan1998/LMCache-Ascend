@@ -4,7 +4,7 @@
 # Standard
 from argparse import ArgumentParser, Namespace
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -24,6 +24,8 @@ class WorkItem:
     prompt: str
     repetition: int
     warmup: bool
+    expected_prompt_tokens: int | None = None
+    batch_id: int = 0
 
 
 def _clock_domain() -> tuple[str, str]:
@@ -35,19 +37,29 @@ def _clock_domain() -> tuple[str, str]:
     return host, f"{host}:{boot}"
 
 
-def load_prompts(path: Path) -> list[dict[str, str]]:
+def load_prompts(path: Path) -> list[dict[str, Any]]:
     """Load strict JSONL prompt records with stable case identities."""
 
-    prompts: list[dict[str, str]] = []
+    prompts: list[dict[str, Any]] = []
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), start=1
     ):
         if not line.strip():
             continue
         record = json.loads(line)
-        if not isinstance(record, dict) or set(record) != {"case_id", "prompt"}:
+        if not isinstance(record, dict) or set(record) != {
+            "case_id",
+            "prompt",
+            "expected_prompt_tokens",
+        }:
             raise ValueError(f"invalid prompt record at line {line_number}")
-        if not all(isinstance(record[key], str) and record[key] for key in record):
+        if not all(
+            isinstance(record[key], str) and record[key]
+            for key in ("case_id", "prompt")
+        ) or not (
+            isinstance(record["expected_prompt_tokens"], int)
+            and record["expected_prompt_tokens"] > 0
+        ):
             raise ValueError(f"empty prompt record at line {line_number}")
         prompts.append(record)
     if not prompts or len({item["case_id"] for item in prompts}) != len(prompts):
@@ -56,7 +68,7 @@ def load_prompts(path: Path) -> list[dict[str, str]]:
 
 
 def build_work_items(
-    prompts: Iterable[dict[str, str]],
+    prompts: Iterable[dict[str, Any]],
     *,
     repetitions: int,
     warmups: int,
@@ -68,12 +80,24 @@ def build_work_items(
         raise ValueError("repetitions must be positive and warmups nonnegative")
     records = list(prompts)
     warmup_items = [
-        WorkItem(record["case_id"], record["prompt"], index, True)
+        WorkItem(
+            record["case_id"],
+            record["prompt"],
+            index,
+            True,
+            int(record["expected_prompt_tokens"]),
+        )
         for record in records
         for index in range(warmups)
     ]
     measured_items = [
-        WorkItem(record["case_id"], record["prompt"], index, False)
+        WorkItem(
+            record["case_id"],
+            record["prompt"],
+            index,
+            False,
+            int(record["expected_prompt_tokens"]),
+        )
         for record in records
         for index in range(repetitions)
     ]
@@ -99,6 +123,85 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
+def _generated_content(payload: Mapping[str, Any]) -> str:
+    """Return generated text from one completion or chat-completion event."""
+
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return ""
+    for choice in choices:
+        if not isinstance(choice, Mapping):
+            continue
+        text = choice.get("text")
+        if isinstance(text, str) and text:
+            return text
+        delta = choice.get("delta")
+        if isinstance(delta, Mapping):
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                return content
+    return ""
+
+
+def _read_streaming_response(
+    response: Any,
+) -> tuple[float, float, int, str, int]:
+    """Read SSE incrementally and locate the first generated model token."""
+
+    first_byte_at: float | None = None
+    first_token_at: float | None = None
+    response_bytes = 0
+    request_id = ""
+    prompt_tokens: int | None = None
+    pending = b""
+    read_chunk = getattr(response, "read1", None)
+    if not callable(read_chunk):
+        read_chunk = response.read
+    while True:
+        chunk = read_chunk(4096)
+        now = time.perf_counter()
+        if not chunk:
+            break
+        if first_byte_at is None:
+            first_byte_at = now
+        response_bytes += len(chunk)
+        pending += chunk
+        while b"\n" in pending:
+            raw_line, pending = pending.split(b"\n", 1)
+            line = raw_line.strip()
+            if not line or line.startswith(b":"):
+                continue
+            if not line.startswith(b"data:"):
+                continue
+            encoded = line[5:].strip()
+            if encoded == b"[DONE]":
+                continue
+            try:
+                event = json.loads(encoded)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError("stream contained malformed JSON data") from error
+            if not isinstance(event, dict):
+                raise RuntimeError("stream event must be a JSON object")
+            if event.get("error"):
+                raise RuntimeError(f"stream returned an error: {event['error']}")
+            if not request_id and isinstance(event.get("id"), str):
+                request_id = event["id"]
+            usage = event.get("usage")
+            if isinstance(usage, Mapping) and isinstance(
+                usage.get("prompt_tokens"), int
+            ):
+                prompt_tokens = int(usage["prompt_tokens"])
+            if first_token_at is None and _generated_content(event):
+                first_token_at = now
+    if first_byte_at is None:
+        raise RuntimeError("response completed without a body byte")
+    if first_token_at is None:
+        raise RuntimeError("response completed without a generated token")
+    if prompt_tokens is None or prompt_tokens <= 0:
+        raise RuntimeError("response did not report positive prompt-token usage")
+    return first_byte_at, first_token_at, response_bytes, request_id, prompt_tokens
+
+
 def run_request(
     item: WorkItem,
     *,
@@ -115,13 +218,14 @@ def run_request(
     api_key: str | None,
     opener: Callable[..., Any] = urlopen,
 ) -> dict[str, Any]:
-    """Run one streaming request and record first body-byte latency."""
+    """Run one streaming request and measure the first generated token."""
 
     payload: dict[str, Any] = {
         "prompt": item.prompt,
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     if model:
         payload["model"] = model
@@ -139,19 +243,34 @@ def run_request(
         "prompt_bytes": len(item.prompt.encode()),
         "repetition": item.repetition,
         "warmup": item.warmup,
+        "run_id": trial_id,
+        "batch_id": item.batch_id,
+        "repetition_id": item.repetition,
     }
     host, clock_domain = _clock_domain()
     send_wall_ns = time.time_ns()
     send_monotonic = time.perf_counter()
     try:
         with opener(request, timeout=timeout_seconds) as response:
-            first = response.read(1)
-            first_monotonic = time.perf_counter()
-            remaining = response.read()
+            (
+                first_byte_monotonic,
+                first_token_monotonic,
+                response_bytes,
+                streamed_request_id,
+                prompt_tokens,
+            ) = _read_streaming_response(response)
             complete_monotonic = time.perf_counter()
-            if not first:
-                raise RuntimeError("response completed without a body byte")
-            request_id = response.headers.get("X-Request-Id", "")
+            request_id = response.headers.get("X-Request-Id", "") or streamed_request_id
+            if not request_id:
+                raise RuntimeError("response did not provide a request identity")
+            if (
+                item.expected_prompt_tokens is not None
+                and prompt_tokens != item.expected_prompt_tokens
+            ):
+                raise RuntimeError(
+                    "server prompt-token usage does not match the workload: "
+                    f"expected={item.expected_prompt_tokens}, observed={prompt_tokens}"
+                )
             status = int(getattr(response, "status", 200))
         return {
             "schema": 1,
@@ -169,9 +288,15 @@ def run_request(
             "client_send_monotonic_ms": round(send_monotonic * 1000, 3),
             "proxy_request_id": request_id,
             "http_status": status,
-            "ttft_ms": round((first_monotonic - send_monotonic) * 1000, 3),
+            "ttfb_ms": round((first_byte_monotonic - send_monotonic) * 1000, 3),
+            "first_generated_token_ms": round(
+                (first_token_monotonic - send_monotonic) * 1000, 3
+            ),
+            # Compatibility alias; every gate now means first generated token.
+            "ttft_ms": round((first_token_monotonic - send_monotonic) * 1000, 3),
             "complete_ms": round((complete_monotonic - send_monotonic) * 1000, 3),
-            "response_bytes": len(first) + len(remaining),
+            "response_bytes": response_bytes,
+            "prompt_tokens": prompt_tokens,
             "ok": 200 <= status < 300,
         }
     except Exception as error:
@@ -211,6 +336,18 @@ def _median_confidence_interval(
     return _nearest_rank(medians, 0.025), _nearest_rank(medians, 0.975)
 
 
+def _clustered_medians(rows: Iterable[dict[str, Any]], field: str) -> list[float]:
+    """Collapse correlated concurrent requests into repetition-batch samples."""
+
+    clusters: dict[tuple[Any, Any], list[float]] = {}
+    for row in rows:
+        cluster = (row.get("run_id"), row.get("batch_id"))
+        if cluster[0] in (None, "") or not isinstance(cluster[1], int):
+            raise ValueError("measured trials require run_id and integer batch_id")
+        clusters.setdefault(cluster, []).append(float(row[field]))
+    return [statistics.median(clusters[key]) for key in sorted(clusters)]
+
+
 def summarize(
     results: Iterable[dict[str, Any]], *, measured_wall_seconds: float | None = None
 ) -> dict[str, Any]:
@@ -218,7 +355,10 @@ def summarize(
 
     rows = list(results)
     measured = [row for row in rows if not row["warmup"]]
-    values = [float(row["ttft_ms"]) for row in measured if row.get("ok")]
+    if any(not row.get("ok") for row in measured):
+        raise ValueError("measured qualification trials contain request failures")
+    successful = [row for row in measured if row.get("ok")]
+    values = [float(row["ttft_ms"]) for row in successful]
     if not values:
         raise ValueError("no successful measured TTFT samples")
     identity_fields = (
@@ -232,7 +372,8 @@ def summarize(
     if any(len({row.get(field) for row in measured}) != 1 for field in identity_fields):
         raise ValueError("measured trials contain mixed qualification identity")
     median = statistics.median(values)
-    confidence_low, confidence_high = _median_confidence_interval(values)
+    cluster_values = _clustered_medians(successful, "ttft_ms")
+    confidence_low, confidence_high = _median_confidence_interval(cluster_values)
     return {
         "schema": 1,
         "kind": "direct_remote_lmcache_client_summary",
@@ -244,8 +385,9 @@ def summarize(
         "cache_state": measured[0]["cache_state"],
         "warmups_separate": True,
         "measured": len(measured),
-        "successful": len(values),
+        "successful": len(successful),
         "failed": len(measured) - len(values),
+        "independent_batches": len(cluster_values),
         "median_ttft_ms": median,
         "median_ttft_95_ci_ms": [confidence_low, confidence_high],
         "p95_ttft_ms": _nearest_rank(values, 0.95),
@@ -301,6 +443,8 @@ def compare_modes(
                 row["prompt_sha256"],
                 row["repetition"],
                 row["cache_state"],
+                row.get("prompt_tokens"),
+                row.get("batch_id"),
             )
             if identity in values:
                 raise ValueError(f"mode {mode} contains duplicate trial identity")
@@ -316,11 +460,20 @@ def compare_modes(
     a_values = [indexed["A"][identity] for identity in sorted(identities)]
     b_values = [indexed["B"][identity] for identity in sorted(identities)]
     c_values = [indexed["C"][identity] for identity in sorted(identities)]
+    ordered_identities = sorted(identities)
     gains = [
-        baseline - direct for baseline, direct in zip(a_values, c_values, strict=True)
+        indexed["A"][identity] - indexed["C"][identity]
+        for identity in ordered_identities
+    ]
+    clustered_gains: dict[Any, list[float]] = {}
+    for identity, gain in zip(ordered_identities, gains, strict=True):
+        clustered_gains.setdefault(identity[5], []).append(gain)
+    independent_gains = [
+        statistics.median(clustered_gains[batch])
+        for batch in sorted(clustered_gains)
     ]
     median_gain = statistics.median(gains)
-    gain_low, gain_high = _median_confidence_interval(gains)
+    gain_low, gain_high = _median_confidence_interval(independent_gains)
     median_a = statistics.median(a_values)
     median_b = statistics.median(b_values)
     disabled_regression = (median_b - median_a) / median_a * 100 if median_a else 0.0
@@ -328,6 +481,7 @@ def compare_modes(
         "schema": 1,
         "kind": "direct_remote_lmcache_abc_comparison",
         "paired_samples": len(identities),
+        "independent_batches": len(independent_gains),
         "workload_id": next(iter(workload_specs))[0],
         "workload_spec_sha256": next(iter(workload_specs))[1],
         "qualification_manifest_sha256": {
@@ -344,7 +498,7 @@ def compare_modes(
         "median_remote_fill_gain_95_ci_ms": [gain_low, gain_high],
         "disabled_ttft_gate_pass": disabled_regression <= 1.0,
         "experimental_ttft_gate_pass": median_gain >= 500 and gain_low > 0,
-        "release_sample_count_pass": len(identities) >= 30,
+        "release_sample_count_pass": len(independent_gains) >= 30,
         "proceed_gate_complete": False,
         "proceed_gate_incomplete_reason": (
             "decoder critical-path reduction and active-load interference "
@@ -380,6 +534,15 @@ def main() -> None:
         raise ValueError("max-tokens, concurrency, and timeout must be positive")
     prompts = load_prompts(args.prompts)
     manifest = json.loads(args.qualification_manifest.read_text(encoding="utf-8"))
+    # Local import keeps the standalone workload helpers importable in tests.
+    import remote_fill_qualification as qualification
+
+    qualification.validate_manifest(manifest, allow_dirty=False)
+    if args.cache_state == "cold" and args.warmups:
+        raise ValueError(
+            "cold qualification requires --warmups=0 unless a deployment adapter "
+            "provides reset evidence between warmup and measured requests"
+        )
     qualification_manifest_sha256 = payload_sha256(manifest)
     workload_spec_sha256 = payload_sha256(
         {
@@ -388,6 +551,7 @@ def main() -> None:
                 {
                     "case_id": record["case_id"],
                     "prompt_sha256": sha256(record["prompt"].encode()).hexdigest(),
+                    "expected_prompt_tokens": record["expected_prompt_tokens"],
                 }
                 for record in prompts
             ],
@@ -413,6 +577,10 @@ def main() -> None:
     measured_items = [item for item in items if not item.warmup]
 
     def execute(executor: ThreadPoolExecutor, selected: list[WorkItem]):
+        batched = [
+            replace(item, batch_id=index // args.concurrency)
+            for index, item in enumerate(selected)
+        ]
         return list(
             executor.map(
                 lambda item: run_request(
@@ -429,7 +597,7 @@ def main() -> None:
                     timeout_seconds=args.timeout_seconds,
                     api_key=api_key,
                 ),
-                selected,
+                batched,
             )
         )
 

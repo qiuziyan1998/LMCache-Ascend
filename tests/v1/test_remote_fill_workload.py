@@ -31,7 +31,11 @@ class _Response:
     headers = {"X-Request-Id": "cmpl-trace"}
 
     def __init__(self) -> None:
-        self._parts = [b"d", b"ata"]
+        self._parts = [
+            b'data: {"id":"cmpl-trace","choices":[{"text":"token"}]}\n\n',
+            b'data: {"id":"cmpl-trace","choices":[],"usage":{"prompt_tokens":6}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
 
     def __enter__(self):
         return self
@@ -46,7 +50,7 @@ class _Response:
 
 def test_client_trial_records_proxy_trace_and_ttft() -> None:
     module = _module()
-    item = module.WorkItem("case", "prompt", 0, False)
+    item = module.WorkItem("case", "prompt", 0, False, 6)
     row = module.run_request(
         item,
         endpoint="http://proxy/v1/completions",
@@ -64,17 +68,44 @@ def test_client_trial_records_proxy_trace_and_ttft() -> None:
     )
     assert row["ok"] is True
     assert row["proxy_request_id"] == "cmpl-trace"
-    assert row["response_bytes"] == 4
+    assert row["response_bytes"] > 4
     assert row["ttft_ms"] >= 0
+    assert row["first_generated_token_ms"] == row["ttft_ms"]
+    assert row["ttfb_ms"] <= row["ttft_ms"]
     assert row["prompt_bytes"] == 6
+    assert row["prompt_tokens"] == 6
     assert "prompt" not in row
     assert row["workload_spec_sha256"] == "spec"
+
+
+def test_client_trial_rejects_prompt_token_mismatch() -> None:
+    module = _module()
+    item = module.WorkItem("case", "prompt", 0, False, 7)
+
+    row = module.run_request(
+        item,
+        endpoint="http://proxy/v1/completions",
+        mode="C",
+        trial_id="trial",
+        workload_id="workload",
+        workload_spec_sha256="spec",
+        qualification_manifest_sha256="manifest",
+        cache_state="cold",
+        model=None,
+        max_tokens=1,
+        timeout_seconds=1,
+        api_key=None,
+        opener=lambda *_args, **_kwargs: _Response(),
+    )
+
+    assert row["ok"] is False
+    assert "prompt-token usage" in row["error"]
 
 
 def test_work_items_keep_warmups_before_measured_trials() -> None:
     module = _module()
     items = module.build_work_items(
-        [{"case_id": "case", "prompt": "prompt"}],
+        [{"case_id": "case", "prompt": "prompt", "expected_prompt_tokens": 6}],
         repetitions=2,
         warmups=2,
         seed=0,
@@ -97,6 +128,8 @@ def test_summary_excludes_warmup_and_rejects_all_failures() -> None:
             "workload_spec_sha256": "spec",
             "qualification_manifest_sha256": "manifest",
             "cache_state": "cold",
+            "run_id": "trial",
+            "batch_id": 0,
         },
         {
             "warmup": False,
@@ -108,12 +141,14 @@ def test_summary_excludes_warmup_and_rejects_all_failures() -> None:
             "workload_spec_sha256": "spec",
             "qualification_manifest_sha256": "manifest",
             "cache_state": "cold",
+            "run_id": "trial",
+            "batch_id": 1,
         },
     ]
     assert module.summarize(rows)["median_ttft_ms"] == 15
     for row in rows:
         row["ok"] = False
-    with pytest.raises(ValueError, match="no successful"):
+    with pytest.raises(ValueError, match="request failures"):
         module.summarize(rows)
 
 
@@ -134,6 +169,9 @@ def test_abc_comparison_is_paired_and_does_not_claim_complete_gate() -> None:
                 "workload_id": "workload",
                 "workload_spec_sha256": "a" * 64,
                 "qualification_manifest_sha256": "b" * 64,
+                "prompt_tokens": 100,
+                "run_id": f"trial-{mode}",
+                "batch_id": repetition,
             }
             for repetition in range(10)
         ]

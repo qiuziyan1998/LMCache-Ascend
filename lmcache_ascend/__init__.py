@@ -6,6 +6,7 @@ from ._version import __version__ as __version__  # noqa: F401  # isort:skip
 from ._version import __version_tuple__ as __version_tuple__  # noqa: F401  # isort:skip
 
 # Standard
+import os
 import sys
 from typing import Optional
 
@@ -30,6 +31,43 @@ def _patch_config():
     # Third Party
     from lmcache.v1.config_base import _to_bool, _to_int_list, create_config_class
     import lmcache.v1.config
+
+    upstream_validate_config = lmcache.v1.config._validate_config
+
+    def _validate_ascend_config(config):
+        """Apply RemoteFill's fixed Ascend contract before validation."""
+
+        remote_fill_active = bool(
+            getattr(config, "enable_remote_lmcache_store", False)
+            and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
+            == "mooncake-sync-write-visible-v1"
+        )
+        if remote_fill_active:
+            # None of these are independent feature choices. RemoteFill uses
+            # the existing direct-NPU, page-first, rank0-owned DSA path and
+            # finalizes persistent stores asynchronously on the prefiller.
+            config.use_layerwise = True
+            config.enable_sparse_attention = True
+            config.dsa_two_groups = True
+            config.save_unfull_chunk = True
+            extra_config = dict(config.extra_config or {})
+            extra_config.update(
+                {
+                    "save_only_first_rank": True,
+                    "mooncake_page_first_multi_buffer": True,
+                    "mooncake_layer_merged_page_objects": True,
+                    "save_chunk_meta": False,
+                }
+            )
+            if getattr(config, "pd_role", None) == "receiver":
+                config.enable_shared_cpu_cache = True
+                config.shared_cpu_cache_strict = True
+            else:
+                config.store_async = True
+                config.store_async_max_queue_size = 2
+                extra_config["use_ascend_direct"] = True
+            config.extra_config = extra_config
+        return upstream_validate_config(config)
 
     lmcache.v1.config._CONFIG_DEFINITIONS["enable_shared_cpu_cache"] = {
         "type": bool,
@@ -264,7 +302,7 @@ def _patch_config():
     }
 
     namespace_extras = {
-        "validate": lmcache.v1.config._validate_config,
+        "validate": _validate_ascend_config,
         "log_config": lmcache.v1.config._log_config,
         "get_extra_config_value": lmcache.v1.config._get_extra_config_value,
         "get_lmcache_worker_ids": lmcache.v1.config._get_lmcache_worker_ids,

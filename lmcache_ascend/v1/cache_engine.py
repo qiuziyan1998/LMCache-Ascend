@@ -14,6 +14,7 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from weakref import WeakSet
 import json
 import os
@@ -105,11 +106,25 @@ from lmcache_ascend.v1.remote_fill_producer import (
     RemoteFillStaticSpec,
     RemoteFillTerminalResult,
     create_remote_fill_client,
-    load_remote_fill_hmac_secret,
     parse_remote_fill_handoff,
 )
 
 logger = init_logger(__name__)
+REMOTE_FILL_DEFAULT_CONTROL_PORT = 19000
+
+
+def _remote_fill_advertise_host_from_session(remote_session: str) -> str:
+    """Extract the decoder host already advertised by its GlobalTE session."""
+
+    value = str(remote_session).strip()
+    if not value:
+        raise ValueError("remote-fill GlobalTE session is empty")
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    if not parsed.hostname:
+        raise ValueError(
+            "remote-fill cannot infer a routable control host from GlobalTE session"
+        )
+    return parsed.hostname
 
 
 def _validate_remote_fill_control_port(
@@ -1010,19 +1025,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._remote_fill_layout_cache = cached
             return cached
 
-    def _remote_fill_immutable_secret(self) -> bytes:
-        """Read and bind the deployment secret once per qualified P engine."""
-
-        secret = getattr(self, "_remote_fill_hmac_secret", None)
-        if secret is not None:
-            return secret
-        with self._engine_state_lock:
-            secret = getattr(self, "_remote_fill_hmac_secret", None)
-            if secret is None:
-                secret = load_remote_fill_hmac_secret()
-                self._remote_fill_hmac_secret = secret
-            return secret
-
     def _remote_fill_static_spec(
         self,
         handoff: RemoteFillHandoff,
@@ -1066,7 +1068,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if handoff is None:
             raise RuntimeError("remote-fill handoff is unavailable")
         limits = self._remote_fill_protocol_limits()
-        secret = self._remote_fill_immutable_secret()
+        verification_key = handoff.descriptor_verification_key
         static_spec = self._remote_fill_static_spec(handoff)
         factory = getattr(self, "_remote_fill_client_factory", None)
         client = (
@@ -1122,7 +1124,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             handoff=handoff,
             static_spec=static_spec,
             client=client,
-            secret=secret,
+            secret=verification_key,
             planned_window_count_hint=planned_windows,
             required_store_end_hint=required_store_end_hint,
             native_hard_timeout_seconds=(
@@ -1625,6 +1627,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                         arm_ms=round(result.arm_seconds * 1000, 3),
                         source_event_wait_ms=round(
                             result.source_event_wait_seconds * 1000, 3
+                        ),
+                        source_fences_ready_monotonic_ms=round(
+                            result.source_fences_ready_monotonic * 1000, 3
                         ),
                         source_registration_ms=round(
                             result.source_registration_seconds * 1000, 3
@@ -9272,17 +9277,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "is explicitly qualified"
             )
             return
-        control_host = str(self.config.remote_fill_control_host or "").strip()
-        control_advertise_host = str(
-            getattr(self.config, "remote_fill_control_advertise_host", None)
-            or control_host
-        ).strip()
-        base_port = self.config.remote_fill_control_port_start
+        configured_control_host = self.config.remote_fill_control_host
+        configured_control_port = self.config.remote_fill_control_port_start
         is_decoder = self.config.pd_role == "receiver" or bool(
-            control_host and base_port is not None
+            configured_control_host or configured_control_port is not None
         )
         if not is_decoder:
             return
+        control_host = str(configured_control_host or "0.0.0.0").strip()
+        base_port = int(
+            configured_control_port or REMOTE_FILL_DEFAULT_CONTROL_PORT
+        )
         if not (self.save_only_first_rank and self.save_indexer_only_first_rank):
             raise ValueError(
                 "remote-fill decoder requires TP0 ownership for both DSA groups"
@@ -9298,8 +9303,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise ValueError(
                 "remote-fill TP>1 decoder requires a completed shared-cache preflight"
             )
-        if not control_host or base_port is None:
-            raise ValueError("remote-fill decoder control endpoint is not configured")
+        if not control_host:
+            raise ValueError("remote-fill decoder control bind host is empty")
         layout_tag, payload_descriptor = mooncake_payload_layout(
             self.config,
             self.metadata,
@@ -9344,6 +9349,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise ValueError(
                 "remote-fill decoder requires a registered GlobalTE session"
             )
+        control_advertise_host = str(
+            getattr(self.config, "remote_fill_control_advertise_host", None)
+            or _remote_fill_advertise_host_from_session(native_session)
+        ).strip()
         local_backend = self._shared_local_cpu_backend()
         if not callable(getattr(local_backend, "get_allocator_capacity_bytes", None)):
             raise ValueError(
