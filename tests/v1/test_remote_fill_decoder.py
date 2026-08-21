@@ -448,6 +448,7 @@ class _FakeCapabilityEngine:
         broadcast: Any,
         page: _FakeCapabilityPage,
         passive_page: _FakeCapabilityPage | None = None,
+        collective_all_true: Any = bool,
     ) -> None:
         self.metadata = SimpleNamespace(
             world_size=2,
@@ -460,6 +461,7 @@ class _FakeCapabilityEngine:
         self._broadcast = broadcast
         self._page = page
         self._passive_page = passive_page
+        self.collective_all_true_fn = collective_all_true
 
     def broadcast_object_fn(self, payload: Any, source_rank: int) -> Any:
         return self._broadcast(payload, source_rank)
@@ -553,7 +555,7 @@ def _capability_page() -> _FakeCapabilityPage:
     )
 
 
-def test_group1_shared_startup_requires_every_rank_ack_and_reclaims_probe(
+def test_group1_shared_startup_uses_rank0_broadcast_and_tp_consensus(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -567,12 +569,11 @@ def test_group1_shared_startup_requires_every_rank_ack_and_reclaims_probe(
     rank0_page = _capability_page()
 
     def rank0_broadcast(payload: Any, source_rank: int) -> Any:
+        assert source_rank == 0
         if isinstance(payload, dict) and "batch" in payload:
             captured["payload"] = payload
             return payload
-        if source_rank == 0:
-            return payload
-        return {"rank": 1, "status": "ok", "message": ""}
+        return payload
 
     rank0 = _FakeCapabilityEngine(
         rank=0,
@@ -587,16 +588,12 @@ def test_group1_shared_startup_requires_every_rank_ack_and_reclaims_probe(
     assert rank0_page.refs == 0
     assert "payload" in captured
 
-    source0_calls = 0
     passive_page = _capability_page()
 
     def passive_broadcast(payload: Any, source_rank: int) -> Any:
-        nonlocal source0_calls
+        assert source_rank == 0
         if source_rank == 0:
-            source0_calls += 1
-            if source0_calls == 1:
-                return captured["payload"]
-            return {"rank": 0, "status": "ok", "message": ""}
+            return captured["payload"]
         return payload
 
     passive = _FakeCapabilityEngine(
@@ -652,21 +649,13 @@ def test_group1_shared_startup_fails_closed_on_passive_rank_rejection(
     monkeypatch.setattr(LayerPageMemoryObj, "pin_many", staticmethod(pin_many))
     rank0_page = _capability_page()
 
-    def broadcast(payload: Any, source_rank: int) -> Any:
-        if source_rank == 0:
-            return payload
-        return {
-            "rank": 1,
-            "status": "error",
-            "message": "passive view rejected",
-        }
-
     engine = _FakeCapabilityEngine(
         rank=0,
-        broadcast=broadcast,
+        broadcast=lambda payload, source_rank: payload,
         page=rank0_page,
+        collective_all_true=lambda local_ready: False,
     )
-    with pytest.raises(ValueError, match="passive view rejected"):
+    with pytest.raises(ValueError, match="another TP rank rejected"):
         engine._preflight_remote_fill_shared_group1(
             _layout(),
             {"version": 3, "group1_schema_version": "dsa-index-v2"},

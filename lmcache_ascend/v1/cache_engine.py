@@ -9109,9 +9109,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         This collective is startup-only. Rank 0 allocates and pins a hidden
         one-token page, broadcasts its compact shared-slab descriptor, and
         every passive rank creates and validates its ordinary passive view.
-        Every rank then broadcasts one pointer-free acknowledgement. The
-        remote-fill service is advertised only after all acknowledgements
-        succeed.
+        Every rank then participates in one CPU-group boolean consensus. The
+        remote-fill service is advertised only after every rank succeeds.
         """
 
         if self.metadata.world_size <= 1:
@@ -9305,35 +9304,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "message": f"{type(exc).__name__}: {exc}",
                 }
 
-            acknowledgements: list[dict[str, object]] = []
-            for source_rank in ranks:
-                outbound = local_ack if worker_id == source_rank else None
-                acknowledgement = self.broadcast_object_fn(outbound, source_rank)
-                if worker_id == source_rank and acknowledgement is None:
-                    acknowledgement = outbound
-                if not isinstance(acknowledgement, dict):
-                    acknowledgement = {
-                        "rank": source_rank,
-                        "status": "error",
-                        "message": "invalid acknowledgement",
-                    }
-                acknowledgements.append(acknowledgement)
-            failures = [
-                acknowledgement
-                for source_rank, acknowledgement in zip(
-                    ranks, acknowledgements, strict=True
+            collective = getattr(self, "collective_all_true_fn", None)
+            if not callable(collective):
+                raise ValueError(
+                    "remote-fill Group-1 startup lacks TP consensus callback"
                 )
-                if acknowledgement.get("rank") != source_rank
-                or acknowledgement.get("status") != "ok"
-            ]
-            if failures:
+            all_ranks_ready = bool(collective(local_ack["status"] == "ok"))
+            if not all_ranks_ready:
+                local_message = str(local_ack.get("message") or "")
+                detail = (
+                    f"rank={worker_id} error={local_message}"
+                    if local_ack["status"] != "ok"
+                    else "another TP rank rejected the shared page"
+                )
                 raise ValueError(
                     "remote-fill Group-1 shared startup capability failed: "
-                    + "; ".join(
-                        f"rank={failure.get('rank')} "
-                        f"error={failure.get('message')}"
-                        for failure in failures
-                    )
+                    + detail
                 )
             self._remote_fill_shared_group1_supported = True
         finally:
