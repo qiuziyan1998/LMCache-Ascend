@@ -4624,6 +4624,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ) = self._unpack_sparse_dynamic_request(sparse_request)
             # The producer, this transfer, and its consumer are submitted to
             # the same current stream, so stream order replaces the event wait.
+            # A cold bootstrap carries no selection (the indexer selects only
+            # after the prefix is resident), so the TOPK bound must not
+            # truncate its implicit dense payload.
+            sparse_selection_explicit = selected_token_idx is not None
 
             if target_slot_mapping is not None:
                 slot_mapping_packed, selected_token_idx, selected_token_counts = (
@@ -4642,7 +4646,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 )
                 selected_token_counts = None
-            if _SPARSE_TRANSFER_TOPK and selected_token_counts is None:
+            if (
+                _SPARSE_TRANSFER_TOPK
+                and selected_token_counts is None
+                and sparse_selection_explicit
+            ):
                 slot_mapping_packed, selected_token_idx = (
                     self._limit_sparse_transfer_inputs(
                         slot_mapping_packed,
@@ -4876,6 +4884,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_counts,
             ) = self._unpack_sparse_dynamic_request(dynamic_request)
             explicit_sparse_payload = target_slot_mapping is not None
+            # A cold bootstrap arrives with no selection: the indexer can only
+            # select after the full prefix is resident, so its payload is the
+            # implicit dense arange. The TOPK bound must never truncate it.
+            sparse_selection_explicit = selected_token_idx is not None
             deep_seen = {}
             capture_deep_payload = False
             if deep_diag_enabled:
@@ -4911,7 +4923,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         token_start_index,
                     )
                 )
-            if _SPARSE_TRANSFER_TOPK and selected_token_counts is None:
+            if (
+                _SPARSE_TRANSFER_TOPK
+                and selected_token_counts is None
+                and sparse_selection_explicit
+            ):
                 slot_mapping_packed, selected_token_idx = (
                     self._limit_sparse_transfer_inputs(
                         slot_mapping_packed,

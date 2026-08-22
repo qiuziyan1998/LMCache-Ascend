@@ -620,9 +620,13 @@ def _flush_store_probes() -> None:
                     if index >= int(rows.shape[0]):
                         break
                     row = rows[index]
-                    row_hashes[f"{layer_id}:{int(token)}"] = _hash_cpu_tensor(
-                        row
-                    )
+                    # Disambiguated key so prefiller-stored and decoder-loaded
+                    # rows compare mechanically across hosts: group 0 has two
+                    # planes and group 1 one, which collide under a bare
+                    # "{layer}:{token}" key.
+                    row_hashes[
+                        f"{group}:{layer_id}:{plane_index}:{int(token)}"
+                    ] = _hash_cpu_tensor(row)
                     if int(torch.count_nonzero(row).item()) == 0:
                         zero_tokens.append(int(token))
                 zero_rows[variant] += len(zero_tokens)
@@ -792,8 +796,12 @@ def log_shared_page_source_fingerprint(
                         for local_token in local_tokens:
                             digest = _hash_cpu_tensor(rows[local_token])
                             if chunk_start is not None:
+                                # Same disambiguated key format as the
+                                # prefiller store-time fingerprint so the two
+                                # hosts' row hashes compare directly.
                                 row_hashes[
-                                    f"{int(layer_id)}:{chunk_start + local_token}"
+                                    f"{int(kv_group)}:{int(layer_id)}:0:"
+                                    f"{chunk_start + local_token}"
                                 ] = digest
                             else:
                                 row_hashes[
@@ -921,11 +929,15 @@ def log_group1_pointer_table(
                 }
                 table_ok = False
                 continue
-            page = pages[0]
-            expected_delta = int(page.group_prefix_sum[int(layer_id)])
+            # Each page carries its own prefix sums: full pages share the
+            # chunk-size stride, but the partial tail page has a smaller
+            # per-layer stride. Compare every chunk against its own page's
+            # prefix, not page 0's.
             deltas = [int(row[k]) - int(dev_ptr_rows[0][k]) for k in range(num_chunks)]
             delta_mismatches = [
-                k for k, delta in enumerate(deltas) if delta != expected_delta
+                k
+                for k, delta in enumerate(deltas)
+                if delta != int(pages[k].group_prefix_sum[int(layer_id)])
             ]
             if int(layer_id) == 0:
                 registration_offsets = [

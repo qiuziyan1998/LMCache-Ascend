@@ -7860,6 +7860,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     pages=pre_resolved_shared_mem_layers[0][
                         :layer_page_chunks
                     ],
+                    chunk_starts=starts,
                     rank=self.metadata.worker_id,
                     passive=False,
                 )
@@ -8133,6 +8134,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     pages=pre_resolved_shared_mem_layers[0][
                                         :layer_page_chunks
                                     ],
+                                    chunk_starts=starts[cached_prefix_chunks:],
                                     rank=self.metadata.worker_id,
                                     passive=False,
                                 )
