@@ -2166,6 +2166,130 @@ def test_sparse_transfer_topk_limits_aligned_views(monkeypatch) -> None:
     assert slots.numel() == selected.numel() == 4
 
 
+@pytest.mark.parametrize(
+    "selection",
+    [None, [], torch.empty(0, dtype=torch.int32)],
+)
+def test_sparse_transfer_topk_preserves_implicit_dense_bootstrap(
+    monkeypatch,
+    selection,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    connector = _make_sparse_pack_connector()
+    slots = torch.arange(4, dtype=torch.long)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selection,
+        None,
+    )
+    packed_slots, packed_selected = connector._pack_sparse_layer_inputs(
+        slots,
+        normalized,
+        0,
+    )
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=None,
+        )
+    )
+
+    assert has_explicit_selection is False
+    assert limited_slots.tolist() == [0, 1, 2, 3]
+    assert limited_selected.tolist() == [0, 1, 2, 3]
+
+
+def test_sparse_transfer_topk_limits_only_simple_explicit_selection(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    connector = _make_sparse_pack_connector()
+    slots = torch.arange(4, dtype=torch.long)
+    selected = torch.tensor([3, 2, 1, 0], dtype=torch.int32)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selected,
+        None,
+    )
+    packed_slots, packed_selected = connector._pack_sparse_layer_inputs(
+        slots,
+        normalized,
+        0,
+    )
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=None,
+        )
+    )
+
+    assert has_explicit_selection is True
+    assert limited_slots.tolist() == [0, 1]
+    assert limited_selected.tolist() == [3, 2]
+
+
+def test_sparse_transfer_topk_preserves_target_mapped_selection_counts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor([[3, 2, 1, 0]], dtype=torch.int32)
+    target_slots = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    selected_counts = torch.tensor([4], dtype=torch.int32)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selected,
+        target_slots,
+    )
+    packed_slots, packed_selected, packed_counts = (
+        connector._pack_sparse_explicit_slot_inputs(
+            normalized,
+            target_slots,
+            selected_counts,
+        )
+    )
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=packed_counts,
+        )
+    )
+
+    assert has_explicit_selection is True
+    assert limited_slots.tolist() == [[10, 11, 12, 13]]
+    assert limited_selected.tolist() == [[3, 2, 1, 0]]
+
+
+def test_empty_target_mapped_selection_remains_explicit_noop() -> None:
+    connector = _make_sparse_pack_connector()
+    selected = torch.empty((1, 0), dtype=torch.int32)
+    target_slots = torch.empty((1, 0), dtype=torch.long)
+    selected_counts = torch.tensor([0], dtype=torch.int32)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selected,
+        target_slots,
+    )
+    packed_slots, packed_selected, packed_counts = (
+        connector._pack_sparse_explicit_slot_inputs(
+            normalized,
+            target_slots,
+            selected_counts,
+        )
+    )
+
+    assert has_explicit_selection is True
+    assert packed_slots.numel() == 0
+    assert packed_selected.numel() == 0
+    assert packed_counts.tolist() == [0]
+
+
 @pytest.mark.parametrize("limit", [0, 4, 8])
 def test_sparse_transfer_topk_preserves_shorter_inputs(
     monkeypatch,

@@ -934,10 +934,16 @@ def log_group1_pointer_table(
             # per-layer stride. Compare every chunk against its own page's
             # prefix, not page 0's.
             deltas = [int(row[k]) - int(dev_ptr_rows[0][k]) for k in range(num_chunks)]
+            expected_deltas = [
+                int(pages[k].group_prefix_sum[int(layer_id)])
+                for k in range(num_chunks)
+            ]
             delta_mismatches = [
                 k
-                for k, delta in enumerate(deltas)
-                if delta != int(pages[k].group_prefix_sum[int(layer_id)])
+                for k, (delta, expected_delta) in enumerate(
+                    zip(deltas, expected_deltas, strict=True)
+                )
+                if delta != expected_delta
             ]
             if int(layer_id) == 0:
                 registration_offsets = [
@@ -946,7 +952,7 @@ def log_group1_pointer_table(
             if delta_mismatches:
                 table_ok = False
             layer_reports[str(int(layer_id))] = {
-                "expected_delta": expected_delta,
+                "expected_deltas_preview": expected_deltas[:4],
                 "deltas_preview": deltas[:4],
                 "delta_mismatch_chunks": delta_mismatches[:8],
                 "row_preview": [int(value) for value in row[:4]],

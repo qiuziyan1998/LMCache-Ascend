@@ -1509,7 +1509,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if _SPARSE_TRANSFER_TOPK:
             logger.warning(
                 "Limiting each sparse LMCache transfer to the first %d "
-                "selected tokens for debugging; vLLM's sparse-attention "
+                "explicitly selected tokens for debugging; implicit dense "
+                "bootstrap ignores this limit and vLLM's sparse-attention "
                 "width is unchanged",
                 _SPARSE_TRANSFER_TOPK,
             )
@@ -2312,6 +2313,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_counts,
         )
 
+    @staticmethod
+    def _normalize_sparse_selection(
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        target_slot_mapping: Optional[Union[torch.Tensor, list]],
+    ) -> tuple[Optional[Union[torch.Tensor, list]], bool]:
+        """Preserve dense-bootstrap intent before packing materializes it.
+
+        Without an explicit target map, the existing contract treats both
+        ``None`` and an empty selection as an implicit dense bootstrap. With
+        an explicit target map, an empty selection remains an explicit no-op
+        and is validated by ``_pack_sparse_explicit_slot_inputs``.
+        """
+        if target_slot_mapping is None and selected_token_idx is not None:
+            selection_empty = (
+                selected_token_idx.numel() == 0
+                if isinstance(selected_token_idx, torch.Tensor)
+                else len(selected_token_idx) == 0
+            )
+            if selection_empty:
+                selected_token_idx = None
+        return selected_token_idx, selected_token_idx is not None
+
     def _pack_sparse_layer_inputs(
         self,
         slot_mapping: torch.Tensor,
@@ -2624,6 +2647,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return (
             slot_mapping_packed[:_SPARSE_TRANSFER_TOPK],
             selected_token_idx[:_SPARSE_TRANSFER_TOPK],
+        )
+
+    @classmethod
+    def _maybe_limit_sparse_transfer_inputs(
+        cls,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        *,
+        has_explicit_sparse_selection: bool,
+        selected_token_counts: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the debug TOPK bound only to simple explicit selections."""
+        if not has_explicit_sparse_selection or selected_token_counts is not None:
+            return slot_mapping_packed, selected_token_idx
+        return cls._limit_sparse_transfer_inputs(
+            slot_mapping_packed,
+            selected_token_idx,
         )
 
     @staticmethod
@@ -4627,7 +4667,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # A cold bootstrap carries no selection (the indexer selects only
             # after the prefix is resident), so the TOPK bound must not
             # truncate its implicit dense payload.
-            sparse_selection_explicit = selected_token_idx is not None
+            selected_token_idx, has_explicit_sparse_selection = (
+                self._normalize_sparse_selection(
+                    selected_token_idx,
+                    target_slot_mapping,
+                )
+            )
 
             if target_slot_mapping is not None:
                 slot_mapping_packed, selected_token_idx, selected_token_counts = (
@@ -4646,17 +4691,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 )
                 selected_token_counts = None
-            if (
-                _SPARSE_TRANSFER_TOPK
-                and selected_token_counts is None
-                and sparse_selection_explicit
-            ):
-                slot_mapping_packed, selected_token_idx = (
-                    self._limit_sparse_transfer_inputs(
-                        slot_mapping_packed,
-                        selected_token_idx,
-                    )
+            slot_mapping_packed, selected_token_idx = (
+                self._maybe_limit_sparse_transfer_inputs(
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    has_explicit_sparse_selection=has_explicit_sparse_selection,
+                    selected_token_counts=selected_token_counts,
                 )
+            )
 
             deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
             capture_content = _should_capture_deep_payload(
@@ -4887,7 +4929,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # A cold bootstrap arrives with no selection: the indexer can only
             # select after the full prefix is resident, so its payload is the
             # implicit dense arange. The TOPK bound must never truncate it.
-            sparse_selection_explicit = selected_token_idx is not None
+            selected_token_idx, has_explicit_sparse_selection = (
+                self._normalize_sparse_selection(
+                    selected_token_idx,
+                    target_slot_mapping,
+                )
+            )
             deep_seen = {}
             capture_deep_payload = False
             if deep_diag_enabled:
@@ -4923,17 +4970,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         token_start_index,
                     )
                 )
-            if (
-                _SPARSE_TRANSFER_TOPK
-                and selected_token_counts is None
-                and sparse_selection_explicit
-            ):
-                slot_mapping_packed, selected_token_idx = (
-                    self._limit_sparse_transfer_inputs(
-                        slot_mapping_packed,
-                        selected_token_idx,
-                    )
+            slot_mapping_packed, selected_token_idx = (
+                self._maybe_limit_sparse_transfer_inputs(
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    has_explicit_sparse_selection=has_explicit_sparse_selection,
+                    selected_token_counts=selected_token_counts,
                 )
+            )
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
