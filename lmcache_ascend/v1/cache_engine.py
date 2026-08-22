@@ -87,6 +87,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.content_diagnostics import (
     fingerprint_compact_group1,
+    log_group1_pointer_table,
     log_npu_content_diagnostic_event,
     log_shared_page_source_fingerprint,
     npu_content_diagnostics_enabled,
@@ -7097,6 +7098,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                                         transient_chunk_ptrs_npu,
                                     )
                                 )
+                                if (
+                                    npu_content_diagnostics_enabled()
+                                    and prepared_compact_ptrs
+                                ):
+                                    log_group1_pointer_table(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        kv_group=kv_group,
+                                        pages=compact_pages,
+                                        dev_ptr_rows=transient_chunk_dev_ptrs,
+                                        rank=self.metadata.worker_id,
+                                    )
                                 if pointer_started:
                                     pointer_seal_s = (
                                         cold_start_perf_now() - pointer_started

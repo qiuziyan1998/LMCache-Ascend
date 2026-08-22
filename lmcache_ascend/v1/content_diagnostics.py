@@ -849,6 +849,131 @@ def log_shared_page_source_fingerprint(
         )
 
 
+def log_group1_pointer_table(
+    *,
+    req_id: str,
+    phase: str,
+    kv_group: int,
+    pages: Sequence[Any],
+    dev_ptr_rows: Sequence[Sequence[int]],
+    rank: int,
+) -> None:
+    """Validate the dense-direct H2D per-layer source pointer table.
+
+    The dense-direct kernel is layer-agnostic: for one layer it reads
+    ``dev_ptr_rows[layer][chunk]`` and scatters to that layer's destination.
+    A layer-specific corruption (e.g. only the last DSA index layer reading
+    zeros while other layers of the same pages read real bytes) therefore
+    localizes to this table's per-layer rows, or to the device registration
+    behind them.  This check validates, per chunk:
+
+    - row deltas: ``row[layer][k] - row[0][k]`` must equal the page's own
+      ``group_prefix_sum[layer]`` (the same offset the CPU views use);
+    - registration offset: ``row[0][k] - page_k.layer_data_ptr(0)`` (device
+      minus host address) must be constant across chunks — a varying offset
+      means the device pointers do not map 1:1 onto the host slab;
+    - raggedness: every layer row must have the same chunk count.
+
+    All values are host-side integers captured after the table is built;
+    nothing here touches the device.
+
+    Args:
+        req_id: Request identifier.
+        phase: Shared-CPU phase of the load.
+        kv_group: KV group of the pages (probe targets group 1).
+        pages: Materialized layer page objects (chunk order).
+        dev_ptr_rows: Per-layer source device pointer rows.
+        rank: Reporting worker rank.
+
+    Notes:
+        Strict no-op unless the content-diagnostic knob is enabled.
+    """
+    if not _ENABLED or int(kv_group) != 1 or not pages or not dev_ptr_rows:
+        return
+    started = time.perf_counter()
+    try:
+        num_layers = len(dev_ptr_rows)
+        num_chunks = len(pages)
+        ragged = sorted(
+            {
+                len(row) if row is not None else -1
+                for row in dev_ptr_rows
+            }
+        )
+        layer_ids = _ordered_sample(
+            (0, num_layers // 2, num_layers - 1),
+            MAX_LAYER_SAMPLES,
+        )
+        host_bases = [int(page.layer_data_ptr(0)) for page in pages]
+        registration_offsets = []
+        table_ok = True
+        layer_reports: dict[str, Any] = {}
+        for layer_id in layer_ids:
+            row = (
+                dev_ptr_rows[int(layer_id)]
+                if int(layer_id) < len(dev_ptr_rows)
+                else None
+            )
+            if row is None or len(row) < num_chunks:
+                layer_reports[str(int(layer_id))] = {
+                    "error": "missing_or_short_row",
+                    "row_len": len(row) if row is not None else None,
+                }
+                table_ok = False
+                continue
+            page = pages[0]
+            expected_delta = int(page.group_prefix_sum[int(layer_id)])
+            deltas = [int(row[k]) - int(dev_ptr_rows[0][k]) for k in range(num_chunks)]
+            delta_mismatches = [
+                k for k, delta in enumerate(deltas) if delta != expected_delta
+            ]
+            if int(layer_id) == 0:
+                registration_offsets = [
+                    int(row[k]) - host_bases[k] for k in range(num_chunks)
+                ]
+            if delta_mismatches:
+                table_ok = False
+            layer_reports[str(int(layer_id))] = {
+                "expected_delta": expected_delta,
+                "deltas_preview": deltas[:4],
+                "delta_mismatch_chunks": delta_mismatches[:8],
+                "row_preview": [int(value) for value in row[:4]],
+            }
+        host_strides = [
+            host_bases[k + 1] - host_bases[k] for k in range(num_chunks - 1)
+        ]
+        _content_log(
+            "group1_pointer_table",
+            req_id=str(req_id),
+            phase=str(phase),
+            kv_group=int(kv_group),
+            rank=int(rank),
+            num_layers=num_layers,
+            num_chunks=num_chunks,
+            ragged_row_lengths=ragged,
+            host_base_preview=host_bases[:4],
+            host_strides_preview=host_strides[:4],
+            registration_offsets=registration_offsets,
+            registration_offset_constant=(
+                len(set(registration_offsets)) == 1
+                if registration_offsets
+                else None
+            ),
+            layer_reports=layer_reports,
+            table_consistent=table_ok,
+            readback_mode="host_integers_only",
+            readback_may_synchronize=False,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+    except Exception as error:
+        _content_log(
+            "group1_pointer_table_probe_error",
+            req_id=str(req_id),
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+
+
 def fingerprint_compact_group1(
     *,
     event: str,
