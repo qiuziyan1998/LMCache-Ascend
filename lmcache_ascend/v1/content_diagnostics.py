@@ -672,6 +672,183 @@ def _flush_store_probes() -> None:
             )
 
 
+def _page_layer_tensor(
+    page: Any,
+    layer_id: int,
+    slab: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Return one layer's CPU tensor view for a shared layer page.
+
+    Rank0 page objects carry their own ``raw_data`` (the allocated slab
+    slice); passive page views have ``raw_data=None`` and address the shared
+    slab through ``meta.address`` plus the page-relative group prefix sums.
+    """
+    prefix = getattr(page, "group_prefix_sum", ())
+    meta = getattr(page, "meta", None)
+    if (
+        meta is None
+        or layer_id + 1 >= len(prefix)
+        or not meta.dtypes
+        or not meta.shapes
+        or layer_id >= len(meta.dtypes)
+        or layer_id >= len(meta.shapes)
+    ):
+        return None
+    begin, end = int(prefix[layer_id]), int(prefix[layer_id + 1])
+    raw_data = getattr(page, "raw_data", None)
+    if isinstance(raw_data, torch.Tensor):
+        base = raw_data
+    else:
+        if not isinstance(slab, torch.Tensor):
+            return None
+        address = int(meta.address)
+        base = slab[address : address + int(meta.phy_size)]
+    try:
+        return base[begin:end].view(meta.dtypes[layer_id]).view(
+            meta.shapes[layer_id]
+        )
+    except (RuntimeError, ValueError):
+        return None
+
+
+def log_shared_page_source_fingerprint(
+    *,
+    req_id: str,
+    phase: str,
+    kv_group: int,
+    pages: Sequence[Any],
+    chunk_starts: Sequence[int] | None = None,
+    slab: torch.Tensor | None = None,
+    rank: int,
+    passive: bool,
+) -> None:
+    """Fingerprint shared-slab page sources before the H2D copy reads them.
+
+    The slab is host memory and the producing GET/broadcast completed before
+    materialization, so this reads CPU bytes only: it never touches an NPU
+    stream and cannot perturb load/compute ordering.  Zero-content findings at
+    this point therefore reflect slab content or view offset arithmetic, not a
+    synchronization race.  Row hashes use the ``"{layer}:{token}"`` key format
+    of the store-time source fingerprint when ``chunk_starts`` is provided,
+    so prefiller-stored and decoder-loaded rows compare directly.
+
+    Args:
+        req_id: Request identifier.
+        phase: Shared-CPU phase (e.g. ``sparse_decode_bootstrap``).
+        kv_group: KV group of the pages (probe targets group 1).
+        pages: Layer page objects materialized for this request.
+        chunk_starts: Absolute first-token index per page, when aligned.
+        slab: Passive shared slab tensor, required for passive views.
+        rank: Reporting worker rank.
+        passive: Whether this rank materialized passive views.
+
+    Notes:
+        Strict no-op unless the single content-diagnostic config knob is
+        enabled; failures are logged and swallowed.
+    """
+    if not _ENABLED or not pages or int(kv_group) != 1:
+        return
+    started = time.perf_counter()
+    try:
+        first = pages[0]
+        num_layers = int(getattr(first, "num_layers", 0) or 0)
+        if num_layers <= 0:
+            return
+        layer_ids = _ordered_sample(
+            (0, num_layers // 2, num_layers - 1),
+            MAX_LAYER_SAMPLES,
+        )
+        zero_pages_by_layer = {int(layer): 0 for layer in layer_ids}
+        page_reports: list[dict[str, Any]] = []
+        for page_index, page in enumerate(pages):
+            valid_tokens = int(getattr(page, "valid_tokens", 0) or 0)
+            local_tokens = (
+                _ordered_sample(
+                    (0, valid_tokens // 2, valid_tokens - 1),
+                    3,
+                )
+                if valid_tokens > 0
+                else []
+            )
+            chunk_start = (
+                int(chunk_starts[page_index])
+                if chunk_starts is not None and page_index < len(chunk_starts)
+                else None
+            )
+            layer_reports: dict[str, Any] = {}
+            for layer_id in layer_ids:
+                tensor = _page_layer_tensor(page, int(layer_id), slab)
+                if tensor is None:
+                    layer_reports[str(int(layer_id))] = {
+                        "error": "unresolved_layer_view"
+                    }
+                    continue
+                nonzero = int(torch.count_nonzero(tensor).item())
+                elements = int(tensor.numel())
+                row_hashes: dict[str, str] = {}
+                if local_tokens:
+                    try:
+                        rows = tensor.reshape(valid_tokens, -1)
+                        for local_token in local_tokens:
+                            digest = _hash_cpu_tensor(rows[local_token])
+                            if chunk_start is not None:
+                                row_hashes[
+                                    f"{int(layer_id)}:{chunk_start + local_token}"
+                                ] = digest
+                            else:
+                                row_hashes[
+                                    f"L{int(layer_id)}:p{page_index}"
+                                    f"t{local_token}"
+                                ] = digest
+                    except (RuntimeError, ValueError):
+                        row_hashes = {}
+                if nonzero == 0:
+                    zero_pages_by_layer[int(layer_id)] += 1
+                layer_reports[str(int(layer_id))] = {
+                    "nonzero": nonzero,
+                    "elements": elements,
+                    "layer_size": int(getattr(page, "layer_size", 0) or 0),
+                    "prefix": int(page.group_prefix_sum[int(layer_id)]),
+                    "address": int(page.meta.address),
+                    "valid_tokens": valid_tokens,
+                    "row_hashes": row_hashes,
+                    "all_zero": nonzero == 0,
+                }
+            page_reports.append(
+                {
+                    "page": page_index,
+                    "chunk_start": chunk_start,
+                    "layers": layer_reports,
+                }
+            )
+        _content_log(
+            "group1_page_source_fingerprint",
+            req_id=str(req_id),
+            phase=str(phase),
+            kv_group=int(kv_group),
+            rank=int(rank),
+            passive=bool(passive),
+            pages=len(pages),
+            sampled_layers=[int(layer) for layer in layer_ids],
+            zero_pages_by_layer={
+                str(int(layer)): count
+                for layer, count in zero_pages_by_layer.items()
+            },
+            page_reports=page_reports,
+            readback_mode="inline_cpu_slab_only",
+            readback_may_synchronize=False,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+    except Exception as error:
+        _content_log(
+            "group1_page_source_probe_error",
+            req_id=str(req_id),
+            stage="log",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+
+
 def fingerprint_compact_group1(
     *,
     event: str,

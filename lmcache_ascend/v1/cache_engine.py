@@ -88,6 +88,7 @@ import torch
 from lmcache_ascend.v1.content_diagnostics import (
     fingerprint_compact_group1,
     log_npu_content_diagnostic_event,
+    log_shared_page_source_fingerprint,
     npu_content_diagnostics_enabled,
     queue_store_time_source_fingerprint,
 )
@@ -7056,6 +7057,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 page_view_build_s = (
                                     cold_start_perf_now() - page_started
                                 )
+                            if npu_content_diagnostics_enabled():
+                                log_shared_page_source_fingerprint(
+                                    req_id=req_id,
+                                    phase=phase,
+                                    kv_group=kv_group,
+                                    pages=compact_pages,
+                                    chunk_starts=starts[cached_prefix_chunks:],
+                                    slab=getattr(
+                                        self.shared_cpu_cache_passive_allocator,
+                                        "slab_tensor",
+                                        None,
+                                    ),
+                                    rank=self.metadata.worker_id,
+                                    passive=True,
+                                )
                             to_release.extend(compact_pages)
                             prepare_page_ptrs = getattr(
                                 self.gpu_connector,
@@ -7821,6 +7837,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                 keys_layer_major=missing_keys,
                 page_chunks=len(missing_keys[0]),
             )
+            if npu_content_diagnostics_enabled() and layer_page_chunks:
+                log_shared_page_source_fingerprint(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    kv_group=kv_group,
+                    pages=pre_resolved_shared_mem_layers[0][
+                        :layer_page_chunks
+                    ],
+                    rank=self.metadata.worker_id,
+                    passive=False,
+                )
 
         sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
         remote_layers_per_batch = max(
@@ -8075,6 +8104,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 keys_layer_major=missing_keys,
                                 page_chunks=page_chunks,
                             )
+                            if (
+                                npu_content_diagnostics_enabled()
+                                and layer_page_chunks
+                            ):
+                                log_shared_page_source_fingerprint(
+                                    req_id=kwargs.get(
+                                        "req_id", "unspecified"
+                                    ),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    kv_group=kv_group,
+                                    pages=pre_resolved_shared_mem_layers[0][
+                                        :layer_page_chunks
+                                    ],
+                                    rank=self.metadata.worker_id,
+                                    passive=False,
+                                )
                         elif page_first_locations is not None:
                             prefixes = None
                             if local_prefix_layers:
