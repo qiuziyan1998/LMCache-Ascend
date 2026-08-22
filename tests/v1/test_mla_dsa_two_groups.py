@@ -2281,13 +2281,61 @@ def test_group1_direct_store_rejects_current_stream_event_fallback() -> None:
         )
 
 
+def test_direct_store_retains_causal_join_through_exact_token_frontier() -> None:
+    event = object()
+    state = SimpleNamespace(
+        source_ready_event=None,
+        source_ready_event_source="missing",
+        source_ready_token_end=0,
+        source_ready_events=(),
+        source_ready_events_token_end=0,
+    )
+
+    AscendLMCacheEngine._remember_direct_source_readiness(
+        state,
+        1024,
+        event,
+        "forward_context.sfa_reshape_cache_event",
+        (event, event),
+    )
+
+    assert state.source_ready_events == (event,)
+    assert state.source_ready_events_token_end == 1024
+    assert AscendLMCacheEngine._direct_source_ready_events(state, 1024) == (
+        event,
+    )
+    assert AscendLMCacheEngine._direct_source_ready_events(state, 1025) == ()
+
+
+def test_singleton_readiness_does_not_claim_complete_remote_fill_fence() -> None:
+    event = object()
+    state = SimpleNamespace(
+        source_ready_event=None,
+        source_ready_event_source="missing",
+        source_ready_token_end=0,
+        source_ready_events=(),
+        source_ready_events_token_end=0,
+    )
+
+    AscendLMCacheEngine._remember_direct_source_readiness(
+        state,
+        1024,
+        event,
+        "attn_metadata.reshape_cache_event",
+    )
+
+    assert state.source_ready_event is event
+    assert state.source_ready_token_end == 1024
+    assert AscendLMCacheEngine._direct_source_ready_events(state, 1024) == ()
+
+
 def test_save_layer_carries_final_indexer_producer_event() -> None:
     event = object()
     submitted = []
     request = SimpleNamespace(req_id="request")
     adapter = _ascend_adapter_fake(
         config=SimpleNamespace(dsa_two_groups=True),
-        _latent_layer_names=("model.layers.0.self_attn",),
+        _latent_layer_names=("model.layers.0.self_attn.attn",),
         _indexer_layer_names=("model.layers.0.self_attn.indexer.k_cache",),
         _direct_prefill_requests=lambda: [request],
         _preflight_direct_store=lambda _requests: True,
@@ -2297,11 +2345,15 @@ def test_save_layer_carries_final_indexer_producer_event() -> None:
         _latest_live_source_ready_event=None,
         _latest_live_source_ready_event_source="missing",
     )
-    metadata = SimpleNamespace(reshape_cache_event=event)
+    metadata = {
+        "model.layers.0.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=event
+        )
+    }
 
     _ascend_adapter_method("save_kv_layer")(
         adapter,
-        "model.layers.0.self_attn",
+        "model.layers.0.self_attn.attn",
         object(),
         metadata,
     )
@@ -2369,6 +2421,47 @@ def test_source_ready_event_uses_matching_layer_metadata() -> None:
     source_event = _ascend_adapter_method("_source_ready_event")
     assert source_event("layer.1", metadata) is expected
     assert source_event("missing", metadata) is None
+
+
+def test_source_ready_event_resolves_unbundled_indexer_sibling() -> None:
+    expected = object()
+    metadata = {
+        "model.layers.0.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=expected
+        ),
+        "model.layers.1.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=object()
+        ),
+    }
+
+    source_event = _ascend_adapter_method("_source_ready_event")
+    assert (
+        source_event(
+            "model.layers.0.self_attn.indexer.k_cache",
+            metadata,
+        )
+        is expected
+    )
+
+
+def test_source_ready_event_rejects_ambiguous_indexer_sibling() -> None:
+    metadata = {
+        "model.layers.0.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=object()
+        ),
+        "model.layers.0.self_attn.mla": SimpleNamespace(
+            reshape_cache_event=object()
+        ),
+    }
+
+    source_event = _ascend_adapter_method("_source_ready_event")
+    assert (
+        source_event(
+            "model.layers.0.self_attn.indexer.k_cache",
+            metadata,
+        )
+        is None
+    )
 
 
 def test_save_batch_does_not_rebuild_completed_live_descriptor() -> None:

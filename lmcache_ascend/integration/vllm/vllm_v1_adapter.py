@@ -465,8 +465,22 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     @staticmethod
     def _source_ready_event(layer_name: str, attn_metadata: Any) -> Any:
         metadata = attn_metadata
-        if isinstance(attn_metadata, dict):
+        if isinstance(attn_metadata, Mapping):
             metadata = attn_metadata.get(layer_name)
+            if metadata is None and layer_name.endswith(".indexer.k_cache"):
+                # SFA publishes one event after writing both the latent and
+                # unbundled indexer caches, but ForwardContext stores it under
+                # the latent attention-layer name.  Resolve the synthetic
+                # indexer cache callback back to that unique sibling layer.
+                sibling_metadata = [
+                    value
+                    for name, value in attn_metadata.items()
+                    if isinstance(name, str)
+                    and name.rsplit(".", 1)[0] + ".indexer.k_cache"
+                    == layer_name
+                ]
+                if len(sibling_metadata) == 1:
+                    metadata = sibling_metadata[0]
         return getattr(metadata, "reshape_cache_event", None)
 
     @staticmethod
@@ -1059,6 +1073,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         direct_ready_events = dict(
             getattr(self, "_latest_direct_source_ready_events", {})
         )
+        observed_direct_layers = set(self._direct_store_observed_layers)
         expected_direct_layers = set(self._latent_layer_names)
         if self.config.dsa_two_groups:
             expected_direct_layers.update(self._indexer_layer_names)
@@ -1087,6 +1102,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if hasattr(metadata, "_live_source_event_handoff"):
                 delattr(metadata, "_live_source_event_handoff")
             expected_ids = self._live_source_handoff_request_ids(requests)
+            handoff_status = "absent"
             if (
                 expected_ids
                 and isinstance(handoff, tuple)
@@ -1104,6 +1120,45 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 # cache writes, including deferred callbacks, so it is also the
                 # complete RemoteFill source-fence set for this submission.
                 source_ready_events = (source_ready_event,)
+                handoff_status = "adopted"
+            elif not expected_ids:
+                handoff_status = "not_armed"
+            elif handoff is not None and not (
+                isinstance(handoff, tuple) and len(handoff) == 2
+            ):
+                handoff_status = "malformed"
+            elif isinstance(handoff, tuple) and handoff[0] != expected_ids:
+                handoff_status = "request_mismatch"
+            elif isinstance(handoff, tuple) and handoff[1] is None:
+                handoff_status = "missing_event"
+            for request in requests:
+                remote_fill_eligible = bool(
+                    getattr(request, "_lmcache_remote_fill_qualified", False)
+                )
+                if request.req_id not in expected_ids and not remote_fill_eligible:
+                    continue
+                cold_start_perf_log(
+                    logger,
+                    "remote_fill_producer_fence_decision",
+                    req_id=request.req_id,
+                    handoff_status=handoff_status,
+                    expected_layer_count=len(expected_direct_layers),
+                    observed_layer_count=len(
+                        expected_direct_layers & observed_direct_layers
+                    ),
+                    event_layer_count=len(
+                        expected_direct_layers & direct_ready_events.keys()
+                    ),
+                    callback_fence_complete=bool(
+                        expected_direct_layers
+                        and expected_direct_layers.issubset(direct_ready_events)
+                    ),
+                    complete_fence_count=len(source_ready_events),
+                    source_event_present=source_ready_event is not None,
+                    event_source=source_ready_event_source,
+                    accepted_store_end=len(request.token_ids),
+                    remote_fill_eligible=remote_fill_eligible,
+                )
             request_ids = {request.req_id for request in requests}
             adopted_requests = set()
             for (req_id, _), result in completed.items():

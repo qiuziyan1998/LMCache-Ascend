@@ -27,6 +27,8 @@ def _request(
         req_id=req_id,
         live_source_requested=live_source_requested,
         is_last_prefill=is_last_prefill,
+        token_ids=[1],
+        _lmcache_remote_fill_qualified=live_source_requested,
     )
 
 
@@ -138,7 +140,7 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
     adapter._submit_direct_prefill_requests = MagicMock()
 
-    with patch.object(adapter_mod, "cold_start_perf_log"):
+    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
         adapter._finish_save_batch({})
 
     adapter._submit_direct_prefill_requests.assert_called_once_with(
@@ -147,6 +149,21 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
         source_ready_event=event,
         source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
         source_ready_events=(event,),
+    )
+    perf_log.assert_any_call(
+        adapter_mod.logger,
+        "remote_fill_producer_fence_decision",
+        req_id="req-1",
+        handoff_status="adopted",
+        expected_layer_count=4,
+        observed_layer_count=0,
+        event_layer_count=0,
+        callback_fence_complete=False,
+        complete_fence_count=1,
+        source_event_present=True,
+        event_source="forward_context.sfa_reshape_cache_event",
+        accepted_store_end=1,
+        remote_fill_eligible=True,
     )
 
 
@@ -166,7 +183,7 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
     adapter._indexer_layer_names = ["index-0", "index-78"]
     adapter.config = SimpleNamespace(dsa_two_groups=True)
     adapter._direct_store_step_supported = True
-    adapter._direct_store_observed_layers = set()
+    adapter._direct_store_observed_layers = {"layer-0"}
     adapter._completed_layerwise_stores = {}
     adapter._unfenced_live_stores = {"req-1": request}
     metadata = SimpleNamespace(
@@ -176,7 +193,7 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
     adapter._submit_direct_prefill_requests = MagicMock()
 
-    with patch.object(adapter_mod, "cold_start_perf_log"):
+    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
         adapter._finish_save_batch({})
 
     adapter._submit_direct_prefill_requests.assert_called_once_with(
@@ -185,6 +202,21 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
         source_ready_event=handoff_event,
         source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
         source_ready_events=(handoff_event,),
+    )
+    perf_log.assert_any_call(
+        adapter_mod.logger,
+        "remote_fill_producer_fence_decision",
+        req_id="req-1",
+        handoff_status="adopted",
+        expected_layer_count=4,
+        observed_layer_count=1,
+        event_layer_count=1,
+        callback_fence_complete=False,
+        complete_fence_count=1,
+        source_event_present=True,
+        event_source="forward_context.sfa_reshape_cache_event",
+        accepted_store_end=1,
+        remote_fill_eligible=True,
     )
 
 
@@ -203,7 +235,7 @@ def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
     adapter._indexer_layer_names = ["index-0", "index-78"]
     adapter.config = SimpleNamespace(dsa_two_groups=True)
     adapter._direct_store_step_supported = True
-    adapter._direct_store_observed_layers = set()
+    adapter._direct_store_observed_layers = {"layer-0"}
     adapter._completed_layerwise_stores = {}
     adapter._unfenced_live_stores = {"req-1": request}
     metadata = SimpleNamespace(
@@ -213,7 +245,7 @@ def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
     adapter._submit_direct_prefill_requests = MagicMock()
 
-    with patch.object(adapter_mod, "cold_start_perf_log"):
+    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
         adapter._finish_save_batch({})
 
     adapter._submit_direct_prefill_requests.assert_called_once_with(
@@ -222,6 +254,68 @@ def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
         source_ready_event=callback_event,
         source_ready_event_source=("attn_metadata.reshape_cache_event"),
         source_ready_events=(),
+    )
+    perf_log.assert_any_call(
+        adapter_mod.logger,
+        "remote_fill_producer_fence_decision",
+        req_id="req-1",
+        handoff_status="request_mismatch",
+        expected_layer_count=4,
+        observed_layer_count=1,
+        event_layer_count=1,
+        callback_fence_complete=False,
+        complete_fence_count=0,
+        source_event_present=True,
+        event_source="attn_metadata.reshape_cache_event",
+        accepted_store_end=1,
+        remote_fill_eligible=True,
+    )
+
+
+def test_finish_save_batch_logs_absent_handoff_without_completing_fence() -> None:
+    adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
+    request = _request("req-1")
+    adapter.kv_role = "kv_producer"
+    adapter.lmcache_engine = MagicMock()
+    adapter._latest_live_source_ready_event = None
+    adapter._latest_live_source_ready_event_source = "missing"
+    adapter._latest_direct_source_ready_events = {}
+    adapter._latent_layer_names = ["layer-0", "layer-78"]
+    adapter._indexer_layer_names = ["index-0", "index-78"]
+    adapter.config = SimpleNamespace(dsa_two_groups=True)
+    adapter._direct_store_step_supported = True
+    adapter._direct_store_observed_layers = set()
+    adapter._completed_layerwise_stores = {}
+    adapter._unfenced_live_stores = {"req-1": request}
+    metadata = SimpleNamespace()
+    adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+    adapter._direct_prefill_requests = MagicMock(return_value=[request])
+    adapter._submit_direct_prefill_requests = MagicMock()
+
+    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
+        adapter._finish_save_batch({})
+
+    adapter._submit_direct_prefill_requests.assert_called_once_with(
+        [request],
+        set(),
+        source_ready_event=None,
+        source_ready_event_source="missing",
+        source_ready_events=(),
+    )
+    perf_log.assert_any_call(
+        adapter_mod.logger,
+        "remote_fill_producer_fence_decision",
+        req_id="req-1",
+        handoff_status="absent",
+        expected_layer_count=4,
+        observed_layer_count=0,
+        event_layer_count=0,
+        callback_fence_complete=False,
+        complete_fence_count=0,
+        source_event_present=False,
+        event_source="missing",
+        accepted_store_end=1,
+        remote_fill_eligible=True,
     )
 
 
