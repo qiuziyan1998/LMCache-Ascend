@@ -125,6 +125,10 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
     adapter.lmcache_engine = MagicMock()
     adapter._latest_live_source_ready_event = None
     adapter._latest_live_source_ready_event_source = "missing"
+    adapter._latest_direct_source_ready_events = {}
+    adapter._latent_layer_names = ["layer-0", "layer-78"]
+    adapter._indexer_layer_names = ["index-0", "index-78"]
+    adapter.config = SimpleNamespace(dsa_two_groups=True)
     adapter._direct_store_step_supported = True
     adapter._direct_store_observed_layers = set()
     adapter._completed_layerwise_stores = {}
@@ -142,6 +146,82 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
         set(),
         source_ready_event=event,
         source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
+        source_ready_events=(event,),
+    )
+
+
+def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
+    adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
+    callback_event = object()
+    handoff_event = object()
+    request = _request("req-1")
+    adapter.kv_role = "kv_producer"
+    adapter.lmcache_engine = MagicMock()
+    adapter._latest_live_source_ready_event = callback_event
+    adapter._latest_live_source_ready_event_source = (
+        "attn_metadata.reshape_cache_event"
+    )
+    adapter._latest_direct_source_ready_events = {"layer-0": callback_event}
+    adapter._latent_layer_names = ["layer-0", "layer-78"]
+    adapter._indexer_layer_names = ["index-0", "index-78"]
+    adapter.config = SimpleNamespace(dsa_two_groups=True)
+    adapter._direct_store_step_supported = True
+    adapter._direct_store_observed_layers = set()
+    adapter._completed_layerwise_stores = {}
+    adapter._unfenced_live_stores = {"req-1": request}
+    metadata = SimpleNamespace(
+        _live_source_event_handoff=(("req-1",), handoff_event)
+    )
+    adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+    adapter._direct_prefill_requests = MagicMock(return_value=[request])
+    adapter._submit_direct_prefill_requests = MagicMock()
+
+    with patch.object(adapter_mod, "cold_start_perf_log"):
+        adapter._finish_save_batch({})
+
+    adapter._submit_direct_prefill_requests.assert_called_once_with(
+        [request],
+        set(),
+        source_ready_event=handoff_event,
+        source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
+        source_ready_events=(handoff_event,),
+    )
+
+
+def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
+    adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
+    callback_event = object()
+    request = _request("req-1")
+    adapter.kv_role = "kv_producer"
+    adapter.lmcache_engine = MagicMock()
+    adapter._latest_live_source_ready_event = callback_event
+    adapter._latest_live_source_ready_event_source = (
+        "attn_metadata.reshape_cache_event"
+    )
+    adapter._latest_direct_source_ready_events = {"layer-0": callback_event}
+    adapter._latent_layer_names = ["layer-0", "layer-78"]
+    adapter._indexer_layer_names = ["index-0", "index-78"]
+    adapter.config = SimpleNamespace(dsa_two_groups=True)
+    adapter._direct_store_step_supported = True
+    adapter._direct_store_observed_layers = set()
+    adapter._completed_layerwise_stores = {}
+    adapter._unfenced_live_stores = {"req-1": request}
+    metadata = SimpleNamespace(
+        _live_source_event_handoff=(("other-request",), object())
+    )
+    adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+    adapter._direct_prefill_requests = MagicMock(return_value=[request])
+    adapter._submit_direct_prefill_requests = MagicMock()
+
+    with patch.object(adapter_mod, "cold_start_perf_log"):
+        adapter._finish_save_batch({})
+
+    adapter._submit_direct_prefill_requests.assert_called_once_with(
+        [request],
+        set(),
+        source_ready_event=callback_event,
+        source_ready_event_source=("attn_metadata.reshape_cache_event"),
+        source_ready_events=(),
     )
 
 

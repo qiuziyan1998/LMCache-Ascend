@@ -1088,15 +1088,22 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 delattr(metadata, "_live_source_event_handoff")
             expected_ids = self._live_source_handoff_request_ids(requests)
             if (
-                source_ready_event is None
+                expected_ids
                 and isinstance(handoff, tuple)
                 and len(handoff) == 2
                 and handoff[0] == expected_ids
+                and handoff[1] is not None
             ):
-                request_ids, source_ready_event = handoff
+                _, source_ready_event = handoff
                 source_ready_event_source = (
                     "forward_context.sfa_reshape_cache_event"
                 )
+                # capture_live_source_event_handoff only publishes the final
+                # producer event for one validated request set and one forward
+                # stream.  That event is the causal join for the preceding
+                # cache writes, including deferred callbacks, so it is also the
+                # complete RemoteFill source-fence set for this submission.
+                source_ready_events = (source_ready_event,)
             request_ids = {request.req_id for request in requests}
             adopted_requests = set()
             for (req_id, _), result in completed.items():
