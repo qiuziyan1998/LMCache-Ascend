@@ -89,6 +89,7 @@ from lmcache_ascend.v1.content_diagnostics import (
     fingerprint_compact_group1,
     log_npu_content_diagnostic_event,
     npu_content_diagnostics_enabled,
+    queue_store_time_source_fingerprint,
 )
 from lmcache_ascend.v1.remote_fill import (
     RemoteFillDecoderLayout,
@@ -3069,6 +3070,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ready_event,
                 group_ends,
                 tuple((start, end) for _ in keys),
+                # Same producer fence contract as the full-page persistent
+                # batch: the put must not DMA-read source slots before the
+                # attention scatter of the producing forward completes.
+                remote_ready_events
+                or ((ready_event,) if ready_event is not None else ()),
             )
             self._track_direct_batch(
                 batch,
@@ -3557,6 +3563,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             else tuple(owners.values())
         )
         if keys:
+            # The persistent put synchronizes the producer events carried by
+            # the batch before its unfenced DMA reads the registered NPU
+            # source. Without this fence the DMA can read slots before the
+            # attention scatter of the current forward lands (deterministically
+            # the youngest layer, e.g. the last DSA index layer).
+            persistent_fence_events = remote_ready_events or (
+                (ready_event,) if ready_event is not None else ()
+            )
             batch = _DirectPageBatch(
                 req_id,
                 keys,
@@ -3566,7 +3580,29 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ready_event,
                 group_ends,
                 tuple(ranges),
+                persistent_fence_events,
             )
+            if npu_content_diagnostics_enabled():
+                try:
+                    queue_store_time_source_fingerprint(
+                        req_id=req_id,
+                        group_caches=group_caches,
+                        slot_mappings=slot_mappings,
+                        slot_mapping_base=slot_mapping_base,
+                        page_ranges=tuple(ranges),
+                        put_producer_events=batch.ready_events,
+                        producer_fence_events=(
+                            remote_ready_events
+                            or ((ready_event,) if ready_event is not None else ())
+                        ),
+                        ready_event_source=ready_event_source,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Store-time source fingerprint failed for %s",
+                        req_id,
+                        exc_info=True,
+                    )
             try:
                 self._track_direct_batch(
                     batch,

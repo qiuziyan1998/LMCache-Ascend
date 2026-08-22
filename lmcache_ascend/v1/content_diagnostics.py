@@ -23,7 +23,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 # Third Party
 from lmcache.logging import init_logger
@@ -47,6 +47,8 @@ _REQUEST_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _GROUP0_SOURCE_PROBES: OrderedDict[
     tuple[str, int], "_Group0SourceProbe"
 ] = OrderedDict()
+_STORE_PROBE_STREAMS: dict[int, Any] = {}
+_PENDING_STORE_PROBES: list["_PendingStoreProbe"] = []
 
 
 @dataclass(slots=True)
@@ -75,6 +77,29 @@ class _DeferredSnapshot:
     group0_source_probes: tuple[_Group0SourceProbe, ...] | None = None
 
 
+@dataclass(slots=True)
+class _PendingStoreProbe:
+    """Deferred store-time source probe captured on an independent stream.
+
+    ``as_put`` rows mirror the persistent put's actual fence contract (the
+    producer events handed to the connector), while ``producer_fenced`` rows
+    additionally wait on the attention producer events the put could have
+    used.  Both captures are device-side only; host readback happens at flush
+    time on the probe's own stream, so the probe can neither synchronize nor
+    reorder the serving or store workflow.
+    """
+
+    req_id: str
+    stream: Any
+    page_ranges: tuple[tuple[int, int], ...]
+    put_producer_event_count: int
+    producer_fence_events: tuple[Any, ...]
+    ready_event_source: str
+    tokens_by_group: dict[int, list[int]]
+    slot_tensors: dict[int, Any]
+    rows: dict[tuple[str, int, int, int], torch.Tensor]
+
+
 def configure_npu_content_diagnostics(enabled: bool) -> None:
     """Configure the process-local diagnostic gate from LMCache config.
 
@@ -94,6 +119,7 @@ def configure_npu_content_diagnostics(enabled: bool) -> None:
             _SEEN.clear()
             _REQUEST_SPECS.clear()
             _GROUP0_SOURCE_PROBES.clear()
+            _PENDING_STORE_PROBES.clear()
     _configure_vllm_diagnostic_bridge(_ENABLED)
     if _ENABLED:
         _content_log(
@@ -316,6 +342,334 @@ def _wire_fingerprint(result: dict[str, Any]) -> dict[str, Any]:
         "combined_hash": result["combined_hash"],
         "readback_may_synchronize": True,
     }
+
+
+def _store_probe_stream(device: torch.device) -> Any:
+    """Return the per-device stream used for store-time source probes.
+
+    The stream is deliberately independent of every compute stream: a probe
+    enqueued on it carries no ordering dependency on attention scatter work,
+    which is exactly the read contract of the transfer engine's fenced DMA.
+    """
+    index = device.index if device.index is not None else torch.npu.current_device()
+    with _STATE_LOCK:
+        stream = _STORE_PROBE_STREAMS.get(int(index))
+        if stream is None:
+            stream = torch.npu.Stream(device=int(index))
+            _STORE_PROBE_STREAMS[int(index)] = stream
+        return stream
+
+
+def _wait_probe_event(stream: Any, event: Any) -> None:
+    """Order the probe stream behind a producer event without host sync."""
+    wait_event = getattr(stream, "wait_event", None)
+    if callable(wait_event):
+        wait_event(event)
+        return
+    event.wait(stream)
+
+
+def _store_probe_layers(layers: Sequence[Any]) -> list[int]:
+    """Return the bounded first/middle/last layer sample for a KV group."""
+    num_layers = len(layers)
+    if num_layers <= 0:
+        return []
+    return _ordered_sample(
+        (0, num_layers // 2, num_layers - 1),
+        MAX_LAYER_SAMPLES,
+    )
+
+
+def _store_probe_planes(entry: Any) -> tuple[Any, ...]:
+    """Normalize one per-layer cache entry into its tensor planes."""
+    if isinstance(entry, (tuple, list)):
+        return tuple(entry)
+    return (entry,)
+
+
+def queue_store_time_source_fingerprint(
+    *,
+    req_id: str,
+    group_caches: Mapping[int, Sequence[Any]],
+    slot_mappings: Mapping[int, Any],
+    slot_mapping_base: int,
+    page_ranges: Sequence[tuple[int, int]],
+    put_producer_events: Any = None,
+    producer_fence_events: Any = None,
+    ready_event_source: str = "missing",
+) -> None:
+    """Queue a store-time fingerprint of the direct-store NPU source rows.
+
+    The persistent direct-NPU put synchronizes only the producer events it is
+    handed and then reads the registered source memory without any torch
+    stream ordering.  This probe mirrors that contract: ``as_put`` rows are
+    captured on an independent stream gated by exactly the events the put
+    receives, and ``producer_fenced`` rows wait on the attention producer
+    fence the put could have used.  Both captures are device-side clones, so
+    an ordering race is observed rather than masked; host readback is
+    deferred to :func:`flush_deferred_diagnostics` on the probe stream alone.
+
+    Args:
+        req_id: Request identifier for the store batch.
+        group_caches: Per-KV-group list of per-layer cache tensors or plane
+            tuples.
+        slot_mappings: Per-KV-group token-to-slot mapping for this store
+            window.
+        slot_mapping_base: Absolute token index of the mapping window start.
+        page_ranges: Absolute ``(start, end)`` token ranges of the pages in
+            the batch.
+        put_producer_events: The fence events the persistent put will
+            actually synchronize on.
+        producer_fence_events: The attention producer fence the put could
+            have used (counterfactual capture).
+        ready_event_source: Provenance of the resolved producer event.
+
+    Notes:
+        The function is a strict no-op unless the single content-diagnostic
+        config knob is enabled, and any failure is logged and swallowed.
+    """
+    if not _ENABLED or not group_caches or not page_ranges:
+        return
+    started = time.perf_counter()
+    try:
+        candidates: set[int] = set()
+        for range_start, range_end in page_ranges:
+            range_start = int(range_start)
+            range_end = int(range_end)
+            candidates.update((range_start, range_end - 1))
+            if range_end - range_start > 2:
+                candidates.add((range_start + range_end - 1) // 2)
+        tokens = _ordered_sample(candidates, MAX_LOGICAL_TOKEN_SAMPLES)
+        if not tokens:
+            return
+        device = None
+        for layers in group_caches.values():
+            for entry in layers:
+                tensor = _store_probe_planes(entry)[0]
+                if isinstance(tensor, torch.Tensor):
+                    device = tensor.device
+                    break
+            if device is not None:
+                break
+        if device is None or device.type != "npu":
+            return
+        stream = _store_probe_stream(device)
+        base = int(slot_mapping_base)
+
+        def _as_events(value: Any) -> tuple[Any, ...]:
+            if isinstance(value, (tuple, list)):
+                return tuple(event for event in value if event is not None)
+            return () if value is None else (value,)
+
+        put_events = _as_events(put_producer_events)
+        fence_events = _as_events(producer_fence_events)
+
+        tokens_by_group: dict[int, list[int]] = {}
+        slot_tensors: dict[int, Any] = {}
+        rows: dict[tuple[str, int, int, int], torch.Tensor] = {}
+        captures: list[tuple[int, int, int, torch.Tensor, Any]] = []
+        with torch.npu.stream(stream):
+            # Mirror the put's actual fence: it synchronizes exactly these
+            # events before the DMA reads registered source memory.
+            for event in put_events:
+                _wait_probe_event(stream, event)
+            for group, layers in sorted(group_caches.items()):
+                mapping = (
+                    slot_mappings.get(group)
+                    if hasattr(slot_mappings, "get")
+                    else None
+                )
+                if not isinstance(mapping, torch.Tensor):
+                    continue
+                group_tokens = [
+                    token
+                    for token in tokens
+                    if 0 <= token - base < int(mapping.numel())
+                ]
+                if not group_tokens:
+                    continue
+                index_tensor = torch.tensor(
+                    [token - base for token in group_tokens],
+                    dtype=torch.long,
+                    device=mapping.device,
+                )
+                slot_tensor = (
+                    mapping.detach()
+                    .reshape(-1)
+                    .index_select(0, index_tensor)
+                    .long()
+                )
+                slot_gpu = slot_tensor.to(device)
+                tokens_by_group[int(group)] = group_tokens
+                slot_tensors[int(group)] = slot_gpu
+                for layer_id in _store_probe_layers(layers):
+                    entry = layers[int(layer_id)]
+                    for plane_index, plane in enumerate(
+                        _store_probe_planes(entry)
+                    ):
+                        if (
+                            not isinstance(plane, torch.Tensor)
+                            or plane.ndim < 2
+                        ):
+                            continue
+                        # Match the attention scatter's own flattened view
+                        # so slot indices address exactly the bytes the DMA
+                        # reads for this (layer, token).
+                        flat = plane.detach().reshape(-1, plane.shape[-1])
+                        captures.append(
+                            (
+                                int(group),
+                                int(layer_id),
+                                plane_index,
+                                flat,
+                                slot_gpu,
+                            )
+                        )
+                        rows[("as_put", int(group), int(layer_id), plane_index)] = (
+                            flat.index_select(0, slot_gpu).detach()
+                        )
+            if fence_events and captures:
+                for event in fence_events:
+                    _wait_probe_event(stream, event)
+                for group, layer_id, plane_index, flat, slot_gpu in captures:
+                    rows[
+                        ("producer_fenced", group, layer_id, plane_index)
+                    ] = flat.index_select(0, slot_gpu).detach()
+
+        probe = _PendingStoreProbe(
+            req_id=str(req_id),
+            stream=stream,
+            page_ranges=tuple(
+                (int(range_start), int(range_end))
+                for range_start, range_end in page_ranges
+            ),
+            put_producer_event_count=len(put_events),
+            producer_fence_events=fence_events,
+            ready_event_source=str(ready_event_source),
+            tokens_by_group=tokens_by_group,
+            slot_tensors=slot_tensors,
+            rows=rows,
+        )
+        dropped = None
+        with _STATE_LOCK:
+            if len(_PENDING_STORE_PROBES) >= MAX_PENDING_SNAPSHOTS:
+                dropped = _PENDING_STORE_PROBES.pop(0)
+            _PENDING_STORE_PROBES.append(probe)
+        if dropped is not None:
+            _content_log(
+                "content_diagnostic_snapshot_dropped",
+                dropped_event="store_time_source_fingerprint",
+                reason="pending_limit",
+            )
+        _content_log(
+            "store_time_source_probe_queued",
+            req_id=str(req_id),
+            tokens=tokens,
+            groups=sorted(tokens_by_group),
+            put_producer_event_count=len(put_events),
+            producer_fence_event_count=len(fence_events),
+            ready_event_source=str(ready_event_source),
+            capture_order=(
+                "as_put_on_probe_stream_then_producer_fenced_on_probe_stream"
+            ),
+            readback_mode="deferred_after_model_forward_on_probe_stream",
+            readback_may_synchronize=False,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+    except Exception as error:
+        _content_log(
+            "store_time_source_probe_error",
+            req_id=str(req_id),
+            stage="queue",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+
+
+def _flush_store_probes() -> None:
+    """Read queued store probes on their own stream and log fingerprints."""
+    with _STATE_LOCK:
+        probes = list(_PENDING_STORE_PROBES)
+        _PENDING_STORE_PROBES.clear()
+    for probe in probes:
+        started = time.perf_counter()
+        try:
+            rows_cpu: dict[tuple[str, int, int, int], torch.Tensor] = {}
+            slots_cpu: dict[int, list[int]] = {}
+            # Readback rides the probe stream so it can never order or
+            # synchronize the compute stream; the synchronize below covers
+            # only the probe's own tiny copies.
+            with torch.npu.stream(probe.stream):
+                for key, value in probe.rows.items():
+                    rows_cpu[key] = value.detach().to("cpu").contiguous()
+                for group, tensor in probe.slot_tensors.items():
+                    slots_cpu[int(group)] = (
+                        tensor.detach().to("cpu").reshape(-1).tolist()
+                    )
+            probe.stream.synchronize()
+            summaries: list[dict[str, Any]] = []
+            zero_rows = {"as_put": 0, "producer_fenced": 0}
+            total_rows = {"as_put": 0, "producer_fenced": 0}
+            for key in sorted(rows_cpu):
+                variant, group, layer_id, plane_index = key
+                group_tokens = probe.tokens_by_group.get(group, ())
+                rows = rows_cpu[key]
+                row_hashes: dict[str, str] = {}
+                zero_tokens: list[int] = []
+                for index, token in enumerate(group_tokens):
+                    if index >= int(rows.shape[0]):
+                        break
+                    row = rows[index]
+                    row_hashes[f"{layer_id}:{int(token)}"] = _hash_cpu_tensor(
+                        row
+                    )
+                    if int(torch.count_nonzero(row).item()) == 0:
+                        zero_tokens.append(int(token))
+                zero_rows[variant] += len(zero_tokens)
+                total_rows[variant] += len(row_hashes)
+                summaries.append(
+                    {
+                        "variant": variant,
+                        "kv_group": group,
+                        "layer_id": layer_id,
+                        "plane": plane_index,
+                        "tokens": [int(token) for token in group_tokens],
+                        "row_hashes": row_hashes,
+                        "zero_tokens": zero_tokens,
+                        "all_zero": bool(
+                            zero_tokens
+                            and len(zero_tokens) == len(row_hashes)
+                        ),
+                    }
+                )
+            _content_log(
+                "store_time_source_fingerprint",
+                req_id=probe.req_id,
+                page_ranges=[list(r) for r in probe.page_ranges],
+                put_producer_event_count=probe.put_producer_event_count,
+                producer_fence_event_count=len(probe.producer_fence_events),
+                ready_event_source=probe.ready_event_source,
+                slots={
+                    str(group): values
+                    for group, values in sorted(slots_cpu.items())
+                },
+                layer_summaries=summaries,
+                as_put_zero_rows=zero_rows["as_put"],
+                as_put_total_rows=total_rows["as_put"],
+                producer_fenced_zero_rows=zero_rows["producer_fenced"],
+                producer_fenced_total_rows=total_rows["producer_fenced"],
+                readback_mode="deferred_after_model_forward_on_probe_stream",
+                readback_may_synchronize=False,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
+        except Exception as error:
+            _content_log(
+                "store_time_source_probe_error",
+                req_id=probe.req_id,
+                stage="flush",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
 
 
 def fingerprint_compact_group1(
@@ -797,13 +1151,48 @@ def queue_cache_tail_fingerprint(
         query_end = min(int(query_starts[req_index + 1]), actual_limit)
         if query_end <= query_start:
             continue
+        query_length = int(query_starts[req_index + 1]) - query_start
+        sequence_length = int(seq_lens[req_index])
+        cached_prefix_tokens = max(sequence_length - query_length, 0)
+        if "before_current_scatter" in str(stage):
+            # The before-scatter row sits inside the current query window and
+            # is only comparable when it was previously populated by a cache
+            # load (the request's first resume forward with a cached prefix).
+            # A cold request's first forward (cached_prefix == 0) samples an
+            # unwritten row, and its chunked-prefill continuations sample the
+            # first new token of the chunk; both compare unequal by
+            # construction and would drown the verdict histogram in
+            # guaranteed-false noise. Emit exactly once, and only when the
+            # first forward carried a cached prefix.
+            first_window_key = (
+                f"tail_before:{int(kv_group)}",
+                str(req_id),
+                str(layer_name),
+            )
+            with _STATE_LOCK:
+                first_window = first_window_key not in _SEEN
+                if first_window:
+                    _SEEN[first_window_key] = None
+                    while len(_SEEN) > MAX_TRACKED_REQUEST_LAYERS:
+                        _SEEN.popitem(last=False)
+            if not first_window or not cached_prefix_tokens:
+                _log_snapshot_skip_once(
+                    requested_event="cache_tail_fingerprint",
+                    req_ids=[req_id],
+                    layer_name=layer_name,
+                    reason=(
+                        "first_forward_without_cached_prefix"
+                        if not cached_prefix_tokens
+                        else "later_window_before_scatter"
+                    ),
+                    kv_group=int(kv_group),
+                    stage=str(stage),
+                )
+                continue
         if not _claim_once(
             f"tail:{int(kv_group)}:{stage}", req_id, layer_name
         ):
             continue
-        query_length = int(query_starts[req_index + 1]) - query_start
-        sequence_length = int(seq_lens[req_index])
-        cached_prefix_tokens = max(sequence_length - query_length, 0)
         # On a prefix hit, the first query row is the mandatory boundary token
         # that replaces the final cached row. On a full prefill there is no
         # cached boundary, so sample the final prompt row for cross-run/source
@@ -861,6 +1250,17 @@ def queue_cache_tail_fingerprint(
                         "first_query_row_at_cached_prefix_boundary"
                         if cached_prefix_tokens
                         else "last_full_prefill_row"
+                    ),
+                    # Explicitly scope what a matches_produced verdict here
+                    # can and cannot prove. After-scatter comparisons ride the
+                    # compute stream's own ordering, so they validate the
+                    # scatter writeback only: they cannot observe what an
+                    # unfenced concurrent DMA (direct store) reads from the
+                    # same slots. Store-time source fingerprints cover that.
+                    "comparison_scope": (
+                        "scatter_writeback_stream_ordered"
+                        if "after_current_scatter" in str(stage)
+                        else "loaded_boundary_row_before_replacement"
                     ),
                     "num_actual_tokens": (
                         int(num_actual_tokens)
@@ -1385,10 +1785,12 @@ def begin_deferred_diagnostic_step() -> None:
         stale = len(_PENDING)
         _PENDING.clear()
         _GROUP0_SOURCE_PROBES.clear()
-    if stale:
+        stale_probes = len(_PENDING_STORE_PROBES)
+        _PENDING_STORE_PROBES.clear()
+    if stale or stale_probes:
         _content_log(
             "content_diagnostic_snapshot_dropped",
-            dropped_count=stale,
+            dropped_count=stale + stale_probes,
             reason="previous_forward_did_not_flush",
         )
 
@@ -1512,6 +1914,7 @@ def flush_deferred_diagnostics() -> None:
     """Read snapshots after behavior-critical work and log fingerprints."""
     if not _ENABLED:
         return
+    _flush_store_probes()
     with _STATE_LOCK:
         pending = list(_PENDING)
         _PENDING.clear()
