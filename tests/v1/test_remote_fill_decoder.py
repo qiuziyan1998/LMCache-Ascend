@@ -23,6 +23,7 @@ from lmcache.v1.remote_fill import (
     PageDisposition,
     ReservedPageView,
     UnsafePageLifecycleError,
+    content_digest,
 )
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch
 from lmcache.v1.storage_backend.local_cpu_backend import (
@@ -315,14 +316,32 @@ class _FakeLocalBackend:
             if key not in self.hot and key not in ready_reservations
         )
         if missing:
-            return SimpleNamespace(committed=False, missing_keys=missing)
+            return SimpleNamespace(
+                committed=False,
+                inserted_keys=(),
+                existing_keys=(),
+                missing_keys=missing,
+                lock_wait_seconds=0.0,
+                lock_hold_seconds=0.0,
+            )
+        inserted = []
+        existing = []
         for key in required:
             if key in self.hot:
+                existing.append(key)
                 continue
             page = ready_reservations[key]
             page.ref_count_up()
             self.hot[key] = page
-        return SimpleNamespace(committed=True, missing_keys=())
+            inserted.append(key)
+        return SimpleNamespace(
+            committed=True,
+            inserted_keys=tuple(inserted),
+            existing_keys=tuple(existing),
+            missing_keys=(),
+            lock_wait_seconds=0.0,
+            lock_hold_seconds=0.0,
+        )
 
 
 class _FakeServer:
@@ -751,7 +770,11 @@ def _views(
     )
 
 
-def test_full_and_partial_pages_publish_only_after_exact_atomic_finish() -> None:
+def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
+    caplog,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(local)
     controls = tuple(
@@ -770,12 +793,13 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish() -> None
     )
     assert [item.destination_length for item in prepared] == [64, 32, 32, 16]
 
-    committed = lifecycle.commit_pages(
-        "transfer",
-        controls,
-        _views(controls, prepared),
-        _finish(6, partial=2),
-    )
+    with caplog.at_level(logging.INFO):
+        committed = lifecycle.commit_pages(
+            "transfer",
+            controls,
+            _views(controls, prepared),
+            _finish(6, partial=2),
+        )
 
     assert committed is True
     assert set(local.hot) == {
@@ -787,6 +811,23 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish() -> None
         for page in call["pages"]:
             assert page.refs == 1
             assert page.pins == 0
+    group0 = tuple(
+        CacheEngineKey.from_string(controls[index].canonical_key)
+        for index in range(0, len(controls), 2)
+    )
+    group1 = tuple(
+        CacheEngineKey.from_string(controls[index].canonical_key)
+        for index in range(1, len(controls), 2)
+    )
+    expected_digest = content_digest(
+        (
+            tuple(key.to_string() for key in group0),
+            tuple(key.to_string() for key in group1),
+        )
+    )
+    assert '"inserted_keys":4' in caplog.text
+    assert '"existing_keys":0' in caplog.text
+    assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 
 @pytest.mark.parametrize(

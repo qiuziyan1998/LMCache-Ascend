@@ -15,7 +15,10 @@ from typing import Any, Protocol
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.cold_start_perf import cold_start_perf_log
+from lmcache.v1.cold_start_perf import (
+    cold_start_perf_enabled,
+    cold_start_perf_log,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -40,6 +43,7 @@ from lmcache.v1.remote_fill import (
     RemoteFillStateCore,
     ReservedPageView,
     UnsafePageLifecycleError,
+    content_digest,
     log_remote_fill_validation_failure,
 )
 from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
@@ -810,6 +814,26 @@ class AscendRemoteFillPageLifecycle:
             raise UnsafePageLifecycleError(
                 "remote-fill reservation ownership transfer failed after publish"
             ) from error
+        diagnostic_fields: dict[str, object] = {
+            "inserted_keys": len(result.inserted_keys),
+            "existing_keys": len(result.existing_keys),
+        }
+        if cold_start_perf_enabled():
+            try:
+                diagnostic_fields["required_key_digest"] = content_digest(
+                    (
+                        tuple(key.to_string() for key in group0_keys),
+                        tuple(key.to_string() for key in group1_keys),
+                    )
+                )
+            except Exception:
+                # Publication and ownership transfer are already complete;
+                # observability must never turn that success into a failure.
+                diagnostic_fields["key_digest_error"] = True
+                logger.warning(
+                    "Failed to fingerprint remote-fill commit keys",
+                    exc_info=True,
+                )
         log_commit(
             committed=True,
             error=False,
@@ -818,6 +842,7 @@ class AscendRemoteFillPageLifecycle:
             published_bytes=sum(page.get_size() for page in ready.values()),
             lock_wait_ms=round(result.lock_wait_seconds * 1000, 3),
             lock_hold_ms=round(result.lock_hold_seconds * 1000, 3),
+            **diagnostic_fields,
         )
         return True
 
