@@ -99,11 +99,9 @@ from lmcache_ascend.v1.remote_fill import (
     DecoderRemoteFillRuntime,
     build_decoder_layout,
     create_decoder_remote_fill_runtime,
-    remote_fill_h0_qualified,
     remote_fill_token_hash_identity,
 )
 from lmcache_ascend.v1.remote_fill_producer import (
-    REMOTE_FILL_H0_QUALIFICATION_ENV,
     RemoteFillFatalError,
     RemoteFillHandoff,
     RemoteFillProducerMetrics,
@@ -117,6 +115,9 @@ from lmcache_ascend.v1.remote_fill_producer import (
 
 logger = init_logger(__name__)
 REMOTE_FILL_DEFAULT_CONTROL_PORT = 19000
+_REMOTE_FILL_REQUEST_HANDOFF_EVENT_SOURCE = (
+    "forward_context.sfa_reshape_cache_event"
+)
 
 
 def _log_remote_fill_producer_fence_state(
@@ -493,10 +494,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self.config.get_extra_config_value(
                     "mooncake_direct_npu_prefill_store", False
                 )
-                or bool(
-                    self.config.enable_remote_lmcache_store
-                    and remote_fill_h0_qualified()
-                )
+                or bool(self.config.enable_remote_lmcache_store)
             )
             and self._is_passive() is False
             and mooncake_layer_pages_enabled(self.config)
@@ -655,7 +653,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             direct_submitter: Optional armed native submission callable.
                 Production forwards to ``StorageManager``.
             activation_factory: Optional armed-attempt activation builder.
-                Production requires the explicit H0 environment value.
+                Runtime activation requires the explicit feature flag.
         """
 
         if client_factory is not None:
@@ -840,11 +838,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if not state.remote_fill_metrics_started:
             metrics.start_attempt()
             state.remote_fill_metrics_started = True
-        if (
-            not handoff.global_te_push
-            or os.environ.get(REMOTE_FILL_H0_QUALIFICATION_ENV, "")
-            != DIRECT_PUSH_H0_QUALIFICATION_V1
-        ):
+        if not handoff.global_te_push:
             state.remote_fill_disabled_reason = "native_not_qualified"
             log_remote_fill_validation_failure(
                 logger,
@@ -1659,9 +1653,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self,
                     "_remote_fill_activation_factory",
                     lambda attempt_id: NativeDirectPushActivation(
-                        h0_qualification=os.environ.get(
-                            REMOTE_FILL_H0_QUALIFICATION_ENV, ""
-                        ),
+                        h0_qualification=DIRECT_PUSH_H0_QUALIFICATION_V1,
                         native_transfer_attempt_id=attempt_id,
                         arm_acknowledged=True,
                     ),
@@ -2298,6 +2290,27 @@ class AscendLMCacheEngine(LMCacheEngine):
         if state.source_ready_events_token_end < token_end:
             return ()
         return state.source_ready_events
+
+    @staticmethod
+    def _remote_fill_source_ready_events(
+        state: _DirectStoreRequestState,
+        token_end: int,
+    ) -> tuple[Any, ...]:
+        """Return only the exact request/frontier-matched producer fence."""
+
+        if (
+            state.source_ready_event is None
+            or state.source_ready_event_source
+            != _REMOTE_FILL_REQUEST_HANDOFF_EVENT_SOURCE
+            or state.source_ready_token_end < token_end
+        ):
+            return ()
+        events = AscendLMCacheEngine._direct_source_ready_events(
+            state, token_end
+        )
+        if not any(event is state.source_ready_event for event in events):
+            return ()
+        return events
 
     @staticmethod
     def _direct_source_ready_event(
@@ -2938,7 +2951,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         if remote_fill and set(group_caches) != {0, 1}:
             state.remote_fill_disabled_reason = "incomplete_groups"
             remote_fill = False
-        remote_ready_events = self._direct_source_ready_events(
+        complete_ready_events = self._direct_source_ready_events(
+            state, len(tokens)
+        )
+        remote_ready_events = self._remote_fill_source_ready_events(
             state, len(tokens)
         )
         if remote_fill and not remote_ready_events:
@@ -3143,7 +3159,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # Same producer fence contract as the full-page persistent
                 # batch: the put must not DMA-read source slots before the
                 # attention scatter of the producing forward completes.
-                remote_ready_events
+                complete_ready_events
                 or ((ready_event,) if ready_event is not None else ()),
             )
             self._track_direct_batch(
@@ -3270,9 +3286,29 @@ class AscendLMCacheEngine(LMCacheEngine):
                 accepted_store_end=len(tokens),
             )
             remote_fill = False
-        remote_ready_events = self._direct_source_ready_events(
+        complete_ready_events = self._direct_source_ready_events(
             state, len(tokens)
         )
+        remote_ready_events = self._remote_fill_source_ready_events(
+            state, len(tokens)
+        )
+        submission_mode = getattr(
+            self.config,
+            "remote_fill_submission_mode",
+            "final_deferred",
+        )
+        deferred_by_mode = bool(
+            remote_fill
+            and not final
+            and submission_mode == "final_deferred"
+            and complete_ready_events
+        )
+        if (
+            remote_fill
+            and not final
+            and submission_mode == "final_deferred"
+        ):
+            remote_ready_events = ()
         defer_remote_fill_sources = False
         if remote_fill and not remote_ready_events:
             log_fence_transition = final or not state.remote_fill_fence_deferred
@@ -3282,10 +3318,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "incomplete producer fence"
                 )
             else:
-                # The complete DSA producer fence is exported by the final
-                # request-matched handoff. Earlier chunk callbacks must keep
-                # persistence moving without permanently poisoning that later
-                # proof.
+                # A later request/frontier-matched handoff may still provide
+                # the complete DSA producer fence without blocking persistence.
                 state.remote_fill_fence_deferred = True
                 defer_remote_fill_sources = True
             if log_fence_transition:
@@ -3296,16 +3330,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                     reason=(
                         "incomplete_producer_fence"
                         if final
-                        else "awaiting_final_request_handoff"
+                        else (
+                            "final_deferred_submission_mode"
+                            if deferred_by_mode
+                            else "awaiting_request_matched_handoff"
+                        )
                     ),
                     token_end=len(tokens),
-                    complete_fence_count=0,
+                    complete_fence_count=(
+                        len(complete_ready_events) if deferred_by_mode else 0
+                    ),
                     complete_fence_token_end=(
                         state.source_ready_events_token_end
                     ),
                     event_source=state.source_ready_event_source,
                     transfer_id=state.remote_fill_handoff.transfer_id,
                     slot_mapping_base=slot_mapping_base,
+                    submission_mode=submission_mode,
                     deferred_batch_count=len(
                         state.remote_fill_deferred_batches
                     ),
@@ -3721,7 +3762,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             # source. Without this fence the DMA can read slots before the
             # attention scatter of the current forward lands (deterministically
             # the youngest layer, e.g. the last DSA index layer).
-            persistent_fence_events = remote_ready_events or (
+            persistent_fence_events = complete_ready_events or (
                 (ready_event,) if ready_event is not None else ()
             )
             batch = _DirectPageBatch(
@@ -3745,7 +3786,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         page_ranges=tuple(ranges),
                         put_producer_events=batch.ready_events,
                         producer_fence_events=(
-                            remote_ready_events
+                            complete_ready_events
                             or ((ready_event,) if ready_event is not None else ())
                         ),
                         ready_event_source=ready_event_source,
@@ -3822,15 +3863,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                         req_id,
                         "retain_deferred_sources",
                         final=final,
-                        reason="awaiting_final_request_handoff",
+                        reason=(
+                            "final_deferred_submission_mode"
+                            if deferred_by_mode
+                            else "awaiting_request_matched_handoff"
+                        ),
                         token_end=len(tokens),
-                        complete_fence_count=0,
+                        complete_fence_count=(
+                            len(complete_ready_events) if deferred_by_mode else 0
+                        ),
                         complete_fence_token_end=(
                             state.source_ready_events_token_end
                         ),
                         event_source=state.source_ready_event_source,
                         transfer_id=state.remote_fill_handoff.transfer_id,
                         slot_mapping_base=slot_mapping_base,
+                        submission_mode=submission_mode,
                         deferred_batch_count=len(
                             state.remote_fill_deferred_batches
                         ),
@@ -9617,15 +9665,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         if not bool(self.config.enable_remote_lmcache_store):
             return
         if self.metadata.role == "scheduler" or self.config.pd_role == "sender":
-            return
-        if not remote_fill_h0_qualified():
-            # Enabling the prototype configuration before the hardware gate is
-            # qualified must leave the deployed legacy P/D path untouched.
-            self._remote_fill_decoder_initialized = True
-            logger.info(
-                "Remote-fill decoder service remains disabled until Gate H0 "
-                "is explicitly qualified"
-            )
             return
         configured_control_host = self.config.remote_fill_control_host
         configured_control_port = self.config.remote_fill_control_port_start

@@ -6,7 +6,6 @@ from ._version import __version__ as __version__  # noqa: F401  # isort:skip
 from ._version import __version_tuple__ as __version_tuple__  # noqa: F401  # isort:skip
 
 # Standard
-import os
 import sys
 from typing import Optional
 
@@ -39,8 +38,6 @@ def _patch_config():
 
         remote_fill_active = bool(
             getattr(config, "enable_remote_lmcache_store", False)
-            and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
-            == "mooncake-sync-write-visible-v1"
         )
         if remote_fill_active:
             # None of these are independent feature choices. RemoteFill uses

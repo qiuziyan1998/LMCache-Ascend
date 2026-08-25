@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from threading import Event
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import logging
 
 # Third Party
@@ -1335,6 +1335,59 @@ def test_producer_and_decoder_fatal_paths_share_one_supervisor_latch() -> None:
     connector = object.__new__(LMCacheAscendConnectorV1Dynamic)
     connector._lmcache_engine = SimpleNamespace(lmcache_engine=engine)
     assert connector.remote_fill_requires_paired_restart()
+
+
+def test_standalone_connector_forwards_remote_fill_contract() -> None:
+    from lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1 import (
+        LMCacheAscendConnectorV1Dynamic,
+    )
+
+    context = object()
+    implementation = SimpleNamespace(
+        capture_live_source_event_handoff=Mock(return_value=True),
+        lmcache_engine=SimpleNamespace(
+            get_remote_fill_placement_info=lambda: {"control_port": 19001},
+            get_remote_fill_metrics=lambda: {"active_transactions": 1},
+            remote_fill_requires_paired_restart=lambda: True,
+        ),
+    )
+    connector = object.__new__(LMCacheAscendConnectorV1Dynamic)
+    connector._lmcache_engine = implementation
+
+    assert connector.capture_live_source_event_handoff(context)
+    implementation.capture_live_source_event_handoff.assert_called_once_with(
+        context
+    )
+    assert connector.get_remote_fill_placement_info() == {"control_port": 19001}
+    assert connector.get_remote_fill_metrics() == {"active_transactions": 1}
+    assert connector.remote_fill_requires_paired_restart()
+
+
+def test_standalone_connector_injects_destination_dp_identity() -> None:
+    from lmcache_ascend.integration.vllm import lmcache_ascend_connector_v1 as module
+
+    transfer = SimpleNamespace(kv_connector_extra_config={"preserved": True})
+    config = SimpleNamespace(
+        kv_transfer_config=transfer,
+        parallel_config=SimpleNamespace(
+            data_parallel_index=2,
+            data_parallel_size=4,
+        ),
+    )
+
+    with patch.object(
+        module.LMCacheConnectorV1Dynamic,
+        "__init__",
+        return_value=None,
+    ) as base_init:
+        module.LMCacheAscendConnectorV1Dynamic(config, object())
+
+    assert transfer.kv_connector_extra_config == {
+        "preserved": True,
+        "lmcache_remote_fill_destination_dp_rank": 2,
+        "lmcache_remote_fill_destination_dp_size": 4,
+    }
+    base_init.assert_called_once()
 
 
 def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(

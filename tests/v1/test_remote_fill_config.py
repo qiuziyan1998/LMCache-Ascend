@@ -1,20 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """RemoteFill must not expose fixed protocol invariants as YAML knobs."""
 
-# Third Party
-import pytest
-
 # First Party
 import lmcache_ascend  # noqa: F401
 from lmcache.v1.config import LMCacheEngineConfig
-
-
-@pytest.fixture(autouse=True)
-def _qualify_remote_fill_hardware_gate(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
-        "mooncake-sync-write-visible-v1",
-    )
 
 
 def _config(role: str) -> LMCacheEngineConfig:
@@ -57,9 +46,8 @@ def test_remote_fill_decoder_implies_strict_shared_publication() -> None:
     assert config.get_extra_config_value("save_only_first_rank") is True
 
 
-def test_unqualified_feature_flag_preserves_legacy_ascend_config(monkeypatch) -> None:
-    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
-    config = LMCacheEngineConfig.from_defaults(enable_remote_lmcache_store=True)
+def test_disabled_feature_preserves_legacy_ascend_config() -> None:
+    config = LMCacheEngineConfig.from_defaults(enable_remote_lmcache_store=False)
 
     config.validate()
 

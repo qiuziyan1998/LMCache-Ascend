@@ -2411,6 +2411,34 @@ def test_save_layer_preserves_distinct_group_producer_fences() -> None:
     )
 
 
+def test_save_layer_retains_callback_fence_for_remote_fill_finish() -> None:
+    event = object()
+    request = SimpleNamespace(
+        req_id="request",
+        _lmcache_remote_fill_qualified=True,
+    )
+    adapter = _ascend_adapter_fake(
+        config=SimpleNamespace(dsa_two_groups=False),
+        _remote_store_requested=True,
+        _latent_layer_names=("latent",),
+        _indexer_layer_names=(),
+        _direct_prefill_requests=lambda: [request],
+        _preflight_direct_store=lambda _requests: True,
+        _submit_direct_prefill_requests=lambda *_args, **_kwargs: None,
+    )
+
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "latent",
+        object(),
+        SimpleNamespace(reshape_cache_event=event),
+    )
+
+    assert adapter._direct_store_observed_layers == {"latent"}
+    assert adapter._latest_live_source_ready_event is event
+    assert adapter._latest_direct_source_ready_events == {"latent": event}
+
+
 def test_source_ready_event_uses_matching_layer_metadata() -> None:
     expected = object()
     metadata = {
@@ -3256,15 +3284,9 @@ def _adapter_remote_fill_request_configs() -> dict:
     }
 
 
-def test_remote_fill_persistence_uses_prefiller_local_default(monkeypatch) -> None:
-    from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
-
+def test_remote_fill_persistence_uses_prefiller_local_default() -> None:
     from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
         _prepare_remote_fill_persistent_placement,
-    )
-    monkeypatch.setenv(
-        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
-        DIRECT_PUSH_H0_QUALIFICATION_V1,
     )
     request_configs = _adapter_remote_fill_request_configs()
     request_configs["lmcache.mooncake_preferred_segment"] = "decoder-host"
@@ -3277,20 +3299,13 @@ def test_remote_fill_persistence_uses_prefiller_local_default(monkeypatch) -> No
     assert ordinary["lmcache.mooncake_preferred_segment"] == "decoder-host"
 
 
-def test_remote_fill_h0_off_preserves_legacy_placement_and_group_selection(
-    monkeypatch,
-) -> None:
-    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
-        _prepare_remote_fill_persistent_placement,
-    )
-
-    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
+def test_remote_fill_disabled_preserves_legacy_group_selection() -> None:
     request_configs = _adapter_remote_fill_request_configs()
     request_configs["lmcache.remote_fill"]["transfer_id"] = "stale-transfer"
     request_configs["lmcache.mooncake_preferred_segment"] = (
         "legacy-decoder-host"
     )
-    adapter = _ascend_adapter_fake(_remote_store_requested=True)
+    adapter = _ascend_adapter_fake(_remote_store_requested=False)
     request = SimpleNamespace(
         request_configs=request_configs,
         save_spec=SimpleNamespace(
@@ -3299,7 +3314,6 @@ def test_remote_fill_h0_off_preserves_legacy_placement_and_group_selection(
         ),
     )
 
-    assert _prepare_remote_fill_persistent_placement(request_configs) is False
     assert (
         request_configs["lmcache.mooncake_preferred_segment"]
         == "legacy-decoder-host"
@@ -3311,10 +3325,9 @@ def test_remote_fill_h0_off_preserves_legacy_placement_and_group_selection(
     ) == {}
 
 
-def test_remote_fill_h0_off_stale_handoff_does_not_disable_live_source(
+def test_remote_fill_disabled_stale_handoff_does_not_disable_live_source(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
     monkeypatch.setattr(
         "lmcache_ascend.integration.vllm.vllm_v1_adapter."
         "get_tensor_model_parallel_rank",
@@ -3338,7 +3351,7 @@ def test_remote_fill_h0_off_stale_handoff_does_not_disable_live_source(
     adapter = _ascend_adapter_fake(
         lmcache_engine=engine,
         config=SimpleNamespace(dsa_two_groups=True),
-        _remote_store_requested=True,
+        _remote_store_requested=False,
         _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
         _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
         _direct_request_inputs=lambda *_args: (
@@ -3380,13 +3393,7 @@ def test_remote_fill_h0_off_stale_handoff_does_not_disable_live_source(
     )
 
 
-def test_remote_fill_selects_both_authoritative_groups(monkeypatch) -> None:
-    from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
-
-    monkeypatch.setenv(
-        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
-        DIRECT_PUSH_H0_QUALIFICATION_V1,
-    )
+def test_remote_fill_selects_both_authoritative_groups() -> None:
     adapter = _ascend_adapter_fake(_remote_store_requested=True)
     request = SimpleNamespace(
         request_configs=_adapter_remote_fill_request_configs(),
@@ -3404,7 +3411,14 @@ def test_remote_fill_selects_both_authoritative_groups(monkeypatch) -> None:
     assert selected == groups
 
 
-def test_remote_fill_final_is_owned_by_finish_batch() -> None:
+@pytest.mark.parametrize(
+    ("is_last_prefill", "expected_final"),
+    [(False, False), (True, True)],
+)
+def test_remote_fill_submission_is_owned_by_finish_batch(
+    is_last_prefill: bool,
+    expected_final: bool,
+) -> None:
     calls = []
     engine = SimpleNamespace(
         discard_live_source_descriptor=lambda *_args: None,
@@ -3415,7 +3429,10 @@ def test_remote_fill_final_is_owned_by_finish_batch() -> None:
     )
     adapter = _ascend_adapter_fake(
         lmcache_engine=engine,
-        config=SimpleNamespace(dsa_two_groups=True),
+        config=SimpleNamespace(
+            dsa_two_groups=True,
+            remote_fill_submission_mode="per_chunk",
+        ),
         _remote_store_requested=True,
         _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
         _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
@@ -3431,7 +3448,7 @@ def test_remote_fill_final_is_owned_by_finish_batch() -> None:
         request_configs=_adapter_remote_fill_request_configs(),
         load_spec=None,
         live_source_requested=True,
-        is_last_prefill=True,
+        is_last_prefill=is_last_prefill,
         _lmcache_remote_fill_qualified=True,
     )
 
@@ -3439,6 +3456,7 @@ def test_remote_fill_final_is_owned_by_finish_batch() -> None:
         adapter,
         [request],
     )
+    assert calls == []
     event = object()
     _ascend_adapter_method("_submit_direct_prefill_requests")(
         adapter,
@@ -3449,9 +3467,9 @@ def test_remote_fill_final_is_owned_by_finish_batch() -> None:
         source_ready_events=(event,),
     )
 
-    assert [kwargs["final"] for _, kwargs in calls] == [False, True]
-    assert calls[0][1]["source_ready_events"] == ()
-    assert calls[1][1]["source_ready_events"] == (event,)
+    assert len(calls) == 1
+    assert calls[0][1]["final"] is expected_final
+    assert calls[0][1]["source_ready_events"] == (event,)
 
 
 def test_remote_fill_rebuilds_probe_keys_for_full_prefix_hit() -> None:

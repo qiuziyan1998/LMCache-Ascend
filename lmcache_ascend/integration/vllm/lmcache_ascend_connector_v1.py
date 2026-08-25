@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
+from typing import Any
+
 # Third Party
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -56,6 +59,15 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             )
             transfer.kv_connector_extra_config = extra
         super().__init__(vllm_config=vllm_config, role=role)
+
+    def capture_live_source_event_handoff(self, forward_context: Any) -> bool:
+        """Forward an armed post-forward producer event to the implementation."""
+
+        return bool(
+            self._lmcache_engine.capture_live_source_event_handoff(
+                forward_context
+            )
+        )
 
     def get_remote_fill_placement_info(
         self,

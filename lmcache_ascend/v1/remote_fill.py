@@ -47,7 +47,6 @@ from lmcache.v1.remote_fill import (
     content_digest,
     log_remote_fill_validation_failure,
 )
-from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
 from lmcache.v1.rpc.zmq_transport import ZmqRouterServerTransport
 from lmcache.v1.storage_backend.local_cpu_backend import (
     LayerPageAdmissionRollbackError,
@@ -57,7 +56,6 @@ import torch
 
 logger = init_logger(__name__)
 
-REMOTE_FILL_H0_QUALIFICATION_ENV = "LMCACHE_REMOTE_FILL_H0_QUALIFICATION"
 REMOTE_FILL_MODEL_LAYOUT = "mla-dsa-layer-page-v3"
 _DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES = 32
 
@@ -479,24 +477,6 @@ def build_remote_fill_negotiation_spec(
         destination_remote_session=remote_session,
         token_hash_algorithm=hash_identity,
         python_hash_seed=python_hash_seed,
-    )
-
-
-def remote_fill_h0_qualified(
-    environment: Mapping[str, str] | None = None,
-) -> bool:
-    """Return whether this deployment explicitly activated the H0 contract.
-
-    Args:
-        environment: Environment mapping, defaulting to ``os.environ``.
-
-    Returns:
-        ``True`` only for the exact versioned native qualification token.
-    """
-
-    env = os.environ if environment is None else environment
-    return (
-        env.get(REMOTE_FILL_H0_QUALIFICATION_ENV, "") == DIRECT_PUSH_H0_QUALIFICATION_V1
     )
 
 
@@ -1332,7 +1312,7 @@ def create_decoder_remote_fill_runtime(
         shared_cache_generation: Current registered shared-slab generation.
         capacity_available: Nonblocking ordinary-cache headroom check.
         fatal_restart: Whole-deployment restart callback.
-        global_te_push: Whether Gate H0-qualified native push is available.
+        global_te_push: Whether negotiated native push is available.
         save_only_first_rank: Resolved physical Group 0 ownership policy.
         save_indexer_only_first_rank: Resolved Group 1 ownership policy.
         shared_cpu_cache_strict: Whether every passive view passed preflight.

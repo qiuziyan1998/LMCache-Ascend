@@ -1,8 +1,8 @@
 {
   "V1": {
     "evidence": [
-      "vllm-ascend/tests/ut/kv_connector/test_dsa_index_connector.py",
-      "PENDING: deployed AscendMultiConnector construction"
+      "LMCache-Ascend/tests/v1/test_remote_fill_decoder.py::test_standalone_connector_forwards_remote_fill_contract",
+      "PENDING: deployed standalone LMCacheAscendConnectorV1Dynamic construction"
     ],
     "status": "PENDING_HARDWARE"
   },

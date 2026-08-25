@@ -75,7 +75,6 @@ def test_remote_fill_rejects_vllm_sleep_mode(
 ) -> None:
     from lmcache_ascend.integration.vllm import vllm_v1_adapter
 
-    monkeypatch.setattr(vllm_v1_adapter, "remote_fill_h0_qualified", lambda: True)
     config = SimpleNamespace(enable_remote_lmcache_store=True)
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enable_sleep_mode=True)
@@ -1456,7 +1455,12 @@ def test_remote_fill_requires_one_complete_source_page(
     )
 
 
-def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
+@pytest.mark.parametrize(
+    "submission_mode", ["per_chunk", "final_deferred"]
+)
+def test_nonfinal_missing_fence_retains_windowed_sources(
+    caplog, submission_mode: str
+) -> None:
     class _Key:
         def __init__(self, kv_group: int, start: int) -> None:
             self.kv_group = kv_group
@@ -1506,10 +1510,15 @@ def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
     engine.config = SimpleNamespace(
         chunk_size=1024,
         dsa_two_groups=True,
+        remote_fill_submission_mode=submission_mode,
         get_extra_config_value=lambda _name, default: default,
     )
     engine._remote_fill_prepare_request = lambda *_args: True
     engine._get_remote_fill_producer_metrics = lambda: metrics
+    engine._store_cv = Condition()
+    engine._pending_store_reqs = {}
+    engine.wait_for_direct_stores = lambda _req_ids: set()
+    engine._finalize_direct_store = lambda *_args, **_kwargs: None
 
     def suffix_plans(
         request_state: _DirectStoreRequestState,
@@ -1517,6 +1526,8 @@ def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
         *_args: Any,
     ) -> dict[int, list[Any]]:
         end = len(request_tokens)
+        if request_state.planned_end >= end:
+            return {0: [], 1: []}
         start = end - 1024
         request_state.planned_end = end
         request_state.planned_hash = f"chunk-{start}".encode()
@@ -1532,6 +1543,16 @@ def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
     group_caches = {0: [object()], 1: [object()]}
     slot_mappings = {0: object(), 1: object()}
     tokens = list(range(1024))
+    event = object()
+    initial_fence = {
+        "source_ready_event": event,
+        "source_ready_event_source": (
+            "forward_context.sfa_reshape_cache_event"
+            if submission_mode == "final_deferred"
+            else "attn_metadata.reshape_cache_event"
+        ),
+        "source_ready_events": (event,),
+    }
 
     with caplog.at_level(logging.INFO):
         assert engine.store_direct_prefill(
@@ -1540,12 +1561,35 @@ def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
             group_caches,
             slot_mappings,
             final=False,
+            **initial_fence,
         )
     assert state.remote_fill_fence_deferred
     assert state.remote_fill_disabled_reason == ""
     assert metrics.abandoned == []
     assert state.submitted_end == {0: 1024, 1: 1024}
     assert scheduled == []
+    if submission_mode == "final_deferred":
+        assert len(state.remote_fill_deferred_batches) == 1
+        assert '"reason":"final_deferred_submission_mode"' in caplog.text
+        assert '"complete_fence_count":1' in caplog.text
+        assert engine.store_direct_prefill(
+            "request",
+            tokens,
+            group_caches,
+            slot_mappings,
+            final=True,
+            source_ready_event=event,
+            source_ready_event_source=(
+                "forward_context.sfa_reshape_cache_event"
+            ),
+            source_ready_events=(event,),
+        )
+        assert not state.remote_fill_fence_deferred
+        assert state.remote_fill_deferred_batches == []
+        assert len(scheduled) == 1
+        assert scheduled[0].ready_events == (event,)
+        return
+
     with caplog.at_level(logging.INFO):
         assert engine.store_direct_prefill(
             "request",
@@ -1560,7 +1604,6 @@ def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
     assert state.remote_fill_deferred_pages == 4
     assert state.remote_fill_deferred_bytes == 256
 
-    event = object()
     with caplog.at_level(logging.INFO):
         assert engine.store_direct_prefill(
             "request",
@@ -1570,7 +1613,9 @@ def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
             final=False,
             slot_mapping_base=1024,
             source_ready_event=event,
-            source_ready_event_source="request_handoff",
+            source_ready_event_source=(
+                "forward_context.sfa_reshape_cache_event"
+            ),
             source_ready_events=(event,),
         )
 

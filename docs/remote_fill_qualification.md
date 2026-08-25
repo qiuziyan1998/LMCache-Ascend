@@ -1,7 +1,7 @@
 # Direct Remote LMCache qualification
 
-This runbook applies the evidence-gated qualification plan. It does not claim
-that native direct placement has passed H0, C1, or production qualification.
+This runbook applies the production-path qualification plan. It does not claim
+that native direct placement has passed C1 or production qualification.
 The production default remains disabled, and the conservative wire protocol is
 unchanged.
 
@@ -16,9 +16,27 @@ only new LMCache setting required on P and D is:
 enable_remote_lmcache_store: true
 ```
 
+`remote_fill_submission_mode` defaults to `per_chunk`; set it to
+`final_deferred` for the conservative rollback path.
+
+Use the standalone connector on both P and D:
+
+```json
+{
+  "kv_connector": "LMCacheAscendConnectorV1Dynamic",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_module_path":
+    "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1"
+}
+```
+
+Do not add a sibling `MooncakeConnectorV1`. Mandatory persistence and shared
+GlobalTE reuse are owned by LMCache's Mooncake backend in this design.
+
 The feature flag internally selects DSA two-group page layout, rank0 ownership,
-strict shared publication on D, asynchronous direct storage on P, final-only
-publication, and non-evicting reservations. The deployment still needs its
+strict shared publication on D, per-chunk asynchronous direct storage on P,
+final-only publication, and non-evicting reservations. The deployment still needs its
 ordinary Mooncake URL, P/D role, decoder LocalCPU capacity, and already working
 cold-compact model settings. An operator may
 still override `remote_fill_model_artifact_id` with an immutable build ID when
@@ -68,21 +86,19 @@ Add `--require-hardware` only for a C1-exit or release record. It rejects every
 remaining `PENDING_HARDWARE` item and requires V1, V2, and V6 to carry
 `FIXED_AND_PASS` hardware evidence; unit-only evidence cannot close those gates.
 
-## H0 gate
+## Optional H0 transport diagnostic
 
 H0 must run in an isolated P/D deployment with the exact production GlobalTE,
 source registration, source-page planner, decoder LocalCPU allocator, NIC,
-MTU, routing, and NUMA policy. Set
-`LMCACHE_REMOTE_FILL_H0_QUALIFICATION=mooncake-sync-write-visible-v1` only for
-that isolated deployment.
+MTU, routing, and NUMA policy. It is an optional transport-development
+diagnostic, not a runtime activation gate or a release blocker.
 
 The hardware driver must cover H0-A through H0-G from the governing plan and
 retain raw results. It must validate destination bytes inside D before any test
 allocation is released and must not publish synthetic pages into ordinary
 LMCache. Stop the campaign on a byte/canary mismatch, late mutation, ambiguous
-native terminal state, registration overlap, or resource leak. The activation
-environment variable is operator intent; it is not evidence that H0 passed.
-Validate the resulting report with `validate_h0_report`; its
+native terminal state, registration overlap, or resource leak. Validate the
+resulting report with `validate_h0_report`; its
 `qualification_manifest_sha256` must equal `payload_sha256` of the exact
 generated manifest.
 
@@ -100,7 +116,7 @@ python benchmark/v1/kv_transfer/remote_fill_h0.py \
 
 The adapter contract is `H0Adapter`. A mock adapter can test orchestration but
 cannot satisfy a hardware evidence record; its report must never be promoted
-to `FIXED_AND_PASS` or used to activate serving.
+to `FIXED_AND_PASS` or treated as production-path evidence.
 
 ## Client-observed TTFT
 
@@ -180,8 +196,9 @@ python benchmark/v1/kv_transfer/remote_fill_c1.py \
 
 The adapter must run beside the real TP8/DP2/MTP launcher. The runner fixes the
 nine-scenario order, binds the report to the manifest, always closes the
-adapter, and requires explicit use of production vLLM, AscendMultiConnector,
-LMCache, Mooncake, shared LocalCPU, DP2 routing, and MTP. A mock validates only
+adapter, and requires explicit use of production vLLM, standalone
+`LMCacheAscendConnectorV1Dynamic`, LMCache, Mooncake, shared LocalCPU, DP2
+routing, and MTP. A mock validates only
 orchestration. `validate_c1_report` requires scenario-specific proof, both TP8
 passive-group failure campaigns, all four DP2 mappings, bounded diagnostics,
 the complete comparison matrix, a cross-DP reuse decision, and zero values for
@@ -191,9 +208,9 @@ every integrity invariant. Fill
 experimental, production, publication, overlap, and O1 thresholds. It always
 keeps O2 disabled until a separate post-O1 hardware result exists.
 
-For the full staged P1 matrix, provide a deployment adapter that activates the
-exact A/B/C mode and completely resets cache state before each mode. Every
-result must attest its path contract: A=`existing_production_path`,
+The shipped P1 runner currently supports exactly A/B/C. Provide a deployment
+adapter that activates each mode and completely resets cache state before it.
+Every result must attest its path contract: A=`existing_production_path`,
 B=`new_code_feature_disabled`, and C=`conservative_remote_fill`. This prevents
 a partially enabled mode from being accepted as a valid comparison. Cold
 evidence must also attest either a full tier clear before every measured batch
@@ -215,6 +232,10 @@ Cartesian product. Tier 1 is
 the default; run `--tier 2`, then `--tier 3`, and finally targeted `--tier 4`
 only after reviewing the preceding report. Multiple `--tier` options may be
 combined deliberately.
+
+Before Phase 8, extend the workload, comparator, campaign, and strict
+qualification validator with D=`asynchronous_remote_fill`. Until that extension
+lands, the command above cannot qualify per-chunk overlap or an A/B/C/D result.
 
 ## Paired restart boundary
 

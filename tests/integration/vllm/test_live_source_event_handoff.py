@@ -22,27 +22,62 @@ def _request(
     *,
     live_source_requested: bool = True,
     is_last_prefill: bool = True,
+    remote_fill_qualified: bool | None = None,
+    token_count: int = 1,
 ):
+    if remote_fill_qualified is None:
+        remote_fill_qualified = live_source_requested
     return SimpleNamespace(
         req_id=req_id,
         live_source_requested=live_source_requested,
         is_last_prefill=is_last_prefill,
-        token_ids=[1],
-        _lmcache_remote_fill_qualified=live_source_requested,
+        token_ids=list(range(token_count)),
+        _lmcache_remote_fill_qualified=remote_fill_qualified,
     )
 
 
-def test_handoff_request_ids_include_only_final_live_exports() -> None:
+def test_final_deferred_targets_include_only_final_requests() -> None:
+    adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
+    adapter.config = SimpleNamespace(remote_fill_submission_mode="final_deferred")
+    adapter._remote_store_requested = True
     requests = [
         _request("live-final"),
         _request("live-partial", is_last_prefill=False),
-        _request("persistent", live_source_requested=False),
+        _request(
+            "remote-final",
+            live_source_requested=False,
+            remote_fill_qualified=True,
+        ),
+        _request(
+            "remote-partial",
+            live_source_requested=False,
+            remote_fill_qualified=True,
+            is_last_prefill=False,
+        ),
         _request("live-final"),
     ]
 
-    assert adapter_mod.LMCacheAscendConnectorV1Impl._live_source_handoff_request_ids(
-        requests
-    ) == ("live-final",)
+    assert adapter._producer_fence_handoff_targets(requests) == (
+        ("live-final", 1),
+        ("remote-final", 1),
+    )
+
+
+def test_per_chunk_targets_include_qualified_nonfinal_frontier() -> None:
+    adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
+    adapter.config = SimpleNamespace(remote_fill_submission_mode="per_chunk")
+    adapter._remote_store_requested = True
+    request = _request(
+        "remote-partial",
+        live_source_requested=False,
+        remote_fill_qualified=True,
+        is_last_prefill=False,
+        token_count=1024,
+    )
+
+    assert adapter._producer_fence_handoff_targets([request]) == (
+        ("remote-partial", 1024),
+    )
 
 
 def test_start_load_arms_handoff_after_base_load_setup() -> None:
@@ -63,7 +98,7 @@ def test_start_load_arms_handoff_after_base_load_setup() -> None:
 
     base_start.assert_called_once_with(context)
     state = context.additional_kwargs["lmcache_ascend_live_source_event_handoff_v1"]
-    assert state == ("req-1",)
+    assert state == (("req-1", 1),)
 
 
 def test_capture_retains_exact_event_for_deferred_mtp_finalization() -> None:
@@ -74,7 +109,9 @@ def test_capture_retains_exact_event_for_deferred_mtp_finalization() -> None:
     adapter._direct_prefill_requests = MagicMock(return_value=[_request("req-1")])
     event = object()
     context = SimpleNamespace(
-        additional_kwargs={handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: ("req-1",)},
+        additional_kwargs={
+            handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: (("req-1", 1),)
+        },
         attn_metadata={
             "layer-0": SimpleNamespace(reshape_cache_event=event),
             "layer-78": SimpleNamespace(),
@@ -82,8 +119,8 @@ def test_capture_retains_exact_event_for_deferred_mtp_finalization() -> None:
     )
 
     assert adapter.capture_live_source_event_handoff(context)
-    request_ids, retained_event = metadata._live_source_event_handoff
-    assert request_ids == ("req-1",)
+    targets, retained_event = metadata._live_source_event_handoff
+    assert targets == (("req-1", 1),)
     assert retained_event is event
     assert handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY not in context.additional_kwargs
 
@@ -95,7 +132,9 @@ def test_dbo_capture_fails_closed() -> None:
     adapter._latent_layer_names = ["layer-0"]
     adapter._direct_prefill_requests = MagicMock(return_value=[_request("req-1")])
     context = SimpleNamespace(
-        additional_kwargs={handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: ("req-1",)},
+        additional_kwargs={
+            handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: (("req-1", 1),)
+        },
         attn_metadata=[{"layer-0": SimpleNamespace(reshape_cache_event=object())}],
     )
 
@@ -105,12 +144,16 @@ def test_dbo_capture_fails_closed() -> None:
 
 def test_duplicate_capture_discards_retained_event() -> None:
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
-    metadata = SimpleNamespace(_live_source_event_handoff=(("req-1",), object()))
+    metadata = SimpleNamespace(
+        _live_source_event_handoff=((("req-1", 1),), object())
+    )
     adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
     adapter._latent_layer_names = ["layer-0"]
     adapter._direct_prefill_requests = MagicMock(return_value=[_request("req-1")])
     context = SimpleNamespace(
-        additional_kwargs={handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: ("req-1",)},
+        additional_kwargs={
+            handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: (("req-1", 1),)
+        },
         attn_metadata={"layer-0": SimpleNamespace(reshape_cache_event=object())},
     )
 
@@ -122,7 +165,7 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
     event = object()
     request = _request("req-1")
-    handoff = (("req-1",), event)
+    handoff = ((("req-1", 1),), event)
     adapter.kv_role = "kv_producer"
     adapter.lmcache_engine = MagicMock()
     adapter._latest_live_source_ready_event = None
@@ -164,6 +207,7 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
         source_event_present=True,
         event_source="forward_context.sfa_reshape_cache_event",
         accepted_store_end=1,
+        submission_mode="final_deferred",
         remote_fill_eligible=True,
     )
 
@@ -188,7 +232,7 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
     adapter._completed_layerwise_stores = {}
     adapter._unfenced_live_stores = {"req-1": request}
     metadata = SimpleNamespace(
-        _live_source_event_handoff=(("req-1",), handoff_event)
+        _live_source_event_handoff=((("req-1", 1),), handoff_event)
     )
     adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
@@ -218,11 +262,13 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
         source_event_present=True,
         event_source="forward_context.sfa_reshape_cache_event",
         accepted_store_end=1,
+        submission_mode="final_deferred",
         remote_fill_eligible=True,
     )
 
 
-def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
+def test_finish_save_batch_mismatched_handoff_does_not_authorize_remote_fill(
+) -> None:
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
     callback_event = object()
     request = _request("req-1")
@@ -232,16 +278,24 @@ def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
     adapter._latest_live_source_ready_event_source = (
         "attn_metadata.reshape_cache_event"
     )
-    adapter._latest_direct_source_ready_events = {"layer-0": callback_event}
+    adapter._latest_direct_source_ready_events = {
+        name: callback_event
+        for name in ("layer-0", "layer-78", "index-0", "index-78")
+    }
     adapter._latent_layer_names = ["layer-0", "layer-78"]
     adapter._indexer_layer_names = ["index-0", "index-78"]
     adapter.config = SimpleNamespace(dsa_two_groups=True)
     adapter._direct_store_step_supported = True
-    adapter._direct_store_observed_layers = {"layer-0"}
+    adapter._direct_store_observed_layers = {
+        "layer-0",
+        "layer-78",
+        "index-0",
+        "index-78",
+    }
     adapter._completed_layerwise_stores = {}
     adapter._unfenced_live_stores = {"req-1": request}
     metadata = SimpleNamespace(
-        _live_source_event_handoff=(("other-request",), object())
+        _live_source_event_handoff=((("other-request", 1),), object())
     )
     adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
@@ -256,21 +310,22 @@ def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
         finish_batch=True,
         source_ready_event=callback_event,
         source_ready_event_source=("attn_metadata.reshape_cache_event"),
-        source_ready_events=(),
+        source_ready_events=(callback_event,),
     )
     perf_log.assert_any_call(
         adapter_mod.logger,
         "remote_fill_producer_fence_decision",
         req_id="req-1",
-        handoff_status="request_mismatch",
+        handoff_status="target_mismatch",
         expected_layer_count=4,
-        observed_layer_count=1,
-        event_layer_count=1,
-        callback_fence_complete=False,
-        complete_fence_count=0,
+        observed_layer_count=4,
+        event_layer_count=4,
+        callback_fence_complete=True,
+        complete_fence_count=1,
         source_event_present=True,
         event_source="attn_metadata.reshape_cache_event",
         accepted_store_end=1,
+        submission_mode="final_deferred",
         remote_fill_eligible=True,
     )
 
@@ -319,19 +374,22 @@ def test_finish_save_batch_logs_absent_handoff_without_completing_fence() -> Non
         source_event_present=False,
         event_source="missing",
         accepted_store_end=1,
+        submission_mode="final_deferred",
         remote_fill_eligible=True,
     )
 
 
-def test_prefix_hit_request_mismatch_fails_closed() -> None:
+def test_frontier_change_between_arm_and_capture_fails_closed() -> None:
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
     metadata = SimpleNamespace()
     adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
     adapter._latent_layer_names = ["layer-78"]
-    adapter._direct_prefill_requests = MagicMock(return_value=[_request("new-request")])
+    adapter._direct_prefill_requests = MagicMock(return_value=[_request("req-1")])
     event = object()
     context = SimpleNamespace(
-        additional_kwargs={handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: ("old-request",)},
+        additional_kwargs={
+            handoff_mod.LIVE_SOURCE_EVENT_HANDOFF_KEY: (("req-1", 2),)
+        },
         attn_metadata={"layer-78": SimpleNamespace(reshape_cache_event=event)},
     )
 

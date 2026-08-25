@@ -32,7 +32,6 @@ from lmcache_ascend.v1.content_diagnostics import (
     log_npu_content_diagnostic_event,
     npu_content_diagnostics_enabled,
 )
-from lmcache_ascend.v1.remote_fill import remote_fill_h0_qualified
 from lmcache_ascend.v1.remote_fill_producer import parse_remote_fill_handoff
 
 if TYPE_CHECKING:
@@ -100,8 +99,6 @@ def _remote_fill_response_params(
 
 def _remote_fill_handoff_qualified(request_configs: Any) -> bool:
     """Return whether this request may activate direct remote fill."""
-    if not remote_fill_h0_qualified():
-        return False
     try:
         handoff = parse_remote_fill_handoff(request_configs)
     except ValueError:
@@ -136,7 +133,6 @@ def _validate_remote_fill_sleep_mode(config: Any, vllm_config: Any) -> None:
 
     if (
         getattr(config, "enable_remote_lmcache_store", False)
-        and remote_fill_h0_qualified()
         and bool(
             getattr(
                 getattr(vllm_config, "model_config", None),
@@ -208,7 +204,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._remote_store_requested = bool(
             getattr(self.config, "enable_remote_lmcache_store", False)
             and getattr(self.config, "pd_role", None) != "receiver"
-            and remote_fill_h0_qualified()
         )
         self._direct_store_requested = bool(
             self._remote_store_requested
@@ -248,7 +243,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 and str(self.config.remote_url).startswith("mooncakestore://")
                 and self.use_layerwise
                 and (
-                    self._remote_store_requested
+                    getattr(self, "_remote_store_requested", False)
                     or self.config.enable_shared_cpu_cache
                 )
                 and extra.get("mooncake_page_first_multi_buffer", False)
@@ -287,15 +282,25 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # established group-1 path.
         self._live_latent_split_requested = False
 
-    @staticmethod
-    def _live_source_handoff_request_ids(
+    def _producer_fence_handoff_targets(
+        self,
         requests: Iterable[ReqMeta],
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, int], ...]:
+        mode = getattr(
+            self.config, "remote_fill_submission_mode", "final_deferred"
+        )
         return tuple(
             sorted({
-                request.req_id
+                (request.req_id, len(request.token_ids))
                 for request in requests
-                if request.live_source_requested and request.is_last_prefill
+                if (
+                    request.live_source_requested and request.is_last_prefill
+                )
+                or (
+                    getattr(self, "_remote_store_requested", False)
+                    and _remote_fill_request_qualified(request)
+                    and (mode == "per_chunk" or request.is_last_prefill)
+                )
             })
         )
 
@@ -310,13 +315,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if forward_context.attn_metadata is None or not self.config.dsa_two_groups:
             return
         requests = self._direct_prefill_requests() or []
-        request_ids = self._live_source_handoff_request_ids(requests)
-        if not request_ids or not self._latent_layer_names:
+        targets = self._producer_fence_handoff_targets(requests)
+        if not targets or not self._latent_layer_names:
             return
         existing = forward_context.additional_kwargs.setdefault(
-            LIVE_SOURCE_EVENT_HANDOFF_KEY, request_ids
+            LIVE_SOURCE_EVENT_HANDOFF_KEY, targets
         )
-        if existing != request_ids:
+        if existing != targets:
             forward_context.additional_kwargs.pop(
                 LIVE_SOURCE_EVENT_HANDOFF_KEY, None
             )
@@ -336,8 +341,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if arm is None:
             return False
         requests = self._direct_prefill_requests() or ()
-        request_ids = self._live_source_handoff_request_ids(requests)
-        if arm != request_ids:
+        targets = self._producer_fence_handoff_targets(requests)
+        if arm != targets:
             return False
         attn_metadata = forward_context.attn_metadata
         # A single event cannot fence multiple DBO microbatch streams.
@@ -361,7 +366,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
             return False
         metadata._live_source_event_handoff = (  # type: ignore[attr-defined]
-            request_ids,
+            targets,
             source_ready_event,
         )
         return True
@@ -605,6 +610,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if not expected.issubset(self._direct_store_observed_layers):
             return
 
+        retain_remote_fill_fence = bool(
+            getattr(self, "_remote_store_requested", False)
+            and any(_remote_fill_request_qualified(request) for request in requests)
+        )
         complete_events = getattr(
             self, "_latest_direct_source_ready_events", {}
         )
@@ -622,6 +631,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             ),
             source_ready_events=source_ready_events,
         )
+        if retain_remote_fill_fence:
+            return
         self._direct_store_observed_layers.clear()
         self._latest_live_source_ready_event = None
         self._latest_live_source_ready_event_source = "missing"
@@ -719,6 +730,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         ]
         if not requests:
             return
+        if not finish_batch and getattr(
+            self, "_remote_store_requested", False
+        ):
+            # RemoteFill accepts readiness only from the exact post-forward
+            # request/frontier handoff. Callback events remain retained until
+            # _finish_save_batch submits this chunk.
+            requests = [
+                request
+                for request in requests
+                if not _remote_fill_request_qualified(request)
+            ]
+            if not requests:
+                return
         group_caches = self._direct_group_caches()
         for request in requests:
             live_source = bool(getattr(request, "live_source_requested", False))
@@ -1109,34 +1133,32 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             handoff = getattr(metadata, "_live_source_event_handoff", None)
             if hasattr(metadata, "_live_source_event_handoff"):
                 delattr(metadata, "_live_source_event_handoff")
-            expected_ids = self._live_source_handoff_request_ids(requests)
+            expected_targets = self._producer_fence_handoff_targets(requests)
+            expected_ids = {req_id for req_id, _ in expected_targets}
             handoff_status = "absent"
             if (
-                expected_ids
+                expected_targets
                 and isinstance(handoff, tuple)
                 and len(handoff) == 2
-                and handoff[0] == expected_ids
+                and handoff[0] == expected_targets
                 and handoff[1] is not None
             ):
                 _, source_ready_event = handoff
                 source_ready_event_source = (
                     "forward_context.sfa_reshape_cache_event"
                 )
-                # capture_live_source_event_handoff only publishes the final
-                # producer event for one validated request set and one forward
-                # stream.  That event is the causal join for the preceding
-                # cache writes, including deferred callbacks, so it is also the
-                # complete RemoteFill source-fence set for this submission.
+                # The request/frontier-matched event causally joins preceding
+                # cache writes on this forward stream, including callbacks.
                 source_ready_events = (source_ready_event,)
                 handoff_status = "adopted"
-            elif not expected_ids:
+            elif not expected_targets:
                 handoff_status = "not_armed"
             elif handoff is not None and not (
                 isinstance(handoff, tuple) and len(handoff) == 2
             ):
                 handoff_status = "malformed"
-            elif isinstance(handoff, tuple) and handoff[0] != expected_ids:
-                handoff_status = "request_mismatch"
+            elif isinstance(handoff, tuple) and handoff[0] != expected_targets:
+                handoff_status = "target_mismatch"
             elif isinstance(handoff, tuple) and handoff[1] is None:
                 handoff_status = "missing_event"
             for request in requests:
@@ -1165,6 +1187,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     source_event_present=source_ready_event is not None,
                     event_source=source_ready_event_source,
                     accepted_store_end=len(request.token_ids),
+                    submission_mode=getattr(
+                        self.config,
+                        "remote_fill_submission_mode",
+                        "final_deferred",
+                    ),
                     remote_fill_eligible=remote_fill_eligible,
                 )
             request_ids = {request.req_id for request in requests}
