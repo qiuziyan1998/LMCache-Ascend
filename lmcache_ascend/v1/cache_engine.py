@@ -191,6 +191,7 @@ LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 REMOTE_BACKEND_NAME = "RemoteBackend"
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
+_REMOTE_FILL_EXACT_LOCATIONS_KEY = "_remote_fill_exact_locations"
 
 
 def _shared_sparse_request(request):
@@ -6103,6 +6104,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             new_starts: List[int] = []
             new_ends: List[int] = []
             keys: List[List[CacheEngineKey]] = []
+            remote_fill_chunk_plan: Optional[
+                list[tuple[int, int, Any]]
+            ] = None
+            remote_fill_locations: Optional[list[str]] = None
             preflight_state = (
                 retrieve_kwargs.get("shared_cpu_request_preflight_state")
                 if retrieve_kwargs is not None
@@ -6118,6 +6123,39 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and isinstance(preflight_state, dict)
                 else None
             )
+            if retrieve_kwargs is not None:
+                retrieve_kwargs.pop(_REMOTE_FILL_EXACT_LOCATIONS_KEY, None)
+            remote_fill_hint = self._remote_fill_local_full_hint(request_configs)
+            if (
+                shared_rank0_retrieve
+                and not cached_keys
+                and not cached_starts
+                and not cached_ends
+                and remote_fill_hint is not None
+            ):
+                try:
+                    retained_plan = self._remote_fill_retained_local_page_plan(
+                        self._get_req_id(retrieve_kwargs or {}),
+                        kv_group,
+                        remote_fill_hint[0],
+                    )
+                except RuntimeError as exc:
+                    retained_plan = None
+                    logger.warning(
+                        "RemoteFill retained plan is inconsistent; using "
+                        "ordinary sparse metadata lookup: req_id=%s, "
+                        "kv_group=%s, error=%s",
+                        self._get_req_id(retrieve_kwargs or {}),
+                        kv_group,
+                        exc,
+                    )
+                if retained_plan is not None:
+                    remote_fill_chunk_plan, remote_fill_locations = retained_plan
+                    assert retrieve_kwargs is not None
+                    retrieve_kwargs[_REMOTE_FILL_EXACT_LOCATIONS_KEY] = tuple(
+                        remote_fill_locations
+                    )
+            key_plan = remote_fill_chunk_plan or chunk_plan
             metadata_extension = (
                 self._build_retrieve_metadata_extension(
                     tokens=tokens,
@@ -6131,7 +6169,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         "cached_metadata_token_ids"
                     ),
                 )
-                if chunk_plan is None
+                if key_plan is None
                 else None
             )
             chunk_index_base = 0
@@ -6145,17 +6183,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     for layer_id in (0,)
                 )
-            elif chunk_plan is not None:
+            elif key_plan is not None:
                 generated_keys = self.token_database.process_tokens(
-                    hashes=[entry[2] for entry in chunk_plan],
-                    offsets=[entry[1] - entry[0] for entry in chunk_plan],
+                    hashes=[entry[2] for entry in key_plan],
+                    offsets=[entry[1] - entry[0] for entry in key_plan],
                     request_configs=request_configs,
                     kv_group=kv_group,
                 )
                 token_results = (
                     (start, end, key)
                     for (start, end, _), (_, _, key) in zip(
-                        chunk_plan, generated_keys, strict=True
+                        key_plan, generated_keys, strict=True
                     )
                 )
             else:
@@ -6179,13 +6217,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and isinstance(preflight_state, dict)
                 else None
             )
-            for start, end, key in token_results:
+            for candidate_index, (start, end, key) in enumerate(token_results):
                 assert isinstance(key, CacheEngineKey)
                 if new_chunk_plan is not None:
                     new_chunk_plan.append((start, end, key.chunk_hash))
 
                 keys_multi_layer = key.split_layers(self.num_layers)
-                if sampled_worker_retrieve:
+                remote_fill_location = (
+                    remote_fill_locations[candidate_index]
+                    if remote_fill_locations is not None
+                    else None
+                )
+                if remote_fill_location is not None:
+                    current_location = remote_fill_location
+                elif sampled_worker_retrieve:
                     current_location = (
                         REMOTE_BACKEND_NAME
                         if (retrieve_kwargs or {}).get("direct_external_pages")
@@ -6301,7 +6346,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     retrieve_kwargs["cached_retrieve_location"] = location
                 retrieve_kwargs["_retrieve_metadata_warm"] = True
                 retrieve_kwargs["_retrieve_metadata_mode"] = (
-                    "incremental" if metadata_extension is not None else "full"
+                    "remote_fill_retained"
+                    if remote_fill_chunk_plan is not None
+                    else "incremental"
+                    if metadata_extension is not None
+                    else "full"
                 )
                 retrieve_kwargs["_retrieve_metadata_generated_chunks"] = len(
                     new_starts
@@ -7840,6 +7889,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kv_group=kv_group,
                 layers=len(retrieve_keys),
                 chunks=required_chunks,
+                metadata_mode=kwargs.get("_retrieve_metadata_mode", "unknown"),
                 rank=self.metadata.worker_id,
                 passive=False,
             )
@@ -7864,8 +7914,21 @@ class AscendLMCacheEngine(LMCacheEngine):
             layer_keys[cached_prefix_chunks:]
             for layer_keys in retrieve_keys
         ]
+        exact_locations_value = kwargs.get(_REMOTE_FILL_EXACT_LOCATIONS_KEY)
+        remote_fill_exact_locations = (
+            list(exact_locations_value)
+            if cached_prefix_chunks == 0
+            and isinstance(exact_locations_value, (list, tuple))
+            and len(exact_locations_value) == required_chunks
+            and all(
+                location == LOCAL_CPU_BACKEND_NAME
+                for location in exact_locations_value
+            )
+            else None
+        )
         direct_group1_pages = bool(
             direct_external_pages
+            and remote_fill_exact_locations is None
             and not use_cached_retrieve
             and cached_prefix_chunks == 0
             and mooncake_layer_pages_enabled(self.config)
@@ -8115,7 +8178,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cold_start_perf_now() if perf_enabled else 0.0
             )
             missing_locations: list[tuple[int, int]] = []
-            if sampled_worker_retrieve:
+            if remote_fill_exact_locations is not None:
+                shared_chunk_locations_layer_major = [
+                    list(remote_fill_exact_locations) for _ in missing_keys
+                ]
+            elif sampled_worker_retrieve:
                 local_cpu_backend = self._shared_local_cpu_backend()
                 try:
                     batched_prefix_get = getattr(
@@ -8219,6 +8286,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     remote_chunks=remote_chunks,
                     unresolved_chunks=unresolved_chunks,
                     sampled=sampled_worker_retrieve,
+                    storage_probe_skipped=(
+                        remote_fill_exact_locations is not None
+                    ),
                 )
             page_first_locations = (
                 self._shared_page_first_common_prefix_plan(
@@ -8257,7 +8327,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                         if perf_enabled
                         else 0.0
                     )
-                    capacity_details = self._shared_cpu_runtime_capacity_details(
+                    capacity_check: Callable[..., dict[str, Any]] = (
+                        self._shared_cpu_runtime_capacity_details
+                    )
+                    if remote_fill_exact_locations is not None:
+                        capacity_check = lambda **_kwargs: {
+                            "fits": True,
+                            "missing_chunk_count": 0,
+                        }
+                    capacity_details = capacity_check(
                         req_id=kwargs.get("req_id", "unspecified"),
                         phase=kwargs.get(
                             "shared_cpu_phase", "sparse_decode_bootstrap"
@@ -8298,6 +8376,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             available_bytes=capacity_details.get(
                                 "available_after_eviction"
                             ),
+                            skipped=(remote_fill_exact_locations is not None),
                         )
                 except Exception:
                     release_local_prefix_layers()
@@ -8332,6 +8411,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             and page_chunks
                         ):
                             release_local_prefix_layers()
+                            materialize_started = (
+                                cold_start_perf_now() if perf_enabled else 0.0
+                            )
                             (
                                 pre_resolved_shared_mem_layers,
                                 layer_page_chunks,
@@ -8343,7 +8425,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 kv_group=kv_group,
                                 keys_layer_major=missing_keys,
                                 page_chunks=page_chunks,
+                                exact_chunk_locations=(
+                                    remote_fill_exact_locations
+                                ),
                             )
+                            if perf_enabled:
+                                cold_start_perf_log(
+                                    logger,
+                                    "rank0_page_materialize",
+                                    started=materialize_started,
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    kv_group=kv_group,
+                                    pages=layer_page_chunks,
+                                    remote_fill_plan_reused=(
+                                        remote_fill_exact_locations is not None
+                                    ),
+                                )
                             if (
                                 npu_content_diagnostics_enabled()
                                 and layer_page_chunks
@@ -8518,6 +8615,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             and not use_cached_retrieve
             and cached_prefix_chunks < required_chunks
         ):
+            group_cache_started = (
+                cold_start_perf_now() if perf_enabled else 0.0
+            )
             try:
                 page_sources = (
                     [
@@ -8579,6 +8679,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_handle_chunks,
                             )
                         self._fence_shared_cpu_store_publication()
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "rank0_group_cache_prepare",
+                        started=group_cache_started,
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        kv_group=kv_group,
+                        chunks=required_chunks - cached_prefix_chunks,
+                        remote_fill_plan_reused=(
+                            remote_fill_exact_locations is not None
+                        ),
+                    )
             except Exception as exc:
                 if not shared_sparse_retrieve:
                     release_pre_resolved_shared_mem_layers()
