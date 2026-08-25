@@ -100,6 +100,7 @@ from lmcache_ascend.v1.remote_fill import (
     build_decoder_layout,
     create_decoder_remote_fill_runtime,
     remote_fill_h0_qualified,
+    remote_fill_token_hash_identity,
 )
 from lmcache_ascend.v1.remote_fill_producer import (
     REMOTE_FILL_H0_QUALIFICATION_ENV,
@@ -1080,10 +1081,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         handoff: RemoteFillHandoff,
     ) -> RemoteFillStaticSpec:
         layout_tag, layout = self._remote_fill_immutable_layout()
-        token_hash_algorithm = str(self.config.pre_caching_hash_algorithm)
+        configured_hash_algorithm = str(self.config.pre_caching_hash_algorithm)
+        token_hash_algorithm = remote_fill_token_hash_identity(
+            configured_hash_algorithm,
+            self.token_database.chunk_hash_type,
+            self.token_database.chunk_hash_bytes,
+        )
         python_hash_seed = (
             os.environ.get("PYTHONHASHSEED", "")
-            if token_hash_algorithm == "builtin"
+            if configured_hash_algorithm == "builtin"
             else ""
         )
         if (
@@ -9724,6 +9730,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             save_only_first_rank=self.save_only_first_rank,
             save_indexer_only_first_rank=self.save_indexer_only_first_rank,
             shared_cpu_cache_strict=self.shared_cpu_cache_strict,
+            chunk_hash_type=self.token_database.chunk_hash_type,
+            chunk_hash_bytes=self.token_database.chunk_hash_bytes,
         )
         try:
             runtime.start()

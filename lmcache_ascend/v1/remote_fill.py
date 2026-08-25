@@ -61,6 +61,46 @@ REMOTE_FILL_MODEL_LAYOUT = "mla-dsa-layer-page-v3"
 _DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES = 32
 
 
+def remote_fill_token_hash_identity(
+    hash_algorithm: str,
+    chunk_hash_type: type[int] | type[bytes],
+    chunk_hash_bytes: int | None,
+) -> str:
+    """Return the exact cross-process token-hash ABI identity.
+
+    The same vLLM algorithm name can return integers in older releases and
+    raw digest bytes in newer releases.  Include that representation in the
+    existing negotiation identity so mixed hash semantics fail closed.
+
+    Args:
+        hash_algorithm: Configured vLLM hash algorithm name.
+        chunk_hash_type: Actual output type of the loaded hash function.
+        chunk_hash_bytes: Fixed digest width for byte hashes, else ``None``.
+
+    Returns:
+        A stable identity suitable for ``NegotiationSpec.token_hash_algorithm``.
+
+    Raises:
+        TypeError: If ``chunk_hash_type`` is unsupported.
+        ValueError: If the name or output contract is invalid.
+    """
+
+    algorithm = hash_algorithm.strip()
+    if not algorithm:
+        raise ValueError("remote-fill token hash algorithm must not be empty")
+    if chunk_hash_type is int:
+        if chunk_hash_bytes is not None:
+            raise ValueError("integer chunk hashes must not declare a digest width")
+        return algorithm if algorithm == "builtin" else f"{algorithm}:int"
+    if chunk_hash_type is bytes:
+        if type(chunk_hash_bytes) is not int or chunk_hash_bytes <= 0:
+            raise ValueError("byte chunk hashes require a positive digest width")
+        if algorithm == "builtin":
+            raise ValueError("builtin token hashing must produce integers")
+        return f"{algorithm}:bytes:{chunk_hash_bytes}"
+    raise TypeError("chunk_hash_type must be int or bytes")
+
+
 def _format_tcp_host(host: str) -> str:
     """Bracket literal IPv6 addresses for ZeroMQ TCP endpoints."""
 
@@ -379,6 +419,8 @@ def build_remote_fill_negotiation_spec(
     dp_size: int,
     global_te_push: bool,
     destination_remote_session: str,
+    chunk_hash_type: type[int] | type[bytes],
+    chunk_hash_bytes: int | None,
 ) -> NegotiationSpec:
     """Build the byte-identical source/destination negotiation identity.
 
@@ -391,6 +433,8 @@ def build_remote_fill_negotiation_spec(
         dp_size: Deployment data-parallel size.
         global_te_push: Whether the native transport premise is activated.
         destination_remote_session: Decoder GlobalTE session identifier.
+        chunk_hash_type: Actual output type of the decoder hash function.
+        chunk_hash_bytes: Fixed digest width for byte hashes.
 
     Returns:
         The public core protocol negotiation descriptor.
@@ -406,8 +450,11 @@ def build_remote_fill_negotiation_spec(
     if dp_size <= 0 or not 0 <= destination_dp_rank < dp_size:
         raise ValueError("remote-fill destination DP rank is out of range")
     hash_algorithm = str(config.pre_caching_hash_algorithm).strip()
-    if not hash_algorithm:
-        raise ValueError("remote-fill token hash algorithm must not be empty")
+    hash_identity = remote_fill_token_hash_identity(
+        hash_algorithm,
+        chunk_hash_type,
+        chunk_hash_bytes,
+    )
     python_hash_seed = (
         os.getenv("PYTHONHASHSEED", "") if hash_algorithm == "builtin" else ""
     )
@@ -429,7 +476,7 @@ def build_remote_fill_negotiation_spec(
         destination_engine_id=engine_id,
         destination_dp_rank=destination_dp_rank,
         destination_remote_session=remote_session,
-        token_hash_algorithm=hash_algorithm,
+        token_hash_algorithm=hash_identity,
         python_hash_seed=python_hash_seed,
     )
 
@@ -461,6 +508,8 @@ class AscendRemoteFillPageLifecycle:
         local_backend: RemoteFillLocalBackend,
         layout: RemoteFillDecoderLayout,
         capacity_available: Callable[[int], bool],
+        chunk_hash_type: type[int] | type[bytes],
+        chunk_hash_bytes: int | None,
         pin_pages: Callable[[Sequence[LayerPageMemoryObj]], bool] = (
             LayerPageMemoryObj.pin_many
         ),
@@ -471,12 +520,31 @@ class AscendRemoteFillPageLifecycle:
             local_backend: Rank0 LocalCPU backend public interface.
             layout: Validated static two-group page layout.
             capacity_available: Nonblocking ordinary-cache headroom check.
+            chunk_hash_type: Exact chunk-hash representation negotiated with
+                the producer.
+            chunk_hash_bytes: Fixed digest width when ``chunk_hash_type`` is
+                ``bytes``; otherwise ``None``.
             pin_pages: Atomic pin primitive, injectable for tests.
+
+        Raises:
+            TypeError: If ``chunk_hash_type`` is neither ``int`` nor ``bytes``.
+            ValueError: If the hash type and byte width are inconsistent.
         """
 
+        if chunk_hash_type not in (int, bytes):
+            raise TypeError("chunk_hash_type must be int or bytes")
+        if chunk_hash_type is bytes:
+            if type(chunk_hash_bytes) is not int or chunk_hash_bytes <= 0:
+                raise ValueError(
+                    "byte chunk hashes require a positive fixed digest width"
+                )
+        elif chunk_hash_bytes is not None:
+            raise ValueError("integer chunk hashes must not declare a digest width")
         self._local = local_backend
         self._layout = layout
         self._capacity_available = capacity_available
+        self._chunk_hash_type = chunk_hash_type
+        self._chunk_hash_bytes = chunk_hash_bytes
         self._pin_pages = pin_pages
 
     def prepare_pages(
@@ -850,7 +918,17 @@ class AscendRemoteFillPageLifecycle:
         return True
 
     def _validate_control_page(self, page: ControlPage) -> CacheEngineKey:
-        key = CacheEngineKey.from_string(page.canonical_key)
+        key = CacheEngineKey.from_string(
+            page.canonical_key,
+            chunk_hash_type=self._chunk_hash_type,
+        )
+        if (
+            self._chunk_hash_type is bytes
+            and len(key.chunk_hash) != self._chunk_hash_bytes
+        ):
+            raise ValueError(
+                "remote-fill page chunk hash has an unexpected digest width"
+            )
         if key.to_string() != page.canonical_key:
             raise ValueError("remote-fill page key is not canonical")
         if key.kv_group != page.kv_group:
@@ -1217,6 +1295,8 @@ def create_decoder_remote_fill_runtime(
     save_only_first_rank: bool,
     save_indexer_only_first_rank: bool,
     shared_cpu_cache_strict: bool,
+    chunk_hash_type: type[int] | type[bytes],
+    chunk_hash_bytes: int | None,
     descriptor_verification_capability: bytes | None = None,
     server_factory: Callable[[RemoteFillService], RemoteFillServer] | None = None,
 ) -> DecoderRemoteFillRuntime:
@@ -1242,6 +1322,8 @@ def create_decoder_remote_fill_runtime(
         save_only_first_rank: Resolved physical Group 0 ownership policy.
         save_indexer_only_first_rank: Resolved Group 1 ownership policy.
         shared_cpu_cache_strict: Whether every passive view passed preflight.
+        chunk_hash_type: Actual output type of the decoder token hash function.
+        chunk_hash_bytes: Actual fixed digest width for byte hashes.
         descriptor_verification_capability: Optional injected decoder-runtime
             descriptor verification key for tests. Production generates one.
         server_factory: Optional RPC server factory for tests.
@@ -1307,11 +1389,15 @@ def create_decoder_remote_fill_runtime(
         dp_size=destination_dp_size,
         global_te_push=global_te_push,
         destination_remote_session=destination_remote_session,
+        chunk_hash_type=chunk_hash_type,
+        chunk_hash_bytes=chunk_hash_bytes,
     )
     lifecycle = AscendRemoteFillPageLifecycle(
         local_backend=local_backend,
         layout=layout,
         capacity_available=capacity_available,
+        chunk_hash_type=chunk_hash_type,
+        chunk_hash_bytes=chunk_hash_bytes,
     )
     verification_capability = _descriptor_verification_capability(
         descriptor_verification_capability

@@ -46,6 +46,7 @@ from lmcache_ascend.v1.remote_fill import (
     RemoteFillGroupLayout,
     build_decoder_layout,
     create_decoder_remote_fill_runtime,
+    remote_fill_token_hash_identity,
 )
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
 
@@ -76,6 +77,41 @@ class _FakePage:
         if self.pins <= 0:
             raise RuntimeError("page pin underflow")
         self.pins -= 1
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "hash_type", "hash_bytes", "expected"),
+    (
+        ("builtin", int, None, "builtin"),
+        ("sha256", int, None, "sha256:int"),
+        ("sha256_cbor", bytes, 32, "sha256_cbor:bytes:32"),
+        ("xxhash", bytes, 16, "xxhash:bytes:16"),
+    ),
+)
+def test_token_hash_identity_includes_actual_output_abi(
+    algorithm: str,
+    hash_type: type[int] | type[bytes],
+    hash_bytes: int | None,
+    expected: str,
+) -> None:
+    assert remote_fill_token_hash_identity(algorithm, hash_type, hash_bytes) == expected
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "hash_type", "hash_bytes"),
+    (
+        ("builtin", bytes, 32),
+        ("sha256", bytes, None),
+        ("sha256", int, 32),
+    ),
+)
+def test_token_hash_identity_rejects_inconsistent_contract(
+    algorithm: str,
+    hash_type: type[int] | type[bytes],
+    hash_bytes: int | None,
+) -> None:
+    with pytest.raises(ValueError):
+        remote_fill_token_hash_identity(algorithm, hash_type, hash_bytes)
 
 
 def test_decoder_layout_infers_dsa_dimensions_without_manual_config(
@@ -686,7 +722,13 @@ def test_group1_shared_startup_fails_closed_on_passive_rank_rejection(
     assert rank0_page.refs == 0
 
 
-def _key(chunk_index: int, kv_group: int, valid_tokens: int = 4) -> CacheEngineKey:
+def _key(
+    chunk_index: int,
+    kv_group: int,
+    valid_tokens: int = 4,
+    *,
+    chunk_hash: int | bytes | None = None,
+) -> CacheEngineKey:
     request_configs = {"lmcache.tag.payload_v3": "payload-v3"}
     if kv_group == 1:
         request_configs["lmcache.tag.dsa_idx"] = "v3"
@@ -696,7 +738,7 @@ def _key(chunk_index: int, kv_group: int, valid_tokens: int = 4) -> CacheEngineK
         "model",
         1,
         0,
-        100 + chunk_index,
+        100 + chunk_index if chunk_hash is None else chunk_hash,
         torch.bfloat16,
         request_configs,
         kv_group=kv_group,
@@ -709,9 +751,15 @@ def _control_page(
     *,
     valid_tokens: int = 4,
     expected_bytes: int | None = None,
+    chunk_hash: int | bytes | None = None,
 ) -> ControlPage:
     layout = _layout()
-    key = _key(chunk_index, kv_group, valid_tokens)
+    key = _key(
+        chunk_index,
+        kv_group,
+        valid_tokens,
+        chunk_hash=chunk_hash,
+    )
     return ControlPage(
         canonical_key=key.to_string(),
         kv_group=kv_group,
@@ -734,6 +782,8 @@ def _lifecycle(
     local: _FakeLocalBackend,
     *,
     capacity: bool = True,
+    chunk_hash_type: type[int] | type[bytes] = int,
+    chunk_hash_bytes: int | None = None,
 ) -> AscendRemoteFillPageLifecycle:
     def pin_pages(pages: list[_FakePage]) -> bool:
         for page in pages:
@@ -744,6 +794,8 @@ def _lifecycle(
         local_backend=local,
         layout=_layout(),
         capacity_available=lambda requested: capacity and requested >= 0,
+        chunk_hash_type=chunk_hash_type,
+        chunk_hash_bytes=chunk_hash_bytes,
         pin_pages=pin_pages,
     )
 
@@ -830,6 +882,64 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     assert '"existing_keys":0' in caplog.text
     assert '"retention_trace_id":17' in caplog.text
     assert f'"required_key_digest":"{expected_digest}"' in caplog.text
+
+
+@pytest.mark.parametrize(
+    "chunk_hash",
+    (
+        bytes.fromhex("ab" * 32),
+        bytes.fromhex("00" + "ab" * 31),
+    ),
+)
+def test_digest_control_keys_match_independent_decoder_lookup(
+    chunk_hash: bytes,
+) -> None:
+    local = _FakeLocalBackend()
+    lifecycle = _lifecycle(
+        local,
+        chunk_hash_type=bytes,
+        chunk_hash_bytes=32,
+    )
+    controls = (
+        _control_page(0, 0, chunk_hash=chunk_hash),
+        _control_page(0, 1, chunk_hash=chunk_hash),
+    )
+
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+    assert lifecycle.commit_pages(
+        "transfer",
+        controls,
+        _views(controls, prepared),
+        _finish(4),
+    )
+
+    lookup_keys = (
+        _key(0, 0, chunk_hash=chunk_hash),
+        _key(0, 1, chunk_hash=chunk_hash),
+    )
+    assert all(isinstance(key.chunk_hash, bytes) for key in local.hot)
+    assert all(local.contains(key) for key in lookup_keys)
+    assert {key.to_string() for key in local.hot} == {
+        page.canonical_key for page in controls
+    }
+
+
+@pytest.mark.parametrize("digest_bytes", (b"", b"\xab" * 31, b"\xab" * 33))
+def test_digest_control_keys_reject_unexpected_width(
+    digest_bytes: bytes,
+) -> None:
+    lifecycle = _lifecycle(
+        _FakeLocalBackend(),
+        chunk_hash_type=bytes,
+        chunk_hash_bytes=32,
+    )
+    controls = (
+        _control_page(0, 0, chunk_hash=digest_bytes),
+        _control_page(0, 1, chunk_hash=digest_bytes),
+    )
+
+    with pytest.raises(ValueError, match="unexpected digest width"):
+        lifecycle.prepare_pages("transfer", 0, controls, True)
 
 
 @pytest.mark.parametrize(
@@ -1343,6 +1453,8 @@ def test_runtime_requires_tp0_and_strict_shared_storage_for_tp_gt_one(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=True,
+        chunk_hash_type=int,
+        chunk_hash_bytes=None,
         descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: _FakeServer(),
     )
@@ -1384,6 +1496,8 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=False,
+        chunk_hash_type=int,
+        chunk_hash_bytes=None,
         descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: server,
     )
@@ -1429,11 +1543,16 @@ def test_nonbuiltin_hash_ignores_unrelated_python_hash_seed(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=False,
+        chunk_hash_type=bytes,
+        chunk_hash_bytes=32,
         descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: _FakeServer(),
     )
 
-    assert runtime.placement.token_hash_algorithm == "sha256_cbor_64bit"
+    assert (
+        runtime.placement.token_hash_algorithm
+        == "sha256_cbor_64bit:bytes:32"
+    )
     assert runtime.placement.python_hash_seed == ""
     runtime.close()
 
@@ -1466,6 +1585,8 @@ def test_runtime_rotates_verification_capability_per_incarnation(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=False,
+        chunk_hash_type=int,
+        chunk_hash_bytes=None,
         server_factory=lambda service: _FakeServer(),
     )
 
@@ -1501,6 +1622,8 @@ def test_runtime_separates_bind_and_ipv6_advertised_host(
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         shared_cpu_cache_strict=False,
+        chunk_hash_type=int,
+        chunk_hash_bytes=None,
         descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: _FakeServer(),
     )
@@ -1535,6 +1658,8 @@ def test_runtime_rejects_nonroutable_advertised_host(
             save_only_first_rank=True,
             save_indexer_only_first_rank=True,
             shared_cpu_cache_strict=False,
+            chunk_hash_type=int,
+            chunk_hash_bytes=None,
             descriptor_verification_capability=b"x" * 32,
             server_factory=lambda service: _FakeServer(),
         )
