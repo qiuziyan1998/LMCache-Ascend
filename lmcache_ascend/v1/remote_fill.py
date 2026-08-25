@@ -26,6 +26,7 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
+    MOONCAKE_VALID_TOKENS_TAG,
     mooncake_valid_tokens,
     resolve_mooncake_dsa_raw_token_dims,
     resolve_remote_fill_identity,
@@ -922,6 +923,19 @@ class AscendRemoteFillPageLifecycle:
             page.canonical_key,
             chunk_hash_type=self._chunk_hash_type,
         )
+        key_valid_tokens = mooncake_valid_tokens(key, self._layout.chunk_size)
+        if key_valid_tokens != self._layout.chunk_size:
+            request_configs = dict(key.request_configs or {})
+            request_configs[MOONCAKE_VALID_TOKENS_TAG] = key_valid_tokens
+            key = CacheEngineKey(
+                key.model_name,
+                key.world_size,
+                key.worker_id,
+                key.chunk_hash,
+                key.dtype,
+                request_configs,
+                kv_group=key.kv_group,
+            )
         if (
             self._chunk_hash_type is bytes
             and len(key.chunk_hash) != self._chunk_hash_bytes
@@ -953,7 +967,7 @@ class AscendRemoteFillPageLifecycle:
             raise ValueError("remote-fill page valid-token interval mismatch")
         if not 0 < page.valid_tokens <= self._layout.chunk_size:
             raise ValueError("remote-fill page valid-token count is out of range")
-        if mooncake_valid_tokens(key, self._layout.chunk_size) != page.valid_tokens:
+        if key_valid_tokens != page.valid_tokens:
             raise ValueError("remote-fill key valid-token tag mismatch")
         group = self._layout.group(page.kv_group)
         if key.dtype != group.dtype:

@@ -733,7 +733,7 @@ def _key(
     if kv_group == 1:
         request_configs["lmcache.tag.dsa_idx"] = "v3"
     if valid_tokens != 4:
-        request_configs["lmcache.tag.internal.valid_tokens"] = str(valid_tokens)
+        request_configs["lmcache.tag.internal.valid_tokens"] = valid_tokens
     return CacheEngineKey(
         "model",
         1,
@@ -891,8 +891,10 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
         bytes.fromhex("00" + "ab" * 31),
     ),
 )
+@pytest.mark.parametrize("valid_tokens", (4, 2))
 def test_digest_control_keys_match_independent_decoder_lookup(
     chunk_hash: bytes,
+    valid_tokens: int,
 ) -> None:
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(
@@ -901,8 +903,8 @@ def test_digest_control_keys_match_independent_decoder_lookup(
         chunk_hash_bytes=32,
     )
     controls = (
-        _control_page(0, 0, chunk_hash=chunk_hash),
-        _control_page(0, 1, chunk_hash=chunk_hash),
+        _control_page(0, 0, valid_tokens=valid_tokens, chunk_hash=chunk_hash),
+        _control_page(0, 1, valid_tokens=valid_tokens, chunk_hash=chunk_hash),
     )
 
     prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
@@ -910,12 +912,12 @@ def test_digest_control_keys_match_independent_decoder_lookup(
         "transfer",
         controls,
         _views(controls, prepared),
-        _finish(4),
+        _finish(valid_tokens, partial=valid_tokens if valid_tokens < 4 else 0),
     )
 
     lookup_keys = (
-        _key(0, 0, chunk_hash=chunk_hash),
-        _key(0, 1, chunk_hash=chunk_hash),
+        _key(0, 0, valid_tokens=valid_tokens, chunk_hash=chunk_hash),
+        _key(0, 1, valid_tokens=valid_tokens, chunk_hash=chunk_hash),
     )
     assert all(isinstance(key.chunk_hash, bytes) for key in local.hot)
     assert all(local.contains(key) for key in lookup_keys)
