@@ -697,6 +697,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         requests: list[ReqMeta],
         adopted_requests: Optional[set[str]] = None,
         *,
+        finish_batch: bool = False,
         source_ready_event: Any = None,
         source_ready_event_source: str = "missing",
         source_ready_events: tuple[Any, ...] = (),
@@ -903,14 +904,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 preferred_segment and 0 not in live_groups
             )
             if direct_store and selected:
+                direct_final = request.is_last_prefill and (
+                    not finalized_live or fence_preferred_group0
+                )
+                if remote_fill_request:
+                    # save_kv_layer can observe the last scheduler window before
+                    # the request-matched forward-context handoff is adopted.
+                    # Only _finish_save_batch owns that final causal boundary.
+                    direct_final = direct_final and finish_batch
                 self.lmcache_engine.store_direct_prefill(
                     request.req_id,
                     request.token_ids,
                     selected,
                     slot_mappings,
                     request.request_configs,
-                    final=request.is_last_prefill
-                    and (not finalized_live or fence_preferred_group0),
+                    final=direct_final,
                     slot_mapping_base=mapping_base,
                     verified_prefix_end=verified_prefix_end,
                     # ReqMeta.token_ids is the scheduler-accepted store range
@@ -1171,6 +1179,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 self._submit_direct_prefill_requests(
                     requests,
                     adopted_requests,
+                    finish_batch=True,
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
                     source_ready_events=source_ready_events,

@@ -30,6 +30,12 @@ protocol is unchanged.
   native execution, REPORT, FINISH control, decoder commit, and LocalCPU commit
   lock wait/hold timing. All are CPU-side observations under cold-perf logging;
   no device readback or new synchronization is introduced.
+- Window-owned direct-source plans are retained across chunked-prefill callbacks
+  until `_finish_save_batch` adopts the final request-matched producer fence.
+  An early last-window callback cannot finalize RemoteFill, and a missing final
+  fence still fails closed to mandatory persistence. Structured retain/release/
+  reject counts distinguish ordering from absent-source failures without
+  requiring a full-prefix slot mapping.
 - P1 decision gates for disabled/fallback overhead, client TTFT confidence,
   decoder cache-ready reduction/interference, publication, retention review,
   full-window overlap, and conditional O1 eligibility. O2 always remains off

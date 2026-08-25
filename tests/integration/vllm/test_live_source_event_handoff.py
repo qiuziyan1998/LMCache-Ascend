@@ -146,6 +146,7 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
     adapter._submit_direct_prefill_requests.assert_called_once_with(
         [request],
         set(),
+        finish_batch=True,
         source_ready_event=event,
         source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
         source_ready_events=(event,),
@@ -199,6 +200,7 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
     adapter._submit_direct_prefill_requests.assert_called_once_with(
         [request],
         set(),
+        finish_batch=True,
         source_ready_event=handoff_event,
         source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
         source_ready_events=(handoff_event,),
@@ -251,6 +253,7 @@ def test_finish_save_batch_mismatched_handoff_does_not_complete_fence() -> None:
     adapter._submit_direct_prefill_requests.assert_called_once_with(
         [request],
         set(),
+        finish_batch=True,
         source_ready_event=callback_event,
         source_ready_event_source=("attn_metadata.reshape_cache_event"),
         source_ready_events=(),
@@ -298,6 +301,7 @@ def test_finish_save_batch_logs_absent_handoff_without_completing_fence() -> Non
     adapter._submit_direct_prefill_requests.assert_called_once_with(
         [request],
         set(),
+        finish_batch=True,
         source_ready_event=None,
         source_ready_event_source="missing",
         source_ready_events=(),

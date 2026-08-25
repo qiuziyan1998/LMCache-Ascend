@@ -1456,14 +1456,15 @@ def test_remote_fill_requires_one_complete_source_page(
     )
 
 
-def test_nonfinal_missing_fence_defers_and_replays_full_prefix(caplog) -> None:
+def test_nonfinal_missing_fence_retains_windowed_sources(caplog) -> None:
     class _Key:
-        def __init__(self, kv_group: int) -> None:
+        def __init__(self, kv_group: int, start: int) -> None:
             self.kv_group = kv_group
-            self.chunk_hash = b"chunk"
+            self.chunk_hash = f"chunk-{start}".encode()
+            self.start = start
 
         def to_string(self) -> str:
-            return f"page-{self.kv_group}"
+            return f"page-{self.start}-{self.kv_group}"
 
     class _Storage:
         @staticmethod
@@ -1477,11 +1478,6 @@ def test_nonfinal_missing_fence_defers_and_replays_full_prefix(caplog) -> None:
         def abandon(self, reason: str) -> None:
             self.abandoned.append(reason)
 
-    keys = {group: _Key(group) for group in (0, 1)}
-    plans = {
-        group: [(0, 1024, keys[group])]
-        for group in (0, 1)
-    }
     owner = object()
     planner_calls: list[tuple[int, list[int], list[int], int]] = []
 
@@ -1500,8 +1496,6 @@ def test_nonfinal_missing_fence_defers_and_replays_full_prefix(caplog) -> None:
     state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
     metrics = _Metrics()
     scheduled: list[_DirectPageBatch] = []
-    suffix_calls: list[bool] = []
-    prefix_calls: list[int] = []
     engine = object.__new__(AscendLMCacheEngine)
     engine._direct_store_enabled = True
     engine._direct_store_states = {"request": state}
@@ -1517,18 +1511,21 @@ def test_nonfinal_missing_fence_defers_and_replays_full_prefix(caplog) -> None:
     engine._remote_fill_prepare_request = lambda *_args: True
     engine._get_remote_fill_producer_metrics = lambda: metrics
 
-    def suffix_plans(*_args: Any) -> dict[int, list[Any]]:
-        suffix_calls.append(True)
-        return plans
-
-    def prefix_plans(
-        _tokens: list[int], _configs: object, prefix_end: int
+    def suffix_plans(
+        request_state: _DirectStoreRequestState,
+        request_tokens: list[int],
+        *_args: Any,
     ) -> dict[int, list[Any]]:
-        prefix_calls.append(prefix_end)
-        return plans
+        end = len(request_tokens)
+        start = end - 1024
+        request_state.planned_end = end
+        request_state.planned_hash = f"chunk-{start}".encode()
+        return {
+            group: [(start, end, _Key(group, start))]
+            for group in (0, 1)
+        }
 
     engine._direct_suffix_plans = suffix_plans
-    engine._remote_fill_prefix_plans = prefix_plans
     engine._schedule_remote_fill_batch = (
         lambda _state, batch, _required_end: scheduled.append(batch)
     )
@@ -1552,36 +1549,50 @@ def test_nonfinal_missing_fence_defers_and_replays_full_prefix(caplog) -> None:
     with caplog.at_level(logging.INFO):
         assert engine.store_direct_prefill(
             "request",
-            tokens,
+            list(range(2048)),
             group_caches,
             slot_mappings,
             final=False,
+            slot_mapping_base=1024,
         )
     assert caplog.text.count('"decision":"defer_nonfinal"') == 1
+    assert len(state.remote_fill_deferred_batches) == 2
+    assert state.remote_fill_deferred_pages == 4
+    assert state.remote_fill_deferred_bytes == 256
 
     event = object()
     with caplog.at_level(logging.INFO):
         assert engine.store_direct_prefill(
             "request",
-            tokens,
+            list(range(2048)),
             group_caches,
             slot_mappings,
             final=False,
+            slot_mapping_base=1024,
             source_ready_event=event,
             source_ready_event_source="request_handoff",
             source_ready_events=(event,),
         )
 
     assert not state.remote_fill_fence_deferred
-    assert suffix_calls == [True, True]
-    assert prefix_calls == [1024]
+    assert state.remote_fill_deferred_batches == []
+    assert state.remote_fill_deferred_pages == 0
+    assert state.remote_fill_deferred_bytes == 0
     assert planner_calls == [
         (0, [0], [1024], 0),
         (1, [0], [1024], 0),
+        (0, [1024], [2048], 1024),
+        (1, [1024], [2048], 1024),
     ]
     assert len(scheduled) == 1
-    assert scheduled[0].ranges == ((0, 1024), (0, 1024))
+    assert scheduled[0].ranges == (
+        (0, 1024),
+        (0, 1024),
+        (1024, 2048),
+        (1024, 2048),
+    )
     assert scheduled[0].ready_events == (event,)
     assert '"decision":"defer_nonfinal"' in caplog.text
-    assert '"decision":"replay_deferred_prefix"' in caplog.text
+    assert caplog.text.count('"decision":"retain_deferred_sources"') == 2
+    assert '"decision":"release_deferred_sources"' in caplog.text
     assert '"reason":"complete_request_matched_fence"' in caplog.text

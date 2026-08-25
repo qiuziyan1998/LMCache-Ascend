@@ -3404,6 +3404,56 @@ def test_remote_fill_selects_both_authoritative_groups(monkeypatch) -> None:
     assert selected == groups
 
 
+def test_remote_fill_final_is_owned_by_finish_batch() -> None:
+    calls = []
+    engine = SimpleNamespace(
+        discard_live_source_descriptor=lambda *_args: None,
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            (args, kwargs)
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _remote_store_requested=True,
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["latent"], 1: ["indexer"]},
+            {0: "latent-slots", 1: "indexer-slots"},
+            16384,
+        ),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=list(range(18878)),
+        request_configs=_adapter_remote_fill_request_configs(),
+        load_spec=None,
+        live_source_requested=True,
+        is_last_prefill=True,
+        _lmcache_remote_fill_qualified=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter,
+        [request],
+    )
+    event = object()
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter,
+        [request],
+        finish_batch=True,
+        source_ready_event=event,
+        source_ready_event_source="forward_context.sfa_reshape_cache_event",
+        source_ready_events=(event,),
+    )
+
+    assert [kwargs["final"] for _, kwargs in calls] == [False, True]
+    assert calls[0][1]["source_ready_events"] == ()
+    assert calls[1][1]["source_ready_events"] == (event,)
+
+
 def test_remote_fill_rebuilds_probe_keys_for_full_prefix_hit() -> None:
     class _TokenDatabase:
         def process_tokens(self, **kwargs):

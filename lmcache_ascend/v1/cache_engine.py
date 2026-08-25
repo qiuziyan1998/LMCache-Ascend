@@ -256,6 +256,11 @@ class _DirectStoreRequestState:
     remote_fill_terminal: Optional[RemoteFillTerminalResult] = None
     remote_fill_disabled_reason: str = ""
     remote_fill_fence_deferred: bool = False
+    remote_fill_deferred_batches: list["_DirectPageBatch"] = field(
+        default_factory=list
+    )
+    remote_fill_deferred_pages: int = 0
+    remote_fill_deferred_bytes: int = 0
     remote_fill_metrics_started: bool = False
     remote_fill_viable_counted: bool = False
     remote_fill_active_counted: bool = False
@@ -1489,6 +1494,36 @@ class AscendLMCacheEngine(LMCacheEngine):
             pages=pages,
             owners=batch.owners,
             producer_events=batch.ready_events,
+        )
+
+    @staticmethod
+    def _merge_deferred_remote_fill_batches(
+        batches: list[_DirectPageBatch],
+        ready_events: tuple[Any, ...],
+    ) -> _DirectPageBatch:
+        """Join window-owned source plans under the final causal fence."""
+
+        if not batches or not ready_events:
+            raise ValueError("deferred remote fill requires sources and fences")
+        req_id = batches[0].req_id
+        if any(batch.req_id != req_id for batch in batches):
+            raise ValueError("deferred remote-fill batches span requests")
+        owners: dict[int, torch.Tensor] = {}
+        group_ends: dict[int, int] = {}
+        for batch in batches:
+            owners.update((id(owner), owner) for owner in batch.owners)
+            for group, end in batch.group_ends.items():
+                group_ends[group] = max(group_ends.get(group, 0), end)
+        return _DirectPageBatch(
+            req_id=req_id,
+            keys=[key for batch in batches for key in batch.keys],
+            ptrs=[ptrs for batch in batches for ptrs in batch.ptrs],
+            sizes=[sizes for batch in batches for sizes in batch.sizes],
+            owners=tuple(owners.values()),
+            ready_event=ready_events[-1],
+            group_ends=group_ends,
+            ranges=tuple(page for batch in batches for page in batch.ranges),
+            ready_events=ready_events,
         )
 
     def _schedule_remote_fill_batch(
@@ -3205,6 +3240,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.remote_fill_session is not None
             or state.remote_fill_futures
             or state.remote_fill_probe_end
+            or state.remote_fill_deferred_batches
         )
         if (
             remote_fill
@@ -3231,6 +3267,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         remote_ready_events = self._direct_source_ready_events(
             state, len(tokens)
         )
+        defer_remote_fill_sources = False
         if remote_fill and not remote_ready_events:
             log_fence_transition = final or not state.remote_fill_fence_deferred
             if final:
@@ -3244,6 +3281,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # persistence moving without permanently poisoning that later
                 # proof.
                 state.remote_fill_fence_deferred = True
+                defer_remote_fill_sources = True
             if log_fence_transition:
                 _log_remote_fill_producer_fence_state(
                     req_id,
@@ -3262,25 +3300,35 @@ class AscendLMCacheEngine(LMCacheEngine):
                     event_source=state.source_ready_event_source,
                     transfer_id=state.remote_fill_handoff.transfer_id,
                     slot_mapping_base=slot_mapping_base,
+                    deferred_batch_count=len(
+                        state.remote_fill_deferred_batches
+                    ),
+                    deferred_pages=state.remote_fill_deferred_pages,
+                    deferred_bytes=state.remote_fill_deferred_bytes,
                     submitted_end=dict(sorted(state.submitted_end.items())),
                 )
+            if final:
+                state.remote_fill_deferred_batches.clear()
+                state.remote_fill_deferred_pages = 0
+                state.remote_fill_deferred_bytes = 0
+                state.remote_fill_fence_deferred = False
             remote_fill = False
-        replay_deferred_prefix = False
         if remote_fill and state.remote_fill_fence_deferred:
-            if slot_mapping_base != 0:
-                # Replaying already-persisted pages is safe only while the
-                # producer still exposes the request-owned full-prefix mapping.
-                state.remote_fill_disabled_reason = (
-                    "deferred_prefix_unaddressable"
+            deferred_batches = state.remote_fill_deferred_batches
+            if deferred_batches:
+                deferred_batch = self._merge_deferred_remote_fill_batches(
+                    deferred_batches, remote_ready_events
                 )
-                self._get_remote_fill_producer_metrics().abandon(
-                    "deferred prefix is outside the source mapping"
+                deferred_pages = len(deferred_batch.keys)
+                deferred_bytes = sum(map(sum, deferred_batch.sizes))
+                self._schedule_remote_fill_batch(
+                    state, deferred_batch, len(tokens)
                 )
                 _log_remote_fill_producer_fence_state(
                     req_id,
-                    "reject_deferred_prefix_unaddressable",
+                    "release_deferred_sources",
                     final=final,
-                    reason=state.remote_fill_disabled_reason,
+                    reason="complete_request_matched_fence",
                     token_end=len(tokens),
                     complete_fence_count=len(remote_ready_events),
                     complete_fence_token_end=(
@@ -3289,50 +3337,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                     event_source=state.source_ready_event_source,
                     transfer_id=state.remote_fill_handoff.transfer_id,
                     slot_mapping_base=slot_mapping_base,
+                    deferred_batch_count=len(deferred_batches),
+                    deferred_pages=deferred_pages,
+                    deferred_bytes=deferred_bytes,
                     submitted_end=dict(sorted(state.submitted_end.items())),
                 )
-                remote_fill = False
-            else:
-                replay_deferred_prefix = True
-                state.remote_fill_fence_deferred = False
+            state.remote_fill_deferred_batches.clear()
+            state.remote_fill_deferred_pages = 0
+            state.remote_fill_deferred_bytes = 0
+            state.remote_fill_fence_deferred = False
+            remote_fill = not state.remote_fill_disabled_reason
         for group in group_caches:
             if group not in state.submitted_end:
                 state.submitted_end[group] = verified_prefix_end
                 state.committed_end[group] = verified_prefix_end
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
         cpu_fallback_s = 0.0
-        if replay_deferred_prefix:
-            full_end = len(tokens) // int(self.config.chunk_size) * int(
-                self.config.chunk_size
-            )
-            plans = self._remote_fill_prefix_plans(
-                tokens, request_configs, full_end
-            )
-            if plans[0]:
-                state.planned_end = plans[0][-1][1]
-                state.planned_hash = plans[0][-1][2].chunk_hash
-            _log_remote_fill_producer_fence_state(
-                req_id,
-                "replay_deferred_prefix",
-                final=final,
-                reason="complete_request_matched_fence",
-                token_end=len(tokens),
-                complete_fence_count=len(remote_ready_events),
-                complete_fence_token_end=(
-                    state.source_ready_events_token_end
-                ),
-                event_source=state.source_ready_event_source,
-                transfer_id=state.remote_fill_handoff.transfer_id,
-                slot_mapping_base=slot_mapping_base,
-                replay_start=0,
-                replay_end=full_end,
-                replay_page_pairs=len(plans[0]),
-                submitted_end=dict(sorted(state.submitted_end.items())),
-            )
-        else:
-            plans = self._direct_suffix_plans(
-                state, tokens, group_caches, request_configs
-            )
+        plans = self._direct_suffix_plans(
+            state, tokens, group_caches, request_configs
+        )
         if remote_fill:
             probe_target = verified_prefix_end // int(self.config.chunk_size) * int(
                 self.config.chunk_size
@@ -3388,6 +3411,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         remote_ranges: list[tuple[int, int]] = []
         remote_owners: dict[int, torch.Tensor] = {}
         remote_group_ends: dict[int, int] = {}
+        collect_remote_sources = remote_fill or defer_remote_fill_sources
         merged_runs = 0
         chunk_size = int(self.config.chunk_size)
         planner = getattr(self.gpu_connector, "plan_direct_page_sources", None)
@@ -3415,8 +3439,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             group_candidates = [
                 (start, end, key)
                 for start, end, key in plans[group]
-                if (replay_deferred_prefix or end > submitted)
-                and end - start == chunk_size
+                if end > submitted and end - start == chunk_size
             ]
             candidates[group] = group_candidates
             candidate_refs.extend((group, item) for item in group_candidates)
@@ -3492,15 +3515,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             ]
             full = (
                 authoritative_candidates[group]
-                if remote_fill
+                if collect_remote_sources
                 else persistent_full
             )
             if full:
-                if remote_fill and any(
+                if collect_remote_sources and any(
                     start < slot_mapping_base for start, _, _ in full
                 ):
                     state.remote_fill_disabled_reason = "unaddressable_source"
                     remote_fill = False
+                    defer_remote_fill_sources = False
+                    collect_remote_sources = False
                     full = persistent_full
                 starts = [start for start, _, _ in full]
                 ends = [end for _, end, _ in full]
@@ -3534,9 +3559,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ):
                         fallback_reason = "buffer_limit_exceeded"
                 if fallback_reason is not None:
-                    if remote_fill:
+                    if collect_remote_sources:
                         state.remote_fill_disabled_reason = fallback_reason
                         remote_fill = False
+                        defer_remote_fill_sources = False
+                        collect_remote_sources = False
                     if not persistent_full:
                         continue
                     if state.fallback_reasons.get(group) != fallback_reason:
@@ -3597,7 +3624,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     full, group_ptrs, group_sizes, strict=True
                 ):
                     start, end, key = item
-                    if remote_fill:
+                    if collect_remote_sources:
                         remote_keys.append(key)
                         remote_ptrs.append(page_ptrs)
                         remote_sizes.append(page_sizes)
@@ -3623,7 +3650,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     # Existing pages between missing pages are part of the same
                     # contiguous committed prefix once this batch succeeds.
                     group_ends[group] = candidate_ends[group]
-                if remote_fill:
+                if collect_remote_sources:
                     remote_owners.update(
                         (id(owner), owner) for owner in group_owners
                     )
@@ -3674,9 +3701,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                     source_ready_token_end=state.source_ready_token_end,
                     format="page",
                 )
+        elif defer_remote_fill_sources and remote_keys:
+            ready_event = state.source_ready_event
+            ready_event_source = state.source_ready_event_source
         shared_sink_owners = (
             tuple(remote_owners.values())
-            if remote_fill and remote_keys
+            if collect_remote_sources and remote_keys
             else tuple(owners.values())
         )
         if keys:
@@ -3757,7 +3787,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     req_id, tokens, group_caches, state, final
                 )
                 return True
-        if remote_fill and remote_keys:
+        if collect_remote_sources and remote_keys:
             if {int(key.kv_group) for key in remote_keys} != {0, 1}:
                 state.remote_fill_disabled_reason = "incomplete_page_pair"
             else:
@@ -3772,9 +3802,36 @@ class AscendLMCacheEngine(LMCacheEngine):
                     tuple(remote_ranges),
                     remote_ready_events,
                 )
-                self._schedule_remote_fill_batch(
-                    state, remote_batch, len(tokens)
-                )
+                if remote_fill:
+                    self._schedule_remote_fill_batch(
+                        state, remote_batch, len(tokens)
+                    )
+                else:
+                    state.remote_fill_deferred_batches.append(remote_batch)
+                    state.remote_fill_deferred_pages += len(remote_batch.keys)
+                    state.remote_fill_deferred_bytes += sum(
+                        map(sum, remote_batch.sizes)
+                    )
+                    _log_remote_fill_producer_fence_state(
+                        req_id,
+                        "retain_deferred_sources",
+                        final=final,
+                        reason="awaiting_final_request_handoff",
+                        token_end=len(tokens),
+                        complete_fence_count=0,
+                        complete_fence_token_end=(
+                            state.source_ready_events_token_end
+                        ),
+                        event_source=state.source_ready_event_source,
+                        transfer_id=state.remote_fill_handoff.transfer_id,
+                        slot_mapping_base=slot_mapping_base,
+                        deferred_batch_count=len(
+                            state.remote_fill_deferred_batches
+                        ),
+                        deferred_pages=state.remote_fill_deferred_pages,
+                        deferred_bytes=state.remote_fill_deferred_bytes,
+                        submitted_end=dict(sorted(state.submitted_end.items())),
+                    )
 
         # Final publication is also the chunked-prefill correctness fence.
         if final:
