@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 from weakref import WeakSet
 import json
+import logging
 import os
 import queue
 import secrets
@@ -115,6 +116,31 @@ from lmcache_ascend.v1.remote_fill_producer import (
 
 logger = init_logger(__name__)
 REMOTE_FILL_DEFAULT_CONTROL_PORT = 19000
+
+
+def _log_remote_fill_producer_fence_state(
+    req_id: str,
+    decision: str,
+    **fields: object,
+) -> None:
+    """Emit a structured producer fence decision without tensor addresses."""
+
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    logger.info(
+        "[LMCACHE_REMOTE_FILL] %s",
+        json.dumps(
+            {
+                "schema": 1,
+                "event": "remote_fill_producer_fence_state",
+                "req_id": req_id,
+                "decision": decision,
+                **fields,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _remote_fill_advertise_host_from_session(remote_session: str) -> str:
@@ -229,6 +255,7 @@ class _DirectStoreRequestState:
     remote_fill_backlog_logged: bool = False
     remote_fill_terminal: Optional[RemoteFillTerminalResult] = None
     remote_fill_disabled_reason: str = ""
+    remote_fill_fence_deferred: bool = False
     remote_fill_metrics_started: bool = False
     remote_fill_viable_counted: bool = False
     remote_fill_active_counted: bool = False
@@ -3205,20 +3232,107 @@ class AscendLMCacheEngine(LMCacheEngine):
             state, len(tokens)
         )
         if remote_fill and not remote_ready_events:
-            state.remote_fill_disabled_reason = "incomplete_producer_fence"
-            self._get_remote_fill_producer_metrics().abandon(
-                "incomplete producer fence"
-            )
+            log_fence_transition = final or not state.remote_fill_fence_deferred
+            if final:
+                state.remote_fill_disabled_reason = "incomplete_producer_fence"
+                self._get_remote_fill_producer_metrics().abandon(
+                    "incomplete producer fence"
+                )
+            else:
+                # The complete DSA producer fence is exported by the final
+                # request-matched handoff. Earlier chunk callbacks must keep
+                # persistence moving without permanently poisoning that later
+                # proof.
+                state.remote_fill_fence_deferred = True
+            if log_fence_transition:
+                _log_remote_fill_producer_fence_state(
+                    req_id,
+                    "reject_final" if final else "defer_nonfinal",
+                    final=final,
+                    reason=(
+                        "incomplete_producer_fence"
+                        if final
+                        else "awaiting_final_request_handoff"
+                    ),
+                    token_end=len(tokens),
+                    complete_fence_count=0,
+                    complete_fence_token_end=(
+                        state.source_ready_events_token_end
+                    ),
+                    event_source=state.source_ready_event_source,
+                    transfer_id=state.remote_fill_handoff.transfer_id,
+                    slot_mapping_base=slot_mapping_base,
+                    submitted_end=dict(sorted(state.submitted_end.items())),
+                )
             remote_fill = False
+        replay_deferred_prefix = False
+        if remote_fill and state.remote_fill_fence_deferred:
+            if slot_mapping_base != 0:
+                # Replaying already-persisted pages is safe only while the
+                # producer still exposes the request-owned full-prefix mapping.
+                state.remote_fill_disabled_reason = (
+                    "deferred_prefix_unaddressable"
+                )
+                self._get_remote_fill_producer_metrics().abandon(
+                    "deferred prefix is outside the source mapping"
+                )
+                _log_remote_fill_producer_fence_state(
+                    req_id,
+                    "reject_deferred_prefix_unaddressable",
+                    final=final,
+                    reason=state.remote_fill_disabled_reason,
+                    token_end=len(tokens),
+                    complete_fence_count=len(remote_ready_events),
+                    complete_fence_token_end=(
+                        state.source_ready_events_token_end
+                    ),
+                    event_source=state.source_ready_event_source,
+                    transfer_id=state.remote_fill_handoff.transfer_id,
+                    slot_mapping_base=slot_mapping_base,
+                    submitted_end=dict(sorted(state.submitted_end.items())),
+                )
+                remote_fill = False
+            else:
+                replay_deferred_prefix = True
+                state.remote_fill_fence_deferred = False
         for group in group_caches:
             if group not in state.submitted_end:
                 state.submitted_end[group] = verified_prefix_end
                 state.committed_end[group] = verified_prefix_end
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
         cpu_fallback_s = 0.0
-        plans = self._direct_suffix_plans(
-            state, tokens, group_caches, request_configs
-        )
+        if replay_deferred_prefix:
+            full_end = len(tokens) // int(self.config.chunk_size) * int(
+                self.config.chunk_size
+            )
+            plans = self._remote_fill_prefix_plans(
+                tokens, request_configs, full_end
+            )
+            if plans[0]:
+                state.planned_end = plans[0][-1][1]
+                state.planned_hash = plans[0][-1][2].chunk_hash
+            _log_remote_fill_producer_fence_state(
+                req_id,
+                "replay_deferred_prefix",
+                final=final,
+                reason="complete_request_matched_fence",
+                token_end=len(tokens),
+                complete_fence_count=len(remote_ready_events),
+                complete_fence_token_end=(
+                    state.source_ready_events_token_end
+                ),
+                event_source=state.source_ready_event_source,
+                transfer_id=state.remote_fill_handoff.transfer_id,
+                slot_mapping_base=slot_mapping_base,
+                replay_start=0,
+                replay_end=full_end,
+                replay_page_pairs=len(plans[0]),
+                submitted_end=dict(sorted(state.submitted_end.items())),
+            )
+        else:
+            plans = self._direct_suffix_plans(
+                state, tokens, group_caches, request_configs
+            )
         if remote_fill:
             probe_target = verified_prefix_end // int(self.config.chunk_size) * int(
                 self.config.chunk_size
@@ -3301,7 +3415,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             group_candidates = [
                 (start, end, key)
                 for start, end, key in plans[group]
-                if end > submitted and end - start == chunk_size
+                if (replay_deferred_prefix or end > submitted)
+                and end - start == chunk_size
             ]
             candidates[group] = group_candidates
             candidate_refs.extend((group, item) for item in group_candidates)
