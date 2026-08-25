@@ -341,6 +341,7 @@ class _FakeLocalBackend:
             missing_keys=(),
             lock_wait_seconds=0.0,
             lock_hold_seconds=0.0,
+            retention_trace_id=17,
         )
 
 
@@ -827,6 +828,7 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     )
     assert '"inserted_keys":4' in caplog.text
     assert '"existing_keys":0' in caplog.text
+    assert '"retention_trace_id":17' in caplog.text
     assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 

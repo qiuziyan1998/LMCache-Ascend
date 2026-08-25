@@ -818,6 +818,9 @@ class AscendRemoteFillPageLifecycle:
             "inserted_keys": len(result.inserted_keys),
             "existing_keys": len(result.existing_keys),
         }
+        retention_trace_id = getattr(result, "retention_trace_id", None)
+        if isinstance(retention_trace_id, int):
+            diagnostic_fields["retention_trace_id"] = retention_trace_id
         if cold_start_perf_enabled():
             try:
                 diagnostic_fields["required_key_digest"] = content_digest(
