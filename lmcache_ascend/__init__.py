@@ -483,6 +483,7 @@ def _patch_vllm_v1_adapter():
             and getattr(engine, "kv_role", None)
             in ("kv_both", "kv_consumer")
             and getattr(config, "dsa_two_groups", False)
+            and getattr(config, "enable_sparse_attention", False)
         )
 
     vllm_lmcache_connector.LMCacheConnectorV1.supports_dsa_index_lmcache = True

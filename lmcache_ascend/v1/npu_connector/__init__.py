@@ -13,6 +13,9 @@ import torch
 
 # First Party
 from lmcache_ascend import _build_info
+from lmcache_ascend.v1.content_diagnostics import (
+    configure_npu_content_diagnostics,
+)
 
 if _build_info.__framework_name__ == "pytorch":
     # First Party
@@ -44,6 +47,9 @@ def CreateNPUConnector(
     connector implementations.
     """
     use_gpu = need_gpu_interm_buffer(config)
+    configure_npu_content_diagnostics(
+        bool(getattr(config, "enable_npu_content_diagnostics", False))
+    )
 
     num_gpus = torch.npu.device_count()
     local_rank = metadata.worker_id % num_gpus
@@ -66,6 +72,9 @@ def CreateNPUConnector(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
             conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
+            conn.enable_npu_transfer_validation = getattr(
+                config, "enable_npu_transfer_validation", True
+            )
             return conn
 
         if config.use_gpu_connector_v3:

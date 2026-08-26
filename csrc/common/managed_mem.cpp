@@ -184,8 +184,9 @@ int HostRegisteredMemoryManager::halUnregisterHostPtr(void *hostPtr) {
  * calculate the offset from the host ptr and apply to the device ptr finally we
  * return the device ptr.
  */
-void *HostRegisteredMemoryManager::getDevicePtr(void *hostPtr) {
-  if (hostPtr == nullptr) {
+void *HostRegisteredMemoryManager::getDevicePtr(void *hostPtr,
+                                                size_t requiredSize) {
+  if (hostPtr == nullptr || requiredSize == 0) {
     return nullptr;
   }
   const std::shared_lock<std::shared_mutex> guard(this->mux);
@@ -195,13 +196,11 @@ void *HostRegisteredMemoryManager::getDevicePtr(void *hostPtr) {
   for (const auto &pair : this->allocatedMap) {
     const RegisteredMemoryRecord &record = pair.second;
 
-    if (hostAddrPtr >= record.ptr &&
-        hostAddrPtr < (record.ptr + record.buffSize)) {
+    if (hostAddrPtr >= record.ptr) {
       const size_t offset = hostAddrPtr - record.ptr;
-
-      const uintptr_t deviceAddrPtr = record.devptr + offset;
-
-      return reinterpret_cast<void *>(deviceAddrPtr);
+      if (offset < record.buffSize && requiredSize <= record.buffSize - offset) {
+        return reinterpret_cast<void *>(record.devptr + offset);
+      }
     }
   }
 
@@ -390,7 +389,7 @@ int unregister_ptr(void *ptr) {
   }
 }
 
-void *get_device_ptr(void *ptr) {
+void *get_device_ptr(void *ptr, size_t requiredSize) {
   auto &hmm = lmc::HostRegisteredMemoryManager::GetInstance();
-  return hmm.getDevicePtr(ptr);
+  return hmm.getDevicePtr(ptr, requiredSize);
 };

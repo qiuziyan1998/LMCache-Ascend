@@ -31,6 +31,116 @@ def _load_benchmark_module():
     return module
 
 
+def _evidence_manifest(benchmark):
+    hashes = benchmark.correctness_hashes(
+        prompt="deterministic prompt",
+        token_ids=[1, 2, 3],
+        first_token_logits=[0.125, -0.25],
+        output_token_ids=[4, 5],
+    )
+    return {
+        "model": "/workspace/models/GLM-5.1-w4a8",
+        "prompt_hash": hashes["prompt_sha256"],
+        "tp": 8,
+        "dp": 2,
+        "mtp": True,
+        "page_layout": "mooncake_page_first_multi_buffer",
+        "network": {"transport": "rdma", "hosts": 2},
+        "bytes": {"group_0": 123, "group_1": 45},
+        "outputs": hashes,
+        "ttft_ms": [],
+        "tpot_ms": [],
+        "peak_npu_memory_bytes": [],
+    }
+
+
+def test_evidence_contract_has_fixed_matrix_fresh_namespaces_and_hashes() -> None:
+    benchmark = _load_benchmark_module()
+    manifest = _evidence_manifest(benchmark)
+    report = benchmark.build_evidence_contract(
+        manifest,
+        "python production_decode.py --prompt-file prompt.json --max-tokens 32",
+        repetitions=3,
+    )
+
+    assert report["schema"] == 1
+    assert report["matrix"] == {
+        "num_tokens": [18_878, 120_000],
+        "chunk_sizes": [256, 512, 1024],
+        "repetitions": 3,
+    }
+    commands = report["commands"]
+    assert len(commands) == 2 * 2 * 3 * 3
+    namespaces = [item["namespace"] for item in commands]
+    # Diagnostic/final modes intentionally address disjoint cache namespaces.
+    assert len(namespaces) == len(set(namespaces))
+    assert {item["prompt_hash"] for item in commands} == {
+        manifest["prompt_hash"]
+    }
+    assert {item["token_hash"] for item in commands} == {
+        manifest["outputs"]["token_ids_sha256"]
+    }
+    assert all("LMCACHE_CHUNK_SIZE" in item["command"] for item in commands)
+    assert all("synthetic" not in item["command"] for item in commands)
+    diagnostic = [item for item in commands if item["mode"] == "diagnostic"]
+    final = [item for item in commands if item["mode"] == "final_ttft"]
+    assert all("LMCACHE_COLD_START_PERF='1'" in item["command"] for item in diagnostic)
+    assert all("LMCACHE_COLD_START_PERF='0'" in item["command"] for item in final)
+    assert report["comparison_rules"]["ttft_authority"] == "final_ttft mode only"
+
+
+def test_evidence_contract_rejects_incomplete_or_wrong_topology_manifest() -> None:
+    benchmark = _load_benchmark_module()
+    manifest = _evidence_manifest(benchmark)
+    del manifest["peak_npu_memory_bytes"]
+    with pytest.raises(ValueError, match="peak_npu_memory_bytes"):
+        benchmark.build_evidence_contract(manifest, "python production_decode.py")
+
+    manifest = _evidence_manifest(benchmark)
+    manifest["dp"] = 1
+    with pytest.raises(ValueError, match="TP8 and DP2"):
+        benchmark.build_evidence_contract(manifest, "python production_decode.py")
+
+
+def test_filtered_evidence_json_has_one_timeline_and_exclusive_mooncake() -> None:
+    benchmark = _load_benchmark_module()
+    lines = [
+        'noise before payload',
+        '[LMCACHE_COLD_PERF] {"schema":1,"event":"metadata_prepare",'
+        '"req_id":"r1","pid":1,"monotonic_ms":1,"elapsed_ms":2}',
+        '[LMCACHE_COLD_PERF] {"schema":1,"event":"mooncake_page_lookup",'
+        '"req_id":"r1","pid":1,"monotonic_ms":2,"elapsed_ms":3}',
+        '[LMCACHE_COLD_PERF] {"schema":1,"event":"mooncake_page_get",'
+        '"req_id":"r1","pid":1,"monotonic_ms":3,"elapsed_ms":7}',
+        '[LMCACHE_COLD_PERF] {"schema":1,"event":"remote_resolver",'
+        '"req_id":"r1","pid":1,"monotonic_ms":4,"elapsed_ms":15}',
+        '[LMCACHE_COLD_PERF] {"schema":1,"event":"worker_load_complete",'
+        '"req_id":"r1","pid":1,"monotonic_ms":5,"elapsed_ms":20}',
+        '[LMCACHE_COLD_PERF] {"schema":1,"event":"worker_load_complete",'
+        '"req_id":"other","pid":1,"monotonic_ms":6,"elapsed_ms":99}',
+    ]
+    timeline = benchmark.filter_request_timeline(
+        benchmark.parse_cold_perf_jsonl(lines), "r1"
+    )
+
+    assert timeline["req_id"] == "r1"
+    assert {item["req_id"] for item in timeline["events"]} == {"r1"}
+    assert timeline["nested_mooncake_ms"] == pytest.approx(10)
+    assert timeline["resolver_wall_ms"] == pytest.approx(15)
+    assert timeline["exclusive_stages_ms"]["resolver_cpu_ms"] == pytest.approx(5)
+    assert timeline["exclusive_stages_ms"]["lookup_ms"] == pytest.approx(3)
+    assert timeline["exclusive_stages_ms"]["transfer_ms"] == pytest.approx(7)
+    # The critical wall is the outer worker completion only; nested stages are
+    # diagnostic attribution and are never summed back into it.
+    assert timeline["critical_total_ms"] == pytest.approx(20)
+
+
+def test_evidence_statistics_use_median_and_nearest_rank_p95() -> None:
+    benchmark = _load_benchmark_module()
+    summary = benchmark.summarize_evidence_samples([1, 2, 3, 4, 100])
+    assert summary == {"median": 3, "p95_nearest_rank": 100}
+
+
 def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse(
     monkeypatch,
 ):
@@ -83,6 +193,58 @@ def test_cold_bootstrap_benchmark_preserves_page_first_topology_and_warm_reuse(
         assert result.resolver_classification_s > 0
         assert result.resolver_validation_s == 0
         assert result.resolver_rollback_s == 0
+
+
+@pytest.mark.parametrize("chunk_size", [256, 512, 1024])
+def test_partial_tail_is_one_merged_mooncake_page(
+    monkeypatch, chunk_size
+) -> None:
+    benchmark = _load_benchmark_module()
+    page_keys = []
+    make_page_key = benchmark.mooncake_page_key
+
+    def capture_page_key(key, num_layers):
+        page_key = make_page_key(key, num_layers)
+        page_keys.append((key, page_key))
+        return page_key
+
+    monkeypatch.setattr(benchmark, "mooncake_page_key", capture_page_key)
+    monitor = SimpleNamespace(
+        on_pin=lambda _obj: None,
+        on_pin_many=lambda _objs: None,
+        on_unpin=lambda _obj: None,
+    )
+    monkeypatch.setattr(
+        benchmark.PinMonitor,
+        "GetOrCreate",
+        lambda _config=None: monitor,
+    )
+    args = SimpleNamespace(
+        num_tokens=chunk_size + chunk_size // 2,
+        chunk_size=chunk_size,
+        num_layers=3,
+        latent_bytes_per_token=8,
+        indexer_bytes_per_token=4,
+        remote_gbps=0.0,
+        rpc_overhead_us=0.0,
+        object_mode="synthetic",
+        kv_groups=[0, 1],
+    )
+
+    result = benchmark.run_once(args, kv_group=0, prefix_mode="batched")
+
+    assert result.mooncake_page_objects == 2
+    assert result.partial_page_objects == 1
+    assert result.partial_buffer_bytes == chunk_size // 2 * 8
+    assert result.remote_transfer_calls == 1
+    assert result.remote_lookup_calls == 1
+    assert result.lmcache_memory_objects == 6
+    assert result.remote_logical_keys == 6
+    assert result.transferred_bytes == (chunk_size + chunk_size // 2) * 8 * 3
+    assert len(page_keys) == 2
+    tail_key, tail_page_key = page_keys[-1]
+    assert dict(tail_key.tags)["internal.valid_tokens"] == chunk_size // 2
+    assert tail_page_key == make_page_key(tail_key, 3)
 
 
 def test_resolver_timing_hook_covers_all_production_stages() -> None:
