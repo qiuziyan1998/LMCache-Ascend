@@ -1869,6 +1869,7 @@ def test_direct_prefill_uses_window_relative_save_mappings() -> None:
     }
     assert calls[0][1]["slot_mapping_base"] == 256
     assert calls[0][1]["verified_prefix_end"] == 0
+    assert calls[0][1]["accepted_store_end"] == 512
 
     request.load_spec = SimpleNamespace(lmcache_cached_tokens=256)
     _ascend_adapter_method("_submit_direct_prefill_requests")(
@@ -2280,13 +2281,61 @@ def test_group1_direct_store_rejects_current_stream_event_fallback() -> None:
         )
 
 
+def test_direct_store_retains_causal_join_through_exact_token_frontier() -> None:
+    event = object()
+    state = SimpleNamespace(
+        source_ready_event=None,
+        source_ready_event_source="missing",
+        source_ready_token_end=0,
+        source_ready_events=(),
+        source_ready_events_token_end=0,
+    )
+
+    AscendLMCacheEngine._remember_direct_source_readiness(
+        state,
+        1024,
+        event,
+        "forward_context.sfa_reshape_cache_event",
+        (event, event),
+    )
+
+    assert state.source_ready_events == (event,)
+    assert state.source_ready_events_token_end == 1024
+    assert AscendLMCacheEngine._direct_source_ready_events(state, 1024) == (
+        event,
+    )
+    assert AscendLMCacheEngine._direct_source_ready_events(state, 1025) == ()
+
+
+def test_singleton_readiness_does_not_claim_complete_remote_fill_fence() -> None:
+    event = object()
+    state = SimpleNamespace(
+        source_ready_event=None,
+        source_ready_event_source="missing",
+        source_ready_token_end=0,
+        source_ready_events=(),
+        source_ready_events_token_end=0,
+    )
+
+    AscendLMCacheEngine._remember_direct_source_readiness(
+        state,
+        1024,
+        event,
+        "attn_metadata.reshape_cache_event",
+    )
+
+    assert state.source_ready_event is event
+    assert state.source_ready_token_end == 1024
+    assert AscendLMCacheEngine._direct_source_ready_events(state, 1024) == ()
+
+
 def test_save_layer_carries_final_indexer_producer_event() -> None:
     event = object()
     submitted = []
     request = SimpleNamespace(req_id="request")
     adapter = _ascend_adapter_fake(
         config=SimpleNamespace(dsa_two_groups=True),
-        _latent_layer_names=("model.layers.0.self_attn",),
+        _latent_layer_names=("model.layers.0.self_attn.attn",),
         _indexer_layer_names=("model.layers.0.self_attn.indexer.k_cache",),
         _direct_prefill_requests=lambda: [request],
         _preflight_direct_store=lambda _requests: True,
@@ -2296,11 +2345,15 @@ def test_save_layer_carries_final_indexer_producer_event() -> None:
         _latest_live_source_ready_event=None,
         _latest_live_source_ready_event_source="missing",
     )
-    metadata = SimpleNamespace(reshape_cache_event=event)
+    metadata = {
+        "model.layers.0.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=event
+        )
+    }
 
     _ascend_adapter_method("save_kv_layer")(
         adapter,
-        "model.layers.0.self_attn",
+        "model.layers.0.self_attn.attn",
         object(),
         metadata,
     )
@@ -2317,7 +2370,73 @@ def test_save_layer_carries_final_indexer_producer_event() -> None:
     assert submitted[0][1]["source_ready_event_source"] == (
         "attn_metadata.reshape_cache_event"
     )
+    assert submitted[0][1]["source_ready_events"] == (event,)
     assert adapter._latest_live_source_ready_event is None
+
+
+def test_save_layer_preserves_distinct_group_producer_fences() -> None:
+    latent_event = object()
+    index_event = object()
+    submitted = []
+    request = SimpleNamespace(req_id="request")
+    adapter = _ascend_adapter_fake(
+        config=SimpleNamespace(dsa_two_groups=True),
+        _latent_layer_names=("latent",),
+        _indexer_layer_names=("index",),
+        _direct_prefill_requests=lambda: [request],
+        _preflight_direct_store=lambda _requests: True,
+        _submit_direct_prefill_requests=lambda requests, **kwargs: submitted.append(
+            (requests, kwargs)
+        ),
+        _latest_live_source_ready_event=None,
+        _latest_live_source_ready_event_source="missing",
+    )
+
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "latent",
+        object(),
+        SimpleNamespace(reshape_cache_event=latent_event),
+    )
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "index",
+        object(),
+        SimpleNamespace(reshape_cache_event=index_event),
+    )
+
+    assert submitted[0][1]["source_ready_events"] == (
+        latent_event,
+        index_event,
+    )
+
+
+def test_save_layer_retains_callback_fence_for_remote_fill_finish() -> None:
+    event = object()
+    request = SimpleNamespace(
+        req_id="request",
+        _lmcache_remote_fill_qualified=True,
+    )
+    adapter = _ascend_adapter_fake(
+        config=SimpleNamespace(dsa_two_groups=False),
+        _remote_store_requested=True,
+        _latent_layer_names=("latent",),
+        _indexer_layer_names=(),
+        _direct_prefill_requests=lambda: [request],
+        _preflight_direct_store=lambda _requests: True,
+        _submit_direct_prefill_requests=lambda *_args, **_kwargs: None,
+    )
+
+    _ascend_adapter_method("save_kv_layer")(
+        adapter,
+        "latent",
+        object(),
+        SimpleNamespace(reshape_cache_event=event),
+    )
+
+    assert adapter._direct_store_observed_layers == {"latent"}
+    assert adapter._latest_live_source_ready_event is event
+    assert adapter._latest_direct_source_ready_events == {"latent": event}
 
 
 def test_source_ready_event_uses_matching_layer_metadata() -> None:
@@ -2330,6 +2449,47 @@ def test_source_ready_event_uses_matching_layer_metadata() -> None:
     source_event = _ascend_adapter_method("_source_ready_event")
     assert source_event("layer.1", metadata) is expected
     assert source_event("missing", metadata) is None
+
+
+def test_source_ready_event_resolves_unbundled_indexer_sibling() -> None:
+    expected = object()
+    metadata = {
+        "model.layers.0.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=expected
+        ),
+        "model.layers.1.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=object()
+        ),
+    }
+
+    source_event = _ascend_adapter_method("_source_ready_event")
+    assert (
+        source_event(
+            "model.layers.0.self_attn.indexer.k_cache",
+            metadata,
+        )
+        is expected
+    )
+
+
+def test_source_ready_event_rejects_ambiguous_indexer_sibling() -> None:
+    metadata = {
+        "model.layers.0.self_attn.attn": SimpleNamespace(
+            reshape_cache_event=object()
+        ),
+        "model.layers.0.self_attn.mla": SimpleNamespace(
+            reshape_cache_event=object()
+        ),
+    }
+
+    source_event = _ascend_adapter_method("_source_ready_event")
+    assert (
+        source_event(
+            "model.layers.0.self_attn.indexer.k_cache",
+            metadata,
+        )
+        is None
+    )
 
 
 def test_save_batch_does_not_rebuild_completed_live_descriptor() -> None:
@@ -3034,6 +3194,306 @@ def test_live_source_is_published_to_following_connector(monkeypatch) -> None:
     assert request.kv_transfer_params["ascend_live_split_source_v1"] == {
         "descriptors": [descriptor]
     }
+
+
+def test_remote_fill_terminal_is_returned_without_private_capabilities(
+    monkeypatch,
+) -> None:
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "request_finished",
+        lambda *_args: (False, {"first_tok": 7}),
+    )
+    terminal = {
+        "transfer_id": "transfer",
+        "outcome": "LOCAL_FULL",
+        "persistent_common_end": 4096,
+        "required_store_end": 4096,
+    }
+    adapter = _ascend_adapter_fake(
+        _scheduler_live_sources={},
+        _scheduler_remote_fill_results={"request": terminal},
+        _vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=8,
+                data_parallel_index=1,
+            )
+        ),
+        store_async=True,
+        kv_role="kv_producer",
+    )
+    request = SimpleNamespace(
+        request_id="request",
+        kv_transfer_params={
+            "do_remote_decode": True,
+            "remote_engine_id": "decoder",
+            "lmcache.remote_fill": {
+                "transfer_id": "transfer",
+                "request_attempt": 1,
+                "source_engine_id": "prefiller",
+                "destination_engine_id": "decoder",
+                "destination_engine_epoch": 2,
+                "control_endpoint": "tcp://private:19001",
+                "destination_dp_rank": 1,
+                "shared_cache_generation": 3,
+                "destination_tp_size": 8,
+                "destination_dp_size": 2,
+                "global_te_push": True,
+                "token_hash_algorithm": "sha256",
+                "python_hash_seed": "",
+                "capability_mac": "must-not-leak",
+                "destination_ptr": 1234,
+            },
+        },
+    )
+
+    delay_free, returned = _ascend_adapter_method("request_finished")(
+        adapter, request, []
+    )
+
+    assert delay_free is True
+    assert returned["first_tok"] == 7
+    assert returned["do_remote_decode"] is True
+    assert returned["remote_engine_id"] == "decoder"
+    public = returned["lmcache.remote_fill"]
+    assert public["terminal"] == terminal
+    assert "control_endpoint" not in public
+    assert "capability_mac" not in public
+    assert "destination_ptr" not in public
+
+
+def _adapter_remote_fill_request_configs() -> dict:
+    return {
+        "lmcache.remote_fill": {
+            "transfer_id": "transfer",
+            "request_attempt": 1,
+            "source_engine_id": "prefiller",
+            "destination_engine_id": "decoder",
+            "destination_engine_epoch": 7,
+            "control_endpoint": "tcp://decoder:19001",
+            "destination_dp_rank": 0,
+            "shared_cache_generation": 3,
+            "destination_tp_size": 8,
+            "destination_dp_size": 1,
+            "global_te_push": True,
+            "token_hash_algorithm": "sha256",
+            "python_hash_seed": "",
+        }
+    }
+
+
+def test_remote_fill_persistence_uses_prefiller_local_default() -> None:
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        _prepare_remote_fill_persistent_placement,
+    )
+    request_configs = _adapter_remote_fill_request_configs()
+    request_configs["lmcache.mooncake_preferred_segment"] = "decoder-host"
+
+    assert _prepare_remote_fill_persistent_placement(request_configs) is True
+    assert "lmcache.mooncake_preferred_segment" not in request_configs
+
+    ordinary = {"lmcache.mooncake_preferred_segment": "decoder-host"}
+    assert _prepare_remote_fill_persistent_placement(ordinary) is False
+    assert ordinary["lmcache.mooncake_preferred_segment"] == "decoder-host"
+
+
+def test_remote_fill_disabled_preserves_legacy_group_selection() -> None:
+    request_configs = _adapter_remote_fill_request_configs()
+    request_configs["lmcache.remote_fill"]["transfer_id"] = "stale-transfer"
+    request_configs["lmcache.mooncake_preferred_segment"] = (
+        "legacy-decoder-host"
+    )
+    adapter = _ascend_adapter_fake(_remote_store_requested=False)
+    request = SimpleNamespace(
+        request_configs=request_configs,
+        save_spec=SimpleNamespace(
+            can_save_latent=False,
+            can_save_indexer=False,
+        ),
+    )
+
+    assert (
+        request_configs["lmcache.mooncake_preferred_segment"]
+        == "legacy-decoder-host"
+    )
+    assert _ascend_adapter_method("_direct_selected_groups")(
+        adapter,
+        request,
+        {0: ["latent"], 1: ["indexer"]},
+    ) == {}
+
+
+def test_remote_fill_disabled_stale_handoff_does_not_disable_live_source(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter."
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    calls = []
+    engine = SimpleNamespace(
+        discard_live_source_descriptor=lambda *_args: pytest.fail(
+            "an unqualified remote-fill hint must not disable legacy live source"
+        ),
+        begin_live_source_descriptor=lambda *args: calls.append(("begin", args)),
+        capture_live_source_step=lambda *args: calls.append(("capture", args)),
+        finalize_live_source_descriptor=lambda *args: (
+            calls.append(("finalize", args)) or True
+        ),
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            ("store", args, kwargs)
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(dsa_two_groups=True),
+        _remote_store_requested=False,
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["latent"], 1: ["indexer"]},
+            {0: "latent-slots", 1: "indexer-slots"},
+            0,
+        ),
+    )
+    request_configs = _adapter_remote_fill_request_configs()
+    request_configs["lmcache.mooncake_preferred_segment"] = "legacy-decoder"
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2, 3],
+        slot_mapping=["latent-slots"],
+        indexer_slot_mapping=["indexer-slots"],
+        save_slot_mapping_base=0,
+        save_spec=None,
+        load_spec=None,
+        request_configs=request_configs,
+        live_source_requested=True,
+        is_last_prefill=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter,
+        [request],
+        source_ready_event=object(),
+    )
+
+    assert [item[0] for item in calls] == [
+        "begin",
+        "capture",
+        "finalize",
+        "store",
+    ]
+    assert calls[-1][2]["final"] is True
+    assert request_configs["lmcache.mooncake_preferred_segment"] == (
+        "legacy-decoder"
+    )
+
+
+def test_remote_fill_selects_both_authoritative_groups() -> None:
+    adapter = _ascend_adapter_fake(_remote_store_requested=True)
+    request = SimpleNamespace(
+        request_configs=_adapter_remote_fill_request_configs(),
+        save_spec=SimpleNamespace(
+            can_save_latent=False,
+            can_save_indexer=False,
+        ),
+    )
+    groups = {0: ["latent"], 1: ["indexer"]}
+
+    selected = _ascend_adapter_method("_direct_selected_groups")(
+        adapter, request, groups
+    )
+
+    assert selected == groups
+
+
+@pytest.mark.parametrize(
+    ("is_last_prefill", "expected_final"),
+    [(False, False), (True, True)],
+)
+def test_remote_fill_submission_is_owned_by_finish_batch(
+    is_last_prefill: bool,
+    expected_final: bool,
+) -> None:
+    calls = []
+    engine = SimpleNamespace(
+        discard_live_source_descriptor=lambda *_args: None,
+        direct_prefill_store_enabled=lambda: True,
+        store_direct_prefill=lambda *args, **kwargs: calls.append(
+            (args, kwargs)
+        ),
+    )
+    adapter = _ascend_adapter_fake(
+        lmcache_engine=engine,
+        config=SimpleNamespace(
+            dsa_two_groups=True,
+            remote_fill_submission_mode="per_chunk",
+        ),
+        _remote_store_requested=True,
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
+        _direct_request_inputs=lambda *_args: (
+            {0: ["latent"], 1: ["indexer"]},
+            {0: "latent-slots", 1: "indexer-slots"},
+            16384,
+        ),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=list(range(18878)),
+        request_configs=_adapter_remote_fill_request_configs(),
+        load_spec=None,
+        live_source_requested=True,
+        is_last_prefill=is_last_prefill,
+        _lmcache_remote_fill_qualified=True,
+    )
+
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter,
+        [request],
+    )
+    assert calls == []
+    event = object()
+    _ascend_adapter_method("_submit_direct_prefill_requests")(
+        adapter,
+        [request],
+        finish_batch=True,
+        source_ready_event=event,
+        source_ready_event_source="forward_context.sfa_reshape_cache_event",
+        source_ready_events=(event,),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["final"] is expected_final
+    assert calls[0][1]["source_ready_events"] == (event,)
+
+
+def test_remote_fill_rebuilds_probe_keys_for_full_prefix_hit() -> None:
+    class _TokenDatabase:
+        def process_tokens(self, **kwargs):
+            group = kwargs["kv_group"]
+            if group == 0:
+                assert len(kwargs["tokens"]) == 1024
+            else:
+                assert kwargs["hashes"] == [91]
+                assert kwargs["offsets"] == [1024]
+            return [(0, 1024, SimpleNamespace(chunk_hash=91, kv_group=group))]
+
+    engine = SimpleNamespace(token_database=_TokenDatabase())
+    plans = AscendLMCacheEngine._remote_fill_prefix_plans(
+        engine,
+        list(range(1024)),
+        {"lmcache.remote_fill": {"transfer_id": "transfer"}},
+        1024,
+    )
+
+    assert set(plans) == {0, 1}
+    assert plans[0][0][:2] == (0, 1024)
+    assert plans[1][0][:2] == (0, 1024)
 
 
 def test_failed_direct_preflight_uses_overlapped_layerwise_store(monkeypatch) -> None:

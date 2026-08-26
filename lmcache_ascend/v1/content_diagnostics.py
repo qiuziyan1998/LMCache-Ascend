@@ -23,7 +23,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 # Third Party
 from lmcache.logging import init_logger
@@ -47,6 +47,8 @@ _REQUEST_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _GROUP0_SOURCE_PROBES: OrderedDict[
     tuple[str, int], "_Group0SourceProbe"
 ] = OrderedDict()
+_STORE_PROBE_STREAMS: dict[int, Any] = {}
+_PENDING_STORE_PROBES: list["_PendingStoreProbe"] = []
 
 
 @dataclass(slots=True)
@@ -75,6 +77,29 @@ class _DeferredSnapshot:
     group0_source_probes: tuple[_Group0SourceProbe, ...] | None = None
 
 
+@dataclass(slots=True)
+class _PendingStoreProbe:
+    """Deferred store-time source probe captured on an independent stream.
+
+    ``as_put`` rows mirror the persistent put's actual fence contract (the
+    producer events handed to the connector), while ``producer_fenced`` rows
+    additionally wait on the attention producer events the put could have
+    used.  Both captures are device-side only; host readback happens at flush
+    time on the probe's own stream, so the probe can neither synchronize nor
+    reorder the serving or store workflow.
+    """
+
+    req_id: str
+    stream: Any
+    page_ranges: tuple[tuple[int, int], ...]
+    put_producer_event_count: int
+    producer_fence_events: tuple[Any, ...]
+    ready_event_source: str
+    tokens_by_group: dict[int, list[int]]
+    slot_tensors: dict[int, Any]
+    rows: dict[tuple[str, int, int, int], torch.Tensor]
+
+
 def configure_npu_content_diagnostics(enabled: bool) -> None:
     """Configure the process-local diagnostic gate from LMCache config.
 
@@ -94,6 +119,7 @@ def configure_npu_content_diagnostics(enabled: bool) -> None:
             _SEEN.clear()
             _REQUEST_SPECS.clear()
             _GROUP0_SOURCE_PROBES.clear()
+            _PENDING_STORE_PROBES.clear()
     _configure_vllm_diagnostic_bridge(_ENABLED)
     if _ENABLED:
         _content_log(
@@ -316,6 +342,654 @@ def _wire_fingerprint(result: dict[str, Any]) -> dict[str, Any]:
         "combined_hash": result["combined_hash"],
         "readback_may_synchronize": True,
     }
+
+
+def _store_probe_stream(device: torch.device) -> Any:
+    """Return the per-device stream used for store-time source probes.
+
+    The stream is deliberately independent of every compute stream: a probe
+    enqueued on it carries no ordering dependency on attention scatter work,
+    which is exactly the read contract of the transfer engine's fenced DMA.
+    """
+    index = device.index if device.index is not None else torch.npu.current_device()
+    with _STATE_LOCK:
+        stream = _STORE_PROBE_STREAMS.get(int(index))
+        if stream is None:
+            stream = torch.npu.Stream(device=int(index))
+            _STORE_PROBE_STREAMS[int(index)] = stream
+        return stream
+
+
+def _wait_probe_event(stream: Any, event: Any) -> None:
+    """Order the probe stream behind a producer event without host sync."""
+    wait_event = getattr(stream, "wait_event", None)
+    if callable(wait_event):
+        wait_event(event)
+        return
+    event.wait(stream)
+
+
+def _store_probe_layers(layers: Sequence[Any]) -> list[int]:
+    """Return the bounded first/middle/last layer sample for a KV group."""
+    num_layers = len(layers)
+    if num_layers <= 0:
+        return []
+    return _ordered_sample(
+        (0, num_layers // 2, num_layers - 1),
+        MAX_LAYER_SAMPLES,
+    )
+
+
+def _store_probe_planes(entry: Any) -> tuple[Any, ...]:
+    """Normalize one per-layer cache entry into its tensor planes."""
+    if isinstance(entry, (tuple, list)):
+        return tuple(entry)
+    return (entry,)
+
+
+def queue_store_time_source_fingerprint(
+    *,
+    req_id: str,
+    group_caches: Mapping[int, Sequence[Any]],
+    slot_mappings: Mapping[int, Any],
+    slot_mapping_base: int,
+    page_ranges: Sequence[tuple[int, int]],
+    put_producer_events: Any = None,
+    producer_fence_events: Any = None,
+    ready_event_source: str = "missing",
+) -> None:
+    """Queue a store-time fingerprint of the direct-store NPU source rows.
+
+    The persistent direct-NPU put synchronizes only the producer events it is
+    handed and then reads the registered source memory without any torch
+    stream ordering.  This probe mirrors that contract: ``as_put`` rows are
+    captured on an independent stream gated by exactly the events the put
+    receives, and ``producer_fenced`` rows wait on the attention producer
+    fence the put could have used.  Both captures are device-side clones, so
+    an ordering race is observed rather than masked; host readback is
+    deferred to :func:`flush_deferred_diagnostics` on the probe stream alone.
+
+    Args:
+        req_id: Request identifier for the store batch.
+        group_caches: Per-KV-group list of per-layer cache tensors or plane
+            tuples.
+        slot_mappings: Per-KV-group token-to-slot mapping for this store
+            window.
+        slot_mapping_base: Absolute token index of the mapping window start.
+        page_ranges: Absolute ``(start, end)`` token ranges of the pages in
+            the batch.
+        put_producer_events: The fence events the persistent put will
+            actually synchronize on.
+        producer_fence_events: The attention producer fence the put could
+            have used (counterfactual capture).
+        ready_event_source: Provenance of the resolved producer event.
+
+    Notes:
+        The function is a strict no-op unless the single content-diagnostic
+        config knob is enabled, and any failure is logged and swallowed.
+    """
+    if not _ENABLED or not group_caches or not page_ranges:
+        return
+    started = time.perf_counter()
+    try:
+        candidates: set[int] = set()
+        for range_start, range_end in page_ranges:
+            range_start = int(range_start)
+            range_end = int(range_end)
+            candidates.update((range_start, range_end - 1))
+            if range_end - range_start > 2:
+                candidates.add((range_start + range_end - 1) // 2)
+        tokens = _ordered_sample(candidates, MAX_LOGICAL_TOKEN_SAMPLES)
+        if not tokens:
+            return
+        device = None
+        for layers in group_caches.values():
+            for entry in layers:
+                tensor = _store_probe_planes(entry)[0]
+                if isinstance(tensor, torch.Tensor):
+                    device = tensor.device
+                    break
+            if device is not None:
+                break
+        if device is None or device.type != "npu":
+            return
+        stream = _store_probe_stream(device)
+        base = int(slot_mapping_base)
+
+        def _as_events(value: Any) -> tuple[Any, ...]:
+            if isinstance(value, (tuple, list)):
+                return tuple(event for event in value if event is not None)
+            return () if value is None else (value,)
+
+        put_events = _as_events(put_producer_events)
+        fence_events = _as_events(producer_fence_events)
+
+        tokens_by_group: dict[int, list[int]] = {}
+        slot_tensors: dict[int, Any] = {}
+        rows: dict[tuple[str, int, int, int], torch.Tensor] = {}
+        captures: list[tuple[int, int, int, torch.Tensor, Any]] = []
+        with torch.npu.stream(stream):
+            # Mirror the put's actual fence: it synchronizes exactly these
+            # events before the DMA reads registered source memory.
+            for event in put_events:
+                _wait_probe_event(stream, event)
+            for group, layers in sorted(group_caches.items()):
+                mapping = (
+                    slot_mappings.get(group)
+                    if hasattr(slot_mappings, "get")
+                    else None
+                )
+                if not isinstance(mapping, torch.Tensor):
+                    continue
+                group_tokens = [
+                    token
+                    for token in tokens
+                    if 0 <= token - base < int(mapping.numel())
+                ]
+                if not group_tokens:
+                    continue
+                index_tensor = torch.tensor(
+                    [token - base for token in group_tokens],
+                    dtype=torch.long,
+                    device=mapping.device,
+                )
+                slot_tensor = (
+                    mapping.detach()
+                    .reshape(-1)
+                    .index_select(0, index_tensor)
+                    .long()
+                )
+                slot_gpu = slot_tensor.to(device)
+                tokens_by_group[int(group)] = group_tokens
+                slot_tensors[int(group)] = slot_gpu
+                for layer_id in _store_probe_layers(layers):
+                    entry = layers[int(layer_id)]
+                    for plane_index, plane in enumerate(
+                        _store_probe_planes(entry)
+                    ):
+                        if (
+                            not isinstance(plane, torch.Tensor)
+                            or plane.ndim < 2
+                        ):
+                            continue
+                        # Match the attention scatter's own flattened view
+                        # so slot indices address exactly the bytes the DMA
+                        # reads for this (layer, token).
+                        flat = plane.detach().reshape(-1, plane.shape[-1])
+                        captures.append(
+                            (
+                                int(group),
+                                int(layer_id),
+                                plane_index,
+                                flat,
+                                slot_gpu,
+                            )
+                        )
+                        rows[("as_put", int(group), int(layer_id), plane_index)] = (
+                            flat.index_select(0, slot_gpu).detach()
+                        )
+            if fence_events and captures:
+                for event in fence_events:
+                    _wait_probe_event(stream, event)
+                for group, layer_id, plane_index, flat, slot_gpu in captures:
+                    rows[
+                        ("producer_fenced", group, layer_id, plane_index)
+                    ] = flat.index_select(0, slot_gpu).detach()
+
+        probe = _PendingStoreProbe(
+            req_id=str(req_id),
+            stream=stream,
+            page_ranges=tuple(
+                (int(range_start), int(range_end))
+                for range_start, range_end in page_ranges
+            ),
+            put_producer_event_count=len(put_events),
+            producer_fence_events=fence_events,
+            ready_event_source=str(ready_event_source),
+            tokens_by_group=tokens_by_group,
+            slot_tensors=slot_tensors,
+            rows=rows,
+        )
+        dropped = None
+        with _STATE_LOCK:
+            if len(_PENDING_STORE_PROBES) >= MAX_PENDING_SNAPSHOTS:
+                dropped = _PENDING_STORE_PROBES.pop(0)
+            _PENDING_STORE_PROBES.append(probe)
+        if dropped is not None:
+            _content_log(
+                "content_diagnostic_snapshot_dropped",
+                dropped_event="store_time_source_fingerprint",
+                reason="pending_limit",
+            )
+        _content_log(
+            "store_time_source_probe_queued",
+            req_id=str(req_id),
+            tokens=tokens,
+            groups=sorted(tokens_by_group),
+            put_producer_event_count=len(put_events),
+            producer_fence_event_count=len(fence_events),
+            ready_event_source=str(ready_event_source),
+            capture_order=(
+                "as_put_on_probe_stream_then_producer_fenced_on_probe_stream"
+            ),
+            readback_mode="deferred_after_model_forward_on_probe_stream",
+            readback_may_synchronize=False,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+    except Exception as error:
+        _content_log(
+            "store_time_source_probe_error",
+            req_id=str(req_id),
+            stage="queue",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+
+
+def _flush_store_probes() -> None:
+    """Read queued store probes on their own stream and log fingerprints."""
+    with _STATE_LOCK:
+        probes = list(_PENDING_STORE_PROBES)
+        _PENDING_STORE_PROBES.clear()
+    for probe in probes:
+        started = time.perf_counter()
+        try:
+            rows_cpu: dict[tuple[str, int, int, int], torch.Tensor] = {}
+            slots_cpu: dict[int, list[int]] = {}
+            # Readback rides the probe stream so it can never order or
+            # synchronize the compute stream; the synchronize below covers
+            # only the probe's own tiny copies.
+            with torch.npu.stream(probe.stream):
+                for key, value in probe.rows.items():
+                    rows_cpu[key] = value.detach().to("cpu").contiguous()
+                for group, tensor in probe.slot_tensors.items():
+                    slots_cpu[int(group)] = (
+                        tensor.detach().to("cpu").reshape(-1).tolist()
+                    )
+            probe.stream.synchronize()
+            summaries: list[dict[str, Any]] = []
+            zero_rows = {"as_put": 0, "producer_fenced": 0}
+            total_rows = {"as_put": 0, "producer_fenced": 0}
+            for key in sorted(rows_cpu):
+                variant, group, layer_id, plane_index = key
+                group_tokens = probe.tokens_by_group.get(group, ())
+                rows = rows_cpu[key]
+                row_hashes: dict[str, str] = {}
+                zero_tokens: list[int] = []
+                for index, token in enumerate(group_tokens):
+                    if index >= int(rows.shape[0]):
+                        break
+                    row = rows[index]
+                    # Disambiguated key so prefiller-stored and decoder-loaded
+                    # rows compare mechanically across hosts: group 0 has two
+                    # planes and group 1 one, which collide under a bare
+                    # "{layer}:{token}" key.
+                    row_hashes[
+                        f"{group}:{layer_id}:{plane_index}:{int(token)}"
+                    ] = _hash_cpu_tensor(row)
+                    if int(torch.count_nonzero(row).item()) == 0:
+                        zero_tokens.append(int(token))
+                zero_rows[variant] += len(zero_tokens)
+                total_rows[variant] += len(row_hashes)
+                summaries.append(
+                    {
+                        "variant": variant,
+                        "kv_group": group,
+                        "layer_id": layer_id,
+                        "plane": plane_index,
+                        "tokens": [int(token) for token in group_tokens],
+                        "row_hashes": row_hashes,
+                        "zero_tokens": zero_tokens,
+                        "all_zero": bool(
+                            zero_tokens
+                            and len(zero_tokens) == len(row_hashes)
+                        ),
+                    }
+                )
+            _content_log(
+                "store_time_source_fingerprint",
+                req_id=probe.req_id,
+                page_ranges=[list(r) for r in probe.page_ranges],
+                put_producer_event_count=probe.put_producer_event_count,
+                producer_fence_event_count=len(probe.producer_fence_events),
+                ready_event_source=probe.ready_event_source,
+                slots={
+                    str(group): values
+                    for group, values in sorted(slots_cpu.items())
+                },
+                layer_summaries=summaries,
+                as_put_zero_rows=zero_rows["as_put"],
+                as_put_total_rows=total_rows["as_put"],
+                producer_fenced_zero_rows=zero_rows["producer_fenced"],
+                producer_fenced_total_rows=total_rows["producer_fenced"],
+                readback_mode="deferred_after_model_forward_on_probe_stream",
+                readback_may_synchronize=False,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
+        except Exception as error:
+            _content_log(
+                "store_time_source_probe_error",
+                req_id=probe.req_id,
+                stage="flush",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+
+
+def _page_layer_tensor(
+    page: Any,
+    layer_id: int,
+    slab: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Return one layer's CPU tensor view for a shared layer page.
+
+    Rank0 page objects carry their own ``raw_data`` (the allocated slab
+    slice); passive page views have ``raw_data=None`` and address the shared
+    slab through ``meta.address`` plus the page-relative group prefix sums.
+    """
+    prefix = getattr(page, "group_prefix_sum", ())
+    meta = getattr(page, "meta", None)
+    if (
+        meta is None
+        or layer_id + 1 >= len(prefix)
+        or not meta.dtypes
+        or not meta.shapes
+        or layer_id >= len(meta.dtypes)
+        or layer_id >= len(meta.shapes)
+    ):
+        return None
+    begin, end = int(prefix[layer_id]), int(prefix[layer_id + 1])
+    raw_data = getattr(page, "raw_data", None)
+    if isinstance(raw_data, torch.Tensor):
+        base = raw_data
+    else:
+        if not isinstance(slab, torch.Tensor):
+            return None
+        address = int(meta.address)
+        base = slab[address : address + int(meta.phy_size)]
+    try:
+        return base[begin:end].view(meta.dtypes[layer_id]).view(
+            meta.shapes[layer_id]
+        )
+    except (RuntimeError, ValueError):
+        return None
+
+
+def log_shared_page_source_fingerprint(
+    *,
+    req_id: str,
+    phase: str,
+    kv_group: int,
+    pages: Sequence[Any],
+    chunk_starts: Sequence[int] | None = None,
+    slab: torch.Tensor | None = None,
+    rank: int,
+    passive: bool,
+) -> None:
+    """Fingerprint shared-slab page sources before the H2D copy reads them.
+
+    The slab is host memory and the producing GET/broadcast completed before
+    materialization, so this reads CPU bytes only: it never touches an NPU
+    stream and cannot perturb load/compute ordering.  Zero-content findings at
+    this point therefore reflect slab content or view offset arithmetic, not a
+    synchronization race.  Row hashes use the ``"{layer}:{token}"`` key format
+    of the store-time source fingerprint when ``chunk_starts`` is provided,
+    so prefiller-stored and decoder-loaded rows compare directly.
+
+    Args:
+        req_id: Request identifier.
+        phase: Shared-CPU phase (e.g. ``sparse_decode_bootstrap``).
+        kv_group: KV group of the pages (probe targets group 1).
+        pages: Layer page objects materialized for this request.
+        chunk_starts: Absolute first-token index per page, when aligned.
+        slab: Passive shared slab tensor, required for passive views.
+        rank: Reporting worker rank.
+        passive: Whether this rank materialized passive views.
+
+    Notes:
+        Strict no-op unless the single content-diagnostic config knob is
+        enabled; failures are logged and swallowed.
+    """
+    if not _ENABLED or not pages or int(kv_group) != 1:
+        return
+    started = time.perf_counter()
+    try:
+        first = pages[0]
+        num_layers = int(getattr(first, "num_layers", 0) or 0)
+        if num_layers <= 0:
+            return
+        layer_ids = _ordered_sample(
+            (0, num_layers // 2, num_layers - 1),
+            MAX_LAYER_SAMPLES,
+        )
+        zero_pages_by_layer = {int(layer): 0 for layer in layer_ids}
+        page_reports: list[dict[str, Any]] = []
+        for page_index, page in enumerate(pages):
+            valid_tokens = int(getattr(page, "valid_tokens", 0) or 0)
+            local_tokens = (
+                _ordered_sample(
+                    (0, valid_tokens // 2, valid_tokens - 1),
+                    3,
+                )
+                if valid_tokens > 0
+                else []
+            )
+            chunk_start = (
+                int(chunk_starts[page_index])
+                if chunk_starts is not None and page_index < len(chunk_starts)
+                else None
+            )
+            layer_reports: dict[str, Any] = {}
+            for layer_id in layer_ids:
+                tensor = _page_layer_tensor(page, int(layer_id), slab)
+                if tensor is None:
+                    layer_reports[str(int(layer_id))] = {
+                        "error": "unresolved_layer_view"
+                    }
+                    continue
+                nonzero = int(torch.count_nonzero(tensor).item())
+                elements = int(tensor.numel())
+                row_hashes: dict[str, str] = {}
+                if local_tokens:
+                    try:
+                        rows = tensor.reshape(valid_tokens, -1)
+                        for local_token in local_tokens:
+                            digest = _hash_cpu_tensor(rows[local_token])
+                            if chunk_start is not None:
+                                # Same disambiguated key format as the
+                                # prefiller store-time fingerprint so the two
+                                # hosts' row hashes compare directly.
+                                row_hashes[
+                                    f"{int(kv_group)}:{int(layer_id)}:0:"
+                                    f"{chunk_start + local_token}"
+                                ] = digest
+                            else:
+                                row_hashes[
+                                    f"L{int(layer_id)}:p{page_index}"
+                                    f"t{local_token}"
+                                ] = digest
+                    except (RuntimeError, ValueError):
+                        row_hashes = {}
+                if nonzero == 0:
+                    zero_pages_by_layer[int(layer_id)] += 1
+                layer_reports[str(int(layer_id))] = {
+                    "nonzero": nonzero,
+                    "elements": elements,
+                    "layer_size": int(getattr(page, "layer_size", 0) or 0),
+                    "prefix": int(page.group_prefix_sum[int(layer_id)]),
+                    "address": int(page.meta.address),
+                    "valid_tokens": valid_tokens,
+                    "row_hashes": row_hashes,
+                    "all_zero": nonzero == 0,
+                }
+            page_reports.append(
+                {
+                    "page": page_index,
+                    "chunk_start": chunk_start,
+                    "layers": layer_reports,
+                }
+            )
+        _content_log(
+            "group1_page_source_fingerprint",
+            req_id=str(req_id),
+            phase=str(phase),
+            kv_group=int(kv_group),
+            rank=int(rank),
+            passive=bool(passive),
+            pages=len(pages),
+            sampled_layers=[int(layer) for layer in layer_ids],
+            zero_pages_by_layer={
+                str(int(layer)): count
+                for layer, count in zero_pages_by_layer.items()
+            },
+            page_reports=page_reports,
+            readback_mode="inline_cpu_slab_only",
+            readback_may_synchronize=False,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+    except Exception as error:
+        _content_log(
+            "group1_page_source_probe_error",
+            req_id=str(req_id),
+            stage="log",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+
+
+def log_group1_pointer_table(
+    *,
+    req_id: str,
+    phase: str,
+    kv_group: int,
+    pages: Sequence[Any],
+    dev_ptr_rows: Sequence[Sequence[int]],
+    rank: int,
+) -> None:
+    """Validate the dense-direct H2D per-layer source pointer table.
+
+    The dense-direct kernel is layer-agnostic: for one layer it reads
+    ``dev_ptr_rows[layer][chunk]`` and scatters to that layer's destination.
+    A layer-specific corruption (e.g. only the last DSA index layer reading
+    zeros while other layers of the same pages read real bytes) therefore
+    localizes to this table's per-layer rows, or to the device registration
+    behind them.  This check validates, per chunk:
+
+    - row deltas: ``row[layer][k] - row[0][k]`` must equal the page's own
+      ``group_prefix_sum[layer]`` (the same offset the CPU views use);
+    - registration offset: ``row[0][k] - page_k.layer_data_ptr(0)`` (device
+      minus host address) must be constant across chunks — a varying offset
+      means the device pointers do not map 1:1 onto the host slab;
+    - raggedness: every layer row must have the same chunk count.
+
+    All values are host-side integers captured after the table is built;
+    nothing here touches the device.
+
+    Args:
+        req_id: Request identifier.
+        phase: Shared-CPU phase of the load.
+        kv_group: KV group of the pages (probe targets group 1).
+        pages: Materialized layer page objects (chunk order).
+        dev_ptr_rows: Per-layer source device pointer rows.
+        rank: Reporting worker rank.
+
+    Notes:
+        Strict no-op unless the content-diagnostic knob is enabled.
+    """
+    if not _ENABLED or int(kv_group) != 1 or not pages or not dev_ptr_rows:
+        return
+    started = time.perf_counter()
+    try:
+        num_layers = len(dev_ptr_rows)
+        num_chunks = len(pages)
+        ragged = sorted(
+            {
+                len(row) if row is not None else -1
+                for row in dev_ptr_rows
+            }
+        )
+        layer_ids = _ordered_sample(
+            (0, num_layers // 2, num_layers - 1),
+            MAX_LAYER_SAMPLES,
+        )
+        host_bases = [int(page.layer_data_ptr(0)) for page in pages]
+        registration_offsets = []
+        table_ok = True
+        layer_reports: dict[str, Any] = {}
+        for layer_id in layer_ids:
+            row = (
+                dev_ptr_rows[int(layer_id)]
+                if int(layer_id) < len(dev_ptr_rows)
+                else None
+            )
+            if row is None or len(row) < num_chunks:
+                layer_reports[str(int(layer_id))] = {
+                    "error": "missing_or_short_row",
+                    "row_len": len(row) if row is not None else None,
+                }
+                table_ok = False
+                continue
+            # Each page carries its own prefix sums: full pages share the
+            # chunk-size stride, but the partial tail page has a smaller
+            # per-layer stride. Compare every chunk against its own page's
+            # prefix, not page 0's.
+            deltas = [int(row[k]) - int(dev_ptr_rows[0][k]) for k in range(num_chunks)]
+            expected_deltas = [
+                int(pages[k].group_prefix_sum[int(layer_id)])
+                for k in range(num_chunks)
+            ]
+            delta_mismatches = [
+                k
+                for k, (delta, expected_delta) in enumerate(
+                    zip(deltas, expected_deltas, strict=True)
+                )
+                if delta != expected_delta
+            ]
+            if int(layer_id) == 0:
+                registration_offsets = [
+                    int(row[k]) - host_bases[k] for k in range(num_chunks)
+                ]
+            if delta_mismatches:
+                table_ok = False
+            layer_reports[str(int(layer_id))] = {
+                "expected_deltas_preview": expected_deltas[:4],
+                "deltas_preview": deltas[:4],
+                "delta_mismatch_chunks": delta_mismatches[:8],
+                "row_preview": [int(value) for value in row[:4]],
+            }
+        host_strides = [
+            host_bases[k + 1] - host_bases[k] for k in range(num_chunks - 1)
+        ]
+        _content_log(
+            "group1_pointer_table",
+            req_id=str(req_id),
+            phase=str(phase),
+            kv_group=int(kv_group),
+            rank=int(rank),
+            num_layers=num_layers,
+            num_chunks=num_chunks,
+            ragged_row_lengths=ragged,
+            host_base_preview=host_bases[:4],
+            host_strides_preview=host_strides[:4],
+            registration_offsets=registration_offsets,
+            registration_offset_constant=(
+                len(set(registration_offsets)) == 1
+                if registration_offsets
+                else None
+            ),
+            layer_reports=layer_reports,
+            table_consistent=table_ok,
+            readback_mode="host_integers_only",
+            readback_may_synchronize=False,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+    except Exception as error:
+        _content_log(
+            "group1_pointer_table_probe_error",
+            req_id=str(req_id),
+            error_type=type(error).__name__,
+            error=str(error),
+        )
 
 
 def fingerprint_compact_group1(
@@ -797,13 +1471,48 @@ def queue_cache_tail_fingerprint(
         query_end = min(int(query_starts[req_index + 1]), actual_limit)
         if query_end <= query_start:
             continue
+        query_length = int(query_starts[req_index + 1]) - query_start
+        sequence_length = int(seq_lens[req_index])
+        cached_prefix_tokens = max(sequence_length - query_length, 0)
+        if "before_current_scatter" in str(stage):
+            # The before-scatter row sits inside the current query window and
+            # is only comparable when it was previously populated by a cache
+            # load (the request's first resume forward with a cached prefix).
+            # A cold request's first forward (cached_prefix == 0) samples an
+            # unwritten row, and its chunked-prefill continuations sample the
+            # first new token of the chunk; both compare unequal by
+            # construction and would drown the verdict histogram in
+            # guaranteed-false noise. Emit exactly once, and only when the
+            # first forward carried a cached prefix.
+            first_window_key = (
+                f"tail_before:{int(kv_group)}",
+                str(req_id),
+                str(layer_name),
+            )
+            with _STATE_LOCK:
+                first_window = first_window_key not in _SEEN
+                if first_window:
+                    _SEEN[first_window_key] = None
+                    while len(_SEEN) > MAX_TRACKED_REQUEST_LAYERS:
+                        _SEEN.popitem(last=False)
+            if not first_window or not cached_prefix_tokens:
+                _log_snapshot_skip_once(
+                    requested_event="cache_tail_fingerprint",
+                    req_ids=[req_id],
+                    layer_name=layer_name,
+                    reason=(
+                        "first_forward_without_cached_prefix"
+                        if not cached_prefix_tokens
+                        else "later_window_before_scatter"
+                    ),
+                    kv_group=int(kv_group),
+                    stage=str(stage),
+                )
+                continue
         if not _claim_once(
             f"tail:{int(kv_group)}:{stage}", req_id, layer_name
         ):
             continue
-        query_length = int(query_starts[req_index + 1]) - query_start
-        sequence_length = int(seq_lens[req_index])
-        cached_prefix_tokens = max(sequence_length - query_length, 0)
         # On a prefix hit, the first query row is the mandatory boundary token
         # that replaces the final cached row. On a full prefill there is no
         # cached boundary, so sample the final prompt row for cross-run/source
@@ -861,6 +1570,17 @@ def queue_cache_tail_fingerprint(
                         "first_query_row_at_cached_prefix_boundary"
                         if cached_prefix_tokens
                         else "last_full_prefill_row"
+                    ),
+                    # Explicitly scope what a matches_produced verdict here
+                    # can and cannot prove. After-scatter comparisons ride the
+                    # compute stream's own ordering, so they validate the
+                    # scatter writeback only: they cannot observe what an
+                    # unfenced concurrent DMA (direct store) reads from the
+                    # same slots. Store-time source fingerprints cover that.
+                    "comparison_scope": (
+                        "scatter_writeback_stream_ordered"
+                        if "after_current_scatter" in str(stage)
+                        else "loaded_boundary_row_before_replacement"
                     ),
                     "num_actual_tokens": (
                         int(num_actual_tokens)
@@ -1385,10 +2105,12 @@ def begin_deferred_diagnostic_step() -> None:
         stale = len(_PENDING)
         _PENDING.clear()
         _GROUP0_SOURCE_PROBES.clear()
-    if stale:
+        stale_probes = len(_PENDING_STORE_PROBES)
+        _PENDING_STORE_PROBES.clear()
+    if stale or stale_probes:
         _content_log(
             "content_diagnostic_snapshot_dropped",
-            dropped_count=stale,
+            dropped_count=stale + stale_probes,
             reason="previous_forward_did_not_flush",
         )
 
@@ -1512,6 +2234,7 @@ def flush_deferred_diagnostics() -> None:
     """Read snapshots after behavior-critical work and log fingerprints."""
     if not _ENABLED:
         return
+    _flush_store_probes()
     with _STATE_LOCK:
         pending = list(_PENDING)
         _PENDING.clear()

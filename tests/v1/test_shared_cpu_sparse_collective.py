@@ -19,6 +19,7 @@ from lmcache.v1.cache_engine import (
 from lmcache.v1.memory_management import LayerPageMemoryObj, LayerPageSource
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch, SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
+import lmcache.v1.cache_engine as core_cache_engine
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
@@ -465,6 +466,114 @@ def test_partial_legacy_state_does_not_hide_remote_layer_page(monkeypatch) -> No
 
     assert page_chunks == 1
     assert resolved == [[page], [page]]
+
+
+def test_remote_fill_exact_page_plan_does_not_reselect_local(monkeypatch) -> None:
+    class _Page:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.num_layers = 2
+            self.is_pinned = False
+            self.unpin_count = 0
+            self.release_count = 0
+
+        @classmethod
+        def pin_many(cls, pages) -> bool:
+            for page in pages:
+                page.is_pinned = True
+            return True
+
+        def get_shape(self):
+            return torch.Size([4, 4])
+
+        def unpin(self) -> None:
+            self.is_pinned = False
+            self.unpin_count += 1
+
+        def ref_count_down(self) -> None:
+            self.release_count += 1
+
+    monkeypatch.setattr(core_cache_engine, "LayerPageMemoryObj", _Page)
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    local_page = _Page("isolated-local")
+    remote_page = _Page("paired-remote")
+    local_calls = []
+    remote_calls = []
+    local = SimpleNamespace(
+        batched_get_layer_page_prefix=lambda keys: (
+            local_calls.append(list(keys)) or [local_page],
+            1,
+        )
+    )
+    remote = SimpleNamespace(
+        batched_get_layer_pages=lambda keys: (
+            remote_calls.append(list(keys)) or [remote_page]
+        )
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(chunk_size=4)
+    engine.storage_manager = SimpleNamespace(
+        storage_backends={"RemoteBackend": remote}
+    )
+    engine._shared_local_cpu_backend = lambda: local
+    engine._expected_shared_cpu_chunk_metadata = (
+        lambda **_kwargs: (torch.Size([4, 4]), torch.float16, None)
+    )
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    resolved, page_chunks = engine._resolve_shared_rank0_layer_pages(
+        req_id="request",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[
+            [key.get_layer(0)],
+            [key.get_layer(1)],
+        ],
+        page_chunks=1,
+        base_page_keys=[key],
+        exact_chunk_locations=["RemoteBackend"],
+    )
+
+    assert resolved == [[remote_page], [remote_page]]
+    assert page_chunks == 1
+    assert local_calls == []
+    assert remote_calls == [[key]]
+    assert remote_page.is_pinned
+
+
+def test_remote_fill_exact_legacy_plan_does_not_reselect_local() -> None:
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16).get_layer(0)
+    remote_obj = _FakeClaimableMemObj()
+    local = SimpleNamespace(
+        get_blocking=lambda _key: pytest.fail(
+            "an exact remote plan must not probe LocalCPU"
+        )
+    )
+    fetches = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.storage_manager = SimpleNamespace(
+        batched_get=lambda keys, location=None: (
+            fetches.append((list(keys), location)) or [remote_obj]
+        )
+    )
+    engine._shared_local_cpu_backend = lambda: local
+    engine._is_rank0_shared_mem_obj = lambda obj: obj is remote_obj
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    resolved = engine._resolve_shared_rank0_layer_mem_objs(
+        req_id="request",
+        phase="dense_prefix",
+        layer_id=0,
+        kv_group=0,
+        keys_layer=[key],
+        chunk_locations=["RemoteBackend"],
+        enforce_planned_location=True,
+    )
+
+    assert resolved == [remote_obj]
+    assert fetches == [([key], "RemoteBackend")]
+    assert remote_obj.pin_count == 1
 
 
 def test_live_import_admission_transfers_temporary_page_ownership() -> None:
@@ -1590,6 +1699,68 @@ def test_sampled_metadata_build_skips_per_chunk_contains(
     assert ends == [1]
     assert keys == [[key.split_layers(2)[0]], [key.split_layers(2)[1]]]
     assert ret_mask.tolist() == [True]
+
+
+@pytest.mark.parametrize("kv_group", [0, 1])
+def test_remote_fill_metadata_reuses_retained_plan_without_probes(
+    kv_group: int,
+) -> None:
+    keys = [
+        _make_key(kv_group=kv_group, chunk_hash=101),
+        _make_key(kv_group=kv_group, chunk_hash=202),
+    ]
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    hash_calls = []
+
+    def process_hashes(**kwargs: Any) -> Any:
+        hash_calls.append(kwargs)
+        return iter([(0, 4, keys[0]), (4, 8, keys[1])])
+
+    engine.token_database = SimpleNamespace(process_tokens=process_hashes)
+    engine._should_use_shared_layerwise_retrieve = lambda _group: True
+    engine._is_shared_retrieve_passive = lambda _group: False
+    engine._use_sampled_worker_retrieve = lambda _group: False
+    engine._find_shared_rank0_chunk_location = lambda _key: pytest.fail(
+        "RemoteFill retained metadata must not probe storage per layer"
+    )
+    engine._remote_fill_retained_local_page_plan = lambda *_args: (
+        [(0, 4, 101), (4, 8, 202)],
+        ["LocalCPUBackend", "LocalCPUBackend"],
+    )
+    retrieve_kwargs = {"kv_group": kv_group, "req_id": "req-remote-fill"}
+
+    location, starts, ends, layer_keys = engine._ensure_retrieve_chunk_metadata(
+        tokens=list(range(8)),
+        mask=None,
+        request_configs={
+            "lmcache.remote_fill_result": {
+                "outcome": "LOCAL_FULL",
+                "required_store_end": 8,
+                "destination_engine_epoch": 7,
+            }
+        },
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        ret_mask=torch.zeros(8, dtype=torch.bool),
+        retrieve_kwargs=retrieve_kwargs,
+    )
+
+    assert location == "LocalCPUBackend"
+    assert hash_calls[0]["hashes"] == [101, 202]
+    assert hash_calls[0]["offsets"] == [4, 4]
+    assert "tokens" not in hash_calls[0]
+    assert starts == [0, 4]
+    assert ends == [4, 8]
+    assert layer_keys == [
+        [key.split_layers(2)[layer] for key in keys] for layer in range(2)
+    ]
+    assert retrieve_kwargs["_retrieve_metadata_mode"] == "remote_fill_retained"
+    assert retrieve_kwargs["_remote_fill_exact_locations"] == (
+        "LocalCPUBackend",
+        "LocalCPUBackend",
+    )
 
 
 def test_sampled_metadata_reuses_latent_chunk_hashes_for_indexer() -> None:
@@ -3254,9 +3425,13 @@ def test_compact_batch_uses_exactly_one_final_status(
         [1],
         [[layer_keys[0]], [layer_keys[1]]],
     )
-    engine._find_shared_rank0_chunk_location = lambda _key: "LocalCPUBackend"
+    engine._find_shared_rank0_chunk_location = lambda _key: pytest.fail(
+        "retained RemoteFill plan must skip storage probes"
+    )
     engine._get_shared_config_value = lambda _name, default: default
-    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: {"fits": True}
+    engine._shared_cpu_runtime_capacity_details = lambda **_kwargs: pytest.fail(
+        "resident RemoteFill pages must skip capacity preflight"
+    )
     engine._resolve_shared_rank0_layer_mem_objs = lambda **kwargs: [
         allocated[kwargs["layer_id"]]
     ]
@@ -3289,6 +3464,7 @@ def test_compact_batch_uses_exactly_one_final_status(
         shared_cpu_request_preflight_state=preflight_state,
         kv_group=0,
         req_id="req-compact",
+        _remote_fill_exact_locations=("LocalCPUBackend",),
     )
 
     next(retriever)

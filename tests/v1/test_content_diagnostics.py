@@ -5,6 +5,7 @@
 from collections.abc import Iterator
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 # Third Party
 import pytest
@@ -101,6 +102,47 @@ def test_metadata_only_event_uses_same_diagnostic_gate(
         "ready", req_id="request", ready=False
     )
     assert events[-1] == ("ready", {"req_id": "request", "ready": False})
+
+
+def test_group1_pointer_table_reports_per_page_expected_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        diagnostics,
+        "_content_log",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    diagnostics.configure_npu_content_diagnostics(True)
+
+    class Page:
+        def __init__(self, base: int, group_prefix_sum: tuple[int, ...]) -> None:
+            self.base = base
+            self.group_prefix_sum = group_prefix_sum
+
+        def layer_data_ptr(self, layer_id: int) -> int:
+            return self.base + self.group_prefix_sum[layer_id]
+
+    pages = [Page(1_000, (0, 16)), Page(2_000, (0, 8))]
+    dev_ptr_rows = [[1_100, 2_100], [1_116, 2_108]]
+
+    diagnostics.log_group1_pointer_table(
+        req_id="request",
+        phase="cold_bootstrap",
+        kv_group=1,
+        pages=pages,
+        dev_ptr_rows=dev_ptr_rows,
+        rank=0,
+    )
+
+    assert len(events) == 1
+    event, fields = events[0]
+    assert event == "group1_pointer_table"
+    assert fields["table_consistent"] is True
+    layer_report = fields["layer_reports"]["1"]
+    assert layer_report["expected_deltas_preview"] == [16, 8]
+    assert layer_report["deltas_preview"] == [16, 8]
+    assert layer_report["delta_mismatch_chunks"] == []
 
 
 def test_configure_installs_and_clears_vllm_callback_bridge(

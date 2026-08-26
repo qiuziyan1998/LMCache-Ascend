@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
+from typing import Any
+
 # Third Party
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -37,11 +40,54 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
         config = getattr(engine, "config", None)
         return bool(
             getattr(engine, "use_layerwise", False)
-            and getattr(engine, "kv_role", None)
-            in ("kv_both", "kv_consumer")
+            and getattr(engine, "kv_role", None) in ("kv_both", "kv_consumer")
             and getattr(config, "dsa_two_groups", False)
             and getattr(config, "enable_sparse_attention", False)
         )
 
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole) -> None:
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        parallel = getattr(vllm_config, "parallel_config", None)
+        if transfer is not None and parallel is not None:
+            extra = dict(getattr(transfer, "kv_connector_extra_config", None) or {})
+            dp_rank = getattr(parallel, "data_parallel_index", None)
+            if dp_rank is None:
+                dp_rank = getattr(parallel, "data_parallel_rank_local", 0)
+            extra["lmcache_remote_fill_destination_dp_rank"] = int(dp_rank or 0)
+            extra["lmcache_remote_fill_destination_dp_size"] = int(
+                getattr(parallel, "data_parallel_size", 1) or 1
+            )
+            transfer.kv_connector_extra_config = extra
         super().__init__(vllm_config=vllm_config, role=role)
+
+    def capture_live_source_event_handoff(self, forward_context: Any) -> bool:
+        """Forward an armed post-forward producer event to the implementation."""
+
+        return bool(
+            self._lmcache_engine.capture_live_source_event_handoff(
+                forward_context
+            )
+        )
+
+    def get_remote_fill_placement_info(
+        self,
+    ) -> dict[str, int | str | bool] | None:
+        """Return the decoder's pointer-free remote-fill placement."""
+
+        engine = getattr(self._lmcache_engine, "lmcache_engine", None)
+        discover = getattr(engine, "get_remote_fill_placement_info", None)
+        return discover() if callable(discover) else None
+
+    def get_remote_fill_metrics(self) -> dict[str, int] | None:
+        """Return fixed-cardinality decoder protocol metrics when active."""
+
+        engine = getattr(self._lmcache_engine, "lmcache_engine", None)
+        snapshot = getattr(engine, "get_remote_fill_metrics", None)
+        return snapshot() if callable(snapshot) else None
+
+    def remote_fill_requires_paired_restart(self) -> bool:
+        """Expose an armed-transfer fatal latch to the worker supervisor."""
+
+        engine = getattr(self._lmcache_engine, "lmcache_engine", None)
+        check = getattr(engine, "remote_fill_requires_paired_restart", None)
+        return bool(check()) if callable(check) else False
