@@ -5,6 +5,7 @@ import hashlib
 from itertools import pairwise
 import json
 import os
+import time
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
@@ -1563,15 +1564,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
 
-    def synchronize_dense_load_stream(self) -> None:
+    def synchronize_dense_load_stream(self, stream: Optional[Any] = None) -> None:
         """Synchronize dense load work before unsafe host-side cleanup."""
-        self.load_stream.synchronize()
+        (self.load_stream if stream is None else stream).synchronize()
 
-    def record_dense_load_readiness(self) -> Any:
+    def record_dense_load_readiness(self, stream: Optional[Any] = None) -> Any:
         """Record and return an opaque completion fence for dense load work."""
         event = torch.npu.Event()
-        event.record(self.load_stream)
+        event.record(self.load_stream if stream is None else stream)
         return event
+
+    def synchronize_dense_load_readiness(self, readiness: Any) -> None:
+        """Synchronize one exact dense-load completion fence."""
+        readiness.synchronize()
 
     def consume_dense_load_readiness(self, readiness: Any) -> None:
         """Order the current consumer stream after an opaque dense-load fence."""
@@ -2096,8 +2101,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_v_hidden_dims: int,
         sparse_dsa_hidden_dims: int,
         expected_device: Optional[torch.device],
+        diagnostics: Optional[dict[str, Any]] = None,
     ) -> _SparseDestinationPlan:
         """Resolve process-invariant native states for one destination group."""
+        resolve_started = time.perf_counter() if diagnostics is not None else 0.0
         if expected_device is None:
             raise RuntimeError(f"kv_group={kv_group} has no initialized NPU device")
         if len(kvcaches_ref) != self.num_layers:
@@ -2136,6 +2143,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             and plan.signature == signature
         ):
             plans[kv_group] = plan
+            if diagnostics is not None:
+                diagnostics["destination_plan_cache_hit"] = True
+                diagnostics["destination_plan_resolve_ms"] = round(
+                    (time.perf_counter() - resolve_started) * 1000, 3
+                )
             return plan
 
         states = tuple(
@@ -2153,6 +2165,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         plans[kv_group] = plan
         while len(plans) > _SPARSE_DESTINATION_PLAN_CACHE_SIZE:
             del plans[next(iter(plans))]
+        if diagnostics is not None:
+            diagnostics["destination_plan_cache_hit"] = False
+            diagnostics["destination_plan_resolve_ms"] = round(
+                (time.perf_counter() - resolve_started) * 1000, 3
+            )
         return plan
 
     def _sparse_direct_state_key(
@@ -4623,12 +4640,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group = int(transfer_kwargs.get("kv_group", 0))
         req_id = transfer_kwargs.get("req_id")
         frontier = int(transfer_kwargs.get("lmcache_cached_tokens", 0) or 0)
+        diagnostics = transfer_kwargs.get("_cold_perf_breakdown")
+        if not isinstance(diagnostics, dict):
+            diagnostics = None
+        layout_started = time.perf_counter() if diagnostics is not None else 0.0
         layout = self._group_layouts.get(kv_group)
+        layout_cache_hit = layout is not None
         if layout is None:
             layout = self._lazy_initialize_buffer_with_staging(
                 kvcaches_snapshot,
                 kv_group=kv_group,
                 init_staging=False,
+            )
+        if diagnostics is not None:
+            diagnostics["layout_cache_hit"] = layout_cache_hit
+            diagnostics["layout_resolve_ms"] = round(
+                (time.perf_counter() - layout_started) * 1000, 3
+            )
+            cached_idx = getattr(self, "_layerwise_sparse_idx_cache", None)
+            diagnostics["selection_index_cached_tokens_before"] = (
+                int(cached_idx.shape[0]) if cached_idx is not None else 0
             )
 
         sparse_k_hidden_dims = layout.k_hidden_dims
@@ -4660,6 +4691,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
             expected_device=layout.kv_device,
+            diagnostics=diagnostics,
         )
 
         for layer_id, source_layer in enumerate(source.layers):
@@ -4821,17 +4853,38 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if kwargs.get("prepared_sparse_source") is not None:
             yield from self._batched_to_gpu_head_token_wise_prepared(kwargs)
             return
+        diagnostics = kwargs.get("_cold_perf_breakdown")
+        if not isinstance(diagnostics, dict):
+            diagnostics = None
+        connector_init_started = (
+            time.perf_counter() if diagnostics is not None else 0.0
+        )
         self.initialize_kvcaches_ptr(**kwargs)
+        if diagnostics is not None:
+            diagnostics["connector_init_ms"] = round(
+                (time.perf_counter() - connector_init_started) * 1000, 3
+            )
         kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
         assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
         kv_group = kwargs.get("kv_group", 0)
+        layout_cache_hit = kv_group in self._group_layouts
+        layout_started = time.perf_counter() if diagnostics is not None else 0.0
         layout = self._lazy_initialize_buffer_with_staging(
             kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
+        if diagnostics is not None:
+            diagnostics["layout_cache_hit"] = layout_cache_hit
+            diagnostics["layout_resolve_ms"] = round(
+                (time.perf_counter() - layout_started) * 1000, 3
+            )
+            cached_idx = getattr(self, "_layerwise_sparse_idx_cache", None)
+            diagnostics["selection_index_cached_tokens_before"] = (
+                int(cached_idx.shape[0]) if cached_idx is not None else 0
+            )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -4880,6 +4933,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 sparse_v_hidden_dims=sparse_v_hidden_dims,
                 sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
                 expected_device=layout.kv_device,
+                diagnostics=diagnostics,
             )
         for layer_id in range(self.num_layers):
             sparse_request = yield

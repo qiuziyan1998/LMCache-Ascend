@@ -1721,6 +1721,9 @@ class _TrackingEvent:
     def record(self, stream):
         self.records.append(stream.name)
 
+    def synchronize(self):
+        self.records.append("synchronize")
+
 
 class _DenseLayout:
     k_hidden_dims = 1
@@ -1789,6 +1792,7 @@ def test_shared_cpu_store_publication_fences_store_stream() -> None:
 def test_dense_load_readiness_records_and_waits_without_host_sync(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.load_stream = _TrackingStream("dense-load")
+    producer_stream = _TrackingStream("producer")
     compute_stream = _TrackingStream("compute")
     event = _TrackingEvent("dense-ready")
     monkeypatch.setattr(
@@ -1800,13 +1804,37 @@ def test_dense_load_readiness_records_and_waits_without_host_sync(monkeypatch) -
         ),
     )
 
-    readiness = connector.record_dense_load_readiness()
+    readiness = connector.record_dense_load_readiness(producer_stream)
     connector.consume_dense_load_readiness(readiness)
 
     assert readiness is event
-    assert event.records == ["dense-load"]
+    assert event.records == ["producer"]
     assert compute_stream.events == [("wait_event", "dense-ready")]
     assert connector.load_stream.events == []
+
+
+def test_dense_load_readiness_synchronizes_exact_event() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    event = _TrackingEvent("dense-ready")
+
+    connector.synchronize_dense_load_readiness(event)
+
+    assert event.records == ["synchronize"]
+
+
+def test_dense_load_readiness_defaults_to_legacy_load_stream(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.load_stream = _TrackingStream("dense-load")
+    event = _TrackingEvent("dense-ready")
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(Event=lambda: event),
+    )
+
+    connector.record_dense_load_readiness()
+
+    assert event.records == ["dense-load"]
 
 
 def test_sparse_direct_state_key_tracks_source_and_destination(monkeypatch) -> None:
@@ -3032,12 +3060,16 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
         "sparse_dsa_hidden_dims": 0,
         "expected_device": torch.device("cpu"),
     }
+    first_diagnostics = {}
     first = connector._get_or_create_sparse_destination_plan(
         slot_mapping_ref=torch.arange(4, dtype=torch.long),
+        diagnostics=first_diagnostics,
         **plan_kwargs,
     )
+    second_diagnostics = {}
     second = connector._get_or_create_sparse_destination_plan(
         slot_mapping_ref=torch.arange(32, dtype=torch.long),
+        diagnostics=second_diagnostics,
         **plan_kwargs,
     )
 
@@ -3045,6 +3077,10 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
     assert len(prepare_calls) == 2
     assert not hasattr(first, "validated")
     assert not hasattr(first, "source")
+    assert first_diagnostics["destination_plan_cache_hit"] is False
+    assert second_diagnostics["destination_plan_cache_hit"] is True
+    assert first_diagnostics["destination_plan_resolve_ms"] >= 0
+    assert second_diagnostics["destination_plan_resolve_ms"] >= 0
 
 
 def test_sparse_destination_plan_rebuilds_after_tensor_replacement(
