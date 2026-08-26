@@ -1940,6 +1940,7 @@ def test_dense_bootstrap_ticket_orders_one_consumer_without_host_sync(
         "request-a", 11, (3, 4), kvcaches, 1, torch.long, token_count=9
     )
     assert ticket is not None
+    assert not connector.dense_bootstrap_load_submitted(ticket)
     _bind_dense_bootstrap_retirement(connector, ticket)
     owner = object()
     request_metadata = object()
@@ -1953,6 +1954,7 @@ def test_dense_bootstrap_ticket_orders_one_consumer_without_host_sync(
         connector.finish_dense_bootstrap_load(ticket, expected_layers=2)
 
     event = events[0]
+    assert connector.dense_bootstrap_load_submitted(ticket)
     assert len(native_calls) == 2
     assert ticket.submitted_layers == 2
     assert event.records == [ticket.stream.name]

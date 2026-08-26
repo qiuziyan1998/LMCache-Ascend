@@ -2345,6 +2345,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise wait_error
         self.poll_dense_bootstrap_retirements()
 
+    def dense_bootstrap_load_submitted(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> bool:
+        """Return whether host submission and completion recording succeeded."""
+        self._require_dense_bootstrap_ticket(ticket)
+        with ticket.state_lock:
+            if ticket.state is DenseLoadTicketState.FATAL_RESTART:
+                raise RuntimeError(
+                    "dense bootstrap load entered a fatal state"
+                ) from ticket.failure
+            return ticket.host_submission_done.is_set() and ticket.state in (
+                DenseLoadTicketState.RECORDED,
+                DenseLoadTicketState.WAIT_ENQUEUED,
+                DenseLoadTicketState.DEVICE_COMPLETE,
+            )
+
     def record_dense_bootstrap_future_wait(
         self,
         ticket: DenseBootstrapLoadTicket,
