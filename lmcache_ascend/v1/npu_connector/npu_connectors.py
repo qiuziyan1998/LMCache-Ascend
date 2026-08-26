@@ -1563,15 +1563,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
 
-    def synchronize_dense_load_stream(self) -> None:
+    def synchronize_dense_load_stream(self, stream: Optional[Any] = None) -> None:
         """Synchronize dense load work before unsafe host-side cleanup."""
-        self.load_stream.synchronize()
+        (self.load_stream if stream is None else stream).synchronize()
 
-    def record_dense_load_readiness(self) -> Any:
+    def record_dense_load_readiness(self, stream: Optional[Any] = None) -> Any:
         """Record and return an opaque completion fence for dense load work."""
         event = torch.npu.Event()
-        event.record(self.load_stream)
+        event.record(self.load_stream if stream is None else stream)
         return event
+
+    def synchronize_dense_load_readiness(self, readiness: Any) -> None:
+        """Synchronize one exact dense-load completion fence."""
+        readiness.synchronize()
 
     def consume_dense_load_readiness(self, readiness: Any) -> None:
         """Order the current consumer stream after an opaque dense-load fence."""
