@@ -3060,12 +3060,16 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
         "sparse_dsa_hidden_dims": 0,
         "expected_device": torch.device("cpu"),
     }
+    first_diagnostics = {}
     first = connector._get_or_create_sparse_destination_plan(
         slot_mapping_ref=torch.arange(4, dtype=torch.long),
+        diagnostics=first_diagnostics,
         **plan_kwargs,
     )
+    second_diagnostics = {}
     second = connector._get_or_create_sparse_destination_plan(
         slot_mapping_ref=torch.arange(32, dtype=torch.long),
+        diagnostics=second_diagnostics,
         **plan_kwargs,
     )
 
@@ -3073,6 +3077,10 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
     assert len(prepare_calls) == 2
     assert not hasattr(first, "validated")
     assert not hasattr(first, "source")
+    assert first_diagnostics["destination_plan_cache_hit"] is False
+    assert second_diagnostics["destination_plan_cache_hit"] is True
+    assert first_diagnostics["destination_plan_resolve_ms"] >= 0
+    assert second_diagnostics["destination_plan_resolve_ms"] >= 0
 
 
 def test_sparse_destination_plan_rebuilds_after_tensor_replacement(
