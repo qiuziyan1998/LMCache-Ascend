@@ -1846,12 +1846,20 @@ def _make_dense_bootstrap_connector(monkeypatch, *, stream_count=2, layers=2):
     connector._layerwise_sparse_idx_cache = None
     connector._ensure_dense_bootstrap_state()
     kvcaches = tuple(object() for _ in range(layers))
+    layout = connector._group_layouts[1]
+    connector._lazy_initialize_buffer_with_staging = (
+        lambda _caches, *, kv_group, init_staging: (
+            connector._group_layouts.setdefault(kv_group, layout)
+        )
+    )
     monkeypatch.setattr(
         npu_connectors,
         "prepare_sparse_direct_destination_state",
         lambda *args: object(),
     )
-    connector.register_sparse_destination_kv_caches((None, kvcaches))
+    connector.register_sparse_destination_kv_caches(
+        (None, kvcaches), slot_mapping_dtype=torch.long
+    )
     return connector, list(kvcaches), events
 
 
@@ -1968,7 +1976,7 @@ def test_dense_bootstrap_ticket_orders_one_consumer_without_host_sync(
     assert ticket.stream.events == []
     assert ticket.token_count == 9
     assert ticket.chunk_count == 3
-    assert ticket.host_submit_ms is not None
+    assert ticket.producer_context_ms is not None
     assert ticket.consumer_stream_identity == ("npu_stream", 7)
     assert len(summaries) == 1
     assert summaries[0]["stream_identity"] == ["npu_stream", 100]
@@ -2265,6 +2273,47 @@ def test_dense_bootstrap_cancel_waits_for_active_pre_submit_producer(
     assert ticket.state is npu_connectors.DenseLoadTicketState.FAILED_PRE_SUBMIT
     assert ticket.stream.events == []
     assert connector.release_dense_bootstrap_load(ticket)
+
+
+def test_dense_bootstrap_pre_submit_failure_needs_no_retirement_callback(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    connector.retain_dense_bootstrap_metadata(ticket, object())
+
+    assert connector.fail_dense_bootstrap_load(ticket, RuntimeError("failed"))
+    assert ticket.state is npu_connectors.DenseLoadTicketState.FAILED_PRE_SUBMIT
+    assert ticket.stream.events == []
+    assert ticket.metadata_tensors == []
+    assert ticket.destination_plan is None
+    assert connector.release_dense_bootstrap_load(ticket)
+
+
+def test_dense_bootstrap_rejects_late_retention(monkeypatch) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+    with connector.dense_bootstrap_load_context(ticket):
+        connector.mark_dense_bootstrap_submission(ticket)
+        connector.mark_dense_bootstrap_external_layers_complete(ticket, 1)
+        connector.finish_dense_bootstrap_load(ticket, expected_layers=1)
+
+    with pytest.raises(RuntimeError, match="inactive ticket"):
+        connector.retain_dense_bootstrap_sources(ticket, [object()])
+    with pytest.raises(RuntimeError, match="inactive ticket"):
+        connector.retain_dense_bootstrap_metadata(ticket, object())
 
 
 def test_dense_bootstrap_consumer_wait_failure_self_drains(monkeypatch) -> None:
@@ -4024,10 +4073,24 @@ def test_sparse_destination_registration_freezes_two_plan_slots(
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
+    layout = SimpleNamespace(
+        k_hidden_dims=1,
+        v_hidden_dims=1,
+        dsa_hidden_dims=0,
+        kv_format=SimpleNamespace(value=0),
+        kv_device=torch.device("cpu"),
+    )
+    connector._group_layouts = {0: layout, 1: layout}
+    connector._lazy_initialize_buffer_with_staging = (
+        lambda _caches, *, kv_group, init_staging: (
+            connector._group_layouts.setdefault(kv_group, layout)
+        )
+    )
+    prepare_calls = []
     monkeypatch.setattr(
         npu_connectors,
         "prepare_sparse_direct_destination_state",
-        lambda *args: object(),
+        lambda *args: prepare_calls.append(args) or object(),
     )
 
     def get_plan(kvcaches, kv_group):
@@ -4046,21 +4109,23 @@ def test_sparse_destination_registration_freezes_two_plan_slots(
     indexer = [object()]
     latent_b = [object()]
     first_incarnation = connector.register_sparse_destination_kv_caches(
-        (latent_a, indexer)
+        (latent_a, indexer), slot_mapping_dtype=torch.long
     )
+    assert len(prepare_calls) == 2
     latent_a_plan = get_plan(latent_a, 0)
     indexer_plan = get_plan(indexer, 1)
     assert connector._sparse_destination_plans[0] is latent_a_plan
     assert connector._sparse_destination_plans[1] is indexer_plan
     assert connector.register_sparse_destination_kv_caches(
-        (list(latent_a), list(indexer))
+        (list(latent_a), list(indexer)), slot_mapping_dtype=torch.long
     ) == first_incarnation
 
     second_incarnation = connector.register_sparse_destination_kv_caches(
-        (latent_b, indexer)
+        (latent_b, indexer), slot_mapping_dtype=torch.long
     )
     assert second_incarnation == first_incarnation + 1
-    assert connector._sparse_destination_plans == (None, None)
+    assert len(prepare_calls) == 4
+    assert all(plan is not None for plan in connector._sparse_destination_plans)
     latent_b_plan = get_plan(latent_b, 0)
     assert latent_b_plan.incarnation == second_incarnation
     assert latent_b_plan.kvcaches_ref == tuple(latent_b)
@@ -4079,7 +4144,13 @@ def test_sparse_destination_registration_initializes_cold_group_layout() -> None
 
     def initialize(kvcaches, *, kv_group, init_staging):
         calls.append((tuple(kvcaches), kv_group, init_staging))
-        layout = SimpleNamespace(kv_device=torch.device("cpu"))
+        layout = SimpleNamespace(
+            k_hidden_dims=1,
+            v_hidden_dims=0,
+            dsa_hidden_dims=1,
+            kv_format=SimpleNamespace(value=3),
+            kv_device=torch.device("cpu"),
+        )
         connector._group_layouts[kv_group] = layout
         return layout
 
@@ -4089,6 +4160,64 @@ def test_sparse_destination_registration_initializes_cold_group_layout() -> None
 
     assert calls == [(tuple(indexer), 1, False)]
     assert connector._group_layouts[1].kv_device == torch.device("cpu")
+
+
+def test_sparse_destination_registration_rebuilds_layout_atomically(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector._group_layouts = {}
+    connector._sparse_direct_layer_states = {"old": object()}
+    connector._sparse_direct_validated_layers = {"old"}
+    prepared_widths = []
+
+    def initialize(kvcaches, *, kv_group, init_staging):
+        width = kvcaches[0].shape[-1]
+        layout = SimpleNamespace(
+            k_hidden_dims=width,
+            v_hidden_dims=0,
+            dsa_hidden_dims=width,
+            kv_format=SimpleNamespace(value=3),
+            kv_device=torch.device("cpu"),
+        )
+        connector._group_layouts[kv_group] = layout
+        connector._sparse_direct_layer_states = None
+        connector._sparse_direct_validated_layers = set()
+        return layout
+
+    def prepare(*args):
+        width = args[3]
+        prepared_widths.append(width)
+        if width == 3:
+            raise RuntimeError("prepare failed")
+        return object()
+
+    connector._lazy_initialize_buffer_with_staging = initialize
+    monkeypatch.setattr(
+        npu_connectors, "prepare_sparse_direct_destination_state", prepare
+    )
+    groups = [
+        [torch.empty(1, 1, width)]
+        for width in (1, 2, 3)
+    ]
+    connector.register_sparse_destination_kv_caches(
+        (None, groups[0]), slot_mapping_dtype=torch.long
+    )
+    incarnation = connector.register_sparse_destination_kv_caches(
+        (None, groups[1]), slot_mapping_dtype=torch.long
+    )
+    plan = connector._sparse_destination_plans[1]
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        connector.register_sparse_destination_kv_caches(
+            (None, groups[2]), slot_mapping_dtype=torch.long
+        )
+
+    assert prepared_widths == [1, 2, 3]
+    assert connector._group_layouts[1].k_hidden_dims == 2
+    assert connector._sparse_destination_incarnation == incarnation
+    assert connector._sparse_destination_plans[1] is plan
 
 
 def test_sparse_destination_plan_rejects_abi_change_within_incarnation(

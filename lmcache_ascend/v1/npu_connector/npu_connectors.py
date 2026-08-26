@@ -1534,8 +1534,8 @@ class DenseBootstrapLoadTicket:
     first_submission_stream_identity: Optional[tuple[str, int]] = None
     completion_record_stream_identity: Optional[tuple[str, int]] = None
     consumer_stream_identity: Optional[tuple[str, int]] = None
-    producer_started_at: Optional[float] = None
-    host_submit_ms: Optional[float] = None
+    producer_context_started_at: Optional[float] = None
+    producer_context_ms: Optional[float] = None
     future_wait_ms: Optional[float] = None
     state: DenseLoadTicketState = DenseLoadTicketState.OPEN
     state_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -1701,8 +1701,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # The ticket pool is intentionally independent from the connector's
         # ordinary sparse-load streams. Use NPU streams directly so a ticket
         # cannot accidentally inherit CUDA-wrapper lifecycle semantics.
-        dense_streams = [torch.npu.Stream() for _ in range(4)]
-        self._dense_bootstrap_stream_pool = _DenseLoadStreamPool(dense_streams)
+        self._dense_bootstrap_stream_pool: Optional[_DenseLoadStreamPool] = None
         self._dense_bootstrap_event_factory = torch.npu.Event
         self._dense_bootstrap_ticket_lock = threading.Lock()
         self._dense_bootstrap_active_tickets: dict[
@@ -1801,35 +1800,40 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if not hasattr(self, "_dense_bootstrap_fatal_error"):
             self._dense_bootstrap_fatal_error = None
 
-    def register_sparse_destination_kv_caches(self, groups: Any) -> int:
+    def register_sparse_destination_kv_caches(
+        self,
+        groups: Any,
+        *,
+        slot_mapping_dtype: Optional[torch.dtype] = None,
+    ) -> int:
         """Publish a new two-group destination-cache incarnation.
 
         Re-registering the exact same tensor identities is an O(1)-behavioral
         no-op (the small identity walk happens only at registration). A storage
         change is rejected while any ticket can still target the prior
-        incarnation.
+        incarnation. Supplying the fixed slot dtype eagerly freezes native
+        destination plans before request admission.
         """
         self._ensure_dense_bootstrap_state()
         normalized = self._normalize_destination_groups(groups)
-        # Registration happens before request admission. Resolve layout-only
-        # metadata here so the first cold request can acquire a ticket without
-        # lazily initializing shared connector state in its background thread.
         group_layouts = getattr(self, "_group_layouts", None)
-        for kv_group, group in enumerate(normalized):
-            if (
-                group_layouts is not None
-                and group is not None
-                and kv_group not in group_layouts
-            ):
-                self._lazy_initialize_buffer_with_staging(
-                    list(group), kv_group=kv_group, init_staging=False
-                )
+        manage_layouts = isinstance(group_layouts, dict)
+        eager_plan = slot_mapping_dtype is not None and manage_layouts
         signatures = tuple(
             None if group is None else self._destination_cache_identity(group)
             for group in normalized
         )
         with self._sparse_destination_plan_lock:
-            if signatures == self._sparse_destination_registration_signatures:
+            plans_ready = all(
+                group is None
+                or (plan is not None and plan.signature[0] == slot_mapping_dtype)
+                for group, plan in zip(
+                    normalized, self._sparse_destination_plans, strict=True
+                )
+            )
+            if signatures == self._sparse_destination_registration_signatures and (
+                not eager_plan or plans_ready
+            ):
                 return self._sparse_destination_incarnation
             with self._dense_bootstrap_ticket_lock:
                 if self._dense_bootstrap_attached_tickets:
@@ -1837,14 +1841,96 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         "cannot replace sparse destination KV caches while "
                         "dense bootstrap tickets are active"
                     )
-            self._sparse_destination_incarnation += 1
-            self._sparse_destination_registrations = normalized
-            self._sparse_destination_registration_signatures = signatures
-            self._sparse_destination_explicit_registration = (
-                normalized[0] is not None,
-                normalized[1] is not None,
+            previous = (
+                self._sparse_destination_incarnation,
+                self._sparse_destination_registrations,
+                self._sparse_destination_registration_signatures,
+                self._sparse_destination_explicit_registration,
+                self._sparse_destination_plans,
             )
-            self._sparse_destination_plans = (None, None)
+            previous_layouts = dict(group_layouts) if manage_layouts else None
+            previous_attributes = {
+                name: getattr(self, name, None)
+                for name in (
+                    "_current_kv_group",
+                    "kv_format",
+                    "k_hidden_dims",
+                    "v_hidden_dims",
+                    "dsa_hidden_dims",
+                    "kv_lora_rank",
+                    "qk_rope_head_dim",
+                    "dsa_head_dim",
+                    "vllm_two_major",
+                    "kv_device",
+                    "gpu_buffer_allocator",
+                    "_sparse_direct_layer_states",
+                    "_sparse_direct_validated_layers",
+                )
+            }
+            try:
+                if manage_layouts:
+                    old_groups = self._sparse_destination_registrations
+                    old_signatures = self._sparse_destination_registration_signatures
+                    for kv_group, group in enumerate(normalized):
+                        if group is None:
+                            if old_groups[kv_group] is not None:
+                                group_layouts.pop(kv_group, None)
+                            continue
+                        if (
+                            kv_group not in group_layouts
+                            or (
+                                old_groups[kv_group] is not None
+                                and old_signatures[kv_group] != signatures[kv_group]
+                            )
+                        ):
+                            group_layouts.pop(kv_group, None)
+                            self._lazy_initialize_buffer_with_staging(
+                                list(group), kv_group=kv_group, init_staging=False
+                            )
+                self._sparse_destination_incarnation += 1
+                self._sparse_destination_registrations = normalized
+                self._sparse_destination_registration_signatures = signatures
+                self._sparse_destination_explicit_registration = (
+                    normalized[0] is not None,
+                    normalized[1] is not None,
+                )
+                self._sparse_destination_plans = (None, None)
+                if eager_plan:
+                    for kv_group, group in enumerate(normalized):
+                        if group is None:
+                            continue
+                        layout = group_layouts[kv_group]
+                        self._get_or_create_sparse_destination_plan_locked(
+                            kvcaches_ref=list(group),
+                            kv_group=kv_group,
+                            slot_mapping_ref=None,
+                            slot_mapping_dtype=slot_mapping_dtype,
+                            sparse_kv_format=layout.kv_format.value,
+                            sparse_k_hidden_dims=layout.k_hidden_dims,
+                            sparse_v_hidden_dims=layout.v_hidden_dims,
+                            sparse_dsa_hidden_dims=layout.dsa_hidden_dims,
+                            expected_device=layout.kv_device,
+                        )
+                if (
+                    hasattr(self, "_dense_bootstrap_stream_pool")
+                    and self._dense_bootstrap_stream_pool is None
+                ):
+                    self._dense_bootstrap_stream_pool = _DenseLoadStreamPool(
+                        [torch.npu.Stream() for _ in range(4)]
+                    )
+            except BaseException:
+                (
+                    self._sparse_destination_incarnation,
+                    self._sparse_destination_registrations,
+                    self._sparse_destination_registration_signatures,
+                    self._sparse_destination_explicit_registration,
+                    self._sparse_destination_plans,
+                ) = previous
+                if previous_layouts is not None:
+                    self._group_layouts = previous_layouts
+                    for name, value in previous_attributes.items():
+                        setattr(self, name, value)
+                raise
             return self._sparse_destination_incarnation
 
     def begin_dense_bootstrap_load(
@@ -1970,16 +2056,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 raise RuntimeError("dense bootstrap ticket was cancelled")
             ticket.producer_active = True
             ticket.producer_thread_id = threading.get_ident()
-            ticket.producer_started_at = time.perf_counter()
+            ticket.producer_context_started_at = time.perf_counter()
         try:
             with stream_context(ticket.stream):
                 yield
         finally:
             with ticket.state_lock:
                 ticket.producer_active = False
-                if ticket.producer_started_at is not None:
-                    ticket.host_submit_ms = (
-                        time.perf_counter() - ticket.producer_started_at
+                if ticket.producer_context_started_at is not None:
+                    ticket.producer_context_ms = (
+                        time.perf_counter() - ticket.producer_context_started_at
                     ) * 1000
                 ticket.host_submission_done.set()
 
@@ -1988,11 +2074,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         self._require_dense_bootstrap_ticket(ticket)
         with ticket.state_lock:
-            if ticket.state in (
-                DenseLoadTicketState.CLEANED,
-                DenseLoadTicketState.FATAL_RESTART,
+            if (
+                ticket.state not in (
+                    DenseLoadTicketState.OPEN,
+                    DenseLoadTicketState.SUBMITTING,
+                )
+                or ticket.cancellation_requested
+                or ticket.sources_retired
             ):
-                raise RuntimeError("cannot retain metadata on a terminal ticket")
+                raise RuntimeError("cannot retain metadata on an inactive ticket")
             for value in values:
                 if value is None or id(value) in ticket.metadata_ids:
                     continue
@@ -2004,11 +2094,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         self._require_dense_bootstrap_ticket(ticket)
         with ticket.state_lock:
-            if ticket.state in (
-                DenseLoadTicketState.CLEANED,
-                DenseLoadTicketState.FATAL_RESTART,
+            if (
+                ticket.state not in (
+                    DenseLoadTicketState.OPEN,
+                    DenseLoadTicketState.SUBMITTING,
+                )
+                or ticket.cancellation_requested
+                or ticket.sources_retired
             ):
-                raise RuntimeError("cannot retain sources on a terminal ticket")
+                raise RuntimeError("cannot retain sources on an inactive ticket")
             known = {id(owner) for owner in ticket.source_owners}
             for owner in owners:
                 if id(owner) in known:
@@ -2026,7 +2120,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if not callable(retire_once):
             raise TypeError("dense bootstrap source retirement must be callable")
         with ticket.state_lock:
-            if ticket.state is not DenseLoadTicketState.OPEN:
+            if (
+                ticket.state is not DenseLoadTicketState.OPEN
+                or ticket.cancellation_requested
+                or ticket.sources_retired
+            ):
                 raise RuntimeError(
                     "source retirement must be bound before ticket submission"
                 )
@@ -2297,7 +2395,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 "host_drained_layers": ticket.host_drained_layers,
                 "token_count": ticket.token_count,
                 "chunk_count": ticket.chunk_count,
-                "host_submit_ms": ticket.host_submit_ms,
+                "producer_context_ms": ticket.producer_context_ms,
                 "future_wait_ms": ticket.future_wait_ms,
                 "consumer_wait_enqueued": ticket.consumer_wait_enqueued,
                 "consumer_stream_identity": ticket.consumer_stream_identity,
@@ -2339,6 +2437,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     return False
                 retire_once = ticket.source_retire_once
             if retire_once is None:
+                with ticket.state_lock:
+                    clean_pre_submit = (
+                        not ticket.submission_may_have_started
+                        and not ticket.source_owners
+                    )
+                    if clean_pre_submit:
+                        ticket.sources_retired = True
+                        ticket.metadata_tensors.clear()
+                        ticket.metadata_ids.clear()
+                        ticket.dense_selection_tensors.clear()
+                        ticket.destination_plan = None
+                        return True
                 self._mark_dense_bootstrap_fatal(
                     ticket,
                     RuntimeError(
