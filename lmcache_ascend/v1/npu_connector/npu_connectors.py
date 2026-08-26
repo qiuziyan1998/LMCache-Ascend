@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import hashlib
 from itertools import pairwise
 import json
 import os
-from typing import Any, Generator, List, Optional, Sequence, Set, Union
+import threading
+import time
+from typing import Any, Callable, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -1459,20 +1463,140 @@ class _GroupLayout:
         self.staging_bytes_per_slot: int = 0
 
 
+def _freeze_sparse_destination_cache(value: Any) -> Any:
+    """Retain an immutable snapshot of nested destination tensor holders."""
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_sparse_destination_cache(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True, slots=True)
 class _SparseDestinationPlan:
     """Process-owned native states for one paged-KV destination group."""
 
-    __slots__ = ("kvcaches_ref", "signature", "states")
+    kvcaches_ref: tuple[Any, ...]
+    signature: tuple
+    states: tuple[Any, ...]
+    incarnation: int = 0
+    kv_group: int = -1
 
-    def __init__(
-        self,
-        kvcaches_ref: list,
-        signature: tuple,
-        states: tuple[Any, ...],
-    ) -> None:
-        self.kvcaches_ref = kvcaches_ref
-        self.signature = signature
-        self.states = states
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "kvcaches_ref",
+            tuple(
+                _freeze_sparse_destination_cache(layer)
+                for layer in self.kvcaches_ref
+            ),
+        )
+        object.__setattr__(self, "states", tuple(self.states))
+
+
+class DenseLoadTicketState(Enum):
+    """Host lifecycle for one request-scoped prepared dense bootstrap."""
+
+    OPEN = auto()
+    SUBMITTING = auto()
+    RECORDED = auto()
+    WAIT_ENQUEUED = auto()
+    DEVICE_COMPLETE = auto()
+    FAILED_PRE_SUBMIT = auto()
+    FAILED_POST_SUBMIT = auto()
+    FATAL_RESTART = auto()
+    CLEANED = auto()
+
+
+@dataclass(slots=True)
+class DenseBootstrapLoadTicket:
+    """Own the stream ordering and lifetimes of one prepared bootstrap.
+
+    Source owners are retained by strong reference. The adapter binds one
+    idempotent retirement callback that releases its LMCache ownership after
+    this ticket proves that the device can no longer read the sources.
+    """
+
+    ticket_id: int
+    request_id: str
+    request_generation: int
+    destination_block_ids: tuple[int, ...]
+    destination_generation: int
+    kv_group: int
+    device_index: int
+    device_identity: str
+    stream_index: int
+    stream: Any
+    stream_identity: tuple[str, int]
+    completion_event: Any
+    destination_plan: Optional[_SparseDestinationPlan]
+    slot_mapping_dtype: torch.dtype
+    token_count: int
+    chunk_count: int
+    first_submission_stream_identity: Optional[tuple[str, int]] = None
+    completion_record_stream_identity: Optional[tuple[str, int]] = None
+    consumer_stream_identity: Optional[tuple[str, int]] = None
+    producer_started_at: Optional[float] = None
+    host_submit_ms: Optional[float] = None
+    future_wait_ms: Optional[float] = None
+    state: DenseLoadTicketState = DenseLoadTicketState.OPEN
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
+    failure_lock: threading.Lock = field(default_factory=threading.Lock)
+    host_submission_done: threading.Event = field(default_factory=threading.Event)
+    producer_thread_id: Optional[int] = None
+    producer_active: bool = False
+    cancellation_requested: bool = False
+    submission_may_have_started: bool = False
+    submitted_layers: int = 0
+    host_drained_layers: int = 0
+    consumer_wait_enqueued: bool = False
+    device_complete: bool = False
+    safe_to_release: bool = False
+    stream_released: bool = False
+    query_failures: int = 0
+    source_owners: list[Any] = field(default_factory=list)
+    metadata_tensors: list[Any] = field(default_factory=list)
+    metadata_ids: set[int] = field(default_factory=set)
+    dense_selection_tensors: dict[int, torch.Tensor] = field(
+        default_factory=dict
+    )
+    source_retire_once: Optional[Callable[[], None]] = None
+    sources_retired: bool = False
+    retirement_lock: threading.Lock = field(default_factory=threading.Lock)
+    summary_logged: bool = False
+    failure: Optional[BaseException] = None
+
+
+class _DenseLoadStreamPool:
+    """Small nonblocking exclusive lease pool for dense bootstrap streams."""
+
+    def __init__(self, streams: Sequence[Any]) -> None:
+        if not streams:
+            raise ValueError("dense bootstrap stream pool must not be empty")
+        self.streams = tuple(streams)
+        self._lock = threading.Lock()
+        self._available = list(range(len(self.streams)))
+        self._leased: set[int] = set()
+
+    @property
+    def capacity(self) -> int:
+        return len(self.streams)
+
+    def try_acquire(self) -> Optional[tuple[int, Any]]:
+        with self._lock:
+            if not self._available:
+                return None
+            stream_index = self._available.pop(0)
+            self._leased.add(stream_index)
+            return stream_index, self.streams[stream_index]
+
+    def release(self, stream_index: int) -> None:
+        with self._lock:
+            if stream_index not in self._leased:
+                raise RuntimeError(
+                    f"dense bootstrap stream {stream_index} is not leased"
+                )
+            self._leased.remove(stream_index)
+            self._available.append(stream_index)
+            self._available.sort()
 
 
 class _SparseLoadJoin:
@@ -1554,11 +1678,855 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # prepared sparse warm path uses destination-only plans below.
         self._sparse_direct_layer_states: Optional[dict] = None
         self._sparse_direct_validated_layers: set = set()
-        # One process-owned destination plan per latent/indexer KV group.
-        self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
+        # Frozen process-owned destination plans. Registration publishes a new
+        # two-slot incarnation atomically; request length and source pointers
+        # are deliberately absent from these plans.
+        self._sparse_destination_plan_lock = threading.Lock()
+        self._sparse_destination_incarnation = 0
+        self._sparse_destination_registrations: tuple[
+            Optional[tuple[Any, ...]], Optional[tuple[Any, ...]]
+        ] = (None, None)
+        self._sparse_destination_registration_signatures: tuple[
+            Optional[tuple], Optional[tuple]
+        ] = (None, None)
+        self._sparse_destination_explicit_registration = (False, False)
+        self._sparse_destination_plans: tuple[
+            Optional[_SparseDestinationPlan],
+            Optional[_SparseDestinationPlan],
+        ] = (None, None)
+
+        # Dense bootstrap tickets use a dedicated stream pool. They must not
+        # alias load_stream_list because ordinary sparse loads have a separate
+        # join/consumer ordering contract.
+        # The ticket pool is intentionally independent from the connector's
+        # ordinary sparse-load streams. Use NPU streams directly so a ticket
+        # cannot accidentally inherit CUDA-wrapper lifecycle semantics.
+        dense_streams = [torch.npu.Stream() for _ in range(4)]
+        self._dense_bootstrap_stream_pool = _DenseLoadStreamPool(dense_streams)
+        self._dense_bootstrap_event_factory = torch.npu.Event
+        self._dense_bootstrap_ticket_lock = threading.Lock()
+        self._dense_bootstrap_active_tickets: dict[
+            int, DenseBootstrapLoadTicket
+        ] = {}
+        self._dense_bootstrap_attached_tickets: dict[
+            int, DenseBootstrapLoadTicket
+        ] = {}
+        self._dense_bootstrap_next_ticket_id = 1
+        self._dense_bootstrap_accepting = True
+        self._dense_bootstrap_fatal_error: Optional[BaseException] = None
         self._direct_page_layout_cache: dict[
             int, tuple[tuple, list[tuple[int, int]]]
         ] = {}
+
+    @staticmethod
+    def is_dense_bootstrap_ticket(value: Any) -> bool:
+        return isinstance(value, DenseBootstrapLoadTicket)
+
+    @staticmethod
+    def _destination_cache_identity(value: Any) -> tuple:
+        if isinstance(value, torch.Tensor):
+            return (
+                "tensor",
+                id(value),
+                int(value.data_ptr()),
+                tuple(int(dim) for dim in value.shape),
+                tuple(int(stride) for stride in value.stride()),
+                value.dtype,
+                str(value.device),
+            )
+        if isinstance(value, (tuple, list)):
+            return (
+                "sequence",
+                tuple(
+                    VLLMPagedMemLayerwiseNPUConnector._destination_cache_identity(
+                        item
+                    )
+                    for item in value
+                ),
+            )
+        return (type(value).__name__, id(value))
+
+    @staticmethod
+    def _normalize_destination_groups(
+        groups: Any,
+    ) -> tuple[Optional[tuple[Any, ...]], Optional[tuple[Any, ...]]]:
+        if isinstance(groups, dict):
+            values = (groups.get(0), groups.get(1))
+        else:
+            values = tuple(groups)
+            if len(values) != 2:
+                raise ValueError(
+                    "sparse destination registration requires exactly two groups"
+                )
+        return tuple(
+            None
+            if group is None
+            else tuple(
+                _freeze_sparse_destination_cache(layer) for layer in group
+            )
+            for group in values
+        )  # type: ignore[return-value]
+
+    def _ensure_dense_bootstrap_state(self) -> None:
+        """Backfill state for lightweight test doubles made with __new__."""
+        if not hasattr(self, "_sparse_destination_plan_lock"):
+            self._sparse_destination_plan_lock = threading.Lock()
+        if not hasattr(self, "_sparse_destination_incarnation"):
+            self._sparse_destination_incarnation = 0
+        if not hasattr(self, "_sparse_destination_registrations"):
+            self._sparse_destination_registrations = (None, None)
+        if not hasattr(self, "_sparse_destination_registration_signatures"):
+            self._sparse_destination_registration_signatures = (None, None)
+        if not hasattr(self, "_sparse_destination_explicit_registration"):
+            self._sparse_destination_explicit_registration = (False, False)
+        plans = getattr(self, "_sparse_destination_plans", None)
+        if not isinstance(plans, tuple) or len(plans) != 2:
+            slots: list[Optional[_SparseDestinationPlan]] = [None, None]
+            if isinstance(plans, dict):
+                for group in (0, 1):
+                    slots[group] = plans.get(group)
+            self._sparse_destination_plans = tuple(slots)
+        if not hasattr(self, "_dense_bootstrap_ticket_lock"):
+            self._dense_bootstrap_ticket_lock = threading.Lock()
+        if not hasattr(self, "_dense_bootstrap_active_tickets"):
+            self._dense_bootstrap_active_tickets = {}
+        if not hasattr(self, "_dense_bootstrap_attached_tickets"):
+            self._dense_bootstrap_attached_tickets = dict(
+                self._dense_bootstrap_active_tickets
+            )
+        if not hasattr(self, "_dense_bootstrap_next_ticket_id"):
+            self._dense_bootstrap_next_ticket_id = 1
+        if not hasattr(self, "_dense_bootstrap_accepting"):
+            self._dense_bootstrap_accepting = True
+        if not hasattr(self, "_dense_bootstrap_fatal_error"):
+            self._dense_bootstrap_fatal_error = None
+
+    def register_sparse_destination_kv_caches(self, groups: Any) -> int:
+        """Publish a new two-group destination-cache incarnation.
+
+        Re-registering the exact same tensor identities is an O(1)-behavioral
+        no-op (the small identity walk happens only at registration). A storage
+        change is rejected while any ticket can still target the prior
+        incarnation.
+        """
+        self._ensure_dense_bootstrap_state()
+        normalized = self._normalize_destination_groups(groups)
+        # Registration happens before request admission. Resolve layout-only
+        # metadata here so the first cold request can acquire a ticket without
+        # lazily initializing shared connector state in its background thread.
+        group_layouts = getattr(self, "_group_layouts", None)
+        for kv_group, group in enumerate(normalized):
+            if (
+                group_layouts is not None
+                and group is not None
+                and kv_group not in group_layouts
+            ):
+                self._lazy_initialize_buffer_with_staging(
+                    list(group), kv_group=kv_group, init_staging=False
+                )
+        signatures = tuple(
+            None if group is None else self._destination_cache_identity(group)
+            for group in normalized
+        )
+        with self._sparse_destination_plan_lock:
+            if signatures == self._sparse_destination_registration_signatures:
+                return self._sparse_destination_incarnation
+            with self._dense_bootstrap_ticket_lock:
+                if self._dense_bootstrap_attached_tickets:
+                    raise RuntimeError(
+                        "cannot replace sparse destination KV caches while "
+                        "dense bootstrap tickets are active"
+                    )
+            self._sparse_destination_incarnation += 1
+            self._sparse_destination_registrations = normalized
+            self._sparse_destination_registration_signatures = signatures
+            self._sparse_destination_explicit_registration = (
+                normalized[0] is not None,
+                normalized[1] is not None,
+            )
+            self._sparse_destination_plans = (None, None)
+            return self._sparse_destination_incarnation
+
+    def begin_dense_bootstrap_load(
+        self,
+        request_id: str,
+        request_generation: int,
+        destination_block_ids: Sequence[int],
+        kvcaches_ref: list,
+        kv_group: int,
+        slot_mapping_dtype: torch.dtype,
+        token_count: int = 0,
+    ) -> Optional[DenseBootstrapLoadTicket]:
+        """Try to acquire an isolated stream and frozen destination plan.
+
+        Capacity exhaustion and an unregistered destination fail closed before
+        any request NPU operation is created; callers can collectively select
+        the conservative path without blocking an active decoder request.
+        """
+        self._ensure_dense_bootstrap_state()
+        self.poll_dense_bootstrap_retirements()
+        if kv_group not in (0, 1):
+            raise ValueError("dense bootstrap kv_group must be 0 or 1")
+        with self._sparse_destination_plan_lock:
+            if not self._dense_bootstrap_accepting:
+                raise RuntimeError("dense bootstrap admission is closed")
+            if self._dense_bootstrap_fatal_error is not None:
+                raise RuntimeError(
+                    "dense bootstrap connector is in a fatal state"
+                ) from self._dense_bootstrap_fatal_error
+            registered_caches = self._sparse_destination_registrations[kv_group]
+            if registered_caches is None:
+                raise RuntimeError(
+                    f"dense bootstrap destination group {kv_group} is not registered"
+                )
+            layout = getattr(self, "_group_layouts", {}).get(kv_group)
+            if layout is None or layout.kv_device is None:
+                raise RuntimeError(
+                    f"dense bootstrap destination group {kv_group} has no device"
+                )
+            plan = self._get_or_create_sparse_destination_plan_locked(
+                kvcaches_ref=list(registered_caches),
+                kv_group=kv_group,
+                slot_mapping_ref=None,
+                slot_mapping_dtype=slot_mapping_dtype,
+                sparse_kv_format=layout.kv_format.value,
+                sparse_k_hidden_dims=layout.k_hidden_dims,
+                sparse_v_hidden_dims=layout.v_hidden_dims,
+                sparse_dsa_hidden_dims=layout.dsa_hidden_dims,
+                expected_device=layout.kv_device,
+            )
+            with self._dense_bootstrap_ticket_lock:
+                if not self._dense_bootstrap_accepting:
+                    raise RuntimeError("dense bootstrap admission is closed")
+                if self._dense_bootstrap_fatal_error is not None:
+                    raise RuntimeError(
+                        "dense bootstrap connector is in a fatal state"
+                    ) from self._dense_bootstrap_fatal_error
+                pool = getattr(self, "_dense_bootstrap_stream_pool", None)
+                if pool is None:
+                    raise RuntimeError("dense bootstrap stream pool is unavailable")
+                lease = pool.try_acquire()
+                if lease is None:
+                    return None
+                stream_index, stream = lease
+                try:
+                    event = self._dense_bootstrap_event_factory()
+                except BaseException:
+                    pool.release(stream_index)
+                    raise
+                ticket_id = self._dense_bootstrap_next_ticket_id
+                self._dense_bootstrap_next_ticket_id += 1
+                ticket = DenseBootstrapLoadTicket(
+                    ticket_id=ticket_id,
+                    request_id=str(request_id),
+                    request_generation=int(request_generation),
+                    destination_block_ids=tuple(
+                        int(block_id) for block_id in destination_block_ids
+                    ),
+                    destination_generation=int(request_generation),
+                    kv_group=int(kv_group),
+                    device_index=(
+                        int(layout.kv_device.index)
+                        if layout.kv_device.index is not None
+                        else -1
+                    ),
+                    device_identity=str(layout.kv_device),
+                    stream_index=stream_index,
+                    stream=stream,
+                    stream_identity=self._stream_identity(stream),
+                    completion_event=event,
+                    destination_plan=plan,
+                    slot_mapping_dtype=slot_mapping_dtype,
+                    token_count=max(0, int(token_count)),
+                    chunk_count=(
+                        (
+                            max(0, int(token_count))
+                            + int(self.lmcache_chunk_size)
+                            - 1
+                        )
+                        // int(self.lmcache_chunk_size)
+                        if int(getattr(self, "lmcache_chunk_size", 0) or 0) > 0
+                        else 0
+                    ),
+                )
+                self._dense_bootstrap_active_tickets[ticket_id] = ticket
+                self._dense_bootstrap_attached_tickets[ticket_id] = ticket
+                return ticket
+
+    @contextmanager
+    def dense_bootstrap_load_context(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> Generator[None, None, None]:
+        self._require_dense_bootstrap_ticket(ticket)
+        stream_context = getattr(getattr(torch, "npu", None), "stream", None)
+        if stream_context is None:
+            stream_context = torch.cuda.stream
+        with ticket.state_lock:
+            if ticket.state is not DenseLoadTicketState.OPEN:
+                raise RuntimeError(
+                    "dense bootstrap producer requires an open ticket"
+                )
+            if ticket.cancellation_requested:
+                raise RuntimeError("dense bootstrap ticket was cancelled")
+            ticket.producer_active = True
+            ticket.producer_thread_id = threading.get_ident()
+            ticket.producer_started_at = time.perf_counter()
+        try:
+            with stream_context(ticket.stream):
+                yield
+        finally:
+            with ticket.state_lock:
+                ticket.producer_active = False
+                if ticket.producer_started_at is not None:
+                    ticket.host_submit_ms = (
+                        time.perf_counter() - ticket.producer_started_at
+                    ) * 1000
+                ticket.host_submission_done.set()
+
+    def retain_dense_bootstrap_metadata(
+        self, ticket: DenseBootstrapLoadTicket, *values: Any
+    ) -> None:
+        self._require_dense_bootstrap_ticket(ticket)
+        with ticket.state_lock:
+            if ticket.state in (
+                DenseLoadTicketState.CLEANED,
+                DenseLoadTicketState.FATAL_RESTART,
+            ):
+                raise RuntimeError("cannot retain metadata on a terminal ticket")
+            for value in values:
+                if value is None or id(value) in ticket.metadata_ids:
+                    continue
+                ticket.metadata_ids.add(id(value))
+                ticket.metadata_tensors.append(value)
+
+    def retain_dense_bootstrap_sources(
+        self, ticket: DenseBootstrapLoadTicket, owners: Sequence[Any]
+    ) -> None:
+        self._require_dense_bootstrap_ticket(ticket)
+        with ticket.state_lock:
+            if ticket.state in (
+                DenseLoadTicketState.CLEANED,
+                DenseLoadTicketState.FATAL_RESTART,
+            ):
+                raise RuntimeError("cannot retain sources on a terminal ticket")
+            known = {id(owner) for owner in ticket.source_owners}
+            for owner in owners:
+                if id(owner) in known:
+                    continue
+                known.add(id(owner))
+                ticket.source_owners.append(owner)
+
+    def bind_dense_bootstrap_source_retirement(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        retire_once: Callable[[], None],
+    ) -> None:
+        """Bind the adapter-owned idempotent source retirement capsule."""
+        self._require_dense_bootstrap_ticket(ticket)
+        if not callable(retire_once):
+            raise TypeError("dense bootstrap source retirement must be callable")
+        with ticket.state_lock:
+            if ticket.state is not DenseLoadTicketState.OPEN:
+                raise RuntimeError(
+                    "source retirement must be bound before ticket submission"
+                )
+            if ticket.source_retire_once is not None:
+                raise RuntimeError("dense bootstrap source retirement already bound")
+            ticket.source_retire_once = retire_once
+
+    def _require_dense_bootstrap_ticket(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> None:
+        if not isinstance(ticket, DenseBootstrapLoadTicket):
+            raise TypeError("expected a DenseBootstrapLoadTicket")
+        self._ensure_dense_bootstrap_state()
+        with self._dense_bootstrap_ticket_lock:
+            if (
+                self._dense_bootstrap_attached_tickets.get(ticket.ticket_id)
+                is not ticket
+            ):
+                raise RuntimeError("dense bootstrap ticket is not attached")
+
+    @staticmethod
+    def _current_npu_stream() -> Any:
+        current_stream = getattr(getattr(torch, "npu", None), "current_stream", None)
+        return (
+            current_stream()
+            if current_stream is not None
+            else torch.cuda.current_stream()
+        )
+
+    @staticmethod
+    def _stream_identity(stream: Any) -> tuple[str, int]:
+        for attribute in ("npu_stream", "cuda_stream"):
+            value = getattr(stream, attribute, None)
+            if value is not None:
+                return attribute, int(value)
+        return "object", id(stream)
+
+    @staticmethod
+    def _validate_dense_bootstrap_device(
+        ticket: DenseBootstrapLoadTicket,
+    ) -> None:
+        current_device = getattr(
+            getattr(torch, "npu", None), "current_device", None
+        )
+        if current_device is None or ticket.device_index < 0:
+            return
+        current_device_index = int(current_device())
+        if current_device_index != ticket.device_index:
+            raise RuntimeError(
+                "dense bootstrap ticket used on the wrong NPU device: "
+                f"current={current_device_index}, "
+                f"expected={ticket.device_index}"
+            )
+
+    def _mark_dense_bootstrap_submission(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> None:
+        # Only the first native call establishes the stream contract. All
+        # later calls run in the same single generator-driving stream context.
+        with ticket.state_lock:
+            if ticket.submission_may_have_started:
+                if ticket.state is not DenseLoadTicketState.SUBMITTING:
+                    raise RuntimeError(
+                        f"cannot submit dense bootstrap in state {ticket.state.name}"
+                    )
+                return
+        self._require_dense_bootstrap_ticket(ticket)
+        self._validate_dense_bootstrap_device(ticket)
+        current_stream = self._current_npu_stream()
+        current_stream_identity = self._stream_identity(current_stream)
+        if current_stream_identity != ticket.stream_identity:
+            raise RuntimeError(
+                "prepared dense bootstrap launch is not on its ticket stream"
+            )
+        with ticket.state_lock:
+            if ticket.state is not DenseLoadTicketState.OPEN:
+                raise RuntimeError(
+                    f"cannot submit dense bootstrap in state {ticket.state.name}"
+                )
+            if not ticket.producer_active:
+                raise RuntimeError(
+                    "dense bootstrap submission requires its producer context"
+                )
+            if ticket.producer_thread_id != threading.get_ident():
+                raise RuntimeError(
+                    "dense bootstrap submission changed producer thread"
+                )
+            if ticket.cancellation_requested:
+                raise RuntimeError("dense bootstrap ticket was cancelled")
+            # Set before entering pybind: an exception may occur after the
+            # native implementation has already enqueued device work.
+            ticket.first_submission_stream_identity = current_stream_identity
+            ticket.submission_may_have_started = True
+            ticket.state = DenseLoadTicketState.SUBMITTING
+
+    def mark_dense_bootstrap_submission(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> None:
+        """Mark the first request NPU operation before it can enqueue work.
+
+        The integration calls this inside :meth:`dense_bootstrap_load_context`
+        immediately before request metadata is copied to the NPU. Prepared
+        native launches call the same idempotent marker, so no additional
+        per-layer stream/device validation is introduced.
+        """
+        self._mark_dense_bootstrap_submission(ticket)
+
+    def mark_dense_bootstrap_external_layers_complete(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        layer_count: int,
+    ) -> None:
+        """Account for a host-drained direct external-page transfer."""
+        self._require_dense_bootstrap_ticket(ticket)
+        if int(layer_count) <= 0:
+            raise ValueError("external dense bootstrap layer count must be positive")
+        with ticket.state_lock:
+            if ticket.state is not DenseLoadTicketState.SUBMITTING:
+                raise RuntimeError(
+                    "external dense bootstrap completion requires a submitting "
+                    "ticket"
+                )
+            if ticket.submitted_layers or ticket.host_drained_layers:
+                raise RuntimeError(
+                    "external dense bootstrap completion cannot mix with "
+                    "prepared layer submissions"
+                )
+            ticket.host_drained_layers = int(layer_count)
+
+    def mark_dense_bootstrap_external_load_fatal(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        error: BaseException,
+    ) -> None:
+        """Retain a ticket whose external writer cannot be safely replayed."""
+        self._require_dense_bootstrap_ticket(ticket)
+        self._mark_dense_bootstrap_fatal(ticket, error)
+
+    @staticmethod
+    def _mark_dense_bootstrap_layer_submitted(
+        ticket: DenseBootstrapLoadTicket,
+    ) -> None:
+        with ticket.state_lock:
+            ticket.submitted_layers += 1
+
+    def finish_dense_bootstrap_load(
+        self, ticket: DenseBootstrapLoadTicket, expected_layers: int
+    ) -> None:
+        self._require_dense_bootstrap_ticket(ticket)
+        self._validate_dense_bootstrap_device(ticket)
+        current_stream = self._current_npu_stream()
+        current_stream_identity = self._stream_identity(current_stream)
+        if current_stream_identity != ticket.stream_identity:
+            raise RuntimeError(
+                "dense bootstrap completion is not recorded on its ticket stream"
+            )
+        with ticket.state_lock:
+            if ticket.state is not DenseLoadTicketState.SUBMITTING:
+                raise RuntimeError(
+                    f"cannot finish dense bootstrap in state {ticket.state.name}"
+                )
+            if ticket.source_retire_once is None:
+                raise RuntimeError(
+                    "dense bootstrap source retirement was not bound"
+                )
+            completed_layers = (
+                ticket.submitted_layers + ticket.host_drained_layers
+            )
+            if completed_layers != int(expected_layers):
+                raise RuntimeError(
+                    "dense bootstrap completed layer count mismatch: "
+                    f"submitted={ticket.submitted_layers}, "
+                    f"host_drained={ticket.host_drained_layers}, "
+                    f"expected={int(expected_layers)}"
+                )
+            try:
+                ticket.completion_event.record(ticket.stream)
+            except BaseException:
+                # Recording can fail after all native work was submitted.
+                ticket.submission_may_have_started = True
+                raise
+            ticket.completion_record_stream_identity = current_stream_identity
+            ticket.state = DenseLoadTicketState.RECORDED
+
+    def consume_dense_bootstrap_load(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> None:
+        self._require_dense_bootstrap_ticket(ticket)
+        consumer_stream = self._current_npu_stream()
+        wait_error: Optional[BaseException] = None
+        with ticket.state_lock:
+            if ticket.state not in (
+                DenseLoadTicketState.RECORDED,
+                DenseLoadTicketState.DEVICE_COMPLETE,
+            ):
+                raise RuntimeError(
+                    f"cannot consume dense bootstrap in state {ticket.state.name}"
+                )
+            if ticket.consumer_wait_enqueued:
+                raise RuntimeError("dense bootstrap consumer wait already enqueued")
+            try:
+                consumer_stream.wait_event(ticket.completion_event)
+            except BaseException as exc:
+                wait_error = exc
+            else:
+                ticket.consumer_wait_enqueued = True
+                ticket.consumer_stream_identity = self._stream_identity(
+                    consumer_stream
+                )
+                if not ticket.device_complete:
+                    ticket.state = DenseLoadTicketState.WAIT_ENQUEUED
+        if wait_error is not None:
+            if not self.fail_dense_bootstrap_load(ticket, wait_error):
+                raise RuntimeError(
+                    "dense bootstrap consumer wait failed and ticket stream "
+                    "could not be drained"
+                ) from wait_error
+            raise wait_error
+        self.poll_dense_bootstrap_retirements()
+
+    def record_dense_bootstrap_future_wait(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        future_wait_ms: float,
+    ) -> None:
+        """Attach the already measured host dependency wait to the ticket."""
+        self._require_dense_bootstrap_ticket(ticket)
+        with ticket.state_lock:
+            ticket.future_wait_ms = max(0.0, float(future_wait_ms))
+
+    def _release_dense_bootstrap_stream(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> None:
+        with self._dense_bootstrap_ticket_lock:
+            with ticket.state_lock:
+                if ticket.stream_released:
+                    return
+                ticket.stream_released = True
+                stream_index = ticket.stream_index
+            self._dense_bootstrap_active_tickets.pop(ticket.ticket_id, None)
+            self._dense_bootstrap_stream_pool.release(stream_index)
+
+    def _log_dense_bootstrap_summary(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        outcome: str,
+    ) -> None:
+        with ticket.state_lock:
+            if ticket.summary_logged:
+                return
+            ticket.summary_logged = True
+            payload = {
+                "event": "dense_bootstrap_ticket_terminal",
+                "ticket_id": ticket.ticket_id,
+                "request_id": ticket.request_id,
+                "request_generation": ticket.request_generation,
+                "destination_generation": ticket.destination_generation,
+                "kv_group": ticket.kv_group,
+                "stream_index": ticket.stream_index,
+                "stream_identity": ticket.stream_identity,
+                "first_submission_stream_identity": (
+                    ticket.first_submission_stream_identity
+                ),
+                "completion_record_stream_identity": (
+                    ticket.completion_record_stream_identity
+                ),
+                "submitted_layers": ticket.submitted_layers,
+                "host_drained_layers": ticket.host_drained_layers,
+                "token_count": ticket.token_count,
+                "chunk_count": ticket.chunk_count,
+                "host_submit_ms": ticket.host_submit_ms,
+                "future_wait_ms": ticket.future_wait_ms,
+                "consumer_wait_enqueued": ticket.consumer_wait_enqueued,
+                "consumer_stream_identity": ticket.consumer_stream_identity,
+                "device_complete": ticket.device_complete,
+                "query_failures": ticket.query_failures,
+                "outcome": outcome,
+            }
+            if ticket.failure is not None:
+                payload["error"] = repr(ticket.failure)
+        log = logger.critical if outcome == "FATAL_RESTART" else logger.info
+        log("[LMCACHE_DENSE_BOOTSTRAP] %s", json.dumps(payload, sort_keys=True))
+
+    def _mark_dense_bootstrap_fatal(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        error: BaseException,
+    ) -> None:
+        # Publish the process-wide admission barrier before making the ticket
+        # terminal. begin_dense_bootstrap_load rechecks this under the same
+        # lock immediately before leasing a stream.
+        with self._dense_bootstrap_ticket_lock:
+            self._dense_bootstrap_fatal_error = error
+            with ticket.state_lock:
+                ticket.failure = error
+                ticket.safe_to_release = False
+                ticket.state = DenseLoadTicketState.FATAL_RESTART
+        self._log_dense_bootstrap_summary(ticket, "FATAL_RESTART")
+
+    def _retire_dense_bootstrap_sources(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+    ) -> bool:
+        """Retire adapter ownership exactly once after device quiescence."""
+        with ticket.retirement_lock:
+            with ticket.state_lock:
+                if ticket.sources_retired:
+                    return True
+                if ticket.state is DenseLoadTicketState.FATAL_RESTART:
+                    return False
+                retire_once = ticket.source_retire_once
+            if retire_once is None:
+                self._mark_dense_bootstrap_fatal(
+                    ticket,
+                    RuntimeError(
+                        "dense bootstrap source retirement was not bound"
+                    ),
+                )
+                return False
+            try:
+                retire_once()
+            except BaseException as error:
+                self._mark_dense_bootstrap_fatal(ticket, error)
+                return False
+            with ticket.state_lock:
+                ticket.sources_retired = True
+                ticket.source_owners.clear()
+                ticket.metadata_tensors.clear()
+                ticket.metadata_ids.clear()
+                ticket.dense_selection_tensors.clear()
+                ticket.destination_plan = None
+            return True
+
+    def _complete_dense_bootstrap_device(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        state: DenseLoadTicketState,
+    ) -> bool:
+        with ticket.state_lock:
+            ticket.device_complete = True
+        retired = self._retire_dense_bootstrap_sources(ticket)
+        if retired:
+            with ticket.state_lock:
+                ticket.safe_to_release = True
+                ticket.state = state
+        self._release_dense_bootstrap_stream(ticket)
+        return retired
+
+    def poll_dense_bootstrap_retirements(self) -> int:
+        """Nonblocking completion polling; never synchronizes normal work."""
+        self._ensure_dense_bootstrap_state()
+        with self._dense_bootstrap_ticket_lock:
+            tickets = tuple(self._dense_bootstrap_active_tickets.values())
+        completed: list[DenseBootstrapLoadTicket] = []
+        failed_queries: list[DenseBootstrapLoadTicket] = []
+        for ticket in tickets:
+            with ticket.failure_lock:
+                with ticket.state_lock:
+                    if ticket.safe_to_release or ticket.state not in (
+                        DenseLoadTicketState.RECORDED,
+                        DenseLoadTicketState.WAIT_ENQUEUED,
+                    ):
+                        continue
+                    # Event completion alone cannot recycle a stream while its
+                    # host producer context could still enqueue later work.
+                    if not ticket.host_submission_done.is_set():
+                        continue
+                    try:
+                        ready = bool(ticket.completion_event.query())
+                    except BaseException as exc:
+                        ticket.query_failures += 1
+                        ticket.failure = exc
+                        if ticket.query_failures >= 3:
+                            failed_queries.append(ticket)
+                        continue
+                    if not ready:
+                        continue
+                if self._complete_dense_bootstrap_device(
+                    ticket, DenseLoadTicketState.DEVICE_COMPLETE
+                ):
+                    completed.append(ticket)
+        for ticket in failed_queries:
+            self.fail_dense_bootstrap_load(
+                ticket,
+                RuntimeError("dense bootstrap completion event query failed"),
+            )
+        return len(completed)
+
+    def dense_bootstrap_load_complete(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> bool:
+        self._require_dense_bootstrap_ticket(ticket)
+        self.poll_dense_bootstrap_retirements()
+        with ticket.state_lock:
+            fatal = ticket.state is DenseLoadTicketState.FATAL_RESTART
+            failure = ticket.failure
+            safe_to_release = ticket.safe_to_release
+        if fatal:
+            raise RuntimeError(
+                "dense bootstrap load entered a fatal state; worker restart "
+                "is required"
+            ) from failure
+        return safe_to_release
+
+    def fail_dense_bootstrap_load(
+        self,
+        ticket: DenseBootstrapLoadTicket,
+        error: BaseException,
+    ) -> bool:
+        """Prove ticket-stream quiescence after a failed submission.
+
+        Returns True only when source owners and scheduler destination blocks
+        are safe for their owning integration to release. A stream-drain
+        failure retains every reference and leaves the connector in a fatal
+        state.
+        """
+        with ticket.failure_lock:
+            self._require_dense_bootstrap_ticket(ticket)
+            with ticket.state_lock:
+                if ticket.state is DenseLoadTicketState.FATAL_RESTART:
+                    return False
+                ticket.failure = error
+                if ticket.safe_to_release:
+                    return True
+                ticket.cancellation_requested = True
+                producer_active = ticket.producer_active
+                producer_thread_id = ticket.producer_thread_id
+            if producer_active:
+                if producer_thread_id == threading.get_ident():
+                    raise RuntimeError(
+                        "fail_dense_bootstrap_load cannot drain from inside "
+                        "the active producer context"
+                    )
+                # Cancellation can race the producer before its first native
+                # call. Wait for the context to close, then re-read the marker:
+                # either no device work started or this exact stream must drain.
+                ticket.host_submission_done.wait()
+            with ticket.state_lock:
+                if ticket.safe_to_release:
+                    return True
+                post_submit = ticket.submission_may_have_started
+            if not post_submit:
+                return self._complete_dense_bootstrap_device(
+                    ticket, DenseLoadTicketState.FAILED_PRE_SUBMIT
+                )
+            try:
+                ticket.stream.synchronize()
+            except BaseException as sync_error:
+                self._mark_dense_bootstrap_fatal(ticket, sync_error)
+                logger.critical(
+                    "Dense bootstrap ticket stream could not be drained; "
+                    "retaining all source/destination ownership",
+                    exc_info=True,
+                )
+                return False
+            return self._complete_dense_bootstrap_device(
+                ticket, DenseLoadTicketState.FAILED_POST_SUBMIT
+            )
+
+    def release_dense_bootstrap_load(
+        self, ticket: DenseBootstrapLoadTicket
+    ) -> bool:
+        """Detach a device-complete ticket after its one consumer wait."""
+        self._require_dense_bootstrap_ticket(ticket)
+        self.poll_dense_bootstrap_retirements()
+        with ticket.state_lock:
+            if not ticket.safe_to_release:
+                return False
+            ticket.state = DenseLoadTicketState.CLEANED
+        self._release_dense_bootstrap_stream(ticket)
+        with self._dense_bootstrap_ticket_lock:
+            self._dense_bootstrap_attached_tickets.pop(ticket.ticket_id, None)
+        self._log_dense_bootstrap_summary(ticket, "CLEANED")
+        return True
+
+    def shutdown_dense_bootstrap_loads(self) -> None:
+        """Drain all ticket streams before destination allocators are torn down."""
+        self._ensure_dense_bootstrap_state()
+        with self._dense_bootstrap_ticket_lock:
+            self._dense_bootstrap_accepting = False
+            tickets = tuple(self._dense_bootstrap_attached_tickets.values())
+        unsafe: list[DenseBootstrapLoadTicket] = []
+        shutdown_error = RuntimeError("dense bootstrap connector shutdown")
+        for ticket in tickets:
+            try:
+                complete = self.dense_bootstrap_load_complete(ticket)
+            except BaseException:
+                unsafe.append(ticket)
+                continue
+            if not complete and not self.fail_dense_bootstrap_load(
+                ticket, shutdown_error
+            ):
+                unsafe.append(ticket)
+        if unsafe:
+            raise RuntimeError(
+                "dense bootstrap shutdown could not prove stream quiescence; "
+                "ticket ownership was deliberately retained"
+            ) from self._dense_bootstrap_fatal_error
+        for ticket in tickets:
+            self.release_dense_bootstrap_load(ticket)
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
@@ -2090,14 +3058,45 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         *,
         kvcaches_ref: list,
         kv_group: int,
-        slot_mapping_ref: torch.Tensor,
+        slot_mapping_ref: Optional[torch.Tensor],
+        slot_mapping_dtype: Optional[torch.dtype] = None,
         sparse_kv_format: int,
         sparse_k_hidden_dims: int,
         sparse_v_hidden_dims: int,
         sparse_dsa_hidden_dims: int,
         expected_device: Optional[torch.device],
     ) -> _SparseDestinationPlan:
-        """Resolve process-invariant native states for one destination group."""
+        """Resolve one frozen process-owned destination plan."""
+        self._ensure_dense_bootstrap_state()
+        with self._sparse_destination_plan_lock:
+            return self._get_or_create_sparse_destination_plan_locked(
+                kvcaches_ref=kvcaches_ref,
+                kv_group=kv_group,
+                slot_mapping_ref=slot_mapping_ref,
+                slot_mapping_dtype=slot_mapping_dtype,
+                sparse_kv_format=sparse_kv_format,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                expected_device=expected_device,
+            )
+
+    def _get_or_create_sparse_destination_plan_locked(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        slot_mapping_ref: Optional[torch.Tensor],
+        slot_mapping_dtype: Optional[torch.dtype],
+        sparse_kv_format: int,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        expected_device: Optional[torch.device],
+    ) -> _SparseDestinationPlan:
+        """Locked implementation; callers hold destination_plan_lock."""
+        if kv_group not in (0, 1):
+            raise ValueError("prepared sparse destination group must be 0 or 1")
         if expected_device is None:
             raise RuntimeError(f"kv_group={kv_group} has no initialized NPU device")
         if len(kvcaches_ref) != self.num_layers:
@@ -2105,43 +3104,90 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 "Prepared sparse destination has the wrong layer count: "
                 f"kvcaches={len(kvcaches_ref)}, connector={self.num_layers}"
             )
-        if slot_mapping_ref.device != expected_device:
+        if slot_mapping_ref is not None and slot_mapping_ref.device != expected_device:
             raise ValueError(
                 "Prepared sparse slot mapping is on the wrong device: "
                 f"device={slot_mapping_ref.device}, expected={expected_device}"
             )
+        if slot_mapping_ref is not None:
+            if (
+                slot_mapping_dtype is not None
+                and slot_mapping_dtype != slot_mapping_ref.dtype
+            ):
+                raise ValueError("slot mapping dtype disagrees with its tensor")
+            slot_mapping_dtype = slot_mapping_ref.dtype
+        if slot_mapping_dtype is None:
+            raise ValueError("prepared sparse destination requires a slot dtype")
+
+        explicitly_registered = self._sparse_destination_explicit_registration[
+            kv_group
+        ]
+        registered_caches = self._sparse_destination_registrations[kv_group]
+        cache_signature = None
+        if explicitly_registered:
+            if registered_caches is None:
+                raise RuntimeError("explicit destination registration is missing")
+            # Explicit registration authenticated the complete stable storage
+            # signature once. Hot ticket lookup uses the published incarnation
+            # and does not walk all cache layers again.
+            kvcaches_ref = list(registered_caches)
+        else:
+            cache_signature = self._destination_cache_identity(kvcaches_ref)
+        registered_signature = self._sparse_destination_registration_signatures[
+            kv_group
+        ]
+        if not explicitly_registered and registered_signature != cache_signature:
+            with self._dense_bootstrap_ticket_lock:
+                if self._dense_bootstrap_attached_tickets:
+                    raise RuntimeError(
+                        "cannot change sparse destination registration while "
+                        "dense bootstrap tickets are active"
+                    )
+            registrations = list(self._sparse_destination_registrations)
+            signatures = list(
+                self._sparse_destination_registration_signatures
+            )
+            registrations[kv_group] = tuple(kvcaches_ref)
+            signatures[kv_group] = cache_signature
+            explicit = list(self._sparse_destination_explicit_registration)
+            explicit[kv_group] = False
+            self._sparse_destination_incarnation += 1
+            self._sparse_destination_registrations = tuple(registrations)
+            self._sparse_destination_registration_signatures = tuple(signatures)
+            self._sparse_destination_explicit_registration = tuple(explicit)
+            self._sparse_destination_plans = (None, None)
 
         signature = (
-            slot_mapping_ref.dtype,
-            str(slot_mapping_ref.device),
+            slot_mapping_dtype,
+            str(expected_device),
             int(sparse_kv_format),
             int(sparse_k_hidden_dims),
             int(sparse_v_hidden_dims),
             int(sparse_dsa_hidden_dims),
-            tuple(
-                self._vllm_layer_cache_identity_signature(layer)
-                for layer in kvcaches_ref
-            )
-            if getattr(self, "enable_npu_transfer_validation", False)
-            else (),
         )
-        plans = getattr(self, "_sparse_destination_plans", None)
-        if plans is None:
-            plans = {}
-            self._sparse_destination_plans = plans
-        plan = plans.pop(kv_group, None)
-        if (
-            plan is not None
-            and plan.kvcaches_ref is kvcaches_ref
-            and plan.signature == signature
-        ):
-            plans[kv_group] = plan
+        plan = self._sparse_destination_plans[kv_group]
+        if plan is not None:
+            if (
+                plan.incarnation != self._sparse_destination_incarnation
+                or plan.signature != signature
+            ):
+                raise RuntimeError(
+                    "published sparse destination plan is immutable; register "
+                    "a new KV-cache incarnation before changing its ABI"
+                )
             return plan
 
+        # Native preparation consumes only the slot scalar type. Avoid creating
+        # request NPU metadata when a ticket builds a plan from its dtype.
+        slot_type_ref = (
+            slot_mapping_ref
+            if slot_mapping_ref is not None
+            else torch.empty(0, dtype=slot_mapping_dtype, device="cpu")
+        )
         states = tuple(
             prepare_sparse_direct_destination_state(
                 kvcaches_ref[layer_id],
-                slot_mapping_ref,
+                slot_type_ref,
                 sparse_kv_format,
                 sparse_k_hidden_dims,
                 sparse_v_hidden_dims,
@@ -2149,10 +3195,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             for layer_id in range(self.num_layers)
         )
-        plan = _SparseDestinationPlan(kvcaches_ref, signature, states)
+        plan = _SparseDestinationPlan(
+            tuple(kvcaches_ref),
+            signature,
+            states,
+            incarnation=self._sparse_destination_incarnation,
+            kv_group=kv_group,
+        )
+        plans = list(self._sparse_destination_plans)
         plans[kv_group] = plan
-        while len(plans) > _SPARSE_DESTINATION_PLAN_CACHE_SIZE:
-            del plans[next(iter(plans))]
+        self._sparse_destination_plans = tuple(plans)
         return plan
 
     def _sparse_direct_state_key(
@@ -2342,6 +3394,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         token_start_index: int,
         target_slot_mapping: Optional[Union[torch.Tensor, list]] = None,
         selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
+        dense_load_ticket: Optional[DenseBootstrapLoadTicket] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build parallel destination/source arrays for the sparse copy kernel."""
         if selected_token_idx is not None and not isinstance(
@@ -2356,6 +3409,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 selected_token_idx,
                 target_slot_mapping,
                 selected_token_counts,
+                dense_load_ticket=dense_load_ticket,
             )
             return packed, selected
 
@@ -2411,7 +3465,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     slot_mapping_packed = slot_mapping[gather_indices]
                     selected_token_idx = rows.reshape(-1)
                     selected_token_idx = self._sparse_selected_token_idx(
-                        selected_token_idx, slot_mapping_packed.shape[0]
+                        selected_token_idx,
+                        slot_mapping_packed.shape[0],
+                        dense_load_ticket,
                     )
                     return slot_mapping_packed, selected_token_idx
 
@@ -2438,7 +3494,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     else selected_token_idx.reshape(-1)[:0]
                 )
                 selected_token_idx = self._sparse_selected_token_idx(
-                    selected_token_idx, slot_mapping_packed.shape[0]
+                    selected_token_idx,
+                    slot_mapping_packed.shape[0],
+                    dense_load_ticket,
                 )
                 return slot_mapping_packed, selected_token_idx
 
@@ -2454,7 +3512,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 slot_mapping_packed = slot_mapping[:0]
                 selected_token_idx = selected_token_idx[:0]
             selected_token_idx = self._sparse_selected_token_idx(
-                selected_token_idx, slot_mapping_packed.shape[0]
+                selected_token_idx,
+                slot_mapping_packed.shape[0],
+                dense_load_ticket,
             )
             return slot_mapping_packed, selected_token_idx
 
@@ -2464,7 +3524,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else slot_mapping[int(token_start_index) :]
         )
         selected_token_idx = self._sparse_selected_token_idx(
-            None, slot_mapping_packed.shape[0]
+            None, slot_mapping_packed.shape[0], dense_load_ticket
         )
         return slot_mapping_packed, selected_token_idx
 
@@ -2473,6 +3533,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         selected_token_idx: Optional[Union[torch.Tensor, list]],
         target_slot_mapping: Union[torch.Tensor, list],
         selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
+        *,
+        dense_load_ticket: Optional[DenseBootstrapLoadTicket] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Use caller-provided target slots for row-wise MTP sparse loads."""
         if selected_token_idx is None:
@@ -2539,8 +3601,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"length: {target_slot_mapping.numel()} vs {selected_token_idx.numel()}"
             )
         selected_token_idx = self._sparse_selected_token_idx(
-            selected_token_idx, target_slot_mapping.numel()
+            selected_token_idx,
+            target_slot_mapping.numel(),
+            dense_load_ticket,
         )
+        if dense_load_ticket is not None:
+            self.retain_dense_bootstrap_metadata(
+                dense_load_ticket,
+                target_slot_mapping,
+                selected_token_counts,
+            )
         return target_slot_mapping, selected_token_idx, selected_token_counts
 
     def _run_sparse_staging_kv_transfer_layer(
@@ -2818,8 +3888,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         total_tokens: int,
         sparse_host_interleaved: bool,
         selected_token_counts: Optional[torch.Tensor] = None,
+        dense_load_ticket: Optional[DenseBootstrapLoadTicket] = None,
     ) -> None:
-        """Launch one prepared layer directly on the current compute stream."""
+        """Launch one prepared layer on the caller's current NPU stream."""
         if selected_token_idx.numel() == 0:
             return
         if total_tokens <= 0:
@@ -2827,23 +3898,47 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._validate_sparse_fixed_chunk_coverage(
             int(chunk_ptrs_npu.numel()), int(chunk_size), int(total_tokens)
         )
-        sparse_mla_dsa_batched_direct_kv_transfer_prepared(
-            plan.states[layer_id],
-            slot_mapping_packed,
-            selected_token_idx,
-            chunk_ptrs_npu,
-            chunk_size,
-            total_tokens,
-            sparse_host_interleaved,
-            selected_token_counts,
-        )
+        if dense_load_ticket is not None:
+            if dense_load_ticket.destination_plan is not plan:
+                raise RuntimeError("dense bootstrap destination plan mismatch")
+            self._mark_dense_bootstrap_submission(dense_load_ticket)
+        try:
+            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+                plan.states[layer_id],
+                slot_mapping_packed,
+                selected_token_idx,
+                chunk_ptrs_npu,
+                chunk_size,
+                total_tokens,
+                sparse_host_interleaved,
+                selected_token_counts,
+            )
+        except BaseException:
+            # A pybind error can be raised after native work was enqueued. The
+            # pre-call marker deliberately forces ticket-stream drain/no replay.
+            raise
+        else:
+            if dense_load_ticket is not None:
+                self._mark_dense_bootstrap_layer_submitted(dense_load_ticket)
 
     def _sparse_selected_token_idx(
         self,
         selected_token_idx: Optional[torch.Tensor],
         num_sparse: int,
+        dense_load_ticket: Optional[DenseBootstrapLoadTicket] = None,
     ) -> torch.Tensor:
         if selected_token_idx is None:
+            if dense_load_ticket is not None:
+                cached = dense_load_ticket.dense_selection_tensors.get(num_sparse)
+                if cached is None:
+                    cached = torch.arange(
+                        num_sparse, dtype=torch.int32, device=self.kv_device
+                    )
+                    dense_load_ticket.dense_selection_tensors[num_sparse] = cached
+                    self.retain_dense_bootstrap_metadata(
+                        dense_load_ticket, cached
+                    )
+                return cached
             cached = self._layerwise_sparse_idx_cache
             if cached is None or cached.shape[0] != num_sparse:
                 cached = torch.arange(
@@ -2855,8 +3950,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_idx.dtype == torch.int32
             and selected_token_idx.device == self.kv_device
         ):
+            if dense_load_ticket is not None:
+                self.retain_dense_bootstrap_metadata(
+                    dense_load_ticket, selected_token_idx
+                )
             return selected_token_idx
-        return selected_token_idx.to(device=self.kv_device, dtype=torch.int32)
+        selected_token_idx = selected_token_idx.to(
+            device=self.kv_device, dtype=torch.int32
+        )
+        if dense_load_ticket is not None:
+            self.retain_dense_bootstrap_metadata(
+                dense_load_ticket, selected_token_idx
+            )
+        return selected_token_idx
 
     def _is_mla_dsa_format(self, kv_group: Optional[int] = None) -> bool:
         fmt = self._fmt_for(kv_group)
@@ -3356,7 +4462,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if (
                 local_start < 0
                 or local_end > len(slot_mapping)
-                or any(left != right for left, right in zip(ends[:-1], starts[1:]))
+                or any(
+                    left != right
+                    for left, right in zip(
+                        ends[:-1], starts[1:], strict=True
+                    )
+                )
             ):
                 return self._reject_direct_page_plan(
                     kv_group, "noncontiguous_slot_window"
@@ -3430,7 +4541,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if (
                 local_start < 0
                 or local_end > len(slot_mapping)
-                or any(left != right for left, right in zip(ends[:-1], starts[1:]))
+                or any(
+                    left != right
+                    for left, right in zip(
+                        ends[:-1], starts[1:], strict=True
+                    )
+                )
             ):
                 return self._reject_direct_page_plan(
                     kv_group, "noncontiguous_slot_window"
@@ -3619,6 +4735,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: int,
         layerwise: bool = False,
         slot_mapping_base: int = 0,
+        dense_load_ticket: Optional[DenseBootstrapLoadTicket] = None,
     ) -> Optional[
         tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
     ]:
@@ -3627,6 +4744,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return self._reject_direct_page_plan(
                 kv_group, "dense_direct_load_disabled"
             )
+        if dense_load_ticket is not None:
+            self._require_dense_bootstrap_ticket(dense_load_ticket)
+            if dense_load_ticket.kv_group != kv_group:
+                raise RuntimeError("dense bootstrap ticket KV group mismatch")
+            destination_plan = dense_load_ticket.destination_plan
+            if destination_plan is None:
+                raise RuntimeError(
+                    "dense bootstrap destination plan was already retired"
+                )
+            if (
+                destination_plan.incarnation
+                != self._sparse_destination_incarnation
+                or self._sparse_destination_plans[kv_group]
+                is not destination_plan
+            ):
+                raise RuntimeError(
+                    "dense bootstrap destination incarnation changed after "
+                    "ticket creation"
+                )
+            kvcaches = list(destination_plan.kvcaches_ref)
         return self._plan_direct_page_buffers(
             kvcaches,
             slot_mapping,
@@ -4611,6 +5748,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping = transfer_kwargs["slot_mapping"]
 
         kv_group = int(transfer_kwargs.get("kv_group", 0))
+        dense_load_ticket = transfer_kwargs.get("dense_load_ticket")
+        if dense_load_ticket is not None:
+            self._require_dense_bootstrap_ticket(dense_load_ticket)
+            if dense_load_ticket.kv_group != kv_group:
+                raise RuntimeError("dense bootstrap ticket KV group mismatch")
         req_id = transfer_kwargs.get("req_id")
         frontier = int(transfer_kwargs.get("lmcache_cached_tokens", 0) or 0)
         layout = self._group_layouts.get(kv_group)
@@ -4641,16 +5783,33 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"coverage={chunk_token_counts}"
             )
 
-        destination_plan = self._get_or_create_sparse_destination_plan(
-            kvcaches_ref=kvcaches_snapshot,
-            kv_group=kv_group,
-            slot_mapping_ref=slot_mapping,
-            sparse_kv_format=sparse_kv_format,
-            sparse_k_hidden_dims=sparse_k_hidden_dims,
-            sparse_v_hidden_dims=sparse_v_hidden_dims,
-            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-            expected_device=layout.kv_device,
-        )
+        if dense_load_ticket is not None:
+            destination_plan = dense_load_ticket.destination_plan
+            if destination_plan is None:
+                raise RuntimeError(
+                    "dense bootstrap destination plan was already retired"
+                )
+            if (
+                destination_plan.incarnation
+                != self._sparse_destination_incarnation
+                or self._sparse_destination_plans[kv_group]
+                is not destination_plan
+            ):
+                raise RuntimeError(
+                    "dense bootstrap destination incarnation changed after "
+                    "ticket creation"
+                )
+        else:
+            destination_plan = self._get_or_create_sparse_destination_plan(
+                kvcaches_ref=kvcaches_snapshot,
+                kv_group=kv_group,
+                slot_mapping_ref=slot_mapping,
+                sparse_kv_format=sparse_kv_format,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                expected_device=layout.kv_device,
+            )
 
         for layer_id, source_layer in enumerate(source.layers):
             sparse_request = yield
@@ -4680,6 +5839,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         selected_token_idx,
                         target_slot_mapping,
                         selected_token_counts,
+                        dense_load_ticket=dense_load_ticket,
                     )
                 )
             else:
@@ -4688,6 +5848,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_mapping,
                         selected_token_idx,
                         token_start_index,
+                        dense_load_ticket=dense_load_ticket,
                     )
                 )
                 selected_token_counts = None
@@ -4699,6 +5860,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     selected_token_counts=selected_token_counts,
                 )
             )
+            if dense_load_ticket is not None:
+                self.retain_dense_bootstrap_metadata(
+                    dense_load_ticket,
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    selected_token_counts,
+                    source_layer.chunk_ptrs_npu,
+                )
 
             deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
             capture_content = _should_capture_deep_payload(
@@ -4744,6 +5913,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens=source.total_tokens,
                 sparse_host_interleaved=sparse_host_interleaved,
                 selected_token_counts=selected_token_counts,
+                dense_load_ticket=dense_load_ticket,
             )
             if capture_content and layer_id == 0:
                 source_tensors = list(source_layer.tensors)
@@ -4817,6 +5987,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
         kv_group = kwargs.get("kv_group", 0)
+        dense_load_ticket = kwargs.get("dense_load_ticket")
+        if dense_load_ticket is not None:
+            self._require_dense_bootstrap_ticket(dense_load_ticket)
+            if dense_load_ticket.kv_group != kv_group:
+                raise RuntimeError("dense bootstrap ticket KV group mismatch")
         layout = self._lazy_initialize_buffer_with_staging(
             kvcaches_snapshot,
             kv_group=kv_group,
@@ -4840,8 +6015,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         lmcache_cached_tokens: int = int(kwargs.get("lmcache_cached_tokens", 0) or 0)
 
-        load_stream_idx = self.load_stream_idx
-        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
+        load_stream_idx = 0
+        if dense_load_ticket is None:
+            load_stream_idx = self.load_stream_idx
+            self.load_stream_idx = (
+                self.load_stream_idx + 1
+            ) % self.load_stream_num
 
         chunk_size = self.lmcache_chunk_size
 
@@ -4861,16 +6040,35 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         bootstrap_destination_plan = None
         if self._is_mla_dsa_format(kv_group):
-            bootstrap_destination_plan = self._get_or_create_sparse_destination_plan(
-                kvcaches_ref=kvcaches_snapshot,
-                kv_group=kv_group,
-                slot_mapping_ref=slot_mapping,
-                sparse_kv_format=sparse_kv_format,
-                sparse_k_hidden_dims=sparse_k_hidden_dims,
-                sparse_v_hidden_dims=sparse_v_hidden_dims,
-                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
-                expected_device=layout.kv_device,
-            )
+            if dense_load_ticket is not None:
+                bootstrap_destination_plan = dense_load_ticket.destination_plan
+                if bootstrap_destination_plan is None:
+                    raise RuntimeError(
+                        "dense bootstrap destination plan was already retired"
+                    )
+                if (
+                    bootstrap_destination_plan.incarnation
+                    != self._sparse_destination_incarnation
+                    or self._sparse_destination_plans[kv_group]
+                    is not bootstrap_destination_plan
+                ):
+                    raise RuntimeError(
+                        "dense bootstrap destination incarnation changed after "
+                        "ticket creation"
+                    )
+            else:
+                bootstrap_destination_plan = (
+                    self._get_or_create_sparse_destination_plan(
+                        kvcaches_ref=kvcaches_snapshot,
+                        kv_group=kv_group,
+                        slot_mapping_ref=slot_mapping,
+                        sparse_kv_format=sparse_kv_format,
+                        sparse_k_hidden_dims=sparse_k_hidden_dims,
+                        sparse_v_hidden_dims=sparse_v_hidden_dims,
+                        sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                        expected_device=layout.kv_device,
+                    )
+                )
         for layer_id in range(self.num_layers):
             sparse_request = yield
             # The generator is resumed from vLLM's attention path; refresh the
@@ -4960,6 +6158,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         selected_token_idx,
                         target_slot_mapping,
                         selected_token_counts,
+                        dense_load_ticket=dense_load_ticket,
                     )
                 )
             else:
@@ -4968,6 +6167,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         slot_mapping,
                         selected_token_idx,
                         token_start_index,
+                        dense_load_ticket=dense_load_ticket,
                     )
                 )
             slot_mapping_packed, selected_token_idx = (
@@ -4978,6 +6178,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     selected_token_counts=selected_token_counts,
                 )
             )
+            if dense_load_ticket is not None:
+                self.retain_dense_bootstrap_metadata(
+                    dense_load_ticket,
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    selected_token_counts,
+                )
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
@@ -5040,6 +6247,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors,
                     cached_chunk_ptrs_npu,
                 )
+            if dense_load_ticket is not None:
+                self.retain_dense_bootstrap_metadata(
+                    dense_load_ticket,
+                    chunk_ptrs_npu,
+                )
             total_tokens = (
                 lmcache_cached_tokens
                 if lmcache_cached_tokens > 0
@@ -5047,7 +6259,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             if (
                 bootstrap_destination_plan is not None
-                and self._active_sparse_load_join is None
+                and (
+                    dense_load_ticket is not None
+                    or self._active_sparse_load_join is None
+                )
             ):
                 self._run_prepared_sparse_direct_kv_transfer_layer(
                     plan=bootstrap_destination_plan,
@@ -5059,6 +6274,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     total_tokens=total_tokens,
                     sparse_host_interleaved=sparse_host_interleaved,
                     selected_token_counts=selected_token_counts,
+                    dense_load_ticket=dense_load_ticket,
                 )
             else:
                 self._run_sparse_direct_kv_transfer_layer(

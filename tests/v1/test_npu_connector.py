@@ -3,8 +3,9 @@
 # Standard
 from collections import deque
 from concurrent.futures import Future
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import ctypes
+import json
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -1699,8 +1700,9 @@ class _RecordableTensor:
 
 
 class _TrackingStream:
-    def __init__(self, name: str):
+    def __init__(self, name: str, handle: int | None = None):
         self.name = name
+        self.npu_stream = id(self) if handle is None else handle
         self.events = []
 
     def wait_stream(self, stream):
@@ -1714,12 +1716,19 @@ class _TrackingStream:
 
 
 class _TrackingEvent:
-    def __init__(self, name: str):
+    def __init__(self, name: str, ready: bool = False):
         self.name = name
         self.records = []
+        self.ready = ready
+        self.query_error = None
 
     def record(self, stream):
         self.records.append(stream.name)
+
+    def query(self):
+        if self.query_error is not None:
+            raise self.query_error
+        return self.ready
 
 
 class _DenseLayout:
@@ -1742,7 +1751,7 @@ def test_sparse_memory_update_resets_fast_direct_state() -> None:
     connector._sparse_direct_layer_states = {(123, 0, 0): object()}
     connector._sparse_direct_validated_layers = {(0, 0)}
     destination_plan = object()
-    connector._sparse_destination_plans = {0: destination_plan}
+    connector._sparse_destination_plans = (destination_plan, None)
 
     connector.notify_sparse_memory_objs_updated()
 
@@ -1807,6 +1816,757 @@ def test_dense_load_readiness_records_and_waits_without_host_sync(monkeypatch) -
     assert event.records == ["dense-load"]
     assert compute_stream.events == [("wait_event", "dense-ready")]
     assert connector.load_stream.events == []
+
+
+def _make_dense_bootstrap_connector(monkeypatch, *, stream_count=2, layers=2):
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = layers
+    connector.kv_device = torch.device("cpu")
+    connector._group_layouts = {
+        1: SimpleNamespace(
+            k_hidden_dims=1,
+            v_hidden_dims=0,
+            dsa_hidden_dims=1,
+            kv_format=SimpleNamespace(value=3),
+            kv_device=torch.device("cpu"),
+        )
+    }
+    connector._dense_bootstrap_stream_pool = npu_connectors._DenseLoadStreamPool(
+        [_TrackingStream(f"ticket-{index}", handle=100 + index)
+         for index in range(stream_count)]
+    )
+    events = deque()
+
+    def event_factory():
+        event = _TrackingEvent(f"ticket-event-{len(events)}")
+        events.append(event)
+        return event
+
+    connector._dense_bootstrap_event_factory = event_factory
+    connector._layerwise_sparse_idx_cache = None
+    connector._ensure_dense_bootstrap_state()
+    kvcaches = tuple(object() for _ in range(layers))
+    monkeypatch.setattr(
+        npu_connectors,
+        "prepare_sparse_direct_destination_state",
+        lambda *args: object(),
+    )
+    connector.register_sparse_destination_kv_caches((None, kvcaches))
+    return connector, list(kvcaches), events
+
+
+def _install_dense_bootstrap_stream_context(
+    monkeypatch, *, wrap_same_handle: bool = False
+):
+    compute_stream = _TrackingStream("compute", handle=7)
+    current = {"stream": compute_stream}
+
+    @contextmanager
+    def stream_context(stream):
+        previous = current["stream"]
+        current["stream"] = (
+            _TrackingStream(f"wrapper-{stream.name}", handle=stream.npu_stream)
+            if wrap_same_handle
+            else stream
+        )
+        try:
+            yield
+        finally:
+            current["stream"] = previous
+
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(
+            current_stream=lambda: current["stream"],
+            stream=stream_context,
+        ),
+        raising=False,
+    )
+    return compute_stream
+
+
+def _submit_dense_bootstrap_layer(connector, ticket, layer_id=0) -> None:
+    connector._run_prepared_sparse_direct_kv_transfer_layer(
+        plan=ticket.destination_plan,
+        chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+        layer_id=layer_id,
+        slot_mapping_packed=torch.arange(4, dtype=torch.long),
+        selected_token_idx=torch.arange(4, dtype=torch.int32),
+        chunk_size=4,
+        total_tokens=4,
+        sparse_host_interleaved=True,
+        dense_load_ticket=ticket,
+    )
+
+
+def _bind_dense_bootstrap_retirement(connector, ticket, callback=None) -> None:
+    connector.bind_dense_bootstrap_source_retirement(
+        ticket, callback if callback is not None else lambda: None
+    )
+
+
+def test_dense_bootstrap_ticket_orders_one_consumer_without_host_sync(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, events = _make_dense_bootstrap_connector(monkeypatch)
+    connector.lmcache_chunk_size = 4
+    summaries = []
+
+    def capture_summary(message, *args):
+        if message == "[LMCACHE_DENSE_BOOTSTRAP] %s":
+            summaries.append(json.loads(args[0]))
+
+    monkeypatch.setattr(npu_connectors.logger, "info", capture_summary)
+    compute_stream = _install_dense_bootstrap_stream_context(
+        monkeypatch, wrap_same_handle=True
+    )
+    native_calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: native_calls.append(args),
+    )
+
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 11, (3, 4), kvcaches, 1, torch.long, token_count=9
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+    owner = object()
+    request_metadata = object()
+    connector.retain_dense_bootstrap_sources(ticket, [owner])
+    connector.retain_dense_bootstrap_metadata(ticket, request_metadata)
+    with connector.dense_bootstrap_load_context(ticket):
+        connector.mark_dense_bootstrap_submission(ticket)
+        connector._sparse_selected_token_idx(None, 4, ticket)
+        for layer_id in range(2):
+            _submit_dense_bootstrap_layer(connector, ticket, layer_id)
+        connector.finish_dense_bootstrap_load(ticket, expected_layers=2)
+
+    event = events[0]
+    assert len(native_calls) == 2
+    assert ticket.submitted_layers == 2
+    assert event.records == [ticket.stream.name]
+    assert ticket.stream.events == []
+    assert connector._layerwise_sparse_idx_cache is None
+
+    connector.record_dense_bootstrap_future_wait(ticket, 12.5)
+    connector.consume_dense_bootstrap_load(ticket)
+    assert compute_stream.events == [("wait_event", event.name)]
+    assert not connector.dense_bootstrap_load_complete(ticket)
+    assert not connector.release_dense_bootstrap_load(ticket)
+    assert ticket.source_owners == [owner]
+    assert request_metadata in ticket.metadata_tensors
+    assert ticket.stream.events == []
+
+    event.ready = True
+    assert connector.dense_bootstrap_load_complete(ticket)
+    assert connector.release_dense_bootstrap_load(ticket)
+    assert ticket.source_owners == []
+    assert ticket.metadata_tensors == []
+    assert ticket.stream.events == []
+    assert ticket.token_count == 9
+    assert ticket.chunk_count == 3
+    assert ticket.host_submit_ms is not None
+    assert ticket.consumer_stream_identity == ("npu_stream", 7)
+    assert len(summaries) == 1
+    assert summaries[0]["stream_identity"] == ["npu_stream", 100]
+    assert summaries[0]["first_submission_stream_identity"] == [
+        "npu_stream",
+        100,
+    ]
+    assert summaries[0]["completion_record_stream_identity"] == [
+        "npu_stream",
+        100,
+    ]
+    assert summaries[0]["consumer_stream_identity"] == ["npu_stream", 7]
+    assert summaries[0]["future_wait_ms"] == 12.5
+
+
+def test_dense_bootstrap_host_drained_layers_finish_on_ticket_stream(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, events = _make_dense_bootstrap_connector(
+        monkeypatch, layers=2
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-external", 1, (3, 4), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+
+    with connector.dense_bootstrap_load_context(ticket):
+        connector.mark_dense_bootstrap_submission(ticket)
+        connector.mark_dense_bootstrap_external_layers_complete(ticket, 2)
+        connector.finish_dense_bootstrap_load(ticket, expected_layers=2)
+
+    assert ticket.submitted_layers == 0
+    assert ticket.host_drained_layers == 2
+    assert events[0].records == [ticket.stream.name]
+
+
+def test_direct_destination_planner_uses_ticket_frozen_kvcaches(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-plan", 1, (3,), kvcaches, 1, torch.long, token_count=4
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+    captured = []
+    expected = ([[7]], [[8]], (kvcaches[0],))
+
+    def plan(*args):
+        captured.append(args)
+        return expected
+
+    monkeypatch.setattr(connector, "_plan_direct_page_buffers", plan)
+    result = connector.plan_direct_page_destinations(
+        [object()],
+        torch.arange(4, dtype=torch.long),
+        [0],
+        [4],
+        1,
+        dense_load_ticket=ticket,
+    )
+
+    assert result is expected
+    assert captured[0][0][0] is ticket.destination_plan.kvcaches_ref[0]
+    assert connector.fail_dense_bootstrap_load(ticket, RuntimeError("done"))
+    assert connector.release_dense_bootstrap_load(ticket)
+
+
+def test_dense_bootstrap_regular_retrieve_uses_ticket_plan_and_stream(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0")
+    connector, kvcaches, events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    connector.lmcache_chunk_size = 4
+    connector.kvcaches = kvcaches
+    connector.load_stream_idx = 0
+    connector.load_stream_num = 1
+    legacy_stream = _TrackingStream("legacy", handle=200)
+    connector.load_stream_list = [legacy_stream]
+    connector._active_sparse_load_join = object()
+    connector._group_layouts[1].vllm_two_major = False
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **kwargs: None)
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda *args, **kwargs: connector._group_layouts[1],
+    )
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda _group: True)
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda _group: True)
+    monkeypatch.setattr(
+        connector, "_sparse_lmc_host_interleaved", lambda _group: False
+    )
+    slots = torch.arange(4, dtype=torch.long)
+    selected = torch.arange(4, dtype=torch.int32)
+    monkeypatch.setattr(
+        connector,
+        "_pack_sparse_layer_inputs",
+        lambda *args, **kwargs: (slots, selected),
+    )
+    chunk_ptrs = torch.tensor([123], dtype=torch.int64)
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        lambda *args, **kwargs: chunk_ptrs,
+    )
+    native_calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: native_calls.append(args),
+    )
+
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-regular", 1, (3,), kvcaches, 1, torch.long, token_count=4
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+    generator = connector.batched_to_gpu_head_token_wise(
+        kvcaches=kvcaches,
+        slot_mapping=slots,
+        sync=False,
+        kv_group=1,
+        cached_tensors=[[torch.zeros(4)]],
+        lmcache_cached_tokens=4,
+        dense_load_ticket=ticket,
+    )
+    next(generator)
+    with connector.dense_bootstrap_load_context(ticket):
+        connector.mark_dense_bootstrap_submission(ticket)
+        generator.send(([], None, 0))
+        connector.finish_dense_bootstrap_load(ticket, expected_layers=1)
+    generator.close()
+
+    assert ticket.submitted_layers == 1
+    assert len(native_calls) == 1
+    assert native_calls[0][0] is ticket.destination_plan.states[0]
+    assert legacy_stream.events == []
+    assert any(value is slots for value in ticket.metadata_tensors)
+    assert any(value is selected for value in ticket.metadata_tensors)
+    assert any(value is chunk_ptrs for value in ticket.metadata_tensors)
+    assert events[0].records == [ticket.stream.name]
+
+
+def test_dense_bootstrap_tickets_are_request_owned_and_fail_closed(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=2, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+
+    first = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (1,), kvcaches, 1, torch.long
+    )
+    second = connector.begin_dense_bootstrap_load(
+        "request-b", 2, (2, 3), list(kvcaches), 1, torch.long
+    )
+    assert first is not None and second is not None
+    _bind_dense_bootstrap_retirement(connector, first)
+    _bind_dense_bootstrap_retirement(connector, second)
+    assert first.stream is not second.stream
+    with connector.dense_bootstrap_load_context(first):
+        first_selection = connector._sparse_selected_token_idx(None, 4, first)
+    with connector.dense_bootstrap_load_context(second):
+        second_selection = connector._sparse_selected_token_idx(None, 7, second)
+    assert first_selection is not second_selection
+    assert (first_selection.numel(), second_selection.numel()) == (4, 7)
+    assert connector.begin_dense_bootstrap_load(
+        "request-c", 3, (4,), kvcaches, 1, torch.long
+    ) is None
+    with pytest.raises(RuntimeError, match="tickets are active"):
+        connector.register_sparse_destination_kv_caches(
+            (None, [object()])
+        )
+
+    assert connector.fail_dense_bootstrap_load(first, RuntimeError("cancel"))
+    assert connector.release_dense_bootstrap_load(first)
+    assert connector.fail_dense_bootstrap_load(second, RuntimeError("cancel"))
+    assert connector.release_dense_bootstrap_load(second)
+    assert first.stream.events == []
+    assert second.stream.events == []
+
+
+def test_dense_bootstrap_post_submit_failure_drains_only_ticket_stream(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("native failed")),
+    )
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+    owner = object()
+    connector.retain_dense_bootstrap_sources(ticket, [owner])
+    with connector.dense_bootstrap_load_context(ticket):
+        with pytest.raises(RuntimeError, match="native failed"):
+            _submit_dense_bootstrap_layer(connector, ticket)
+    assert ticket.submission_may_have_started
+    assert connector.fail_dense_bootstrap_load(ticket, RuntimeError("failed"))
+    assert ticket.stream.events == ["synchronize"]
+    assert ticket.source_owners == []
+    assert connector.release_dense_bootstrap_load(ticket)
+
+
+def test_dense_bootstrap_cancel_waits_for_active_pre_submit_producer(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+
+    class _SubmissionGate:
+        def __init__(self):
+            self._event = threading.Event()
+            self.wait_entered = threading.Event()
+
+        def wait(self):
+            self.wait_entered.set()
+            return self._event.wait()
+
+        def set(self):
+            self._event.set()
+
+    submission_gate = _SubmissionGate()
+    ticket.host_submission_done = submission_gate
+
+    producer_entered = threading.Event()
+    try_submission = threading.Event()
+    producer_errors = []
+
+    def producer() -> None:
+        try:
+            with connector.dense_bootstrap_load_context(ticket):
+                producer_entered.set()
+                try_submission.wait()
+                connector.mark_dense_bootstrap_submission(ticket)
+        except BaseException as exc:
+            producer_errors.append(exc)
+
+    producer_thread = threading.Thread(target=producer)
+    producer_thread.start()
+    assert producer_entered.wait(timeout=1)
+
+    cancel_result = []
+
+    def cancel() -> None:
+        cancel_result.append(
+            connector.fail_dense_bootstrap_load(ticket, RuntimeError("cancel"))
+        )
+
+    cancel_thread = threading.Thread(target=cancel)
+    cancel_thread.start()
+    assert submission_gate.wait_entered.wait(timeout=1)
+    with ticket.state_lock:
+        assert ticket.cancellation_requested
+
+    # The only ticket stream remains leased until the producer leaves its
+    # context, even though no native launch has started yet.
+    assert connector.begin_dense_bootstrap_load(
+        "request-b", 2, (10,), kvcaches, 1, torch.long
+    ) is None
+    assert not ticket.stream_released
+
+    try_submission.set()
+    producer_thread.join(timeout=1)
+    cancel_thread.join(timeout=1)
+    assert not producer_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert cancel_result == [True]
+    assert len(producer_errors) == 1
+    assert "cancelled" in str(producer_errors[0])
+    assert ticket.state is npu_connectors.DenseLoadTicketState.FAILED_PRE_SUBMIT
+    assert ticket.stream.events == []
+    assert connector.release_dense_bootstrap_load(ticket)
+
+
+def test_dense_bootstrap_consumer_wait_failure_self_drains(monkeypatch) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    compute_stream = _install_dense_bootstrap_stream_context(monkeypatch)
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: None,
+    )
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+    with connector.dense_bootstrap_load_context(ticket):
+        _submit_dense_bootstrap_layer(connector, ticket)
+        connector.finish_dense_bootstrap_load(ticket, expected_layers=1)
+
+    def fail_wait(_event):
+        raise RuntimeError("wait failed")
+
+    compute_stream.wait_event = fail_wait
+    with pytest.raises(RuntimeError, match="wait failed"):
+        connector.consume_dense_bootstrap_load(ticket)
+
+    assert ticket.safe_to_release
+    assert ticket.stream.events == ["synchronize"]
+    assert connector.release_dense_bootstrap_load(ticket)
+
+
+def test_dense_bootstrap_completed_ticket_reuses_stream_before_consume(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    compute_stream = _install_dense_bootstrap_stream_context(monkeypatch)
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: None,
+    )
+    first = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert first is not None
+    _bind_dense_bootstrap_retirement(connector, first)
+    with connector.dense_bootstrap_load_context(first):
+        _submit_dense_bootstrap_layer(connector, first)
+        connector.finish_dense_bootstrap_load(first, expected_layers=1)
+
+    events[0].ready = True
+    assert connector.dense_bootstrap_load_complete(first)
+    assert first.stream_released
+    second = connector.begin_dense_bootstrap_load(
+        "request-b", 2, (10,), kvcaches, 1, torch.long
+    )
+    assert second is not None
+    _bind_dense_bootstrap_retirement(connector, second)
+    assert second.stream_index == first.stream_index
+
+    # Consumer attachment is independent from ticket-stream lease reuse.
+    connector.consume_dense_bootstrap_load(first)
+    assert compute_stream.events == [("wait_event", events[0].name)]
+    assert connector.release_dense_bootstrap_load(first)
+    assert connector.fail_dense_bootstrap_load(second, RuntimeError("cancel"))
+    assert connector.release_dense_bootstrap_load(second)
+
+
+def test_dense_bootstrap_completed_unconsumed_tickets_do_not_consume_leases(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: None,
+    )
+    tickets = []
+    for ordinal in range(3):
+        ticket = connector.begin_dense_bootstrap_load(
+            f"request-{ordinal}", ordinal, (ordinal,), kvcaches, 1, torch.long
+        )
+        assert ticket is not None
+        _bind_dense_bootstrap_retirement(connector, ticket)
+        with connector.dense_bootstrap_load_context(ticket):
+            _submit_dense_bootstrap_layer(connector, ticket)
+            connector.finish_dense_bootstrap_load(ticket, expected_layers=1)
+        events[ordinal].ready = True
+        assert connector.dense_bootstrap_load_complete(ticket)
+        tickets.append(ticket)
+
+    assert connector._dense_bootstrap_active_tickets == {}
+    assert len(connector._dense_bootstrap_attached_tickets) == 3
+    with pytest.raises(RuntimeError, match="tickets are active"):
+        connector.register_sparse_destination_kv_caches((None, [object()]))
+    for ticket in tickets:
+        connector.consume_dense_bootstrap_load(ticket)
+        assert connector.release_dense_bootstrap_load(ticket)
+    assert connector._dense_bootstrap_attached_tickets == {}
+
+
+def test_dense_bootstrap_retirement_failure_is_fatal_and_not_retried(
+    monkeypatch,
+) -> None:
+    connector, kvcaches, events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: None,
+    )
+    retire = MagicMock(side_effect=RuntimeError("partial retirement"))
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket, retire)
+    with connector.dense_bootstrap_load_context(ticket):
+        _submit_dense_bootstrap_layer(connector, ticket)
+        connector.finish_dense_bootstrap_load(ticket, expected_layers=1)
+
+    events[0].ready = True
+    with pytest.raises(RuntimeError, match="worker restart is required"):
+        connector.dense_bootstrap_load_complete(ticket)
+    assert ticket.state is npu_connectors.DenseLoadTicketState.FATAL_RESTART
+    assert ticket.stream_released
+    assert not connector.release_dense_bootstrap_load(ticket)
+    assert not connector.fail_dense_bootstrap_load(
+        ticket, RuntimeError("second cleanup")
+    )
+    retire.assert_called_once_with()
+
+
+def test_dense_bootstrap_sync_failure_retains_ticket_ownership(monkeypatch) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: None,
+    )
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    owner = object()
+    retire = MagicMock()
+    connector.bind_dense_bootstrap_source_retirement(ticket, retire)
+    connector.retain_dense_bootstrap_sources(ticket, [owner])
+    with connector.dense_bootstrap_load_context(ticket):
+        connector.mark_dense_bootstrap_submission(ticket)
+
+    sync_calls = 0
+
+    def fail_sync_once():
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            raise RuntimeError("sync failed")
+
+    ticket.stream.synchronize = fail_sync_once
+    assert not connector.fail_dense_bootstrap_load(
+        ticket, RuntimeError("submission failed")
+    )
+    assert ticket.state is npu_connectors.DenseLoadTicketState.FATAL_RESTART
+    assert ticket.source_owners == [owner]
+    assert not ticket.stream_released
+    retire.assert_not_called()
+    assert not connector.release_dense_bootstrap_load(ticket)
+    assert not connector.fail_dense_bootstrap_load(
+        ticket, RuntimeError("second cleanup")
+    )
+    assert sync_calls == 1
+    assert ticket.state is npu_connectors.DenseLoadTicketState.FATAL_RESTART
+    assert ticket.source_owners == [owner]
+    assert not ticket.stream_released
+    with pytest.raises(RuntimeError, match="fatal state"):
+        connector.begin_dense_bootstrap_load(
+            "request-b", 2, (10,), kvcaches, 1, torch.long
+        )
+    with pytest.raises(RuntimeError, match="could not prove stream quiescence"):
+        connector.shutdown_dense_bootstrap_loads()
+
+
+def test_dense_bootstrap_fatal_barrier_precedes_terminal_state(monkeypatch) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=2, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    ticket = connector.begin_dense_bootstrap_load(
+        "request-a", 1, (9,), kvcaches, 1, torch.long
+    )
+    assert ticket is not None
+    _bind_dense_bootstrap_retirement(connector, ticket)
+    with connector.dense_bootstrap_load_context(ticket):
+        connector.mark_dense_bootstrap_submission(ticket)
+    ticket.stream.synchronize = MagicMock(side_effect=RuntimeError("sync failed"))
+
+    fatal_state_entered = threading.Event()
+    allow_terminal_state = threading.Event()
+    original_lock = ticket.state_lock
+
+    class _PauseAfterFatalPublished:
+        def __enter__(self):
+            original_lock.acquire()
+            if (
+                connector._dense_bootstrap_fatal_error is not None
+                and not fatal_state_entered.is_set()
+            ):
+                fatal_state_entered.set()
+                assert allow_terminal_state.wait(timeout=1)
+            return self
+
+        def __exit__(self, *_args):
+            original_lock.release()
+
+    ticket.state_lock = _PauseAfterFatalPublished()
+    fail_result = []
+    fail_thread = threading.Thread(
+        target=lambda: fail_result.append(
+            connector.fail_dense_bootstrap_load(ticket, RuntimeError("failed"))
+        )
+    )
+    fail_thread.start()
+    assert fatal_state_entered.wait(timeout=1)
+
+    admission_errors = []
+
+    def admit_after_fatal() -> None:
+        try:
+            connector.begin_dense_bootstrap_load(
+                "request-b", 2, (10,), kvcaches, 1, torch.long
+            )
+        except BaseException as error:
+            admission_errors.append(error)
+
+    admission_thread = threading.Thread(
+        target=admit_after_fatal
+    )
+    admission_thread.start()
+    admission_thread.join(timeout=1)
+    assert len(admission_errors) == 1
+    assert "fatal state" in str(admission_errors[0])
+
+    allow_terminal_state.set()
+    fail_thread.join(timeout=1)
+    assert fail_result == [False]
+
+
+def test_dense_bootstrap_shutdown_closes_admission_atomically(monkeypatch) -> None:
+    connector, kvcaches, _events = _make_dense_bootstrap_connector(
+        monkeypatch, stream_count=1, layers=1
+    )
+    _install_dense_bootstrap_stream_context(monkeypatch)
+    plan_started = threading.Event()
+    resume_plan = threading.Event()
+    original = connector._get_or_create_sparse_destination_plan_locked
+
+    def pause_before_admission(*args, **kwargs):
+        plan = original(*args, **kwargs)
+        plan_started.set()
+        assert resume_plan.wait(timeout=1)
+        return plan
+
+    connector._get_or_create_sparse_destination_plan_locked = (
+        pause_before_admission
+    )
+    errors = []
+
+    def admit_during_shutdown() -> None:
+        try:
+            connector.begin_dense_bootstrap_load(
+                "request-a", 1, (9,), kvcaches, 1, torch.long
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(
+        target=admit_during_shutdown
+    )
+    thread.start()
+    assert plan_started.wait(timeout=1)
+
+    connector.shutdown_dense_bootstrap_loads()
+    resume_plan.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert "admission is closed" in str(errors[0])
+    assert connector._dense_bootstrap_active_tickets == {}
 
 
 def test_sparse_direct_state_key_tracks_source_and_destination(monkeypatch) -> None:
@@ -3014,7 +3774,6 @@ def test_prepared_sparse_rejects_nonstandard_chunk_coverage() -> None:
 def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 2
-    connector._sparse_destination_plans = {}
     kvcaches = [object(), object()]
     prepare_calls = []
     monkeypatch.setattr(
@@ -3022,6 +3781,7 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
         "prepare_sparse_direct_destination_state",
         lambda *args: prepare_calls.append(args) or object(),
     )
+    connector.register_sparse_destination_kv_caches((kvcaches, None))
 
     plan_kwargs = {
         "kvcaches_ref": kvcaches,
@@ -3052,8 +3812,6 @@ def test_sparse_destination_plan_rebuilds_after_tensor_replacement(
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector.enable_npu_transfer_validation = True
-    connector._sparse_destination_plans = {}
     kvcaches = [[torch.zeros((1, 4)), torch.zeros((1, 4))]]
     prepare_calls = []
     monkeypatch.setattr(
@@ -3061,6 +3819,7 @@ def test_sparse_destination_plan_rebuilds_after_tensor_replacement(
         "prepare_sparse_direct_destination_state",
         lambda *args: prepare_calls.append(args) or object(),
     )
+    connector.register_sparse_destination_kv_caches((kvcaches, None))
     kwargs = {
         "kvcaches_ref": kvcaches,
         "kv_group": 0,
@@ -3073,10 +3832,16 @@ def test_sparse_destination_plan_rebuilds_after_tensor_replacement(
     }
 
     first = connector._get_or_create_sparse_destination_plan(**kwargs)
-    kvcaches[0][0] = torch.zeros((1, 4))
+    original = kvcaches[0][0]
+    replacement = torch.zeros((1, 4))
+    kvcaches[0][0] = replacement
+    assert isinstance(first.kvcaches_ref[0], tuple)
+    assert first.kvcaches_ref[0][0] is original
+    connector.register_sparse_destination_kv_caches((kvcaches, None))
     second = connector._get_or_create_sparse_destination_plan(**kwargs)
 
     assert second is not first
+    assert second.kvcaches_ref[0][0] is replacement
     assert len(prepare_calls) == 2
 
 
@@ -3254,12 +4019,11 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     assert connector._active_sparse_load_join is None
 
 
-def test_sparse_destination_plan_replaces_destination_per_group(
+def test_sparse_destination_registration_freezes_two_plan_slots(
     monkeypatch,
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector._sparse_destination_plans = {}
     monkeypatch.setattr(
         npu_connectors,
         "prepare_sparse_direct_destination_state",
@@ -3281,29 +4045,57 @@ def test_sparse_destination_plan_replaces_destination_per_group(
     latent_a = [object()]
     indexer = [object()]
     latent_b = [object()]
+    first_incarnation = connector.register_sparse_destination_kv_caches(
+        (latent_a, indexer)
+    )
     latent_a_plan = get_plan(latent_a, 0)
     indexer_plan = get_plan(indexer, 1)
-    latent_b_plan = get_plan(latent_b, 0)
-
-    assert connector._sparse_destination_plans[0] is latent_b_plan
+    assert connector._sparse_destination_plans[0] is latent_a_plan
     assert connector._sparse_destination_plans[1] is indexer_plan
-    assert latent_a_plan not in connector._sparse_destination_plans.values()
+    assert connector.register_sparse_destination_kv_caches(
+        (list(latent_a), list(indexer))
+    ) == first_incarnation
 
-    other_plan = get_plan([object()], 2)
-    assert len(connector._sparse_destination_plans) == (
-        npu_connectors._SPARSE_DESTINATION_PLAN_CACHE_SIZE
+    second_incarnation = connector.register_sparse_destination_kv_caches(
+        (latent_b, indexer)
     )
-    assert 1 not in connector._sparse_destination_plans
-    assert indexer_plan not in connector._sparse_destination_plans.values()
-    assert other_plan in connector._sparse_destination_plans.values()
+    assert second_incarnation == first_incarnation + 1
+    assert connector._sparse_destination_plans == (None, None)
+    latent_b_plan = get_plan(latent_b, 0)
+    assert latent_b_plan.incarnation == second_incarnation
+    assert latent_b_plan.kvcaches_ref == tuple(latent_b)
+    with pytest.raises(AttributeError):
+        latent_b_plan.signature = ()
+
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        get_plan([object()], 2)
 
 
-def test_sparse_destination_plan_rebuilds_for_process_abi_change(
+def test_sparse_destination_registration_initializes_cold_group_layout() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector._group_layouts = {}
+    calls = []
+
+    def initialize(kvcaches, *, kv_group, init_staging):
+        calls.append((tuple(kvcaches), kv_group, init_staging))
+        layout = SimpleNamespace(kv_device=torch.device("cpu"))
+        connector._group_layouts[kv_group] = layout
+        return layout
+
+    connector._lazy_initialize_buffer_with_staging = initialize
+    indexer = [object()]
+    connector.register_sparse_destination_kv_caches((None, indexer))
+
+    assert calls == [(tuple(indexer), 1, False)]
+    assert connector._group_layouts[1].kv_device == torch.device("cpu")
+
+
+def test_sparse_destination_plan_rejects_abi_change_within_incarnation(
     monkeypatch,
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector._sparse_destination_plans = {}
     prepare_calls = []
     monkeypatch.setattr(
         npu_connectors,
@@ -3320,17 +4112,19 @@ def test_sparse_destination_plan_rebuilds_for_process_abi_change(
         "expected_device": torch.device("cpu"),
     }
 
+    connector.register_sparse_destination_kv_caches((kwargs["kvcaches_ref"], None))
     first = connector._get_or_create_sparse_destination_plan(
         slot_mapping_ref=torch.arange(4, dtype=torch.long),
         **kwargs,
     )
-    second = connector._get_or_create_sparse_destination_plan(
-        slot_mapping_ref=torch.arange(4, dtype=torch.int32),
-        **kwargs,
-    )
+    with pytest.raises(RuntimeError, match="plan is immutable"):
+        connector._get_or_create_sparse_destination_plan(
+            slot_mapping_ref=torch.arange(4, dtype=torch.int32),
+            **kwargs,
+        )
 
-    assert second is not first
-    assert len(prepare_calls) == 2
+    assert first is connector._sparse_destination_plans[0]
+    assert len(prepare_calls) == 1
 
 
 def test_prepare_dense_direct_chunk_metadata() -> None:

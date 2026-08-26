@@ -141,8 +141,13 @@ def test_group1_prefetch_releases_incomplete_layer_coverage() -> None:
 
 def test_direct_indexer_missing_readiness_uses_cpu_fallback() -> None:
     engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
     engine.gpu_connector = SimpleNamespace(
-        plan_direct_page_destinations=lambda *args: ([[1]], [[1]], ())
+        plan_direct_page_destinations=lambda *args, **kwargs: (
+            [[1]],
+            [[1]],
+            (),
+        )
     )
     engine.storage_manager = SimpleNamespace(
         batched_get_external_pages=lambda *args: pytest.fail(
@@ -164,9 +169,14 @@ def test_direct_indexer_missing_readiness_uses_cpu_fallback() -> None:
 
 def test_cold_direct_indexer_defers_readiness_to_request_event() -> None:
     engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
     calls = []
     engine.gpu_connector = SimpleNamespace(
-        plan_direct_page_destinations=lambda *args: ([[7]], [[8]], (object(),)),
+        plan_direct_page_destinations=lambda *args, **kwargs: (
+            [[7]],
+            [[8]],
+            (object(),),
+        ),
         record_dense_load_readiness=lambda: calls.append("record"),
         consume_dense_load_readiness=lambda event: calls.append(("consume", event)),
     )
@@ -189,13 +199,109 @@ def test_cold_direct_indexer_defers_readiness_to_request_event() -> None:
     assert calls == ["get"]
 
 
+def test_cold_direct_indexer_accounts_host_drained_ticket_layers() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    calls = []
+    ticket = object()
+
+    def plan(*args, **kwargs):
+        assert kwargs["dense_load_ticket"] is ticket
+        return [[7]], [[8]], (object(),)
+
+    engine.gpu_connector = SimpleNamespace(
+        plan_direct_page_destinations=plan,
+        record_dense_load_readiness=lambda: calls.append("record"),
+        consume_dense_load_readiness=lambda event: calls.append(("consume", event)),
+        mark_dense_bootstrap_external_layers_complete=(
+            lambda value, layers: calls.append(("complete", value, layers))
+        ),
+        mark_dense_bootstrap_external_load_fatal=MagicMock(),
+    )
+    engine.storage_manager = SimpleNamespace(
+        batched_get_external_pages=lambda *args: calls.append("get")
+    )
+    base_key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    keys = [[base_key.split_layers(2)[layer]] for layer in range(2)]
+
+    assert engine._try_direct_indexer_page_load(
+        req_id="request",
+        keys_layer_major=keys,
+        starts=[0],
+        ends=[1],
+        retrieve_kwargs={
+            "kvcaches": [object(), object()],
+            "slot_mapping": torch.tensor([0]),
+            "dense_load_ticket": ticket,
+            "_defer_direct_load_readiness": True,
+        },
+    )
+    assert calls == ["get", ("complete", ticket, 2)]
+
+
+def test_cold_direct_indexer_marker_failure_is_fatal_without_replay() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    calls = []
+    ticket = object()
+
+    def fail_marker(_ticket, _layers):
+        calls.append("complete")
+        raise RuntimeError("completion marker failed")
+
+    engine.gpu_connector = SimpleNamespace(
+        plan_direct_page_destinations=lambda *args, **kwargs: (
+            [[7]],
+            [[8]],
+            (object(),),
+        ),
+        mark_dense_bootstrap_external_layers_complete=fail_marker,
+        mark_dense_bootstrap_external_load_fatal=(
+            lambda value, error: calls.append(("fatal", value, error))
+        ),
+    )
+    engine.storage_manager = SimpleNamespace(
+        batched_get_external_pages=lambda *args: calls.append("get")
+    )
+    engine._remote_fill_require_paired_restart = MagicMock()
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16).split_layers(1)[0]
+
+    with pytest.raises(
+        ascend_cache_engine.RemoteFillFatalError,
+        match="completion contract failed",
+    ):
+        engine._try_direct_indexer_page_load(
+            req_id="request",
+            keys_layer_major=[[key]],
+            starts=[0],
+            ends=[1],
+            retrieve_kwargs={
+                "kvcaches": [object()],
+                "slot_mapping": torch.tensor([0]),
+                "dense_load_ticket": ticket,
+                "_defer_direct_load_readiness": True,
+            },
+        )
+
+    assert calls[:2] == ["get", "complete"]
+    assert calls[2][0:2] == ("fatal", ticket)
+    engine._remote_fill_require_paired_restart.assert_called_once_with(
+        ("request",)
+    )
+
+
 def test_cold_direct_indexer_failure_fences_before_cpu_fallback() -> None:
     engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
     calls = []
     owner = object()
     event = object()
     engine.gpu_connector = SimpleNamespace(
-        plan_direct_page_destinations=lambda *args: ([[7]], [[8]], (owner,)),
+        plan_direct_page_destinations=lambda *args, **kwargs: (
+            [[7]],
+            [[8]],
+            (owner,),
+        ),
         record_dense_load_readiness=lambda: calls.append("record") or event,
         consume_dense_load_readiness=lambda value: calls.append(
             ("consume", value)

@@ -5166,16 +5166,38 @@ class AscendLMCacheEngine(LMCacheEngine):
         consume = getattr(
             self.gpu_connector, "consume_dense_load_readiness", None
         )
+        dense_load_ticket = retrieve_kwargs.get("dense_load_ticket")
+        mark_external_complete = getattr(
+            self.gpu_connector,
+            "mark_dense_bootstrap_external_layers_complete",
+            None,
+        )
+        mark_external_fatal = getattr(
+            self.gpu_connector,
+            "mark_dense_bootstrap_external_load_fatal",
+            None,
+        )
         kvcaches = retrieve_kwargs.get("kvcaches")
         slot_mapping = retrieve_kwargs.get("slot_mapping")
         direct_load_submitted = False
         if (
             not callable(planner)
-            or not callable(record)
-            or not callable(consume)
+            or (
+                dense_load_ticket is not None
+                and (
+                    not callable(mark_external_complete)
+                    or not callable(mark_external_fatal)
+                )
+            )
+            or (
+                dense_load_ticket is None
+                and (not callable(record) or not callable(consume))
+            )
             or kvcaches is None
             or slot_mapping is None
         ):
+            return False
+        if len(keys_layer_major) != self.num_layers:
             return False
         try:
             pages = [
@@ -5185,7 +5207,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             ]
             if len(pages) != len(keys_layer_major[0]):
                 return False
-            planned = planner(kvcaches, slot_mapping, starts, ends, 1)
+            if dense_load_ticket is None:
+                planned = planner(kvcaches, slot_mapping, starts, ends, 1)
+            else:
+                planned = planner(
+                    kvcaches,
+                    slot_mapping,
+                    starts,
+                    ends,
+                    1,
+                    dense_load_ticket=dense_load_ticket,
+                )
             if planned is None:
                 if cold_start_perf_enabled():
                     rejection = getattr(
@@ -5214,16 +5246,17 @@ class AscendLMCacheEngine(LMCacheEngine):
             self.storage_manager.batched_get_external_pages(
                 pages, ptrs, sizes, owners, req_id
             )
-            if not retrieve_kwargs.get("_defer_direct_load_readiness", False):
-                consume(record())
-            return True
         except Exception as exc:
             if isinstance(exc, NativeExternalPageTransferUnknownError):
-                self._remote_fill_require_paired_restart((req_id,))
-                raise RemoteFillFatalError(
+                fatal = RemoteFillFatalError(
                     "decoder external-page DMA exceeded its hard deadline"
-                ) from exc
-            if direct_load_submitted:
+                )
+                self._remote_fill_require_paired_restart((req_id,))
+                if dense_load_ticket is not None:
+                    assert callable(mark_external_fatal)
+                    mark_external_fatal(dense_load_ticket, fatal)
+                raise fatal from exc
+            if direct_load_submitted and dense_load_ticket is None:
                 # A backend failure can be reported after some direct writes
                 # have already been queued.  Fence those writes, while their
                 # destination owners are still live, before CPU fallback is
@@ -5243,6 +5276,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                     reason=type(exc).__name__,
                 )
             return False
+
+        # The external writer has completed successfully. Any failure after
+        # this point must fail-stop rather than replay the same destination
+        # through the CPU-staged fallback.
+        try:
+            if dense_load_ticket is not None:
+                assert callable(mark_external_complete)
+                mark_external_complete(
+                    dense_load_ticket,
+                    self.num_layers,
+                )
+            if (
+                dense_load_ticket is None
+                and not retrieve_kwargs.get(
+                    "_defer_direct_load_readiness", False
+                )
+            ):
+                consume(record())
+        except BaseException as exc:
+            fatal = RemoteFillFatalError(
+                "decoder external-page completion contract failed"
+            )
+            self._remote_fill_require_paired_restart((req_id,))
+            if dense_load_ticket is not None:
+                assert callable(mark_external_fatal)
+                mark_external_fatal(dense_load_ticket, fatal)
+            raise fatal from exc
+        return True
 
     def _prepare_live_split_import(
         self,
@@ -10036,5 +10097,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
+
+        # Dense-bootstrap events may protect request metadata, registered
+        # LocalCPU source pages, and scheduler-owned destination blocks. Drain
+        # their exact ticket streams before the base engine tears down either
+        # allocator. A failed drain intentionally aborts normal teardown.
+        shutdown_dense_bootstrap = getattr(
+            self.gpu_connector, "shutdown_dense_bootstrap_loads", None
+        )
+        if callable(shutdown_dense_bootstrap):
+            shutdown_dense_bootstrap()
 
         super().close()
