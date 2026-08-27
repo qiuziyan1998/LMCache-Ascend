@@ -7281,6 +7281,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         legacy_tail_objects = 0
         prepared_compact_ptrs = False
         defer_finish = False
+        prepare_count = dispatch_count = 0
+        prepare_sum_s = prepare_max_s = 0.0
+        dispatch_sum_s = dispatch_max_s = 0.0
 
         try:
             for layer_id in range(self.num_layers):
@@ -7530,17 +7533,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_prefix_chunks,
                     )
                     if perf_enabled:
-                        cold_start_perf_log(
-                            logger,
-                            "passive_layer_prepare",
-                            started=prepare_started,
-                            req_id=req_id,
-                            phase=phase,
-                            kv_group=kv_group,
-                            layer=layer_id,
-                            objects=len(compact_pages) + len(mem_objs_layer),
-                            rank=self.metadata.worker_id,
-                        )
+                        elapsed_s = cold_start_perf_now() - prepare_started
+                        prepare_count += 1
+                        prepare_sum_s += elapsed_s
+                        prepare_max_s = max(prepare_max_s, elapsed_s)
 
                 if prepare_only:
                     sparse_request = yield ret_mask
@@ -7573,29 +7569,37 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     )
                 if perf_enabled:
-                    source_chunks = len(compact_pages) + len(mem_objs_layer)
-                    if (
-                        not source_chunks
-                        and cached_memory_objs is not None
-                        and layer_id < len(cached_memory_objs)
-                    ):
-                        cached_layer = cached_memory_objs[layer_id]
-                        source_chunks = (
-                            len(cached_layer) if cached_layer is not None else 0
-                        )
+                    elapsed_s = cold_start_perf_now() - dispatch_started
+                    dispatch_count += 1
+                    dispatch_sum_s += elapsed_s
+                    dispatch_max_s = max(dispatch_max_s, elapsed_s)
+            if perf_enabled:
+                if prepare_count:
                     cold_start_perf_log(
                         logger,
-                        "npu_layer_submit_cpu",
-                        started=dispatch_started,
+                        "passive_layer_prepare",
                         req_id=req_id,
                         phase=phase,
                         kv_group=kv_group,
-                        layer=layer_id,
-                        objects=len(compact_pages) + len(mem_objs_layer),
-                        source_chunks=source_chunks,
                         rank=self.metadata.worker_id,
-                        passive=True,
+                        count=prepare_count,
+                        sum_ms=round(prepare_sum_s * 1000, 3),
+                        max_ms=round(prepare_max_s * 1000, 3),
+                        elapsed_ms=round(prepare_sum_s * 1000, 3),
                     )
+                cold_start_perf_log(
+                    logger,
+                    "npu_layer_submit_cpu",
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    passive=True,
+                    count=dispatch_count,
+                    sum_ms=round(dispatch_sum_s * 1000, 3),
+                    max_ms=round(dispatch_max_s * 1000, 3),
+                    elapsed_ms=round(dispatch_sum_s * 1000, 3),
+                )
             next(mem_obj_consumer)
             if defer_finish:
                 yield ret_mask
@@ -9018,6 +9022,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
 
         defer_finish = False
+        dispatch_count = 0
+        dispatch_sum_s = dispatch_max_s = 0.0
         try:
             for layer_id in range(self.num_layers):
                 sparse_request = yield ret_mask
@@ -9274,32 +9280,27 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     )
                 if perf_enabled:
-                    source_chunks = len(mem_objs_layer)
-                    if (
-                        not source_chunks
-                        and cached_tensors is not None
-                        and layer_id < len(cached_tensors)
-                    ):
-                        cached_layer = cached_tensors[layer_id]
-                        source_chunks = (
-                            len(cached_layer) if cached_layer is not None else 0
-                        )
-                    cold_start_perf_log(
-                        logger,
-                        "npu_layer_submit_cpu",
-                        started=dispatch_started,
-                        req_id=kwargs.get("req_id", "unspecified"),
-                        phase=kwargs.get(
-                            "shared_cpu_phase",
-                            "sparse_decode_bootstrap",
-                        ),
-                        kv_group=kv_group,
-                        layer=layer_id,
-                        objects=len(mem_objs_layer),
-                        source_chunks=source_chunks,
-                        rank=self.metadata.worker_id,
-                        passive=False,
-                    )
+                    elapsed_s = cold_start_perf_now() - dispatch_started
+                    dispatch_count += 1
+                    dispatch_sum_s += elapsed_s
+                    dispatch_max_s = max(dispatch_max_s, elapsed_s)
+
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "npu_layer_submit_cpu",
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    passive=False,
+                    count=dispatch_count,
+                    sum_ms=round(dispatch_sum_s * 1000, 3),
+                    max_ms=round(dispatch_max_s * 1000, 3),
+                    elapsed_ms=round(dispatch_sum_s * 1000, 3),
+                )
 
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)

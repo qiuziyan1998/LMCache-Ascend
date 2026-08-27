@@ -2872,6 +2872,16 @@ def test_sparse_passive_reuses_one_merged_page(
         assert aggregate["legacy_tail_objects"] == 0
         assert aggregate["page_view_build_ms"] >= 0
         assert aggregate["pointer_seal_ms"] >= 0
+        prepare = [
+            event for event in perf_events if event[0] == "passive_layer_prepare"
+        ]
+        dispatch = [
+            event for event in perf_events if event[0] == "npu_layer_submit_cpu"
+        ]
+        assert len(prepare) == len(dispatch) == 1
+        assert prepare[0][1]["count"] == dispatch[0][1]["count"] == 2
+        assert prepare[0][1]["elapsed_ms"] == prepare[0][1]["sum_ms"]
+        assert dispatch[0][1]["elapsed_ms"] == dispatch[0][1]["sum_ms"]
     else:
         assert cached_memory_objs == []
         assert cached_chunk_dev_ptrs == []
