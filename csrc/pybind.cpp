@@ -359,6 +359,13 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
         py::arg("lmc_host_interleaved"), py::arg("direction"),
         py::arg("validate_inputs") = false, py::arg("fixed_chunk_size") = 0);
+  m.def("dense_mla_dsa_batched_direct_kv_transfer_prepared",
+        &dense_mla_dsa_batched_direct_kv_transfer_prepared,
+        py::arg("destination_state"), py::arg("slot_mapping_full"),
+        py::arg("chunk_ptrs_npu"), py::arg("chunk_offsets_npu"),
+        py::arg("chunk_sizes_npu"), py::arg("total_tokens"),
+        py::arg("lmc_host_interleaved"),
+        py::arg("validate_inputs") = false, py::arg("fixed_chunk_size") = 0);
   m.def("dense_mla_dsa_group_direct_kv_transfer_fast",
         &dense_mla_dsa_group_direct_kv_transfer_fast_wrapper,
         py::arg("layer_states"), py::arg("layer_tensors"),

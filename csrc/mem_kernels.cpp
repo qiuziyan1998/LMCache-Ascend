@@ -999,6 +999,59 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
   cmd.Run();
 }
 
+void dense_mla_dsa_batched_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_ptrs_npu,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const bool validate_inputs, const int64_t fixed_chunk_size) {
+  if (validate_inputs) {
+    validate_dense_direct_inputs(slot_mapping_full, chunk_ptrs_npu,
+                                 chunk_offsets_npu, chunk_sizes_npu,
+                                 total_tokens, fixed_chunk_size);
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+  const uint32_t aiv_num = direct_aiv_num(num_tokens);
+  const SparseDirectDestinationState state = destination_state;
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([state, stream, aiv_num, slot_mapping_ptr,
+                        chunk_ptrs_ptr, chunk_offsets_ptr, chunk_sizes_ptr,
+                        num_tokens, num_chunks, fixed_chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved]() -> int {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
+        state.scalar_type_num, state.slot_type_num,
+        kernel_format(state.kvcache_format), aiv_num, stream, chunk_ptrs_ptr,
+        chunk_offsets_ptr, chunk_sizes_ptr, state.vllm_k_ptr, state.vllm_v_ptr,
+        state.vllm_dsa_ptr, slot_mapping_ptr, state.vllm_k_bytes,
+        state.vllm_v_bytes, state.vllm_dsa_bytes, state.max_tokens_per_loop,
+        state.k_hidden_dims, state.v_hidden_dims, state.dsa_hidden_dims,
+        num_tokens, num_chunks, fixed_chunk_size_i, total_tokens_i,
+        state.block_size, false, lmc_host_interleaved);
+    return 0;
+  });
+  cmd.Run();
+}
+
 void dense_mla_dsa_group_direct_kv_transfer_fast(
     const std::vector<SparseDirectLayerState> &layer_states,
     torch::Tensor &slot_mapping_full, torch::Tensor &layer_chunk_ptrs_npu,

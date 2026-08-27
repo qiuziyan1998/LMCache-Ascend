@@ -45,6 +45,7 @@ from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer_fast,
+    dense_mla_dsa_batched_direct_kv_transfer_prepared,
     dense_mla_dsa_group_direct_kv_transfer_fast,
     prepare_sparse_direct_destination_state,
     prepare_sparse_direct_layer_state,
@@ -1461,7 +1462,7 @@ class _GroupLayout:
 
 
 class _SparseDestinationPlan:
-    """Process-owned native states for one paged-KV destination group."""
+    """Process-owned direct-retrieve states for one paged-KV group."""
 
     __slots__ = ("kvcaches_ref", "signature", "states")
 
@@ -1551,8 +1552,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.kv_device: Optional[torch.device] = None
 
         self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
-        # Legacy direct/dense state remains source-layout specialized. The
-        # prepared sparse warm path uses destination-only plans below.
+        # Legacy direct/dense state remains source-layout specialized. Prepared
+        # direct retrieve paths use destination-only plans below.
         self._sparse_direct_layer_states: Optional[dict] = None
         self._sparse_direct_validated_layers: set = set()
         # One process-owned destination plan per latent/indexer KV group.
@@ -3127,9 +3128,34 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_host_interleaved: bool,
         layer_tensors: List[torch.Tensor],
         direction: bool,
+        destination_plan: Optional[_SparseDestinationPlan] = None,
     ) -> None:
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
+            return
+
+        if destination_plan is not None:
+            if direction:
+                raise ValueError("Prepared dense destination only supports H2D.")
+            with self._stream_context_or_null(transfer_stream):
+                if transfer_stream is not current_stream:
+                    transfer_stream.wait_stream(current_stream)
+                dense_mla_dsa_batched_direct_kv_transfer_prepared(
+                    destination_plan.states[layer_id],
+                    slot_mapping_full,
+                    chunk_ptrs_npu,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    total_tokens,
+                    dense_host_interleaved,
+                    validate_inputs=(
+                        getattr(self, "enable_npu_transfer_validation", True)
+                        and layer_id == 0
+                    ),
+                    fixed_chunk_size=fixed_chunk_size,
+                )
+            if transfer_stream is not current_stream:
+                current_stream.wait_stream(transfer_stream)
             return
 
         source_signature = self._dense_direct_pointer_cache_signature(
@@ -4502,6 +4528,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             slot_mapping_full = self._slot_mapping_on_kv_device(
                 slot_mapping_full, self.load_stream
             )
+            destination_plan = self._get_or_create_sparse_destination_plan(
+                kvcaches_ref=kvcaches_snapshot,
+                kv_group=kv_group,
+                slot_mapping_ref=slot_mapping_full,
+                sparse_kv_format=kv_format_value,
+                sparse_k_hidden_dims=k_hidden_dims,
+                sparse_v_hidden_dims=v_hidden_dims,
+                sparse_dsa_hidden_dims=dsa_hidden_dims,
+                expected_device=layout.kv_device,
+            )
+        else:
+            destination_plan = None
         pointer_stream_kwargs = (
             {"stream": self.load_stream} if defer_dense_waits else {}
         )
@@ -4597,6 +4635,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         dense_host_interleaved=dense_host_interleaved,
                         layer_tensors=cpu_tensors,
                         direction=False,
+                        destination_plan=destination_plan,
                     )
                 else:
                     with torch.cuda.stream(self.load_stream):

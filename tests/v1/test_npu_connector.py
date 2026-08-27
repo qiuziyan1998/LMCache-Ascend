@@ -1731,6 +1731,7 @@ class _DenseLayout:
     dsa_hidden_dims = 0
     kv_format = type("_Fmt", (), {"value": 0})()
     vllm_two_major = False
+    kv_device = torch.device("cpu")
     gpu_buffer_allocator = None
 
 
@@ -2546,6 +2547,69 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
         ("wait_stream", "load"),
         ("wait_stream", "load"),
     ]
+
+
+def test_prepared_dense_load_bypasses_shape_cache_and_validates_once(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.enable_npu_transfer_validation = True
+    connector._sparse_direct_layer_states = {}
+    stream = _TrackingStream("load")
+    states = (object(), object())
+    plan = npu_connectors._SparseDestinationPlan([], (), states)
+    calls = []
+
+    monkeypatch.setattr(
+        connector,
+        "_stream_context_or_null",
+        lambda _stream: nullcontext(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_dense_direct_pointer_cache_signature",
+        lambda **_kwargs: pytest.fail("prepared dense load built a shape key"),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_direct_layer_state",
+        lambda **_kwargs: pytest.fail("prepared dense load used hybrid state"),
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    common = dict(
+        kvcaches_ref=[],
+        kv_group=1,
+        transfer_stream=stream,
+        current_stream=stream,
+        slot_mapping_full=_RecordableTensor(273),
+        chunk_ptrs_npu=_RecordableTensor(2),
+        chunk_offsets_npu=_RecordableTensor(1, dtype=torch.int32),
+        chunk_sizes_npu=_RecordableTensor(1, dtype=torch.int32),
+        total_tokens=273,
+        fixed_chunk_size=256,
+        dense_kv_format=0,
+        dense_token_major=False,
+        dense_vllm_two_major=False,
+        dense_k_hidden_dims=1,
+        dense_v_hidden_dims=1,
+        dense_dsa_hidden_dims=0,
+        dense_host_interleaved=False,
+        layer_tensors=[],
+        direction=False,
+        destination_plan=plan,
+    )
+    connector._run_dense_direct_kv_transfer_layer(layer_id=0, **common)
+    connector._run_dense_direct_kv_transfer_layer(layer_id=1, **common)
+
+    assert [call[0][0] for call in calls] == list(states)
+    assert [call[1]["validate_inputs"] for call in calls] == [True, False]
+    assert all(call[1]["fixed_chunk_size"] == 256 for call in calls)
+    assert connector._sparse_direct_layer_states == {}
 
 
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
@@ -3610,6 +3674,14 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         _resolve_chunk_ptrs,
     )
 
+    destination_plan = object()
+    plan_calls = []
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **kwargs: plan_calls.append(kwargs) or destination_plan,
+    )
+
     direct_calls = []
     monkeypatch.setattr(
         connector,
@@ -3652,11 +3724,12 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert direct_calls[0]["total_tokens"] == 273
     assert direct_calls[0]["fixed_chunk_size"] == 256
     assert direct_calls[0]["kvcaches_ref"] is request_kvcaches
+    assert direct_calls[0]["destination_plan"] is destination_plan
 
     cached_gen = connector.batched_to_gpu(
         [0, 256],
-        [256, 273],
-        slot_mapping=torch.arange(273, dtype=torch.long),
+        [256, 300],
+        slot_mapping=torch.arange(300, dtype=torch.long),
         sync=False,
         kv_group=0,
         cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
@@ -3666,10 +3739,12 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     cached_gen.send(
         [
             _MemoryObj(torch.zeros(256, dtype=torch.bfloat16)),
-            _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
+            _MemoryObj(torch.zeros(44, dtype=torch.bfloat16)),
         ]
     )
     cached_gen.close()
+    assert direct_calls[1]["total_tokens"] == 300
+    assert direct_calls[1]["destination_plan"] is destination_plan
     assert len(pointer_calls[-1][1]) == 1
     assert pointer_calls[-1][3] == 2
 
@@ -3703,6 +3778,7 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert readiness_out == [readiness]
     assert connector.load_stream.events == [("wait_stream", "producer")]
     assert direct_calls[-1]["current_stream"] is connector.load_stream
+    assert all(call["kvcaches_ref"] is request_kvcaches for call in plan_calls)
     record.assert_called_once_with()
 
 
@@ -3758,6 +3834,12 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
             [111, 222, 333], dtype=torch.long
         ),
     )
+    destination_plan = object()
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **_kwargs: destination_plan,
+    )
 
     direct_calls = []
     monkeypatch.setattr(
@@ -3789,6 +3871,7 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["direction"] is False
     assert direct_calls[0]["fixed_chunk_size"] == 0
     assert direct_calls[0]["total_tokens"] == 401
+    assert direct_calls[0]["destination_plan"] is destination_plan
     assert direct_calls[0]["chunk_offsets_npu"].tolist() == starts
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
 
