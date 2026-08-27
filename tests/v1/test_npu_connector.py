@@ -2465,8 +2465,8 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     connector._sparse_direct_layer_states = None
     connector._sparse_direct_validated_layers = set()
 
-    transfer_stream = _NoopStream()
-    current_stream = _NoopStream()
+    transfer_stream = _TrackingStream("load")
+    current_stream = _TrackingStream("producer")
     slot_mapping = _RecordableTensor(8)
     chunk_ptrs = _RecordableTensor(2)
     chunk_offsets = _RecordableTensor(2, dtype=torch.int32)
@@ -2527,13 +2527,25 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
         **common_kwargs,
         direction=True,
     )
+    connector._run_dense_direct_kv_transfer_layer(
+        **{**common_kwargs, "current_stream": transfer_stream},
+        direction=False,
+    )
 
     assert len(prepared) == 2
-    assert len(fast_calls) == 2
+    assert len(fast_calls) == 3
     assert fast_calls[0][0][0] is prepared[0]
     assert fast_calls[1][0][0] is prepared[1]
     assert fast_calls[0][0][7] is False
     assert fast_calls[1][0][7] is True
+    assert transfer_stream.events == [
+        ("wait_stream", "producer"),
+        ("wait_stream", "producer"),
+    ]
+    assert current_stream.events == [
+        ("wait_stream", "load"),
+        ("wait_stream", "load"),
+    ]
 
 
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
@@ -3574,6 +3586,7 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         expected_num_chunks=None,
         cached_chunk_dev_ptrs=None,
         source_objs=None,
+        stream=None,
     ):
         pointer_calls.append(
             (
@@ -3659,6 +3672,38 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     cached_gen.close()
     assert len(pointer_calls[-1][1]) == 1
     assert pointer_calls[-1][3] == 2
+
+    producer_stream = _TrackingStream("producer")
+    connector.load_stream = _TrackingStream("load")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: producer_stream)
+    readiness = object()
+    record = MagicMock(return_value=readiness)
+    monkeypatch.setattr(connector, "record_dense_load_readiness", record)
+    readiness_out = []
+    deferred_gen = connector.batched_to_gpu(
+        [0, 256],
+        [256, 273],
+        slot_mapping=torch.arange(273, dtype=torch.long),
+        sync=True,
+        kv_group=0,
+        cached_chunk_ptrs_npu=[],
+        kvcaches=request_kvcaches,
+        _dense_load_readiness_out=readiness_out,
+    )
+    next(deferred_gen)
+    deferred_gen.send(
+        [
+            _MemoryObj(torch.zeros(256, dtype=torch.bfloat16)),
+            _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
+        ]
+    )
+    next(deferred_gen)
+    deferred_gen.close()
+
+    assert readiness_out == [readiness]
+    assert connector.load_stream.events == [("wait_stream", "producer")]
+    assert direct_calls[-1]["current_stream"] is connector.load_stream
+    record.assert_called_once_with()
 
 
 def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(

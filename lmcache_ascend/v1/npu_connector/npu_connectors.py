@@ -2909,6 +2909,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         expected_num_chunks: Optional[int] = None,
         cached_chunk_dev_ptrs: Optional[List[List[int]]] = None,
         source_objs: Optional[Sequence[MemoryObj]] = None,
+        stream: Optional[Any] = None,
     ) -> torch.Tensor:
         num_chunks = (
             len(cpu_tensors)
@@ -2970,7 +2971,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 for chunk_index, source in enumerate(pointer_sources)
             ]
-        chunk_ptrs_npu = torch.tensor(dev_ptrs, dtype=torch.long, device=self.kv_device)
+        with self._stream_context_or_null(stream):
+            chunk_ptrs_npu = torch.tensor(
+                dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
         if cached_chunk_dev_ptrs is not None:
             while len(cached_chunk_dev_ptrs) <= layer_id:
                 cached_chunk_dev_ptrs.append([])
@@ -3164,7 +3168,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             validate_key = ("dense", kv_group, layer_id)
 
         with self._stream_context_or_null(transfer_stream):
-            transfer_stream.wait_stream(current_stream)
+            if transfer_stream is not current_stream:
+                transfer_stream.wait_stream(current_stream)
             if layer_state is not None:
                 validate_inputs = (
                     getattr(self, "enable_npu_transfer_validation", True)
@@ -3203,7 +3208,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
-        current_stream.wait_stream(transfer_stream)
+        if transfer_stream is not current_stream:
+            current_stream.wait_stream(transfer_stream)
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
         return (
@@ -4416,6 +4422,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         is_mla_dsa = self._is_mla_dsa_format(kv_group)
         dense_direct = is_mla_dsa and not _DENSE_DIRECT_LOAD_DISABLE
+        readiness_out = kwargs.get("_dense_load_readiness_out")
+        defer_dense_waits = readiness_out is not None
+        if defer_dense_waits and (
+            not dense_direct
+            or not sync
+            or not isinstance(readiness_out, list)
+            or readiness_out
+        ):
+            raise ValueError("Invalid deferred dense-load readiness request.")
 
         if not dense_direct:
             if is_mla_dsa and not self.use_gpu:
@@ -4454,11 +4469,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             slot_mapping_full=slot_mapping_full,
             kvcaches_ref=kvcaches_snapshot,
         )
-        if dense_direct:
-            slot_mapping_full = self._slot_mapping_on_kv_device(
-                slot_mapping_full, self.load_stream
-            )
-
         # Snapshot per-group values so interleaved per-group generators
         # do not race on the mirrored instance attributes.
         kv_format_value = layout.kv_format.value
@@ -4487,6 +4497,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens=num_tokens,
                 kv_group=kv_group,
             )
+            if defer_dense_waits:
+                self.load_stream.wait_stream(torch.cuda.current_stream())
+            slot_mapping_full = self._slot_mapping_on_kv_device(
+                slot_mapping_full, self.load_stream
+            )
+        pointer_stream_kwargs = (
+            {"stream": self.load_stream} if defer_dense_waits else {}
+        )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
         staging_tensor: Optional[torch.Tensor] = None
@@ -4527,8 +4545,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 # The generator is resumed from vLLM's attention path; refresh the
                 # active compute stream per layer before ordering load -> compute.
-                current_stream = torch.cuda.current_stream()
-                if sync:
+                current_stream = (
+                    self.load_stream
+                    if defer_dense_waits
+                    else torch.cuda.current_stream()
+                )
+                if sync and not defer_dense_waits:
                     current_stream.wait_stream(self.load_stream)
                 if layer_id > 0 and logger.isEnabledFor(10):
                     logger.debug("Finished loading layer %d", layer_id - 1)
@@ -4542,6 +4564,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             expected_num_chunks=len(source_objs),
                             cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
                             source_objs=source_objs,
+                            **pointer_stream_kwargs,
                         )
                     else:
                         chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
@@ -4549,6 +4572,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             cpu_tensors,
                             cached_chunk_ptrs_npu,
                             cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                            **pointer_stream_kwargs,
                         )
                     assert chunk_offsets_npu is not None
                     assert chunk_sizes_npu is not None
@@ -4615,10 +4639,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     continue
                 if logger.isEnabledFor(10):
                     logger.debug("Finished loading layer %d", layer_id)
+            if defer_dense_waits:
+                readiness_out.append(self.record_dense_load_readiness())
             yield
 
             # synchronize the last layer
-            if sync:
+            if sync and not defer_dense_waits:
                 current_stream.wait_stream(self.load_stream)
             if tmp_gpu_buffer_obj is not None:
                 tmp_gpu_buffer_obj.ref_count_down()
