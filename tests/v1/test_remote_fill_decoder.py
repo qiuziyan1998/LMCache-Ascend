@@ -884,6 +884,27 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 
+def test_finish_reuses_required_manifest_keys(monkeypatch) -> None:
+    local = _FakeLocalBackend()
+    lifecycle = _lifecycle(local)
+    controls = tuple(
+        _control_page(chunk, group, valid_tokens=4 if chunk == 0 else 2)
+        for chunk in range(2)
+        for group in (0, 1)
+    )
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+    validate = Mock(wraps=lifecycle._validate_control_page)
+    monkeypatch.setattr(lifecycle, "_validate_control_page", validate)
+
+    assert lifecycle.commit_pages(
+        "transfer",
+        controls,
+        _views(controls, prepared),
+        _finish(6, partial=2),
+    )
+    assert validate.call_count == len(controls)
+
+
 @pytest.mark.parametrize(
     "chunk_hash",
     (
@@ -1127,6 +1148,20 @@ def test_invalid_prepared_handle_does_not_leak_other_hidden_pages() -> None:
         assert result.handle.page.pins == 0
 
 
+def test_info_logging_skips_reserve_serialization(monkeypatch, caplog) -> None:
+    lifecycle = _lifecycle(_FakeLocalBackend())
+    controls = (_control_page(0, 0), _control_page(0, 1))
+    dumps = Mock(side_effect=AssertionError("reserve event must stay below INFO"))
+
+    with monkeypatch.context() as context:
+        context.setattr("lmcache_ascend.v1.remote_fill.json.dumps", dumps)
+        with caplog.at_level(logging.INFO, logger="lmcache_ascend.v1.remote_fill"):
+            prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+
+    assert not dumps.called
+    lifecycle.release_prepared_pages(prepared, "test cleanup")
+
+
 def test_service_host_propagates_only_maintenance_fatal_evidence() -> None:
     service = _FakeService(maintenance=("armed-transfer",))
     server = _FakeServer()
@@ -1144,6 +1179,39 @@ def test_service_host_propagates_only_maintenance_fatal_evidence() -> None:
     assert fatal == [("armed-transfer",)]
     assert service.shutdown_calls == 1
     assert server.closed
+
+
+def test_busy_service_does_not_run_maintenance_per_rpc(monkeypatch) -> None:
+    class _BusyServer(_FakeServer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.done = Event()
+            self.stop = None
+
+        def serve_once(self) -> bool:
+            self.calls += 1
+            if self.calls == 100:
+                self.done.set()
+                self.stop.set()
+            return True
+
+    monkeypatch.setattr("lmcache_ascend.v1.remote_fill.monotonic", lambda: 0.0)
+    service = _FakeService()
+    server = _BusyServer()
+    host = DecoderRemoteFillServiceHost(
+        service=service,
+        server=server,
+        fatal_restart=lambda transfers: None,
+    )
+    server.stop = host._stop
+
+    host.start()
+    assert server.done.wait(timeout=1.0)
+    host.close()
+
+    assert server.calls == 100
+    assert not service.maintenance_called.is_set()
 
 
 @pytest.mark.parametrize(
@@ -1246,6 +1314,7 @@ def test_service_thread_start_failure_closes_control_transport() -> None:
 
 def test_service_host_emits_only_changed_fixed_cardinality_metrics(
     monkeypatch: pytest.MonkeyPatch,
+    caplog,
 ) -> None:
     service = _FakeService()
     host = DecoderRemoteFillServiceHost(
@@ -1256,17 +1325,18 @@ def test_service_host_emits_only_changed_fixed_cardinality_metrics(
     events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
         "lmcache_ascend.v1.remote_fill._log_remote_fill_event",
-        lambda event, **fields: events.append((event, fields)),
+        lambda event, level=logging.INFO, **fields: events.append((event, fields)),
     )
 
-    host._emit_metrics_if_changed(force=True)
-    assert events == []
+    with caplog.at_level(logging.DEBUG, logger="lmcache_ascend.v1.remote_fill"):
+        host._emit_metrics_if_changed(force=True)
+        assert events == []
 
-    service.metrics = _FakeMetricsSnapshot(
-        active_transactions=1,
-        submitted_bytes_total=4096,
-    )
-    host._emit_metrics_if_changed(force=True)
+        service.metrics = _FakeMetricsSnapshot(
+            active_transactions=1,
+            submitted_bytes_total=4096,
+        )
+        host._emit_metrics_if_changed(force=True)
 
     assert events == [
         (
@@ -1276,7 +1346,6 @@ def test_service_host_emits_only_changed_fixed_cardinality_metrics(
                 "submitted_bytes_total_delta": 4096,
             },
         ),
-        ("remote_fill_arm", {"submitted_bytes": 4096}),
     ]
 
 

@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 import ipaddress
 import json
+import logging
 import os
 import secrets
 from threading import Event, Lock, Thread
@@ -136,10 +137,18 @@ def _validate_advertised_control_host(host: str) -> str:
     return host
 
 
-def _log_remote_fill_event(event: str, **fields: object) -> None:
+def _log_remote_fill_event(
+    event: str,
+    *,
+    level: int = logging.INFO,
+    **fields: object,
+) -> None:
     """Emit one low-cardinality decoder lifecycle event."""
 
-    logger.info(
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
         "[LMCACHE_REMOTE_FILL] %s",
         json.dumps(
             {"schema": 1, "event": event, **fields},
@@ -565,28 +574,30 @@ class AscendRemoteFillPageLifecycle:
             if any(result is None for result in results):
                 raise RuntimeError("remote-fill page preparation omitted an input page")
             prepared = tuple(result for result in results if result is not None)
-            _log_remote_fill_event(
-                "remote_fill_reserve",
-                pages=len(prepared),
-                allocated=sum(
-                    result.disposition is PageDisposition.ALLOCATED
-                    for result in prepared
-                ),
-                existing=sum(
-                    result.disposition is PageDisposition.EXISTING
-                    for result in prepared
-                ),
-                missing=sum(
-                    result.disposition is PageDisposition.MISSING
-                    for result in prepared
-                ),
-                reserved_bytes=sum(
-                    result.destination_length
-                    for result in prepared
-                    if result.disposition is PageDisposition.ALLOCATED
-                ),
-                reserve_missing=reserve_missing,
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                _log_remote_fill_event(
+                    "remote_fill_reserve",
+                    level=logging.DEBUG,
+                    pages=len(prepared),
+                    allocated=sum(
+                        result.disposition is PageDisposition.ALLOCATED
+                        for result in prepared
+                    ),
+                    existing=sum(
+                        result.disposition is PageDisposition.EXISTING
+                        for result in prepared
+                    ),
+                    missing=sum(
+                        result.disposition is PageDisposition.MISSING
+                        for result in prepared
+                    ),
+                    reserved_bytes=sum(
+                        result.destination_length
+                        for result in prepared
+                        if result.disposition is PageDisposition.ALLOCATED
+                    ),
+                    reserve_missing=reserve_missing,
+                )
             return prepared
 
         missing_indices: list[int] = []
@@ -699,6 +710,7 @@ class AscendRemoteFillPageLifecycle:
                 handle.release()
         _log_remote_fill_event(
             "remote_fill_release",
+            level=logging.ERROR if invalid_handles else logging.DEBUG,
             reason=reason,
             pages=released_pages,
             released_bytes=released_bytes,
@@ -741,6 +753,7 @@ class AscendRemoteFillPageLifecycle:
                 handle.release()
         _log_remote_fill_event(
             "remote_fill_release",
+            level=logging.ERROR if invalid_handles else logging.DEBUG,
             reason=reason,
             pages=released_pages,
             released_bytes=released_bytes,
@@ -801,7 +814,14 @@ class AscendRemoteFillPageLifecycle:
             handle = view.prepared.handle
             if not isinstance(handle, _HiddenPage):
                 raise TypeError("remote-fill allocated page has an invalid handle")
-            key = self._validate_control_page(view.control_page)
+            kv_group = view.control_page.kv_group
+            if kv_group not in (0, 1):
+                raise ValueError("remote-fill ready reservation group is invalid")
+            chunk_index = view.control_page.chunk_index
+            group_keys = group0_keys if kv_group == 0 else group1_keys
+            if chunk_index < 0 or chunk_index >= len(group_keys):
+                raise ValueError("remote-fill ready reservation chunk is out of range")
+            key = group_keys[chunk_index]
             if key != handle.key or key in ready:
                 raise ValueError("remote-fill ready reservation identity mismatch")
             ready[key] = handle.page
@@ -1095,6 +1115,7 @@ class DecoderRemoteFillServiceHost:
         self._started = False
         self._last_metrics = self._read_metrics()
         self._next_idle_metrics_at = monotonic() + 1.0
+        self._next_maintenance_at = monotonic() + 0.1
         self._thread = Thread(
             target=self._run,
             daemon=True,
@@ -1155,9 +1176,13 @@ class DecoderRemoteFillServiceHost:
         try:
             while not self._stop.is_set():
                 served = self._server.serve_once()
-                fatal = self._service.run_maintenance()
+                now = monotonic()
+                fatal = ()
+                if not served or now >= self._next_maintenance_at:
+                    fatal = self._service.run_maintenance()
+                    self._next_maintenance_at = now + 0.1
                 self._emit_metrics_if_changed(
-                    force=bool(served or fatal),
+                    force=bool(fatal),
                 )
                 if fatal and not self._fatal_reported:
                     self._fatal_reported = True
@@ -1202,6 +1227,8 @@ class DecoderRemoteFillServiceHost:
         }
 
     def _emit_metrics_if_changed(self, *, force: bool) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         now = monotonic()
         if not force and now < self._next_idle_metrics_at:
             return
@@ -1224,14 +1251,9 @@ class DecoderRemoteFillServiceHost:
             return
         _log_remote_fill_event(
             "remote_fill_metrics",
+            level=logging.DEBUG,
             **changes,
         )
-        submitted = changes.get("submitted_bytes_total_delta", 0)
-        if submitted > 0:
-            _log_remote_fill_event(
-                "remote_fill_arm",
-                submitted_bytes=submitted,
-            )
 
 
 @dataclass(slots=True)
