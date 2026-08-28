@@ -1578,8 +1578,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             for offset in range(0, len(control_pages), maximum)
         )
         byte_count = sum(sum(page_sizes) for page_sizes in batch.sizes)
+        lease_bytes = max(
+            sum(page.expected_bytes for page in pages) for pages in control_windows
+        )
+        request_oversized = byte_count > int(
+            self.config.remote_fill_max_bytes_per_request
+        )
         queued_at = time.perf_counter()
-        if not self._remote_fill_acquire_queue_capacity(state, byte_count):
+        if request_oversized or not self._remote_fill_acquire_queue_capacity(
+            state, lease_bytes
+        ):
             state.remote_fill_disabled_reason = "producer_backpressure"
             self._log_remote_fill_prearm_failure(
                 state,
@@ -1594,16 +1602,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "remote_fill_batch_skipped",
                 req_id=batch.req_id,
                 reason="producer_backpressure",
-                bytes=byte_count,
+                bytes=byte_count if request_oversized else lease_bytes,
             )
             return
         self._get_remote_fill_producer_metrics().observe(
             "queue_wait_seconds", time.perf_counter() - queued_at
         )
         try:
-            source_plan = self._remote_fill_source_plan(batch)
+            source_plans = tuple(
+                self._remote_fill_source_plan(
+                    batch
+                    if len(control_windows) == 1
+                    else self._remote_fill_select_batch_pages(batch, pages)
+                )
+                for pages in control_windows
+            )
         except Exception as error:
-            self._remote_fill_release_queue_capacity(state, byte_count)
+            self._remote_fill_release_queue_capacity(state, lease_bytes)
             state.remote_fill_disabled_reason = type(error).__name__
             self._log_remote_fill_prearm_failure(
                 state,
@@ -1629,7 +1644,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     thread_name_prefix="lmcache-remote-fill-producer",
                 )
             except Exception as error:
-                self._remote_fill_release_queue_capacity(state, byte_count)
+                self._remote_fill_release_queue_capacity(state, lease_bytes)
                 state.remote_fill_disabled_reason = type(error).__name__
                 self._log_remote_fill_prearm_failure(
                     state,
@@ -1672,7 +1687,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ),
                 )
                 results = []
-                for window_offset, window_pages in enumerate(control_windows):
+                windows = zip(control_windows, source_plans, strict=True)
+                for window_offset, (window_pages, source_plan) in enumerate(windows):
                     window_id = first_window_id + window_offset
                     chunk_start = min(page.chunk_start for page in window_pages)
                     chunk_end = max(page.chunk_end for page in window_pages)
@@ -1770,12 +1786,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 metrics.abandon("prearm failure")
                 return None
             finally:
-                self._remote_fill_release_queue_capacity(state, byte_count)
+                self._remote_fill_release_queue_capacity(state, lease_bytes)
 
         try:
             future = executor.submit(run)
         except Exception as error:
-            self._remote_fill_release_queue_capacity(state, byte_count)
+            self._remote_fill_release_queue_capacity(state, lease_bytes)
             state.remote_fill_disabled_reason = type(error).__name__
             self._log_remote_fill_prearm_failure(
                 state,

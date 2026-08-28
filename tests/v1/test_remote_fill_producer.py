@@ -60,6 +60,7 @@ from lmcache_ascend.v1.remote_fill_producer import (
     RemoteFillNegotiationCache,
     RemoteFillStaticSpec,
     RemoteFillTerminalResult,
+    RemoteFillWindowResult,
     parse_remote_fill_handoff,
 )
 
@@ -1164,25 +1165,17 @@ def test_global_producer_inflight_bytes_are_bounded_across_requests() -> None:
     )
 
 
-def test_one_produced_batch_uses_one_bounded_executor_task_for_all_splits(
+def test_oversized_batch_uses_one_bounded_window_lease(
     caplog,
 ) -> None:
-    class _RecordingExecutor:
-        def __init__(self) -> None:
-            self.functions = []
-
-        def submit(self, function: Any) -> Future:
-            self.functions.append(function)
-            return Future()
-
     control_pages = tuple(
         ControlPage(
             canonical_key=f"chunk-{chunk}-group-{group}",
             kv_group=group,
             chunk_index=chunk,
             chunk_start=chunk * 1024,
-            chunk_end=(chunk + 1) * 1024,
-            valid_tokens=1024,
+            chunk_end=min((chunk + 1) * 1024, 2500),
+            valid_tokens=min(1024, 2500 - chunk * 1024),
             destination_tp_rank=0,
             expected_bytes=5,
             layer_count=79,
@@ -1194,47 +1187,86 @@ def test_one_produced_batch_uses_one_bounded_executor_task_for_all_splits(
     owner = object()
     batch = _DirectPageBatch(
         req_id="request",
-        keys=[],
-        ptrs=[],
-        sizes=[[10], [20]],
+        keys=[
+            SimpleNamespace(
+                kv_group=page.kv_group,
+                to_string=lambda value=page.canonical_key: value,
+            )
+            for page in control_pages
+        ],
+        ptrs=[[index] for index in range(len(control_pages))],
+        sizes=[[5] for _page in control_pages],
         owners=(owner,),
         ready_event=object(),
-        group_ends={0: 3072, 1: 3072},
+        group_ends={0: 2500, 1: 2500},
+        ranges=tuple(
+            (page.chunk_start, page.chunk_end) for page in control_pages
+        ),
+        ready_events=(object(),),
     )
-    executor = _RecordingExecutor()
+    executor_calls = []
+
+    def submit(function: Any) -> Future:
+        executor_calls.append(function)
+        future: Future = Future()
+        future.set_result(function())
+        return future
+
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(
-        remote_fill_max_inflight_bytes=1000,
-        remote_fill_max_bytes_per_request=1000,
+        # The 30-byte logical batch exceeds this active-window bound, while
+        # each two-page control window is a valid 10-byte admission.
+        remote_fill_max_inflight_bytes=15,
+        remote_fill_max_bytes_per_request=100,
         remote_fill_max_inflight_windows_per_request=1,
+        remote_fill_window_tokens=1024,
     )
-    engine._remote_fill_producer_executor = executor
+    engine._remote_fill_producer_executor = SimpleNamespace(submit=submit)
     engine._remote_fill_producer_metrics = RemoteFillProducerMetrics()
     engine._remote_fill_control_pages = lambda _batch: control_pages
     engine._remote_fill_pages_per_window = lambda: 2
     source_plan_calls = []
     engine._remote_fill_source_plan = lambda queued_batch: (
-        source_plan_calls.append(queued_batch) or object()
+        source_plan_calls.append(queued_batch) or queued_batch
+    )
+    transfer_calls = []
+    result = RemoteFillWindowResult(
+        0, True, True, reason="complete", submitted_bytes=10
+    )
+    session = SimpleNamespace(
+        direct_viable=True,
+        transfer_window=lambda **kwargs: (
+            transfer_calls.append(kwargs) or result
+        ),
+    )
+    engine._remote_fill_create_session = lambda *_args: session
+    engine.storage_manager = SimpleNamespace(
+        submit_remote_fill_direct_push=object(),
+        prepare_remote_fill_source=object(),
     )
     state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
 
-    engine._schedule_remote_fill_batch(state, batch, 3072)
+    engine._schedule_remote_fill_batch(state, batch, 2500)
 
-    assert len(executor.functions) == 1
-    assert source_plan_calls == [batch]
+    assert len(executor_calls) == 1
+    assert state.remote_fill_futures[0].exception() is None
+    assert len(source_plan_calls) == 3
+    assert all(len(window.keys) == 2 for window in source_plan_calls)
+    assert all(sum(map(sum, window.sizes)) == 10 for window in source_plan_calls)
+    assert source_plan_calls[-1].ranges == ((2048, 2500), (2048, 2500))
+    assert len(transfer_calls) == 3
+    assert all(len(call["control_pages"]) == 2 for call in transfer_calls)
     assert state.remote_fill_next_window_id == 3
-    assert state.remote_fill_queued_windows == 1
-    assert state.remote_fill_queued_bytes == 30
+    assert state.remote_fill_queued_windows == 0
+    assert state.remote_fill_queued_bytes == 0
 
-    # A logical batch over the configured producer cap is rejected before its
-    # source plan or owner set is captured by another executor closure.
-    engine._remote_fill_release_queue_capacity(state, 30)
+    # The aggregate request limit remains independent of active-window bytes.
     engine.config.remote_fill_max_bytes_per_request = 20
     rejected = _DirectStoreRequestState(remote_fill_handoff=_handoff())
     with caplog.at_level(logging.WARNING):
-        engine._schedule_remote_fill_batch(rejected, batch, 3072)
-    assert len(executor.functions) == 1
-    assert source_plan_calls == [batch]
+        engine._schedule_remote_fill_batch(rejected, batch, 2500)
+    assert len(executor_calls) == 1
+    assert len(source_plan_calls) == 3
     assert rejected.remote_fill_disabled_reason == "producer_backpressure"
     assert '"code":"RF-P-004"' in caplog.text
     assert '"diagnostic_name":"producer_persistent_fallback"' in caplog.text
