@@ -64,7 +64,7 @@ from lmcache.v1.remote_fill import (
     ControlPage,
     OperationKind,
     ProtocolLimits,
-    log_remote_fill_validation_failure,
+    log_remote_fill_diagnostic,
 )
 from lmcache.v1.remote_fill.native import (
     DIRECT_PUSH_H0_QUALIFICATION_V1,
@@ -559,8 +559,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         try:
             self._initialize_decoder_remote_fill()
         except Exception as error:
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_startup_failure",
                 code="RF-D-000",
                 stage="decoder_startup_validation",
                 action="STARTUP_ABORT",
@@ -736,8 +737,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Make a safe direct-fill fallback immediately operator-visible."""
 
         handoff = state.remote_fill_handoff
-        log_remote_fill_validation_failure(
+        log_remote_fill_diagnostic(
             logger,
+            event="remote_fill_fallback",
             code="RF-P-004",
             stage=stage,
             action="PERSISTENT_ONLY",
@@ -793,8 +795,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             fatal = bool(result.fatal_restart_required)
             handoff = state.remote_fill_handoff
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event=(
+                    "remote_fill_fatal_restart"
+                    if fatal
+                    else "remote_fill_fallback"
+                ),
                 code="RF-P-900" if fatal else "RF-P-004",
                 stage="window_terminal",
                 action=(
@@ -820,8 +827,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             handoff = parse_remote_fill_handoff(request_configs)
         except ValueError as error:
             state.remote_fill_disabled_reason = type(error).__name__
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_handoff_rejected",
                 code="RF-P-001",
                 stage="handoff_validation",
                 action="PERSISTENT_ONLY",
@@ -841,8 +849,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.remote_fill_metrics_started = True
         if not handoff.global_te_push:
             state.remote_fill_disabled_reason = "native_not_qualified"
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_handoff_rejected",
                 code="RF-P-002",
                 stage="handoff_validation",
                 action="LEGACY_PATH",
@@ -854,8 +863,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             return False
         if handoff.destination_dp_rank >= handoff.destination_dp_size:
             state.remote_fill_disabled_reason = "invalid_dp_mapping"
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_handoff_rejected",
                 code="RF-P-002",
                 stage="handoff_validation",
                 action="PERSISTENT_ONLY",
@@ -867,8 +877,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             return False
         if handoff.destination_tp_size != int(self.metadata.world_size):
             state.remote_fill_disabled_reason = "incompatible_tp_mapping"
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_handoff_rejected",
                 code="RF-P-002",
                 stage="handoff_validation",
                 action="PERSISTENT_ONLY",
@@ -880,8 +891,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             return False
         if not self._remote_fill_circuit_allows():
             state.remote_fill_disabled_reason = "circuit_open"
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_fallback",
                 code="RF-P-003",
                 stage="producer_admission",
                 action="PERSISTENT_ONLY",
@@ -1865,8 +1877,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         if terminal.outcome == "LOCAL_FULL":
             self._remote_fill_record_success()
         elif terminal.outcome == "PERSISTENT_ONLY":
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_fallback",
                 code="RF-P-004",
                 stage="producer_terminal",
                 action="PERSISTENT_ONLY",
@@ -9987,8 +10000,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             '"event":"remote_fill_fatal_restart","count":%d}',
             len(self._remote_fill_fatal_transfers),
         )
-        log_remote_fill_validation_failure(
+        log_remote_fill_diagnostic(
             logger,
+            event="remote_fill_fatal_restart",
             code="RF-D-900",
             stage="armed_native_lifecycle",
             action="PAIRED_RESTART_REQUIRED",

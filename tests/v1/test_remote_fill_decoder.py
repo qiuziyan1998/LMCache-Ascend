@@ -1244,6 +1244,8 @@ def test_service_loop_failure_reports_only_real_shutdown_fatal_evidence(
     assert service.shutdown_calls == 1
     assert server.closed
     assert '"code":"RF-D-005"' in caplog.text
+    assert '"diagnostic_name":"decoder_control_service_failure"' in caplog.text
+    assert '"event":"remote_fill_service_failure"' in caplog.text
     assert '"action":"DISABLE_DIRECT_SERVICE_AND_AUDIT_ARMED_STATE"' in caplog.text
 
 

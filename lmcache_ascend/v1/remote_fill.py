@@ -46,7 +46,7 @@ from lmcache.v1.remote_fill import (
     ReservedPageView,
     UnsafePageLifecycleError,
     content_digest,
-    log_remote_fill_validation_failure,
+    log_remote_fill_diagnostic,
 )
 from lmcache.v1.rpc.zmq_transport import ZmqRouterServerTransport
 from lmcache.v1.storage_backend.local_cpu_backend import (
@@ -1189,8 +1189,9 @@ class DecoderRemoteFillServiceHost:
                     self._fatal_restart(fatal)
                     self._stop.set()
         except Exception as error:
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_service_failure",
                 code="RF-D-005",
                 stage="decoder_control_service",
                 action="DISABLE_DIRECT_SERVICE_AND_AUDIT_ARMED_STATE",

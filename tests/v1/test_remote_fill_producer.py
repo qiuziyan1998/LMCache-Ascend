@@ -1105,6 +1105,8 @@ def test_malformed_handoff_is_visible_and_uses_persistent_fallback(caplog) -> No
     assert enabled is False
     assert state.remote_fill_handoff is None
     assert '"code":"RF-P-001"' in caplog.text
+    assert '"diagnostic_name":"producer_handoff_malformed"' in caplog.text
+    assert '"event":"remote_fill_handoff_rejected"' in caplog.text
     assert '"action":"PERSISTENT_ONLY"' in caplog.text
 
 
@@ -1235,6 +1237,8 @@ def test_one_produced_batch_uses_one_bounded_executor_task_for_all_splits(
     assert source_plan_calls == [batch]
     assert rejected.remote_fill_disabled_reason == "producer_backpressure"
     assert '"code":"RF-P-004"' in caplog.text
+    assert '"diagnostic_name":"producer_persistent_fallback"' in caplog.text
+    assert '"event":"remote_fill_fallback"' in caplog.text
     assert '"stage":"producer_admission"' in caplog.text
 
 
