@@ -1065,10 +1065,14 @@ class _RecordableTensor:
     def __init__(self, numel: int, dtype=torch.long):
         self._numel = numel
         self.dtype = dtype
+        self.recorded_streams = []
         self.device = torch.device("cpu")
 
     def numel(self):
         return self._numel
+
+    def record_stream(self, stream):
+        self.recorded_streams.append(stream)
 
 
 class _TrackingStream:
@@ -1656,6 +1660,16 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     assert fast_calls[1][0][0] is prepared[1]
     assert fast_calls[0][0][7] is False
     assert fast_calls[1][0][7] is True
+    for transfer_input in (
+        slot_mapping,
+        chunk_ptrs,
+        chunk_offsets,
+        chunk_sizes,
+    ):
+        assert transfer_input.recorded_streams == [
+            transfer_stream,
+            transfer_stream,
+        ]
 
 
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
