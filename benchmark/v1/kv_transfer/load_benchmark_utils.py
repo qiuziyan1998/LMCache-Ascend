@@ -40,6 +40,7 @@ from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer_fast,
+    dense_mla_dsa_batched_direct_kv_transfer_prepared,
     prepare_sparse_direct_destination_state,
     prepare_sparse_direct_layer_state,
     sparse_mla_dsa_batched_direct_kv_transfer,
@@ -562,7 +563,7 @@ def run_direct_fast_load_layer(
 
 def run_dense_direct_fast_load_layer(
     *,
-    layer_state,
+    destination_state,
     slot_mapping_full: torch.Tensor,
     chunk_ptrs_npu: torch.Tensor,
     chunk_offsets_npu: torch.Tensor,
@@ -571,15 +572,14 @@ def run_dense_direct_fast_load_layer(
     kv_format: int,
     fixed_chunk_size: int,
 ) -> None:
-    dense_mla_dsa_batched_direct_kv_transfer_fast(
-        layer_state,
+    dense_mla_dsa_batched_direct_kv_transfer_prepared(
+        destination_state,
         slot_mapping_full,
         chunk_ptrs_npu,
         chunk_offsets_npu,
         chunk_sizes_npu,
         total_tokens,
         lmc_host_interleaved_for_kv_format(kv_format),
-        False,
         False,
         fixed_chunk_size,
     )
@@ -615,31 +615,14 @@ def time_npu_callable(
 
 
 def rebuild_direct_fast_layer_states(h: LoadBenchmarkHarness) -> None:
-    if not h.dense_load:
-        h.layer_states = [
-            prepare_sparse_direct_destination_state(
-                as_vllm_kv_caches(h.dst_direct_fast[layer_id]),
-                h.slot_mapping_full,
-                h.kv_format,
-                h.dims.k_hidden_dims,
-                h.dims.v_hidden_dims,
-                h.dims.dsa_hidden_dims,
-            )
-            for layer_id in range(h.num_layers)
-        ]
-        return
     h.layer_states = [
-        prepare_sparse_direct_layer_state(
-            h.stacked_by_layer[layer_id][0],
+        prepare_sparse_direct_destination_state(
             as_vllm_kv_caches(h.dst_direct_fast[layer_id]),
             h.slot_mapping_full,
-            False,
-            False,
             h.kv_format,
             h.dims.k_hidden_dims,
             h.dims.v_hidden_dims,
             h.dims.dsa_hidden_dims,
-            h.num_tokens,
         )
         for layer_id in range(h.num_layers)
     ]
@@ -759,32 +742,16 @@ def build_load_benchmark_harness(
         expected_stacked_by_layer.append([chunk.detach().clone() for chunk in stacked])
         chunk_ptrs = build_chunk_ptrs_npu(stacked, device)
         chunk_ptrs_by_layer.append(chunk_ptrs)
-        if dense_load:
-            layer_states.append(
-                prepare_sparse_direct_layer_state(
-                    stacked[0],
-                    as_vllm_kv_caches(dst_direct_fast[layer_id]),
-                    slot_mapping_full,
-                    False,
-                    False,
-                    kv_format,
-                    dims.k_hidden_dims,
-                    dims.v_hidden_dims,
-                    dims.dsa_hidden_dims,
-                    num_tokens,
-                )
+        layer_states.append(
+            prepare_sparse_direct_destination_state(
+                as_vllm_kv_caches(dst_direct_fast[layer_id]),
+                slot_mapping_full,
+                kv_format,
+                dims.k_hidden_dims,
+                dims.v_hidden_dims,
+                dims.dsa_hidden_dims,
             )
-        else:
-            layer_states.append(
-                prepare_sparse_direct_destination_state(
-                    as_vllm_kv_caches(dst_direct_fast[layer_id]),
-                    slot_mapping_full,
-                    kv_format,
-                    dims.k_hidden_dims,
-                    dims.v_hidden_dims,
-                    dims.dsa_hidden_dims,
-                )
-            )
+        )
         store_layer_states.append(
             prepare_sparse_direct_layer_state(
                 stacked[0],
@@ -877,7 +844,7 @@ def run_all_direct_fast_layers(h: LoadBenchmarkHarness) -> None:
     for layer_id in range(h.num_layers):
         if h.dense_load:
             run_dense_direct_fast_load_layer(
-                layer_state=h.layer_states[layer_id],
+                destination_state=h.layer_states[layer_id],
                 slot_mapping_full=h.slot_mapping_full,
                 chunk_ptrs_npu=h.chunk_ptrs_by_layer[layer_id],
                 chunk_offsets_npu=h.chunk_offsets_npu,
