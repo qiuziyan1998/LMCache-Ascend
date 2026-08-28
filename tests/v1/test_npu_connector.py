@@ -1692,10 +1692,14 @@ class _RecordableTensor:
     def __init__(self, numel: int, dtype=torch.long):
         self._numel = numel
         self.dtype = dtype
+        self.recorded_streams = []
         self.device = torch.device("cpu")
 
     def numel(self):
         return self._numel
+
+    def record_stream(self, stream):
+        self.recorded_streams.append(stream)
 
 
 class _TrackingStream:
@@ -2547,6 +2551,13 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
         ("wait_stream", "load"),
         ("wait_stream", "load"),
     ]
+    for transfer_input in (
+        slot_mapping,
+        chunk_ptrs,
+        chunk_offsets,
+        chunk_sizes,
+    ):
+        assert transfer_input.recorded_streams == [transfer_stream] * 3
 
 
 def test_prepared_dense_load_bypasses_shape_cache_and_validates_once(
@@ -2581,15 +2592,19 @@ def test_prepared_dense_load_bypasses_shape_cache_and_validates_once(
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
+    slot_mapping = _RecordableTensor(273)
+    chunk_ptrs = _RecordableTensor(2)
+    chunk_offsets = _RecordableTensor(1, dtype=torch.int32)
+    chunk_sizes = _RecordableTensor(1, dtype=torch.int32)
     common = dict(
         kvcaches_ref=[],
         kv_group=1,
         transfer_stream=stream,
         current_stream=stream,
-        slot_mapping_full=_RecordableTensor(273),
-        chunk_ptrs_npu=_RecordableTensor(2),
-        chunk_offsets_npu=_RecordableTensor(1, dtype=torch.int32),
-        chunk_sizes_npu=_RecordableTensor(1, dtype=torch.int32),
+        slot_mapping_full=slot_mapping,
+        chunk_ptrs_npu=chunk_ptrs,
+        chunk_offsets_npu=chunk_offsets,
+        chunk_sizes_npu=chunk_sizes,
         total_tokens=273,
         fixed_chunk_size=256,
         dense_kv_format=0,
@@ -2610,6 +2625,10 @@ def test_prepared_dense_load_bypasses_shape_cache_and_validates_once(
     assert [call[1]["validate_inputs"] for call in calls] == [True, False]
     assert all(call[1]["fixed_chunk_size"] == 256 for call in calls)
     assert connector._sparse_direct_layer_states == {}
+    assert slot_mapping.recorded_streams == [stream]
+    assert chunk_offsets.recorded_streams == [stream]
+    assert chunk_sizes.recorded_streams == [stream]
+    assert chunk_ptrs.recorded_streams == [stream, stream]
 
 
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:

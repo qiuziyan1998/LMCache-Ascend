@@ -3134,6 +3134,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
 
+        # Custom kernels consume raw pointers on transfer_stream, so make the
+        # allocator retain per-layer metadata and record shared inputs once.
+        chunk_ptrs_npu.record_stream(transfer_stream)
+        if layer_id == 0:
+            slot_mapping_full.record_stream(transfer_stream)
+            chunk_offsets_npu.record_stream(transfer_stream)
+            if chunk_sizes_npu is not chunk_offsets_npu:
+                chunk_sizes_npu.record_stream(transfer_stream)
+
         if destination_plan is not None:
             if direction:
                 raise ValueError("Prepared dense destination only supports H2D.")
