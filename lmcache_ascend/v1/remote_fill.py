@@ -500,6 +500,7 @@ class AscendRemoteFillPageLifecycle:
         capacity_available: Callable[[int], bool],
         chunk_hash_type: type[int] | type[bytes],
         chunk_hash_bytes: int | None,
+        capacity_reclaimer: Callable[[int], bool] | None = None,
         pin_pages: Callable[[Sequence[LayerPageMemoryObj]], bool] = (
             LayerPageMemoryObj.pin_many
         ),
@@ -510,6 +511,7 @@ class AscendRemoteFillPageLifecycle:
             local_backend: Rank0 LocalCPU backend public interface.
             layout: Validated static two-group page layout.
             capacity_available: Nonblocking ordinary-cache headroom check.
+            capacity_reclaimer: Optional bounded pressure-path reclaim callback.
             chunk_hash_type: Exact chunk-hash representation negotiated with
                 the producer.
             chunk_hash_bytes: Fixed digest width when ``chunk_hash_type`` is
@@ -533,6 +535,7 @@ class AscendRemoteFillPageLifecycle:
         self._local = local_backend
         self._layout = layout
         self._capacity_available = capacity_available
+        self._capacity_reclaimer = capacity_reclaimer
         self._chunk_hash_type = chunk_hash_type
         self._chunk_hash_bytes = chunk_hash_bytes
         self._pin_pages = pin_pages
@@ -600,31 +603,36 @@ class AscendRemoteFillPageLifecycle:
                 )
             return prepared
 
-        missing_indices: list[int] = []
-        for index, key in enumerate(keys):
-            if self._local.contains(key, pin=False):
-                results[index] = PreparedPage(
-                    handle=None,
-                    disposition=PageDisposition.EXISTING,
+        def classify_pages() -> list[int]:
+            missing = []
+            for index, key in enumerate(keys):
+                disposition = (
+                    PageDisposition.EXISTING
+                    if self._local.contains(key, pin=False)
+                    else PageDisposition.MISSING
                 )
-            else:
-                missing_indices.append(index)
+                results[index] = PreparedPage(handle=None, disposition=disposition)
+                if disposition is PageDisposition.MISSING:
+                    missing.append(index)
+            return missing
+
+        missing_indices = classify_pages()
 
         if not reserve_missing:
-            for index in missing_indices:
-                results[index] = PreparedPage(
-                    handle=None,
-                    disposition=PageDisposition.MISSING,
-                )
             return finalize_results()
         requested_bytes = sum(pages[index].expected_bytes for index in missing_indices)
         if requested_bytes and not self._capacity_available(requested_bytes):
-            for index in missing_indices:
-                results[index] = PreparedPage(
-                    handle=None,
-                    disposition=PageDisposition.MISSING,
-                )
-            return finalize_results()
+            if self._capacity_reclaimer is None:
+                return finalize_results()
+            reclaimed = self._capacity_reclaimer(
+                sum(page.expected_bytes for page in pages)
+            )
+            missing_indices = classify_pages()
+            requested_bytes = sum(
+                pages[index].expected_bytes for index in missing_indices
+            )
+            if not reclaimed or not self._capacity_available(requested_bytes):
+                return finalize_results()
 
         allocated: dict[int, LayerPageMemoryObj] = {}
         pinned = False
@@ -1314,6 +1322,7 @@ def create_decoder_remote_fill_runtime(
     shared_cpu_cache_strict: bool,
     chunk_hash_type: type[int] | type[bytes],
     chunk_hash_bytes: int | None,
+    capacity_reclaimer: Callable[[int], bool] | None = None,
     descriptor_verification_capability: bytes | None = None,
     server_factory: Callable[[RemoteFillService], RemoteFillServer] | None = None,
 ) -> DecoderRemoteFillRuntime:
@@ -1334,6 +1343,7 @@ def create_decoder_remote_fill_runtime(
         control_port: Dedicated control port for this decoder DP rank.
         shared_cache_generation: Current registered shared-slab generation.
         capacity_available: Nonblocking ordinary-cache headroom check.
+        capacity_reclaimer: Optional bounded pressure-path reclaim callback.
         fatal_restart: Whole-deployment restart callback.
         global_te_push: Whether negotiated native push is available.
         save_only_first_rank: Resolved physical Group 0 ownership policy.
@@ -1413,6 +1423,7 @@ def create_decoder_remote_fill_runtime(
         local_backend=local_backend,
         layout=layout,
         capacity_available=capacity_available,
+        capacity_reclaimer=capacity_reclaimer,
         chunk_hash_type=chunk_hash_type,
         chunk_hash_bytes=chunk_hash_bytes,
     )

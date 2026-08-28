@@ -9924,6 +9924,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             control_port=control_port,
             shared_cache_generation=int(self.shared_cpu_cache_generation),
             capacity_available=self._remote_fill_capacity_available,
+            capacity_reclaimer=self._remote_fill_reclaim_capacity,
             fatal_restart=self._remote_fill_require_paired_restart,
             global_te_push=True,
             save_only_first_rank=self.save_only_first_rank,
@@ -9985,6 +9986,26 @@ class AscendLMCacheEngine(LMCacheEngine):
             int(heap_bytes * float(self.config.remote_fill_min_free_ratio)),
         )
         return free_bytes - requested_bytes >= reserve
+
+    def _remote_fill_reclaim_capacity(self, requested_bytes: int) -> bool:
+        if requested_bytes < 0:
+            return False
+        reclaim = getattr(
+            self._shared_local_cpu_backend(),
+            "reclaim_evictable_capacity",
+            None,
+        )
+        if not callable(reclaim):
+            return False
+        return bool(
+            reclaim(
+                requested_bytes,
+                min_free_bytes=int(self.config.remote_fill_min_free_bytes),
+                min_free_ratio=float(self.config.remote_fill_min_free_ratio),
+                num_layers=int(self.num_layers),
+                cause="remote_fill_capacity_reclaim",
+            )
+        )
 
     def _remote_fill_require_paired_restart(
         self,

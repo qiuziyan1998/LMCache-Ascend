@@ -7,7 +7,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Event
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import Mock, patch
 import logging
 
@@ -781,7 +781,8 @@ def _control_page(
 def _lifecycle(
     local: _FakeLocalBackend,
     *,
-    capacity: bool = True,
+    capacity: bool | Callable[[int], bool] = True,
+    capacity_reclaimer: Callable[[int], bool] | None = None,
     chunk_hash_type: type[int] | type[bytes] = int,
     chunk_hash_bytes: int | None = None,
 ) -> AscendRemoteFillPageLifecycle:
@@ -793,7 +794,12 @@ def _lifecycle(
     return AscendRemoteFillPageLifecycle(
         local_backend=local,
         layout=_layout(),
-        capacity_available=lambda requested: capacity and requested >= 0,
+        capacity_available=(
+            capacity
+            if callable(capacity)
+            else lambda requested: capacity and requested >= 0
+        ),
+        capacity_reclaimer=capacity_reclaimer,
         chunk_hash_type=chunk_hash_type,
         chunk_hash_bytes=chunk_hash_bytes,
         pin_pages=pin_pages,
@@ -1084,9 +1090,14 @@ def test_existing_page_wins_race_and_hidden_duplicate_is_reclaimed() -> None:
 
 def test_probe_only_and_capacity_rejection_never_allocate() -> None:
     controls = (_control_page(0, 0), _control_page(0, 1))
+    reclaimer = Mock(return_value=True)
     for reserve_missing, capacity in ((False, True), (True, False)):
         local = _FakeLocalBackend()
-        prepared = _lifecycle(local, capacity=capacity).prepare_pages(
+        prepared = _lifecycle(
+            local,
+            capacity=capacity,
+            capacity_reclaimer=reclaimer if not reserve_missing else None,
+        ).prepare_pages(
             "transfer",
             0,
             controls,
@@ -1094,6 +1105,75 @@ def test_probe_only_and_capacity_rejection_never_allocate() -> None:
         )
         assert all(item.disposition is PageDisposition.MISSING for item in prepared)
         assert local.allocations == []
+    reclaimer.assert_not_called()
+
+    local = _FakeLocalBackend()
+    lifecycle = _lifecycle(
+        local,
+        capacity=True,
+        capacity_reclaimer=reclaimer,
+    )
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+    reclaimer.assert_not_called()
+    lifecycle.release_pages(_views(controls, prepared), "test cleanup")
+
+
+def test_capacity_reclaim_reclassifies_window_and_allocates_once() -> None:
+    controls = (_control_page(0, 0), _control_page(0, 1))
+    local = _FakeLocalBackend()
+    existing_key = _key(0, 0)
+    local.hot[existing_key] = _FakePage(
+        size=controls[0].expected_bytes,
+        data_ptr=0xF000,
+    )
+    available = False
+    reclaimed_bytes: list[int] = []
+
+    def capacity_available(requested: int) -> bool:
+        return available and requested >= 0
+
+    def reclaim(requested: int) -> bool:
+        nonlocal available
+        reclaimed_bytes.append(requested)
+        local.hot.pop(existing_key)
+        available = True
+        return True
+
+    lifecycle = _lifecycle(
+        local,
+        capacity=capacity_available,
+        capacity_reclaimer=reclaim,
+    )
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+
+    assert reclaimed_bytes == [sum(page.expected_bytes for page in controls)]
+    assert all(item.disposition is PageDisposition.ALLOCATED for item in prepared)
+    assert len(local.allocations) == 2
+    assert all(call["eviction"] is False for call in local.allocations)
+    lifecycle.release_pages(_views(controls, prepared), "test cleanup")
+
+
+def test_failed_capacity_reclaim_returns_fresh_missing_snapshot() -> None:
+    controls = (_control_page(0, 0), _control_page(0, 1))
+    local = _FakeLocalBackend()
+    existing_key = _key(0, 0)
+    local.hot[existing_key] = _FakePage(
+        size=controls[0].expected_bytes,
+        data_ptr=0xF000,
+    )
+
+    def reclaim(_: int) -> bool:
+        local.hot.pop(existing_key)
+        return False
+
+    prepared = _lifecycle(
+        local,
+        capacity=False,
+        capacity_reclaimer=reclaim,
+    ).prepare_pages("transfer", 0, controls, True)
+
+    assert all(item.disposition is PageDisposition.MISSING for item in prepared)
+    assert local.allocations == []
 
 
 def test_manifest_rejects_duplicates_and_prefiller_byte_claims() -> None:
