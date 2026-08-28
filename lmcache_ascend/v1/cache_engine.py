@@ -6621,6 +6621,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kv_group=kv_group,
                 start=start,
                 end=end,
+                allow_legacy_fallback=not page_store,
             ):
                 continue
 
@@ -6694,6 +6695,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                     memory_objs_multi_layer = [page[0]] * self.num_layers
                 else:
                     legacy_suffix = True
+            if (
+                memory_objs_multi_layer is None
+                and legacy_suffix
+                and self._layerwise_chunk_fully_stored(
+                    keys_multi_layer,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    start=start,
+                    end=end,
+                )
+            ):
+                continue
             if memory_objs_multi_layer is None:
                 memory_objs_multi_layer = self.storage_manager.batched_allocate(
                     kv_shape_single_layer,

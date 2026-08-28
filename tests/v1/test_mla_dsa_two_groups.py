@@ -637,6 +637,12 @@ class TestAscendStoreLayerCompletion:
         assert "eviction" not in allocations[1].kwargs
         engine.storage_manager.batched_allocate.assert_not_called()
         engine.storage_manager.batched_put_layer_pages.assert_called_once()
+        assert (
+            engine._layerwise_chunk_fully_stored.call_args.kwargs[
+                "allow_legacy_fallback"
+            ]
+            is False
+        )
         pages[0].ref_count_down()
 
     def test_layer_pages_allocate_full_chunks_and_tail_in_one_batch(self):
@@ -777,6 +783,11 @@ class TestAscendStoreLayerCompletion:
         legacy_keys, legacy_objs = engine.storage_manager.batched_put.call_args.args[:2]
         assert legacy_keys == [keys[1].get_layer(0), keys[2].get_layer(0)]
         assert legacy_objs == legacy
+        checks = engine._layerwise_chunk_fully_stored.call_args_list
+        assert all(
+            call.kwargs["allow_legacy_fallback"] is False for call in checks[:3]
+        )
+        assert all("allow_legacy_fallback" not in call.kwargs for call in checks[3:])
         for page in pages:
             page.ref_count_down()
 
