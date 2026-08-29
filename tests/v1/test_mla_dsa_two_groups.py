@@ -2754,7 +2754,7 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
         direct_prefill_store_enabled=lambda: True,
         capture_live_source_step=lambda *args: calls.append(("capture", args[0])),
         store_direct_prefill=lambda *args, **kwargs: calls.append(
-            ("store", args[0])
+            ("store", args[0], kwargs["final"])
         ),
     )
     adapter = SimpleNamespace(
@@ -2789,7 +2789,7 @@ def test_adopted_direct_store_still_captures_live_source() -> None:
     assert calls == [
         ("begin", "request", (1,)),
         ("capture", "request"),
-        ("store", "request"),
+        ("store", "request", False),
     ]
 
 
@@ -2854,7 +2854,7 @@ def test_preferred_group0_store_is_fenced_before_group1_live_publish() -> None:
     assert adapter._finalized_live_source_submissions == {"request"}
 
 
-def test_group0_live_keeps_preferred_persistence_unfenced(monkeypatch) -> None:
+def test_unqualified_remote_fill_fences_final_live_persistence(monkeypatch) -> None:
     calls = []
     engine = SimpleNamespace(
         begin_live_source_descriptor=lambda _req_id, _groups=(0, 1): None,
@@ -2869,6 +2869,7 @@ def test_group0_live_keeps_preferred_persistence_unfenced(monkeypatch) -> None:
         lmcache_engine=engine,
         config=SimpleNamespace(dsa_two_groups=True),
         _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        _remote_store_requested=True,
         _direct_group_caches=lambda: {0: ["latent"], 1: ["indexer"]},
         _direct_request_inputs=lambda *_args: (
             {0: ["latent"], 1: ["indexer"]},
@@ -2885,10 +2886,9 @@ def test_group0_live_keeps_preferred_persistence_unfenced(monkeypatch) -> None:
         live_source_indexer_slot_mapping=["live-indexer"],
         live_source_requested=True,
         load_spec=None,
-        request_configs={
-            "lmcache.mooncake_preferred_segment": "decoder-tp0:12345"
-        },
+        request_configs={},
         is_last_prefill=True,
+        _lmcache_remote_fill_qualified=False,
     )
     monkeypatch.setattr(
         "lmcache_ascend.integration.vllm.vllm_v1_adapter."
@@ -2900,11 +2900,11 @@ def test_group0_live_keeps_preferred_persistence_unfenced(monkeypatch) -> None:
         adapter, [request], source_ready_event=object()
     )
 
-    assert calls == [("request", False)]
-    assert adapter._unfenced_live_stores == {"request": request}
+    assert calls == [("request", True)]
+    assert adapter._unfenced_live_stores == {}
 
 
-def test_group1_only_rank_does_not_fence_preferred_persistence() -> None:
+def test_final_group1_only_rank_fences_persistence() -> None:
     calls = []
     engine = SimpleNamespace(
         begin_live_source_descriptor=lambda _req_id, _groups=(0, 1): None,
@@ -2945,8 +2945,8 @@ def test_group1_only_rank_does_not_fence_preferred_persistence() -> None:
         adapter, [request], source_ready_event=object()
     )
 
-    assert calls == [("request", False)]
-    assert adapter._unfenced_live_stores == {"request": request}
+    assert calls == [("request", True)]
+    assert adapter._unfenced_live_stores == {}
 
 
 def test_enabled_live_latent_source_is_tp0_only(monkeypatch) -> None:

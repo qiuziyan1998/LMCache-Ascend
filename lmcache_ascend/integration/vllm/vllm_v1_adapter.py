@@ -910,27 +910,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         "Final live Group-1 descriptor has no producer NPU event"
                     )
             direct_store = self.lmcache_engine.direct_prefill_store_enabled()
-            preferred_segment = (
-                request.request_configs.get(_MOONCAKE_PREFERRED_SEGMENT_CONFIG)
-                if finalized_live
-                and 0 in selected
-                and isinstance(request.request_configs, dict)
-                else None
-            )
-            # A decoder-preferred group-0 object is the decoder's only source
-            # when the live transport carries group 1 alone.  Fence that final
-            # persistent write before the live descriptor can leave the worker;
-            # otherwise the decoder can race the asynchronous Mooncake Put.
-            # Preserve the existing unfenced path for unhinted requests and for
-            # true group-0 live transfer, where persistence is not on TTFT's
-            # critical correctness path.
-            fence_preferred_group0 = bool(
-                preferred_segment and 0 not in live_groups
-            )
             if direct_store and selected:
-                direct_final = request.is_last_prefill and (
-                    not finalized_live or fence_preferred_group0
-                )
+                direct_final = request.is_last_prefill
                 if remote_fill_request:
                     # save_kv_layer can observe the last scheduler window before
                     # the request-matched forward-context handoff is adopted.
@@ -956,7 +937,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 finalized_live
                 and direct_store
                 and selected
-                and not fence_preferred_group0
+                and not direct_final
             ):
                 self._unfenced_live_stores[request.req_id] = request
 
