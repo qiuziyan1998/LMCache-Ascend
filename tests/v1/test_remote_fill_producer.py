@@ -35,7 +35,9 @@ from lmcache.v1.remote_fill import (
     WindowState,
     WindowStatus,
     destination_descriptor_digest,
+    manifest_digest,
     seal_descriptor,
+    transaction_manifest_digest,
 )
 from lmcache.v1.remote_fill.native import (
     DirectPushPageSource,
@@ -593,6 +595,7 @@ def test_probe_hole_latches_persistent_only_without_arm() -> None:
     assert not result.direct_satisfied
     assert result.reason == "cached-prefix hole"
     assert not session.direct_viable
+    assert session.window_manifests == [(0, manifest_digest(_pages()))]
     assert not any(isinstance(item, ArmWindowRequest) for item in client.requests)
     reserve_count = sum(
         isinstance(item, ReserveWindowRequest) for item in client.requests
@@ -610,6 +613,103 @@ def test_probe_hole_latches_persistent_only_without_arm() -> None:
         sum(isinstance(item, ReserveWindowRequest) for item in client.requests)
         == reserve_count
     )
+
+
+@pytest.mark.parametrize("operation", ("probe", "transfer"))
+def test_early_rejected_window_is_excluded_from_finish_manifest(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+    )
+    session = _session(client)
+    execute = client.execute
+
+    def reject_probe(request: Any) -> RemoteFillResponse:
+        if isinstance(request, ReserveWindowRequest):
+            client.requests.append(request)
+            return client._response(
+                request, ResultCode.WINDOW_CONFLICT, message="window rejected"
+            )
+        if isinstance(request, FinishRequest):
+            assert request.final_manifest_digest == transaction_manifest_digest(
+                session.manifest_digest_seed,
+                (),
+                request.required_store_end,
+                request.final_partial_valid_tokens,
+            )
+            client.requests.append(request)
+            return client._response(
+                request,
+                ResultCode.TERMINAL,
+                terminal_outcome=TerminalOutcome.PERSISTENT_ONLY,
+            )
+        return execute(request)
+
+    monkeypatch.setattr(client, "execute", reject_probe)
+    if operation == "probe":
+        result = session.probe_window(
+            window_id=0,
+            source_generation=44,
+            control_pages=_pages(),
+        )
+    else:
+        result = session.transfer_window(
+            window_id=0,
+            source_generation=44,
+            control_pages=_pages(),
+            source_plan=_source_plan(),
+            submitter=lambda **_kwargs: pytest.fail("rejection must not submit"),
+            activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+        )
+    terminal = session.finish(
+        required_store_end=1024,
+        persistent_common_end=1024,
+    )
+
+    assert not result.direct_satisfied
+    assert result.reason == (
+        "probe result invalid"
+        if operation == "probe"
+        else "reservation result invalid"
+    )
+    assert session.window_manifests == []
+    assert terminal.outcome == "PERSISTENT_ONLY"
+
+
+def test_malformed_accepted_reservation_aborts_unknown_control_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+    )
+    session = _session(client)
+    execute = client.execute
+
+    def malformed_success(request: Any) -> RemoteFillResponse:
+        if isinstance(request, ReserveWindowRequest):
+            client.requests.append(request)
+            return client._response(request, ResultCode.OK)
+        return execute(request)
+
+    monkeypatch.setattr(client, "execute", malformed_success)
+    result = session.probe_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=_pages(),
+    )
+    terminal = session.finish(
+        required_store_end=1024,
+        persistent_common_end=1024,
+    )
+
+    assert not result.direct_satisfied
+    assert session.prearm_control_unknown
+    assert session.window_manifests == []
+    assert terminal.outcome == "PERSISTENT_ONLY"
+    assert any(isinstance(item, AbortRequest) for item in client.requests)
+    assert not any(isinstance(item, FinishRequest) for item in client.requests)
 
 
 def test_wrong_destination_dp_binding_is_rejected_before_arm() -> None:

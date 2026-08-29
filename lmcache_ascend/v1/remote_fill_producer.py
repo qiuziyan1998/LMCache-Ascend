@@ -695,16 +695,18 @@ class RemoteFillProducerSession:
                 reserve_seconds=reserve_seconds,
             )
         reserve_seconds = time.perf_counter() - reserve_started
-        self.window_manifests.append((window_id, digest))
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
+            if self._accepted(reserved):
+                self.prearm_control_unknown = True
             self.direct_viable = False
             return self._abandoned_window(
                 window_id,
                 "probe result invalid",
                 reserve_seconds=reserve_seconds,
             )
+        self.window_manifests.append((window_id, digest))
         existing_pages = sum(item is PageDisposition.EXISTING for item in dispositions)
         if (
             reserved.code is not ResultCode.OK
@@ -797,22 +799,24 @@ class RemoteFillProducerSession:
                 reserve_seconds=reserve_seconds,
             )
         reserve_seconds = time.perf_counter() - reserve_started
+        descriptors = reserved.descriptors
+        try:
+            dispositions = self._validate_page_results(control_pages, reserved)
+        except ValueError:
+            if self._accepted(reserved):
+                self.prearm_control_unknown = True
+            self.direct_viable = False
+            return self._abandoned_window(
+                window_id,
+                "reservation result invalid",
+                reserve_seconds=reserve_seconds,
+            )
         self.window_manifests.append((window_id, digest))
         if reserved.code is not ResultCode.OK:
             self.direct_viable = False
             return self._abandoned_window(
                 window_id,
                 "reservation rejected",
-                reserve_seconds=reserve_seconds,
-            )
-        descriptors = reserved.descriptors
-        try:
-            dispositions = self._validate_page_results(control_pages, reserved)
-        except ValueError:
-            self.direct_viable = False
-            return self._abandoned_window(
-                window_id,
-                "reservation result invalid",
                 reserve_seconds=reserve_seconds,
             )
         existing_pages = sum(item is PageDisposition.EXISTING for item in dispositions)
@@ -1268,7 +1272,10 @@ class RemoteFillProducerSession:
                     outcome = TerminalOutcome.FATAL_RESTART.value
                 elif response.terminal_outcome is None:
                     raise RuntimeError(
-                        "remote-fill FINISH returned no terminal outcome"
+                        "remote-fill FINISH returned no terminal outcome: "
+                        f"code={response.code.value} "
+                        f"state={response.transaction_state} "
+                        f"message={response.message!r}"
                     )
                 else:
                     outcome = response.terminal_outcome.value
