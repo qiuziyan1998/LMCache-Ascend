@@ -2390,9 +2390,13 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
             self._numel = numel
             self.dtype = torch.long
             self.device = torch.device("cpu")
+            self.recorded_streams = []
 
         def numel(self):
             return self._numel
+
+        def record_stream(self, stream):
+            self.recorded_streams.append(stream)
 
     fast_calls = []
     slow_calls = []
@@ -2421,6 +2425,7 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     slot_mapping = _TensorLike(2)
     selected = _TensorLike(2)
     chunk_ptrs = _TensorLike(1)
+    selected_counts = _TensorLike(1)
 
     transfer_kwargs = dict(
         kvcaches_ref=[(object(), object())],
@@ -2444,6 +2449,7 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         layer_tensors=[lmc_chunk],
         slot_mapping_ref=slot_mapping,
         cpu_tensors=[lmc_chunk],
+        selected_token_counts=selected_counts,
     )
     first_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
     second_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
@@ -2461,6 +2467,10 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     assert fast_calls[0][0][7] is True
     assert fast_calls[1][0][7] is False
     assert fast_calls[2][0][7] is False
+    assert slot_mapping.recorded_streams == [transfer_kwargs["load_stream"]] * 3
+    assert selected.recorded_streams == [transfer_kwargs["load_stream"]] * 3
+    assert chunk_ptrs.recorded_streams == [transfer_kwargs["load_stream"]] * 3
+    assert selected_counts.recorded_streams == [transfer_kwargs["load_stream"]] * 3
 
 
 def test_dense_direct_fast_state_cache_separates_load_and_store(
@@ -3267,15 +3277,32 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     compute_stream = _TrackingStream("compute")
     load_streams = [_TrackingStream("load-0"), _TrackingStream("load-1")]
     done_events = [_TrackingEvent("done-0"), _TrackingEvent("done-1")]
+
     connector.load_stream_list = load_streams
     connector._sparse_load_done_events = done_events
     connector._active_sparse_load_join = None
+    host_stages = []
+
+    class _Watchdog:
+        def begin_host(self, **fields):
+            return fields
+
+        def update_host(self, _state, stage):
+            host_stages.append(stage)
+
+        def end_host(self, _state):
+            host_stages.append("done")
+
+    connector._sparse_h2d_stall_watchdog = _Watchdog()
 
     connector._sparse_direct_validated_layers = set()
+    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: True)
     monkeypatch.setattr(
         npu_connectors.torch,
         "npu",
-        SimpleNamespace(current_stream=lambda: compute_stream),
+        SimpleNamespace(
+            current_stream=lambda: compute_stream,
+        ),
         raising=False,
     )
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
@@ -3303,11 +3330,11 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
             load_stream=load_streams[stream_index],
             load_stream_idx=stream_index,
             current_stream=compute_stream,
-            slot_mapping_packed=torch.arange(2, dtype=torch.long),
-            selected_token_idx=torch.arange(2, dtype=torch.int32),
+            slot_mapping_packed=_RecordableTensor(2),
+            selected_token_idx=_RecordableTensor(2, dtype=torch.int32),
             chunk_size=256,
             total_tokens=4,
-            chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+            chunk_ptrs_npu=_RecordableTensor(1, dtype=torch.int64),
             sparse_kv_format=0,
             sparse_token_major=False,
             sparse_vllm_two_major=False,
@@ -3336,6 +3363,8 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
         ("wait_event", "done-0"),
         ("wait_event", "done-1"),
     ]
+    assert host_stages.count("native_return") == 2
+    assert host_stages.count("done") == 2
     assert connector._active_sparse_load_join is None
 
     load_streams[0].events.clear()
@@ -3383,6 +3412,91 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     assert load_streams[0].events[-1] == "synchronize"
     assert load_streams[1].events[-1] == "synchronize"
     assert connector._active_sparse_load_join is None
+
+
+def test_sparse_h2d_watchdog_captures_stalled_python_stack(monkeypatch) -> None:
+    reports = []
+    reported = threading.Event()
+    release = threading.Event()
+
+    def capture(_logger, event, **fields):
+        reports.append((event, fields))
+        reported.set()
+
+    def stalled_submission(watchdog):
+        state = watchdog.begin_host(layer=16)
+        watchdog.update_host(state, "resolve_layer_state")
+        while not release.is_set():
+            sum(range(64))
+        watchdog.end_host(state)
+
+    monkeypatch.setattr(npu_connectors, "cold_start_perf_log", capture)
+    watchdog = npu_connectors._SparseH2DStallWatchdog(0.01)
+    worker = threading.Thread(target=stalled_submission, args=(watchdog,))
+    worker.start()
+
+    try:
+        assert reported.wait(1)
+        assert reports[0][0] == "sparse_h2d_python_stall"
+        assert reports[0][1]["pending_stage"] == "resolve_layer_state"
+        assert reports[0][1]["layer"] == 16
+        assert reports[0][1]["timeout_seconds"] == 0.01
+        assert any(
+            frame["function"] == "stalled_submission"
+            for frame in reports[0][1]["python_stack"]
+        )
+    finally:
+        release.set()
+        worker.join(1)
+    assert watchdog.begin_host(layer=18) is None
+
+    reports.clear()
+    reported.clear()
+    watchdog = npu_connectors._SparseH2DStallWatchdog(0.01)
+    state = watchdog.begin_host(layer=17)
+    watchdog.update_host(state, "native_return")
+    watchdog.end_host(state)
+
+    assert not reported.wait(0.05)
+    assert reports == []
+
+
+def test_sparse_h2d_watchdog_failures_do_not_affect_submission(monkeypatch) -> None:
+    class _BrokenWatchdog:
+        def begin_host(self, **_fields):
+            return {}
+
+        def update_host(self, _state, _stage):
+            raise RuntimeError("diagnostic update failed")
+
+        def end_host(self, _state):
+            raise RuntimeError("diagnostic cleanup failed")
+
+    class _Connector:
+        _active_sparse_load_join = SimpleNamespace(
+            host_state=None,
+            watchdog=_BrokenWatchdog(),
+        )
+
+        @npu_connectors._trace_sparse_h2d_python
+        def submit(self, **_kwargs):
+            npu_connectors._sparse_h2d_python_stage(
+                self._active_sparse_load_join,
+                "native_fast_submit",
+            )
+            return "ok"
+
+    assert _Connector().submit(layer_id=3) == "ok"
+
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_h2d_stall_watchdog = None
+    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: True)
+
+    def fail_watchdog(_timeout):
+        raise RuntimeError("thread creation failed")
+
+    monkeypatch.setattr(npu_connectors, "_SparseH2DStallWatchdog", fail_watchdog)
+    assert connector._get_sparse_h2d_stall_watchdog() is None
 
 
 def test_sparse_destination_plan_replaces_destination_per_group(

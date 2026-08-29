@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
+from functools import wraps
 import hashlib
 from itertools import pairwise
 import json
 import os
+import sys
+from threading import Condition, Thread, get_ident
 import time
+import traceback
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
@@ -13,6 +17,10 @@ from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
+from lmcache.v1.cold_start_perf import (
+    cold_start_perf_enabled,
+    cold_start_perf_log,
+)
 from lmcache.v1.gpu_connector.gpu_connectors import (
     SGLangGPUConnector,
     SGLangLayerwiseGPUConnector,
@@ -314,6 +322,14 @@ _SPARSE_TRANSFER_TOPK = max(
 )
 
 _SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
+_SPARSE_H2D_STALL_TIMEOUT_ENV = "LMCACHE_COLD_PERF_SPARSE_H2D_STALL_SECONDS"
+
+
+def _sparse_h2d_stall_timeout() -> float:
+    try:
+        return max(1.0, float(os.getenv(_SPARSE_H2D_STALL_TIMEOUT_ENV, "30")))
+    except ValueError:
+        return 30.0
 
 
 def _wait_payload_events(stream: Any, payload_event: Any) -> None:
@@ -1477,14 +1493,142 @@ class _SparseDestinationPlan:
         self.states = states
 
 
+class _SparseH2DStallWatchdog:
+    """Report a sparse host submission that exceeds its deadline."""
+
+    def __init__(self, timeout: float) -> None:
+        self._timeout = timeout
+        self._condition = Condition()
+        self._host_state: Optional[dict[str, Any]] = None
+        self._reported = False
+        Thread(
+            target=self._run,
+            name="lmcache-sparse-h2d-watchdog",
+            daemon=True,
+        ).start()
+
+    def begin_host(self, **fields: Any) -> Optional[dict[str, Any]]:
+        started = time.perf_counter()
+        state = {
+            "_started": started,
+            "_deadline": started + self._timeout,
+            "_thread_id": get_ident(),
+            "pending_stage": "entry",
+            "timeout_seconds": self._timeout,
+            **fields,
+        }
+        with self._condition:
+            if self._reported:
+                return None
+            self._host_state = state
+            self._condition.notify()
+        return state
+
+    def update_host(self, state: Optional[dict[str, Any]], stage: str) -> None:
+        if state is not None and self._host_state is state:
+            state["pending_stage"] = stage
+
+    def end_host(self, state: Optional[dict[str, Any]]) -> None:
+        if state is None:
+            return
+        with self._condition:
+            if self._host_state is state:
+                self._host_state = None
+                self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._host_state is None or self._reported:
+                    self._condition.wait()
+                state = self._host_state
+                remaining = state["_deadline"] - time.perf_counter()
+                if remaining > 0:
+                    self._condition.wait(remaining)
+                    continue
+                frame = sys._current_frames().get(state["_thread_id"])
+                fields = {key: value for key, value in state.items() if key[0] != "_"}
+                fields["python_thread_id"] = state["_thread_id"]
+                self._host_state = None
+                self._reported = True
+                started = state["_started"]
+            stack = traceback.extract_stack(frame)[-16:] if frame is not None else ()
+            cold_start_perf_log(
+                logger,
+                "sparse_h2d_python_stall",
+                started=started,
+                python_stack=[
+                    {
+                        "file": item.filename,
+                        "line": item.lineno,
+                        "function": item.name,
+                        "code": item.line,
+                    }
+                    for item in stack
+                ],
+                **fields,
+            )
+
+
 class _SparseLoadJoin:
     """One layer/group fan-out from a compute stream to load streams."""
 
-    __slots__ = ("compute_stream", "used_stream_indices")
+    __slots__ = (
+        "compute_stream",
+        "host_state",
+        "used_stream_indices",
+        "watchdog",
+    )
 
-    def __init__(self, compute_stream: Any) -> None:
+    def __init__(
+        self,
+        compute_stream: Any,
+        watchdog: Optional[_SparseH2DStallWatchdog] = None,
+    ) -> None:
         self.compute_stream = compute_stream
+        self.host_state: Optional[dict[str, Any]] = None
         self.used_stream_indices: set[int] = set()
+        self.watchdog = watchdog
+
+
+def _trace_sparse_h2d_python(func):
+    """Arm one cold-perf-only Python stack watchdog around sparse submission."""
+
+    @wraps(func)
+    def wrapped(self, *args, **kwargs):
+        join = getattr(self, "_active_sparse_load_join", None)
+        watchdog = getattr(join, "watchdog", None)
+        if watchdog is None:
+            return func(self, *args, **kwargs)
+        try:
+            state = watchdog.begin_host(
+                req_id=kwargs.get("req_id"),
+                kv_group=kwargs.get("kv_group"),
+                layer=kwargs.get("layer_id"),
+                load_stream_index=kwargs.get("load_stream_idx"),
+            )
+        except Exception:
+            return func(self, *args, **kwargs)
+        join.host_state = state
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            try:
+                watchdog.end_host(state)
+            except Exception:
+                pass
+            join.host_state = None
+
+    return wrapped
+
+
+def _sparse_h2d_python_stage(join: Optional[_SparseLoadJoin], stage: str) -> None:
+    if join is None or join.host_state is None:
+        return
+    try:
+        join.watchdog.update_host(join.host_state, stage)
+    except Exception:
+        pass
 
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
@@ -1508,6 +1652,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             torch.npu.Event() for _ in range(self.load_stream_num)
         ]
         self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
+        self._sparse_h2d_stall_watchdog: Optional[_SparseH2DStallWatchdog] = None
         if _SPARSE_TRANSFER_TOPK:
             logger.warning(
                 "Limiting each sparse LMCache transfer to the first %d "
@@ -1583,6 +1728,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Order the current consumer stream after an opaque dense-load fence."""
         torch.npu.current_stream().wait_event(readiness)
 
+    def _get_sparse_h2d_stall_watchdog(
+        self,
+    ) -> Optional[_SparseH2DStallWatchdog]:
+        if not cold_start_perf_enabled():
+            return None
+        watchdog = getattr(self, "_sparse_h2d_stall_watchdog", None)
+        if watchdog is None:
+            try:
+                watchdog = _SparseH2DStallWatchdog(_sparse_h2d_stall_timeout())
+            except Exception:
+                return None
+            self._sparse_h2d_stall_watchdog = watchdog
+        return watchdog
+
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
         """Join sparse request load streams after all layer submissions.
@@ -1598,7 +1757,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
             else torch.cuda.current_stream()
         )
-        join = _SparseLoadJoin(compute_stream)
+        join = _SparseLoadJoin(compute_stream, self._get_sparse_h2d_stall_watchdog())
         self._active_sparse_load_join = join
         try:
             yield
@@ -2698,6 +2857,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"chunk_size={chunk_size}, total_tokens={total_tokens}"
             )
 
+    @_trace_sparse_h2d_python
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -2724,12 +2884,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cpu_tensors: Optional[List[torch.Tensor]] = None,
         payload_event: Optional[Any] = None,
         selected_token_counts: Optional[torch.Tensor] = None,
+        req_id: Optional[str] = None,
     ) -> str:
+        join = getattr(self, "_active_sparse_load_join", None)
+        _sparse_h2d_python_stage(join, "input_metadata")
         num_sparse = int(selected_token_idx.numel())
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return "none"
         chunk_count = int(chunk_ptrs_npu.numel())
         chunk_size_int = int(chunk_size)
+        _sparse_h2d_python_stage(join, "validate_coverage")
         self._validate_sparse_fixed_chunk_coverage(
             chunk_count, chunk_size_int, int(total_tokens)
         )
@@ -2741,6 +2905,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         resolve_slot_mapping = (
             slot_mapping_ref if slot_mapping_ref is not None else slot_mapping_packed
         )
+        _sparse_h2d_python_stage(join, "pointer_signature")
         runtime_source_signature = self._sparse_direct_pointer_cache_signature(
             chunk_ptrs_npu=chunk_ptrs_npu,
             slot_mapping_ref=resolve_slot_mapping,
@@ -2755,6 +2920,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
 
+        _sparse_h2d_python_stage(join, "resolve_layer_state")
         layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
             kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
@@ -2773,18 +2939,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         if validate_key is None:
             validate_key = (kv_group, layer_id)
-        join = getattr(self, "_active_sparse_load_join", None)
+
+        # The custom kernel consumes these raw pointers asynchronously.
+        _sparse_h2d_python_stage(join, "record_stream_ownership")
+        slot_mapping_packed.record_stream(load_stream)
+        selected_token_idx.record_stream(load_stream)
+        chunk_ptrs_npu.record_stream(load_stream)
+        if selected_token_counts is not None:
+            selected_token_counts.record_stream(load_stream)
+
         if join is not None:
             if self.load_stream_list[load_stream_idx] is not load_stream:
                 raise RuntimeError("sparse load stream index does not match its stream")
             join.used_stream_indices.add(load_stream_idx)
+        _sparse_h2d_python_stage(join, "load_stream_context")
         with torch.cuda.stream(load_stream):
+            _sparse_h2d_python_stage(join, "load_stream_dependency")
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
+                _sparse_h2d_python_stage(join, "validation_decision")
                 validate_inputs = (
                     getattr(self, "enable_npu_transfer_validation", True)
                     and validate_key not in self._sparse_direct_validated_layers
                 )
+                _sparse_h2d_python_stage(join, "native_fast_submit")
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_packed,
@@ -2800,7 +2978,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._sparse_direct_validated_layers.add(validate_key)
                 kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer_fast"
             else:
+                _sparse_h2d_python_stage(join, "fallback_input_check")
                 assert cpu_tensors is not None and len(cpu_tensors) > 0
+                _sparse_h2d_python_stage(join, "native_fallback_submit")
                 sparse_mla_dsa_batched_direct_kv_transfer(
                     cpu_tensors,
                     kvcaches_ref[layer_id],
@@ -2819,6 +2999,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     selected_token_counts,
                 )
                 kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer"
+            _sparse_h2d_python_stage(join, "native_return")
 
         if join is None:
             current_stream.wait_stream(load_stream)
@@ -5226,6 +5407,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     ),
                     cpu_tensors=cpu_tensors,
                     selected_token_counts=selected_token_counts,
+                    req_id=req_id,
                 )
             if content_diag_enabled and layer_id in (0, self.num_layers // 2):
                 diagnostic_cpu_tensors = cpu_tensors
