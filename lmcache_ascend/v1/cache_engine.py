@@ -562,7 +562,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         super().post_init(**kwargs)
         try:
             if (
-                self._group1_direct_hbm_enabled()
+                self._persistent_direct_hbm_split_group_enabled()
                 and self.config.pd_role != "sender"
                 and self._is_passive()
             ):
@@ -630,14 +630,22 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Return whether this worker can use direct NPU page publication."""
         return self._direct_store_enabled
 
-    def _group1_direct_hbm_enabled(self) -> bool:
+    def _remote_fill_direct_groups(self) -> tuple[int, ...]:
         return (
-            getattr(self.config, "dsa_group1_load_mode", "p2p_preferred")
-            == "persistent_direct_hbm"
+            (0,)
+            if self._persistent_direct_hbm_split_group_enabled()
+            else (0, 1)
         )
 
-    def _remote_fill_direct_groups(self) -> tuple[int, ...]:
-        return (0,) if self._group1_direct_hbm_enabled() else (0, 1)
+    def _group1_external_page_load(self) -> Callable[..., None]:
+        loader = (
+            self._group1_external_page_reader
+            if self._is_passive()
+            else self.storage_manager
+        )
+        if loader is None:
+            raise RuntimeError("Group-1 external page reader is unavailable")
+        return loader.batched_get_external_pages
 
     def _rollback_group1_direct_hbm_startup(self) -> None:
         """Close every resource acquired by direct-HBM decoder startup."""
@@ -661,7 +669,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def preflight_group1_direct_hbm(self, kvcaches: list) -> None:
         """Reject unsupported direct-HBM layouts uniformly across TP ranks."""
         if (
-            not self._group1_direct_hbm_enabled()
+            not self._persistent_direct_hbm_split_group_enabled()
             or self.config.pd_role == "sender"
         ):
             return
@@ -674,20 +682,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             if not callable(check) or not check(kvcaches, 1):
                 raise RuntimeError("Group-1 direct-HBM layout is unsupported")
-            loader = (
-                self._group1_external_page_reader
-                if self._is_passive()
-                else self.storage_manager
-            )
-            load_pages = getattr(
-                loader,
-                "get_pages"
-                if self._is_passive()
-                else "batched_get_external_pages",
-                None,
-            )
-            if not callable(load_pages):
-                raise RuntimeError("Group-1 external page reader is unavailable")
+            self._group1_external_page_load()
         except BaseException as error:
             local_error = error
         ready = local_error is None
@@ -726,7 +721,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         req_id: str,
     ) -> None:
         """Load exact persistent Group-1 pages into final vLLM HBM blocks."""
-        if not self._group1_direct_hbm_enabled():
+        if not self._persistent_direct_hbm_split_group_enabled():
             raise RuntimeError("Group-1 direct-HBM mode is disabled")
         plans = list(
             self.token_database.process_tokens(
@@ -766,20 +761,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         ptrs, sizes, owners = planned
         if len(ptrs) != len(keys) or len(sizes) != len(keys):
             raise RuntimeError("Group-1 direct-HBM page count is invalid")
-        loader = (
-            self._group1_external_page_reader
-            if self._is_passive()
-            else self.storage_manager
-        )
-        load_pages = getattr(
-            loader,
-            "get_pages"
-            if self._is_passive()
-            else "batched_get_external_pages",
-            None,
-        )
-        if not callable(load_pages):
-            raise RuntimeError("Group-1 external page reader is unavailable")
+        load_pages = self._group1_external_page_load()
         started = cold_start_perf_now()
         try:
             # This strict API returns only after native DMA reaches a known
@@ -1304,7 +1286,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             group_dimensions=layout.group_dimensions,
             layer_count=layout.num_layers,
             save_only_first_rank=True,
-            shared_group1=not self._group1_direct_hbm_enabled(),
+            shared_group1=(
+                not self._persistent_direct_hbm_split_group_enabled()
+            ),
             tp_size=int(self.metadata.world_size),
             dp_size=handoff.destination_dp_size,
             global_te_push=handoff.global_te_push,
@@ -10072,7 +10056,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             num_layers=int(self.num_layers),
         )
         self._validate_remote_fill_decoder_layout(layout)
-        shared_group1 = not self._group1_direct_hbm_enabled()
+        shared_group1 = not self._persistent_direct_hbm_split_group_enabled()
         if tp_shared and shared_group1:
             self._preflight_remote_fill_shared_group1(
                 layout,

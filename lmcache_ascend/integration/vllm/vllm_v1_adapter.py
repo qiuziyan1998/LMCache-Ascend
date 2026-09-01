@@ -585,12 +585,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     _prepare_remote_fill_persistent_placement(
                         request.request_configs,
                         group1_direct_hbm=(
-                            getattr(
-                                self.config,
-                                "dsa_group1_load_mode",
-                                "p2p_preferred",
-                            )
-                            == "persistent_direct_hbm"
+                            self.lmcache_engine._persistent_direct_hbm_split_group_enabled()
                         ),
                     )
         expected = set(self._latent_layer_names)
@@ -827,12 +822,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 _prepare_remote_fill_persistent_placement(
                     request.request_configs,
                     group1_direct_hbm=(
-                        getattr(
-                            self.config,
-                            "dsa_group1_load_mode",
-                            "p2p_preferred",
-                        )
-                        == "persistent_direct_hbm"
+                        self.lmcache_engine._persistent_direct_hbm_split_group_enabled()
                     ),
                 )
                 live_source = False
