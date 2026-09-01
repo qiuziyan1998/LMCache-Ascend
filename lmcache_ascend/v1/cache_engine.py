@@ -631,11 +631,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         return self._direct_store_enabled
 
     def _remote_fill_direct_groups(self) -> tuple[int, ...]:
-        return (
-            (0,)
-            if self._persistent_direct_hbm_split_group_enabled()
-            else (0, 1)
-        )
+        return (0,) if self._persistent_direct_hbm_split_group_enabled() else (0, 1)
 
     def _group1_external_page_load(self) -> Callable[..., None]:
         loader = (
@@ -762,7 +758,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         if len(ptrs) != len(keys) or len(sizes) != len(keys):
             raise RuntimeError("Group-1 direct-HBM page count is invalid")
         load_pages = self._group1_external_page_load()
-        started = cold_start_perf_now()
         try:
             # This strict API returns only after native DMA reaches a known
             # terminal status; an unrelated Ascend stream event adds no fence.
@@ -772,17 +767,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise RemoteFillFatalError(
                 "decoder Group-1 external-page DMA state is unknown"
             ) from error
-        cold_start_perf_log(
-            logger,
-            "group1_direct_hbm_complete",
-            started=started,
-            req_id=req_id,
-            tokens=len(tokens),
-            pages=len(keys),
-            buffers=sum(map(len, ptrs)),
-            bytes=sum(map(sum, sizes)),
-            rank=self.metadata.worker_id,
-        )
 
     def direct_prefill_plan_supported(
         self,

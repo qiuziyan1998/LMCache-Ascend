@@ -118,8 +118,7 @@ def _remote_fill_request_qualified(request: Any) -> bool:
 
 
 def _persistent_direct_hbm_enabled(config: Any) -> bool:
-    mode = getattr(config, "dsa_group1_load_mode", "p2p_preferred")
-    return mode == "persistent_direct_hbm"
+    return config.dsa_group1_load_mode == "persistent_direct_hbm"
 
 
 def _prepare_remote_fill_persistent_placement(

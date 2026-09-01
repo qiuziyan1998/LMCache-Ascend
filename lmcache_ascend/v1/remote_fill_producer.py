@@ -1362,16 +1362,14 @@ class RemoteFillProducerSession:
             if hasattr(transaction_state, "value")
             else transaction_state
         )
-        if state == "GROUP0_LOCAL":
-            if terminal_outcome is not TerminalOutcome.PERSISTENT_ONLY:
+        expected = {
+            "GROUP0_LOCAL": TerminalOutcome.PERSISTENT_ONLY,
+            "LOCAL_FULL": TerminalOutcome.LOCAL_FULL,
+        }.get(state)
+        if expected is not None:
+            if terminal_outcome is not expected:
                 raise RuntimeError(
-                    "GROUP0_LOCAL must have public PERSISTENT_ONLY outcome"
-                )
-            return outcome, True
-        if state == "LOCAL_FULL":
-            if terminal_outcome is not TerminalOutcome.LOCAL_FULL:
-                raise RuntimeError(
-                    "LOCAL_FULL state must have public LOCAL_FULL outcome"
+                    f"{state} has contradictory outcome {outcome}"
                 )
             return outcome, True
         if terminal_outcome is TerminalOutcome.LOCAL_FULL:
