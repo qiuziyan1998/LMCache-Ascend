@@ -4898,6 +4898,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         diagnostics = transfer_kwargs.get("_cold_perf_breakdown")
         if not isinstance(diagnostics, dict):
             diagnostics = None
+        perf_enabled = cold_start_perf_enabled()
+        submit_count = 0
+        submit_sum_s = submit_max_s = 0.0
+        submit_thread_cpu_ns = 0
         layout_started = time.perf_counter() if diagnostics is not None else 0.0
         layout = self._group_layouts.get(kv_group)
         layout_cache_hit = layout is not None
@@ -4951,6 +4955,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         for layer_id, source_layer in enumerate(source.layers):
             sparse_request = yield
+            submit_started = time.perf_counter() if perf_enabled else 0.0
+            submit_thread_started = time.thread_time_ns() if perf_enabled else 0
 
             (
                 selected_token_idx,
@@ -5042,6 +5048,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 sparse_host_interleaved=sparse_host_interleaved,
                 selected_token_counts=selected_token_counts,
             )
+            if perf_enabled:
+                submit_elapsed = time.perf_counter() - submit_started
+                submit_count += 1
+                submit_sum_s += submit_elapsed
+                submit_max_s = max(submit_max_s, submit_elapsed)
+                submit_thread_cpu_ns += (
+                    time.thread_time_ns() - submit_thread_started
+                )
             if capture_content and layer_id == 0:
                 source_tensors = list(source_layer.tensors)
                 for memory_obj in (
@@ -5088,6 +5102,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 self._mtp_dw_deep_diag_seen = deep_seen
 
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "prepared_sparse_submit_summary",
+                req_id=req_id or "unspecified",
+                kv_group=kv_group,
+                layers=submit_count,
+                tokens=source.total_tokens,
+                sum_ms=round(submit_sum_s * 1000, 3),
+                max_ms=round(submit_max_s * 1000, 3),
+                thread_cpu_ms=round(submit_thread_cpu_ns / 1_000_000, 3),
+            )
         yield
         yield
 

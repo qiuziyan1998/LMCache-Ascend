@@ -2901,6 +2901,13 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
 
 def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
+    perf_events = []
+    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: True)
+    monkeypatch.setattr(
+        npu_connectors,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: perf_events.append((event, fields)),
+    )
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
     connector.lmcache_chunk_size = 256
@@ -3019,6 +3026,15 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
         "load_stream" not in call and "current_stream" not in call
         for call in transfer_calls
     )
+    assert [event for event, _ in perf_events] == [
+        "prepared_sparse_submit_summary",
+        "prepared_sparse_submit_summary",
+    ]
+    for _, fields in perf_events:
+        assert fields["layers"] == 1
+        assert fields["tokens"] == 4
+        assert fields["sum_ms"] >= fields["max_ms"] >= 0
+        assert fields["thread_cpu_ms"] >= 0
 
     for generator in generators:
         generator.close()
