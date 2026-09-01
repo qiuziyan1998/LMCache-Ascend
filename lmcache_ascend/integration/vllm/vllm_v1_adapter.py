@@ -117,6 +117,11 @@ def _remote_fill_request_qualified(request: Any) -> bool:
     return bool(cached)
 
 
+def _persistent_direct_hbm_enabled(config: Any) -> bool:
+    mode = getattr(config, "dsa_group1_load_mode", "p2p_preferred")
+    return mode == "persistent_direct_hbm"
+
+
 def _prepare_remote_fill_persistent_placement(
     request_configs: Any,
     *,
@@ -584,9 +589,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 if _remote_fill_request_qualified(request):
                     _prepare_remote_fill_persistent_placement(
                         request.request_configs,
-                        group1_direct_hbm=(
-                            self.lmcache_engine._persistent_direct_hbm_split_group_enabled()
-                        ),
+                        group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
                     )
         expected = set(self._latent_layer_names)
         if self.config.dsa_two_groups:
@@ -821,9 +824,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 # is prepositioned in the selected decoder's Mooncake segment.
                 _prepare_remote_fill_persistent_placement(
                     request.request_configs,
-                    group1_direct_hbm=(
-                        self.lmcache_engine._persistent_direct_hbm_split_group_enabled()
-                    ),
+                    group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
                 )
                 live_source = False
                 self.lmcache_engine.discard_live_source_descriptor(request.req_id)
