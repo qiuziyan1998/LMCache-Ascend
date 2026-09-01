@@ -189,6 +189,7 @@ class RemoteFillTerminalResult:
     outcome: str
     persistent_common_end: int
     required_store_end: int
+    direct_satisfied: bool = field(default=False, repr=False)
 
     def as_dict(self) -> dict[str, str | int]:
         """Return the pointer-free proxy handoff representation."""
@@ -1226,6 +1227,7 @@ class RemoteFillProducerSession:
 
         if self._terminal is not None:
             return self._terminal
+        direct_satisfied = False
         if self.fatal_restart_required:
             outcome = TerminalOutcome.FATAL_RESTART.value
         elif persistent_common_end < required_store_end:
@@ -1266,7 +1268,7 @@ class RemoteFillProducerSession:
                 # FINISH may have committed before its reply was lost. Resolve
                 # the transaction-level terminal state instead of discarding
                 # valid decoder-local pages and under-reporting LOCAL_FULL.
-                outcome = self._resolve_ambiguous_finish()
+                outcome, direct_satisfied = self._resolve_ambiguous_finish()
             else:
                 if response.fatal_restart_required:
                     outcome = TerminalOutcome.FATAL_RESTART.value
@@ -1278,17 +1280,20 @@ class RemoteFillProducerSession:
                         f"message={response.message!r}"
                     )
                 else:
-                    outcome = response.terminal_outcome.value
+                    outcome, direct_satisfied = self._classify_terminal(
+                        response
+                    )
         self._terminal = RemoteFillTerminalResult(
             transfer_id=self.handoff.transfer_id,
             outcome=outcome,
             persistent_common_end=persistent_common_end,
             required_store_end=required_store_end,
+            direct_satisfied=direct_satisfied,
         )
         self.closed = True
         return self._terminal
 
-    def _resolve_ambiguous_finish(self) -> str:
+    def _resolve_ambiguous_finish(self) -> tuple[str, bool]:
         """Resolve a lost FINISH reply without resubmitting publication."""
 
         try:
@@ -1299,7 +1304,7 @@ class RemoteFillProducerSession:
             raise
         except Exception:
             self.direct_viable = False
-            return TerminalOutcome.PERSISTENT_ONLY.value
+            return TerminalOutcome.PERSISTENT_ONLY.value, False
         if response.fatal_restart_required or (
             response.terminal_outcome is TerminalOutcome.FATAL_RESTART
         ):
@@ -1325,7 +1330,7 @@ class RemoteFillProducerSession:
             TerminalOutcome.PERSISTENCE_FAILED,
             TerminalOutcome.CANCELLED,
         ):
-            return response.terminal_outcome.value
+            return self._classify_terminal(response)
         # All native operations were terminal before FINISH. If publication
         # did not happen, explicitly abort the still-hidden transaction so it
         # cannot retain decoder pages indefinitely.
@@ -1341,7 +1346,43 @@ class RemoteFillProducerSession:
         except Exception:
             pass
         self.direct_viable = False
-        return TerminalOutcome.PERSISTENT_ONLY.value
+        return TerminalOutcome.PERSISTENT_ONLY.value, False
+
+    @staticmethod
+    def _classify_terminal(response: RemoteFillResponse) -> tuple[str, bool]:
+        """Map decoder-private terminal state to public and accounting views."""
+
+        terminal_outcome = response.terminal_outcome
+        if terminal_outcome is None:
+            raise RuntimeError("remote-fill response has no terminal outcome")
+        outcome = terminal_outcome.value
+        transaction_state = response.transaction_state
+        state = (
+            transaction_state.value
+            if hasattr(transaction_state, "value")
+            else transaction_state
+        )
+        if state == "GROUP0_LOCAL":
+            if terminal_outcome is not TerminalOutcome.PERSISTENT_ONLY:
+                raise RuntimeError(
+                    "GROUP0_LOCAL must have public PERSISTENT_ONLY outcome"
+                )
+            return outcome, True
+        if state == "LOCAL_FULL":
+            if terminal_outcome is not TerminalOutcome.LOCAL_FULL:
+                raise RuntimeError(
+                    "LOCAL_FULL state must have public LOCAL_FULL outcome"
+                )
+            return outcome, True
+        if terminal_outcome is TerminalOutcome.LOCAL_FULL:
+            if state is not None:
+                raise RuntimeError(
+                    "LOCAL_FULL outcome has a contradictory transaction state"
+                )
+            # Compatibility with legacy peers and test transports that did not
+            # populate transaction_state on a terminal response.
+            return outcome, True
+        return outcome, False
 
     def abort(self, reason: str) -> None:
         """Release a nonfatal hidden transaction that will not be finished."""

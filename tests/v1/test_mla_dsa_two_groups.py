@@ -3295,19 +3295,44 @@ def _adapter_remote_fill_request_configs() -> dict:
     }
 
 
-def test_remote_fill_persistence_uses_prefiller_local_default() -> None:
+def test_remote_fill_persistence_selects_group1_decoder_segment() -> None:
     from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
         _prepare_remote_fill_persistent_placement,
     )
     request_configs = _adapter_remote_fill_request_configs()
     request_configs["lmcache.mooncake_preferred_segment"] = "decoder-host"
 
-    assert _prepare_remote_fill_persistent_placement(request_configs) is True
-    assert "lmcache.mooncake_preferred_segment" not in request_configs
+    assert _prepare_remote_fill_persistent_placement(
+        request_configs, group1_direct_hbm=True
+    ) is True
+    assert (
+        request_configs["lmcache.mooncake_preferred_segment"]
+        == "decoder-host"
+    )
+    assert request_configs["lmcache.mooncake_preferred_kv_group"] == 1
+
+    legacy = _adapter_remote_fill_request_configs()
+    legacy["lmcache.mooncake_preferred_segment"] = "decoder-host"
+    assert _prepare_remote_fill_persistent_placement(legacy) is True
+    assert "lmcache.mooncake_preferred_segment" not in legacy
+    assert "lmcache.mooncake_preferred_kv_group" not in legacy
 
     ordinary = {"lmcache.mooncake_preferred_segment": "decoder-host"}
     assert _prepare_remote_fill_persistent_placement(ordinary) is False
     assert ordinary["lmcache.mooncake_preferred_segment"] == "decoder-host"
+
+
+def test_group1_direct_persistence_requires_decoder_segment() -> None:
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        _prepare_remote_fill_persistent_placement,
+    )
+
+    with pytest.raises(
+        ValueError, match="requires a decoder-local Mooncake segment"
+    ):
+        _prepare_remote_fill_persistent_placement(
+            _adapter_remote_fill_request_configs(), group1_direct_hbm=True
+        )
 
 
 def test_remote_fill_disabled_preserves_legacy_group_selection() -> None:
@@ -3494,7 +3519,10 @@ def test_remote_fill_rebuilds_probe_keys_for_full_prefix_hit() -> None:
                 assert kwargs["offsets"] == [1024]
             return [(0, 1024, SimpleNamespace(chunk_hash=91, kv_group=group))]
 
-    engine = SimpleNamespace(token_database=_TokenDatabase())
+    engine = SimpleNamespace(
+        token_database=_TokenDatabase(),
+        _remote_fill_direct_groups=lambda: (0, 1),
+    )
     plans = AscendLMCacheEngine._remote_fill_prefix_plans(
         engine,
         list(range(1024)),
@@ -3505,6 +3533,27 @@ def test_remote_fill_rebuilds_probe_keys_for_full_prefix_hit() -> None:
     assert set(plans) == {0, 1}
     assert plans[0][0][:2] == (0, 1024)
     assert plans[1][0][:2] == (0, 1024)
+
+
+def test_group0_remote_fill_rebuild_skips_group1_metadata() -> None:
+    class _TokenDatabase:
+        def process_tokens(self, **kwargs):
+            assert kwargs["kv_group"] == 0
+            return [(0, 1024, SimpleNamespace(chunk_hash=91, kv_group=0))]
+
+    engine = SimpleNamespace(
+        token_database=_TokenDatabase(),
+        _remote_fill_direct_groups=lambda: (0,),
+    )
+
+    plans = AscendLMCacheEngine._remote_fill_prefix_plans(
+        engine,
+        list(range(1024)),
+        {"lmcache.remote_fill": {"transfer_id": "transfer"}},
+        1024,
+    )
+
+    assert set(plans) == {0}
 
 
 def test_failed_direct_preflight_uses_overlapped_layerwise_store(monkeypatch) -> None:

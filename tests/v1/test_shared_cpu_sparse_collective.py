@@ -189,6 +189,120 @@ def test_cold_direct_indexer_defers_readiness_to_request_event() -> None:
     assert calls == ["get"]
 
 
+def test_persistent_direct_group1_load_uses_native_terminal_return() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    owner = object()
+    calls = []
+    engine.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_direct_hbm"
+    )
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine._is_passive = lambda: False
+    process_tokens = MagicMock(return_value=[(0, 4, key)])
+    engine.token_database = SimpleNamespace(process_tokens=process_tokens)
+    engine._ensure_layerwise_connector_layout = MagicMock()
+    engine.gpu_connector = SimpleNamespace(
+        plan_direct_page_destinations=MagicMock(
+            return_value=([[7]], [[8]], (owner,))
+        ),
+    )
+    engine.storage_manager = SimpleNamespace(
+        batched_get_external_pages=lambda *args: calls.append("get")
+    )
+
+    engine.load_group1_pages_direct(
+        [1, 2, 3, 4],
+        torch.arange(4),
+        [object()],
+        None,
+        "request",
+    )
+
+    # The native get is terminal; the strict path must not create or wait on
+    # an unrelated torch stream event after it returns.
+    assert calls == ["get"]
+    process_tokens.assert_called_once_with(
+        tokens=[1, 2, 3, 4], request_configs=None, kv_group=1
+    )
+    engine._ensure_layerwise_connector_layout.assert_called_once()
+    engine.gpu_connector.plan_direct_page_destinations.assert_called_once()
+
+    engine.storage_manager.batched_get_external_pages = MagicMock(
+        side_effect=RuntimeError("known native failure")
+    )
+    with pytest.raises(RuntimeError, match="known native failure"):
+        engine.load_group1_pages_direct(
+            [1, 2, 3, 4], torch.arange(4), [object()], None, "request"
+        )
+
+
+def test_persistent_direct_group1_preflight_skips_sender() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_direct_hbm",
+        pd_role="sender",
+    )
+    engine.gpu_connector = SimpleNamespace(
+        direct_page_layout_supported=MagicMock(
+            side_effect=AssertionError("sender entered decoder preflight")
+        )
+    )
+
+    engine.preflight_group1_direct_hbm([object()])
+
+    engine.gpu_connector.direct_page_layout_supported.assert_not_called()
+
+
+def test_persistent_direct_group1_preflight_rolls_back_startup_resources() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    runtime = MagicMock()
+    reader = MagicMock()
+    engine.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_direct_hbm",
+        pd_role="receiver",
+    )
+    engine.metadata = SimpleNamespace(world_size=1)
+    engine._is_passive = lambda: True
+    engine.gpu_connector = SimpleNamespace(
+        direct_page_layout_supported=lambda *_args: False
+    )
+    engine._remote_fill_runtime = runtime
+    engine._group1_external_page_reader = reader
+    engine._remote_fill_decoder_initialized = True
+
+    with pytest.raises(RuntimeError, match="direct-HBM preflight failed"):
+        engine.preflight_group1_direct_hbm([object()])
+
+    runtime.close.assert_called_once_with()
+    reader.close.assert_called_once_with()
+    assert engine._remote_fill_runtime is None
+    assert engine._group1_external_page_reader is None
+    assert engine._remote_fill_decoder_initialized is False
+
+
+def test_persistent_direct_group1_rejects_incomplete_page_plan() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_direct_hbm"
+    )
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: [(0, 3, object())]
+    )
+    engine._ensure_layerwise_connector_layout = MagicMock()
+
+    with pytest.raises(RuntimeError, match="persistent page plan is incomplete"):
+        engine.load_group1_pages_direct(
+            [1, 2, 3, 4],
+            torch.arange(4),
+            [object()],
+            None,
+            "request",
+        )
+
+    engine._ensure_layerwise_connector_layout.assert_not_called()
+
+
 def test_cold_direct_indexer_failure_fences_before_cpu_fallback() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     calls = []

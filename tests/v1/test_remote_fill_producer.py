@@ -32,6 +32,7 @@ from lmcache.v1.remote_fill import (
     ResultCode,
     StatusRequest,
     TerminalOutcome,
+    TransactionState,
     WindowState,
     WindowStatus,
     destination_descriptor_digest,
@@ -111,7 +112,7 @@ def _handoff(**overrides: Any) -> RemoteFillHandoff:
     return RemoteFillHandoff(**values)
 
 
-def _static_spec() -> RemoteFillStaticSpec:
+def _static_spec(*, shared_group1: bool = True) -> RemoteFillStaticSpec:
     return RemoteFillStaticSpec(
         cache_namespace_tag="deployment-a",
         layout_tag="payload-v3",
@@ -121,7 +122,7 @@ def _static_spec() -> RemoteFillStaticSpec:
         group_dimensions=(576, 128),
         layer_count=79,
         save_only_first_rank=True,
-        shared_group1=True,
+        shared_group1=shared_group1,
         tp_size=8,
         dp_size=2,
         global_te_push=True,
@@ -163,7 +164,7 @@ class _ScriptedClient:
     def __init__(
         self,
         *,
-        reserve_dispositions: tuple[PageDisposition, PageDisposition],
+        reserve_dispositions: tuple[PageDisposition, ...],
         descriptor_dp_rank: int = 1,
         descriptor_tp_rank: int | None = None,
         fail_arm: bool = False,
@@ -173,6 +174,8 @@ class _ScriptedClient:
         report_status_native_state: DestinationNativeState | None = None,
         fail_finish_replies: int = 0,
         fatal_on: type | None = None,
+        finish_outcome: TerminalOutcome = TerminalOutcome.LOCAL_FULL,
+        finish_transaction_state: Any = None,
     ) -> None:
         self.reserve_dispositions = reserve_dispositions
         self.descriptor_dp_rank = descriptor_dp_rank
@@ -185,6 +188,8 @@ class _ScriptedClient:
         self.fail_finish_replies = fail_finish_replies
         self.finish_committed = False
         self.fatal_on = fatal_on
+        self.finish_outcome = finish_outcome
+        self.finish_transaction_state = finish_transaction_state
         self.requests: list[Any] = []
         self.closed = False
 
@@ -301,7 +306,8 @@ class _ScriptedClient:
                 return self._response(
                     request,
                     ResultCode.OK,
-                    terminal_outcome=TerminalOutcome.LOCAL_FULL,
+                    terminal_outcome=self.finish_outcome,
+                    transaction_state=self.finish_transaction_state,
                 )
             armed = self.arm_status_armed
             native_state = self.report_status_native_state or (
@@ -338,7 +344,8 @@ class _ScriptedClient:
             return self._response(
                 request,
                 ResultCode.OK,
-                terminal_outcome=TerminalOutcome.LOCAL_FULL,
+                terminal_outcome=self.finish_outcome,
+                transaction_state=self.finish_transaction_state,
             )
         if isinstance(request, AbortRequest):
             return self._response(request, ResultCode.TERMINAL)
@@ -353,11 +360,12 @@ def _session(
     *,
     native_hard_timeout_seconds: float = 120.0,
     negotiation_cache: RemoteFillNegotiationCache | None = None,
+    shared_group1: bool = True,
 ) -> RemoteFillProducerSession:
     return RemoteFillProducerSession(
         request_id="request-1",
         handoff=_handoff(),
-        static_spec=_static_spec(),
+        static_spec=_static_spec(shared_group1=shared_group1),
         client=client,
         secret=_SECRET,
         planned_window_count_hint=1,
@@ -580,6 +588,71 @@ def test_lost_finish_reply_recovers_committed_local_full_with_status() -> None:
         isinstance(item, StatusRequest) and item.window_id == -1
         for item in client.requests
     )
+
+
+@pytest.mark.parametrize("lost_finish_reply", (False, True))
+def test_group0_local_is_internal_direct_success_with_public_persistent_only(
+    lost_finish_reply: bool,
+) -> None:
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING,),
+        fail_finish_replies=2 if lost_finish_reply else 0,
+        finish_outcome=TerminalOutcome.PERSISTENT_ONLY,
+        finish_transaction_state=TransactionState.GROUP0_LOCAL,
+    )
+    session = _session(client, shared_group1=False)
+    control_pages = (_pages()[0],)
+
+    result = session.probe_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=control_pages,
+    )
+    terminal = session.finish(
+        required_store_end=1024,
+        persistent_common_end=1024,
+    )
+
+    assert result.direct_satisfied
+    assert terminal.outcome == "PERSISTENT_ONLY"
+    assert terminal.direct_satisfied is True
+    assert terminal.as_dict() == {
+        "transfer_id": "transfer-1",
+        "outcome": "PERSISTENT_ONLY",
+        "persistent_common_end": 1024,
+        "required_store_end": 1024,
+    }
+    assert "direct_satisfied" not in repr(terminal)
+    negotiate = next(
+        item for item in client.requests if isinstance(item, NegotiateRequest)
+    )
+    assert negotiate.shared_group1 is False
+    assert any(
+        isinstance(item, StatusRequest) and item.window_id == -1
+        for item in client.requests
+    ) is lost_finish_reply
+
+
+def test_ordinary_persistent_only_is_not_internal_direct_success() -> None:
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING,),
+        finish_outcome=TerminalOutcome.PERSISTENT_ONLY,
+        finish_transaction_state=TransactionState.PERSISTENT_ONLY,
+    )
+    session = _session(client, shared_group1=False)
+    assert session.probe_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=(_pages()[0],),
+    ).direct_satisfied
+
+    terminal = session.finish(
+        required_store_end=1024,
+        persistent_common_end=1024,
+    )
+
+    assert terminal.outcome == "PERSISTENT_ONLY"
+    assert terminal.direct_satisfied is False
 
 
 def test_probe_hole_latches_persistent_only_without_arm() -> None:
@@ -1265,24 +1338,23 @@ def test_global_producer_inflight_bytes_are_bounded_across_requests() -> None:
     )
 
 
-def test_oversized_batch_uses_one_bounded_window_lease(
+def test_multi_window_batch_charges_all_retained_group0_bytes(
     caplog,
 ) -> None:
     control_pages = tuple(
         ControlPage(
-            canonical_key=f"chunk-{chunk}-group-{group}",
-            kv_group=group,
+            canonical_key=f"chunk-{chunk}-group-0",
+            kv_group=0,
             chunk_index=chunk,
             chunk_start=chunk * 1024,
-            chunk_end=min((chunk + 1) * 1024, 2500),
-            valid_tokens=min(1024, 2500 - chunk * 1024),
+            chunk_end=(chunk + 1) * 1024,
+            valid_tokens=1024,
             destination_tp_rank=0,
-            expected_bytes=5,
+            expected_bytes=10,
             layer_count=79,
             layout_tag="payload-v3",
         )
-        for chunk in range(3)
-        for group in (0, 1)
+        for chunk in range(2)
     )
     owner = object()
     batch = _DirectPageBatch(
@@ -1295,27 +1367,29 @@ def test_oversized_batch_uses_one_bounded_window_lease(
             for page in control_pages
         ],
         ptrs=[[index] for index in range(len(control_pages))],
-        sizes=[[5] for _page in control_pages],
+        sizes=[[10] for _page in control_pages],
         owners=(owner,),
         ready_event=object(),
-        group_ends={0: 2500, 1: 2500},
+        group_ends={0: 2048},
         ranges=tuple(
             (page.chunk_start, page.chunk_end) for page in control_pages
         ),
         ready_events=(object(),),
     )
     executor_calls = []
+    executor_futures: list[Future] = []
 
     def submit(function: Any) -> Future:
         executor_calls.append(function)
         future: Future = Future()
-        future.set_result(function())
+        executor_futures.append(future)
         return future
 
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(
-        # The 30-byte logical batch exceeds this active-window bound, while
-        # each two-page control window is a valid 10-byte admission.
+        dsa_group1_load_mode="persistent_direct_hbm",
+        # Each retained window is 10 bytes, but their one producer job owns
+        # both source windows until terminal completion.
         remote_fill_max_inflight_bytes=15,
         remote_fill_max_bytes_per_request=100,
         remote_fill_max_inflight_windows_per_request=1,
@@ -1324,7 +1398,7 @@ def test_oversized_batch_uses_one_bounded_window_lease(
     engine._remote_fill_producer_executor = SimpleNamespace(submit=submit)
     engine._remote_fill_producer_metrics = RemoteFillProducerMetrics()
     engine._remote_fill_control_pages = lambda _batch: control_pages
-    engine._remote_fill_pages_per_window = lambda: 2
+    engine._remote_fill_pages_per_window = lambda: 1
     source_plan_calls = []
     engine._remote_fill_source_plan = lambda queued_batch: (
         source_plan_calls.append(queued_batch) or queued_batch
@@ -1346,27 +1420,43 @@ def test_oversized_batch_uses_one_bounded_window_lease(
     )
     state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
 
-    engine._schedule_remote_fill_batch(state, batch, 2500)
+    engine._schedule_remote_fill_batch(state, batch, 2048)
+
+    # The old largest-window lease admitted this job (10 <= 15) despite
+    # retaining 20 bytes. Full-batch charging rejects it before source plans.
+    assert len(executor_calls) == 0
+    assert len(source_plan_calls) == 0
+    assert state.remote_fill_disabled_reason == "producer_backpressure"
+
+    engine.config.remote_fill_max_inflight_bytes = 20
+    accepted = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    engine._schedule_remote_fill_batch(accepted, batch, 2048)
 
     assert len(executor_calls) == 1
-    assert state.remote_fill_futures[0].exception() is None
-    assert len(source_plan_calls) == 3
-    assert all(len(window.keys) == 2 for window in source_plan_calls)
+    assert accepted.remote_fill_queued_bytes == 20
+    assert (
+        engine.remote_fill_producer_metrics_snapshot()["gauges"]["inflight_bytes"]
+        == 20
+    )
+    executor_futures[0].set_result(executor_calls[0]())
+    assert accepted.remote_fill_futures[0].exception() is None
+    assert len(source_plan_calls) == 2
+    assert all(len(window.keys) == 1 for window in source_plan_calls)
     assert all(sum(map(sum, window.sizes)) == 10 for window in source_plan_calls)
-    assert source_plan_calls[-1].ranges == ((2048, 2500), (2048, 2500))
-    assert len(transfer_calls) == 3
-    assert all(len(call["control_pages"]) == 2 for call in transfer_calls)
-    assert state.remote_fill_next_window_id == 3
-    assert state.remote_fill_queued_windows == 0
-    assert state.remote_fill_queued_bytes == 0
+    assert source_plan_calls[-1].ranges == ((1024, 2048),)
+    assert len(transfer_calls) == 2
+    assert all(len(call["control_pages"]) == 1 for call in transfer_calls)
+    assert accepted.remote_fill_next_window_id == 2
+    assert accepted.remote_fill_queued_windows == 0
+    assert accepted.remote_fill_queued_bytes == 0
 
     # The aggregate request limit remains independent of active-window bytes.
-    engine.config.remote_fill_max_bytes_per_request = 20
+    engine.config.remote_fill_max_bytes_per_request = 19
     rejected = _DirectStoreRequestState(remote_fill_handoff=_handoff())
     with caplog.at_level(logging.WARNING):
-        engine._schedule_remote_fill_batch(rejected, batch, 2500)
+        engine._schedule_remote_fill_batch(rejected, batch, 2048)
     assert len(executor_calls) == 1
-    assert len(source_plan_calls) == 3
+    assert len(source_plan_calls) == 2
     assert rejected.remote_fill_disabled_reason == "producer_backpressure"
     assert '"code":"RF-P-004"' in caplog.text
     assert '"diagnostic_name":"producer_persistent_fallback"' in caplog.text

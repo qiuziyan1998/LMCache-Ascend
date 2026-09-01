@@ -287,6 +287,7 @@ class _FakeLocalBackend:
         self.allocations: list[dict[str, Any]] = []
         self.next_ptr = 0x100000
         self.commit_error: Exception | None = None
+        self.commit_modes: list[str] = []
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         assert pin is False
@@ -335,8 +336,7 @@ class _FakeLocalBackend:
         required_group1_keys: tuple[CacheEngineKey, ...],
         ready_reservations: dict[CacheEngineKey, _FakePage],
     ) -> SimpleNamespace:
-        if self.commit_error is not None:
-            raise self.commit_error
+        self.commit_modes.append("paired")
         required = tuple(
             key
             for pair in zip(
@@ -346,6 +346,23 @@ class _FakeLocalBackend:
             )
             for key in pair
         )
+        return self._commit(required, ready_reservations)
+
+    def commit_external_group0_prefix_if_absent(
+        self,
+        required_group0_keys: tuple[CacheEngineKey, ...],
+        ready_reservations: dict[CacheEngineKey, _FakePage],
+    ) -> SimpleNamespace:
+        self.commit_modes.append("group0")
+        return self._commit(required_group0_keys, ready_reservations)
+
+    def _commit(
+        self,
+        required: tuple[CacheEngineKey, ...],
+        ready_reservations: dict[CacheEngineKey, _FakePage],
+    ) -> SimpleNamespace:
+        if self.commit_error is not None:
+            raise self.commit_error
         missing = tuple(
             key
             for key in required
@@ -785,6 +802,7 @@ def _lifecycle(
     capacity_reclaimer: Callable[[int], bool] | None = None,
     chunk_hash_type: type[int] | type[bytes] = int,
     chunk_hash_bytes: int | None = None,
+    direct_groups: tuple[int, ...] = (0, 1),
 ) -> AscendRemoteFillPageLifecycle:
     def pin_pages(pages: list[_FakePage]) -> bool:
         for page in pages:
@@ -802,6 +820,7 @@ def _lifecycle(
         capacity_reclaimer=capacity_reclaimer,
         chunk_hash_type=chunk_hash_type,
         chunk_hash_bytes=chunk_hash_bytes,
+        direct_groups=direct_groups,
         pin_pages=pin_pages,
     )
 
@@ -888,6 +907,54 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     assert '"existing_keys":0' in caplog.text
     assert '"retention_trace_id":17' in caplog.text
     assert f'"required_key_digest":"{expected_digest}"' in caplog.text
+
+
+def test_group0_only_lifecycle_allocates_and_commits_no_group1_pages() -> None:
+    local = _FakeLocalBackend()
+    lifecycle = _lifecycle(local, direct_groups=(0,))
+    controls = tuple(
+        _control_page(chunk, 0, valid_tokens=4 if chunk == 0 else 2)
+        for chunk in range(2)
+    )
+
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+
+    assert lifecycle.direct_groups == (0,)
+    assert all(item.disposition is PageDisposition.ALLOCATED for item in prepared)
+    assert len(local.allocations) == 1
+    assert local.allocations[0]["fmt"] is MemoryFormat.KV_MLA_LATENT_FMT
+    assert local.allocations[0]["valid_tokens"] == (4, 2)
+    assert lifecycle.commit_pages(
+        "transfer",
+        controls,
+        _views(controls, prepared),
+        _finish(6, partial=2),
+    )
+    assert local.commit_modes == ["group0"]
+    assert set(local.hot) == {
+        _key(0, 0),
+        _key(1, 0, valid_tokens=2),
+    }
+    assert all(key.kv_group == 0 for key in local.hot)
+    for result in prepared:
+        assert result.handle.page.refs == 1
+        assert result.handle.page.pins == 0
+
+
+def test_group0_only_lifecycle_rejects_group1_before_allocation() -> None:
+    local = _FakeLocalBackend()
+    lifecycle = _lifecycle(local, direct_groups=(0,))
+
+    with pytest.raises(ValueError, match="group was not negotiated"):
+        lifecycle.prepare_pages(
+            "transfer",
+            0,
+            (_control_page(0, 0), _control_page(0, 1)),
+            True,
+        )
+
+    assert local.allocations == []
+    assert local.hot == {}
 
 
 def test_finish_reuses_required_manifest_keys(monkeypatch) -> None:
@@ -1146,7 +1213,7 @@ def test_capacity_reclaim_reclassifies_window_and_allocates_once() -> None:
     )
     prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
 
-    assert reclaimed_bytes == [sum(page.expected_bytes for page in controls)]
+    assert reclaimed_bytes == [controls[1].expected_bytes]
     assert all(item.disposition is PageDisposition.ALLOCATED for item in prepared)
     assert len(local.allocations) == 2
     assert all(call["eviction"] is False for call in local.allocations)
@@ -1567,6 +1634,7 @@ def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(
         lambda self, states: None,
     )
     engine._remote_fill_runtime = _SafeRuntime()
+    engine._group1_external_page_reader = None
     engine._remote_fill_fatal_transfers = ()
     engine._direct_store_states = {}
     engine._live_source_builders = {}
@@ -1585,13 +1653,18 @@ def test_prefiller_fatal_close_retains_native_owned_memory(
 ) -> None:
     engine = object.__new__(AscendLMCacheEngine)
     base_close = Mock()
+    runtime = Mock()
+    reader = Mock()
     monkeypatch.setattr(LMCacheEngine, "close", base_close)
-    engine._remote_fill_runtime = None
+    engine._remote_fill_runtime = runtime
+    engine._group1_external_page_reader = reader
     engine._remote_fill_fatal_transfers = ("producer-transfer",)
 
     with pytest.raises(RuntimeError, match="paired P\+D restart"):
         engine.close()
 
+    runtime.close.assert_not_called()
+    reader.close.assert_not_called()
     base_close.assert_not_called()
 
 
@@ -1704,11 +1777,13 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
         shared_cpu_cache_strict=False,
         chunk_hash_type=int,
         chunk_hash_bytes=None,
+        shared_group1=False,
         descriptor_verification_capability=b"x" * 32,
         server_factory=lambda service: server,
     )
 
     placement = runtime.placement.to_dict()
+    assert runtime.lifecycle.direct_groups == (0,)
     assert placement["destination_engine_id"] == "decoder"
     assert placement["destination_engine_epoch"] == 7
     assert placement["destination_tp_size"] == 1
@@ -1718,6 +1793,7 @@ def test_single_rank_runtime_advertises_pointer_free_identity(
     assert placement["token_hash_algorithm"] == "builtin"
     assert placement["python_hash_seed"] == "0"
     assert placement["descriptor_verification_capability"] == (b"x" * 32).hex()
+    assert placement["destination_remote_session"] == "decoder:1234"
     assert "descriptor_verification_capability" not in repr(runtime.placement)
     assert all("ptr" not in key and "secret" not in key for key in placement)
     runtime.close()

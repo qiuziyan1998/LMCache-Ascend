@@ -78,6 +78,7 @@ from lmcache.v1.shared_cpu_cache import (
     SharedHandleEnvelope,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
+from lmcache.v1.storage_backend.remote_backend import RemoteExternalPageReader
 from lmcache.v1.token_database import (
     DSA_INDEX_CACHE_SCHEMA,
     DSA_INDEX_CACHE_SCHEMA_TAG,
@@ -509,6 +510,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._live_source_builders: dict[str, dict[str, Any]] = {}
         self._completed_live_sources: dict[str, dict[str, Any]] = {}
         self._remote_fill_runtime: Optional[DecoderRemoteFillRuntime] = None
+        self._group1_external_page_reader: Optional[
+            RemoteExternalPageReader
+        ] = None
         self._remote_fill_decoder_initialized = False
         self._remote_fill_fatal_transfers: tuple[str, ...] = ()
         self._remote_fill_fatal_lock = threading.Lock()
@@ -557,6 +561,15 @@ class AscendLMCacheEngine(LMCacheEngine):
     def post_init(self, **kwargs) -> None:
         super().post_init(**kwargs)
         try:
+            if (
+                self._group1_direct_hbm_enabled()
+                and self.config.pd_role != "sender"
+                and self._is_passive()
+            ):
+                self._group1_external_page_reader = RemoteExternalPageReader(
+                    self.config,
+                    self.metadata,
+                )
             self._initialize_decoder_remote_fill()
         except Exception as error:
             log_remote_fill_diagnostic(
@@ -572,6 +585,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 error=error,
                 severity="critical",
             )
+            try:
+                self._rollback_group1_direct_hbm_startup()
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    "Group-1 direct-HBM startup and rollback both failed"
+                ) from rollback_error
             raise
         if self.is_store_async and not self._direct_store_enabled:
             self._device_id = torch.npu.current_device()
@@ -610,6 +629,178 @@ class AscendLMCacheEngine(LMCacheEngine):
     def direct_prefill_store_enabled(self) -> bool:
         """Return whether this worker can use direct NPU page publication."""
         return self._direct_store_enabled
+
+    def _group1_direct_hbm_enabled(self) -> bool:
+        return (
+            getattr(self.config, "dsa_group1_load_mode", "p2p_preferred")
+            == "persistent_direct_hbm"
+        )
+
+    def _remote_fill_direct_groups(self) -> tuple[int, ...]:
+        return (0,) if self._group1_direct_hbm_enabled() else (0, 1)
+
+    def _rollback_group1_direct_hbm_startup(self) -> None:
+        """Close every resource acquired by direct-HBM decoder startup."""
+        errors: list[BaseException] = []
+        for name in ("_remote_fill_runtime", "_group1_external_page_reader"):
+            resource = getattr(self, name, None)
+            if resource is None:
+                continue
+            try:
+                resource.close()
+            except BaseException as error:
+                errors.append(error)
+            else:
+                setattr(self, name, None)
+        self._remote_fill_decoder_initialized = False
+        if errors:
+            raise RuntimeError(
+                "Group-1 direct-HBM startup rollback failed"
+            ) from errors[0]
+
+    def preflight_group1_direct_hbm(self, kvcaches: list) -> None:
+        """Reject unsupported direct-HBM layouts uniformly across TP ranks."""
+        if (
+            not self._group1_direct_hbm_enabled()
+            or self.config.pd_role == "sender"
+        ):
+            return
+        local_error: Optional[BaseException] = None
+        try:
+            check = getattr(
+                self.gpu_connector,
+                "direct_page_layout_supported",
+                None,
+            )
+            if not callable(check) or not check(kvcaches, 1):
+                raise RuntimeError("Group-1 direct-HBM layout is unsupported")
+            loader = (
+                self._group1_external_page_reader
+                if self._is_passive()
+                else self.storage_manager
+            )
+            load_pages = getattr(
+                loader,
+                "get_pages"
+                if self._is_passive()
+                else "batched_get_external_pages",
+                None,
+            )
+            if not callable(load_pages):
+                raise RuntimeError("Group-1 external page reader is unavailable")
+        except BaseException as error:
+            local_error = error
+        ready = local_error is None
+        if self.metadata.world_size > 1:
+            try:
+                collective = getattr(self, "collective_all_true_fn", None)
+                if not callable(collective):
+                    raise RuntimeError(
+                        "Group-1 direct-HBM startup lacks TP consensus"
+                    )
+                ready = bool(collective(ready))
+            except BaseException as error:
+                local_error = local_error or error
+                ready = False
+        if not ready:
+            detail = (
+                f": {type(local_error).__name__}: {local_error}"
+                if local_error is not None
+                else " on another TP rank"
+            )
+            failure = RuntimeError("Group-1 direct-HBM preflight failed" + detail)
+            try:
+                self._rollback_group1_direct_hbm_startup()
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    f"{failure}; startup rollback also failed"
+                ) from rollback_error
+            raise failure
+
+    def load_group1_pages_direct(
+        self,
+        tokens: list[int],
+        slot_mapping: torch.Tensor,
+        kvcaches: list,
+        request_configs: Optional[dict],
+        req_id: str,
+    ) -> None:
+        """Load exact persistent Group-1 pages into final vLLM HBM blocks."""
+        if not self._group1_direct_hbm_enabled():
+            raise RuntimeError("Group-1 direct-HBM mode is disabled")
+        plans = list(
+            self.token_database.process_tokens(
+                tokens=tokens,
+                request_configs=request_configs,
+                kv_group=1,
+            )
+        )
+        if not plans or plans[-1][1] != len(tokens):
+            raise RuntimeError("Group-1 persistent page plan is incomplete")
+        self._ensure_layerwise_connector_layout(
+            kvcaches=kvcaches,
+            kv_group=1,
+        )
+        planner = getattr(
+            self.gpu_connector,
+            "plan_direct_page_destinations",
+            None,
+        )
+        if not callable(planner):
+            raise RuntimeError("Group-1 direct-HBM planner is unavailable")
+        starts = [start for start, _, _ in plans]
+        ends = [end for _, end, _ in plans]
+        keys = [key for _, _, key in plans]
+        planned = planner(kvcaches, slot_mapping, starts, ends, 1)
+        if planned is None:
+            rejection = getattr(
+                self.gpu_connector,
+                "direct_page_plan_rejection",
+                None,
+            )
+            reason = rejection(1) if callable(rejection) else None
+            raise RuntimeError(
+                "Group-1 direct-HBM destination plan failed: "
+                f"{reason or 'unsupported_layout'}"
+            )
+        ptrs, sizes, owners = planned
+        if len(ptrs) != len(keys) or len(sizes) != len(keys):
+            raise RuntimeError("Group-1 direct-HBM page count is invalid")
+        loader = (
+            self._group1_external_page_reader
+            if self._is_passive()
+            else self.storage_manager
+        )
+        load_pages = getattr(
+            loader,
+            "get_pages"
+            if self._is_passive()
+            else "batched_get_external_pages",
+            None,
+        )
+        if not callable(load_pages):
+            raise RuntimeError("Group-1 external page reader is unavailable")
+        started = cold_start_perf_now()
+        try:
+            # This strict API returns only after native DMA reaches a known
+            # terminal status; an unrelated Ascend stream event adds no fence.
+            load_pages(keys, ptrs, sizes, owners, req_id)
+        except NativeExternalPageTransferUnknownError as error:
+            self._remote_fill_require_paired_restart((req_id,))
+            raise RemoteFillFatalError(
+                "decoder Group-1 external-page DMA state is unknown"
+            ) from error
+        cold_start_perf_log(
+            logger,
+            "group1_direct_hbm_complete",
+            started=started,
+            req_id=req_id,
+            tokens=len(tokens),
+            pages=len(keys),
+            buffers=sum(map(len, ptrs)),
+            bytes=sum(map(sum, sizes)),
+            rank=self.metadata.worker_id,
+        )
 
     def direct_prefill_plan_supported(
         self,
@@ -1113,7 +1304,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             group_dimensions=layout.group_dimensions,
             layer_count=layout.num_layers,
             save_only_first_rank=True,
-            shared_group1=True,
+            shared_group1=not self._group1_direct_hbm_enabled(),
             tp_size=int(self.metadata.world_size),
             dp_size=handoff.destination_dp_size,
             global_te_push=handoff.global_te_push,
@@ -1211,6 +1402,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         ):
             raise ValueError("remote-fill source page metadata is incomplete")
         layout_tag, layout = self._remote_fill_immutable_layout()
+        direct_groups = set(self._remote_fill_direct_groups())
         pages = [
             ControlPage(
                 canonical_key=key.to_string(),
@@ -1227,6 +1419,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             for key, page_sizes, (start, end) in zip(
                 batch.keys, batch.sizes, batch.ranges, strict=True
             )
+            if int(key.kv_group) in direct_groups
         ]
         pages.sort(key=lambda page: (page.chunk_index, page.kv_group))
         for page in pages:
@@ -1239,18 +1432,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         return tuple(pages)
 
     def _remote_fill_pages_per_window(self) -> int:
-        """Return the bounded two-group control-page capacity of one window."""
+        """Return the bounded direct-group page capacity of one window."""
 
+        group_count = len(self._remote_fill_direct_groups())
         by_tokens = (
             int(self.config.remote_fill_window_tokens)
             // int(self.config.chunk_size)
-            * 2
+            * group_count
         )
         maximum = min(
             int(self.config.remote_fill_max_control_pages_per_window),
             by_tokens,
         )
-        return maximum - maximum % 2
+        return maximum - maximum % group_count
 
     @staticmethod
     def _remote_fill_select_batch_pages(
@@ -1296,8 +1490,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             ready_events=batch.ready_events,
         )
 
-    @staticmethod
     def _remote_fill_validate_page_pairs(
+        self,
         pages: tuple[ControlPage, ...],
     ) -> None:
         by_chunk: dict[int, set[int]] = {}
@@ -1306,8 +1500,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             if page.kv_group in groups:
                 raise ValueError("remote-fill page identity is duplicated")
             groups.add(page.kv_group)
-        if not by_chunk or any(groups != {0, 1} for groups in by_chunk.values()):
-            raise ValueError("remote fill requires an exact two-group page pair")
+        expected = set(self._remote_fill_direct_groups())
+        if not by_chunk or any(groups != expected for groups in by_chunk.values()):
+            raise ValueError("remote fill requires exact direct-group pages")
 
     def _remote_fill_probe_control_pages(
         self,
@@ -1319,7 +1514,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         _, layout = self._remote_fill_immutable_layout()
         pages: list[ControlPage] = []
-        for group in (0, 1):
+        for group in self._remote_fill_direct_groups():
             for start, end, key in plans.get(group, ()):
                 if end <= probe_start or end > probe_end:
                     continue
@@ -1362,6 +1557,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kv_group=0,
             )
         )
+        direct_groups = self._remote_fill_direct_groups()
+        if 1 not in direct_groups:
+            return {0: latent}
         hashes = [key.chunk_hash for _, _, key in latent]
         offsets = [end - start for start, end, _ in latent]
         indexer = list(
@@ -1577,16 +1775,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             control_pages[offset : offset + maximum]
             for offset in range(0, len(control_pages), maximum)
         )
+        # Every window plan retains the batch-wide owners/events, so its one
+        # producer job must be charged for the complete retained source set.
         byte_count = sum(sum(page_sizes) for page_sizes in batch.sizes)
-        lease_bytes = max(
-            sum(page.expected_bytes for page in pages) for pages in control_windows
-        )
         request_oversized = byte_count > int(
             self.config.remote_fill_max_bytes_per_request
         )
         queued_at = time.perf_counter()
         if request_oversized or not self._remote_fill_acquire_queue_capacity(
-            state, lease_bytes
+            state, byte_count
         ):
             state.remote_fill_disabled_reason = "producer_backpressure"
             self._log_remote_fill_prearm_failure(
@@ -1602,7 +1799,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "remote_fill_batch_skipped",
                 req_id=batch.req_id,
                 reason="producer_backpressure",
-                bytes=byte_count if request_oversized else lease_bytes,
+                bytes=byte_count,
             )
             return
         self._get_remote_fill_producer_metrics().observe(
@@ -1618,7 +1815,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for pages in control_windows
             )
         except Exception as error:
-            self._remote_fill_release_queue_capacity(state, lease_bytes)
+            self._remote_fill_release_queue_capacity(state, byte_count)
             state.remote_fill_disabled_reason = type(error).__name__
             self._log_remote_fill_prearm_failure(
                 state,
@@ -1644,7 +1841,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     thread_name_prefix="lmcache-remote-fill-producer",
                 )
             except Exception as error:
-                self._remote_fill_release_queue_capacity(state, lease_bytes)
+                self._remote_fill_release_queue_capacity(state, byte_count)
                 state.remote_fill_disabled_reason = type(error).__name__
                 self._log_remote_fill_prearm_failure(
                     state,
@@ -1786,12 +1983,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 metrics.abandon("prearm failure")
                 return None
             finally:
-                self._remote_fill_release_queue_capacity(state, lease_bytes)
+                self._remote_fill_release_queue_capacity(state, byte_count)
 
         try:
             future = executor.submit(run)
         except Exception as error:
-            self._remote_fill_release_queue_capacity(state, lease_bytes)
+            self._remote_fill_release_queue_capacity(state, byte_count)
             state.remote_fill_disabled_reason = type(error).__name__
             self._log_remote_fill_prearm_failure(
                 state,
@@ -1882,7 +2079,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if state.remote_fill_active_counted:
             metrics.add_gauge("active_transactions", -1)
             state.remote_fill_active_counted = False
-        if terminal.outcome == "LOCAL_FULL":
+        if terminal.direct_satisfied:
             metrics.add_bytes(
                 "published_bytes", state.remote_fill_submitted_bytes
             )
@@ -1890,7 +2087,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             metrics.add_bytes(
                 "discarded_bytes", state.remote_fill_submitted_bytes
             )
-        if terminal.outcome == "LOCAL_FULL":
+        if terminal.direct_satisfied:
             self._remote_fill_record_success()
         elif terminal.outcome == "PERSISTENT_ONLY":
             log_remote_fill_diagnostic(
@@ -1910,6 +2107,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             req_id=req_id,
             transfer_id=state.remote_fill_handoff.transfer_id,
             outcome=terminal.outcome,
+            direct_satisfied=terminal.direct_satisfied,
             persistent_common_end=persistent_common_end,
             required_store_end=required_store_end,
             finish_control_ms=round(finish_control_seconds * 1000, 3),
@@ -3036,7 +3234,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "mooncake_direct_max_buffers_per_page", 4096
             )
         )
+        direct_groups = set(self._remote_fill_direct_groups())
         for group, kvcaches in group_caches.items():
+            remote_group = remote_fill and group in direct_groups
             key = latent_key
             if group:
                 key = next(
@@ -3055,9 +3255,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 state.submitted_end[group] = end
                 if not state.futures:
                     state.committed_end[group] = end
-                if not remote_fill:
+                if not remote_group:
                     continue
-            if remote_fill and start < slot_mapping_base:
+            if remote_group and start < slot_mapping_base:
                 if persistent_missing:
                     state.remote_fill_disabled_reason = (
                         "unaddressable_partial_source"
@@ -3079,7 +3279,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 slot_mapping_base=slot_mapping_base,
             )
             if planned is None:
-                if remote_fill:
+                if remote_group:
                     state.remote_fill_disabled_reason = "tail_planner_fallback"
                     remote_fill = False
                 if persistent_missing:
@@ -3097,7 +3297,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if persistent_missing:
                     return False
                 continue
-            if remote_fill:
+            if remote_group:
                 remote_keys.append(key)
                 remote_ptrs.extend(group_ptrs)
                 remote_sizes.extend(group_sizes)
@@ -3125,7 +3325,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 start,
                 end,
             )
-            if len(probe_pages) == 2:
+            if len(probe_pages) == len(direct_groups):
                 self._schedule_remote_fill_probe_pages(
                     req_id,
                     state,
@@ -3160,7 +3360,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             ),
         )
         if (
-            1 in (remote_group_ends if remote_fill else group_ends)
+            1 in group_ends
             and npu_content_diagnostics_enabled()
         ):
             log_npu_content_diagnostic_event(
@@ -3171,18 +3371,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 source_ready_token_end=state.source_ready_token_end,
                 format="partial_page",
             )
-        shared_sink_owners = (
-            tuple(remote_owners.values())
-            if remote_fill and remote_keys
-            else tuple(owners.values())
-        )
         if keys:
             batch = _DirectPageBatch(
                 req_id,
                 keys,
                 ptrs,
                 sizes,
-                shared_sink_owners,
+                tuple(owners.values()),
                 ready_event,
                 group_ends,
                 tuple((start, end) for _ in keys),
@@ -3204,13 +3399,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ),
             )
         if remote_fill and remote_keys:
-            if {int(key.kv_group) for key in remote_keys} == {0, 1}:
+            if {int(key.kv_group) for key in remote_keys} == direct_groups:
                 remote_batch = _DirectPageBatch(
                     req_id,
                     remote_keys,
                     remote_ptrs,
                     remote_sizes,
-                    shared_sink_owners,
+                    tuple(remote_owners.values()),
                     ready_event,
                     remote_group_ends,
                     tuple((start, end) for _ in remote_keys),
@@ -3433,6 +3628,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         plans = self._direct_suffix_plans(
             state, tokens, group_caches, request_configs
         )
+        direct_groups = set(self._remote_fill_direct_groups())
         if remote_fill:
             probe_target = verified_prefix_end // int(self.config.chunk_size) * int(
                 self.config.chunk_size
@@ -3446,7 +3642,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 expected_pages = (
                     (probe_target - state.remote_fill_probe_end)
                     // int(self.config.chunk_size)
-                    * 2
+                    * len(direct_groups)
                 )
                 if len(probe_pages) != expected_pages:
                     prefix_plans = self._remote_fill_prefix_plans(
@@ -3583,6 +3779,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
 
         for group, kvcaches in group_caches.items():
+            collect_remote_group = (
+                collect_remote_sources and group in direct_groups
+            )
             submitted = state.committed_end.get(group, 0)
             persistent_full = candidates[group]
             persistent_full = [
@@ -3592,11 +3791,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             ]
             full = (
                 authoritative_candidates[group]
-                if collect_remote_sources
+                if collect_remote_group
                 else persistent_full
             )
             if full:
-                if collect_remote_sources and any(
+                if collect_remote_group and any(
                     start < slot_mapping_base for start, _, _ in full
                 ):
                     state.remote_fill_disabled_reason = "unaddressable_source"
@@ -3636,7 +3835,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ):
                         fallback_reason = "buffer_limit_exceeded"
                 if fallback_reason is not None:
-                    if collect_remote_sources:
+                    if collect_remote_group:
                         state.remote_fill_disabled_reason = fallback_reason
                         remote_fill = False
                         defer_remote_fill_sources = False
@@ -3701,7 +3900,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     full, group_ptrs, group_sizes, strict=True
                 ):
                     start, end, key = item
-                    if collect_remote_sources:
+                    if collect_remote_group:
                         remote_keys.append(key)
                         remote_ptrs.append(page_ptrs)
                         remote_sizes.append(page_sizes)
@@ -3727,7 +3926,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     # Existing pages between missing pages are part of the same
                     # contiguous committed prefix once this batch succeeds.
                     group_ends[group] = candidate_ends[group]
-                if collect_remote_sources:
+                if collect_remote_group:
                     remote_owners.update(
                         (id(owner), owner) for owner in group_owners
                     )
@@ -3767,7 +3966,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ),
             )
             if (
-                1 in (remote_group_ends if remote_fill else group_ends)
+                1 in group_ends
                 and npu_content_diagnostics_enabled()
             ):
                 log_npu_content_diagnostic_event(
@@ -3781,11 +3980,6 @@ class AscendLMCacheEngine(LMCacheEngine):
         elif defer_remote_fill_sources and remote_keys:
             ready_event = state.source_ready_event
             ready_event_source = state.source_ready_event_source
-        shared_sink_owners = (
-            tuple(remote_owners.values())
-            if collect_remote_sources and remote_keys
-            else tuple(owners.values())
-        )
         if keys:
             # The persistent put synchronizes the producer events carried by
             # the batch before its unfenced DMA reads the registered NPU
@@ -3800,7 +3994,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 keys,
                 ptrs,
                 sizes,
-                shared_sink_owners,
+                tuple(owners.values()),
                 ready_event,
                 group_ends,
                 tuple(ranges),
@@ -3865,7 +4059,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 return True
         if collect_remote_sources and remote_keys:
-            if {int(key.kv_group) for key in remote_keys} != {0, 1}:
+            if {int(key.kv_group) for key in remote_keys} != direct_groups:
                 state.remote_fill_disabled_reason = "incomplete_page_pair"
             else:
                 remote_batch = _DirectPageBatch(
@@ -3873,7 +4067,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     remote_keys,
                     remote_ptrs,
                     remote_sizes,
-                    shared_sink_owners,
+                    tuple(remote_owners.values()),
                     ready_event,
                     remote_group_ends,
                     tuple(remote_ranges),
@@ -9878,7 +10072,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             num_layers=int(self.num_layers),
         )
         self._validate_remote_fill_decoder_layout(layout)
-        if tp_shared:
+        shared_group1 = not self._group1_direct_hbm_enabled()
+        if tp_shared and shared_group1:
             self._preflight_remote_fill_shared_group1(
                 layout,
                 payload_descriptor,
@@ -9920,7 +10115,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise ValueError(
                 "remote-fill decoder requires constant-time LocalCPU capacity"
             )
-        if not self._remote_fill_shared_group1_supported:
+        if shared_group1 and not self._remote_fill_shared_group1_supported:
             raise ValueError("remote-fill Group-1 shared capability is unavailable")
         epoch = secrets.randbits(63) or 1
         runtime = create_decoder_remote_fill_runtime(
@@ -9945,6 +10140,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             shared_cpu_cache_strict=self.shared_cpu_cache_strict,
             chunk_hash_type=self.token_database.chunk_hash_type,
             chunk_hash_bytes=self.token_database.chunk_hash_bytes,
+            shared_group1=shared_group1,
         )
         try:
             runtime.start()
@@ -10067,18 +10263,25 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
-        runtime = self._remote_fill_runtime
-        if runtime is not None:
-            runtime.close()
+        fatal_message = (
+            "remote-fill shutdown requires paired P+D restart; "
+            "native-owned memory was deliberately retained"
+        )
         if self._remote_fill_fatal_transfers:
             # An unknown native writer may still target registered P or D
             # storage. Deliberately retain runtime and allocator ownership
             # until the supervisor terminates the paired deployment.
-            raise RuntimeError(
-                "remote-fill shutdown requires paired P+D restart; "
-                "native-owned memory was deliberately retained"
-            )
+            raise RuntimeError(fatal_message)
+        runtime = self._remote_fill_runtime
+        if runtime is not None:
+            runtime.close()
+        if self._remote_fill_fatal_transfers:
+            # Runtime shutdown can itself discover a still-armed transfer.
+            raise RuntimeError(fatal_message)
         self._remote_fill_runtime = None
+        if self._group1_external_page_reader is not None:
+            self._group1_external_page_reader.close()
+            self._group1_external_page_reader = None
         self.close_remote_fill_producer()
         self.wait_for_direct_stores(tuple(self._direct_store_states))
         self._direct_store_states.clear()

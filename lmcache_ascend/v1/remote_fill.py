@@ -186,6 +186,13 @@ class RemoteFillLocalBackend(Protocol):
     ) -> Any:
         """Atomically publish exact complete two-group coverage."""
 
+    def commit_external_group0_prefix_if_absent(
+        self,
+        required_group0_keys: Sequence[CacheEngineKey],
+        ready_reservations: Mapping[CacheEngineKey, LayerPageMemoryObj],
+    ) -> Any:
+        """Atomically publish exact complete Group-0 coverage."""
+
 
 class RemoteFillServer(Protocol):
     """Server loop boundary used by the decoder service host."""
@@ -268,6 +275,7 @@ class RemoteFillPlacementInfo:
     global_te_push: bool
     token_hash_algorithm: str
     python_hash_seed: str
+    destination_remote_session: str
     descriptor_verification_capability: str = field(repr=False)
 
     def to_dict(self) -> dict[str, int | str | bool]:
@@ -290,6 +298,7 @@ class RemoteFillPlacementInfo:
             "global_te_push": self.global_te_push,
             "token_hash_algorithm": self.token_hash_algorithm,
             "python_hash_seed": self.python_hash_seed,
+            "destination_remote_session": self.destination_remote_session,
             "descriptor_verification_capability": (
                 self.descriptor_verification_capability
             ),
@@ -429,6 +438,7 @@ def build_remote_fill_negotiation_spec(
     destination_remote_session: str,
     chunk_hash_type: type[int] | type[bytes],
     chunk_hash_bytes: int | None,
+    shared_group1: bool = True,
 ) -> NegotiationSpec:
     """Build the byte-identical source/destination negotiation identity.
 
@@ -443,6 +453,7 @@ def build_remote_fill_negotiation_spec(
         destination_remote_session: Decoder GlobalTE session identifier.
         chunk_hash_type: Actual output type of the decoder hash function.
         chunk_hash_bytes: Fixed digest width for byte hashes.
+        shared_group1: Whether direct fill also publishes Group 1 locally.
 
     Returns:
         The public core protocol negotiation descriptor.
@@ -477,7 +488,7 @@ def build_remote_fill_negotiation_spec(
         group_dimensions=layout.group_dimensions,
         layer_count=layout.num_layers,
         save_only_first_rank=True,
-        shared_group1=True,
+        shared_group1=shared_group1,
         tp_size=int(metadata.world_size),
         dp_size=dp_size,
         global_te_push=global_te_push,
@@ -490,7 +501,7 @@ def build_remote_fill_negotiation_spec(
 
 
 class AscendRemoteFillPageLifecycle:
-    """Allocate hidden TP0 pages and atomically publish exact coverage."""
+    """Allocate hidden TP0 pages and atomically publish negotiated coverage."""
 
     def __init__(
         self,
@@ -500,6 +511,7 @@ class AscendRemoteFillPageLifecycle:
         capacity_available: Callable[[int], bool],
         chunk_hash_type: type[int] | type[bytes],
         chunk_hash_bytes: int | None,
+        direct_groups: tuple[int, ...] = (0, 1),
         capacity_reclaimer: Callable[[int], bool] | None = None,
         pin_pages: Callable[[Sequence[LayerPageMemoryObj]], bool] = (
             LayerPageMemoryObj.pin_many
@@ -516,6 +528,7 @@ class AscendRemoteFillPageLifecycle:
                 the producer.
             chunk_hash_bytes: Fixed digest width when ``chunk_hash_type`` is
                 ``bytes``; otherwise ``None``.
+            direct_groups: Exact negotiated LocalCPU destination groups.
             pin_pages: Atomic pin primitive, injectable for tests.
 
         Raises:
@@ -532,13 +545,25 @@ class AscendRemoteFillPageLifecycle:
                 )
         elif chunk_hash_bytes is not None:
             raise ValueError("integer chunk hashes must not declare a digest width")
+        direct_groups = tuple(direct_groups)
+        if direct_groups not in ((0,), (0, 1)):
+            raise ValueError(
+                "remote-fill direct groups must be exactly (0,) or (0, 1)"
+            )
         self._local = local_backend
         self._layout = layout
+        self._direct_groups = direct_groups
         self._capacity_available = capacity_available
         self._capacity_reclaimer = capacity_reclaimer
         self._chunk_hash_type = chunk_hash_type
         self._chunk_hash_bytes = chunk_hash_bytes
         self._pin_pages = pin_pages
+
+    @property
+    def direct_groups(self) -> tuple[int, ...]:
+        """Return the immutable group set fixed by negotiation."""
+
+        return self._direct_groups
 
     def prepare_pages(
         self,
@@ -555,7 +580,7 @@ class AscendRemoteFillPageLifecycle:
         Args:
             transfer_id: Request-attempt transfer identity.
             window_id: Bounded manifest window identity.
-            pages: Complete two-group control pages in logical order.
+            pages: Complete negotiated-group control pages in logical order.
             reserve_missing: Whether absent pages may be allocated.
 
         Returns:
@@ -570,7 +595,7 @@ class AscendRemoteFillPageLifecycle:
         selectors = tuple((page.kv_group, page.chunk_index) for page in pages)
         if len(set(keys)) != len(keys) or len(set(selectors)) != len(selectors):
             raise ValueError("remote-fill page manifest contains duplicate pages")
-        self._validate_window_pairs(pages, keys)
+        self._validate_window_groups(pages, keys)
         results: list[PreparedPage | None] = [None] * len(pages)
 
         def finalize_results() -> tuple[PreparedPage, ...]:
@@ -624,9 +649,7 @@ class AscendRemoteFillPageLifecycle:
         if requested_bytes and not self._capacity_available(requested_bytes):
             if self._capacity_reclaimer is None:
                 return finalize_results()
-            reclaimed = self._capacity_reclaimer(
-                sum(page.expected_bytes for page in pages)
-            )
+            reclaimed = self._capacity_reclaimer(requested_bytes)
             missing_indices = classify_pages()
             requested_bytes = sum(
                 pages[index].expected_bytes for index in missing_indices
@@ -637,7 +660,7 @@ class AscendRemoteFillPageLifecycle:
         allocated: dict[int, LayerPageMemoryObj] = {}
         pinned = False
         try:
-            for kv_group in (0, 1):
+            for kv_group in self._direct_groups:
                 indices = [
                     index
                     for index in missing_indices
@@ -781,7 +804,7 @@ class AscendRemoteFillPageLifecycle:
         pages: tuple[ReservedPageView, ...],
         finish: FinishRequest,
     ) -> bool:
-        """Atomically publish a complete exact two-group prefix.
+        """Atomically publish a complete exact negotiated-group prefix.
 
         Args:
             transfer_id: Transaction identity used only for diagnostics.
@@ -791,8 +814,8 @@ class AscendRemoteFillPageLifecycle:
 
         Returns:
             ``True`` only when the LocalCPU atomic helper committed complete
-            two-group coverage. On success, all hidden reservation references
-            are released after cache ownership has been acquired.
+            negotiated coverage. On success, all hidden reservation
+            references are released after cache ownership has been acquired.
         """
 
         commit_started = monotonic()
@@ -810,7 +833,7 @@ class AscendRemoteFillPageLifecycle:
                 **payload,
             )
 
-        group0_keys, group1_keys = self._validate_required_prefix(
+        required_by_group = self._validate_required_prefix(
             required_pages,
             finish,
         )
@@ -823,10 +846,10 @@ class AscendRemoteFillPageLifecycle:
             if not isinstance(handle, _HiddenPage):
                 raise TypeError("remote-fill allocated page has an invalid handle")
             kv_group = view.control_page.kv_group
-            if kv_group not in (0, 1):
+            if kv_group not in self._direct_groups:
                 raise ValueError("remote-fill ready reservation group is invalid")
             chunk_index = view.control_page.chunk_index
-            group_keys = group0_keys if kv_group == 0 else group1_keys
+            group_keys = required_by_group[kv_group]
             if chunk_index < 0 or chunk_index >= len(group_keys):
                 raise ValueError("remote-fill ready reservation chunk is out of range")
             key = group_keys[chunk_index]
@@ -838,21 +861,27 @@ class AscendRemoteFillPageLifecycle:
             "remote_fill_finish",
             required_store_end=finish.required_store_end,
             persistent_common_end=finish.persistent_common_end,
-            required_pairs=len(group0_keys),
+            required_pairs=len(required_by_group[0]),
             ready_pages=len(ready),
         )
         try:
-            result = self._local.commit_external_two_group_prefix_if_absent(
-                group0_keys,
-                group1_keys,
-                ready,
-            )
+            if self._direct_groups == (0,):
+                result = self._local.commit_external_group0_prefix_if_absent(
+                    required_by_group[0],
+                    ready,
+                )
+            else:
+                result = self._local.commit_external_two_group_prefix_if_absent(
+                    required_by_group[0],
+                    required_by_group[1],
+                    ready,
+                )
         except LayerPageAdmissionRollbackError as error:
             log_commit(
                 committed=False,
                 error=True,
                 rollback_safe=False,
-                required_pairs=len(group0_keys),
+                required_pairs=len(required_by_group[0]),
                 ready_pages=len(ready),
             )
             raise UnsafePageLifecycleError(
@@ -863,7 +892,7 @@ class AscendRemoteFillPageLifecycle:
                 committed=False,
                 error=True,
                 rollback_safe=True,
-                required_pairs=len(group0_keys),
+                required_pairs=len(required_by_group[0]),
                 ready_pages=len(ready),
             )
             raise
@@ -871,7 +900,7 @@ class AscendRemoteFillPageLifecycle:
             log_commit(
                 committed=False,
                 error=False,
-                required_pairs=len(group0_keys),
+                required_pairs=len(required_by_group[0]),
                 ready_pages=len(ready),
                 lock_wait_ms=round(result.lock_wait_seconds * 1000, 3),
                 lock_hold_ms=round(result.lock_hold_seconds * 1000, 3),
@@ -885,7 +914,7 @@ class AscendRemoteFillPageLifecycle:
                 committed=True,
                 error=True,
                 rollback_safe=False,
-                required_pairs=len(group0_keys),
+                required_pairs=len(required_by_group[0]),
                 ready_pages=len(ready),
             )
             raise UnsafePageLifecycleError(
@@ -901,9 +930,12 @@ class AscendRemoteFillPageLifecycle:
         if cold_start_perf_enabled():
             try:
                 diagnostic_fields["required_key_digest"] = content_digest(
-                    (
-                        tuple(key.to_string() for key in group0_keys),
-                        tuple(key.to_string() for key in group1_keys),
+                    tuple(
+                        tuple(
+                            key.to_string()
+                            for key in required_by_group[group]
+                        )
+                        for group in self._direct_groups
                     )
                 )
             except Exception:
@@ -917,7 +949,7 @@ class AscendRemoteFillPageLifecycle:
         log_commit(
             committed=True,
             error=False,
-            required_pairs=len(group0_keys),
+            required_pairs=len(required_by_group[0]),
             ready_pages=len(ready),
             published_bytes=sum(page.get_size() for page in ready.values()),
             lock_wait_ms=round(result.lock_wait_seconds * 1000, 3),
@@ -927,6 +959,8 @@ class AscendRemoteFillPageLifecycle:
         return True
 
     def _validate_control_page(self, page: ControlPage) -> CacheEngineKey:
+        if page.kv_group not in self._direct_groups:
+            raise ValueError("remote-fill page group was not negotiated")
         key = CacheEngineKey.from_string(
             page.canonical_key,
             chunk_hash_type=self._chunk_hash_type,
@@ -992,17 +1026,17 @@ class AscendRemoteFillPageLifecycle:
         self,
         pages: tuple[ControlPage, ...],
         finish: FinishRequest,
-    ) -> tuple[tuple[CacheEngineKey, ...], tuple[CacheEngineKey, ...]]:
+    ) -> dict[int, tuple[CacheEngineKey, ...]]:
         if finish.required_store_end < 0:
             raise ValueError("remote-fill required store end must be nonnegative")
         if finish.required_store_end == 0:
             if pages or finish.final_partial_valid_tokens:
                 raise ValueError("remote-fill empty prefix metadata is inconsistent")
-            return (), ()
-        expected_pairs = (
+            return {group: () for group in self._direct_groups}
+        expected_chunks = (
             finish.required_store_end + self._layout.chunk_size - 1
         ) // self._layout.chunk_size
-        if len(pages) != expected_pairs * 2:
+        if len(pages) != expected_chunks * len(self._direct_groups):
             raise ValueError("remote-fill required page manifest is incomplete")
         by_selector: dict[tuple[int, int], tuple[ControlPage, CacheEngineKey]] = {}
         for page in pages:
@@ -1011,38 +1045,49 @@ class AscendRemoteFillPageLifecycle:
             if selector in by_selector:
                 raise ValueError("remote-fill required page manifest is duplicated")
             by_selector[selector] = (page, key)
-        group0: list[CacheEngineKey] = []
-        group1: list[CacheEngineKey] = []
-        for chunk_index in range(expected_pairs):
-            pair = [by_selector.get((chunk_index, kv_group)) for kv_group in (0, 1)]
-            if any(item is None for item in pair):
+        keys_by_group: dict[int, list[CacheEngineKey]] = {
+            group: [] for group in self._direct_groups
+        }
+        for chunk_index in range(expected_chunks):
+            group_items = [
+                by_selector.get((chunk_index, kv_group))
+                for kv_group in self._direct_groups
+            ]
+            if any(item is None for item in group_items):
                 raise ValueError("remote-fill required page manifest has a hole")
-            (page0, key0), (page1, key1) = pair  # type: ignore[misc]
+            complete_items = [
+                item for item in group_items if item is not None
+            ]
+            reference_page, reference_key = complete_items[0]
             expected_end = min(
                 finish.required_store_end,
                 (chunk_index + 1) * self._layout.chunk_size,
             )
             expected_valid = expected_end - chunk_index * self._layout.chunk_size
-            if (
-                page0.valid_tokens != expected_valid
-                or page1.valid_tokens != expected_valid
-                or page0.chunk_start != page1.chunk_start
-                or page0.chunk_end != page1.chunk_end
-                or key0.chunk_hash != key1.chunk_hash
-                or key0.model_name != key1.model_name
-                or key0.world_size != key1.world_size
-                or key0.worker_id != key1.worker_id
-                or self._shared_key_tags(key0) != self._shared_key_tags(key1)
-            ):
-                raise ValueError("remote-fill two-group page identity mismatch")
-            group0.append(key0)
-            group1.append(key1)
+            for page, key in complete_items:
+                if (
+                    page.valid_tokens != expected_valid
+                    or page.chunk_start != reference_page.chunk_start
+                    or page.chunk_end != reference_page.chunk_end
+                    or key.chunk_hash != reference_key.chunk_hash
+                    or key.model_name != reference_key.model_name
+                    or key.world_size != reference_key.world_size
+                    or key.worker_id != reference_key.worker_id
+                    or self._shared_key_tags(key)
+                    != self._shared_key_tags(reference_key)
+                ):
+                    raise ValueError(
+                        "remote-fill negotiated-group page identity mismatch"
+                    )
+                keys_by_group[page.kv_group].append(key)
         final_valid = finish.required_store_end % self._layout.chunk_size
         if finish.final_partial_valid_tokens != final_valid:
             raise ValueError("remote-fill final partial-page metadata mismatch")
-        return tuple(group0), tuple(group1)
+        return {
+            group: tuple(keys_by_group[group]) for group in self._direct_groups
+        }
 
-    def _validate_window_pairs(
+    def _validate_window_groups(
         self,
         pages: tuple[ControlPage, ...],
         keys: tuple[CacheEngineKey, ...],
@@ -1057,20 +1102,28 @@ class AscendRemoteFillPageLifecycle:
         if chunk_indices != list(range(chunk_indices[0], chunk_indices[-1] + 1)):
             raise ValueError("remote-fill page window must be contiguous")
         for chunk_index in chunk_indices:
-            group0 = by_selector.get((chunk_index, 0))
-            group1 = by_selector.get((chunk_index, 1))
-            if group0 is None or group1 is None:
-                raise ValueError("remote-fill page window requires both groups")
-            page0, key0 = group0
-            page1, key1 = group1
-            if (
-                page0.chunk_start != page1.chunk_start
-                or page0.chunk_end != page1.chunk_end
-                or page0.valid_tokens != page1.valid_tokens
-                or key0.chunk_hash != key1.chunk_hash
-                or self._shared_key_tags(key0) != self._shared_key_tags(key1)
-            ):
-                raise ValueError("remote-fill window group identities do not match")
+            group_items = [
+                by_selector.get((chunk_index, group))
+                for group in self._direct_groups
+            ]
+            if any(item is None for item in group_items):
+                raise ValueError(
+                    "remote-fill page window requires every negotiated group"
+                )
+            complete_items = [item for item in group_items if item is not None]
+            reference_page, reference_key = complete_items[0]
+            for page, key in complete_items[1:]:
+                if (
+                    reference_page.chunk_start != page.chunk_start
+                    or reference_page.chunk_end != page.chunk_end
+                    or reference_page.valid_tokens != page.valid_tokens
+                    or reference_key.chunk_hash != key.chunk_hash
+                    or self._shared_key_tags(reference_key)
+                    != self._shared_key_tags(key)
+                ):
+                    raise ValueError(
+                        "remote-fill window group identities do not match"
+                    )
 
     @staticmethod
     def _shared_key_tags(key: CacheEngineKey) -> tuple:
@@ -1322,6 +1375,7 @@ def create_decoder_remote_fill_runtime(
     shared_cpu_cache_strict: bool,
     chunk_hash_type: type[int] | type[bytes],
     chunk_hash_bytes: int | None,
+    shared_group1: bool = True,
     capacity_reclaimer: Callable[[int], bool] | None = None,
     descriptor_verification_capability: bytes | None = None,
     server_factory: Callable[[RemoteFillService], RemoteFillServer] | None = None,
@@ -1351,6 +1405,7 @@ def create_decoder_remote_fill_runtime(
         shared_cpu_cache_strict: Whether every passive view passed preflight.
         chunk_hash_type: Actual output type of the decoder token hash function.
         chunk_hash_bytes: Actual fixed digest width for byte hashes.
+        shared_group1: Whether RemoteFill also places Group 1 in LocalCPU.
         descriptor_verification_capability: Optional injected decoder-runtime
             descriptor verification key for tests. Production generates one.
         server_factory: Optional RPC server factory for tests.
@@ -1418,7 +1473,9 @@ def create_decoder_remote_fill_runtime(
         destination_remote_session=destination_remote_session,
         chunk_hash_type=chunk_hash_type,
         chunk_hash_bytes=chunk_hash_bytes,
+        shared_group1=shared_group1,
     )
+    direct_groups = (0, 1) if negotiation.shared_group1 else (0,)
     lifecycle = AscendRemoteFillPageLifecycle(
         local_backend=local_backend,
         layout=layout,
@@ -1426,6 +1483,7 @@ def create_decoder_remote_fill_runtime(
         capacity_reclaimer=capacity_reclaimer,
         chunk_hash_type=chunk_hash_type,
         chunk_hash_bytes=chunk_hash_bytes,
+        direct_groups=direct_groups,
     )
     verification_capability = _descriptor_verification_capability(
         descriptor_verification_capability
@@ -1480,6 +1538,7 @@ def create_decoder_remote_fill_runtime(
         global_te_push=global_te_push,
         token_hash_algorithm=negotiation.token_hash_algorithm,
         python_hash_seed=negotiation.python_hash_seed,
+        destination_remote_session=destination_remote_session,
         descriptor_verification_capability=verification_capability.hex(),
     )
     return DecoderRemoteFillRuntime(

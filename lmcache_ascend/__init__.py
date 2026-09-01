@@ -48,6 +48,15 @@ def _patch_config():
             config.dsa_two_groups = True
             config.save_unfull_chunk = True
             extra_config = dict(config.extra_config or {})
+            if (
+                getattr(config, "dsa_group1_load_mode", "")
+                == "persistent_direct_hbm"
+                and bool(extra_config.get("save_chunk_meta", False))
+            ):
+                raise ValueError(
+                    "dsa_group1_load_mode=persistent_direct_hbm requires "
+                    "extra_config.save_chunk_meta=false"
+                )
             extra_config.update(
                 {
                     "save_only_first_rank": True,

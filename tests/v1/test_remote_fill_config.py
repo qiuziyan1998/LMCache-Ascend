@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """RemoteFill must not expose fixed protocol invariants as YAML knobs."""
 
+# Third Party
+import pytest
+
 # First Party
 import lmcache_ascend  # noqa: F401
 from lmcache.v1.config import LMCacheEngineConfig
@@ -55,3 +58,31 @@ def test_disabled_feature_preserves_legacy_ascend_config() -> None:
     assert config.use_layerwise is False
     assert config.enable_shared_cpu_cache is False
     assert config.get_extra_config_value("use_ascend_direct") is None
+
+
+def test_direct_hbm_rejects_explicit_chunk_metadata_before_normalization() -> None:
+    config = LMCacheEngineConfig.from_defaults(
+        enable_remote_lmcache_store=True,
+        enable_dsa_cold_compact_load=True,
+        dsa_group1_load_mode="persistent_direct_hbm",
+        pd_role="sender",
+        remote_url="mooncakestore://metadata",
+        extra_config={"save_chunk_meta": True},
+    )
+
+    with pytest.raises(ValueError, match="save_chunk_meta=false"):
+        config.validate()
+
+
+def test_direct_hbm_sender_does_not_require_decoder_cold_slab() -> None:
+    config = LMCacheEngineConfig.from_defaults(
+        enable_remote_lmcache_store=True,
+        dsa_group1_load_mode="persistent_direct_hbm",
+        pd_role="sender",
+        remote_url="mooncakestore://metadata",
+    )
+
+    config.validate()
+
+    assert config.enable_dsa_cold_compact_load is False
+    assert config.enable_shared_cpu_cache is False

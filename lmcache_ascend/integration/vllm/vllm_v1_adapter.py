@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _MOONCAKE_PREFERRED_SEGMENT_CONFIG = "lmcache.mooncake_preferred_segment"
+_MOONCAKE_PREFERRED_KV_GROUP_CONFIG = "lmcache.mooncake_preferred_kv_group"
 _REMOTE_FILL_ROUTING_KEYS = (
     "do_remote_decode",
     "do_remote_prefill",
@@ -118,13 +119,25 @@ def _remote_fill_request_qualified(request: Any) -> bool:
 
 def _prepare_remote_fill_persistent_placement(
     request_configs: Any,
+    *,
+    group1_direct_hbm: bool = False,
 ) -> bool:
-    """Select the validated prefiller-local Mooncake default for persistence."""
+    """Select split-group Mooncake placement for qualified persistence."""
 
     if not _remote_fill_handoff_qualified(request_configs):
         return False
     assert isinstance(request_configs, dict)
-    request_configs.pop(_MOONCAKE_PREFERRED_SEGMENT_CONFIG, None)
+    if group1_direct_hbm:
+        segment = request_configs.get(_MOONCAKE_PREFERRED_SEGMENT_CONFIG)
+        if not isinstance(segment, str) or not segment.strip():
+            raise ValueError(
+                "Group-1 direct HBM requires a decoder-local Mooncake segment"
+            )
+        request_configs[_MOONCAKE_PREFERRED_SEGMENT_CONFIG] = segment.strip()
+        request_configs[_MOONCAKE_PREFERRED_KV_GROUP_CONFIG] = 1
+    else:
+        request_configs.pop(_MOONCAKE_PREFERRED_SEGMENT_CONFIG, None)
+        request_configs.pop(_MOONCAKE_PREFERRED_KV_GROUP_CONFIG, None)
     return True
 
 
@@ -569,8 +582,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self._remote_store_requested:
             for request in requests:
                 if _remote_fill_request_qualified(request):
-                    request.request_configs.pop(
-                        _MOONCAKE_PREFERRED_SEGMENT_CONFIG, None
+                    _prepare_remote_fill_persistent_placement(
+                        request.request_configs,
+                        group1_direct_hbm=(
+                            getattr(
+                                self.config,
+                                "dsa_group1_load_mode",
+                                "p2p_preferred",
+                            )
+                            == "persistent_direct_hbm"
+                        ),
                     )
         expected = set(self._latent_layer_names)
         if self.config.dsa_two_groups:
@@ -801,12 +822,18 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 and _remote_fill_request_qualified(request)
             )
             if remote_fill_request:
-                # Mandatory persistence is independent of decoder placement.
-                # Removing an old decoder hint makes Mooncake use the startup-
-                # validated prefiller-local default. Direct LocalCPU fill also
-                # supersedes the legacy live NPU source for this request.
-                request.request_configs.pop(
-                    _MOONCAKE_PREFERRED_SEGMENT_CONFIG, None
+                # Group 0 keeps the prefiller-local default. Direct-HBM Group 1
+                # is prepositioned in the selected decoder's Mooncake segment.
+                _prepare_remote_fill_persistent_placement(
+                    request.request_configs,
+                    group1_direct_hbm=(
+                        getattr(
+                            self.config,
+                            "dsa_group1_load_mode",
+                            "p2p_preferred",
+                        )
+                        == "persistent_direct_hbm"
+                    ),
                 )
                 live_source = False
                 self.lmcache_engine.discard_live_source_descriptor(request.req_id)
