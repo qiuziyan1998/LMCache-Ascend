@@ -12,6 +12,7 @@ import asyncio
 import time
 
 # Third Party
+from lmcache.logging import init_logger
 from lmcache.v1.remote_fill import (
     PROTOCOL_VERSION,
     AbortRequest,
@@ -38,6 +39,7 @@ from lmcache.v1.remote_fill import (
     content_digest,
     destination_descriptor_digest,
     manifest_digest,
+    log_remote_fill_diagnostic,
     transaction_manifest_digest,
     verify_descriptor,
 )
@@ -54,6 +56,46 @@ from lmcache.v1.remote_fill.native import (
 
 REMOTE_FILL_REQUEST_CONFIG_KEY = "lmcache.remote_fill"
 _DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES = 32
+logger = init_logger(__name__)
+
+
+def _log_remote_fill_open_failure(
+    session: "RemoteFillProducerSession",
+    stage: str,
+    *,
+    response: RemoteFillResponse | None = None,
+    error: BaseException | None = None,
+    reason: str = "",
+) -> None:
+    """Emit one bounded failure record without touching the success path."""
+
+    details = [reason] if reason else []
+    if response is not None:
+        details.extend(
+            (
+                f"response_code={response.code.value}",
+                f"response_message={response.message}",
+                "transaction_state="
+                f"{getattr(response.transaction_state, 'value', None)}",
+                f"expected_epoch={session.handoff.destination_engine_epoch}",
+                f"response_epoch={response.destination_engine_epoch}",
+                f"expected_generation={session.handoff.shared_cache_generation}",
+                f"response_generation={response.shared_cache_generation}",
+                f"remote_session_present={bool(response.remote_session)}",
+            )
+        )
+    log_remote_fill_diagnostic(
+        logger,
+        event="remote_fill_open_failure",
+        code="RF-P-004",
+        stage=stage,
+        action="PERSISTENT_ONLY",
+        req_id=session.request_id,
+        transfer_id=session.handoff.transfer_id,
+        reason="; ".join(details),
+        error=error,
+        severity="warning",
+    )
 
 
 class DirectPushSubmitter(Protocol):
@@ -578,6 +620,18 @@ class RemoteFillProducerSession:
             self.static_spec.token_hash_algorithm != self.handoff.token_hash_algorithm
             or self.static_spec.python_hash_seed != self.handoff.python_hash_seed
         ):
+            _log_remote_fill_open_failure(
+                self,
+                "producer_hash_precheck",
+                reason=(
+                    "producer_hash_algorithm="
+                    f"{self.static_spec.token_hash_algorithm}; "
+                    "handoff_hash_algorithm="
+                    f"{self.handoff.token_hash_algorithm}; "
+                    f"producer_hash_seed={self.static_spec.python_hash_seed}; "
+                    f"handoff_hash_seed={self.handoff.python_hash_seed}"
+                ),
+            )
             self.direct_viable = False
             return False
         negotiation_key = RemoteFillNegotiationCache.key(
@@ -609,12 +663,16 @@ class RemoteFillProducerSession:
                 negotiated = self._execute(negotiate)
             except RemoteFillFatalError:
                 raise
-            except Exception:
+            except Exception as error:
                 self.prearm_control_unknown = True
                 self.direct_viable = False
+                _log_remote_fill_open_failure(self, "negotiate_execute", error=error)
                 return False
             if not self._accepted(negotiated):
                 self.direct_viable = False
+                _log_remote_fill_open_failure(
+                    self, "negotiate_response", response=negotiated
+                )
                 return False
             if self.negotiation_cache is not None:
                 self.negotiation_cache.record(negotiation_key)
@@ -636,12 +694,14 @@ class RemoteFillProducerSession:
             )
         except RemoteFillFatalError:
             raise
-        except Exception:
+        except Exception as error:
             self.prearm_control_unknown = True
             self.direct_viable = False
+            _log_remote_fill_open_failure(self, "open_execute", error=error)
             return False
         if not self._accepted(opened):
             self.direct_viable = False
+            _log_remote_fill_open_failure(self, "open_response", response=opened)
             return False
         if (
             opened.destination_engine_epoch != self.handoff.destination_engine_epoch
@@ -649,6 +709,9 @@ class RemoteFillProducerSession:
             or not opened.remote_session
         ):
             self.direct_viable = False
+            _log_remote_fill_open_failure(
+                self, "open_response_identity", response=opened
+            )
             return False
         self.d_local_end_open = opened.d_local_end_open
         self.remote_session = opened.remote_session
@@ -1441,15 +1504,19 @@ class RemoteFillProducerSession:
             FinishRequest: OperationKind.FINISH,
             StatusRequest: OperationKind.STATUS,
         }.get(type(request))
-        if (
-            expected_kind is None
-            or response.operation is not expected_kind
-            or response.operation_id != request.common.operation_id
-            or response.destination_engine_epoch
-            != self.handoff.destination_engine_epoch
-            or response.shared_cache_generation != self.handoff.shared_cache_generation
-        ):
-            raise ValueError("remote-fill response identity changed")
+        mismatches = []
+        if expected_kind is None or response.operation is not expected_kind:
+            mismatches.append("operation")
+        if response.operation_id != request.common.operation_id:
+            mismatches.append("operation_id")
+        if response.destination_engine_epoch != self.handoff.destination_engine_epoch:
+            mismatches.append("destination_engine_epoch")
+        if response.shared_cache_generation != self.handoff.shared_cache_generation:
+            mismatches.append("shared_cache_generation")
+        if mismatches:
+            raise ValueError(
+                "remote-fill response identity changed: fields=" + ",".join(mismatches)
+            )
         if response.fatal_restart_required or (
             response.terminal_outcome is TerminalOutcome.FATAL_RESTART
         ):

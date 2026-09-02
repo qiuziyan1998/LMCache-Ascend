@@ -50,6 +50,7 @@ from lmcache.v1.remote_fill.native import (
 )
 
 # First Party
+import lmcache_ascend.v1.remote_fill_producer as producer_module
 from lmcache_ascend.v1.cache_engine import (
     AscendLMCacheEngine,
     _DirectPageBatch,
@@ -176,6 +177,8 @@ class _ScriptedClient:
         fatal_on: type | None = None,
         finish_outcome: TerminalOutcome = TerminalOutcome.LOCAL_FULL,
         finish_transaction_state: Any = None,
+        reject_on: type | None = None,
+        response_epoch: int = _EPOCH,
     ) -> None:
         self.reserve_dispositions = reserve_dispositions
         self.descriptor_dp_rank = descriptor_dp_rank
@@ -190,6 +193,8 @@ class _ScriptedClient:
         self.fatal_on = fatal_on
         self.finish_outcome = finish_outcome
         self.finish_transaction_state = finish_transaction_state
+        self.reject_on = reject_on
+        self.response_epoch = response_epoch
         self.requests: list[Any] = []
         self.closed = False
 
@@ -214,13 +219,19 @@ class _ScriptedClient:
             operation=self._kind(request),
             operation_id=request.common.operation_id,
             code=code,
-            destination_engine_epoch=_EPOCH,
+            destination_engine_epoch=self.response_epoch,
             shared_cache_generation=_GENERATION,
             **kwargs,
         )
 
     def execute(self, request: Any) -> Any:
         self.requests.append(request)
+        if type(request) is self.reject_on:
+            return self._response(
+                request,
+                ResultCode.RESERVATION_REJECTED,
+                message="injected rejection",
+            )
         if isinstance(request, NegotiateRequest):
             return self._response(request, ResultCode.OK)
         if isinstance(request, OpenRequest):
@@ -395,6 +406,59 @@ def test_static_negotiation_is_cached_for_decoder_epoch() -> None:
         isinstance(item, NegotiateRequest) for item in second_client.requests
     )
     assert sum(isinstance(item, OpenRequest) for item in second_client.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("reject_on", "expected_stage"),
+    (
+        (NegotiateRequest, "negotiate_response"),
+        (OpenRequest, "open_response"),
+    ),
+)
+def test_open_logs_exact_rejected_control_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    reject_on: type,
+    expected_stage: str,
+) -> None:
+    records = []
+    monkeypatch.setattr(
+        producer_module,
+        "log_remote_fill_diagnostic",
+        lambda _logger, **fields: records.append(fields),
+    )
+
+    assert not _session(
+        _ScriptedClient(
+            reserve_dispositions=(PageDisposition.EXISTING,) * 2,
+            reject_on=reject_on,
+        )
+    ).open()
+
+    assert records[0]["event"] == "remote_fill_open_failure"
+    assert records[0]["stage"] == expected_stage
+    assert "response_code=RESERVATION_REJECTED" in records[0]["reason"]
+    assert "response_message=injected rejection" in records[0]["reason"]
+
+
+def test_open_logs_response_identity_validation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = []
+    monkeypatch.setattr(
+        producer_module,
+        "log_remote_fill_diagnostic",
+        lambda _logger, **fields: records.append(fields),
+    )
+
+    assert not _session(
+        _ScriptedClient(
+            reserve_dispositions=(PageDisposition.EXISTING,) * 2,
+            response_epoch=_EPOCH + 1,
+        )
+    ).open()
+
+    assert records[0]["stage"] == "negotiate_execute"
+    assert "destination_engine_epoch" in str(records[0]["error"])
 
 
 def _source_plan() -> DirectPushSourcePlan:
