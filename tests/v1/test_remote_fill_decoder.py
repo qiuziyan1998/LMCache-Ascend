@@ -51,6 +51,55 @@ from lmcache_ascend.v1.remote_fill import (
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
 
 
+def test_post_init_emits_startup_stage_timings() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.metadata = SimpleNamespace(worker_id=1)
+    engine.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_direct_hbm",
+        pd_role="receiver",
+    )
+    engine.is_store_async = False
+    engine._direct_store_enabled = False
+    engine._group1_external_page_reader = None
+    engine._is_passive = Mock(return_value=True)
+    engine._initialize_decoder_remote_fill = Mock()
+    reader = object()
+
+    with (
+        patch.object(LMCacheEngine, "post_init"),
+        patch(
+            "lmcache_ascend.v1.cache_engine.cold_start_perf_enabled",
+            return_value=True,
+        ),
+        patch(
+            "lmcache_ascend.v1.cache_engine.cold_start_perf_now",
+            side_effect=[1.0, 2.0, 3.0],
+        ),
+        patch("lmcache_ascend.v1.cache_engine.cold_start_perf_log") as perf_log,
+        patch(
+            "lmcache_ascend.v1.cache_engine.RemoteExternalPageReader",
+            return_value=reader,
+        ),
+    ):
+        engine.post_init()
+
+    assert engine._group1_external_page_reader is reader
+    engine._initialize_decoder_remote_fill.assert_called_once_with()
+    assert [call.args[1] for call in perf_log.call_args_list] == [
+        "lmcache_base_post_init_start",
+        "lmcache_base_post_init_complete",
+        "group1_external_reader_init_start",
+        "group1_external_reader_init_complete",
+        "remote_fill_decoder_init_start",
+        "remote_fill_decoder_init_complete",
+    ]
+    assert [
+        call.kwargs.get("started")
+        for call in perf_log.call_args_list
+        if call.args[1].endswith("_complete")
+    ] == [1.0, 2.0, 3.0]
+
+
 @dataclass
 class _FakePage:
     size: int

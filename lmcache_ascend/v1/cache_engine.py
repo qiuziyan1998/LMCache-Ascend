@@ -559,18 +559,61 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._store_worker_thread.start()
 
     def post_init(self, **kwargs) -> None:
+        perf_enabled = cold_start_perf_enabled()
+        base_started = cold_start_perf_now() if perf_enabled else None
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "lmcache_base_post_init_start",
+                rank=self.metadata.worker_id,
+            )
         super().post_init(**kwargs)
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "lmcache_base_post_init_complete",
+                started=base_started,
+                rank=self.metadata.worker_id,
+            )
         try:
             if (
                 self._persistent_direct_hbm_split_group_enabled()
                 and self.config.pd_role != "sender"
                 and self._is_passive()
             ):
+                reader_started = cold_start_perf_now() if perf_enabled else None
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "group1_external_reader_init_start",
+                        rank=self.metadata.worker_id,
+                    )
                 self._group1_external_page_reader = RemoteExternalPageReader(
                     self.config,
                     self.metadata,
                 )
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "group1_external_reader_init_complete",
+                        started=reader_started,
+                        rank=self.metadata.worker_id,
+                    )
+            remote_fill_started = cold_start_perf_now() if perf_enabled else None
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "remote_fill_decoder_init_start",
+                    rank=self.metadata.worker_id,
+                )
             self._initialize_decoder_remote_fill()
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "remote_fill_decoder_init_complete",
+                    started=remote_fill_started,
+                    rank=self.metadata.worker_id,
+                )
         except Exception as error:
             log_remote_fill_diagnostic(
                 logger,
