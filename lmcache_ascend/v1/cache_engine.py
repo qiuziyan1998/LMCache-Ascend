@@ -8841,9 +8841,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             and not use_cached_retrieve
             and cached_prefix_chunks < required_chunks
         ):
-            group_cache_started = (
-                cold_start_perf_now() if perf_enabled else 0.0
-            )
+            if perf_enabled:
+                group_cache_started = source_view_started = cold_start_perf_now()
+                group_cache_thread_started = time.thread_time_ns()
+                handle_batch_ms = handle_cache_append_ms = 0.0
+
+                def elapsed_ms(started: float) -> float:
+                    return round((cold_start_perf_now() - started) * 1000, 3)
+
+                def thread_cpu_ms(started: int) -> float:
+                    return round((time.thread_time_ns() - started) / 1_000_000, 3)
             try:
                 page_sources = (
                     [
@@ -8863,6 +8870,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     if layer_page_chunks
                     else pre_resolved_shared_mem_layers
                 )
+                if perf_enabled:
+                    source_view_ms = elapsed_ms(source_view_started)
+                    group_cache_append_started = cold_start_perf_now()
+                    group_cache_append_thread_started = time.thread_time_ns()
                 self._append_retrieve_group_cache(
                     page_sources,
                     cached_memory_objs,
@@ -8870,13 +8881,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                 )
+                if perf_enabled:
+                    group_cache_append_ms = elapsed_ms(group_cache_append_started)
+                    group_cache_append_thread_cpu_ms = thread_cpu_ms(
+                        group_cache_append_thread_started
+                    )
                 group_cache_prepared = True
                 if publish_shared_handles:
+                    if perf_enabled:
+                        handle_batch_started = cold_start_perf_now()
                     compact_handle_batch = self._make_shared_handle_batch(
                         pre_resolved_shared_mem_layers,
                         missing_keys,
                     )
+                    if perf_enabled:
+                        handle_batch_ms = elapsed_ms(handle_batch_started)
                     if compact_handle_batch is not None:
+                        if perf_enabled:
+                            handle_cache_started = cold_start_perf_now()
                         if cached_memory_objs is None:
                             raise ValueError(
                                 "Compact shared publication requires retained "
@@ -8904,7 +8926,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_shared_handles,
                                 cached_handle_chunks,
                             )
-                        self._fence_shared_cpu_store_publication()
+                        # These objects were visible in a storage backend before
+                        # this request pinned them.  They have no producer work
+                        # on store_stream, so fencing it would wait for unrelated
+                        # requests without strengthening publication ordering.
+                        if perf_enabled:
+                            handle_cache_append_ms = elapsed_ms(
+                                handle_cache_started
+                            )
                 if perf_enabled:
                     cold_start_perf_log(
                         logger,
@@ -8915,6 +8944,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                         chunks=required_chunks - cached_prefix_chunks,
                         remote_fill_plan_reused=(
                             remote_fill_exact_locations is not None
+                        ),
+                        source_view_ms=source_view_ms,
+                        group_cache_append_ms=group_cache_append_ms,
+                        group_cache_append_thread_cpu_ms=(
+                            group_cache_append_thread_cpu_ms
+                        ),
+                        handle_batch_ms=handle_batch_ms,
+                        handle_cache_append_ms=handle_cache_append_ms,
+                        total_thread_cpu_ms=thread_cpu_ms(
+                            group_cache_thread_started
                         ),
                     )
             except Exception as exc:
@@ -9047,7 +9086,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         published_cached_shared_mem_objs: List[MemoryObj] = []
         cached_publication_handed_off = False
-        shared_store_publication_fenced = compact_handle_batch is not None
+        shared_store_publication_ready = compact_handle_batch is not None
         compact_batch_published = False
         compact_final_status_attempted = False
         compact_final_status_sent = False
@@ -9353,13 +9392,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                         raise ValueError(message)
                     try:
-                        if not shared_store_publication_fenced:
+                        if not shared_store_publication_ready:
                             # Store generators normally synchronize each layer
                             # before storage publication. Reassert that contract
                             # at the cross-rank publication boundary so handles
                             # can never outrun a direct-to-host store.
                             self._fence_shared_cpu_store_publication()
-                            shared_store_publication_fenced = True
+                            shared_store_publication_ready = True
                         if (
                             cached_mem_layers is not None
                             and not prefetched_layer_page_cache

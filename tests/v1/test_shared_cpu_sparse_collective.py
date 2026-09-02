@@ -3512,9 +3512,9 @@ def test_sparse_rank0_cached_request_objects_publish_handles(monkeypatch):
 
 @pytest.mark.parametrize(
     "exit_mode",
-    ["success", "deferred", "exception", "close", "preflight_fence"],
+    ["success", "deferred", "exception", "close", "preflight_error"],
 )
-def test_compact_batch_uses_exactly_one_final_status(
+def test_backend_compact_batch_skips_store_fence_and_finishes_once(
     monkeypatch, exit_mode
 ):
     monkeypatch.setattr(
@@ -3527,6 +3527,15 @@ def test_compact_batch_uses_exactly_one_final_status(
     allocated = [_FakePinnedMemObj(), _FakePinnedMemObj()]
     preflight_state = {}
     broadcasts = []
+    perf_events = {}
+    monkeypatch.setattr(
+        ascend_cache_engine, "cold_start_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        ascend_cache_engine,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: perf_events.__setitem__(event, fields),
+    )
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
     engine.config = SimpleNamespace(
@@ -3570,10 +3579,19 @@ def test_compact_batch_uses_exactly_one_final_status(
     )
     engine._make_shared_handle_batch = lambda *_args: batch
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
-    if exit_mode == "preflight_fence":
-        engine._fence_shared_cpu_store_publication = MagicMock(
-            side_effect=RuntimeError("injected fence failure")
-        )
+    engine._fence_shared_cpu_store_publication = MagicMock()
+    if exit_mode == "preflight_error":
+        append_handles = engine._append_shared_handle_cache
+        append_calls = 0
+
+        def fail_second_handle_append(*args, **kwargs):
+            nonlocal append_calls
+            append_calls += 1
+            if append_calls == 2:
+                raise RuntimeError("injected compact publication failure")
+            return append_handles(*args, **kwargs)
+
+        engine._append_shared_handle_cache = fail_second_handle_append
     cached_shared_handles = []
     retriever = engine.retrieve_layer_head_token_wise(
         [1],
@@ -3592,15 +3610,27 @@ def test_compact_batch_uses_exactly_one_final_status(
     )
 
     next(retriever)
-    if exit_mode == "preflight_fence":
-        # Request-level compact preflight runs before the generator's main
-        # try/finally. It must still roll back placeholder handle appends.
+    engine._fence_shared_cpu_store_publication.assert_not_called()
+    if exit_mode == "preflight_error":
         assert cached_shared_handles == []
+        assert "rank0_group_cache_prepare" not in perf_events
         with pytest.raises(ValueError, match="preflight failed"):
             retriever.send(([0], 0))
         assert len(broadcasts) == 1
         assert broadcasts[0].status == "error"
         return
+    perf = perf_events["rank0_group_cache_prepare"]
+    assert all(
+        isinstance(perf[field], float)
+        for field in (
+            "source_view_ms",
+            "group_cache_append_ms",
+            "group_cache_append_thread_cpu_ms",
+            "handle_batch_ms",
+            "handle_cache_append_ms",
+            "total_thread_cpu_ms",
+        )
+    )
     if exit_mode == "deferred":
         retriever.send({_SHARED_SPARSE_PREPARE_ONLY: True})
     retriever.send(([0], 0))
@@ -3633,6 +3663,7 @@ def test_compact_batch_uses_exactly_one_final_status(
     else:
         retriever.send(([0], 0))
 
+    engine._fence_shared_cpu_store_publication.assert_not_called()
     assert len(broadcasts) == 2
     assert broadcasts[1].layer_id == engine.num_layers
     assert broadcasts[1].handles == []
