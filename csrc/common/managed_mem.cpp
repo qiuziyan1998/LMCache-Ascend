@@ -1,4 +1,5 @@
 #include "managed_mem.h"
+#include "slow_path_diagnostics.h"
 #include <acl/acl.h>
 // Only required for old driver version (look at registerHostPtr)
 #ifdef PROF_ERROR
@@ -9,6 +10,7 @@
 #include "driver/ascend_hal.h"
 #include "driver/ascend_hal_define.h"
 #include <dlfcn.h>
+#include <cstdio>
 #include <iostream>
 #include <string>
 #include <sys/mman.h>
@@ -189,22 +191,48 @@ void *HostRegisteredMemoryManager::getDevicePtr(void *hostPtr,
   if (hostPtr == nullptr || requiredSize == 0) {
     return nullptr;
   }
+  const bool diagnose = slow_diag::enabled();
+  const int64_t started_ns = diagnose ? slow_diag::wall_ns() : 0;
+  const int64_t cpu_started_ns = diagnose ? slow_diag::thread_cpu_ns() : 0;
+  const int64_t lock_started_ns = diagnose ? slow_diag::wall_ns() : 0;
   const std::shared_lock<std::shared_mutex> guard(this->mux);
+  const int64_t lock_acquired_ns = diagnose ? slow_diag::wall_ns() : 0;
 
   const uintptr_t hostAddrPtr = reinterpret_cast<uintptr_t>(hostPtr);
-
+  size_t scanned = 0;
+  void *result = nullptr;
   for (const auto &pair : this->allocatedMap) {
+    ++scanned;
     const RegisteredMemoryRecord &record = pair.second;
 
     if (hostAddrPtr >= record.ptr) {
       const size_t offset = hostAddrPtr - record.ptr;
       if (offset < record.buffSize && requiredSize <= record.buffSize - offset) {
-        return reinterpret_cast<void *>(record.devptr + offset);
+        result = reinterpret_cast<void *>(record.devptr + offset);
+        break;
       }
     }
   }
-
-  return nullptr;
+  if (diagnose) {
+    const int64_t completed_ns = slow_diag::wall_ns();
+    const int64_t cpu_completed_ns = slow_diag::thread_cpu_ns();
+    const double total_ms = slow_diag::elapsed_ms(started_ns, completed_ns);
+    if (total_ms >= slow_diag::kSlowPathMs) {
+      std::fprintf(
+          stderr,
+          "[LMCACHE_COLD_PERF_NATIVE] {\"schema\":1,\"event\":\"get_device_ptr_"
+          "slow\",\"pid\":%ld,\"tid\":%ld,\"required_bytes\":%zu,"
+          "\"records\":%zu,\"records_scanned\":%zu,\"found\":%s,"
+          "\"total_ms\":%.3f,\"thread_cpu_ms\":%.3f,"
+          "\"lock_wait_ms\":%.3f,\"scan_ms\":%.3f}\n",
+          static_cast<long>(getpid()), slow_diag::thread_id(), requiredSize,
+          this->allocatedMap.size(), scanned, result ? "true" : "false",
+          total_ms, slow_diag::elapsed_ms(cpu_started_ns, cpu_completed_ns),
+          slow_diag::elapsed_ms(lock_started_ns, lock_acquired_ns),
+          slow_diag::elapsed_ms(lock_acquired_ns, completed_ns));
+    }
+  }
+  return result;
 };
 
 size_t HostRegisteredMemoryManager::getRecordSize(void *hostPtr) {

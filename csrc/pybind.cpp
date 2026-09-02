@@ -137,11 +137,12 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared_wrapper(
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, int64_t chunk_size, int64_t total_tokens,
     bool lmc_host_interleaved,
-    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt) {
+    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt,
+    int64_t diagnostic_layer_id = -1) {
   sparse_mla_dsa_batched_direct_kv_transfer_prepared(
       destination_state, slot_mapping_packed, selected_token_idx,
       chunk_ptrs_npu, chunk_size, total_tokens, lmc_host_interleaved,
-      selected_token_counts);
+      selected_token_counts, diagnostic_layer_id);
 }
 
 void dense_mla_dsa_batched_direct_kv_transfer_wrapper(
@@ -340,7 +341,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("selected_token_idx"), py::arg("chunk_ptrs_npu"),
         py::arg("chunk_size"), py::arg("total_tokens"),
         py::arg("lmc_host_interleaved"),
-        py::arg("selected_token_counts") = py::none());
+        py::arg("selected_token_counts") = py::none(),
+        py::arg("diagnostic_layer_id") = -1);
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),

@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 from threading import Event, Lock, Thread
+import time
 from time import monotonic
 from typing import Any, Protocol
 
@@ -590,12 +591,19 @@ class AscendRemoteFillPageLifecycle:
             ValueError: If page metadata is not canonical or layout-compatible.
         """
 
-        del transfer_id, window_id
+        diagnose = cold_start_perf_enabled()
+        prepare_started = monotonic() if diagnose else 0.0
+        prepare_thread_started = time.thread_time_ns() if diagnose else 0
+        validation_ms = classify_ms = capacity_ms = reclaim_ms = 0.0
+        allocation_ms = pin_ms = 0.0
+        del window_id
         keys = tuple(self._validate_control_page(page) for page in pages)
         selectors = tuple((page.kv_group, page.chunk_index) for page in pages)
         if len(set(keys)) != len(keys) or len(set(selectors)) != len(selectors):
             raise ValueError("remote-fill page manifest contains duplicate pages")
         self._validate_window_groups(pages, keys)
+        if diagnose:
+            validation_ms = (monotonic() - prepare_started) * 1000
         results: list[PreparedPage | None] = [None] * len(pages)
 
         def finalize_results() -> tuple[PreparedPage, ...]:
@@ -628,6 +636,36 @@ class AscendRemoteFillPageLifecycle:
                 )
             return prepared
 
+        def finish_results() -> tuple[PreparedPage, ...]:
+            prepared = finalize_results()
+            elapsed_ms = (monotonic() - prepare_started) * 1000
+            if diagnose and elapsed_ms >= 100.0:
+                cold_start_perf_log(
+                    logger,
+                    "remote_fill_page_prepare_slow",
+                    transfer_id=transfer_id,
+                    pages=len(pages),
+                    missing=len(missing_indices),
+                    allocated=sum(
+                        result.disposition is PageDisposition.ALLOCATED
+                        for result in prepared
+                    ),
+                    requested_bytes=requested_bytes,
+                    elapsed_ms=round(elapsed_ms, 3),
+                    thread_cpu_ms=round(
+                        (time.thread_time_ns() - prepare_thread_started)
+                        / 1_000_000,
+                        3,
+                    ),
+                    validate_ms=round(validation_ms, 3),
+                    classify_ms=round(classify_ms, 3),
+                    capacity_ms=round(capacity_ms, 3),
+                    reclaim_ms=round(reclaim_ms, 3),
+                    allocation_ms=round(allocation_ms, 3),
+                    pin_ms=round(pin_ms, 3),
+                )
+            return prepared
+
         def classify_pages() -> list[int]:
             missing = []
             for index, key in enumerate(keys):
@@ -641,24 +679,39 @@ class AscendRemoteFillPageLifecycle:
                     missing.append(index)
             return missing
 
+        classify_started = monotonic() if diagnose else 0.0
         missing_indices = classify_pages()
+        if diagnose:
+            classify_ms = (monotonic() - classify_started) * 1000
 
+        requested_bytes = 0
         if not reserve_missing:
-            return finalize_results()
+            return finish_results()
         requested_bytes = sum(pages[index].expected_bytes for index in missing_indices)
+        capacity_started = monotonic() if diagnose else 0.0
         if requested_bytes and not self._capacity_available(requested_bytes):
             if self._capacity_reclaimer is None:
-                return finalize_results()
+                if diagnose:
+                    capacity_ms = (monotonic() - capacity_started) * 1000
+                return finish_results()
+            reclaim_started = monotonic() if diagnose else 0.0
             reclaimed = self._capacity_reclaimer(requested_bytes)
+            if diagnose:
+                reclaim_ms = (monotonic() - reclaim_started) * 1000
             missing_indices = classify_pages()
             requested_bytes = sum(
                 pages[index].expected_bytes for index in missing_indices
             )
             if not reclaimed or not self._capacity_available(requested_bytes):
-                return finalize_results()
+                if diagnose:
+                    capacity_ms = (monotonic() - capacity_started) * 1000
+                return finish_results()
+        if diagnose:
+            capacity_ms = (monotonic() - capacity_started) * 1000 - reclaim_ms
 
         allocated: dict[int, LayerPageMemoryObj] = {}
         pinned = False
+        allocation_started = monotonic() if diagnose else 0.0
         try:
             for kv_group in self._direct_groups:
                 indices = [
@@ -685,9 +738,14 @@ class AscendRemoteFillPageLifecycle:
                         self._release_unpinned(group_pages)
                     raise MemoryError("remote-fill hidden page allocation failed")
                 allocated.update(zip(indices, group_pages, strict=True))
+            if diagnose:
+                allocation_ms = (monotonic() - allocation_started) * 1000
             allocated_pages = list(allocated.values())
+            pin_started = monotonic() if diagnose else 0.0
             if allocated_pages and not self._pin_pages(allocated_pages):
                 raise MemoryError("remote-fill hidden page pin failed")
+            if diagnose:
+                pin_ms = (monotonic() - pin_started) * 1000
             pinned = bool(allocated_pages)
             for index, page in allocated.items():
                 control = pages[index]
@@ -706,7 +764,7 @@ class AscendRemoteFillPageLifecycle:
             self._release_allocated(tuple(allocated.values()), pinned=pinned)
             raise
         try:
-            return finalize_results()
+            return finish_results()
         except Exception:
             self._release_allocated(tuple(allocated.values()), pinned=pinned)
             raise

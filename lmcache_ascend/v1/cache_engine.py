@@ -760,8 +760,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         req_id: str,
     ) -> None:
         """Load exact persistent Group-1 pages into final vLLM HBM blocks."""
+        perf_enabled = cold_start_perf_enabled()
+        load_started = cold_start_perf_now() if perf_enabled else 0.0
+        load_thread_started = time.thread_time_ns() if perf_enabled else 0
         if not self._persistent_direct_hbm_split_group_enabled():
             raise RuntimeError("Group-1 direct-HBM mode is disabled")
+        phase_started = cold_start_perf_now() if perf_enabled else 0.0
         plans = list(
             self.token_database.process_tokens(
                 tokens=tokens,
@@ -769,11 +773,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kv_group=1,
             )
         )
+        token_plan_ms = (
+            (cold_start_perf_now() - phase_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
         if not plans or plans[-1][1] != len(tokens):
             raise RuntimeError("Group-1 persistent page plan is incomplete")
+        phase_started = cold_start_perf_now() if perf_enabled else 0.0
         self._ensure_layerwise_connector_layout(
             kvcaches=kvcaches,
             kv_group=1,
+        )
+        layout_ms = (
+            (cold_start_perf_now() - phase_started) * 1000
+            if perf_enabled
+            else 0.0
         )
         planner = getattr(
             self.gpu_connector,
@@ -785,7 +800,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         starts = [start for start, _, _ in plans]
         ends = [end for _, end, _ in plans]
         keys = [key for _, _, key in plans]
+        phase_started = cold_start_perf_now() if perf_enabled else 0.0
         planned = planner(kvcaches, slot_mapping, starts, ends, 1)
+        destination_plan_ms = (
+            (cold_start_perf_now() - phase_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
         if planned is None:
             rejection = getattr(
                 self.gpu_connector,
@@ -804,7 +825,35 @@ class AscendLMCacheEngine(LMCacheEngine):
         try:
             # This strict API returns only after native DMA reaches a known
             # terminal status; an unrelated Ascend stream event adds no fence.
+            phase_started = cold_start_perf_now() if perf_enabled else 0.0
             load_pages(keys, ptrs, sizes, owners, req_id)
+            native_load_ms = (
+                (cold_start_perf_now() - phase_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
+            elapsed_ms = (
+                (cold_start_perf_now() - load_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
+            if perf_enabled and elapsed_ms >= 100.0:
+                cold_start_perf_log(
+                    logger,
+                    "group1_direct_hbm_load_slow",
+                    started=load_started,
+                    req_id=req_id,
+                    pages=len(keys),
+                    bytes=sum(sizes),
+                    token_plan_ms=round(token_plan_ms, 3),
+                    layout_ms=round(layout_ms, 3),
+                    destination_plan_ms=round(destination_plan_ms, 3),
+                    native_load_ms=round(native_load_ms, 3),
+                    thread_cpu_ms=round(
+                        (time.thread_time_ns() - load_thread_started) / 1e6,
+                        3,
+                    ),
+                )
         except NativeExternalPageTransferUnknownError as error:
             self._remote_fill_require_paired_restart((req_id,))
             raise RemoteFillFatalError(
@@ -5147,6 +5196,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         exact_chunk_locations: Optional[list[str]] = None,
     ) -> tuple[list[list[MemoryObj]], int]:
         """Resolve exact-size full or partial layer pages with legacy fallback."""
+        perf_enabled = cold_start_perf_enabled()
+        resolve_started = cold_start_perf_now() if perf_enabled else 0.0
+        resolve_thread_started = time.thread_time_ns() if perf_enabled else 0
+        local_get_ms = legacy_probe_ms = remote_probe_ms = remote_get_ms = 0.0
+        tail_resolve_ms = validate_pin_ms = 0.0
         if not 0 < page_chunks <= len(keys_layer_major[0]):
             raise ValueError("Layer-page retrieval requires at least one chunk")
         page_keys = (
@@ -5173,13 +5227,19 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         local = self._shared_local_cpu_backend()
         assert self.storage_manager is not None
+        phase_started = cold_start_perf_now() if perf_enabled else 0.0
         pages, local_count = local.batched_get_layer_page_prefix(page_keys)
+        if perf_enabled:
+            local_get_ms = (cold_start_perf_now() - phase_started) * 1000
         owned: list[MemoryObj] = list(pages)
         pinned: list[MemoryObj] = []
         try:
+            phase_started = cold_start_perf_now() if perf_enabled else 0.0
             legacy_suffix = local_count < page_chunks and local.contains_all_exact(
                 page_keys[local_count].split_layers(self.num_layers)
             )
+            if perf_enabled:
+                legacy_probe_ms = (cold_start_perf_now() - phase_started) * 1000
             tail_start = local_count
             if local_count < page_chunks and not legacy_suffix:
                 remote = self.storage_manager.storage_backends.get("RemoteBackend")
@@ -5188,10 +5248,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if not callable(contains) or not callable(retrieve):
                     raise RuntimeError("RemoteBackend does not support layer pages")
                 remote_keys = page_keys[local_count:page_chunks]
+                phase_started = cold_start_perf_now() if perf_enabled else 0.0
                 remote_count = contains(remote_keys)
+                if perf_enabled:
+                    remote_probe_ms = (
+                        cold_start_perf_now() - phase_started
+                    ) * 1000
                 if not 0 <= remote_count <= len(remote_keys):
                     raise ValueError("Remote layer-page lookup returned invalid count")
+                phase_started = cold_start_perf_now() if perf_enabled else 0.0
                 fetched = retrieve(remote_keys[:remote_count]) if remote_count else []
+                if perf_enabled:
+                    remote_get_ms = (
+                        cold_start_perf_now() - phase_started
+                    ) * 1000
                 if len(fetched) != remote_count:
                     raise ValueError("Remote layer-page result count is inconsistent")
                 pages.extend(fetched)
@@ -5217,7 +5287,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 + list(keys_layer_major[layer_id][page_chunks:])
                 for layer_id in range(self.num_layers)
             ]
+            phase_started = cold_start_perf_now() if perf_enabled else 0.0
             tail = (
+                # This retains the legacy layerwise fallback, but measures it
+                # separately from merged-page retrieval.
                 self._resolve_shared_rank0_page_first_layers(
                     req_id=req_id,
                     phase=phase,
@@ -5227,6 +5300,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if tail_keys_layer_major[0]
                 else [[] for _ in keys_layer_major]
             )
+            if perf_enabled:
+                tail_resolve_ms = (
+                    cold_start_perf_now() - phase_started
+                ) * 1000
             tail_objects = [obj for layer in tail for obj in layer]
             owned.extend(tail_objects)
             pinned.extend(tail_objects)
@@ -5234,6 +5311,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 raise ValueError(
                     f"Layer-page result count {len(pages)} != {tail_start}"
                 )
+            phase_started = cold_start_perf_now() if perf_enabled else 0.0
             invalid_page = False
             for chunk_index, page in enumerate(pages):
                 token_count = int(getattr(page, "valid_tokens", 0))
@@ -5257,6 +5335,32 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=kv_group,
                     chunk_index=chunk_index,
                 )
+            if perf_enabled:
+                validate_pin_ms = (
+                    cold_start_perf_now() - phase_started
+                ) * 1000
+                elapsed_ms = (cold_start_perf_now() - resolve_started) * 1000
+                if elapsed_ms >= 100.0:
+                    cold_start_perf_log(
+                        logger,
+                        "rank0_page_resolve_slow",
+                        started=resolve_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        pages=page_chunks,
+                        local_pages=local_count,
+                        local_get_ms=round(local_get_ms, 3),
+                        legacy_probe_ms=round(legacy_probe_ms, 3),
+                        remote_probe_ms=round(remote_probe_ms, 3),
+                        remote_get_ms=round(remote_get_ms, 3),
+                        tail_resolve_ms=round(tail_resolve_ms, 3),
+                        validate_pin_ms=round(validate_pin_ms, 3),
+                        thread_cpu_ms=round(
+                            (time.thread_time_ns() - resolve_thread_started) / 1e6,
+                            3,
+                        ),
+                    )
             return [list(pages) + layer for layer in tail], tail_start
         except Exception:
             for obj in reversed(pinned):
@@ -7525,6 +7629,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         compact_pages = ()
         page_view_build_s = 0.0
         pointer_seal_s = 0.0
+        compact_materialize_started = (
+            cold_start_perf_now() if perf_enabled else 0.0
+        )
+        compact_materialize_thread_started = (
+            time.thread_time_ns() if perf_enabled else 0
+        )
         legacy_tail_objects = 0
         prepared_compact_ptrs = False
         defer_finish = False
@@ -7915,6 +8025,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                         legacy_tail_objects=legacy_tail_objects,
                         page_view_build_ms=round(page_view_build_s * 1000, 3),
                         pointer_seal_ms=pointer_seal_ms,
+                        total_materialize_ms=round(
+                            (
+                                cold_start_perf_now()
+                                - compact_materialize_started
+                            )
+                            * 1000,
+                            3,
+                        ),
+                        thread_cpu_ms=round(
+                            (
+                                time.thread_time_ns()
+                                - compact_materialize_thread_started
+                            )
+                            / 1e6,
+                            3,
+                        ),
                     )
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None
@@ -8683,6 +8809,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             materialize_started = (
                                 cold_start_perf_now() if perf_enabled else 0.0
                             )
+                            materialize_thread_started = (
+                                time.thread_time_ns() if perf_enabled else 0
+                            )
                             (
                                 pre_resolved_shared_mem_layers,
                                 layer_page_chunks,
@@ -8708,6 +8837,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     pages=layer_page_chunks,
                                     remote_fill_plan_reused=(
                                         remote_fill_exact_locations is not None
+                                    ),
+                                    thread_cpu_ms=round(
+                                        (
+                                            time.thread_time_ns()
+                                            - materialize_thread_started
+                                        )
+                                        / 1e6,
+                                        3,
                                     ),
                                 )
                             if (

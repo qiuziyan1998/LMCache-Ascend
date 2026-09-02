@@ -1,8 +1,12 @@
 #include "mem_kernels.h"
+#include "common/slow_path_diagnostics.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
+#include <atomic>
+#include <cstdio>
+#include <memory>
 #include <pybind11/pybind11.h>
 #include <limits>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -750,9 +754,21 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
     const int64_t total_tokens, const bool lmc_host_interleaved,
-    const c10::optional<torch::Tensor> &selected_token_counts) {
+    const c10::optional<torch::Tensor> &selected_token_counts,
+    const int64_t diagnostic_layer_id) {
+  struct HandlerTiming {
+    std::atomic<int64_t> entry_wall_ns{0};
+    std::atomic<int64_t> exit_wall_ns{0};
+    std::atomic<int64_t> entry_cpu_ns{0};
+    std::atomic<int64_t> exit_cpu_ns{0};
+  };
+  const bool diagnose = lmc::slow_diag::enabled();
+  const int64_t entry_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+  const int64_t entry_cpu_ns = diagnose ? lmc::slow_diag::thread_cpu_ns() : 0;
+  const int gil_held = diagnose ? PyGILState_Check() : 0;
   const c10::OptionalDeviceGuard slot_device_guard(
       device_of(slot_mapping_packed));
+  const int64_t guard_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
 
   const int32_t num_sparse = static_cast<int32_t>(selected_token_idx.numel());
   if (num_sparse == 0) {
@@ -769,7 +785,9 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
       ? static_cast<int32_t>(selected_token_counts->stride(0))
       : 1;
   const uint32_t aiv_num = direct_aiv_num(num_sparse);
+  const int64_t shape_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const int64_t stream_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
 
   uint8_t *slot_mapping_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
@@ -786,6 +804,8 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
   const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
   const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
   const SparseDirectDestinationState state = destination_state;
+  const int64_t pointer_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+  auto handler_timing = diagnose ? std::make_shared<HandlerTiming>() : nullptr;
 
   at_npu::native::OpCommand cmd;
   cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
@@ -793,7 +813,14 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
                         counts_ptr, row_width, request_count,
                         selected_count_stride,
                         chunk_ptrs_ptr, num_sparse, num_chunks, chunk_size_i,
-                        total_tokens_i, lmc_host_interleaved]() -> int {
+                        total_tokens_i, lmc_host_interleaved,
+                        handler_timing]() -> int {
+    if (handler_timing) {
+      handler_timing->entry_wall_ns.store(lmc::slow_diag::wall_ns(),
+                                          std::memory_order_relaxed);
+      handler_timing->entry_cpu_ns.store(lmc::slow_diag::thread_cpu_ns(),
+                                         std::memory_order_relaxed);
+    }
     kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
         state.scalar_type_num, state.slot_type_num,
         kernel_format(state.kvcache_format), aiv_num, stream, chunk_ptrs_ptr,
@@ -804,9 +831,67 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         state.v_hidden_dims, state.dsa_hidden_dims, num_sparse, num_chunks,
         chunk_size_i, total_tokens_i, state.block_size, lmc_host_interleaved,
         row_width, request_count, selected_count_stride);
+    if (handler_timing) {
+      handler_timing->exit_cpu_ns.store(lmc::slow_diag::thread_cpu_ns(),
+                                        std::memory_order_relaxed);
+      handler_timing->exit_wall_ns.store(lmc::slow_diag::wall_ns(),
+                                         std::memory_order_relaxed);
+    }
     return 0;
   });
+  const int64_t command_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
   cmd.Run();
+  if (diagnose) {
+    const int64_t return_wall_ns = lmc::slow_diag::wall_ns();
+    const int64_t return_cpu_ns = lmc::slow_diag::thread_cpu_ns();
+    const double total_ms =
+        lmc::slow_diag::elapsed_ms(entry_wall_ns, return_wall_ns);
+    if (total_ms >= lmc::slow_diag::kSlowPathMs) {
+      const int64_t handler_entry_ns =
+          handler_timing->entry_wall_ns.load(std::memory_order_relaxed);
+      const int64_t handler_exit_ns =
+          handler_timing->exit_wall_ns.load(std::memory_order_relaxed);
+      const int64_t handler_entry_cpu_ns =
+          handler_timing->entry_cpu_ns.load(std::memory_order_relaxed);
+      const int64_t handler_exit_cpu_ns =
+          handler_timing->exit_cpu_ns.load(std::memory_order_relaxed);
+      const double run_to_handler_ms = handler_entry_ns
+          ? lmc::slow_diag::elapsed_ms(command_wall_ns, handler_entry_ns)
+          : -1.0;
+      const double handler_ms = handler_exit_ns
+          ? lmc::slow_diag::elapsed_ms(handler_entry_ns, handler_exit_ns)
+          : -1.0;
+      const double handler_to_return_ms = handler_exit_ns
+          ? lmc::slow_diag::elapsed_ms(handler_exit_ns, return_wall_ns)
+          : -1.0;
+      const double handler_cpu_ms =
+          handler_exit_cpu_ns && handler_entry_cpu_ns
+          ? lmc::slow_diag::elapsed_ms(handler_entry_cpu_ns,
+                                      handler_exit_cpu_ns)
+          : -1.0;
+      std::fprintf(
+          stderr,
+          "[LMCACHE_COLD_PERF_NATIVE] {\"schema\":1,\"event\":\"sparse_"
+          "prepared_native_slow\",\"pid\":%ld,\"tid\":%ld,\"layer_id\":%ld,"
+          "\"gil_held\":%d,\"num_sparse\":%d,\"num_chunks\":%d,"
+          "\"total_tokens\":%d,\"total_ms\":%.3f,\"thread_cpu_ms\":%.3f,"
+          "\"device_guard_ms\":%.3f,\"shape_ms\":%.3f,\"stream_lookup_ms\":%.3f,"
+          "\"pointer_extract_ms\":%.3f,\"command_build_ms\":%.3f,"
+          "\"run_to_handler_ms\":%.3f,\"handler_ms\":%.3f,"
+          "\"handler_thread_cpu_ms\":%.3f,\"handler_to_return_ms\":%.3f}\n",
+          static_cast<long>(getpid()), lmc::slow_diag::thread_id(),
+          static_cast<long>(diagnostic_layer_id), gil_held, num_sparse,
+          num_chunks, total_tokens_i, total_ms,
+          lmc::slow_diag::elapsed_ms(entry_cpu_ns, return_cpu_ns),
+          lmc::slow_diag::elapsed_ms(entry_wall_ns, guard_wall_ns),
+          lmc::slow_diag::elapsed_ms(guard_wall_ns, shape_wall_ns),
+          lmc::slow_diag::elapsed_ms(shape_wall_ns, stream_wall_ns),
+          lmc::slow_diag::elapsed_ms(stream_wall_ns, pointer_wall_ns),
+          lmc::slow_diag::elapsed_ms(pointer_wall_ns, command_wall_ns),
+          run_to_handler_ms, handler_ms, handler_cpu_ms,
+          handler_to_return_ms);
+    }
+  }
 }
 
 static void validate_dense_direct_inputs(torch::Tensor &slot_mapping_full,

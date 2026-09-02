@@ -337,6 +337,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     total_tokens: int,
     lmc_host_interleaved: bool,
     selected_token_counts: Optional[torch.Tensor] = None,
+    diagnostic_layer_id: int = -1,
 ) -> None:
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         destination_state,
@@ -347,6 +348,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         total_tokens,
         lmc_host_interleaved,
         selected_token_counts,
+        diagnostic_layer_id,
     )
 
 

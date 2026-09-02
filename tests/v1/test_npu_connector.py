@@ -3283,7 +3283,7 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     assert args[1] is slots
     assert args[2] is selected
     assert args[3] is chunk_ptrs
-    assert args[4:] == (256, 4, True)
+    assert args[4:] == (256, 4, True, None, 0)
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
