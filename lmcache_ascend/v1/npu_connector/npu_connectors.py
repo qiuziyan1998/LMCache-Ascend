@@ -2781,9 +2781,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_idx = torch.tensor(
                 selected_token_idx, dtype=torch.int32, device=self.kv_device
             )
-        selected_token_idx = selected_token_idx.to(
-            device=self.kv_device, dtype=torch.int32
-        )
+        if (
+            selected_token_idx.dtype != torch.int32
+            or selected_token_idx.device != self.kv_device
+        ):
+            selected_token_idx = selected_token_idx.to(
+                device=self.kv_device, dtype=torch.int32
+            )
 
         if not isinstance(target_slot_mapping, torch.Tensor):
             target_slot_mapping = torch.tensor(
@@ -2809,9 +2813,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     dtype=torch.long,
                     device=self.kv_device,
                 )
-            selected_token_counts = selected_token_counts.to(
-                device=self.kv_device, dtype=torch.int32
-            ).reshape(-1)
+            if (
+                selected_token_counts.dtype != torch.int32
+                or selected_token_counts.device != self.kv_device
+            ):
+                selected_token_counts = selected_token_counts.to(
+                    device=self.kv_device, dtype=torch.int32
+                )
+            selected_token_counts = selected_token_counts.reshape(-1)
             if selected_token_idx.dim() == 1:
                 if selected_token_counts.numel() != 1:
                     raise ValueError(
