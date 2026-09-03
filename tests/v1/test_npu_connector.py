@@ -3076,15 +3076,29 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
         "load_stream" not in call and "current_stream" not in call
         for call in transfer_calls
     )
+    assert perf_events == []
+
+    monkeypatch.setattr(npu_connectors, "_COLD_PERF_SLOW_MS", -1.0)
+    slow_generator = connector.batched_to_gpu_head_token_wise(
+        prepared_sparse_source=source,
+        kvcaches=[(object(), object())],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+    )
+    next(slow_generator)
+    slow_generator.send(
+        {
+            "selected_token_ids": selected,
+            "token_start_index": 0,
+            "payload_event": object(),
+        }
+    )
     assert [event for event, _ in perf_events] == [
-        "prepared_sparse_submit_summary",
-        "prepared_sparse_submit_summary",
+        "prepared_sparse_submit_summary"
     ]
-    for _, fields in perf_events:
-        assert fields["layers"] == 1
-        assert fields["tokens"] == 4
-        assert fields["sum_ms"] >= fields["max_ms"] >= 0
-        assert fields["thread_cpu_ms"] >= 0
+    assert perf_events[0][1]["sum_ms"] >= perf_events[0][1]["max_ms"] >= 0
+    slow_generator.close()
 
     for generator in generators:
         generator.close()

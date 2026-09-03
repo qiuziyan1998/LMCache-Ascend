@@ -5249,7 +5249,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 self._mtp_dw_deep_diag_seen = deep_seen
 
-        if perf_enabled:
+        if perf_enabled and submit_sum_s * 1000 >= _COLD_PERF_SLOW_MS:
             cold_start_perf_log(
                 logger,
                 "prepared_sparse_submit_summary",

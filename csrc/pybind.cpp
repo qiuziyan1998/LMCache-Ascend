@@ -342,7 +342,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("chunk_size"), py::arg("total_tokens"),
         py::arg("lmc_host_interleaved"),
         py::arg("selected_token_counts") = py::none(),
-        py::arg("diagnostic_layer_id") = -1);
+        py::arg("diagnostic_layer_id") = -1,
+        py::call_guard<py::gil_scoped_release>());
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),
