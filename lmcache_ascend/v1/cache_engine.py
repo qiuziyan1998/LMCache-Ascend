@@ -444,6 +444,10 @@ class _SparseCacheAppend:
                 )
         pointers = cache.get("cached_chunk_ptrs_npu")
         self._pointers = None if pointers is None else (pointers, list(pointers))
+        pointer_table = cache.get("cached_chunk_ptr_table_npu")
+        self._pointer_table = (
+            None if pointer_table is None else (pointer_table, list(pointer_table))
+        )
         self.committed = False
 
     def commit(self) -> None:
@@ -461,6 +465,9 @@ class _SparseCacheAppend:
             del values[outer_size:]
         if self._pointers is not None:
             values, snapshot = self._pointers
+            values[:] = snapshot
+        if self._pointer_table is not None:
+            values, snapshot = self._pointer_table
             values[:] = snapshot
 
 
@@ -4939,6 +4946,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
+        cached_chunk_ptr_table_npu: Optional[List] = None,
     ) -> Optional[int]:
         """Drop a cached partial tail before publishing its full successor."""
         replace_at: Optional[int] = None
@@ -4972,6 +4980,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             for layer_id, ptrs in enumerate(cached_chunk_ptrs_npu):
                 if isinstance(ptrs, torch.Tensor):
                     cached_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
+        if cached_chunk_ptr_table_npu:
+            cached_chunk_ptr_table_npu[:] = [
+                cached_chunk_ptr_table_npu[0][:, :replace_at].contiguous()
+            ]
         return replace_at
 
     @staticmethod
@@ -5015,6 +5027,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs: Optional[List] = None,
         cached_chunk_ptrs_npu: Optional[List] = None,
         cache_chunk_indices: Optional[List[int]] = None,
+        cached_chunk_ptr_table_npu: Optional[List] = None,
     ) -> None:
         layer_memory_objs = memory_objs[layer_id]
         if cache_chunk_indices is not None:
@@ -5045,7 +5058,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 None,
             )
             if append_ptrs_fn is not None:
-                append_ptrs_fn(
+                append_args = (
                     layer_id,
                     (
                         layer_memory_objs
@@ -5054,6 +5067,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ),
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                )
+                append_ptrs_fn(
+                    *append_args,
+                    **(
+                        {
+                            "cached_chunk_ptr_table_npu": (
+                                cached_chunk_ptr_table_npu
+                            )
+                        }
+                        if cached_chunk_ptr_table_npu is not None
+                        else {}
+                    ),
                 )
 
         if not cache_tensors:
@@ -5071,6 +5096,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
+        cached_chunk_ptr_table_npu: Optional[List] = None,
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
         new_tensors: List[torch.Tensor] = []
@@ -5092,11 +5118,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                 raise ValueError(
                     "Layerwise sparse retrieve resolved an invalid MemoryObj."
                 )
-            append_ptrs_fn(
+            append_args = (
                 layer_id,
                 mem_objs_layer,
                 cached_chunk_dev_ptrs,
                 cached_chunk_ptrs_npu,
+            )
+            append_ptrs_fn(
+                *append_args,
+                **(
+                    {"cached_chunk_ptr_table_npu": cached_chunk_ptr_table_npu}
+                    if cached_chunk_ptr_table_npu is not None
+                    else {}
+                ),
             )
         else:
             new_tensors = [
@@ -5108,11 +5142,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and cached_chunk_dev_ptrs is not None
                 and append_ptrs_fn is not None
             ):
-                append_ptrs_fn(
+                append_args = (
                     layer_id,
                     new_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                )
+                append_ptrs_fn(
+                    *append_args,
+                    **(
+                        {
+                            "cached_chunk_ptr_table_npu": (
+                                cached_chunk_ptr_table_npu
+                            )
+                        }
+                        if cached_chunk_ptr_table_npu is not None
+                        else {}
+                    ),
                 )
 
         if cached_memory_objs is not None:
@@ -5134,6 +5180,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_ptrs_npu: Optional[List],
         host_pointer_rows: List[List[int]],
         layer_chunk_ptrs_npu: torch.Tensor,
+        cached_chunk_ptr_table_npu: Optional[List] = None,
     ) -> None:
         """Publish one native group store's packed pointer metadata."""
         num_layers = len(memory_objs)
@@ -5160,6 +5207,22 @@ class AscendLMCacheEngine(LMCacheEngine):
         if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
             cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
 
+        prefix_chunks = (
+            len(cached_chunk_dev_ptrs[0])
+            if cached_chunk_dev_ptrs and cached_chunk_dev_ptrs[0]
+            else 0
+        )
+        if cached_chunk_ptr_table_npu is not None and (
+            not prefix_chunks or cached_chunk_ptr_table_npu
+        ):
+            cached_chunk_ptr_table_npu[:] = [
+                layer_chunk_ptrs_npu
+                if not cached_chunk_ptr_table_npu
+                else torch.cat(
+                    (cached_chunk_ptr_table_npu[0], layer_chunk_ptrs_npu), dim=1
+                )
+            ]
+
         for layer_id, layer_memory_objs in enumerate(memory_objs):
             host_row = host_pointer_rows[layer_id]
             if len(host_row) != len(layer_memory_objs):
@@ -5176,13 +5239,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             if cached_chunk_dev_ptrs is not None:
                 cached_chunk_dev_ptrs[layer_id].extend(host_row)
             if cached_chunk_ptrs_npu is not None:
-                existing = cached_chunk_ptrs_npu[layer_id]
-                new_row = layer_chunk_ptrs_npu[layer_id]
-                cached_chunk_ptrs_npu[layer_id] = (
-                    new_row
-                    if existing is None
-                    else torch.cat((existing, new_row), dim=0)
-                )
+                if cached_chunk_ptr_table_npu is not None and (
+                    not prefix_chunks or cached_chunk_ptr_table_npu
+                ):
+                    cached_chunk_ptrs_npu[layer_id] = None
+                else:
+                    existing = cached_chunk_ptrs_npu[layer_id]
+                    new_row = layer_chunk_ptrs_npu[layer_id]
+                    cached_chunk_ptrs_npu[layer_id] = (
+                        new_row
+                        if existing is None
+                        else torch.cat((existing, new_row), dim=0)
+                    )
 
     def _resolve_shared_rank0_layer_pages(
         self,
@@ -5799,6 +5867,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         prepared_chunk_dev_ptrs: Optional[List] = None,
         prepared_chunk_ptrs_npu: Optional[List] = None,
         defer_pointer_copy: bool = False,
+        cached_chunk_ptr_table_npu: Optional[List] = None,
+        prepared_chunk_ptr_table_npu: Optional[List] = None,
     ) -> None:
         """Publish an all-layer retained source after one pointer-table copy."""
         group_append = getattr(
@@ -5833,6 +5903,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     row is not None and int(row.numel())
                     for row in cached_chunk_ptrs_npu
                 )
+                or bool(cached_chunk_ptr_table_npu)
                 or any(cached_tensors or ())
             )
             if has_prefix_data:
@@ -5842,11 +5913,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                         f"owners/host/NPU={layer_counts}, "
                         f"expected={self.num_layers}."
                     )
+                packed_table = (
+                    cached_chunk_ptr_table_npu[0]
+                    if cached_chunk_ptr_table_npu
+                    else None
+                )
+                if packed_table is not None and (
+                    packed_table.ndim != 2
+                    or int(packed_table.shape[0]) != self.num_layers
+                ):
+                    raise ValueError("Sparse packed pointer prefix shape mismatch.")
                 for layer_id in range(self.num_layers):
                     owner_count = len(cached_memory_objs[layer_id])
                     host_count = len(cached_chunk_dev_ptrs[layer_id])
                     row = cached_chunk_ptrs_npu[layer_id]
-                    npu_count = 0 if row is None else int(row.numel())
+                    npu_count = (
+                        int(packed_table.shape[1])
+                        if packed_table is not None
+                        else 0 if row is None else int(row.numel())
+                    )
                     if owner_count != host_count or host_count != npu_count:
                         raise ValueError(
                             "Sparse group pointer prefix coverage mismatch: "
@@ -5883,31 +5968,65 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                    cached_chunk_ptr_table_npu,
                 )
             return
         if prepared_chunk_dev_ptrs is None:
+            append_kwargs = {"defer_copy": True} if defer_pointer_copy else {}
+            if cached_chunk_ptr_table_npu is not None:
+                append_kwargs["cached_chunk_ptr_table_npu"] = (
+                    cached_chunk_ptr_table_npu
+                )
             group_append(
                 mem_objs_by_layer if pointer_first else tensors_by_layer,
                 cached_chunk_dev_ptrs,
                 cached_chunk_ptrs_npu,
-                **({"defer_copy": True} if defer_pointer_copy else {}),
+                **append_kwargs,
             )
         else:
-            if any((cached_chunk_dev_ptrs, cached_chunk_ptrs_npu)):
+            if any(
+                (
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                    cached_chunk_ptr_table_npu,
+                )
+            ):
                 raise ValueError(
                     "Prepared sparse pointer rows require an empty cache suffix."
                 )
             expected = [len(owners) for owners in owners_by_layer]
             if [len(row) for row in prepared_chunk_dev_ptrs] != expected:
                 raise ValueError("Prepared sparse host pointer coverage mismatch.")
-            if prepared_chunk_ptrs_npu is None or [
-                0 if row is None else int(row.numel())
-                for row in prepared_chunk_ptrs_npu
-            ] != expected:
+            packed_table = (
+                prepared_chunk_ptr_table_npu[0]
+                if prepared_chunk_ptr_table_npu
+                else None
+            )
+            if packed_table is not None:
+                valid_npu_coverage = (
+                    len(prepared_chunk_ptr_table_npu) == 1
+                    and packed_table.ndim == 2
+                    and int(packed_table.shape[0]) == self.num_layers
+                    and int(packed_table.shape[1]) == expected[0]
+                    and len(set(expected)) == 1
+                )
+            else:
+                valid_npu_coverage = prepared_chunk_ptrs_npu is not None and [
+                    0 if row is None else int(row.numel())
+                    for row in prepared_chunk_ptrs_npu
+                ] == expected
+            if not valid_npu_coverage:
                 raise ValueError("Prepared sparse NPU pointer coverage mismatch.")
             cached_chunk_dev_ptrs.extend(prepared_chunk_dev_ptrs)
             assert cached_chunk_ptrs_npu is not None
-            cached_chunk_ptrs_npu.extend(prepared_chunk_ptrs_npu)
+            cached_chunk_ptrs_npu.extend(
+                [None] * self.num_layers
+                if packed_table is not None
+                else prepared_chunk_ptrs_npu
+            )
+            if packed_table is not None:
+                assert cached_chunk_ptr_table_npu is not None
+                cached_chunk_ptr_table_npu.append(packed_table)
         if cached_memory_objs is not None:
             if not cached_memory_objs:
                 cached_memory_objs.extend([] for _ in range(self.num_layers))
@@ -6880,6 +6999,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors = store_result.tensors
         cached_chunk_dev_ptrs = store_result.chunk_dev_ptrs
         cached_chunk_ptrs_npu = store_result.chunk_ptrs
+        cached_chunk_ptr_table_npu: List[torch.Tensor] = []
 
         starts = []
         ends = []
@@ -7197,6 +7317,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors=cached_tensors,
                     cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+                    cached_chunk_ptr_table_npu=cached_chunk_ptr_table_npu,
                 )
 
             self._append_layerwise_store_cache_chunks(
@@ -7265,6 +7386,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_chunk_ptrs_npu,
                         host_pointer_rows,
                         layer_chunk_ptrs_npu,
+                        cached_chunk_ptr_table_npu=cached_chunk_ptr_table_npu,
                     )
                     if not page_first_store:
                         for layer_id in range(self.num_layers):
@@ -7292,7 +7414,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                             cached_tensors,
                             cached_chunk_dev_ptrs,
                             cached_chunk_ptrs_npu,
-                            cache_chunk_indices,
+                            cache_chunk_indices=cache_chunk_indices,
+                            cached_chunk_ptr_table_npu=cached_chunk_ptr_table_npu,
                         )
                         if page_first_store:
                             continue
@@ -7413,6 +7536,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         if store_complete:
             store_result.committed_end = requested_end
+        store_result.chunk_ptr_table = (
+            cached_chunk_ptr_table_npu[0]
+            if cached_chunk_ptr_table_npu
+            else None
+        )
         if _mtp_dw_diag_enabled() and kwargs.get("decode_window_save"):
             window_start = kwargs.get("decode_window_start")
             window_end = kwargs.get("decode_window_end")
@@ -7463,6 +7591,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors = kwargs.get("cached_tensors")
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_chunk_ptr_table_npu = kwargs.get("cached_chunk_ptr_table_npu")
         cached_shared_handles = kwargs.get("cached_shared_handles")
         append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
 
@@ -7599,6 +7728,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         transfer_kwargs = kwargs
         transient_chunk_dev_ptrs = None
         transient_chunk_ptrs_npu = None
+        transient_chunk_ptr_table_npu = None
         if not cached_prefix_chunks and (
             cached_chunk_dev_ptrs is not None
             or cached_chunk_ptrs_npu is not None
@@ -7612,8 +7742,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             ):
                 transient_chunk_dev_ptrs = []
                 transient_chunk_ptrs_npu = []
+                transient_chunk_ptr_table_npu = []
             transfer_kwargs["cached_chunk_dev_ptrs"] = transient_chunk_dev_ptrs
             transfer_kwargs["cached_chunk_ptrs_npu"] = transient_chunk_ptrs_npu
+            transfer_kwargs["cached_chunk_ptr_table_npu"] = (
+                transient_chunk_ptr_table_npu
+            )
         mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
             **transfer_kwargs
         )
@@ -7726,10 +7860,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 len(compact_pages) == missing_chunks
                                 and transient_chunk_dev_ptrs is not None
                                 and transient_chunk_ptrs_npu is not None
+                                and transient_chunk_ptr_table_npu is not None
                                 and callable(prepare_page_ptrs)
                             ):
                                 pointer_started = (
                                     cold_start_perf_now() if perf_enabled else 0.0
+                                )
+                                prepare_kwargs = (
+                                    {"defer_copy": True}
+                                    if kwargs.get(
+                                        "_defer_sparse_pointer_copy", False
+                                    )
+                                    else {}
+                                )
+                                prepare_kwargs["cached_chunk_ptr_table_npu"] = (
+                                    transient_chunk_ptr_table_npu
                                 )
                                 prepared_compact_ptrs = bool(
                                     prepare_page_ptrs(
@@ -7739,13 +7884,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                         ],
                                         transient_chunk_dev_ptrs,
                                         transient_chunk_ptrs_npu,
-                                        **(
-                                            {"defer_copy": True}
-                                            if kwargs.get(
-                                                "_defer_sparse_pointer_copy", False
-                                            )
-                                            else {}
-                                        ),
+                                        **prepare_kwargs,
                                     )
                                 )
                                 if (
@@ -8008,11 +8147,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
-                    transient_chunk_dev_ptrs if prepared_compact_ptrs else None,
-                    transient_chunk_ptrs_npu if prepared_compact_ptrs else None,
+                    prepared_chunk_dev_ptrs=(
+                        transient_chunk_dev_ptrs if prepared_compact_ptrs else None
+                    ),
+                    prepared_chunk_ptrs_npu=(
+                        transient_chunk_ptrs_npu if prepared_compact_ptrs else None
+                    ),
+                    prepared_chunk_ptr_table_npu=(
+                        transient_chunk_ptr_table_npu
+                        if prepared_compact_ptrs
+                        else None
+                    ),
                     defer_pointer_copy=bool(
                         kwargs.get("_defer_sparse_pointer_copy", False)
                     ),
+                    cached_chunk_ptr_table_npu=cached_chunk_ptr_table_npu,
                 )
                 if pointer_started:
                     pointer_seal_ms = round(
@@ -8263,6 +8412,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors = kwargs.get("cached_tensors")
         cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_chunk_ptr_table_npu = kwargs.get("cached_chunk_ptr_table_npu")
         cached_shared_handles = kwargs.get("cached_shared_handles")
         append: _SparseCacheAppend = kwargs["_sparse_cache_append"]
         cached_prefix_chunks = self._cached_sparse_prefix_chunks(
@@ -9075,6 +9225,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     defer_pointer_copy=bool(
                         kwargs.get("_defer_sparse_pointer_copy", False)
                     ),
+                    cached_chunk_ptr_table_npu=cached_chunk_ptr_table_npu,
                 )
                 if perf_enabled:
                     group_cache_append_ms = elapsed_ms(group_cache_append_started)

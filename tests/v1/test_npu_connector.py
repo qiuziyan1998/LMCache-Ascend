@@ -1361,6 +1361,31 @@ def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
         obj.ref_count_down()
 
 
+def test_group_pointer_append_retains_packed_table_without_row_views(
+    monkeypatch,
+) -> None:
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda _source, *, layer_id, chunk_index, **_kwargs: (
+            100 * layer_id + chunk_index
+        ),
+    )
+    host_rows, npu_rows, packed = [], [], []
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        [[object(), object()], [object(), object()]],
+        host_rows,
+        npu_rows,
+        packed,
+    )
+
+    assert packed[0].tolist() == [[0, 1], [100, 101]]
+    assert npu_rows == [None, None]
+
+
 def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> None:
     allocator = TensorMemoryAllocator(torch.zeros(32768, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
@@ -1778,6 +1803,10 @@ class _TrackingEvent:
     def synchronize(self):
         self.records.append("synchronize")
 
+    def query(self):
+        self.records.append("query")
+        return True
+
 
 class _DenseLayout:
     k_hidden_dims = 1
@@ -1875,6 +1904,15 @@ def test_dense_load_readiness_synchronizes_exact_event() -> None:
     connector.synchronize_dense_load_readiness(event)
 
     assert event.records == ["synchronize"]
+
+
+def test_dense_load_readiness_query_does_not_synchronize() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    event = _TrackingEvent("dense-ready")
+
+    assert connector.query_dense_load_readiness(event)
+
+    assert event.records == ["query"]
 
 
 def test_dense_load_readiness_defaults_to_legacy_load_stream(monkeypatch) -> None:
@@ -3348,6 +3386,40 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     assert args[2] is selected
     assert args[3] is chunk_ptrs
     assert args[4:] == (256, 4, True, None, 0)
+
+
+def test_prepared_sparse_launch_passes_packed_table_and_layer_id(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    states = (object(), object())
+    plan = npu_connectors._SparseDestinationPlan(
+        [object(), object()],
+        (torch.long, "cpu", 0, 1, 1, 0),
+        states,
+    )
+    pointer_table = torch.tensor([[123], [456]], dtype=torch.int64)
+    calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args: calls.append(args),
+    )
+
+    connector._run_prepared_sparse_direct_kv_transfer_layer(
+        plan=plan,
+        chunk_ptrs_npu=pointer_table,
+        layer_id=1,
+        slot_mapping_packed=torch.arange(2, dtype=torch.long),
+        selected_token_idx=torch.arange(2, dtype=torch.int32),
+        chunk_size=256,
+        total_tokens=4,
+        sparse_host_interleaved=True,
+    )
+
+    assert calls[0][0] is states[1]
+    assert calls[0][3] is pointer_table
+    assert calls[0][-1] == 1
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(

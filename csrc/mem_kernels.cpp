@@ -775,7 +775,18 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     return;
   }
 
-  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+  TORCH_CHECK(chunk_ptrs_npu.dim() == 1 || chunk_ptrs_npu.dim() == 2,
+              "chunk_ptrs_npu must be 1D or [layers, chunks].");
+  TORCH_CHECK(chunk_ptrs_npu.scalar_type() == at::ScalarType::Long,
+              "chunk_ptrs_npu must be int64.");
+  const bool packed_pointer_table = chunk_ptrs_npu.dim() == 2;
+  TORCH_CHECK(!packed_pointer_table ||
+                  (diagnostic_layer_id >= 0 &&
+                   diagnostic_layer_id < chunk_ptrs_npu.size(0) &&
+                   chunk_ptrs_npu.stride(1) == 1),
+              "Packed chunk_ptrs_npu requires a valid contiguous layer row.");
+  const int32_t num_chunks = static_cast<int32_t>(
+      packed_pointer_table ? chunk_ptrs_npu.size(1) : chunk_ptrs_npu.numel());
   const int32_t request_count = selected_token_counts.has_value()
       ? static_cast<int32_t>(selected_token_counts->numel())
       : 0;
@@ -800,6 +811,10 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
       : nullptr;
   uint8_t *chunk_ptrs_ptr =
       get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+  if (packed_pointer_table) {
+    chunk_ptrs_ptr += diagnostic_layer_id * chunk_ptrs_npu.stride(0) *
+        chunk_ptrs_npu.element_size();
+  }
 
   const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
   const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
