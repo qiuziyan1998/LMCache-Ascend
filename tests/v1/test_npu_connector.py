@@ -1490,6 +1490,56 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     assert len(calls) == 4
 
 
+def test_group_pointer_append_can_defer_copy_to_dense_stream(monkeypatch) -> None:
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    connector.kv_device = SimpleNamespace(type="npu")
+    connector._resolve_registered_cpu_source_device_ptr = (
+        lambda _source, *, layer_id, chunk_index, **_kwargs: (
+            100 * layer_id + chunk_index
+        )
+    )
+    stage = MagicMock(side_effect=lambda tensor, **_kwargs: tensor)
+    monkeypatch.setattr(connector, "stage_dense_load_tensor", stage)
+    host_rows, npu_rows = [], []
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        [[object()], [object()]],
+        host_rows,
+        npu_rows,
+        defer_copy=True,
+    )
+
+    stage.assert_called_once()
+    assert stage.call_args.args[0].device.type == "cpu"
+    assert host_rows == [[0], [100]]
+    assert [row.tolist() for row in npu_rows] == host_rows
+
+
+def test_dense_metadata_staging_is_pinned_nonblocking_and_streamed() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.kv_device = SimpleNamespace(type="npu")
+    connector.load_stream = object()
+    connector._stream_context_or_null = MagicMock(return_value=nullcontext())
+    tensor = MagicMock()
+    tensor.device.type = "cpu"
+    converted = tensor.to.return_value
+    converted.is_pinned.return_value = False
+    pinned = converted.pin_memory.return_value
+    staged = pinned.to.return_value
+
+    assert connector.stage_dense_load_tensor(tensor, dtype=torch.long) is staged
+
+    tensor.to.assert_called_once_with(dtype=torch.long)
+    converted.pin_memory.assert_called_once_with()
+    connector._stream_context_or_null.assert_called_once_with(connector.load_stream)
+    pinned.to.assert_called_once_with(
+        device=connector.kv_device,
+        dtype=torch.long,
+        non_blocking=True,
+    )
+
+
 def test_group_pointer_append_falls_back_for_malformed_page_layout(
     monkeypatch,
 ) -> None:

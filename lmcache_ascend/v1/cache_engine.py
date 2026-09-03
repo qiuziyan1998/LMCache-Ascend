@@ -844,7 +844,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     started=load_started,
                     req_id=req_id,
                     pages=len(keys),
-                    bytes=sum(sizes),
+                    bytes=sum(map(sum, sizes)),
                     token_plan_ms=round(token_plan_ms, 3),
                     layout_ms=round(layout_ms, 3),
                     destination_plan_ms=round(destination_plan_ms, 3),
@@ -5798,6 +5798,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_ptrs_npu: Optional[List],
         prepared_chunk_dev_ptrs: Optional[List] = None,
         prepared_chunk_ptrs_npu: Optional[List] = None,
+        defer_pointer_copy: bool = False,
     ) -> None:
         """Publish an all-layer retained source after one pointer-table copy."""
         group_append = getattr(
@@ -5889,6 +5890,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 mem_objs_by_layer if pointer_first else tensors_by_layer,
                 cached_chunk_dev_ptrs,
                 cached_chunk_ptrs_npu,
+                **({"defer_copy": True} if defer_pointer_copy else {}),
             )
         else:
             if any((cached_chunk_dev_ptrs, cached_chunk_ptrs_npu)):
@@ -7737,6 +7739,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                                         ],
                                         transient_chunk_dev_ptrs,
                                         transient_chunk_ptrs_npu,
+                                        **(
+                                            {"defer_copy": True}
+                                            if kwargs.get(
+                                                "_defer_sparse_pointer_copy", False
+                                            )
+                                            else {}
+                                        ),
                                     )
                                 )
                                 if (
@@ -8001,6 +8010,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_chunk_ptrs_npu,
                     transient_chunk_dev_ptrs if prepared_compact_ptrs else None,
                     transient_chunk_ptrs_npu if prepared_compact_ptrs else None,
+                    defer_pointer_copy=bool(
+                        kwargs.get("_defer_sparse_pointer_copy", False)
+                    ),
                 )
                 if pointer_started:
                     pointer_seal_ms = round(
@@ -9060,6 +9072,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                    defer_pointer_copy=bool(
+                        kwargs.get("_defer_sparse_pointer_copy", False)
+                    ),
                 )
                 if perf_enabled:
                     group_cache_append_ms = elapsed_ms(group_cache_append_started)

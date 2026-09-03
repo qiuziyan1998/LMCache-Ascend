@@ -1745,6 +1745,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Order the current consumer stream after an opaque dense-load fence."""
         torch.npu.current_stream().wait_event(readiness)
 
+    def stage_dense_load_tensor(
+        self, tensor: torch.Tensor, *, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Copy small CPU metadata on the existing dense-load stream."""
+        if self.kv_device is None:
+            raise RuntimeError("KV device is unavailable for dense-load staging")
+        if tensor.device.type != "cpu":
+            raise ValueError("Dense-load metadata source must be a CPU tensor")
+        source = tensor.to(dtype=dtype)
+        if self.kv_device.type == "cpu":
+            return source
+        if not source.is_pinned():
+            source = source.pin_memory()
+        with self._stream_context_or_null(self.load_stream):
+            staged = source.to(
+                device=self.kv_device, dtype=dtype, non_blocking=True
+            )
+        return staged
+
     def _get_sparse_h2d_stall_watchdog(
         self,
     ) -> Optional[_SparseH2DStallWatchdog]:
@@ -1910,6 +1929,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
     ) -> None:
         """Atomically refresh every layer pointer row with one H2D copy."""
         diagnose = cold_start_perf_enabled()
@@ -1957,7 +1978,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ]
         publish_started = time.perf_counter() if diagnose else 0.0
         self._append_sparse_chunk_ptr_rows(
-            staged_rows, cached_chunk_dev_ptrs, cached_chunk_ptrs_npu
+            staged_rows,
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+            defer_copy=defer_copy,
         )
         if diagnose:
             _log_cold_perf_slow(
@@ -1978,6 +2002,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sources_by_layer: List[LayerPageSource],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
     ) -> bool:
         """Prepare a transient homogeneous page pointer table, if compatible."""
         if any(source.suffix for source in sources_by_layer):
@@ -1986,7 +2012,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if staged_rows is None:
             return False
         self._append_sparse_chunk_ptr_rows(
-            staged_rows, cached_chunk_dev_ptrs, cached_chunk_ptrs_npu
+            staged_rows,
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+            defer_copy=defer_copy,
         )
         return True
 
@@ -1995,6 +2024,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         staged_rows: list[list[int]],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
     ) -> None:
         """Append complete host rows and refresh their shared NPU table."""
         diagnose = cold_start_perf_enabled()
@@ -2020,9 +2051,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         row_views = None
         table_started = time.perf_counter() if diagnose else 0.0
         if cached_chunk_ptrs_npu is not None:
-            pointer_table = torch.tensor(
-                complete_rows, dtype=torch.long, device=self.kv_device
-            )
+            if defer_copy:
+                pointer_table = self.stage_dense_load_tensor(
+                    torch.tensor(complete_rows, dtype=torch.long),
+                    dtype=torch.long,
+                )
+            else:
+                pointer_table = torch.tensor(
+                    complete_rows, dtype=torch.long, device=self.kv_device
+                )
             table_ms = (time.perf_counter() - table_started) * 1000
             unbind_started = time.perf_counter() if diagnose else 0.0
             # The row views retain the table storage after this function returns.

@@ -237,6 +237,47 @@ def test_persistent_direct_group1_load_uses_native_terminal_return() -> None:
         )
 
 
+def test_persistent_direct_group1_slow_log_sums_page_buffers() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    key = CacheEngineKey("model", 1, 0, 7, torch.float16)
+    engine.config = SimpleNamespace(dsa_group1_load_mode="persistent_direct_hbm")
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine._is_passive = lambda: False
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: [(0, 4, key)]
+    )
+    engine._ensure_layerwise_connector_layout = MagicMock()
+    engine.gpu_connector = SimpleNamespace(
+        plan_direct_page_destinations=lambda *_args: (
+            [[7, 8]],
+            [[3, 5]],
+            (object(),),
+        )
+    )
+    engine.storage_manager = SimpleNamespace(
+        batched_get_external_pages=lambda *_args: None
+    )
+    perf_log = MagicMock()
+    timestamps = iter(
+        (0.0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.2)
+    )
+
+    with (
+        patch.object(ascend_cache_engine, "cold_start_perf_enabled", return_value=True),
+        patch.object(
+            ascend_cache_engine,
+            "cold_start_perf_now",
+            side_effect=lambda: next(timestamps),
+        ),
+        patch.object(ascend_cache_engine, "cold_start_perf_log", perf_log),
+    ):
+        engine.load_group1_pages_direct(
+            [1, 2, 3, 4], torch.arange(4), [object()], None, "request"
+        )
+
+    assert perf_log.call_args.kwargs["bytes"] == 8
+
+
 def test_persistent_direct_group1_preflight_skips_sender() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(
@@ -4383,6 +4424,31 @@ def test_append_retrieve_group_accepts_empty_prefix():
     assert cached_memory_objs == new_objs
     assert cached_host_ptrs == [[11], [22]]
     assert [row.tolist() for row in cached_npu_ptrs] == [[11], [22]]
+
+
+def test_append_retrieve_group_forwards_deferred_pointer_copy():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 1
+    deferred = []
+
+    def append(_sources, host_ptrs, npu_ptrs, *, defer_copy=False):
+        deferred.append(defer_copy)
+        host_ptrs.append([11])
+        npu_ptrs.append(torch.tensor([11]))
+
+    engine.gpu_connector = SimpleNamespace(
+        append_sparse_chunk_ptr_cache_for_layers=append
+    )
+    engine._append_retrieve_group_cache(
+        [[_FakeTensorMemObj(torch.empty(1))]],
+        [],
+        [],
+        [],
+        [],
+        defer_pointer_copy=True,
+    )
+
+    assert deferred == [True]
 
 
 def test_append_retrieve_group_preserves_layer_page_sources():
