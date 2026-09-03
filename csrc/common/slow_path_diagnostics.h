@@ -3,7 +3,7 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
+#include <string>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -15,9 +15,23 @@ constexpr double kSlowPathMs = 100.0;
 inline bool enabled() {
   static const bool value = []() {
     const char *raw = std::getenv("LMCACHE_COLD_START_PERF");
-    return raw != nullptr && raw[0] != '\0' && std::strcmp(raw, "0") != 0 &&
-           std::strcmp(raw, "false") != 0 && std::strcmp(raw, "False") != 0 &&
-           std::strcmp(raw, "no") != 0 && std::strcmp(raw, "off") != 0;
+    if (raw == nullptr) {
+      return false;
+    }
+    std::string value(raw);
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+      return false;
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    value = value.substr(first, last - first + 1);
+    for (char &ch : value) {
+      if (ch >= 'A' && ch <= 'Z') {
+        ch = static_cast<char>(ch - 'A' + 'a');
+      }
+    }
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
   }();
   return value;
 }
