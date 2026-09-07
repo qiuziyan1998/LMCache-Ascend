@@ -16,6 +16,7 @@ from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     PreparedSparseSourceLayer,
+    build_prepared_sparse_source,
 )
 from lmcache.v1.memory_management import (
     LayerPageSource,
@@ -3267,6 +3268,83 @@ def test_prepared_sparse_rejects_nonstandard_chunk_coverage() -> None:
 
     with pytest.raises(ValueError, match="full non-tail chunks"):
         next(generator)
+
+
+@pytest.mark.parametrize("sealed,chunk_size", [(True, 4), (True, 2), (False, 4)])
+def test_prepared_chunk_validation_is_reused_safely(
+    sealed: bool,
+    chunk_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.lmcache_chunk_size = chunk_size
+    connector._group_layouts = {
+        0: SimpleNamespace(
+            k_hidden_dims=1,
+            v_hidden_dims=1,
+            dsa_hidden_dims=0,
+            kv_format=SimpleNamespace(value=0),
+            kv_device=torch.device("cpu"),
+        )
+    }
+    connector._sparse_lmc_host_interleaved = lambda group: False
+    connector._get_or_create_sparse_destination_plan = MagicMock()
+    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: False)
+    monkeypatch.setattr(
+        npu_connectors, "cold_start_perf_detailed_enabled", lambda: False
+    )
+    monkeypatch.setattr(
+        npu_connectors, "npu_content_diagnostics_enabled", lambda: False
+    )
+    if sealed:
+        source = build_prepared_sparse_source(
+            [[torch.empty(1), torch.empty(1)]],
+            [torch.tensor([1, 2], dtype=torch.long)],
+            num_layers=1,
+            total_tokens=6,
+            chunk_token_counts=(4, 2),
+            chunk_size=4,
+        )
+        assert source is not None
+    else:
+        source = PreparedSparseSource(
+            layers=(), total_tokens=4, chunk_token_counts=(2, 2)
+        )
+    generator = connector._batched_to_gpu_head_token_wise_prepared(
+        {
+            "prepared_sparse_source": source,
+            "kvcaches": [],
+            "slot_mapping": torch.empty(0, dtype=torch.long),
+        }
+    )
+    if sealed and chunk_size == 4:
+
+        def no_chunk_scan(*args: Any) -> None:
+            pytest.fail("warm reuse rescanned sealed chunk metadata")
+
+        monkeypatch.setattr(npu_connectors, "any", no_chunk_scan, raising=False)
+        assert next(generator) is None
+        generator.close()
+        connector._get_or_create_sparse_destination_plan.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="full non-tail chunks"):
+            next(generator)
+        connector._get_or_create_sparse_destination_plan.assert_not_called()
+
+
+def test_pointer_append_skips_perf_clocks_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: False)
+    monkeypatch.setattr(
+        npu_connectors,
+        "time",
+        SimpleNamespace(
+            perf_counter=MagicMock(side_effect=AssertionError("disabled perf clock")),
+            thread_time_ns=MagicMock(side_effect=AssertionError("disabled CPU clock")),
+        ),
+    )
+    test_group_pointer_append_can_defer_copy_to_dense_stream(monkeypatch)
 
 
 def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> None:

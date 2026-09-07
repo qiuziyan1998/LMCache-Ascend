@@ -2064,11 +2064,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 pointer_table = torch.tensor(
                     complete_rows, dtype=torch.long, device=self.kv_device
                 )
-            table_ms = (time.perf_counter() - table_started) * 1000
+            table_ms = (time.perf_counter() - table_started) * 1000 if diagnose else 0.0
             unbind_started = time.perf_counter() if diagnose else 0.0
             # The row views retain the table storage after this function returns.
             row_views = list(pointer_table.unbind(0))
-            unbind_ms = (time.perf_counter() - unbind_started) * 1000
+            unbind_ms = (
+                (time.perf_counter() - unbind_started) * 1000 if diagnose else 0.0
+            )
         else:
             table_ms = unbind_ms = 0.0
 
@@ -5071,9 +5073,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group == 0 and npu_content_diagnostics_enabled()
         )
         chunk_token_counts = source.chunk_token_counts
-        if chunk_token_counts and (
-            any(count != chunk_size for count in chunk_token_counts[:-1])
-            or chunk_token_counts[-1] > chunk_size
+        if (
+            getattr(source, "validated_chunk_size", None) != chunk_size
+            and chunk_token_counts
+            and (
+                any(count != chunk_size for count in chunk_token_counts[:-1])
+                or chunk_token_counts[-1] > chunk_size
+            )
         ):
             raise ValueError(
                 "Prepared sparse source requires full non-tail chunks and one "
