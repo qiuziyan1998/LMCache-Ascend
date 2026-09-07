@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import wraps
 from itertools import pairwise
 from threading import Condition, Thread, get_ident
@@ -1494,20 +1495,31 @@ class _GroupLayout:
         self.staging_bytes_per_slot: int = 0
 
 
+@dataclass(frozen=True, eq=False)
+class _SparseDestinationLayout:
+    """Worker-lifetime storage contract; KV contents may still change."""
+
+    kvcaches_ref: list
+    signature: tuple
+    tensor_refs: tuple
+
+
 class _SparseDestinationPlan:
     """Process-owned direct-retrieve states for one paged-KV group."""
 
-    __slots__ = ("kvcaches_ref", "signature", "states")
+    __slots__ = ("kvcaches_ref", "signature", "states", "binding")
 
     def __init__(
         self,
         kvcaches_ref: list,
         signature: tuple,
         states: tuple[Any, ...],
+        binding: Optional[_SparseDestinationLayout] = None,
     ) -> None:
         self.kvcaches_ref = kvcaches_ref
         self.signature = signature
         self.states = states
+        self.binding = binding
 
 
 class _SparseH2DStallWatchdog:
@@ -1720,6 +1732,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_validated_layers: set = set()
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
+        self._sealed_sparse_destination_layout: Optional[
+            _SparseDestinationLayout
+        ] = None
         self._direct_page_layout_cache: dict[
             int, tuple[tuple, list[tuple[int, int]]]
         ] = {}
@@ -2379,6 +2394,39 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ),
         )
 
+    def seal_sparse_destination_layout(
+        self, kvcaches_ref: list
+    ) -> Optional[_SparseDestinationLayout]:
+        """Seal final Group-0 buffers after capture, returning an opaque binding.
+
+        The caller must prevent storage/layout mutation for the worker lifetime.
+        Repeated calls validate refresh candidates and retain the canonical list;
+        a structural change raises RuntimeError. Disabled validation returns None.
+        Only tensor metadata is read; no device work is submitted.
+        """
+        if not self.enable_npu_transfer_validation:
+            return None
+        if len(kvcaches_ref) != self.num_layers:
+            raise ValueError("Cannot seal sparse destinations with wrong layer count")
+        signature = tuple(
+            self._vllm_layer_cache_identity_signature(layer) for layer in kvcaches_ref
+        )
+        binding = getattr(self, "_sealed_sparse_destination_layout", None)
+        if binding is not None:
+            if signature != binding.signature:
+                raise RuntimeError("Sealed sparse destinations changed; restart worker")
+            return binding
+        binding = _SparseDestinationLayout(
+            kvcaches_ref,
+            signature,
+            tuple(
+                (layer,) if isinstance(layer, torch.Tensor) else tuple(layer)
+                for layer in kvcaches_ref
+            ),
+        )
+        self._sealed_sparse_destination_layout = binding
+        return binding
+
     def _get_or_create_sparse_destination_plan(
         self,
         *,
@@ -2391,6 +2439,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_dsa_hidden_dims: int,
         expected_device: Optional[torch.device],
         diagnostics: Optional[dict[str, Any]] = None,
+        registered_destination_layout: Optional[_SparseDestinationLayout] = None,
     ) -> _SparseDestinationPlan:
         """Resolve process-invariant native states for one destination group."""
         resolve_started = time.perf_counter() if diagnostics is not None else 0.0
@@ -2407,6 +2456,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"device={slot_mapping_ref.device}, expected={expected_device}"
             )
 
+        binding = registered_destination_layout
+        if binding is not None and (
+            binding is not getattr(self, "_sealed_sparse_destination_layout", None)
+            or kv_group != 0
+            or kvcaches_ref is not binding.kvcaches_ref
+            or not self.enable_npu_transfer_validation
+        ):
+            raise RuntimeError("Stale or incompatible sparse destination binding")
         signature = (
             slot_mapping_ref.dtype,
             str(slot_mapping_ref.device),
@@ -2414,12 +2471,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int(sparse_k_hidden_dims),
             int(sparse_v_hidden_dims),
             int(sparse_dsa_hidden_dims),
-            tuple(
-                self._vllm_layer_cache_identity_signature(layer)
-                for layer in kvcaches_ref
-            )
-            if getattr(self, "enable_npu_transfer_validation", False)
-            else (),
+            binding.signature
+            if binding is not None
+            else (
+                tuple(
+                    self._vllm_layer_cache_identity_signature(layer)
+                    for layer in kvcaches_ref
+                )
+                if getattr(self, "enable_npu_transfer_validation", False)
+                else ()
+            ),
         )
         plans = getattr(self, "_sparse_destination_plans", None)
         if plans is None:
@@ -2431,6 +2492,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             and plan.kvcaches_ref is kvcaches_ref
             and plan.signature == signature
         ):
+            if binding is not None and plan.binding is not binding:
+                # Associate an existing plan once. Later tuple comparisons skip
+                # the shared signature object by identity, without walking layers.
+                plan = _SparseDestinationPlan(
+                    kvcaches_ref, signature, plan.states, binding
+                )
             plans[kv_group] = plan
             if diagnostics is not None:
                 diagnostics["destination_plan_cache_hit"] = True
@@ -2450,7 +2517,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             for layer_id in range(self.num_layers)
         )
-        plan = _SparseDestinationPlan(kvcaches_ref, signature, states)
+        if (
+            binding is not None
+            and binding is not self._sealed_sparse_destination_layout
+        ):
+            raise RuntimeError("Sparse destination binding changed during preparation")
+        plan = _SparseDestinationPlan(kvcaches_ref, signature, states, binding)
         plans[kv_group] = plan
         while len(plans) > _SPARSE_DESTINATION_PLAN_CACHE_SIZE:
             del plans[next(iter(plans))]
@@ -5097,6 +5169,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
             expected_device=layout.kv_device,
             diagnostics=diagnostics,
+            registered_destination_layout=transfer_kwargs.get(
+                "registered_destination_layout"
+            ),
         )
 
         for layer_id, source_layer in enumerate(source.layers):

@@ -69,6 +69,12 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             )
         )
 
+    def seal_sparse_destination_layout(self) -> None:
+        """Forward the final staged-capture storage contract when supported."""
+        seal = getattr(self._lmcache_engine, "seal_sparse_destination_layout", None)
+        if callable(seal):
+            seal()
+
     def get_remote_fill_placement_info(
         self,
     ) -> dict[str, int | str | bool] | None:
