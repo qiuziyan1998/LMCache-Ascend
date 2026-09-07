@@ -12,16 +12,16 @@ namespace lmc::slow_diag {
 
 constexpr double kSlowPathMs = 100.0;
 
-inline bool enabled() {
-  static const bool value = []() {
+inline const std::string &mode() {
+  static const std::string value = []() -> std::string {
     const char *raw = std::getenv("LMCACHE_COLD_START_PERF");
     if (raw == nullptr) {
-      return false;
+      return "0";
     }
     std::string value(raw);
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) {
-      return false;
+      return "0";
     }
     const auto last = value.find_last_not_of(" \t\r\n");
     value = value.substr(first, last - first + 1);
@@ -30,9 +30,21 @@ inline bool enabled() {
         ch = static_cast<char>(ch - 'A' + 'a');
       }
     }
-    return value != "0" && value != "false" && value != "no" &&
-           value != "off";
+    return value;
   }();
+  return value;
+}
+
+inline bool enabled() {
+  static const bool value = mode() != "0" && mode() != "false" &&
+                            mode() != "no" && mode() != "off";
+  return value;
+}
+
+inline bool detailed_enabled() {
+  // Cache once, just as enabled() does. No environment parsing, timing-record
+  // allocation, or diagnostic clocks on ordinary prepared layer submissions.
+  static const bool value = mode() == "detail" || mode() == "device";
   return value;
 }
 

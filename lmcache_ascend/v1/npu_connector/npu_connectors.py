@@ -2,25 +2,26 @@
 # Standard
 from contextlib import contextmanager, nullcontext
 from functools import wraps
-import hashlib
 from itertools import pairwise
+from threading import Condition, Thread, get_ident
+from typing import Any, Generator, List, Optional, Sequence, Set, Union
+import hashlib
 import json
 import os
 import sys
-from threading import Condition, Thread, get_ident
 import time
 import traceback
-from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.cold_start_perf import (
+    cold_start_perf_detailed_enabled,
     cold_start_perf_enabled,
     cold_start_perf_log,
 )
+from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.gpu_connectors import (
     SGLangGPUConnector,
     SGLangLayerwiseGPUConnector,
@@ -49,8 +50,8 @@ from lmcache_ascend.v1.content_diagnostics import (
 )
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
-    batched_fused_sparse_single_layer_kv_transfer,
     batched_fused_single_layer_kv_transfer,
+    batched_fused_sparse_single_layer_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer_fast,
     dense_mla_dsa_batched_direct_kv_transfer_prepared,
@@ -62,7 +63,6 @@ from lmcache_ascend.v1.npu_connector.utils import (
     sparse_mla_dsa_batched_direct_kv_transfer_prepared,
 )
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
-
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -1875,7 +1875,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         new_sources: List[Union[torch.Tensor, MemoryObj]],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
-        cached_chunk_ptr_table_npu: Optional[List[torch.Tensor]] = None,
     ) -> None:
         """Resolve and append NPU device ptrs for newly retrieved chunks only."""
         if not new_sources:
@@ -1893,21 +1892,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         updated_ptrs_npu = None
         if cached_chunk_ptrs_npu is not None:
-            existing_host = (
-                cached_chunk_dev_ptrs[layer_id]
-                if layer_id < len(cached_chunk_dev_ptrs)
-                else []
-            )
-            if cached_chunk_ptr_table_npu is not None:
-                cached_chunk_ptr_table_npu.clear()
             new_ptrs_npu = torch.tensor(
-                (
-                    [*existing_host, *new_dev_ptrs]
-                    if cached_chunk_ptr_table_npu is not None
-                    else new_dev_ptrs
-                ),
-                dtype=torch.long,
-                device=self.kv_device,
+                new_dev_ptrs, dtype=torch.long, device=self.kv_device
             )
             existing = (
                 cached_chunk_ptrs_npu[layer_id]
@@ -1916,7 +1902,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             updated_ptrs_npu = (
                 new_ptrs_npu
-                if existing is None or cached_chunk_ptr_table_npu is not None
+                if existing is None
                 else torch.cat((existing, new_ptrs_npu), dim=0)
             )
 
@@ -1947,7 +1933,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
-        cached_chunk_ptr_table_npu: Optional[List[torch.Tensor]] = None,
         *,
         defer_copy: bool = False,
     ) -> None:
@@ -2000,7 +1985,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             staged_rows,
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
-            cached_chunk_ptr_table_npu,
             defer_copy=defer_copy,
         )
         if diagnose:
@@ -2022,7 +2006,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sources_by_layer: List[LayerPageSource],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
-        cached_chunk_ptr_table_npu: Optional[List[torch.Tensor]] = None,
         *,
         defer_copy: bool = False,
     ) -> bool:
@@ -2036,7 +2019,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             staged_rows,
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
-            cached_chunk_ptr_table_npu,
             defer_copy=defer_copy,
         )
         return True
@@ -2046,7 +2028,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         staged_rows: list[list[int]],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
-        cached_chunk_ptr_table_npu: Optional[List[torch.Tensor]] = None,
         *,
         defer_copy: bool = False,
     ) -> None:
@@ -2073,10 +2054,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ]
         row_views = None
         table_started = time.perf_counter() if diagnose else 0.0
-        if (
-            cached_chunk_ptrs_npu is not None
-            or cached_chunk_ptr_table_npu is not None
-        ):
+        if cached_chunk_ptrs_npu is not None:
             if defer_copy:
                 pointer_table = self.stage_dense_load_tensor(
                     torch.tensor(complete_rows, dtype=torch.long),
@@ -2087,14 +2065,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     complete_rows, dtype=torch.long, device=self.kv_device
                 )
             table_ms = (time.perf_counter() - table_started) * 1000
-            if cached_chunk_ptr_table_npu is not None:
-                cached_chunk_ptr_table_npu[:] = [pointer_table]
-                unbind_ms = 0.0
-            else:
-                unbind_started = time.perf_counter() if diagnose else 0.0
-                # Legacy callers retain one view per layer.
-                row_views = list(pointer_table.unbind(0))
-                unbind_ms = (time.perf_counter() - unbind_started) * 1000
+            unbind_started = time.perf_counter() if diagnose else 0.0
+            # The row views retain the table storage after this function returns.
+            row_views = list(pointer_table.unbind(0))
+            unbind_ms = (time.perf_counter() - unbind_started) * 1000
         else:
             table_ms = unbind_ms = 0.0
 
@@ -2110,11 +2084,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         for layer_id in range(self.num_layers):
             cached_chunk_dev_ptrs[layer_id].extend(staged_rows[layer_id])
             if cached_chunk_ptrs_npu is not None:
-                if cached_chunk_ptr_table_npu is not None:
-                    cached_chunk_ptrs_npu[layer_id] = None
-                else:
-                    assert row_views is not None
-                    cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
+                assert row_views is not None
+                cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
         if diagnose:
             _log_cold_perf_slow(
                 "sparse_pointer_table_publish_slow",
@@ -2124,7 +2095,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 chunks=len(complete_rows[0]),
                 table_h2d_submit_ms=round(table_ms, 3),
                 unbind_ms=round(unbind_ms, 3),
-                packed=cached_chunk_ptr_table_npu is not None,
             )
 
     def _layer_page_pointer_rows(
@@ -3189,13 +3159,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
         if total_tokens <= 0:
             return
-        num_chunks = (
-            int(chunk_ptrs_npu.shape[1])
-            if chunk_ptrs_npu.ndim == 2
-            else int(chunk_ptrs_npu.numel())
-        )
         self._validate_sparse_fixed_chunk_coverage(
-            num_chunks, int(chunk_size), int(total_tokens)
+            int(chunk_ptrs_npu.numel()), int(chunk_size), int(total_tokens)
         )
         sparse_mla_dsa_batched_direct_kv_transfer_prepared(
             plan.states[layer_id],
@@ -5068,9 +5033,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         req_id = transfer_kwargs.get("req_id")
         frontier = int(transfer_kwargs.get("lmcache_cached_tokens", 0) or 0)
         diagnostics = transfer_kwargs.get("_cold_perf_breakdown")
-        if not isinstance(diagnostics, dict):
+        if not cold_start_perf_enabled() or not isinstance(diagnostics, dict):
             diagnostics = None
-        perf_enabled = cold_start_perf_enabled()
+        # Warm layers execute at token frequency. Coarse perf logging must not
+        # collect several wall/CPU clocks and allocate rounded fields per layer.
+        perf_enabled = cold_start_perf_detailed_enabled()
         submit_count = 0
         submit_sum_s = submit_max_s = 0.0
         submit_max_layer = -1
@@ -5215,14 +5182,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     layer_cache=kvcaches_snapshot[layer_id],
                 )
             diagnostic_done = time.perf_counter() if perf_enabled else 0.0
-            chunk_ptrs_npu = source.chunk_ptr_table_npu
-            if chunk_ptrs_npu is None:
-                chunk_ptrs_npu = source_layer.chunk_ptrs_npu
-            if chunk_ptrs_npu is None:
-                raise RuntimeError("Prepared sparse source has no pointer table.")
             self._run_prepared_sparse_direct_kv_transfer_layer(
                 plan=destination_plan,
-                chunk_ptrs_npu=chunk_ptrs_npu,
+                chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
                 layer_id=layer_id,
                 slot_mapping_packed=slot_mapping_packed,
                 selected_token_idx=selected_token_idx,
@@ -5242,20 +5204,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 submit_thread_cpu_ns += (
                     time.thread_time_ns() - submit_thread_started
                 )
-                _log_cold_perf_slow(
-                    "prepared_sparse_layer_slow",
-                    submit_started,
-                    submit_thread_started,
-                    req_id=req_id or "unspecified",
-                    kv_group=kv_group,
-                    layer_id=layer_id,
-                    unpack_ms=round((unpack_done - submit_started) * 1000, 3),
-                    normalize_ms=round((normalize_done - unpack_done) * 1000, 3),
-                    pack_ms=round((pack_done - normalize_done) * 1000, 3),
-                    limit_ms=round((limit_done - pack_done) * 1000, 3),
-                    diagnostic_ms=round((diagnostic_done - limit_done) * 1000, 3),
-                    native_submit_ms=round((native_done - diagnostic_done) * 1000, 3),
-                )
+                if submit_elapsed * 1000 >= _COLD_PERF_SLOW_MS:
+                    _log_cold_perf_slow(
+                        "prepared_sparse_layer_slow",
+                        submit_started,
+                        submit_thread_started,
+                        req_id=req_id or "unspecified",
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        unpack_ms=round((unpack_done - submit_started) * 1000, 3),
+                        normalize_ms=round((normalize_done - unpack_done) * 1000, 3),
+                        pack_ms=round((pack_done - normalize_done) * 1000, 3),
+                        limit_ms=round((limit_done - pack_done) * 1000, 3),
+                        diagnostic_ms=round((diagnostic_done - limit_done) * 1000, 3),
+                        native_submit_ms=round(
+                            (native_done - diagnostic_done) * 1000, 3
+                        ),
+                    )
             if capture_content and layer_id == 0:
                 source_tensors = list(source_layer.tensors)
                 for memory_obj in (

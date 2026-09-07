@@ -4,12 +4,24 @@
 from collections import deque
 from concurrent.futures import Future
 from contextlib import nullcontext
-import ctypes
-import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 from weakref import WeakSet
+import ctypes
+import threading
+
+from lmcache.utils import CacheEngineKey
+from lmcache.v1.cache_engine import LayerwiseStoreResult
+from lmcache.v1.gpu_connector.sparse import (
+    PreparedSparseSource,
+    PreparedSparseSourceLayer,
+)
+from lmcache.v1.memory_management import (
+    LayerPageSource,
+    MemoryFormat,
+    TensorMemoryAllocator,
+)
 
 # Third Party
 from lmcache_tests.v1.test_gpu_connector import (
@@ -21,29 +33,19 @@ from lmcache_tests.v1.test_gpu_connector import (
 from lmcache_tests.v1.test_gpu_connector import (
     test_vllm_paged_connector_v2_to_gpu_bench as original_test_vllm_paged_connector_v2_to_gpu_bench,
 )
-from lmcache.v1.cache_engine import LayerwiseStoreResult
-from lmcache.v1.gpu_connector.sparse import (
-    PreparedSparseSource,
-    PreparedSparseSourceLayer,
-)
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import (
-    LayerPageSource,
-    MemoryFormat,
-    TensorMemoryAllocator,
-)
 import pytest
 import torch
+
+from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 # First Party
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
 )
-from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
+import lmcache_ascend.c_ops as lmc_ops
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
-import lmcache_ascend.c_ops as lmc_ops
 
 
 def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
@@ -1361,31 +1363,6 @@ def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
         obj.ref_count_down()
 
 
-def test_group_pointer_append_retains_packed_table_without_row_views(
-    monkeypatch,
-) -> None:
-    connector = _make_sparse_pack_connector()
-    connector.num_layers = 2
-    monkeypatch.setattr(
-        connector,
-        "_resolve_registered_cpu_source_device_ptr",
-        lambda _source, *, layer_id, chunk_index, **_kwargs: (
-            100 * layer_id + chunk_index
-        ),
-    )
-    host_rows, npu_rows, packed = [], [], []
-
-    connector.append_sparse_chunk_ptr_cache_for_layers(
-        [[object(), object()], [object(), object()]],
-        host_rows,
-        npu_rows,
-        packed,
-    )
-
-    assert packed[0].tolist() == [[0, 1], [100, 101]]
-    assert npu_rows == [None, None]
-
-
 def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> None:
     allocator = TensorMemoryAllocator(torch.zeros(32768, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
@@ -1500,8 +1477,8 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     monkeypatch.setattr(
         connector,
         "_resolve_registered_cpu_source_device_ptr",
-        lambda source, *, layer_id, chunk_index, **_kwargs: calls.append(
-            (source, layer_id, chunk_index)
+        lambda source_obj, *, layer_id, chunk_index, **_kwargs: calls.append(
+            (source_obj, layer_id, chunk_index)
         )
         or 100 * layer_id
         + chunk_index,
@@ -1617,6 +1594,36 @@ def test_sparse_pointer_resolution_prefers_complete_npu_cache(monkeypatch) -> No
     )
 
     assert resolved is cached
+
+
+def test_layer_pointer_append_uploads_only_new_pointers(monkeypatch) -> None:
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    host_rows = [[101, 202], [404]]
+    npu_rows = [torch.tensor(row, dtype=torch.long) for row in host_rows]
+    other_row = npu_rows[1]
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda *_args, **_kwargs: 303,
+    )
+    uploaded = []
+    tensor = torch.tensor
+
+    def track_tensor(values, **kwargs):
+        uploaded.append(list(values))
+        return tensor(values, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", track_tensor)
+
+    connector.append_sparse_chunk_ptr_cache_for_layer(
+        0, [object()], host_rows, npu_rows
+    )
+
+    assert uploaded == [[303]]
+    assert host_rows == [[101, 202, 303], [404]]
+    assert npu_rows[0].tolist() == [101, 202, 303]
+    assert npu_rows[1] is other_row
 
 
 def test_sparse_pointer_resolution_rebuilds_npu_cache_from_host_row(
@@ -3368,6 +3375,12 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
         lambda *args: calls.append(args),
     )
 
+    def fail_tensor_work(*_args, **_kwargs):
+        raise AssertionError("prepared launch copied or read back tensor inputs")
+
+    for operation in ("to", "copy_", "cpu", "item", "sum"):
+        monkeypatch.setattr(torch.Tensor, operation, fail_tensor_work)
+
     connector._run_prepared_sparse_direct_kv_transfer_layer(
         plan=plan,
         chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
@@ -3386,40 +3399,6 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     assert args[2] is selected
     assert args[3] is chunk_ptrs
     assert args[4:] == (256, 4, True, None, 0)
-
-
-def test_prepared_sparse_launch_passes_packed_table_and_layer_id(
-    monkeypatch,
-) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    states = (object(), object())
-    plan = npu_connectors._SparseDestinationPlan(
-        [object(), object()],
-        (torch.long, "cpu", 0, 1, 1, 0),
-        states,
-    )
-    pointer_table = torch.tensor([[123], [456]], dtype=torch.int64)
-    calls = []
-    monkeypatch.setattr(
-        npu_connectors,
-        "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
-        lambda *args: calls.append(args),
-    )
-
-    connector._run_prepared_sparse_direct_kv_transfer_layer(
-        plan=plan,
-        chunk_ptrs_npu=pointer_table,
-        layer_id=1,
-        slot_mapping_packed=torch.arange(2, dtype=torch.long),
-        selected_token_idx=torch.arange(2, dtype=torch.int32),
-        chunk_size=256,
-        total_tokens=4,
-        sparse_host_interleaved=True,
-    )
-
-    assert calls[0][0] is states[1]
-    assert calls[0][3] is pointer_table
-    assert calls[0][-1] == 1
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
