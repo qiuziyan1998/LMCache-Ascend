@@ -1,7 +1,9 @@
 #include "mem_alloc.h"
 #include "managed_mem.h"
+#include "slow_path_diagnostics.h"
 #include <acl/acl.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib> // for std::getenv
 #include <cstring> // for strerror
 #include <errno.h>
@@ -104,7 +106,24 @@ void free_pinned_numa_ptr(uintptr_t p, std::size_t size) {
 }
 
 static void first_touch(void *p, size_t size) {
+#ifdef MADV_POPULATE_WRITE
+  // Populate the page tables in the kernel instead of taking one user-space
+  // write fault per page. This runs only on a newly reserved, zero-filled slab,
+  // while the creator's NUMA policy is still active. Older kernels retain the
+  // existing path; resource failures must still abort initialization.
+  if (madvise(p, size, MADV_POPULATE_WRITE) == 0) {
+    return;
+  }
+  const int err = errno;
+  if (err != EINVAL && err != ENOSYS && err != EOPNOTSUPP) {
+    throw std::runtime_error(std::string("shared slab prefault failed: ") +
+                             strerror(err));
+  }
+#endif
   const long ps = sysconf(_SC_PAGESIZE);
+  if (ps <= 0) {
+    throw std::runtime_error("unable to determine shared slab page size");
+  }
   for (size_t off = 0; off < size; off += ps) {
     volatile char *c = reinterpret_cast<volatile char *>(p) + off;
     *c = 0;
@@ -112,6 +131,47 @@ static void first_touch(void *p, size_t size) {
 }
 
 namespace {
+
+class ShmStartupPhase {
+ public:
+  ShmStartupPhase(const char *phase, std::size_t size)
+      : enabled_(lmc::slow_diag::enabled()), phase_(phase), size_(size),
+        started_(enabled_ ? lmc::slow_diag::wall_ns() : 0),
+        cpu_started_(enabled_ ? lmc::slow_diag::thread_cpu_ns() : 0) {
+    if (enabled_) {
+      std::fprintf(stderr,
+                   "[LMCACHE_COLD_PERF_NATIVE] {\"schema\":1,\"event\":"
+                   "\"shared_slab_phase_start\",\"phase\":\"%s\",\"pid\":%ld,"
+                   "\"tid\":%ld,\"bytes\":%zu,\"monotonic_ns\":%lld}\n",
+                   phase_, static_cast<long>(getpid()),
+                   lmc::slow_diag::thread_id(), size_,
+                   static_cast<long long>(started_));
+    }
+  }
+
+  void complete() const {
+    if (enabled_) {
+      const auto completed = lmc::slow_diag::wall_ns();
+      const auto cpu_completed = lmc::slow_diag::thread_cpu_ns();
+      std::fprintf(stderr,
+                   "[LMCACHE_COLD_PERF_NATIVE] {\"schema\":1,\"event\":"
+                   "\"shared_slab_phase_complete\",\"phase\":\"%s\",\"pid\":%ld,"
+                   "\"tid\":%ld,\"bytes\":%zu,\"elapsed_ms\":%.3f,"
+                   "\"thread_cpu_ms\":%.3f}\n",
+                   phase_, static_cast<long>(getpid()),
+                   lmc::slow_diag::thread_id(), size_,
+                   lmc::slow_diag::elapsed_ms(started_, completed),
+                   lmc::slow_diag::elapsed_ms(cpu_started_, cpu_completed));
+    }
+  }
+
+ private:
+  const bool enabled_;
+  const char *phase_;
+  const std::size_t size_;
+  const int64_t started_;
+  const int64_t cpu_started_;
+};
 
 class ScopedInterleavePolicy {
  public:
@@ -220,7 +280,9 @@ uintptr_t alloc_shm_pinned_ptr(
   }
 
   try {
+    ShmStartupPhase phase("reserve", size);
     reserve_shm_storage(fd, size, shm_name);
+    phase.complete();
   } catch (...) {
     close(fd);
     shm_unlink(shm_name.c_str());
@@ -236,13 +298,16 @@ uintptr_t alloc_shm_pinned_ptr(
   }
 
   try {
+    ShmStartupPhase phase("populate", size);
     first_touch(ptr, size);
+    phase.complete();
     numa_policy.restore();
   } catch (...) {
     munmap(ptr, size);
     shm_unlink(shm_name.c_str());
     throw;
   }
+  ShmStartupPhase phase("owner_register", size);
   auto devPtr = register_ptr(ptr, size);
   if (devPtr == nullptr) {
     munmap(ptr, size);
@@ -250,6 +315,7 @@ uintptr_t alloc_shm_pinned_ptr(
     throw std::runtime_error(std::string("register_ptr failed for ") +
                              shm_name);
   }
+  phase.complete();
 
   return reinterpret_cast<uintptr_t>(ptr);
 }
@@ -278,12 +344,14 @@ uintptr_t attach_shm_pinned_ptr(std::size_t size, const std::string &shm_name,
                              ": " + strerror(errno));
   }
 
+  ShmStartupPhase phase("attach_register", size);
   auto devPtr = register_ptr(ptr, size);
   if (devPtr == nullptr) {
     munmap(ptr, size);
     throw std::runtime_error(std::string("register_ptr attach failed for ") +
                              shm_name);
   }
+  phase.complete();
 
   return reinterpret_cast<uintptr_t>(ptr);
 }
