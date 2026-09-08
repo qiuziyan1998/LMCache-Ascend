@@ -4182,7 +4182,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             expected_device=layout.kv_device,
         )
 
-        for layer_id, source_layer in enumerate(source.layers):
+        start_layer = int(transfer_kwargs.get("prepared_start_layer", 0))
+        if not 0 <= start_layer < len(source.layers):
+            raise ValueError("prepared_start_layer is outside the source")
+        for layer_id in range(start_layer, len(source.layers)):
+            source_layer = source.layers[layer_id]
             sparse_request = yield
 
             (

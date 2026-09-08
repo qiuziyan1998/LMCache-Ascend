@@ -3901,7 +3901,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**retrieve_kwargs)
         next(consumer)
         try:
-            for _ in prepared_source.layers:
+            start_layer = int(retrieve_kwargs.get("prepared_start_layer", 0))
+            if not 0 <= start_layer < len(prepared_source.layers):
+                raise ValueError("prepared_start_layer is outside the source")
+            for _ in prepared_source.layers[start_layer:]:
                 sparse_request = yield ret_mask
                 consumer.send(sparse_request)
             next(consumer)
