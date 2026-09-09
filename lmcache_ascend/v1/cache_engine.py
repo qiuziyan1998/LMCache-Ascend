@@ -65,7 +65,6 @@ from lmcache.v1.mooncake_layout import (
 from lmcache.v1.remote_fill import (
     ControlPage,
     OperationKind,
-    ProtocolLimits,
     log_remote_fill_diagnostic,
 )
 from lmcache.v1.remote_fill.native import (
@@ -101,6 +100,7 @@ from lmcache_ascend.v1.remote_fill import (
     DecoderRemoteFillRuntime,
     RemoteFillDecoderLayout,
     build_decoder_layout,
+    build_remote_fill_protocol_limits,
     create_decoder_remote_fill_runtime,
     remote_fill_token_hash_identity,
 )
@@ -1297,27 +1297,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             metrics.add_gauge("inflight_windows", -1)
             metrics.add_gauge("inflight_bytes", -byte_count)
 
-    def _remote_fill_protocol_limits(self) -> ProtocolLimits:
-        return ProtocolLimits(
-            max_rpc_message_bytes=int(
-                self.config.remote_fill_max_rpc_message_bytes
-            ),
-            max_control_pages_per_window=int(
-                self.config.remote_fill_max_control_pages_per_window
-            ),
-            max_window_bytes=int(self.config.remote_fill_max_inflight_bytes),
-            max_active_transactions=int(
-                self.config.remote_fill_max_active_transactions
-            ),
-            max_inflight_windows_per_transaction=int(
-                self.config.remote_fill_max_inflight_windows_per_request
-            ),
-            max_reserved_bytes=int(self.config.remote_fill_max_reserved_bytes),
-            max_bytes_per_transaction=int(
-                self.config.remote_fill_max_bytes_per_request
-            ),
-        )
-
     def _remote_fill_immutable_layout(self) -> tuple[str, RemoteFillDecoderLayout]:
         """Build the startup-immutable source layout once after opt-in."""
 
@@ -1387,7 +1366,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         handoff = state.remote_fill_handoff
         if handoff is None:
             raise RuntimeError("remote-fill handoff is unavailable")
-        limits = self._remote_fill_protocol_limits()
+        limits = build_remote_fill_protocol_limits(self.config)
         verification_key = handoff.descriptor_verification_key
         static_spec = self._remote_fill_static_spec(handoff)
         factory = getattr(self, "_remote_fill_client_factory", None)

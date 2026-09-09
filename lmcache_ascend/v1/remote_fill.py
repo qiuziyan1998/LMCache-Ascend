@@ -62,6 +62,23 @@ REMOTE_FILL_MODEL_LAYOUT = "mla-dsa-layer-page-v3"
 _DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES = 32
 
 
+def build_remote_fill_protocol_limits(config: LMCacheEngineConfig) -> ProtocolLimits:
+    """Resolve producer and decoder protocol limits with the same field mapping."""
+    return ProtocolLimits(
+        max_rpc_message_bytes=int(config.remote_fill_max_rpc_message_bytes),
+        max_control_pages_per_window=int(
+            config.remote_fill_max_control_pages_per_window
+        ),
+        max_window_bytes=int(config.remote_fill_max_inflight_bytes),
+        max_active_transactions=int(config.remote_fill_max_active_transactions),
+        max_inflight_windows_per_transaction=int(
+            config.remote_fill_max_inflight_windows_per_request
+        ),
+        max_reserved_bytes=int(config.remote_fill_max_reserved_bytes),
+        max_bytes_per_transaction=int(config.remote_fill_max_bytes_per_request),
+    )
+
+
 def remote_fill_token_hash_identity(
     hash_algorithm: str,
     chunk_hash_type: type[int] | type[bytes],
@@ -1507,19 +1524,7 @@ def create_decoder_remote_fill_runtime(
     engine_id = str(metadata.engine_id or "").strip()
     if not engine_id:
         raise ValueError("remote-fill decoder requires destination engine_id")
-    limits = ProtocolLimits(
-        max_rpc_message_bytes=int(config.remote_fill_max_rpc_message_bytes),
-        max_control_pages_per_window=int(
-            config.remote_fill_max_control_pages_per_window
-        ),
-        max_window_bytes=int(config.remote_fill_max_inflight_bytes),
-        max_active_transactions=int(config.remote_fill_max_active_transactions),
-        max_inflight_windows_per_transaction=int(
-            config.remote_fill_max_inflight_windows_per_request
-        ),
-        max_reserved_bytes=int(config.remote_fill_max_reserved_bytes),
-        max_bytes_per_transaction=int(config.remote_fill_max_bytes_per_request),
-    )
+    limits = build_remote_fill_protocol_limits(config)
     negotiation = build_remote_fill_negotiation_spec(
         config,
         metadata,
