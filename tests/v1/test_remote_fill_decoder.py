@@ -61,7 +61,7 @@ def test_post_init_emits_startup_stage_timings() -> None:
     )
     engine.is_store_async = False
     engine._direct_store_enabled = False
-    engine._group1_external_page_reader = None
+    engine._external_page_reader = None
     engine._is_passive = Mock(return_value=True)
     engine._initialize_decoder_remote_fill = Mock()
     reader = object()
@@ -84,7 +84,7 @@ def test_post_init_emits_startup_stage_timings() -> None:
     ):
         engine.post_init()
 
-    assert engine._group1_external_page_reader is reader
+    assert engine._external_page_reader is reader
     engine._initialize_decoder_remote_fill.assert_called_once_with()
     assert [call.args[1] for call in perf_log.call_args_list] == [
         "lmcache_base_post_init_start",
@@ -1689,7 +1689,7 @@ def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(
         lambda self, states: None,
     )
     engine._remote_fill_runtime = _SafeRuntime()
-    engine._group1_external_page_reader = None
+    engine._external_page_reader = None
     engine._remote_fill_fatal_transfers = ()
     engine._direct_store_states = {}
     engine._live_source_builders = {}
@@ -1712,7 +1712,7 @@ def test_prefiller_fatal_close_retains_native_owned_memory(
     reader = Mock()
     monkeypatch.setattr(LMCacheEngine, "close", base_close)
     engine._remote_fill_runtime = runtime
-    engine._group1_external_page_reader = reader
+    engine._external_page_reader = reader
     engine._remote_fill_fatal_transfers = ("producer-transfer",)
 
     with pytest.raises(RuntimeError, match="paired P\+D restart"):

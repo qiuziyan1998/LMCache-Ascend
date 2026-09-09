@@ -311,7 +311,7 @@ def test_persistent_direct_group1_preflight_rolls_back_startup_resources() -> No
         direct_page_layout_supported=lambda *_args: False
     )
     engine._remote_fill_runtime = runtime
-    engine._group1_external_page_reader = reader
+    engine._external_page_reader = reader
     engine._remote_fill_decoder_initialized = True
 
     with pytest.raises(RuntimeError, match="direct-HBM preflight failed"):
@@ -320,7 +320,7 @@ def test_persistent_direct_group1_preflight_rolls_back_startup_resources() -> No
     runtime.close.assert_called_once_with()
     reader.close.assert_called_once_with()
     assert engine._remote_fill_runtime is None
-    assert engine._group1_external_page_reader is None
+    assert engine._external_page_reader is None
     assert engine._remote_fill_decoder_initialized is False
 
 

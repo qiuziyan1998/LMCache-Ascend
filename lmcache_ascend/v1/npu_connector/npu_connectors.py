@@ -3765,6 +3765,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Check direct-store eligibility without scanning request slot mappings."""
         return self._direct_page_tensor_layout(kvcaches, kv_group) is not None
 
+    def direct_page_load_supported(self, kvcaches: list, kv_group: int) -> bool:
+        """Check destination layout and the direct-load disable switch."""
+        return not _DENSE_DIRECT_LOAD_DISABLE and self.direct_page_layout_supported(
+            kvcaches, kv_group
+        )
+
     def direct_page_token_widths(
         self, kvcaches: list, kv_group: int
     ) -> Optional[tuple[int, ...]]:
