@@ -69,8 +69,6 @@ from lmcache.v1.remote_fill import (
 )
 from lmcache.v1.remote_fill.native import (
     DIRECT_PUSH_H0_QUALIFICATION_V1,
-    DirectPushPageSource,
-    DirectPushSourcePlan,
     NativeDirectPushActivation,
     NativeExternalPageTransferUnknownError,
 )
@@ -95,6 +93,12 @@ from lmcache_ascend.v1.content_diagnostics import (
     log_shared_page_source_fingerprint,
     npu_content_diagnostics_enabled,
     queue_store_time_source_fingerprint,
+)
+from lmcache_ascend.v1.direct_store_plan import (
+    DirectPageBatch as _DirectPageBatch,
+    build_remote_fill_source_plan,
+    merge_deferred_remote_fill_batches,
+    select_remote_fill_batch_pages,
 )
 from lmcache_ascend.v1.remote_fill import (
     DecoderRemoteFillRuntime,
@@ -274,17 +278,6 @@ class _DirectStoreRequestState:
     remote_fill_persistent_started_at: float = 0.0
 
 
-@dataclass(slots=True)
-class _DirectPageBatch:
-    req_id: str
-    keys: List[CacheEngineKey]
-    ptrs: List[List[int]]
-    sizes: List[List[int]]
-    owners: tuple[torch.Tensor, ...]
-    ready_event: Any
-    group_ends: dict[int, int]
-    ranges: tuple[tuple[int, int], ...] = ()
-    ready_events: tuple[Any, ...] = ()
 
 
 
@@ -1491,49 +1484,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         return maximum - maximum % group_count
 
-    @staticmethod
-    def _remote_fill_select_batch_pages(
-        batch: _DirectPageBatch,
-        pages: tuple[ControlPage, ...],
-    ) -> _DirectPageBatch:
-        """Select one bounded control window from an existing source batch."""
-
-        sources = {
-            (key.to_string(), int(key.kv_group)): (
-                key,
-                page_ptrs,
-                page_sizes,
-                page_range,
-            )
-            for key, page_ptrs, page_sizes, page_range in zip(
-                batch.keys,
-                batch.ptrs,
-                batch.sizes,
-                batch.ranges,
-                strict=True,
-            )
-        }
-        if len(sources) != len(batch.keys):
-            raise ValueError("remote-fill source page identity is duplicated")
-        selected = [
-            sources[(page.canonical_key, page.kv_group)] for page in pages
-        ]
-        group_ends: dict[int, int] = {}
-        for page, (_, _, _, (_, end)) in zip(pages, selected, strict=True):
-            group_ends[page.kv_group] = max(
-                group_ends.get(page.kv_group, 0), end
-            )
-        return _DirectPageBatch(
-            req_id=batch.req_id,
-            keys=[item[0] for item in selected],
-            ptrs=[item[1] for item in selected],
-            sizes=[item[2] for item in selected],
-            owners=batch.owners,
-            ready_event=batch.ready_event,
-            group_ends=group_ends,
-            ranges=tuple(item[3] for item in selected),
-            ready_events=batch.ready_events,
-        )
+    _remote_fill_select_batch_pages = staticmethod(select_remote_fill_batch_pages)
 
     def _remote_fill_validate_page_pairs(
         self,
@@ -1733,56 +1684,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         state.remote_fill_futures.append(future)
         state.remote_fill_last_future = future
 
-    @staticmethod
-    def _remote_fill_source_plan(batch: _DirectPageBatch) -> DirectPushSourcePlan:
-        pages = tuple(
-            DirectPushPageSource(
-                canonical_key=key.to_string(),
-                kv_group=int(key.kv_group),
-                source_ptrs=tuple(page_ptrs),
-                source_lengths=tuple(page_sizes),
-            )
-            for key, page_ptrs, page_sizes in zip(
-                batch.keys, batch.ptrs, batch.sizes, strict=True
-            )
-        )
-        if not batch.ready_events:
-            raise ValueError("remote fill requires complete producer fences")
-        return DirectPushSourcePlan(
-            pages=pages,
-            owners=batch.owners,
-            producer_events=batch.ready_events,
-        )
+    _remote_fill_source_plan = staticmethod(build_remote_fill_source_plan)
 
-    @staticmethod
-    def _merge_deferred_remote_fill_batches(
-        batches: list[_DirectPageBatch],
-        ready_events: tuple[Any, ...],
-    ) -> _DirectPageBatch:
-        """Join window-owned source plans under the final causal fence."""
-
-        if not batches or not ready_events:
-            raise ValueError("deferred remote fill requires sources and fences")
-        req_id = batches[0].req_id
-        if any(batch.req_id != req_id for batch in batches):
-            raise ValueError("deferred remote-fill batches span requests")
-        owners: dict[int, torch.Tensor] = {}
-        group_ends: dict[int, int] = {}
-        for batch in batches:
-            owners.update((id(owner), owner) for owner in batch.owners)
-            for group, end in batch.group_ends.items():
-                group_ends[group] = max(group_ends.get(group, 0), end)
-        return _DirectPageBatch(
-            req_id=req_id,
-            keys=[key for batch in batches for key in batch.keys],
-            ptrs=[ptrs for batch in batches for ptrs in batch.ptrs],
-            sizes=[sizes for batch in batches for sizes in batch.sizes],
-            owners=tuple(owners.values()),
-            ready_event=ready_events[-1],
-            group_ends=group_ends,
-            ranges=tuple(page for batch in batches for page in batch.ranges),
-            ready_events=ready_events,
-        )
+    _merge_deferred_remote_fill_batches = staticmethod(merge_deferred_remote_fill_batches)
 
     def _schedule_remote_fill_batch(
         self,
