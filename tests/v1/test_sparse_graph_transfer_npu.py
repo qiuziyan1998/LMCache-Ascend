@@ -17,7 +17,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_one_capture_replays_live_topk_and_growing_cpu_history():
+@pytest.mark.parametrize("request_capacity", [1, 4, 16])
+def test_one_capture_replays_live_topk_and_growing_cpu_history(request_capacity):
     from lmcache.v1.gpu_connector.sparse import (
         PreparedSparseSource,
         PreparedSparseSourceLayer,
@@ -77,36 +78,59 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history():
             (source_for((13,), 1000), [0, 3, 11, 12], 1000),
         ]
         caches = tuple(
-            torch.full((4, 16, 1, width), -7, dtype=dtype, device=device)
+            torch.full(
+                ((request_capacity * 4 + 15) // 16 + 1, 16, 1, width),
+                -7,
+                dtype=dtype,
+                device=device,
+            )
             for width in (k_width, pe_width)
         )
-        slots = torch.arange(4, dtype=torch.int64, device=device).view(1, 4)
-        counts = torch.full((1,), 4, dtype=torch.int32, device=device)
-        scores = torch.zeros(1024, device=device)
-        transfer = SparseGraphTransfer(caches, slots, chunk_size, 1024)
-        transfer.load(torch.topk(scores, 4).indices.view(1, 4), counts, slots)
+        slots = torch.arange(
+            request_capacity * 4, dtype=torch.int64, device=device
+        ).view(request_capacity, 4)
+        counts = torch.full((request_capacity,), 4, dtype=torch.int32, device=device)
+        scores = torch.zeros((request_capacity, 1024), device=device)
+        transfer = SparseGraphTransfer(
+            caches, slots, chunk_size, 1024, request_capacity=request_capacity
+        )
+        transfer.load(torch.topk(scores, 4).indices, counts, slots)
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            selected = torch.topk(scores, 4).indices.view(1, 4)
+            selected = torch.topk(scores, 4).indices
             transfer.load(selected, counts, slots)
         addresses = (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
-        for source, tokens, offset in cases:
-            transfer.bind(source, 0)
+        for step in range(len(cases)):
+            lane_cases = [
+                cases[(step + lane) % len(cases)] for lane in range(request_capacity)
+            ]
+            sources = [case[0] for case in lane_cases]
+            if request_capacity > 1:
+                sources[-1] = None
+            transfer.bind_batch(sources, 0)
             scores.fill_(-1000)
-            for rank, token in enumerate(tokens):
-                scores[token] = 10 - rank
+            for lane, (_, tokens, _) in enumerate(lane_cases):
+                for rank, token in enumerate(tokens):
+                    scores[lane, token] = 10 - rank
             for cache in caches:
                 cache.fill_(-7)
             graph.replay()
             torch.npu.synchronize()
-            assert selected.cpu().tolist() == [tokens]
+            assert selected.cpu().tolist() == [case[1] for case in lane_cases]
             for plane, cache in enumerate(caches):
                 flat = cache.view(-1, cache.shape[-1])
-                for slot, token in enumerate(tokens):
-                    expected = torch.full_like(flat[slot], offset + token + plane * 100)
-                    torch.testing.assert_close(flat[slot], expected, rtol=0, atol=0)
-                assert flat[4:].eq(-7).all().item()
+                for lane, (_, tokens, offset) in enumerate(lane_cases):
+                    for column, token in enumerate(tokens):
+                        slot = lane * 4 + column
+                        value = (
+                            -7
+                            if sources[lane] is None
+                            else offset + token + plane * 100
+                        )
+                        expected = torch.full_like(flat[slot], value)
+                        torch.testing.assert_close(flat[slot], expected, rtol=0, atol=0)
+                assert flat[request_capacity * 4 :].eq(-7).all().item()
             assert addresses == (
                 transfer.ptrs.data_ptr(),
                 transfer.valid_tokens.data_ptr(),
@@ -116,7 +140,7 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history():
             if clear_source:
                 transfer.clear_source()
             else:
-                transfer.bind(cases[0][0], 0)
+                transfer.bind_batch([cases[0][0]] * request_capacity, 0)
                 counts.zero_()
             for cache in caches:
                 cache.fill_(-7)

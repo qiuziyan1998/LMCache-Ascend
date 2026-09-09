@@ -146,3 +146,38 @@ def test_native_graph_setup_initializes_npu_before_pinned_allocation():
             mock_call.host_allocator(64 * 1024 * 1024),
         ]
     )
+
+
+@pytest.mark.parametrize("capacity", [4, 8, 12, 16])
+def test_batch_lanes_never_read_another_request_or_padding(transfer_module, capacity):
+    module, calls = transfer_module
+    transfer = module.SparseGraphTransfer(
+        (torch.zeros((32, 16, 1, 512)), torch.zeros((32, 16, 1, 64))),
+        torch.zeros((capacity, 4), dtype=torch.int64),
+        256,
+        1024,
+        request_capacity=capacity,
+    )
+    source_a = make_source([1000], [13])
+    source_b = make_source([2000, 3000], [256, 17])
+    addresses = (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
+    transfer.bind_batch((source_b, None, source_a), 0)
+    assert transfer.ptrs[0, 0] == 2000
+    assert transfer.ptrs[0, 8] == 1000
+    selected = torch.tensor([[0, 12, 256, 273]] * capacity)
+    slots = torch.arange(capacity * 4).reshape(capacity, 4)
+    counts = torch.full((capacity, 16), 4, dtype=torch.int32)
+    transfer.load(selected, counts, slots)
+    assert len(calls) == 2
+    sent = calls[-1]
+    assert sent[2][0].tolist() == [0, 12, 256, 0]
+    assert sent[2][2].tolist() == [2048, 2060, 0, 0]
+    assert sent[1][1].eq(-1).all() and sent[-1][1].eq(0).all()
+    assert sent[1][3:].eq(-1).all() and sent[-1][3:].eq(0).all()
+    assert sent[5] == capacity * 1024
+    transfer.bind_batch((source_a, source_b), 0)
+    assert transfer.valid_tokens[2:].eq(0).all()
+    assert addresses == (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
+    transfer.clear_source()
+    transfer.load(selected, counts, slots)
+    assert calls[-1][1].eq(-1).all() and calls[-1][-1].eq(0).all()

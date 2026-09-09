@@ -2,6 +2,7 @@
 """Fixed-address, device-selected sparse MLA transfers for ACL graph replay."""
 
 # Standard
+from collections.abc import Sequence
 from typing import Any
 
 # Third Party
@@ -34,6 +35,7 @@ class SparseGraphTransfer:
         slot_mapping: torch.Tensor,
         chunk_size: int,
         max_tokens: int,
+        request_capacity: int = 1,
     ) -> None:
         if chunk_size <= 0 or max_tokens <= 0:
             raise ValueError("chunk_size and max_tokens must be positive")
@@ -44,6 +46,12 @@ class SparseGraphTransfer:
         self.chunk_size = chunk_size
         self.max_tokens = max_tokens
         self.capacity = (max_tokens + chunk_size - 1) // chunk_size
+        if (
+            request_capacity <= 0
+            or request_capacity * self.capacity * chunk_size >= 2**31
+        ):
+            raise ValueError("Graph request capacity exceeds int32 token addressing")
+        self.request_capacity = request_capacity
         self.device = kv_caches[0].device
         self.slot_dtype = slot_mapping.dtype
         self.k_bytes = (
@@ -52,9 +60,15 @@ class SparseGraphTransfer:
             * kv_caches[0].element_size()
         )
         self.ptrs = torch.zeros(
-            (2, self.capacity), dtype=torch.int64, device=self.device
+            (2, request_capacity * self.capacity), dtype=torch.int64, device=self.device
         )
-        self.valid_tokens = torch.zeros((), dtype=torch.int32, device=self.device)
+        self.valid_tokens = torch.zeros(
+            (request_capacity, 1), dtype=torch.int32, device=self.device
+        )
+        self.lane_offsets = torch.arange(
+            request_capacity, dtype=torch.int32, device=self.device
+        ).view(-1, 1)
+        self.lane_offsets.mul_(self.capacity * chunk_size)
         self.states: tuple[Any, ...] = tuple(
             prepare_sparse_direct_destination_state(
                 [cache], slot_mapping, KVCacheFormat.DSA_INDEX.value, 0, 0, 0
@@ -64,6 +78,11 @@ class SparseGraphTransfer:
 
     def bind(self, source: PreparedSparseSource, layer_id: int) -> None:
         """Upload request pointers before forward, without changing addresses."""
+        if self.request_capacity != 1:
+            raise ValueError("Use bind_batch for multiple request lanes")
+        self.bind_batch((source,), layer_id)
+
+    def _validate_source(self, source: PreparedSparseSource, layer_id: int) -> None:
         counts = source.chunk_token_counts
         if (
             not counts
@@ -87,14 +106,32 @@ class SparseGraphTransfer:
             raise ValueError("Source pointer table and physical chunk lengths differ")
         if layer.chunk_ptrs_npu.device != self.device:
             raise ValueError("Source pointer table is on the wrong device")
-        # Use device aliases produced by the shared allocator, not CPU data_ptr.
-        count_tensor = torch.tensor(counts, dtype=torch.int64, device=self.device)
+
+    def bind_batch(
+        self, sources: Sequence[PreparedSparseSource | None], layer_id: int
+    ) -> None:
+        """Bind ordered request lanes; None and padded lanes cannot transfer KV."""
+        if len(sources) > self.request_capacity:
+            raise ValueError("Graph sources exceed request capacity")
+        # Validate every lane before overwriting any captured state.
+        for source in sources:
+            if source is not None:
+                self._validate_source(source, layer_id)
         self.ptrs.zero_()
-        self.ptrs[0, : len(counts)].copy_(layer.chunk_ptrs_npu)
-        self.ptrs[1, : len(counts)].copy_(
-            layer.chunk_ptrs_npu + count_tensor * self.k_bytes
-        )
-        self.valid_tokens.fill_(source.total_tokens)
+        self.valid_tokens.zero_()
+        for lane, source in enumerate(sources):
+            if source is None:
+                continue
+            counts = source.chunk_token_counts
+            layer = source.layers[layer_id]
+            count_tensor = torch.tensor(counts, dtype=torch.int64, device=self.device)
+            start = lane * self.capacity
+            end = start + len(counts)
+            self.ptrs[0, start:end].copy_(layer.chunk_ptrs_npu)
+            self.ptrs[1, start:end].copy_(
+                layer.chunk_ptrs_npu + count_tensor * self.k_bytes
+            )
+            self.valid_tokens[lane].fill_(source.total_tokens)
 
     def load(
         self,
@@ -103,10 +140,18 @@ class SparseGraphTransfer:
         slots: torch.Tensor,
     ) -> None:
         """Capture device top-k -> masked sparse copy, with no host inspection."""
+        if (
+            selected.shape[0] != self.request_capacity
+            or slots.shape != selected.shape
+            or counts.shape[0] != self.request_capacity
+        ):
+            raise ValueError("Graph payload does not match request capacity")
         valid = (selected >= 0) & (selected < self.valid_tokens)
-        safe_selected = torch.where(valid, selected, 0).to(torch.int32).contiguous()
+        virtual_selected = selected.to(torch.int32) + self.lane_offsets
+        safe_selected = torch.where(valid, virtual_selected, 0).contiguous()
         safe_slots = torch.where(valid, slots, -1).to(self.slot_dtype).contiguous()
-        safe_counts = counts.to(torch.int32).contiguous()
+        active = self.valid_tokens if counts.ndim == 2 else self.valid_tokens.view(-1)
+        safe_counts = torch.where(active > 0, counts, 0).to(torch.int32).contiguous()
         for plane, state in enumerate(self.states):
             sparse_mla_dsa_batched_direct_kv_transfer_prepared(
                 state,
@@ -114,7 +159,7 @@ class SparseGraphTransfer:
                 safe_selected,
                 self.ptrs[plane],
                 self.chunk_size,
-                self.capacity * self.chunk_size,
+                self.request_capacity * self.capacity * self.chunk_size,
                 False,
                 safe_counts,
             )
