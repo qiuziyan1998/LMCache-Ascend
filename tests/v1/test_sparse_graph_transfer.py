@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests for graph source tables; native capture is tested separately."""
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, call as mock_call
 
 import pytest
 import torch
@@ -97,3 +99,50 @@ def test_invalid_source_is_rejected_before_replay(transfer_module, counts, total
     transfer = make_transfer(module)
     with pytest.raises(ValueError, match="bounded chunk prefix"):
         transfer.bind(make_source([1000] * len(counts), counts, total), 0)
+
+
+def test_native_graph_setup_initializes_npu_before_pinned_allocation():
+    """Check the native test's bootstrap order without importing torch_npu."""
+    path = Path(__file__).with_name("test_sparse_graph_transfer_npu.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    native_test = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_one_capture_replays_live_topk_and_growing_cpu_history"
+    )
+    # Execute the actual setup through the first pinned allocation. Imports
+    # and NPU calls are stubbed; the real device behavior stays in the NPU test.
+    setup_statements = []
+    for statement in native_test.body:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            continue
+        setup_statements.append(statement)
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "allocator"
+            for target in statement.targets
+        ):
+            break
+    else:
+        pytest.fail("Native graph test has no pinned allocator setup")
+
+    runtime = Mock()
+    runtime.device.return_value = "npu:0"
+    namespace = {
+        "__file__": str(path),
+        "Path": Path,
+        "sys": SimpleNamespace(path=[]),
+        "torch": runtime,
+        "ensure_ascend_host_memory_registered": Mock(),
+        "PinMemoryAllocator": runtime.host_allocator,
+    }
+    setup = ast.Module(body=setup_statements, type_ignores=[])
+    exec(compile(setup, str(path), "exec"), namespace)
+    runtime.assert_has_calls(
+        [
+            mock_call.npu.set_device("npu:0"),
+            mock_call.zeros(1, device="npu:0"),
+            mock_call.npu.synchronize(),
+            mock_call.host_allocator(64 * 1024 * 1024),
+        ]
+    )

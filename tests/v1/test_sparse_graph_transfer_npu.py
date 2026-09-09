@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native ACL capture: real changing top-k, source pointers and partial tails.
 
-Run on the server before loading the model:
-pytest -q tests/v1/test_sparse_graph_transfer_npu.py
+Run from the repository root before loading the model:
+python -m pytest --confcutdir=tests/v1 tests/v1/test_sparse_graph_transfer_npu.py
 """
 
 import sys
@@ -34,6 +34,11 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history():
 
     ensure_ascend_host_memory_registered()
     device = torch.device("npu:0")
+    # Isolated pytest runs skip conftest.py's NPU bootstrap. A device
+    # descriptor alone does not create the context required by aclrtMallocHost.
+    torch.npu.set_device(device)
+    _ = torch.zeros(1, device=device)
+    torch.npu.synchronize()
     dtype = torch.bfloat16
     k_width, pe_width, chunk_size = 512, 64, 256
     allocator = PinMemoryAllocator(64 * 1024 * 1024)
