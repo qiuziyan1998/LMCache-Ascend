@@ -1462,8 +1462,14 @@ class RemoteFillProducerSession:
         self.closed = True
 
     def close(self) -> None:
-        """Close client resources after every queued operation has drained."""
+        """Close drained resources; raise on fatal state and retain prepared owners."""
 
+        if self.fatal_restart_required or (
+            self._terminal is not None and self._terminal.outcome == "FATAL_RESTART"
+        ):
+            raise RemoteFillFatalError(
+                "cannot close an ambiguous armed remote-fill transaction"
+            )
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
@@ -1607,3 +1613,4 @@ class RemoteFillProducerSession:
             reason=reason,
             **metrics,
         )
+

@@ -3578,6 +3578,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Forget completed request bookkeeping after vLLM releases ownership."""
         for req_id in req_ids:
             state = self._direct_store_states.get(req_id)
+            if state is not None and (
+                (
+                    state.remote_fill_terminal is not None
+                    and state.remote_fill_terminal.outcome == "FATAL_RESTART"
+                )
+                or getattr(state.remote_fill_session, "fatal_restart_required", False)
+            ):
+                self._latch_remote_fill_producer_fatal(state)
+                raise RemoteFillFatalError(
+                    "cannot release fatal remote-fill request state"
+                )
             if (
                 state is not None
                 and not state.futures

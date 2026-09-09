@@ -139,6 +139,14 @@ class RemoteFillCoordinator:
                     raise RemoteFillFatalError(
                         "remote-fill producer shutdown exceeded its hard deadline"
                     ) from error
+            if (
+                state.remote_fill_terminal is not None
+                and state.remote_fill_terminal.outcome == "FATAL_RESTART"
+            ) or getattr(state.remote_fill_session, "fatal_restart_required", False):
+                self._latch_fatal(state)
+                raise RemoteFillFatalError(
+                    "cannot close fatal remote-fill producer state"
+                )
             if state.remote_fill_session is not None:
                 state.remote_fill_session.close()
         executor = getattr(self, "_executor", None)

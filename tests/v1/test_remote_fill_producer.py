@@ -2462,3 +2462,86 @@ def test_coordinator_session_validation_stays_in_ordered_worker(monkeypatch):
         assert state.remote_fill_session.static_spec == spec
     finally:
         engine.close_remote_fill_producer()
+
+
+@pytest.mark.parametrize("entry", ["drop", "coordinator", "session"])
+@pytest.mark.parametrize("fatal_origin", ["terminal", "session", "none"])
+def test_fatal_cleanup_retains_prepared_owners_without_gc(
+    monkeypatch, entry, fatal_origin
+):
+    import gc
+    import weakref
+    from dataclasses import replace
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    owner_ref = weakref.ref(owner)
+    source = replace(_source_plan(), owners=(owner,))
+    prepared = PreparedDirectPushSource(source, 0.0, 0.0, 0.0)
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+    )
+    operations = []
+    client.close = lambda: operations.append("client_close")
+    session = _session(client)
+    session._prepared_sources[id(source)] = (source, prepared)
+    terminal = RemoteFillTerminalResult(
+        transfer_id=_handoff().transfer_id,
+        outcome="FATAL_RESTART" if fatal_origin == "terminal" else "PERSISTENT_ONLY",
+        persistent_common_end=1024, required_store_end=1024,
+    )
+    state = _DirectStoreRequestState(
+        remote_fill_handoff=_handoff(), remote_fill_session=session,
+        remote_fill_terminal=terminal,
+    )
+    session._terminal = terminal
+    session.fatal_restart_required = fatal_origin == "session"
+    original_close = RemoteFillProducerSession.close
+
+    def close(current):
+        operations.append("session_close")
+        return original_close(current)
+
+    monkeypatch.setattr(RemoteFillProducerSession, "close", close)
+    monkeypatch.setattr(RemoteFillProducerSession, "abort", lambda *_a: pytest.fail("cleanup attempted ABORT"))
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=120000)
+    engine._remote_fill_fatal_transfers = ()
+    engine._init_failed = False
+    engine._health_monitor = None
+    engine._direct_store_states = {"request": state}
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    coordinator = _coordinator(engine)
+    if entry == "session":
+        cleanup = session.close
+    elif entry == "coordinator":
+        cleanup = lambda: coordinator.close(engine._direct_store_states)
+    else:
+        cleanup = lambda: engine.drop_direct_store_states(("request",))
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del owner, source, prepared
+        if fatal_origin == "none":
+            cleanup()
+            assert operations == ["session_close", "client_close"]
+            assert not session._prepared_sources
+            assert owner_ref() is None
+        else:
+            with pytest.raises(RemoteFillFatalError):
+                cleanup()
+            assert session._prepared_sources
+            assert owner_ref() is not None
+            assert not session.closed
+            assert client.requests == []
+            assert operations == (["session_close"] if entry == "session" else [])
+            assert engine._direct_store_states["request"] is state
+            if entry != "session":
+                assert not engine.is_healthy()
+                assert engine.remote_fill_requires_paired_restart()
+    finally:
+        if was_enabled:
+            gc.enable()
