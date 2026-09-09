@@ -2,6 +2,8 @@
 """Sparse decode cache-state and shared collective-order tests."""
 
 # Standard
+import gc
+import weakref
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -4077,7 +4079,8 @@ def test_sparse_per_rank_retrieves_missing_suffix_without_shared_handles(
     assert cached_shared_handles == []
 
 
-def test_sparse_per_rank_short_later_layer_aborts_and_fences(monkeypatch):
+@pytest.mark.parametrize("cancel", [False, True])
+def test_sparse_per_rank_short_later_layer_aborts_and_fences(monkeypatch, cancel):
     monkeypatch.setattr(
         ascend_cache_engine,
         "assert_layerwise_gpu_connector",
@@ -4146,13 +4149,116 @@ def test_sparse_per_rank_short_later_layer_aborts_and_fences(monkeypatch):
 
     next(retriever)
     retriever.send(([0], 0))
-    with pytest.raises(RuntimeError, match="incomplete layer data"):
-        retriever.send(([0], 0))
+    if cancel:
+        retriever.close()
+    else:
+        with pytest.raises(RuntimeError, match="incomplete layer data"):
+            retriever.send(([0], 0))
 
     assert connector.sync_calls == 1
     assert connector.closed is True
     assert first_layer_obj.release_count == 1
     assert cached_memory_objs == []
+    assert not hasattr(engine, "_failed_sparse_loads")
+
+
+@pytest.mark.parametrize("gc_enabled", [False, True])
+@pytest.mark.parametrize("fence_api", ["raises", "missing"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_unfenced_sparse_load_retains_owners_and_blocks_teardown(
+    monkeypatch, gc_enabled, fence_api, cancel
+):
+    monkeypatch.setattr(
+        ascend_cache_engine, "assert_layerwise_gpu_connector", lambda _connector: None
+    )
+    keys = _make_key().split_layers(2)
+    refs = []
+
+    def layerwise_batched_get(_keys, *, location):
+        obj = _FakeTensorMemObj(torch.empty(1))
+        refs.append(weakref.ref(obj))
+        yield SimpleNamespace(result=lambda obj=obj: [obj])
+        del obj
+        yield SimpleNamespace(result=lambda: [])
+
+    class Consumer:
+        closed = False
+
+        def batched_to_gpu_head_token_wise(self, **_kwargs):
+            try:
+                yield
+                while True:
+                    yield
+            finally:
+                self.closed = True
+
+    connector = Consumer()
+    if fence_api == "raises":
+
+        def fail_fence():
+            raise RuntimeError("injected NPU fence failure")
+
+        connector.synchronize_dense_load_stream = fail_fence
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
+    engine.storage_manager = SimpleNamespace(
+        layerwise_batched_get=layerwise_batched_get, close=MagicMock()
+    )
+    engine.gpu_connector = connector
+    engine._init_failed = False
+    engine._health_monitor = None
+    engine._should_use_shared_layerwise_retrieve = lambda _group: False
+    engine._is_passive = lambda: False
+    engine._ensure_retrieve_chunk_metadata = lambda **_kwargs: (
+        "MooncakeStore",
+        [0],
+        [1],
+        [[keys[0]], [keys[1]]],
+    )
+    cache = {
+        name: []
+        for name in (
+            "cached_keys",
+            "cached_starts",
+            "cached_ends",
+            "cached_memory_objs",
+            "cached_tensors",
+            "cached_chunk_dev_ptrs",
+            "cached_chunk_ptrs_npu",
+            "cached_shared_handles",
+        )
+    }
+    previous_gc = gc.isenabled()
+    (gc.enable if gc_enabled else gc.disable)()
+    try:
+        retriever = engine.retrieve_layer_head_token_wise(
+            [1], kv_group=1, req_id="unfenced", **cache
+        )
+        next(retriever)
+        retriever.send(([0], 0))
+        if cancel:
+            retriever.close()
+        else:
+            with pytest.raises(RuntimeError, match="incomplete layer data"):
+                retriever.send(([0], 0))
+        del retriever
+        gc.collect()
+
+        assert cache["cached_memory_objs"] == []
+        assert refs[0]() is not None
+        assert refs[0]().release_count == 0
+        assert connector.closed is False
+        assert engine.is_healthy() is False
+        with pytest.raises(RuntimeError, match="worker restart required"):
+            engine.close()
+        engine.storage_manager.close.assert_not_called()
+        gc.collect()
+        assert refs[0]() is not None
+        assert refs[0]().release_count == 0
+    finally:
+        (gc.enable if previous_gc else gc.disable)()
 
 
 def test_sparse_shared_extension_still_requires_complete_handles():

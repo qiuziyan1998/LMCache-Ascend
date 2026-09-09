@@ -1007,25 +1007,27 @@ class AscendLMCacheEngine(LMCacheEngine):
         result: Any,
     ) -> None:
         metrics = self._get_remote_fill_producer_metrics()
-        metrics.observe("reserve_seconds", float(result.reserve_seconds))
-        metrics.observe("arm_seconds", float(result.arm_seconds))
+        if metrics.timing_enabled:
+            metrics.observe("reserve_seconds", float(result.reserve_seconds))
+            metrics.observe("arm_seconds", float(result.arm_seconds))
         metrics.existing_pages(int(result.existing_pages))
         submitted_bytes = int(result.submitted_bytes)
         if submitted_bytes:
-            metrics.observe(
-                "source_event_wait_seconds",
-                float(result.source_event_wait_seconds),
-            )
-            metrics.observe(
-                "source_registration_seconds",
-                float(result.source_registration_seconds),
-            )
-            metrics.observe(
-                "native_slot_wait_seconds",
-                float(result.native_slot_wait_seconds),
-            )
-            metrics.observe("native_seconds", float(result.native_seconds))
-            metrics.observe("report_seconds", float(result.report_seconds))
+            if metrics.timing_enabled:
+                metrics.observe(
+                    "source_event_wait_seconds",
+                    float(result.source_event_wait_seconds),
+                )
+                metrics.observe(
+                    "source_registration_seconds",
+                    float(result.source_registration_seconds),
+                )
+                metrics.observe(
+                    "native_slot_wait_seconds",
+                    float(result.native_slot_wait_seconds),
+                )
+                metrics.observe("native_seconds", float(result.native_seconds))
+                metrics.observe("report_seconds", float(result.report_seconds))
             metrics.add_bytes("submitted_bytes", submitted_bytes)
             state.remote_fill_submitted_bytes += submitted_bytes
         if not result.direct_satisfied:
@@ -1260,10 +1262,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return False
             state.remote_fill_queued_windows += 1
             state.remote_fill_queued_bytes += byte_count
-            if state.remote_fill_queued_windows == 1:
+            metrics = self._get_remote_fill_producer_metrics()
+            if state.remote_fill_queued_windows == 1 and metrics.timing_enabled:
                 state.remote_fill_oldest_enqueued_at = time.perf_counter()
             self._remote_fill_queued_bytes = global_bytes + byte_count
-            metrics = self._get_remote_fill_producer_metrics()
             metrics.add_gauge("inflight_windows", 1)
             metrics.add_gauge("inflight_bytes", byte_count)
             return True
@@ -1677,12 +1679,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             for offset in range(0, len(pages), maximum)
         )
         metrics = self._get_remote_fill_producer_metrics()
-        queued_at = time.perf_counter()
+        queued_at = time.perf_counter() if metrics.timing_enabled else 0.0
         if not self._remote_fill_acquire_queue_capacity(state, 0):
             state.remote_fill_disabled_reason = "producer_backpressure"
             metrics.abandon("producer backpressure", allocation=True)
             return
-        metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
+        if metrics.timing_enabled:
+            metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
         first_window_id = state.remote_fill_next_window_id
         state.remote_fill_next_window_id += len(control_windows)
         previous = state.remote_fill_last_future
@@ -1843,7 +1846,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         request_oversized = byte_count > int(
             self.config.remote_fill_max_bytes_per_request
         )
-        queued_at = time.perf_counter()
+        metrics = self._get_remote_fill_producer_metrics()
+        queued_at = time.perf_counter() if metrics.timing_enabled else 0.0
         if request_oversized or not self._remote_fill_acquire_queue_capacity(
             state, byte_count
         ):
@@ -1864,9 +1868,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 bytes=byte_count,
             )
             return
-        self._get_remote_fill_producer_metrics().observe(
-            "queue_wait_seconds", time.perf_counter() - queued_at
-        )
+        if metrics.timing_enabled:
+            metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
         try:
             source_plans = tuple(
                 self._remote_fill_source_plan(
@@ -2095,6 +2098,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             required_store_end=required_store_end,
         )
         finish_control_seconds = 0.0
+        metrics = self._get_remote_fill_producer_metrics()
         try:
             if state.remote_fill_session is None:
                 terminal = RemoteFillTerminalResult(
@@ -2104,7 +2108,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     required_store_end=required_store_end,
                 )
             else:
-                finish_started = time.perf_counter()
+                finish_started = time.perf_counter() if metrics.timing_enabled else 0.0
                 try:
                     terminal = state.remote_fill_session.finish(
                         required_store_end=required_store_end,
@@ -2114,19 +2118,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                         ),
                     )
                 finally:
-                    finish_control_seconds = time.perf_counter() - finish_started
-                    self._get_remote_fill_producer_metrics().observe(
-                        "finish_control_seconds",
-                        finish_control_seconds,
-                    )
+                    if metrics.timing_enabled:
+                        finish_control_seconds = time.perf_counter() - finish_started
+                        metrics.observe(
+                            "finish_control_seconds",
+                            finish_control_seconds,
+                        )
         except RemoteFillFatalError:
             self._latch_remote_fill_producer_fatal(state)
             raise
         if terminal.outcome == "FATAL_RESTART":
             self._latch_remote_fill_producer_fatal(state)
         state.remote_fill_terminal = terminal
-        metrics = self._get_remote_fill_producer_metrics()
-        if state.remote_fill_persistent_started_at:
+        if metrics.timing_enabled and state.remote_fill_persistent_started_at:
             metrics.observe(
                 "persistent_seconds",
                 time.perf_counter() - state.remote_fill_persistent_started_at,
@@ -2233,8 +2237,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         if (
             state.remote_fill_metrics_started
             and not state.remote_fill_persistent_started_at
+            and started is not None
         ):
-            state.remote_fill_persistent_started_at = time.perf_counter()
+            state.remote_fill_persistent_started_at = started
         key_strings = {key.to_string() for key in batch.keys}
         state.pending_keys.update(key_strings)
         with self._store_cv:
@@ -4262,10 +4267,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             state = self._direct_store_states.get(req_id)
             if state is None:
                 continue
-            remote_wait_started = (
-                time.perf_counter() if state.remote_fill_metrics_started else None
-            )
             started = cold_start_perf_now() if cold_start_perf_enabled() else None
+            remote_wait_started = started if state.remote_fill_metrics_started else None
             if (
                 started is not None
                 and state.remote_fill_metrics_started
@@ -8147,6 +8150,20 @@ class AscendLMCacheEngine(LMCacheEngine):
         finally:
             consumer.close()
 
+    def _quarantine_failed_sparse_load(
+        self, memory_objs: List[MemoryObj], consumer: Any
+    ) -> None:
+        """Retain unfenced transfer inputs until the worker is restarted."""
+        # Generator locals and request-cache entries disappear during rollback.
+        # Keep a separate strong owner before either can be released. setdefault
+        # also preserves concurrent failing loads without an extra serving lock.
+        self.__dict__.setdefault("_failed_sparse_loads", []).append(
+            (tuple(memory_objs), consumer)
+        )
+        self.mark_init_failed(
+            "sparse load completion is unknown; buffers retained until worker restart"
+        )
+
     def _retrieve_layer_head_token_wise_bootstrap(
         self,
         tokens: Union[torch.Tensor, list[int]],
@@ -9408,17 +9425,23 @@ class AscendLMCacheEngine(LMCacheEngine):
                             stream_synchronize()
                             fenced = True
                     if not fenced:
+                        self._quarantine_failed_sparse_load(
+                            backend_fetched_objs, mem_obj_consumer
+                        )
                         logger.critical(
                             "Aborted sparse prefix load has no NPU stream "
-                            "fence API; retaining backend MemoryObjs"
+                            "fence API; retaining backend MemoryObjs until worker restart"
                         )
                         return
                 except BaseException:
                     # Retaining the owners is safer than freeing storage while
                     # an NPU DMA may still be reading it.
+                    self._quarantine_failed_sparse_load(
+                        backend_fetched_objs, mem_obj_consumer
+                    )
                     logger.critical(
                         "Failed to fence an aborted sparse prefix load; "
-                        "retaining backend MemoryObjs",
+                        "retaining backend MemoryObjs until worker restart",
                         exc_info=True,
                     )
                     return
@@ -10474,6 +10497,13 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
+        if getattr(self, "_failed_sparse_loads", None):
+            # Do not tear down storage or its allocator while an unfenced DMA
+            # may still read it. The engine owns the quarantined inputs.
+            raise RuntimeError(
+                "sparse load completion is unknown; worker restart required "
+                "before retained buffers can be released"
+            )
         fatal_message = (
             "remote-fill shutdown requires paired P+D restart; "
             "native-owned memory was deliberately retained"

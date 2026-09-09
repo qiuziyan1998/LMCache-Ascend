@@ -500,7 +500,7 @@ def test_parse_handoff_rejects_noncanonical_verification_capability(
     raw = asdict(_handoff())
     raw["descriptor_verification_capability"] = capability
 
-    with pytest.raises(ValueError, match="verification capability"):
+    with pytest.raises(ValueError, match="verification[ _]capability"):
         parse_remote_fill_handoff({"lmcache.remote_fill": raw})
 
 
@@ -574,7 +574,9 @@ def test_transfer_arms_only_allocated_descriptor_subset() -> None:
 
 
 def test_transfer_prepares_source_before_reserve_and_arm() -> None:
-    client = _ScriptedClient()
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.ALLOCATED, PageDisposition.ALLOCATED)
+    )
     session = _session(client)
     source_plan = _source_plan()
     prepared_calls = 0
@@ -606,7 +608,7 @@ def test_transfer_prepares_source_before_reserve_and_arm() -> None:
                 native_transfer_attempt_id="native-attempt",
                 return_code=0,
                 vector_count=2,
-                transferred_bytes=96,
+                transferred_bytes=sum(page.expected_bytes for page in _pages()),
                 elapsed_ms=1.0,
                 source_event_wait_ms=2.0,
                 source_registration_ms=1.0,
@@ -1348,7 +1350,8 @@ def test_malformed_handoff_is_visible_and_uses_persistent_fallback(caplog) -> No
     assert '"action":"PERSISTENT_ONLY"' in caplog.text
 
 
-def test_producer_metrics_are_bounded_and_pointer_free() -> None:
+def test_producer_metrics_are_bounded_and_pointer_free(monkeypatch) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
     metrics = RemoteFillProducerMetrics()
     metrics.start_attempt()
     metrics.observe("reserve_seconds", 0.25)
@@ -1375,6 +1378,137 @@ def test_producer_metrics_are_bounded_and_pointer_free() -> None:
     assert snapshot["bytes"]["submitted_bytes"] == 192
     assert "0x1234" not in rendered
     assert "request-specific" not in rendered
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
+def test_producer_duration_gate_preserves_operational_counters(monkeypatch, mode):
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", mode)
+    metrics = RemoteFillProducerMetrics()
+    metrics.start_attempt()
+    metrics.observe("reserve_seconds", 0.25)
+    metrics.add_gauge("inflight_bytes", 64)
+    metrics.add_bytes("submitted_bytes", 64)
+    metrics.finish_attempt("PERSISTENT_ONLY", "producer_backpressure")
+    snapshot = metrics.snapshot()
+    assert snapshot["timers"]["reserve_seconds"]["count"] == (mode != "0")
+    assert snapshot["started_total"] == 1
+    assert snapshot["bytes"]["submitted_bytes"] == 64
+    assert snapshot["gauges"]["inflight_bytes"] == 64
+    assert snapshot["attempts_total"]["PERSISTENT_ONLY:producer_backpressure"] == 1
+
+
+@pytest.mark.parametrize("operation", ["probe", "transfer"])
+@pytest.mark.parametrize("reserve_fails", [False, True])
+def test_disabled_producer_control_timing_reads_no_clocks(
+    monkeypatch, operation, reserve_fails
+):
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "0")
+    monkeypatch.setattr(
+        producer_module,
+        "time",
+        SimpleNamespace(perf_counter=lambda: pytest.fail("diagnostic clock read")),
+    )
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+    )
+    execute = client.execute
+
+    def fail_reserve(request):
+        if reserve_fails and isinstance(request, ReserveWindowRequest):
+            raise TimeoutError("injected lost reservation response")
+        return execute(request)
+
+    monkeypatch.setattr(client, "execute", fail_reserve)
+    session = _session(client)
+    kwargs = dict(window_id=0, source_generation=44, control_pages=_pages())
+    if operation == "probe":
+        result = session.probe_window(**kwargs)
+    else:
+        result = session.transfer_window(
+            **kwargs,
+            source_plan=_source_plan(),
+            submitter=lambda **_kw: pytest.fail("no native submission expected"),
+            activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+        )
+    assert result.reserve_seconds == 0.0
+    assert result.direct_satisfied is (not reserve_fails)
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
+def test_producer_timing_keeps_native_deadline(monkeypatch, mode):
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", mode)
+    clock_reads = []
+
+    def clock():
+        clock_reads.append(100.0 + len(clock_reads) * 0.25)
+        return clock_reads[-1]
+
+    monkeypatch.setattr(producer_module, "time", SimpleNamespace(perf_counter=clock))
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.ALLOCATED)
+    )
+    timeouts = []
+
+    def terminal_result(timeout):
+        timeouts.append(timeout)
+        return NativeDirectPushResult(
+            native_transfer_attempt_id="native-attempt",
+            return_code=0,
+            vector_count=1,
+            transferred_bytes=64,
+            elapsed_ms=1.0,
+        )
+
+    result = _session(client).transfer_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=_pages(),
+        source_plan=_source_plan(),
+        submitter=lambda **_kw: SimpleNamespace(result=terminal_result),
+        activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+    )
+    assert timeouts == [119.75]
+    assert result.direct_satisfied and result.armed
+    assert result.submitted_bytes == 64
+    if mode == "0":
+        assert len(clock_reads) == 2  # Only the native ownership deadline.
+        assert (
+            result.reserve_seconds == result.arm_seconds == result.report_seconds == 0.0
+        )
+    else:
+        assert result.reserve_seconds > 0
+        assert result.arm_seconds > 0
+        assert result.report_seconds > 0
+    assert any(
+        isinstance(item, ReportTransferCompleteRequest) for item in client.requests
+    )
+
+
+def test_disabled_queue_timing_preserves_capacity_accounting(monkeypatch):
+    import lmcache_ascend.v1.cache_engine as engine_module
+
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "0")
+    monkeypatch.setattr(
+        engine_module,
+        "time",
+        SimpleNamespace(perf_counter=lambda: pytest.fail("diagnostic clock read")),
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(
+        remote_fill_max_inflight_bytes=100,
+        remote_fill_max_bytes_per_request=400,
+        remote_fill_max_inflight_windows_per_request=4,
+    )
+    state = _DirectStoreRequestState()
+    assert engine._remote_fill_acquire_queue_capacity(state, 60)
+    assert not engine._remote_fill_acquire_queue_capacity(state, 50)
+    assert state.remote_fill_oldest_enqueued_at == 0.0
+    engine._remote_fill_release_queue_capacity(state, 60)
+    assert state.remote_fill_queued_windows == state.remote_fill_queued_bytes == 0
+    snapshot = engine.remote_fill_producer_metrics_snapshot()
+    assert snapshot["gauges"]["inflight_windows"] == 0
+    assert snapshot["gauges"]["inflight_bytes"] == 0
+    assert snapshot["timers"]["queue_wait_seconds"]["count"] == 0
 
 
 def test_global_producer_inflight_bytes_are_bounded_across_requests() -> None:

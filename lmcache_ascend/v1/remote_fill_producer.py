@@ -13,6 +13,7 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
+from lmcache.v1.cold_start_perf import cold_start_perf_enabled
 from lmcache.v1.remote_fill import (
     PROTOCOL_VERSION,
     AbortRequest,
@@ -249,12 +250,13 @@ class RemoteFillFatalError(RuntimeError):
 
 
 class RemoteFillProducerMetrics:
-    """Enabled-only, low-cardinality producer aggregate metrics.
+    """Low-cardinality producer counters with opt-in duration metrics.
 
     The object is created lazily after a request has supplied a valid remote-
     fill handoff. It intentionally accepts only fixed metric names and bounded
     outcome/reason values; request IDs, transfer IDs, keys, and pointers never
-    enter the aggregate.
+    enter the aggregate. Duration collection follows the cold-start performance
+    knob selected when this metrics object is created.
     """
 
     _TIMERS = frozenset(
@@ -316,6 +318,7 @@ class RemoteFillProducerMetrics:
     )
 
     def __init__(self) -> None:
+        self.timing_enabled = cold_start_perf_enabled()
         self._lock = Lock()
         self._attempts: dict[tuple[str, str], int] = {}
         self._started_total = 0
@@ -368,7 +371,7 @@ class RemoteFillProducerMetrics:
 
     def observe(self, name: str, seconds: float) -> None:
         """Record a nonnegative duration for a predefined timer."""
-        if name not in self._TIMERS or seconds < 0:
+        if not self.timing_enabled or name not in self._TIMERS or seconds < 0:
             return
         with self._lock:
             values = self._timers[name]
@@ -735,7 +738,8 @@ class RemoteFillProducerSession:
         if not self.direct_viable or not self.open():
             return self._abandoned_window(window_id, "open rejected")
         digest = manifest_digest(control_pages)
-        reserve_started = time.perf_counter()
+        perf_enabled = cold_start_perf_enabled()
+        reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(
                 ReserveWindowRequest(
@@ -750,7 +754,9 @@ class RemoteFillProducerSession:
         except RemoteFillFatalError:
             raise
         except Exception:
-            reserve_seconds = time.perf_counter() - reserve_started
+            reserve_seconds = (
+                time.perf_counter() - reserve_started if perf_enabled else 0.0
+            )
             self.prearm_control_unknown = True
             self.direct_viable = False
             return self._abandoned_window(
@@ -758,7 +764,7 @@ class RemoteFillProducerSession:
                 "probe control unavailable",
                 reserve_seconds=reserve_seconds,
             )
-        reserve_seconds = time.perf_counter() - reserve_started
+        reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
@@ -839,7 +845,8 @@ class RemoteFillProducerSession:
                 self.direct_viable = False
                 return self._abandoned_window(window_id, "source preparation failed")
         digest = manifest_digest(control_pages)
-        reserve_started = time.perf_counter()
+        perf_enabled = cold_start_perf_enabled()
+        reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(
                 ReserveWindowRequest(
@@ -854,7 +861,9 @@ class RemoteFillProducerSession:
         except RemoteFillFatalError:
             raise
         except Exception:
-            reserve_seconds = time.perf_counter() - reserve_started
+            reserve_seconds = (
+                time.perf_counter() - reserve_started if perf_enabled else 0.0
+            )
             self.prearm_control_unknown = True
             self.direct_viable = False
             return self._abandoned_window(
@@ -862,7 +871,7 @@ class RemoteFillProducerSession:
                 "reserve control unavailable",
                 reserve_seconds=reserve_seconds,
             )
-        reserve_seconds = time.perf_counter() - reserve_started
+        reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
         descriptors = reserved.descriptors
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
@@ -944,7 +953,7 @@ class RemoteFillProducerSession:
                 existing_pages=existing_pages,
             )
 
-        arm_started = time.perf_counter()
+        arm_started = time.perf_counter() if perf_enabled else 0.0
         try:
             armed = self._execute(
                 ArmWindowRequest(
@@ -969,7 +978,7 @@ class RemoteFillProducerSession:
                     "ARM_WINDOW acknowledgement is ambiguous and STATUS "
                     "could not prove the armed attempt"
                 ) from status_error
-        arm_seconds = time.perf_counter() - arm_started
+        arm_seconds = time.perf_counter() - arm_started if perf_enabled else 0.0
         if armed.code is not ResultCode.OK:
             self.direct_viable = False
             return self._abandoned_window(
@@ -991,6 +1000,8 @@ class RemoteFillProducerSession:
         submitted_bytes = sum(
             descriptor.destination_length for descriptor in descriptors
         )
+        # This clock enforces the native ownership deadline even with diagnostic
+        # timing disabled. Never substitute a diagnostic timestamp here.
         native_wait_started = time.perf_counter()
         native_deadline = native_wait_started + self.native_hard_timeout_seconds
         native_result = None
@@ -1120,7 +1131,7 @@ class RemoteFillProducerSession:
             )
 
         report_succeeded: bool
-        report_started = time.perf_counter()
+        report_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reported = self._execute(
                 ReportTransferCompleteRequest(
@@ -1148,7 +1159,7 @@ class RemoteFillProducerSession:
                     "terminal native report is ambiguous and STATUS could not "
                     "prove the reported result"
                 ) from status_error
-        report_seconds = time.perf_counter() - report_started
+        report_seconds = time.perf_counter() - report_started if perf_enabled else 0.0
         if return_code != 0 or not report_succeeded:
             self.direct_viable = False
             return self._abandoned_window(
