@@ -71,37 +71,55 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history():
             (source_for((256, 256, 17), 1), [0, 511, 512, 528], 1),
             (source_for((13,), 1000), [0, 3, 11, 12], 1000),
         ]
+        second_source = source_for((256,), 2000)
+        second_tokens = [1, 7, 31, 255]
         caches = tuple(
             torch.full((4, 16, 1, width), -7, dtype=dtype, device=device)
             for width in (k_width, pe_width)
         )
-        slots = torch.arange(4, dtype=torch.int64, device=device).view(1, 4)
-        counts = torch.full((1,), 4, dtype=torch.int32, device=device)
-        scores = torch.zeros(1024, device=device)
-        transfer = SparseGraphTransfer(caches, slots, chunk_size, 1024)
-        transfer.load(torch.topk(scores, 4).indices.view(1, 4), counts, slots)
+        slots = torch.arange(8, dtype=torch.int64, device=device).view(2, 4)
+        counts = torch.full((2,), 4, dtype=torch.int32, device=device)
+        scores = torch.zeros((2, 1024), device=device)
+        transfer = SparseGraphTransfer(
+            caches,
+            slots,
+            chunk_size,
+            1024,
+            request_capacity=2,
+        )
+        transfer.load(torch.topk(scores, 4).indices, counts, slots)
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            selected = torch.topk(scores, 4).indices.view(1, 4)
+            selected = torch.topk(scores, 4).indices
             transfer.load(selected, counts, slots)
         addresses = (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
         for source, tokens, offset in cases:
-            transfer.bind(source, 0)
+            transfer.bind_batch((source, second_source), 0)
             scores.fill_(-1000)
             for rank, token in enumerate(tokens):
-                scores[token] = 10 - rank
+                scores[0, token] = 10 - rank
+            for rank, token in enumerate(second_tokens):
+                scores[1, token] = 10 - rank
             for cache in caches:
                 cache.fill_(-7)
             graph.replay()
             torch.npu.synchronize()
-            assert selected.cpu().tolist() == [tokens]
+            assert selected.cpu().tolist() == [tokens, second_tokens]
             for plane, cache in enumerate(caches):
                 flat = cache.view(-1, cache.shape[-1])
                 for slot, token in enumerate(tokens):
                     expected = torch.full_like(flat[slot], offset + token + plane * 100)
                     torch.testing.assert_close(flat[slot], expected, rtol=0, atol=0)
-                assert flat[4:].eq(-7).all().item()
+                for offset_slot, token in enumerate(second_tokens, start=4):
+                    expected = torch.full_like(
+                        flat[offset_slot],
+                        2000 + token + plane * 100,
+                    )
+                    torch.testing.assert_close(
+                        flat[offset_slot], expected, rtol=0, atol=0
+                    )
+                assert flat[8:].eq(-7).all().item()
             assert addresses == (
                 transfer.ptrs.data_ptr(),
                 transfer.valid_tokens.data_ptr(),
@@ -111,7 +129,7 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history():
             if clear_source:
                 transfer.clear_source()
             else:
-                transfer.bind(cases[0][0], 0)
+                transfer.bind_batch((cases[0][0], second_source), 0)
                 counts.zero_()
             for cache in caches:
                 cache.fill_(-7)

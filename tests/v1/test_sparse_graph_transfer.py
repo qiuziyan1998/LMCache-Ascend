@@ -2,12 +2,16 @@
 """CPU tests for graph source tables; native capture is tested separately."""
 
 import importlib.util
+from itertools import count
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+
+
+SOURCE_IDS = count(1)
 
 
 @pytest.fixture
@@ -41,18 +45,20 @@ def transfer_module(monkeypatch):
 
 def make_source(ptrs, counts, total=None):
     return SimpleNamespace(
+        binding_id=next(SOURCE_IDS),
         chunk_token_counts=tuple(counts),
         total_tokens=sum(counts) if total is None else total,
         layers=(SimpleNamespace(chunk_ptrs_npu=torch.tensor(ptrs, dtype=torch.int64)),),
     )
 
 
-def make_transfer(module):
+def make_transfer(module, request_capacity=1):
     return module.SparseGraphTransfer(
         (torch.zeros((2, 16, 1, 512)), torch.zeros((2, 16, 1, 64))),
-        torch.zeros((1, 4), dtype=torch.int64),
+        torch.zeros((request_capacity, 4), dtype=torch.int64),
         256,
         1024,
+        request_capacity=request_capacity,
     )
 
 
@@ -86,6 +92,44 @@ def test_device_selection_masks_invalid_tokens_and_empty_source(transfer_module)
     transfer.clear_source()
     transfer.load(selected, counts.zero_(), slots)
     assert calls[-1][1].eq(-1).all()
+
+
+def test_batch_sources_use_disjoint_virtual_chunk_ranges(transfer_module):
+    module, calls = transfer_module
+    transfer = make_transfer(module, request_capacity=3)
+    transfer.bind_batch(
+        (
+            make_source([1000], [13]),
+            make_source([2000, 3000], [256, 17]),
+        ),
+        0,
+    )
+    selected = torch.tensor(
+        [[0, 12, 13, -1], [0, 256, 272, 273], [0, 1, 2, 3]]
+    )
+    counts = torch.tensor([4, 4, 4])
+    slots = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
+    transfer.load(selected, counts, slots)
+
+    assert torch.equal(
+        transfer.ptrs[0],
+        torch.tensor(
+            [1000, 0, 0, 0, 2000, 3000, 0, 0, 0, 0, 0, 0]
+        ),
+    )
+    for call in calls:
+        assert torch.equal(
+            call[2],
+            torch.tensor(
+                [[0, 12, 0, 0], [1024, 1280, 1296, 0], [0, 0, 0, 0]],
+                dtype=torch.int32,
+            ),
+        )
+        assert torch.equal(
+            call[1],
+            torch.tensor([[1, 2, -1, -1], [5, 6, 7, -1], [-1, -1, -1, -1]]),
+        )
+        assert torch.equal(call[-1], torch.tensor([4, 4, 0], dtype=torch.int32))
 
 
 @pytest.mark.parametrize(

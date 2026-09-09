@@ -4183,7 +4183,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
 
         start_layer = int(transfer_kwargs.get("prepared_start_layer", 0))
-        if not 0 <= start_layer < len(source.layers):
+        if not 0 <= start_layer <= len(source.layers):
             raise ValueError("prepared_start_layer is outside the source")
         for layer_id in range(start_layer, len(source.layers)):
             source_layer = source.layers[layer_id]
