@@ -2258,8 +2258,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         state: _DirectStoreRequestState,
         planner: Callable[..., Any],
         slot_mapping_base: int = 0,
+        *,
+        remote_batches: Optional[list[_DirectPageBatch]] = None,
     ) -> bool:
-        """Publish the unaligned suffix as one exact-size page per KV group."""
+        """Publish an exact-size tail; optionally collect its RemoteFill plan.
+
+        ``remote_batches`` belongs only to the current final store call.
+        Persistent puts are submitted immediately in either case.
+        """
         started = serving_perf_now() if serving_perf_enabled() else None
         start = state.planned_end
         if start >= len(tokens):
@@ -2502,9 +2508,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     tuple((start, end) for _ in remote_keys),
                     remote_ready_events,
                 )
-                self._schedule_remote_fill_batch(
-                    state, remote_batch, len(tokens)
-                )
+                if remote_batches is not None:
+                    remote_batches.append(remote_batch)
+                else:
+                    self._schedule_remote_fill_batch(state, remote_batch, len(tokens))
             else:
                 state.remote_fill.disabled_reason = "incomplete_partial_pair"
         return True
@@ -3153,6 +3160,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     req_id, tokens, group_caches, state, final
                 )
                 return True
+        final_remote_batches: Optional[list[_DirectPageBatch]] = None
         if collect_remote_sources and remote_keys:
             if {int(key.kv_group) for key in remote_keys} != direct_groups:
                 state.remote_fill.disabled_reason = "incomplete_page_pair"
@@ -3169,9 +3177,39 @@ class AscendLMCacheEngine(LMCacheEngine):
                     remote_ready_events,
                 )
                 if remote_fill:
-                    self._schedule_remote_fill_batch(
-                        state, remote_batch, len(tokens)
-                    )
+                    if (
+                        final
+                        and submission_mode == "per_chunk"
+                        and bool(getattr(self.config, "save_unfull_chunk", True))
+                        and len(tokens) % chunk_size
+                        and state.remote_fill.queued_windows
+                        == int(self.config.remote_fill_max_inflight_windows_per_request)
+                        - 1
+                    ):
+                        # Preserve early full-page submission unless combining
+                        # avoids job pressure and fits the current byte budget.
+                        coordinator = self._get_remote_fill_coordinator()
+                        try:
+                            _, layout = self._remote_fill_immutable_layout()
+                            combined_bytes = sum(map(sum, remote_batch.sizes)) + sum(
+                                layout.group(group).expected_bytes(
+                                    len(tokens) % chunk_size, layout.num_layers
+                                )
+                                for group in direct_groups
+                            )
+                        except Exception as error:
+                            coordinator.reject_source_batch(
+                                state.remote_fill, req_id=req_id, error=error
+                            )
+                        else:
+                            if coordinator.can_coalesce_final_batch(
+                                state.remote_fill, combined_bytes
+                            ):
+                                final_remote_batches = [remote_batch]
+                    if final_remote_batches is None:
+                        self._schedule_remote_fill_batch(
+                            state, remote_batch, len(tokens)
+                        )
                 else:
                     state.remote_fill.deferred_batches.append(remote_batch)
                     state.remote_fill.deferred_pages += len(remote_batch.keys)
@@ -3221,6 +3259,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         state,
                         planner,
                         slot_mapping_base,
+                        remote_batches=final_remote_batches,
                     )
                 except Exception:
                     logger.warning(
@@ -3228,6 +3267,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                         req_id,
                         exc_info=True,
                     )
+            if final_remote_batches:
+                if len(final_remote_batches) > 1 and sum(
+                    sum(map(sum, batch.sizes)) for batch in final_remote_batches
+                ) <= min(
+                    int(self.config.remote_fill_max_inflight_bytes),
+                    int(self.config.remote_fill_max_bytes_per_request),
+                ):
+                    events = tuple(
+                        {
+                            id(event): event
+                            for batch in final_remote_batches
+                            for event in batch.ready_events
+                        }.values()
+                    )
+                    final_remote_batches = [
+                        self._merge_deferred_remote_fill_batches(
+                            final_remote_batches, events
+                        )
+                    ]
+                # Oversized combinations keep separate admission. The existing
+                # coordinator still enforces aggregate bytes and window limits.
+                for final_batch in final_remote_batches:
+                    self._schedule_remote_fill_batch(state, final_batch, len(tokens))
+                final_remote_batches.clear()
             with self._store_cv:
                 self._pending_store_reqs[req_id] = (
                     self._pending_store_reqs.get(req_id, 0) + 1

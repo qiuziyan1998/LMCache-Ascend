@@ -444,6 +444,31 @@ class RemoteFillCoordinator:
             self._circuit_open_until = 0.0
             self.get_metrics().set_gauge("circuit_breaker_state", 0)
 
+    def can_coalesce_final_batch(
+        self, state: ProducerRequestState, byte_count: int
+    ) -> bool:
+        """Check whether one combined job fits where two separate jobs would not.
+
+        This is a scheduling hint, not a reservation. Normal admission still
+        checks live counters atomically after the tail has been prepared.
+        """
+        limit = int(self.config.remote_fill_max_inflight_windows_per_request)
+        condition = getattr(self, "_queue_condition", None)
+        if condition is None:
+            condition = threading.Condition()
+            self._queue_condition = condition
+        with condition:
+            byte_limit = int(self.config.remote_fill_max_inflight_bytes)
+            request_limit = min(
+                int(self.config.remote_fill_max_bytes_per_request), byte_limit * limit
+            )
+            return (
+                state.queued_windows == limit - 1
+                and 0 < byte_count <= byte_limit
+                and state.queued_bytes + byte_count <= request_limit
+                and int(getattr(self, "_queued_bytes", 0)) + byte_count <= byte_limit
+            )
+
     def _acquire_queue_capacity(
         self,
         state: ProducerRequestState,

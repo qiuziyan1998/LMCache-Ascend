@@ -19,6 +19,18 @@ enable_remote_lmcache_store: true
 `remote_fill_submission_mode` defaults to `per_chunk`; set it to
 `final_deferred` for the conservative rollback path.
 
+In `per_chunk` mode, full pages and a partial tail from the same final store
+call may share one RemoteFill producer job. This is selected only when exactly
+one job slot remains and the combined payload fits the current request/global
+byte headroom. Otherwise full pages keep their earlier submission, preserving
+overlap with tail preparation. The decision is a hint; actual admission still
+rechecks live limits. It avoids needing three slots for a prefix probe, full
+pages, and a small tail in the eligible case. Earlier chunks still stream
+normally; persistent full-page and tail puts remain separate. Source owners and
+all producer fences are retained, and native windows keep their existing bounds.
+No configuration change is required. Byte pressure, prefix holes and other
+outstanding jobs can still cause the normal persistent fallback.
+
 Use the standalone connector on both P and D:
 
 ```json
