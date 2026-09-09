@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Producer admission and ordered remote-fill jobs, independent of the engine.
 
-Owns executor, session cache, circuit state and queue accounting. Request fields
-are borrowed during the R5b transition; persistent preparation remains external.
+Owns executor, session cache, circuit state and queue accounting.
+Producer request fields live in one owned record; the engine keeps a handle.
+Persistent preparation remains external.
 Caller schedules; per-request chained jobs mutate session outcomes; accounting
 uses the queue condition and circuit lock. Close drains before closing sessions.
 The fatal reporter is weak and invoked only on fatal paths, preserving immediate
@@ -11,16 +12,17 @@ worker unhealthy marking without retaining its engine.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
+from weakref import WeakMethod
 import logging
-from concurrent.futures import Future
 import os
 import secrets
 import threading
 import time
-from typing import Any, Callable, Optional, TYPE_CHECKING
-from weakref import WeakMethod
 
 from lmcache.v1.remote_fill import (
     ControlPage,
@@ -32,6 +34,7 @@ from lmcache.v1.remote_fill.native import (
     NativeDirectPushActivation,
 )
 from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
+
 from lmcache_ascend.v1.direct_store_plan import (
     DirectPageBatch,
     build_remote_fill_source_plan,
@@ -48,6 +51,7 @@ from lmcache_ascend.v1.remote_fill_producer import (
     RemoteFillProducerMetrics,
     RemoteFillProducerSession,
     RemoteFillStaticSpec,
+    RemoteFillTerminalResult,
     create_remote_fill_client,
     parse_remote_fill_handoff,
 )
@@ -55,6 +59,7 @@ from lmcache_ascend.v1.remote_fill_producer import (
 if TYPE_CHECKING:
     from lmcache.v1.config import LMCacheEngineConfig
     from lmcache.v1.storage_backend.storage_manager import StorageManager
+
     from lmcache_ascend.v1.remote_fill import RemoteFillDecoderLayout
 
 
@@ -69,6 +74,39 @@ class ProducerSessionContext:
     chunk_hash_bytes: int | None
     tp_size: int
     shared_group1: bool
+
+
+@dataclass(slots=True)
+class ProducerRequestState:
+    """One request's producer state, referenced by the persistent-store handle.
+
+    Admission/source preparation mutates planning fields on the caller thread;
+    ordered request jobs mutate sessions/results. Queue counters use the shared
+    condition. Completion/release drains jobs before retiring owner references.
+    """
+
+    handoff: Optional[RemoteFillHandoff] = None
+    session: Optional[RemoteFillProducerSession] = None
+    futures: deque[Future] = field(default_factory=deque)
+    last_future: Optional[Future] = None
+    next_window_id: int = 0
+    source_generation: int = 0
+    probe_end: int = 0
+    queued_bytes: int = 0
+    queued_windows: int = 0
+    oldest_enqueued_at: float = 0.0
+    backlog_logged: bool = False
+    terminal: Optional[RemoteFillTerminalResult] = None
+    disabled_reason: str = ""
+    fence_deferred: bool = False
+    deferred_batches: list["DirectPageBatch"] = field(default_factory=list)
+    deferred_pages: int = 0
+    deferred_bytes: int = 0
+    metrics_started: bool = False
+    viable_counted: bool = False
+    active_counted: bool = False
+    submitted_bytes: int = 0
+    persistent_started_at: float = 0.0
 
 
 class RemoteFillCoordinator:
@@ -103,35 +141,37 @@ class RemoteFillCoordinator:
         if activation_factory is not None:
             self._activation_factory = activation_factory
 
-    def reject_source_batch(self, state: Any, *, req_id: str, error: Exception) -> None:
+    def reject_source_batch(
+        self, state: ProducerRequestState, *, req_id: str, error: Exception
+    ) -> None:
         """Record source-planning fallback before producer admission."""
-        state.remote_fill_disabled_reason = type(error).__name__
+        state.disabled_reason = type(error).__name__
         self._log_prearm_failure(
             state,
             req_id=req_id,
             stage="control_page_planning",
-            reason=state.remote_fill_disabled_reason,
+            reason=state.disabled_reason,
             error=error,
         )
         self._record_failure()
 
     def _latch_fatal(self, state) -> None:
-        handoff = state.remote_fill_handoff
+        handoff = state.handoff
         if handoff is None:
             raise RuntimeError("remote-fill fatal state lacks a transfer identity")
         reporter = self._fatal_reporter()
         if reporter is not None:
             reporter((handoff.transfer_id,))
 
-    def close(self, states) -> None:
+    def close(self, states: Iterable[ProducerRequestState]) -> None:
         """Drain producer work and close lazily created control resources."""
 
         deadline = time.perf_counter() + (
             float(self.config.remote_fill_native_hard_timeout_ms) / 1000.0
         )
-        for state in states.values():
-            while state.remote_fill_futures:
-                future = state.remote_fill_futures.popleft()
+        for state in states:
+            while state.futures:
+                future = state.futures.popleft()
                 try:
                     future.result(timeout=max(0.0, deadline - time.perf_counter()))
                 except FutureTimeoutError as error:
@@ -140,15 +180,14 @@ class RemoteFillCoordinator:
                         "remote-fill producer shutdown exceeded its hard deadline"
                     ) from error
             if (
-                state.remote_fill_terminal is not None
-                and state.remote_fill_terminal.outcome == "FATAL_RESTART"
-            ) or getattr(state.remote_fill_session, "fatal_restart_required", False):
+                state.terminal is not None and state.terminal.outcome == "FATAL_RESTART"
+            ) or getattr(state.session, "fatal_restart_required", False):
                 self._latch_fatal(state)
                 raise RemoteFillFatalError(
                     "cannot close fatal remote-fill producer state"
                 )
-            if state.remote_fill_session is not None:
-                state.remote_fill_session.close()
+            if state.session is not None:
+                state.session.close()
         executor = getattr(self, "_executor", None)
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
@@ -169,7 +208,7 @@ class RemoteFillCoordinator:
 
     @staticmethod
     def _log_prearm_failure(
-        state: Any,
+        state: ProducerRequestState,
         *,
         req_id: str,
         stage: str,
@@ -178,7 +217,7 @@ class RemoteFillCoordinator:
     ) -> None:
         """Make a safe direct-fill fallback immediately operator-visible."""
 
-        handoff = state.remote_fill_handoff
+        handoff = state.handoff
         log_remote_fill_diagnostic(
             logger,
             event="remote_fill_fallback",
@@ -194,7 +233,7 @@ class RemoteFillCoordinator:
 
     def _record_window_metrics(
         self,
-        state: Any,
+        state: ProducerRequestState,
         result: Any,
     ) -> None:
         metrics = self.get_metrics()
@@ -220,7 +259,7 @@ class RemoteFillCoordinator:
                 metrics.observe("native_seconds", float(result.native_seconds))
                 metrics.observe("report_seconds", float(result.report_seconds))
             metrics.add_bytes("submitted_bytes", submitted_bytes)
-            state.remote_fill_submitted_bytes += submitted_bytes
+            state.submitted_bytes += submitted_bytes
         if not result.direct_satisfied:
             allocation = result.reason in (
                 "direct destination hole",
@@ -239,7 +278,7 @@ class RemoteFillCoordinator:
                     fatal_restart_required=bool(result.fatal_restart_required),
                 )
             fatal = bool(result.fatal_restart_required)
-            handoff = state.remote_fill_handoff
+            handoff = state.handoff
             log_remote_fill_diagnostic(
                 logger,
                 event=(
@@ -258,16 +297,16 @@ class RemoteFillCoordinator:
         self,
         req_id: str,
         request_configs: Optional[dict],
-        state: Any,
+        state: ProducerRequestState,
     ) -> bool:
         if not bool(getattr(self.config, "enable_remote_lmcache_store", False)):
             return False
-        if state.remote_fill_handoff is not None:
-            return not state.remote_fill_disabled_reason
+        if state.handoff is not None:
+            return not state.disabled_reason
         try:
             handoff = parse_remote_fill_handoff(request_configs)
         except ValueError as error:
-            state.remote_fill_disabled_reason = type(error).__name__
+            state.disabled_reason = type(error).__name__
             log_remote_fill_diagnostic(
                 logger,
                 event="remote_fill_handoff_rejected",
@@ -281,15 +320,15 @@ class RemoteFillCoordinator:
             )
             return False
         if handoff is None:
-            state.remote_fill_disabled_reason = "missing_handoff"
+            state.disabled_reason = "missing_handoff"
             return False
-        state.remote_fill_handoff = handoff
+        state.handoff = handoff
         metrics = self.get_metrics()
-        if not state.remote_fill_metrics_started:
+        if not state.metrics_started:
             metrics.start_attempt()
-            state.remote_fill_metrics_started = True
+            state.metrics_started = True
         if not handoff.global_te_push:
-            state.remote_fill_disabled_reason = "native_not_qualified"
+            state.disabled_reason = "native_not_qualified"
             log_remote_fill_diagnostic(
                 logger,
                 event="remote_fill_handoff_rejected",
@@ -298,12 +337,12 @@ class RemoteFillCoordinator:
                 action="LEGACY_PATH",
                 req_id=req_id,
                 transfer_id=handoff.transfer_id,
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
                 severity="warning",
             )
             return False
         if handoff.destination_dp_rank >= handoff.destination_dp_size:
-            state.remote_fill_disabled_reason = "invalid_dp_mapping"
+            state.disabled_reason = "invalid_dp_mapping"
             log_remote_fill_diagnostic(
                 logger,
                 event="remote_fill_handoff_rejected",
@@ -312,12 +351,12 @@ class RemoteFillCoordinator:
                 action="PERSISTENT_ONLY",
                 req_id=req_id,
                 transfer_id=handoff.transfer_id,
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
                 severity="warning",
             )
             return False
         if handoff.destination_tp_size != self.tp_size:
-            state.remote_fill_disabled_reason = "incompatible_tp_mapping"
+            state.disabled_reason = "incompatible_tp_mapping"
             log_remote_fill_diagnostic(
                 logger,
                 event="remote_fill_handoff_rejected",
@@ -326,12 +365,12 @@ class RemoteFillCoordinator:
                 action="PERSISTENT_ONLY",
                 req_id=req_id,
                 transfer_id=handoff.transfer_id,
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
                 severity="warning",
             )
             return False
         if not self._circuit_allows():
-            state.remote_fill_disabled_reason = "circuit_open"
+            state.disabled_reason = "circuit_open"
             log_remote_fill_diagnostic(
                 logger,
                 event="remote_fill_fallback",
@@ -340,13 +379,13 @@ class RemoteFillCoordinator:
                 action="PERSISTENT_ONLY",
                 req_id=req_id,
                 transfer_id=handoff.transfer_id,
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
                 severity="warning",
             )
             return False
-        state.remote_fill_source_generation = secrets.randbits(63) or 1
+        state.source_generation = secrets.randbits(63) or 1
         metrics.add_gauge("direct_viable", 1)
-        state.remote_fill_viable_counted = True
+        state.viable_counted = True
         if serving_perf_enabled():
             serving_perf_log(
                 logger,
@@ -407,7 +446,7 @@ class RemoteFillCoordinator:
 
     def _acquire_queue_capacity(
         self,
-        state: Any,
+        state: ProducerRequestState,
         byte_count: int,
     ) -> bool:
         """Acquire bounded producer admission before retaining queued work."""
@@ -434,17 +473,17 @@ class RemoteFillCoordinator:
                 return False
             global_bytes = int(getattr(self, "_queued_bytes", 0))
             if (
-                state.remote_fill_queued_windows
+                state.queued_windows
                 >= int(self.config.remote_fill_max_inflight_windows_per_request)
-                or state.remote_fill_queued_bytes + byte_count > request_byte_limit
+                or state.queued_bytes + byte_count > request_byte_limit
                 or global_bytes + byte_count > global_byte_limit
             ):
                 return False
-            state.remote_fill_queued_windows += 1
-            state.remote_fill_queued_bytes += byte_count
+            state.queued_windows += 1
+            state.queued_bytes += byte_count
             metrics = self.get_metrics()
-            if state.remote_fill_queued_windows == 1 and metrics.timing_enabled:
-                state.remote_fill_oldest_enqueued_at = time.perf_counter()
+            if state.queued_windows == 1 and metrics.timing_enabled:
+                state.oldest_enqueued_at = time.perf_counter()
             self._queued_bytes = global_bytes + byte_count
             metrics.add_gauge("inflight_windows", 1)
             metrics.add_gauge("inflight_bytes", byte_count)
@@ -452,21 +491,17 @@ class RemoteFillCoordinator:
 
     def _release_queue_capacity(
         self,
-        state: Any,
+        state: ProducerRequestState,
         byte_count: int,
     ) -> None:
         condition = getattr(self, "_queue_condition", None)
         if condition is None:
             return
         with condition:
-            state.remote_fill_queued_windows = max(
-                0, state.remote_fill_queued_windows - 1
-            )
-            state.remote_fill_queued_bytes = max(
-                0, state.remote_fill_queued_bytes - byte_count
-            )
-            if state.remote_fill_queued_windows == 0:
-                state.remote_fill_oldest_enqueued_at = 0.0
+            state.queued_windows = max(0, state.queued_windows - 1)
+            state.queued_bytes = max(0, state.queued_bytes - byte_count)
+            if state.queued_windows == 0:
+                state.oldest_enqueued_at = 0.0
             self._queued_bytes = max(
                 0,
                 int(getattr(self, "_queued_bytes", 0)) - byte_count,
@@ -517,11 +552,11 @@ class RemoteFillCoordinator:
     def _create_session(
         self,
         req_id: str,
-        state: Any,
+        state: ProducerRequestState,
         required_store_end_hint: int,
         context: ProducerSessionContext,
     ) -> RemoteFillProducerSession:
-        handoff = state.remote_fill_handoff
+        handoff = state.handoff
         if handoff is None:
             raise RuntimeError("remote-fill handoff is unavailable")
         limits = build_remote_fill_protocol_limits(self.config)
@@ -581,15 +616,15 @@ class RemoteFillCoordinator:
             ),
             negotiation_cache=negotiation_cache,
         )
-        if not state.remote_fill_active_counted:
+        if not state.active_counted:
             self.get_metrics().add_gauge("active_transactions", 1)
-            state.remote_fill_active_counted = True
+            state.active_counted = True
         return session
 
     def submit_probe(
         self,
         req_id: str,
-        state: Any,
+        state: ProducerRequestState,
         pages: tuple[ControlPage, ...],
         required_store_end_hint: int,
         *,
@@ -598,10 +633,10 @@ class RemoteFillCoordinator:
     ) -> None:
         """Queue bounded, ordered cached-prefix probes before direct writes."""
 
-        if not pages or state.remote_fill_handoff is None:
+        if not pages or state.handoff is None:
             return
         if maximum <= 0:
-            state.remote_fill_disabled_reason = "invalid_control_page_limit"
+            state.disabled_reason = "invalid_control_page_limit"
             self.get_metrics().abandon("invalid control page limit", allocation=True)
             return
         executor = getattr(self, "_executor", None)
@@ -612,7 +647,7 @@ class RemoteFillCoordinator:
                     thread_name_prefix="lmcache-remote-fill-producer",
                 )
             except Exception as error:
-                state.remote_fill_disabled_reason = type(error).__name__
+                state.disabled_reason = type(error).__name__
                 self._record_failure()
                 return
             self._executor = executor
@@ -622,27 +657,27 @@ class RemoteFillCoordinator:
         metrics = self.get_metrics()
         queued_at = time.perf_counter() if metrics.timing_enabled else 0.0
         if not self._acquire_queue_capacity(state, 0):
-            state.remote_fill_disabled_reason = "producer_backpressure"
+            state.disabled_reason = "producer_backpressure"
             metrics.abandon("producer backpressure", allocation=True)
             return
         if metrics.timing_enabled:
             metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
-        first_window_id = state.remote_fill_next_window_id
-        state.remote_fill_next_window_id += len(control_windows)
-        previous = state.remote_fill_last_future
+        first_window_id = state.next_window_id
+        state.next_window_id += len(control_windows)
+        previous = state.last_future
 
         def run() -> Any:
             try:
                 if previous is not None:
                     previous.result()
-                if state.remote_fill_session is None:
-                    state.remote_fill_session = self._create_session(
+                if state.session is None:
+                    state.session = self._create_session(
                         req_id,
                         state,
                         required_store_end_hint,
                         context,
                     )
-                session = state.remote_fill_session
+                session = state.session
                 if not session.direct_viable:
                     return None
                 results = []
@@ -650,12 +685,12 @@ class RemoteFillCoordinator:
                     window_id = first_window_id + window_offset
                     result = session.probe_window(
                         window_id=window_id,
-                        source_generation=state.remote_fill_source_generation,
+                        source_generation=state.source_generation,
                         control_pages=control_pages,
                     )
                     results.append(result)
                     if not result.direct_satisfied:
-                        state.remote_fill_disabled_reason = result.reason
+                        state.disabled_reason = result.reason
                         if result.reason != "cached-prefix hole":
                             self._record_failure()
                     self._record_window_metrics(state, result)
@@ -676,9 +711,9 @@ class RemoteFillCoordinator:
                 self._latch_fatal(state)
                 raise
             except Exception as error:
-                state.remote_fill_disabled_reason = type(error).__name__
-                if state.remote_fill_session is not None:
-                    state.remote_fill_session.direct_viable = False
+                state.disabled_reason = type(error).__name__
+                if state.session is not None:
+                    state.session.direct_viable = False
                 self._record_failure()
                 return None
             finally:
@@ -688,15 +723,15 @@ class RemoteFillCoordinator:
             future = executor.submit(run)
         except Exception as error:
             self._release_queue_capacity(state, 0)
-            state.remote_fill_disabled_reason = type(error).__name__
+            state.disabled_reason = type(error).__name__
             self._record_failure()
             return
-        state.remote_fill_futures.append(future)
-        state.remote_fill_last_future = future
+        state.futures.append(future)
+        state.last_future = future
 
     def submit_batch(
         self,
-        state: Any,
+        state: ProducerRequestState,
         batch: DirectPageBatch,
         required_store_end_hint: int,
         *,
@@ -705,12 +740,12 @@ class RemoteFillCoordinator:
         context: ProducerSessionContext,
     ) -> None:
         if maximum <= 0:
-            state.remote_fill_disabled_reason = "invalid_control_page_limit"
+            state.disabled_reason = "invalid_control_page_limit"
             self._log_prearm_failure(
                 state,
                 req_id=batch.req_id,
                 stage="control_page_planning",
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
             )
             self.get_metrics().abandon("invalid control page limit", allocation=True)
             return
@@ -727,12 +762,12 @@ class RemoteFillCoordinator:
         metrics = self.get_metrics()
         queued_at = time.perf_counter() if metrics.timing_enabled else 0.0
         if request_oversized or not self._acquire_queue_capacity(state, byte_count):
-            state.remote_fill_disabled_reason = "producer_backpressure"
+            state.disabled_reason = "producer_backpressure"
             self._log_prearm_failure(
                 state,
                 req_id=batch.req_id,
                 stage="producer_admission",
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
             )
             metrics = self.get_metrics()
             metrics.abandon("producer backpressure", allocation=True)
@@ -758,12 +793,12 @@ class RemoteFillCoordinator:
             )
         except Exception as error:
             self._release_queue_capacity(state, byte_count)
-            state.remote_fill_disabled_reason = type(error).__name__
+            state.disabled_reason = type(error).__name__
             self._log_prearm_failure(
                 state,
                 req_id=batch.req_id,
                 stage="source_plan_validation",
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
                 error=error,
             )
             self._record_failure()
@@ -785,31 +820,31 @@ class RemoteFillCoordinator:
                 )
             except Exception as error:
                 self._release_queue_capacity(state, byte_count)
-                state.remote_fill_disabled_reason = type(error).__name__
+                state.disabled_reason = type(error).__name__
                 self._log_prearm_failure(
                     state,
                     req_id=batch.req_id,
                     stage="producer_executor_creation",
-                    reason=state.remote_fill_disabled_reason,
+                    reason=state.disabled_reason,
                     error=error,
                 )
                 self._record_failure()
                 return
             self._executor = executor
-        first_window_id = state.remote_fill_next_window_id
-        state.remote_fill_next_window_id += len(control_windows)
-        source_generation = state.remote_fill_source_generation
-        previous = state.remote_fill_last_future
+        first_window_id = state.next_window_id
+        state.next_window_id += len(control_windows)
+        source_generation = state.source_generation
+        previous = state.last_future
 
         def run() -> Any:
             try:
                 if previous is not None:
                     previous.result()
-                if state.remote_fill_session is None:
-                    state.remote_fill_session = self._create_session(
+                if state.session is None:
+                    state.session = self._create_session(
                         batch.req_id, state, required_store_end_hint, context
                     )
-                session = state.remote_fill_session
+                session = state.session
                 if not session.direct_viable:
                     return None
                 submitter = getattr(
@@ -844,7 +879,7 @@ class RemoteFillCoordinator:
                     )
                     results.append(result)
                     if not result.direct_satisfied:
-                        state.remote_fill_disabled_reason = result.reason
+                        state.disabled_reason = result.reason
                         if result.reason not in (
                             "cached-prefix hole",
                             "direct destination hole",
@@ -856,7 +891,7 @@ class RemoteFillCoordinator:
                             logger,
                             "remote_fill_window_complete",
                             req_id=batch.req_id,
-                            transfer_id=state.remote_fill_handoff.transfer_id,
+                            transfer_id=state.handoff.transfer_id,
                             window_id=window_id,
                             page_count=len(window_pages),
                             chunk_start=chunk_start,
@@ -910,14 +945,14 @@ class RemoteFillCoordinator:
                             phase="native_or_control_terminal",
                         )
                     raise
-                state.remote_fill_disabled_reason = type(error).__name__
-                if state.remote_fill_session is not None:
-                    state.remote_fill_session.direct_viable = False
+                state.disabled_reason = type(error).__name__
+                if state.session is not None:
+                    state.session.direct_viable = False
                 self._log_prearm_failure(
                     state,
                     req_id=batch.req_id,
                     stage="producer_window_execution",
-                    reason=state.remote_fill_disabled_reason,
+                    reason=state.disabled_reason,
                     error=error,
                 )
                 self._record_failure()
@@ -932,15 +967,200 @@ class RemoteFillCoordinator:
             future = executor.submit(run)
         except Exception as error:
             self._release_queue_capacity(state, byte_count)
-            state.remote_fill_disabled_reason = type(error).__name__
+            state.disabled_reason = type(error).__name__
             self._log_prearm_failure(
                 state,
                 req_id=batch.req_id,
                 stage="producer_executor_submission",
-                reason=state.remote_fill_disabled_reason,
+                reason=state.disabled_reason,
                 error=error,
             )
             self._record_failure()
             return
-        state.remote_fill_futures.append(future)
-        state.remote_fill_last_future = future
+        state.futures.append(future)
+        state.last_future = future
+
+    def finish(
+        self,
+        req_id: str,
+        state: ProducerRequestState,
+        required_store_end: int,
+        persistent_common_end: int,
+    ) -> RemoteFillTerminalResult | None:
+        if state.handoff is None:
+            return
+        if state.terminal is not None:
+            return state.terminal
+        self.wait(state)
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_persistent_complete",
+                req_id=req_id,
+                transfer_id=state.handoff.transfer_id,
+                persistent_common_end=persistent_common_end,
+                required_store_end=required_store_end,
+            )
+        finish_control_seconds = 0.0
+        metrics = self.get_metrics()
+        try:
+            if state.session is None:
+                terminal = RemoteFillTerminalResult(
+                    transfer_id=state.handoff.transfer_id,
+                    outcome="PERSISTENT_ONLY",
+                    persistent_common_end=persistent_common_end,
+                    required_store_end=required_store_end,
+                )
+            else:
+                finish_started = time.perf_counter() if metrics.timing_enabled else 0.0
+                try:
+                    terminal = state.session.finish(
+                        required_store_end=required_store_end,
+                        persistent_common_end=persistent_common_end,
+                        final_partial_valid_tokens=(
+                            required_store_end % int(self.config.chunk_size)
+                        ),
+                    )
+                finally:
+                    if metrics.timing_enabled:
+                        finish_control_seconds = time.perf_counter() - finish_started
+                        metrics.observe(
+                            "finish_control_seconds",
+                            finish_control_seconds,
+                        )
+        except RemoteFillFatalError:
+            self._latch_fatal(state)
+            raise
+        if terminal.outcome == "FATAL_RESTART":
+            self._latch_fatal(state)
+        state.terminal = terminal
+        if metrics.timing_enabled and state.persistent_started_at:
+            metrics.observe(
+                "persistent_seconds",
+                time.perf_counter() - state.persistent_started_at,
+            )
+        metrics.finish_attempt(
+            terminal.outcome,
+            state.disabled_reason or "none",
+        )
+        if state.viable_counted:
+            metrics.add_gauge("direct_viable", -1)
+            state.viable_counted = False
+        if state.active_counted:
+            metrics.add_gauge("active_transactions", -1)
+            state.active_counted = False
+        if terminal.direct_satisfied:
+            metrics.add_bytes("published_bytes", state.submitted_bytes)
+        else:
+            metrics.add_bytes("discarded_bytes", state.submitted_bytes)
+        if terminal.direct_satisfied:
+            self.record_success()
+        elif terminal.outcome == "PERSISTENT_ONLY":
+            log_remote_fill_diagnostic(
+                logger,
+                event="remote_fill_fallback",
+                code="RF-P-004",
+                stage="producer_terminal",
+                action="PERSISTENT_ONLY",
+                req_id=req_id,
+                transfer_id=state.handoff.transfer_id,
+                reason=state.disabled_reason or terminal.outcome,
+                severity="warning",
+            )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_producer_terminal",
+                req_id=req_id,
+                transfer_id=state.handoff.transfer_id,
+                outcome=terminal.outcome,
+                direct_satisfied=terminal.direct_satisfied,
+                persistent_common_end=persistent_common_end,
+                required_store_end=required_store_end,
+                finish_control_ms=round(finish_control_seconds * 1000, 3),
+            )
+        completed = getattr(self, "_completed_results", None)
+        if completed is None:
+            completed = {}
+            self._completed_results = completed
+        completed[req_id] = terminal
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_producer_metrics_snapshot",
+                metrics=metrics.snapshot(),
+            )
+        return terminal
+
+    def wait(self, state: ProducerRequestState) -> None:
+        try:
+            while state.futures:
+                state.futures.popleft().result()
+        except RemoteFillFatalError:
+            self._latch_fatal(state)
+            raise
+
+    def release(
+        self, req_id: str, state: ProducerRequestState, *, persistent_ready: bool
+    ) -> bool:
+        """Retire drained producer state, preserving fatal owner retention."""
+        if (
+            state.terminal is not None and state.terminal.outcome == "FATAL_RESTART"
+        ) or getattr(state.session, "fatal_restart_required", False):
+            self._latch_fatal(state)
+            raise RemoteFillFatalError("cannot release fatal remote-fill request state")
+        if (
+            not persistent_ready
+            or state.futures
+            or (state.last_future is not None and not state.last_future.done())
+        ):
+            return False
+        if state.session is not None:
+            if state.terminal is None:
+                try:
+                    state.session.abort("prefiller released request before FINISH")
+                    if serving_perf_enabled():
+                        serving_perf_log(
+                            logger,
+                            "remote_fill_abort",
+                            req_id=req_id,
+                            reason="request_released_before_finish",
+                        )
+                except RemoteFillFatalError:
+                    self._latch_fatal(state)
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Failed to release hidden remote-fill state for %s",
+                        req_id,
+                        exc_info=True,
+                    )
+            state.session.close()
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "remote_fill_release",
+                    req_id=req_id,
+                    terminal=state.terminal is not None,
+                )
+        if state.metrics_started and state.terminal is None:
+            metrics = self.get_metrics()
+            metrics.finish_attempt("ABORTED", "request aborted")
+            metrics.abandon("request aborted")
+            if state.viable_counted:
+                metrics.add_gauge("direct_viable", -1)
+                state.viable_counted = False
+            if state.active_counted:
+                metrics.add_gauge("active_transactions", -1)
+                state.active_counted = False
+            metrics.add_bytes("discarded_bytes", state.submitted_bytes)
+        return True
+
+    def drain_terminal_results(
+        self,
+    ) -> dict[str, dict[str, str | int]]:
+        """Drain sanitized completed outcomes for scheduler/proxy handoff."""
+
+        completed = getattr(self, "_completed_results", {})
+        self._completed_results = {}
+        return {req_id: terminal.as_dict() for req_id, terminal in completed.items()}

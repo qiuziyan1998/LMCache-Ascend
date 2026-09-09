@@ -49,6 +49,7 @@ from lmcache_ascend.v1.remote_fill import (
     remote_fill_token_hash_identity,
 )
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
+from lmcache_ascend.v1.remote_fill_coordinator import ProducerRequestState, RemoteFillCoordinator
 
 
 def test_post_init_emits_startup_stage_timings() -> None:
@@ -1585,10 +1586,14 @@ def test_producer_and_decoder_fatal_paths_share_one_supervisor_latch() -> None:
 
     future: Future = Future()
     future.set_exception(RemoteFillFatalError("native completion unknown"))
-    producer_state = SimpleNamespace(
-        remote_fill_handoff=SimpleNamespace(transfer_id="producer-transfer"),
-        remote_fill_futures=deque((future,)),
+    engine._remote_fill_coordinator = RemoteFillCoordinator(
+        config=SimpleNamespace(), tp_size=1, storage_manager=object(),
+        fatal_reporter=engine._remote_fill_require_paired_restart,
     )
+    producer_state = SimpleNamespace(remote_fill=ProducerRequestState(
+        handoff=SimpleNamespace(transfer_id="producer-transfer"),
+        futures=deque((future,)),
+    ))
     with pytest.raises(RemoteFillFatalError):
         engine._wait_remote_fill_windows(producer_state)
     engine._remote_fill_require_paired_restart(("decoder-transfer", ""))

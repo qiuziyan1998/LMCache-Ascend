@@ -51,7 +51,7 @@ from lmcache.v1.remote_fill.native import (
 
 # First Party
 import lmcache_ascend.v1.remote_fill_coordinator as coordinator_module
-from lmcache_ascend.v1.remote_fill_coordinator import RemoteFillCoordinator
+from lmcache_ascend.v1.remote_fill_coordinator import ProducerRequestState, RemoteFillCoordinator
 import lmcache_ascend.v1.remote_fill_producer as producer_module
 from lmcache_ascend.v1.cache_engine import (
     AscendLMCacheEngine,
@@ -77,6 +77,12 @@ _GENERATION = 23
 _SESSION = "decoder-global-te"
 
 
+def _producer_state(state):
+    if state.remote_fill is None:
+        state.remote_fill = ProducerRequestState()
+    return state.remote_fill
+
+
 def _coordinator(engine):
     coordinator = getattr(engine, "_remote_fill_coordinator", None)
     if coordinator is None:
@@ -93,9 +99,7 @@ def _coordinator(engine):
 def test_finish_skips_disabled_snapshot_but_keeps_terminal_accounting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from lmcache_ascend.v1 import cache_engine as engine_module
-
-    monkeypatch.setattr(engine_module, "serving_perf_enabled", lambda: False)
+    monkeypatch.setattr(coordinator_module, "serving_perf_enabled", lambda: False)
     accounting = []
 
     def forbidden() -> None:
@@ -109,18 +113,16 @@ def test_finish_skips_disabled_snapshot_but_keeps_terminal_accounting(
         snapshot=forbidden,
     )
     state = _DirectStoreRequestState(
-        remote_fill_handoff=_handoff(),
         committed_end={0: 1024, 1: 1024},
+        remote_fill=ProducerRequestState(handoff=_handoff()),
     )
-    engine = SimpleNamespace(
-        _wait_remote_fill_windows=lambda value: accounting.append(("wait", value)),
-        _get_remote_fill_coordinator=lambda: SimpleNamespace(
-            get_metrics=lambda: metrics
-        ),
+    coordinator = SimpleNamespace(
+        wait=lambda value: accounting.append(("wait", value)),
+        get_metrics=lambda: metrics,
     )
-    AscendLMCacheEngine._finish_remote_fill(engine, "r", state, 1024)
-    assert engine._completed_remote_fill_results["r"] is state.remote_fill_terminal
-    assert state.remote_fill_terminal.outcome == "PERSISTENT_ONLY"
+    RemoteFillCoordinator.finish(coordinator, "r", state.remote_fill, 1024, 1024)
+    assert coordinator._completed_results["r"] is state.remote_fill.terminal
+    assert state.remote_fill.terminal.outcome == "PERSISTENT_ONLY"
     assert ("finish", ("PERSISTENT_ONLY", "none")) in accounting
     assert ("bytes", ("discarded_bytes", 0)) in accounting
 
@@ -130,7 +132,6 @@ def test_probe_keeps_results_and_capacity_with_optional_perf(
     monkeypatch: pytest.MonkeyPatch,
     enabled: bool,
 ) -> None:
-
     monkeypatch.setattr(coordinator_module, "serving_perf_enabled", lambda: enabled)
     events = []
     monkeypatch.setattr(
@@ -150,8 +151,10 @@ def test_probe_keeps_results_and_capacity_with_optional_perf(
         future.set_result(operation())
         return future
 
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
-    state.remote_fill_session = SimpleNamespace(
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
+    state.remote_fill.session = SimpleNamespace(
         request_id="r",
         direct_viable=True,
         probe_window=probe,
@@ -161,20 +164,16 @@ def test_probe_keeps_results_and_capacity_with_optional_perf(
         _remote_fill_pages_per_window=lambda: 2,
         get_metrics=lambda: SimpleNamespace(timing_enabled=False),
         _acquire_queue_capacity=lambda *args: True,
-        _release_queue_capacity=lambda *args: calls.append(
-            ("release", args)
-        ),
-        _record_window_metrics=lambda *args: calls.append(
-            ("metrics", args)
-        ),
+        _release_queue_capacity=lambda *args: calls.append(("release", args)),
+        _record_window_metrics=lambda *args: calls.append(("metrics", args)),
         _record_failure=lambda: calls.append(("failure",)),
     )
     pages = (object(), object(), object())
     RemoteFillCoordinator.submit_probe(
-        engine, "r", state, pages, 1024, maximum=2, context=None
+        engine, "r", _producer_state(state), pages, 1024, maximum=2, context=None
     )
-    assert state.remote_fill_last_future.result() == (result, result)
-    assert state.remote_fill_next_window_id == 2
+    assert state.remote_fill.last_future.result() == (result, result)
+    assert state.remote_fill.next_window_id == 2
     assert [kind for kind, *_ in calls] == [
         "probe",
         "metrics",
@@ -1434,7 +1433,8 @@ def test_disabled_engine_path_creates_no_remote_work() -> None:
     )
 
     assert enabled is False
-    assert state.remote_fill_handoff is None
+    assert state.remote_fill is None
+    assert not hasattr(engine, "_remote_fill_coordinator")
     assert not hasattr(engine, "_remote_fill_producer_executor")
     assert not hasattr(engine, "_remote_fill_queue_lock")
     assert not hasattr(engine, "_remote_fill_client_factory")
@@ -1455,7 +1455,7 @@ def test_malformed_handoff_is_visible_and_uses_persistent_fallback(caplog) -> No
         )
 
     assert enabled is False
-    assert state.remote_fill_handoff is None
+    assert state.remote_fill.handoff is None
     assert '"code":"RF-P-001"' in caplog.text
     assert '"diagnostic_name":"producer_handoff_malformed"' in caplog.text
     assert '"event":"remote_fill_handoff_rejected"' in caplog.text
@@ -1601,7 +1601,6 @@ def test_producer_timing_keeps_native_deadline(monkeypatch, mode):
 
 
 def test_disabled_queue_timing_preserves_capacity_accounting(monkeypatch):
-
     monkeypatch.setenv("PD_SERVING_PERF", "0")
     monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "0")
     monkeypatch.setattr(
@@ -1616,11 +1615,11 @@ def test_disabled_queue_timing_preserves_capacity_accounting(monkeypatch):
         remote_fill_max_inflight_windows_per_request=4,
     )
     state = _DirectStoreRequestState()
-    assert _coordinator(engine)._acquire_queue_capacity(state, 60)
-    assert not _coordinator(engine)._acquire_queue_capacity(state, 50)
-    assert state.remote_fill_oldest_enqueued_at == 0.0
-    _coordinator(engine)._release_queue_capacity(state, 60)
-    assert state.remote_fill_queued_windows == state.remote_fill_queued_bytes == 0
+    assert _coordinator(engine)._acquire_queue_capacity(_producer_state(state), 60)
+    assert not _coordinator(engine)._acquire_queue_capacity(_producer_state(state), 50)
+    assert state.remote_fill.oldest_enqueued_at == 0.0
+    _coordinator(engine)._release_queue_capacity(_producer_state(state), 60)
+    assert state.remote_fill.queued_windows == state.remote_fill.queued_bytes == 0
     snapshot = engine.remote_fill_producer_metrics_snapshot()
     assert snapshot["gauges"]["inflight_windows"] == 0
     assert snapshot["gauges"]["inflight_bytes"] == 0
@@ -1639,21 +1638,22 @@ def test_global_producer_inflight_bytes_are_bounded_across_requests() -> None:
     first = _DirectStoreRequestState()
     second = _DirectStoreRequestState()
 
-    assert _coordinator(engine)._acquire_queue_capacity(first, 60)
-    assert not _coordinator(engine)._acquire_queue_capacity(second, 50)
-    assert first.remote_fill_queued_bytes == 60
-    assert second.remote_fill_queued_bytes == 0
+    assert _coordinator(engine)._acquire_queue_capacity(_producer_state(first), 60)
+    assert not _coordinator(engine)._acquire_queue_capacity(_producer_state(second), 50)
+    assert first.remote_fill.queued_bytes == 60
+    assert second.remote_fill.queued_bytes == 0
 
-    _coordinator(engine)._release_queue_capacity(first, 60)
-    assert _coordinator(engine)._acquire_queue_capacity(second, 50)
-    _coordinator(engine)._release_queue_capacity(second, 50)
+    _coordinator(engine)._release_queue_capacity(_producer_state(first), 60)
+    assert _coordinator(engine)._acquire_queue_capacity(_producer_state(second), 50)
+    _coordinator(engine)._release_queue_capacity(_producer_state(second), 50)
     assert (
         engine.remote_fill_producer_metrics_snapshot()["gauges"]["inflight_bytes"] == 0
     )
 
 
 def test_multi_window_batch_charges_all_retained_group0_bytes(
-    caplog, monkeypatch,
+    caplog,
+    monkeypatch,
 ) -> None:
     control_pages = tuple(
         ControlPage(
@@ -1685,9 +1685,7 @@ def test_multi_window_batch_charges_all_retained_group0_bytes(
         owners=(owner,),
         ready_event=object(),
         group_ends={0: 2048},
-        ranges=tuple(
-            (page.chunk_start, page.chunk_end) for page in control_pages
-        ),
+        ranges=tuple((page.chunk_start, page.chunk_end) for page in control_pages),
         ready_events=(object(),),
     )
     executor_calls = []
@@ -1714,18 +1712,18 @@ def test_multi_window_batch_charges_all_retained_group0_bytes(
     engine._remote_fill_control_pages = lambda _batch: control_pages
     engine._remote_fill_pages_per_window = lambda: 1
     source_plan_calls = []
-    monkeypatch.setattr(coordinator_module, "build_remote_fill_source_plan", lambda queued_batch: (
-        source_plan_calls.append(queued_batch) or queued_batch
-    ))
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_remote_fill_source_plan",
+        lambda queued_batch: (source_plan_calls.append(queued_batch) or queued_batch),
+    )
     transfer_calls = []
     result = RemoteFillWindowResult(
         0, True, True, reason="complete", submitted_bytes=10
     )
     session = SimpleNamespace(
         direct_viable=True,
-        transfer_window=lambda **kwargs: (
-            transfer_calls.append(kwargs) or result
-        ),
+        transfer_window=lambda **kwargs: (transfer_calls.append(kwargs) or result),
     )
     _coordinator(engine)._create_session = lambda *_args: session
     engine.storage_manager = SimpleNamespace(
@@ -1734,7 +1732,9 @@ def test_multi_window_batch_charges_all_retained_group0_bytes(
     )
     _coordinator(engine).storage_manager = engine.storage_manager
     engine._remote_fill_session_context = lambda: None
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
 
     engine._schedule_remote_fill_batch(state, batch, 2048)
 
@@ -1742,38 +1742,41 @@ def test_multi_window_batch_charges_all_retained_group0_bytes(
     # retaining 20 bytes. Full-batch charging rejects it before source plans.
     assert len(executor_calls) == 0
     assert len(source_plan_calls) == 0
-    assert state.remote_fill_disabled_reason == "producer_backpressure"
+    assert state.remote_fill.disabled_reason == "producer_backpressure"
 
     _coordinator(engine).config.remote_fill_max_inflight_bytes = 20
-    accepted = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    accepted = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
     engine._schedule_remote_fill_batch(accepted, batch, 2048)
 
     assert len(executor_calls) == 1
-    assert accepted.remote_fill_queued_bytes == 20
+    assert accepted.remote_fill.queued_bytes == 20
     assert (
-        engine.remote_fill_producer_metrics_snapshot()["gauges"]["inflight_bytes"]
-        == 20
+        engine.remote_fill_producer_metrics_snapshot()["gauges"]["inflight_bytes"] == 20
     )
     executor_futures[0].set_result(executor_calls[0]())
-    assert accepted.remote_fill_futures[0].exception() is None
+    assert accepted.remote_fill.futures[0].exception() is None
     assert len(source_plan_calls) == 2
     assert all(len(window.keys) == 1 for window in source_plan_calls)
     assert all(sum(map(sum, window.sizes)) == 10 for window in source_plan_calls)
     assert source_plan_calls[-1].ranges == ((1024, 2048),)
     assert len(transfer_calls) == 2
     assert all(len(call["control_pages"]) == 1 for call in transfer_calls)
-    assert accepted.remote_fill_next_window_id == 2
-    assert accepted.remote_fill_queued_windows == 0
-    assert accepted.remote_fill_queued_bytes == 0
+    assert accepted.remote_fill.next_window_id == 2
+    assert accepted.remote_fill.queued_windows == 0
+    assert accepted.remote_fill.queued_bytes == 0
 
     # The aggregate request limit remains independent of active-window bytes.
     _coordinator(engine).config.remote_fill_max_bytes_per_request = 19
-    rejected = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    rejected = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
     with caplog.at_level(logging.WARNING):
         engine._schedule_remote_fill_batch(rejected, batch, 2048)
     assert len(executor_calls) == 1
     assert len(source_plan_calls) == 2
-    assert rejected.remote_fill_disabled_reason == "producer_backpressure"
+    assert rejected.remote_fill.disabled_reason == "producer_backpressure"
     assert '"code":"RF-P-004"' in caplog.text
     assert '"diagnostic_name":"producer_persistent_fallback"' in caplog.text
     assert '"event":"remote_fill_fallback"' in caplog.text
@@ -1918,9 +1921,11 @@ def test_persistent_and_direct_barriers_precede_finish_and_terminal_export() -> 
         futures=deque([_RecordingFuture("persistent")]),
         submitted_end={0: 1024, 1: 1024},
         committed_end={0: 0, 1: 0},
-        remote_fill_handoff=_handoff(),
-        remote_fill_session=_Session(),
-        remote_fill_futures=deque([_RecordingFuture("direct")]),
+        remote_fill=ProducerRequestState(
+            handoff=_handoff(),
+            session=_Session(),
+            futures=deque([_RecordingFuture("direct")]),
+        ),
     )
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(blocking_timeout_secs=1, chunk_size=1024)
@@ -1955,8 +1960,7 @@ def test_ambiguous_armed_window_blocks_finalize_and_release() -> None:
         accepted_store_end=1024,
         submitted_end={0: 1024, 1: 1024},
         committed_end={0: 1024, 1: 1024},
-        remote_fill_handoff=_handoff(),
-        remote_fill_session=session,
+        remote_fill=ProducerRequestState(handoff=_handoff(), session=session),
     )
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(save_unfull_chunk=True, chunk_size=1024)
@@ -2000,9 +2004,7 @@ def test_remote_fill_requires_one_complete_source_page(
     )
 
 
-@pytest.mark.parametrize(
-    "submission_mode", ["per_chunk", "final_deferred"]
-)
+@pytest.mark.parametrize("submission_mode", ["per_chunk", "final_deferred"])
 def test_nonfinal_missing_fence_retains_windowed_sources(
     caplog, submission_mode: str
 ) -> None:
@@ -2042,7 +2044,9 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
         planner_calls.append((group, starts, ends, slot_mapping_base))
         return [[100 + group]], [[64]], (owner,)
 
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
     metrics = _Metrics()
     scheduled: list[_DirectPageBatch] = []
     engine = object.__new__(AscendLMCacheEngine)
@@ -2055,12 +2059,14 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
     engine.config = SimpleNamespace(
         chunk_size=1024,
         dsa_two_groups=True,
-        dsa_group1_load_mode='p2p_preferred',
+        dsa_group1_load_mode="p2p_preferred",
         remote_fill_submission_mode=submission_mode,
         get_extra_config_value=lambda _name, default: default,
     )
     engine._remote_fill_prepare_request = lambda *_args: True
-    engine._get_remote_fill_coordinator = lambda: SimpleNamespace(get_metrics=lambda: metrics)
+    engine._get_remote_fill_coordinator = lambda: SimpleNamespace(
+        get_metrics=lambda: metrics
+    )
     engine._store_cv = Condition()
     engine._pending_store_reqs = {}
     engine.wait_for_direct_stores = lambda _req_ids: set()
@@ -2077,10 +2083,7 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
         start = end - 1024
         request_state.planned_end = end
         request_state.planned_hash = f"chunk-{start}".encode()
-        return {
-            group: [(start, end, _Key(group, start))]
-            for group in (0, 1)
-        }
+        return {group: [(start, end, _Key(group, start))] for group in (0, 1)}
 
     engine._direct_suffix_plans = suffix_plans
     engine._schedule_remote_fill_batch = (
@@ -2109,13 +2112,13 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
             final=False,
             **initial_fence,
         )
-    assert state.remote_fill_fence_deferred
-    assert state.remote_fill_disabled_reason == ""
+    assert state.remote_fill.fence_deferred
+    assert state.remote_fill.disabled_reason == ""
     assert metrics.abandoned == []
     assert state.submitted_end == {0: 1024, 1: 1024}
     assert scheduled == []
     if submission_mode == "final_deferred":
-        assert len(state.remote_fill_deferred_batches) == 1
+        assert len(state.remote_fill.deferred_batches) == 1
         assert '"reason":"final_deferred_submission_mode"' in caplog.text
         assert '"complete_fence_count":1' in caplog.text
         assert engine.store_direct_prefill(
@@ -2125,13 +2128,11 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
             slot_mappings,
             final=True,
             source_ready_event=event,
-            source_ready_event_source=(
-                "forward_context.sfa_reshape_cache_event"
-            ),
+            source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
             source_ready_events=(event,),
         )
-        assert not state.remote_fill_fence_deferred
-        assert state.remote_fill_deferred_batches == []
+        assert not state.remote_fill.fence_deferred
+        assert state.remote_fill.deferred_batches == []
         assert len(scheduled) == 1
         assert scheduled[0].ready_events == (event,)
         return
@@ -2146,9 +2147,9 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
             slot_mapping_base=1024,
         )
     assert caplog.text.count('"decision":"defer_nonfinal"') == 1
-    assert len(state.remote_fill_deferred_batches) == 2
-    assert state.remote_fill_deferred_pages == 4
-    assert state.remote_fill_deferred_bytes == 256
+    assert len(state.remote_fill.deferred_batches) == 2
+    assert state.remote_fill.deferred_pages == 4
+    assert state.remote_fill.deferred_bytes == 256
 
     with caplog.at_level(logging.INFO):
         assert engine.store_direct_prefill(
@@ -2159,16 +2160,14 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
             final=False,
             slot_mapping_base=1024,
             source_ready_event=event,
-            source_ready_event_source=(
-                "forward_context.sfa_reshape_cache_event"
-            ),
+            source_ready_event_source=("forward_context.sfa_reshape_cache_event"),
             source_ready_events=(event,),
         )
 
-    assert not state.remote_fill_fence_deferred
-    assert state.remote_fill_deferred_batches == []
-    assert state.remote_fill_deferred_pages == 0
-    assert state.remote_fill_deferred_bytes == 0
+    assert not state.remote_fill.fence_deferred
+    assert state.remote_fill.deferred_batches == []
+    assert state.remote_fill.deferred_pages == 0
+    assert state.remote_fill.deferred_bytes == 0
     assert planner_calls == [
         (0, [0], [1024], 0),
         (1, [0], [1024], 0),
@@ -2268,13 +2267,15 @@ def test_coordinator_fatal_report_is_immediate_and_weak(monkeypatch):
     engine._init_failed = False
     engine._health_monitor = None
     coordinator = _coordinator(engine)
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
     was_enabled = gc.isenabled()
     gc.disable()
     try:
         engine_ref = weakref.ref(engine)
         coordinator_ref = weakref.ref(coordinator)
-        coordinator._latch_fatal(state)
+        coordinator._latch_fatal(_producer_state(state))
         assert not engine.is_healthy()
         assert engine.remote_fill_requires_paired_restart()
         assert engine._remote_fill_fatal_transfers == (_handoff().transfer_id,)
@@ -2320,15 +2321,30 @@ def _queued_batch():
 @pytest.mark.parametrize("operation", ["probe", "batch"])
 def test_coordinator_executor_creation_releases_all_admission(monkeypatch, operation):
     engine, coordinator = _queued_coordinator()
-    monkeypatch.setattr(coordinator_module, "ThreadPoolExecutor", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("executor creation")))
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    monkeypatch.setattr(
+        coordinator_module,
+        "ThreadPoolExecutor",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("executor creation")),
+    )
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
     if operation == "probe":
-        coordinator.submit_probe("request", state, _pages(), 1024, maximum=2, context=None)
+        coordinator.submit_probe(
+            "request", _producer_state(state), _pages(), 1024, maximum=2, context=None
+        )
     else:
-        coordinator.submit_batch(state, _queued_batch(), 1024, control_pages=_pages(), maximum=2, context=None)
-    assert state.remote_fill_disabled_reason == "RuntimeError"
-    assert not state.remote_fill_futures
-    assert state.remote_fill_queued_bytes == state.remote_fill_queued_windows == 0
+        coordinator.submit_batch(
+            _producer_state(state),
+            _queued_batch(),
+            1024,
+            control_pages=_pages(),
+            maximum=2,
+            context=None,
+        )
+    assert state.remote_fill.disabled_reason == "RuntimeError"
+    assert not state.remote_fill.futures
+    assert state.remote_fill.queued_bytes == state.remote_fill.queued_windows == 0
     assert getattr(coordinator, "_remote_fill_queued_bytes", 0) == 0
 
 
@@ -2344,17 +2360,32 @@ def test_coordinator_second_submission_keeps_pending_probe_and_charge(monkeypatc
         return first
 
     coordinator._executor = SimpleNamespace(submit=submit)
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
-    state.remote_fill_session = SimpleNamespace(direct_viable=True, request_id="request", probe_window=lambda **kw: RemoteFillWindowResult(kw["window_id"], True, False))
-    coordinator.submit_probe("request", state, _pages(), 1024, maximum=2, context=None)
-    coordinator.submit_batch(state, _queued_batch(), 1024, control_pages=_pages(), maximum=2, context=None)
-    assert state.remote_fill_last_future is first
-    assert list(state.remote_fill_futures) == [first]
-    assert state.remote_fill_queued_windows == 1
-    assert state.remote_fill_queued_bytes == coordinator._queued_bytes == 0
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
+    state.remote_fill.session = SimpleNamespace(
+        direct_viable=True,
+        request_id="request",
+        probe_window=lambda **kw: RemoteFillWindowResult(kw["window_id"], True, False),
+    )
+    coordinator.submit_probe(
+        "request", _producer_state(state), _pages(), 1024, maximum=2, context=None
+    )
+    coordinator.submit_batch(
+        _producer_state(state),
+        _queued_batch(),
+        1024,
+        control_pages=_pages(),
+        maximum=2,
+        context=None,
+    )
+    assert state.remote_fill.last_future is first
+    assert list(state.remote_fill.futures) == [first]
+    assert state.remote_fill.queued_windows == 1
+    assert state.remote_fill.queued_bytes == coordinator._queued_bytes == 0
     first.set_result(jobs[0]())
-    assert state.remote_fill_queued_windows == 0
-    assert state.remote_fill_disabled_reason == "RuntimeError"
+    assert state.remote_fill.queued_windows == 0
+    assert state.remote_fill.disabled_reason == "RuntimeError"
 
 
 def test_coordinator_preserves_order_and_releases_sources_with_gc_disabled():
@@ -2380,24 +2411,41 @@ def test_coordinator_preserves_order_and_releases_sources_with_gc_disabled():
     batch = _queued_batch()
     batch.owners = (owner,)
     coordinator._executor = SimpleNamespace(submit=submit)
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
-    state.remote_fill_session = SimpleNamespace(
-        direct_viable=True, request_id="request",
-        probe_window=lambda **kw: (order.append("probe") or RemoteFillWindowResult(kw["window_id"], True, False)),
-        transfer_window=lambda **kw: (order.append("batch") or RemoteFillWindowResult(kw["window_id"], True, True)),
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff())
+    )
+    state.remote_fill.session = SimpleNamespace(
+        direct_viable=True,
+        request_id="request",
+        probe_window=lambda **kw: (
+            order.append("probe")
+            or RemoteFillWindowResult(kw["window_id"], True, False)
+        ),
+        transfer_window=lambda **kw: (
+            order.append("batch") or RemoteFillWindowResult(kw["window_id"], True, True)
+        ),
     )
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        coordinator.submit_probe("request", state, _pages(), 1024, maximum=2, context=None)
-        coordinator.submit_batch(state, batch, 1024, control_pages=_pages(), maximum=2, context=None)
+        coordinator.submit_probe(
+            "request", _producer_state(state), _pages(), 1024, maximum=2, context=None
+        )
+        coordinator.submit_batch(
+            _producer_state(state),
+            batch,
+            1024,
+            control_pages=_pages(),
+            maximum=2,
+            context=None,
+        )
         del batch, owner
         assert owner_ref() is not None
-        assert state.remote_fill_queued_windows == 2
+        assert state.remote_fill.queued_windows == 2
         futures[0].set_result(jobs.pop(0)())
         futures[1].set_result(jobs.pop(0)())
         assert order == ["probe", "batch"]
-        assert state.remote_fill_queued_windows == state.remote_fill_queued_bytes == 0
+        assert state.remote_fill.queued_windows == state.remote_fill.queued_bytes == 0
         assert coordinator._queued_bytes == 0
         assert owner_ref() is None
     finally:
@@ -2434,13 +2482,22 @@ def test_coordinator_session_validation_stays_in_ordered_worker(monkeypatch):
     engine.token_database = SimpleNamespace(chunk_hash_type=int, chunk_hash_bytes=None)
     spec = _static_spec()
     from dataclasses import replace
+
     spec = replace(spec, token_hash_algorithm="sha256:int")
-    engine._remote_fill_layout_cache = (spec.layout_tag, SimpleNamespace(
-        cache_namespace_tag=spec.cache_namespace_tag, layout_tag=spec.layout_tag,
-        model_artifact_id=spec.model_artifact_id, chunk_size=spec.chunk_size,
-        group_dimensions=spec.group_dimensions, num_layers=spec.layer_count,
-    ))
-    engine._remote_fill_immutable_layout = lambda: pytest.fail("admission rebuilt layout")
+    engine._remote_fill_layout_cache = (
+        spec.layout_tag,
+        SimpleNamespace(
+            cache_namespace_tag=spec.cache_namespace_tag,
+            layout_tag=spec.layout_tag,
+            model_artifact_id=spec.model_artifact_id,
+            chunk_size=spec.chunk_size,
+            group_dimensions=spec.group_dimensions,
+            num_layers=spec.layer_count,
+        ),
+    )
+    engine._remote_fill_immutable_layout = lambda: pytest.fail(
+        "admission rebuilt layout"
+    )
     caller = threading.get_ident()
     threads = []
     original = coordinator_module.remote_fill_token_hash_identity
@@ -2450,16 +2507,22 @@ def test_coordinator_session_validation_stays_in_ordered_worker(monkeypatch):
         return original(*args)
 
     monkeypatch.setattr(coordinator_module, "remote_fill_token_hash_identity", validate)
-    client = _ScriptedClient(reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING))
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+    )
     engine.configure_remote_fill_producer(client_factory=lambda *_args: client)
-    state = _DirectStoreRequestState(remote_fill_handoff=_handoff(token_hash_algorithm="sha256:int"))
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(
+            handoff=_handoff(token_hash_algorithm="sha256:int")
+        )
+    )
     engine._direct_store_states = {"request": state}
     try:
         engine._schedule_remote_fill_probe_pages("request", state, _pages(), 1024)
-        result = state.remote_fill_last_future.result(timeout=5)
+        result = state.remote_fill.last_future.result(timeout=5)
         assert result[0].direct_satisfied
         assert len(threads) == 1 and threads[0] != caller
-        assert state.remote_fill_session.static_spec == spec
+        assert state.remote_fill.session.static_spec == spec
     finally:
         engine.close_remote_fill_producer()
 
@@ -2490,11 +2553,13 @@ def test_fatal_cleanup_retains_prepared_owners_without_gc(
     terminal = RemoteFillTerminalResult(
         transfer_id=_handoff().transfer_id,
         outcome="FATAL_RESTART" if fatal_origin == "terminal" else "PERSISTENT_ONLY",
-        persistent_common_end=1024, required_store_end=1024,
+        persistent_common_end=1024,
+        required_store_end=1024,
     )
     state = _DirectStoreRequestState(
-        remote_fill_handoff=_handoff(), remote_fill_session=session,
-        remote_fill_terminal=terminal,
+        remote_fill=ProducerRequestState(
+            handoff=_handoff(), session=session, terminal=terminal
+        )
     )
     session._terminal = terminal
     session.fatal_restart_required = fatal_origin == "session"
@@ -2505,7 +2570,11 @@ def test_fatal_cleanup_retains_prepared_owners_without_gc(
         return original_close(current)
 
     monkeypatch.setattr(RemoteFillProducerSession, "close", close)
-    monkeypatch.setattr(RemoteFillProducerSession, "abort", lambda *_a: pytest.fail("cleanup attempted ABORT"))
+    monkeypatch.setattr(
+        RemoteFillProducerSession,
+        "abort",
+        lambda *_a: pytest.fail("cleanup attempted ABORT"),
+    )
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=120000)
     engine._remote_fill_fatal_transfers = ()
@@ -2518,7 +2587,11 @@ def test_fatal_cleanup_retains_prepared_owners_without_gc(
     if entry == "session":
         cleanup = session.close
     elif entry == "coordinator":
-        cleanup = lambda: coordinator.close(engine._direct_store_states)
+        cleanup = lambda: coordinator.close(
+            item.remote_fill
+            for item in engine._direct_store_states.values()
+            if item.remote_fill is not None
+        )
     else:
         cleanup = lambda: engine.drop_direct_store_states(("request",))
     was_enabled = gc.isenabled()
@@ -2542,6 +2615,257 @@ def test_fatal_cleanup_retains_prepared_owners_without_gc(
             if entry != "session":
                 assert not engine.is_healthy()
                 assert engine.remote_fill_requires_paired_restart()
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize(
+    "request_configs", [None, {}, {"lmcache.remote_fill": None}, []]
+)
+def test_coordinator_absent_handoff_keeps_persistent_state_lazy(request_configs):
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(enable_remote_lmcache_store=True)
+    state = _DirectStoreRequestState()
+    assert not engine._remote_fill_prepare_request("request", request_configs, state)
+    assert state.remote_fill is None
+    assert not hasattr(engine, "_remote_fill_coordinator")
+    engine._direct_store_states = {"request": state}
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.drop_direct_store_states(("request",))
+    assert not engine._direct_store_states
+    assert not hasattr(engine, "_remote_fill_coordinator")
+
+
+def test_coordinator_finish_once_exports_partial_terminal_through_ascend_adapter(
+    monkeypatch,
+):
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        LMCacheAscendConnectorV1Impl,
+    )
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=1024)
+    calls = []
+    terminal = RemoteFillTerminalResult(
+        transfer_id=_handoff().transfer_id,
+        outcome="LOCAL_FULL",
+        persistent_common_end=1041,
+        required_store_end=1041,
+        direct_satisfied=True,
+    )
+
+    def finish(**kwargs):
+        calls.append(kwargs)
+        return terminal
+
+    state = _DirectStoreRequestState(
+        committed_end={0: 1041, 1: 1041},
+        remote_fill=ProducerRequestState(
+            handoff=_handoff(), session=SimpleNamespace(finish=finish)
+        ),
+    )
+    coordinator = _coordinator(engine)
+    engine._finish_remote_fill("request", state, 1041)
+    engine._finish_remote_fill("request", state, 1041)
+    assert calls == [
+        {
+            "required_store_end": 1041,
+            "persistent_common_end": 1041,
+            "final_partial_valid_tokens": 17,
+        }
+    ]
+    assert state.remote_fill.terminal is terminal
+    assert not hasattr(engine, "_completed_remote_fill_results")
+    exported = engine.drain_remote_fill_terminal_results()
+    assert engine.drain_remote_fill_terminal_results() == {}
+    assert coordinator.drain_terminal_results() == {}
+
+    monkeypatch.setattr(
+        LMCacheAscendConnectorV1Impl.__mro__[1],
+        "request_finished",
+        lambda *_args: (False, {"first_tok": 7}),
+    )
+    adapter = object.__new__(LMCacheAscendConnectorV1Impl)
+    adapter._scheduler_live_sources = {}
+    adapter._scheduler_remote_fill_results = exported
+    adapter.store_async = True
+    adapter.kv_role = "kv_producer"
+    request = SimpleNamespace(
+        request_id="request",
+        kv_transfer_params={
+            "do_remote_decode": True,
+            "lmcache.remote_fill": {
+                "transfer_id": terminal.transfer_id,
+                "control_endpoint": "private",
+                "descriptor_verification_capability": "private",
+            },
+        },
+    )
+    delay_free, params = adapter.request_finished(request, [])
+    assert delay_free
+    assert params["first_tok"] == 7
+    assert params["lmcache.remote_fill"]["terminal"] == terminal.as_dict()
+    assert "control_endpoint" not in params["lmcache.remote_fill"]
+    assert "descriptor_verification_capability" not in params["lmcache.remote_fill"]
+    assert not adapter._scheduler_remote_fill_results
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_coordinator_ascend_preemption_preserves_real_engine_drop_ownership(fatal):
+    import gc
+    import weakref
+    from dataclasses import replace
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        LMCacheAscendConnectorV1Impl,
+    )
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    owner_ref = weakref.ref(owner)
+    source = replace(_source_plan(), owners=(owner,))
+    session = _session(
+        _ScriptedClient(
+            reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
+        )
+    )
+    session._prepared_sources[id(source)] = (
+        source,
+        PreparedDirectPushSource(source, 0, 0, 0),
+    )
+    session.fatal_restart_required = fatal
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(blocking_timeout_secs=1)
+    state = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(handoff=_handoff(), session=session)
+    )
+    engine._direct_store_states = {"request": state}
+    engine._direct_retry_args = {}
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine._remote_fill_fatal_transfers = ()
+    engine._init_failed = False
+    engine._health_monitor = None
+    order = []
+    engine.wait_for_pending_stores = lambda _ids: (order.append("persistent") or set())
+    _coordinator(engine)
+    adapter = object.__new__(LMCacheAscendConnectorV1Impl)
+    adapter.lmcache_engine = engine
+    adapter.store_async = True
+    adapter.kv_role = "kv_producer"
+    adapter._drop_worker_retrieve_state = lambda _req: order.append("retrieve")
+    adapter._unfenced_live_stores = {}
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del owner, source
+        if fatal:
+            with pytest.raises(RemoteFillFatalError):
+                adapter.handle_preemptions({"request"})
+            assert engine._direct_store_states["request"] is state
+            assert owner_ref() is not None
+            assert not session.closed
+            assert not engine.is_healthy()
+        else:
+            adapter.handle_preemptions({"request"})
+            assert not engine._direct_store_states
+            assert owner_ref() is None
+            assert session.closed
+        assert order == ["retrieve", "persistent"]
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_coordinator_late_window_updates_only_original_request_handle():
+    engine, coordinator = _queued_coordinator()
+    jobs = []
+    future = Future()
+    coordinator._executor = SimpleNamespace(
+        submit=lambda job: (jobs.append(job) or future)
+    )
+    old = ProducerRequestState(
+        handoff=_handoff(transfer_id="old"), source_generation=11
+    )
+    observed = []
+    old.session = SimpleNamespace(
+        direct_viable=True,
+        request_id="request",
+        probe_window=lambda **kwargs: (
+            observed.append(kwargs["source_generation"])
+            or RemoteFillWindowResult(kwargs["window_id"], True, False)
+        ),
+    )
+    coordinator.submit_probe("request", old, _pages(), 1024, maximum=2, context=None)
+    current = _DirectStoreRequestState(
+        remote_fill=ProducerRequestState(
+            handoff=_handoff(transfer_id="current"),
+            source_generation=22,
+        )
+    )
+    engine._direct_store_states = {"request": current}
+    future.set_result(jobs.pop()())
+    assert observed == [11]
+    assert engine._direct_store_states["request"] is current
+    assert current.remote_fill.source_generation == 22
+    assert current.remote_fill.session is None
+    assert not current.remote_fill.futures
+    assert current.remote_fill.next_window_id == 0
+    assert current.remote_fill.queued_bytes == current.remote_fill.queued_windows == 0
+    assert coordinator.drain_terminal_results() == {}
+
+
+def test_coordinator_repeated_finish_drop_releases_sources_without_gc():
+    import gc
+    import weakref
+    from dataclasses import replace
+
+    class Owner:
+        pass
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=1024)
+    engine._direct_store_states = {}
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    _coordinator(engine)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(200):
+            owner = Owner()
+            owner_ref = weakref.ref(owner)
+            source = replace(_source_plan(), owners=(owner,))
+            session = _session(
+                _ScriptedClient(
+                    reserve_dispositions=(
+                        PageDisposition.EXISTING,
+                        PageDisposition.EXISTING,
+                    )
+                )
+            )
+            session._prepared_sources[id(source)] = (
+                source,
+                PreparedDirectPushSource(source, 0, 0, 0),
+            )
+            session._terminal = RemoteFillTerminalResult(
+                _handoff().transfer_id, "LOCAL_FULL", 1024, 1024, direct_satisfied=True
+            )
+            state = _DirectStoreRequestState(
+                committed_end={0: 1024, 1: 1024},
+                remote_fill=ProducerRequestState(handoff=_handoff(), session=session),
+            )
+            engine._direct_store_states["reused"] = state
+            del owner, source
+            assert owner_ref() is not None
+            engine._finish_remote_fill("reused", state, 1024)
+            engine.drop_direct_store_states(("reused",))
+            assert owner_ref() is None
+            assert not engine._direct_store_states
+            assert len(engine.drain_remote_fill_terminal_results()) == 1
     finally:
         if was_enabled:
             gc.enable()
