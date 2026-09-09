@@ -11,7 +11,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     ReqMeta,
 )
 from lmcache.logging import init_logger
-from lmcache.v1.cold_start_perf import cold_start_perf_log
+from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 from lmcache.v1.cache_engine import LayerwiseStoreResult
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -528,17 +528,20 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             entry[1].append((req_id, fence))
 
         completed: list[str] = []
+        perf_enabled = serving_perf_enabled()
+        content_enabled = npu_content_diagnostics_enabled()
+        time_fence = perf_enabled or content_enabled
         for event, requests in by_event.values():
             ready_before_publish = (
                 self._query_source_ready_event(event)
-                if npu_content_diagnostics_enabled()
+                if content_enabled
                 else None
             )
-            started = time.perf_counter()
+            started = time.perf_counter() if time_fence else 0.0
             # This is an event-local producer fence.  It does not drain
             # unrelated NPU streams or invoke torch.npu.synchronize().
             event.synchronize()
-            wait_ms = (time.perf_counter() - started) * 1000
+            wait_ms = (time.perf_counter() - started) * 1000 if time_fence else 0.0
             req_ids = [req_id for req_id, _ in requests]
             finalize_readiness = getattr(
                 self.lmcache_engine, "finalize_live_source_readiness", None
@@ -546,27 +549,29 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if callable(finalize_readiness):
                 finalize_readiness(req_ids)
             for req_id, fence in requests:
-                cold_start_perf_log(
-                    logger,
-                    "live_source_ready_fence",
-                    req_id=req_id,
-                    event_source=fence.event_source,
-                    ready_at_finalize=fence.ready_at_finalize,
-                    ready_before_publish=ready_before_publish,
-                    wait_ms=round(wait_ms, 3),
-                    fence_scope="producer_event",
-                )
-                log_npu_content_diagnostic_event(
-                    "group1_source_ready_fence",
-                    req_id=req_id,
-                    event_source=fence.event_source,
-                    ready_at_finalize=fence.ready_at_finalize,
-                    ready_before_publish=ready_before_publish,
-                    ready_after_fence=True,
-                    wait_ms=round(wait_ms, 3),
-                    query_precedes_device_readback=True,
-                    fence_scope="producer_event",
-                )
+                if perf_enabled:
+                    serving_perf_log(
+                        logger,
+                        "live_source_ready_fence",
+                        req_id=req_id,
+                        event_source=fence.event_source,
+                        ready_at_finalize=fence.ready_at_finalize,
+                        ready_before_publish=ready_before_publish,
+                        wait_ms=round(wait_ms, 3),
+                        fence_scope="producer_event",
+                    )
+                if content_enabled:
+                    log_npu_content_diagnostic_event(
+                        "group1_source_ready_fence",
+                        req_id=req_id,
+                        event_source=fence.event_source,
+                        ready_at_finalize=fence.ready_at_finalize,
+                        ready_before_publish=ready_before_publish,
+                        ready_after_fence=True,
+                        wait_ms=round(wait_ms, 3),
+                        query_precedes_device_readback=True,
+                        fence_scope="producer_event",
+                    )
                 completed.append(req_id)
         for req_id in completed:
             fences.pop(req_id, None)
@@ -852,13 +857,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     "no producer NPU event",
                     request.req_id,
                 )
-                cold_start_perf_log(
-                    logger,
-                    "live_source_missing_producer_event",
-                    req_id=request.req_id,
-                    event_source=source_ready_event_source,
-                    action="persistent_only",
-                )
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "live_source_missing_producer_event",
+                        req_id=request.req_id,
+                        event_source=source_ready_event_source,
+                        action="persistent_only",
+                    )
                 log_npu_content_diagnostic_event(
                     "group1_source_missing_producer_event",
                     req_id=request.req_id,
@@ -966,28 +972,29 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         remote_fill_results = (
             self.lmcache_engine.drain_remote_fill_terminal_results()
         )
-        for req_id, descriptor in descriptors.items():
-            cold_start_perf_log(
-                logger,
-                "live_source_worker_emit",
-                req_id=req_id,
-                tp_rank=descriptor.get("tp_rank"),
-                dp_rank=descriptor.get("dp_rank"),
-                segments=len(descriptor.get("segments", ())),
-                compact_layers=len(
-                    descriptor.get("compact_layout", {}).get("layers", ())
-                ),
-                compact_runs=len(
-                    descriptor.get("compact_layout", {}).get("runs", ())
-                ),
-                latent_layers=len(
-                    descriptor.get("latent_layout", {}).get("layers", ())
-                ),
-                latent_pages=len(
-                    descriptor.get("latent_layout", {}).get("pages", ())
-                ),
-                group_byte_totals=descriptor.get("group_byte_totals"),
-            )
+        if serving_perf_enabled():
+            for req_id, descriptor in descriptors.items():
+                serving_perf_log(
+                    logger,
+                    "live_source_worker_emit",
+                    req_id=req_id,
+                    tp_rank=descriptor.get("tp_rank"),
+                    dp_rank=descriptor.get("dp_rank"),
+                    segments=len(descriptor.get("segments", ())),
+                    compact_layers=len(
+                        descriptor.get("compact_layout", {}).get("layers", ())
+                    ),
+                    compact_runs=len(
+                        descriptor.get("compact_layout", {}).get("runs", ())
+                    ),
+                    latent_layers=len(
+                        descriptor.get("latent_layout", {}).get("layers", ())
+                    ),
+                    latent_pages=len(
+                        descriptor.get("latent_layout", {}).get("pages", ())
+                    ),
+                    group_byte_totals=descriptor.get("group_byte_totals"),
+                )
         return (
             LiveSourceWorkerMetadata(
                 {req_id: [descriptor] for req_id, descriptor in descriptors.items()},
@@ -1007,18 +1014,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             for req_id, descriptors in metadata.descriptors.items():
                 active = req_id in active_req_ids
                 tracked = req_id in self._unfinished_requests
-                cold_start_perf_log(
-                    logger,
-                    "live_source_scheduler_ingest",
-                    req_id=req_id,
-                    active=active,
-                    tracked=tracked,
-                    descriptor_count=len(descriptors),
-                    ranks=[
-                        [item.get("tp_rank"), item.get("dp_rank")]
-                        for item in descriptors
-                    ],
-                )
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "live_source_scheduler_ingest",
+                        req_id=req_id,
+                        active=active,
+                        tracked=tracked,
+                        descriptor_count=len(descriptors),
+                        ranks=[
+                            [item.get("tp_rank"), item.get("dp_rank")]
+                            for item in descriptors
+                        ],
+                    )
                 # The final prefiller token may set the request status to
                 # finished before this worker metadata is consumed.  The
                 # scheduler still calls request_finished() later in the same
@@ -1159,39 +1167,40 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 handoff_status = "target_mismatch"
             elif isinstance(handoff, tuple) and handoff[1] is None:
                 handoff_status = "missing_event"
-            for request in requests:
-                remote_fill_eligible = bool(
-                    getattr(request, "_lmcache_remote_fill_qualified", False)
-                )
-                if request.req_id not in expected_ids and not remote_fill_eligible:
-                    continue
-                cold_start_perf_log(
-                    logger,
-                    "remote_fill_producer_fence_decision",
-                    req_id=request.req_id,
-                    handoff_status=handoff_status,
-                    expected_layer_count=len(expected_direct_layers),
-                    observed_layer_count=len(
-                        expected_direct_layers & observed_direct_layers
-                    ),
-                    event_layer_count=len(
-                        expected_direct_layers & direct_ready_events.keys()
-                    ),
-                    callback_fence_complete=bool(
-                        expected_direct_layers
-                        and expected_direct_layers.issubset(direct_ready_events)
-                    ),
-                    complete_fence_count=len(source_ready_events),
-                    source_event_present=source_ready_event is not None,
-                    event_source=source_ready_event_source,
-                    accepted_store_end=len(request.token_ids),
-                    submission_mode=getattr(
-                        self.config,
-                        "remote_fill_submission_mode",
-                        "final_deferred",
-                    ),
-                    remote_fill_eligible=remote_fill_eligible,
-                )
+            if serving_perf_enabled():
+                for request in requests:
+                    remote_fill_eligible = bool(
+                        getattr(request, "_lmcache_remote_fill_qualified", False)
+                    )
+                    if request.req_id not in expected_ids and not remote_fill_eligible:
+                        continue
+                    serving_perf_log(
+                        logger,
+                        "remote_fill_producer_fence_decision",
+                        req_id=request.req_id,
+                        handoff_status=handoff_status,
+                        expected_layer_count=len(expected_direct_layers),
+                        observed_layer_count=len(
+                            expected_direct_layers & observed_direct_layers
+                        ),
+                        event_layer_count=len(
+                            expected_direct_layers & direct_ready_events.keys()
+                        ),
+                        callback_fence_complete=bool(
+                            expected_direct_layers
+                            and expected_direct_layers.issubset(direct_ready_events)
+                        ),
+                        complete_fence_count=len(source_ready_events),
+                        source_event_present=source_ready_event is not None,
+                        event_source=source_ready_event_source,
+                        accepted_store_end=len(request.token_ids),
+                        submission_mode=getattr(
+                            self.config,
+                            "remote_fill_submission_mode",
+                            "final_deferred",
+                        ),
+                        remote_fill_eligible=remote_fill_eligible,
+                    )
             request_ids = {request.req_id for request in requests}
             adopted_requests = set()
             for (req_id, _), result in completed.items():
@@ -1395,18 +1404,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 return_params = _remote_fill_response_params(
                     params, remote_fill_result, return_params
                 )
-                cold_start_perf_log(
-                    logger,
-                    "remote_fill_scheduler_attach",
-                    req_id=request.request_id,
-                    outcome=remote_fill_result.get("outcome"),
-                    persistent_common_end=remote_fill_result.get(
-                        "persistent_common_end"
-                    ),
-                    required_store_end=remote_fill_result.get(
-                        "required_store_end"
-                    ),
-                )
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "remote_fill_scheduler_attach",
+                        req_id=request.request_id,
+                        outcome=remote_fill_result.get("outcome"),
+                        persistent_common_end=remote_fill_result.get(
+                            "persistent_common_end"
+                        ),
+                        required_store_end=remote_fill_result.get("required_store_end"),
+                    )
             else:
                 logger.warning(
                     "Remote-fill result identity mismatch for request %s; "
@@ -1446,25 +1454,27 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             params["ascend_live_split_source_v1"] = {
                 "descriptors": descriptors
             }
-            cold_start_perf_log(
-                logger,
-                "live_source_attach",
-                req_id=request.request_id,
-                attached=True,
-                descriptor_count=len(descriptors),
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_attach",
+                    req_id=request.request_id,
+                    attached=True,
+                    descriptor_count=len(descriptors),
+                )
         elif isinstance(params, dict) and params.get("request_live_split", False):
-            cold_start_perf_log(
-                logger,
-                "live_source_attach",
-                req_id=request.request_id,
-                attached=False,
-                descriptor_count=len(descriptors or ()),
-                reason=(
-                    "missing_or_incomplete_descriptor"
-                    if not descriptors
-                    else "request_not_eligible"
-                ),
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_attach",
+                    req_id=request.request_id,
+                    attached=False,
+                    descriptor_count=len(descriptors or ()),
+                    reason=(
+                        "missing_or_incomplete_descriptor"
+                        if not descriptors
+                        else "request_not_eligible"
+                    ),
+                )
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params

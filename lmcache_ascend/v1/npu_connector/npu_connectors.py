@@ -17,10 +17,10 @@ import traceback
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.cold_start_perf import (
-    cold_start_perf_detailed_enabled,
-    cold_start_perf_enabled,
-    cold_start_perf_log,
+from lmcache.v1.serving_perf import (
+    serving_perf_detailed_enabled,
+    serving_perf_enabled,
+    serving_perf_log,
 )
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.gpu_connectors import (
@@ -76,7 +76,7 @@ def _log_cold_perf_slow(
 ) -> None:
     elapsed_ms = (time.perf_counter() - started) * 1000
     if elapsed_ms >= _COLD_PERF_SLOW_MS:
-        cold_start_perf_log(
+        serving_perf_log(
             logger,
             event,
             elapsed_ms=round(elapsed_ms, 3),
@@ -1582,7 +1582,7 @@ class _SparseH2DStallWatchdog:
                 self._reported = True
                 started = state["_started"]
             stack = traceback.extract_stack(frame)[-16:] if frame is not None else ()
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "sparse_h2d_python_stall",
                 started=started,
@@ -1786,7 +1786,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _get_sparse_h2d_stall_watchdog(
         self,
     ) -> Optional[_SparseH2DStallWatchdog]:
-        if not cold_start_perf_enabled():
+        if not serving_perf_enabled():
             return None
         watchdog = getattr(self, "_sparse_h2d_stall_watchdog", None)
         if watchdog is None:
@@ -1952,7 +1952,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         defer_copy: bool = False,
     ) -> None:
         """Atomically refresh every layer pointer row with one H2D copy."""
-        diagnose = cold_start_perf_enabled()
+        diagnose = serving_perf_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         if not new_sources_by_layer:
@@ -2047,7 +2047,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         defer_copy: bool = False,
     ) -> None:
         """Append complete host rows and refresh their shared NPU table."""
-        diagnose = cold_start_perf_enabled()
+        diagnose = serving_perf_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         prefix_counts = {
@@ -2121,7 +2121,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ],
     ) -> Optional[list[list[int]]]:
         """Resolve a homogeneous layer-page batch once per physical page."""
-        diagnose = cold_start_perf_enabled()
+        diagnose = serving_perf_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         if not sources_by_layer or not all(
@@ -2225,7 +2225,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         source: str,
         required_bytes: Optional[int] = None,
     ) -> int:
-        diagnose = cold_start_perf_enabled()
+        diagnose = serving_perf_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         host_ptr = int(
@@ -5107,11 +5107,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         req_id = transfer_kwargs.get("req_id")
         frontier = int(transfer_kwargs.get("lmcache_cached_tokens", 0) or 0)
         diagnostics = transfer_kwargs.get("_cold_perf_breakdown")
-        if not cold_start_perf_enabled() or not isinstance(diagnostics, dict):
+        if not serving_perf_enabled() or not isinstance(diagnostics, dict):
             diagnostics = None
         # Warm layers execute at token frequency. Coarse perf logging must not
         # collect several wall/CPU clocks and allocate rounded fields per layer.
-        perf_enabled = cold_start_perf_detailed_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         submit_count = 0
         submit_sum_s = submit_max_s = 0.0
         submit_max_layer = -1
@@ -5349,7 +5349,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 self._mtp_dw_deep_diag_seen = deep_seen
 
         if perf_enabled and submit_sum_s * 1000 >= _COLD_PERF_SLOW_MS:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "prepared_sparse_submit_summary",
                 req_id=req_id or "unspecified",

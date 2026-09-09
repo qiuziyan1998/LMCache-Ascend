@@ -75,15 +75,109 @@ _GENERATION = 23
 _SESSION = "decoder-global-te"
 
 
+def test_finish_skips_disabled_snapshot_but_keeps_terminal_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lmcache_ascend.v1 import cache_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "serving_perf_enabled", lambda: False)
+    accounting = []
+
+    def forbidden() -> None:
+        raise AssertionError("disabled producer snapshot")
+
+    metrics = SimpleNamespace(
+        timing_enabled=False,
+        finish_attempt=lambda *args: accounting.append(("finish", args)),
+        add_gauge=lambda *args: accounting.append(("gauge", args)),
+        add_bytes=lambda *args: accounting.append(("bytes", args)),
+        snapshot=forbidden,
+    )
+    state = _DirectStoreRequestState(
+        remote_fill_handoff=_handoff(),
+        committed_end={0: 1024, 1: 1024},
+    )
+    engine = SimpleNamespace(
+        _wait_remote_fill_windows=lambda value: accounting.append(("wait", value)),
+        _get_remote_fill_producer_metrics=lambda: metrics,
+    )
+    AscendLMCacheEngine._finish_remote_fill(engine, "r", state, 1024)
+    assert engine._completed_remote_fill_results["r"] is state.remote_fill_terminal
+    assert state.remote_fill_terminal.outcome == "PERSISTENT_ONLY"
+    assert ("finish", ("PERSISTENT_ONLY", "none")) in accounting
+    assert ("bytes", ("discarded_bytes", 0)) in accounting
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_probe_keeps_results_and_capacity_with_optional_perf(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    from lmcache_ascend.v1 import cache_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "serving_perf_enabled", lambda: enabled)
+    events = []
+    monkeypatch.setattr(
+        engine_module,
+        "serving_perf_log",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+    calls = []
+    result = SimpleNamespace(direct_satisfied=True, reason="")
+
+    def probe(**kwargs: Any) -> Any:
+        calls.append(("probe", kwargs))
+        return result
+
+    def submit(operation: Any) -> Future:
+        future = Future()
+        future.set_result(operation())
+        return future
+
+    state = _DirectStoreRequestState(remote_fill_handoff=_handoff())
+    state.remote_fill_session = SimpleNamespace(
+        request_id="r",
+        direct_viable=True,
+        probe_window=probe,
+    )
+    engine = SimpleNamespace(
+        _remote_fill_producer_executor=SimpleNamespace(submit=submit),
+        _remote_fill_pages_per_window=lambda: 2,
+        _get_remote_fill_producer_metrics=lambda: SimpleNamespace(timing_enabled=False),
+        _remote_fill_acquire_queue_capacity=lambda *args: True,
+        _remote_fill_release_queue_capacity=lambda *args: calls.append(
+            ("release", args)
+        ),
+        _record_remote_fill_window_metrics=lambda *args: calls.append(
+            ("metrics", args)
+        ),
+        _remote_fill_record_failure=lambda: calls.append(("failure",)),
+    )
+    pages = (object(), object(), object())
+    AscendLMCacheEngine._schedule_remote_fill_probe_pages(
+        engine, "r", state, pages, 1024
+    )
+    assert state.remote_fill_last_future.result() == (result, result)
+    assert state.remote_fill_next_window_id == 2
+    assert [kind for kind, *_ in calls] == [
+        "probe",
+        "metrics",
+        "probe",
+        "metrics",
+        "release",
+    ]
+    assert calls[0][1]["control_pages"] == pages[:2]
+    assert calls[2][1]["control_pages"] == pages[2:]
+    assert len(events) == (2 if enabled else 0)
+
+
 def test_remote_fill_rejects_vllm_sleep_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from lmcache_ascend.integration.vllm import vllm_v1_adapter
 
     config = SimpleNamespace(enable_remote_lmcache_store=True)
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enable_sleep_mode=True)
-    )
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(enable_sleep_mode=True))
 
     with pytest.raises(ValueError, match="incompatible with vLLM sleep mode"):
         vllm_v1_adapter._validate_remote_fill_sleep_mode(config, vllm_config)
@@ -1351,7 +1445,8 @@ def test_malformed_handoff_is_visible_and_uses_persistent_fallback(caplog) -> No
 
 
 def test_producer_metrics_are_bounded_and_pointer_free(monkeypatch) -> None:
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     metrics = RemoteFillProducerMetrics()
     metrics.start_attempt()
     metrics.observe("reserve_seconds", 0.25)
@@ -1382,7 +1477,8 @@ def test_producer_metrics_are_bounded_and_pointer_free(monkeypatch) -> None:
 
 @pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
 def test_producer_duration_gate_preserves_operational_counters(monkeypatch, mode):
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", mode)
+    monkeypatch.setenv("PD_SERVING_PERF", mode)
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode.strip().lower())
     metrics = RemoteFillProducerMetrics()
     metrics.start_attempt()
     metrics.observe("reserve_seconds", 0.25)
@@ -1402,7 +1498,8 @@ def test_producer_duration_gate_preserves_operational_counters(monkeypatch, mode
 def test_disabled_producer_control_timing_reads_no_clocks(
     monkeypatch, operation, reserve_fails
 ):
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "0")
+    monkeypatch.setenv("PD_SERVING_PERF", "0")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "0")
     monkeypatch.setattr(
         producer_module,
         "time",
@@ -1436,7 +1533,8 @@ def test_disabled_producer_control_timing_reads_no_clocks(
 
 @pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
 def test_producer_timing_keeps_native_deadline(monkeypatch, mode):
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", mode)
+    monkeypatch.setenv("PD_SERVING_PERF", mode)
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode.strip().lower())
     clock_reads = []
 
     def clock():
@@ -1487,7 +1585,8 @@ def test_producer_timing_keeps_native_deadline(monkeypatch, mode):
 def test_disabled_queue_timing_preserves_capacity_accounting(monkeypatch):
     import lmcache_ascend.v1.cache_engine as engine_module
 
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "0")
+    monkeypatch.setenv("PD_SERVING_PERF", "0")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "0")
     monkeypatch.setattr(
         engine_module,
         "time",

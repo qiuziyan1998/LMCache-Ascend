@@ -84,8 +84,8 @@ def test_evidence_contract_has_fixed_matrix_fresh_namespaces_and_hashes() -> Non
     assert all("synthetic" not in item["command"] for item in commands)
     diagnostic = [item for item in commands if item["mode"] == "diagnostic"]
     final = [item for item in commands if item["mode"] == "final_ttft"]
-    assert all("LMCACHE_COLD_START_PERF='1'" in item["command"] for item in diagnostic)
-    assert all("LMCACHE_COLD_START_PERF='0'" in item["command"] for item in final)
+    assert all("PD_SERVING_PERF='1'" in item["command"] for item in diagnostic)
+    assert all("PD_SERVING_PERF='0'" in item["command"] for item in final)
     assert report["comparison_rules"]["ttft_authority"] == "final_ttft mode only"
 
 

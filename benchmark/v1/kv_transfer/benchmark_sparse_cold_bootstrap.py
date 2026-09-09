@@ -294,7 +294,7 @@ def immutable_evidence_commands(
                         f"r{repetition}"
                     )
                     command = (
-                        f"$env:LMCACHE_COLD_START_PERF='{telemetry}'; "
+                        f"$env:PD_SERVING_PERF='{telemetry}'; "
                         f"$env:LMCACHE_CHUNK_SIZE='{chunk_size}'; "
                         f"$env:LMCACHE_MOONCAKE_NAMESPACE='{namespace}'; "
                         f"{launcher_command}"
@@ -336,9 +336,9 @@ def build_evidence_contract(
             "repetitions": repetitions,
         },
         "measurement_guidance": {
-            "diagnostic": "LMCACHE_COLD_START_PERF=1; use only for stage attribution",
+            "diagnostic": "PD_SERVING_PERF=1; use only for stage attribution",
             "final_ttft": (
-                "LMCACHE_COLD_START_PERF=0; authoritative TTFT/TPOT/memory run; "
+                "PD_SERVING_PERF=0; authoritative TTFT/TPOT/memory run; "
                 "no synthetic H2D, consumer, synchronization, or barrier delay"
             ),
         },

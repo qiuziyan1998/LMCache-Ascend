@@ -265,13 +265,13 @@ def test_persistent_direct_group1_slow_log_sums_page_buffers() -> None:
     )
 
     with (
-        patch.object(ascend_cache_engine, "cold_start_perf_enabled", return_value=True),
+        patch.object(ascend_cache_engine, "serving_perf_enabled", return_value=True),
         patch.object(
             ascend_cache_engine,
-            "cold_start_perf_now",
+            "serving_perf_now",
             side_effect=lambda: next(timestamps),
         ),
-        patch.object(ascend_cache_engine, "cold_start_perf_log", perf_log),
+        patch.object(ascend_cache_engine, "serving_perf_log", perf_log),
     ):
         engine.load_group1_pages_direct(
             [1, 2, 3, 4], torch.arange(4), [object()], None, "request"
@@ -2862,10 +2862,10 @@ def test_sparse_passive_reuses_one_merged_page(
         lambda _connector: None,
     )
     perf_events = []
-    monkeypatch.setattr(ascend_cache_engine, "cold_start_perf_enabled", lambda: True)
+    monkeypatch.setattr(ascend_cache_engine, "serving_perf_enabled", lambda: True)
     monkeypatch.setattr(
         ascend_cache_engine,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: perf_events.append((event, fields)),
     )
     key = _make_key()
@@ -3572,11 +3572,11 @@ def test_backend_compact_batch_skips_store_fence_and_finishes_once(
     broadcasts = []
     perf_events = {}
     monkeypatch.setattr(
-        ascend_cache_engine, "cold_start_perf_enabled", lambda: True
+        ascend_cache_engine, "serving_perf_enabled", lambda: True
     )
     monkeypatch.setattr(
         ascend_cache_engine,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: perf_events.__setitem__(event, fields),
     )
     engine = object.__new__(AscendLMCacheEngine)

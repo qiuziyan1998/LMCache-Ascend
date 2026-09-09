@@ -17,6 +17,49 @@ base_adapter_mod = pytest.importorskip("lmcache.integration.vllm.vllm_v1_adapter
 handoff_mod = pytest.importorskip("vllm_ascend.live_source_handoff")
 
 
+@pytest.mark.parametrize(
+    "perf,content", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_fence_preserves_readiness_with_independent_diagnostic_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    perf: bool,
+    content: bool,
+) -> None:
+    monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: perf)
+    monkeypatch.setattr(adapter_mod, "npu_content_diagnostics_enabled", lambda: content)
+    clock = MagicMock(
+        side_effect=[1.0, 1.125]
+        if perf or content
+        else AssertionError("disabled clock")
+    )
+    monkeypatch.setattr(adapter_mod.time, "perf_counter", clock)
+    perf_log = MagicMock()
+    content_log = MagicMock()
+    monkeypatch.setattr(adapter_mod, "serving_perf_log", perf_log)
+    monkeypatch.setattr(adapter_mod, "log_npu_content_diagnostic_event", content_log)
+    event = SimpleNamespace(synchronize=MagicMock())
+    fence = SimpleNamespace(
+        event=event, event_source="producer", ready_at_finalize=True
+    )
+    finalize = MagicMock()
+    adapter = SimpleNamespace(
+        _live_source_ready_fences={"r": fence},
+        lmcache_engine=SimpleNamespace(finalize_live_source_readiness=finalize),
+        _query_source_ready_event=MagicMock(return_value=True),
+    )
+    adapter_mod.LMCacheAscendConnectorV1Impl._fence_live_source_descriptors(adapter)
+    event.synchronize.assert_called_once_with()
+    finalize.assert_called_once_with(["r"])
+    assert adapter._live_source_ready_fences == {}
+    assert clock.call_count == (2 if perf or content else 0)
+    assert perf_log.call_count == int(perf)
+    assert content_log.call_count == int(content)
+    if perf:
+        assert perf_log.call_args.kwargs["wait_ms"] == 125.0
+    if content:
+        assert content_log.call_args.kwargs["wait_ms"] == 125.0
+
+
 def _request(
     req_id: str,
     *,
@@ -92,7 +135,7 @@ def test_start_load_arms_handoff_after_base_load_setup() -> None:
             base_adapter_mod.LMCacheConnectorV1Impl,
             "start_load_kv",
         ) as base_start,
-        patch.object(adapter_mod, "cold_start_perf_log"),
+        patch.object(adapter_mod, "serving_perf_log"),
     ):
         adapter.start_load_kv(context)
 
@@ -183,7 +226,10 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
     adapter._submit_direct_prefill_requests = MagicMock()
 
-    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
+    with (
+        patch.object(adapter_mod, "serving_perf_enabled", return_value=True),
+        patch.object(adapter_mod, "serving_perf_log") as perf_log,
+    ):
         adapter._finish_save_batch({})
 
     adapter._submit_direct_prefill_requests.assert_called_once_with(
@@ -238,7 +284,10 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
     adapter._submit_direct_prefill_requests = MagicMock()
 
-    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
+    with (
+        patch.object(adapter_mod, "serving_perf_enabled", return_value=True),
+        patch.object(adapter_mod, "serving_perf_log") as perf_log,
+    ):
         adapter._finish_save_batch({})
 
     adapter._submit_direct_prefill_requests.assert_called_once_with(
@@ -301,7 +350,10 @@ def test_finish_save_batch_mismatched_handoff_does_not_authorize_remote_fill(
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
     adapter._submit_direct_prefill_requests = MagicMock()
 
-    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
+    with (
+        patch.object(adapter_mod, "serving_perf_enabled", return_value=True),
+        patch.object(adapter_mod, "serving_perf_log") as perf_log,
+    ):
         adapter._finish_save_batch({})
 
     adapter._submit_direct_prefill_requests.assert_called_once_with(
@@ -350,7 +402,10 @@ def test_finish_save_batch_logs_absent_handoff_without_completing_fence() -> Non
     adapter._direct_prefill_requests = MagicMock(return_value=[request])
     adapter._submit_direct_prefill_requests = MagicMock()
 
-    with patch.object(adapter_mod, "cold_start_perf_log") as perf_log:
+    with (
+        patch.object(adapter_mod, "serving_perf_enabled", return_value=True),
+        patch.object(adapter_mod, "serving_perf_log") as perf_log,
+    ):
         adapter._finish_save_batch({})
 
     adapter._submit_direct_prefill_requests.assert_called_once_with(

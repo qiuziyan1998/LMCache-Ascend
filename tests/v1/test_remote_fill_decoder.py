@@ -68,14 +68,14 @@ def test_post_init_emits_startup_stage_timings() -> None:
     with (
         patch.object(LMCacheEngine, "post_init"),
         patch(
-            "lmcache_ascend.v1.cache_engine.cold_start_perf_enabled",
+            "lmcache_ascend.v1.cache_engine.serving_perf_enabled",
             return_value=True,
         ),
         patch(
-            "lmcache_ascend.v1.cache_engine.cold_start_perf_now",
+            "lmcache_ascend.v1.cache_engine.serving_perf_now",
             side_effect=[1.0, 2.0, 3.0],
         ),
-        patch("lmcache_ascend.v1.cache_engine.cold_start_perf_log") as perf_log,
+        patch("lmcache_ascend.v1.cache_engine.serving_perf_log") as perf_log,
         patch(
             "lmcache_ascend.v1.cache_engine.RemoteExternalPageReader",
             return_value=reader,
@@ -901,7 +901,8 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     caplog,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(local)
     controls = tuple(

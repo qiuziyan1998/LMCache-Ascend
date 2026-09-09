@@ -17,9 +17,9 @@ from typing import Any, Protocol
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.cold_start_perf import (
-    cold_start_perf_enabled,
-    cold_start_perf_log,
+from lmcache.v1.serving_perf import (
+    serving_perf_enabled,
+    serving_perf_log,
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -591,7 +591,7 @@ class AscendRemoteFillPageLifecycle:
             ValueError: If page metadata is not canonical or layout-compatible.
         """
 
-        diagnose = cold_start_perf_enabled()
+        diagnose = serving_perf_enabled()
         prepare_started = monotonic() if diagnose else 0.0
         prepare_thread_started = time.thread_time_ns() if diagnose else 0
         validation_ms = classify_ms = capacity_ms = reclaim_ms = 0.0
@@ -640,7 +640,7 @@ class AscendRemoteFillPageLifecycle:
             prepared = finalize_results()
             elapsed_ms = (monotonic() - prepare_started) * 1000
             if diagnose and elapsed_ms >= 100.0:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "remote_fill_page_prepare_slow",
                     transfer_id=transfer_id,
@@ -884,7 +884,7 @@ class AscendRemoteFillPageLifecycle:
                 "elapsed_ms": round((monotonic() - commit_started) * 1000, 3),
             }
             _log_remote_fill_event("remote_fill_local_commit", **payload)
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "remote_fill_local_commit",
                 transfer_id=transfer_id,
@@ -985,7 +985,7 @@ class AscendRemoteFillPageLifecycle:
         retention_trace_id = getattr(result, "retention_trace_id", None)
         if isinstance(retention_trace_id, int):
             diagnostic_fields["retention_trace_id"] = retention_trace_id
-        if cold_start_perf_enabled():
+        if serving_perf_enabled():
             try:
                 diagnostic_fields["required_key_digest"] = content_digest(
                     tuple(

@@ -13,7 +13,7 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.cold_start_perf import cold_start_perf_enabled
+from lmcache.v1.serving_perf import serving_perf_enabled
 from lmcache.v1.remote_fill import (
     PROTOCOL_VERSION,
     AbortRequest,
@@ -318,7 +318,7 @@ class RemoteFillProducerMetrics:
     )
 
     def __init__(self) -> None:
-        self.timing_enabled = cold_start_perf_enabled()
+        self.timing_enabled = serving_perf_enabled()
         self._lock = Lock()
         self._attempts: dict[tuple[str, str], int] = {}
         self._started_total = 0
@@ -738,7 +738,7 @@ class RemoteFillProducerSession:
         if not self.direct_viable or not self.open():
             return self._abandoned_window(window_id, "open rejected")
         digest = manifest_digest(control_pages)
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
         reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(
@@ -845,7 +845,7 @@ class RemoteFillProducerSession:
                 self.direct_viable = False
                 return self._abandoned_window(window_id, "source preparation failed")
         digest = manifest_digest(control_pages)
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
         reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(

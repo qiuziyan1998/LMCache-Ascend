@@ -42,10 +42,10 @@ from lmcache.v1.cache_engine import (
     LayerwiseStoreResult,
     LMCacheEngine,
 )
-from lmcache.v1.cold_start_perf import (
-    cold_start_perf_enabled,
-    cold_start_perf_log,
-    cold_start_perf_now,
+from lmcache.v1.serving_perf import (
+    serving_perf_enabled,
+    serving_perf_log,
+    serving_perf_now,
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
@@ -561,17 +561,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._store_worker_thread.start()
 
     def post_init(self, **kwargs) -> None:
-        perf_enabled = cold_start_perf_enabled()
-        base_started = cold_start_perf_now() if perf_enabled else None
+        perf_enabled = serving_perf_enabled()
+        base_started = serving_perf_now() if perf_enabled else None
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "lmcache_base_post_init_start",
                 rank=self.metadata.worker_id,
             )
         super().post_init(**kwargs)
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "lmcache_base_post_init_complete",
                 started=base_started,
@@ -583,9 +583,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and self.config.pd_role != "sender"
                 and self._is_passive()
             ):
-                reader_started = cold_start_perf_now() if perf_enabled else None
+                reader_started = serving_perf_now() if perf_enabled else None
                 if perf_enabled:
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "group1_external_reader_init_start",
                         rank=self.metadata.worker_id,
@@ -595,22 +595,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self.metadata,
                 )
                 if perf_enabled:
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "group1_external_reader_init_complete",
                         started=reader_started,
                         rank=self.metadata.worker_id,
                     )
-            remote_fill_started = cold_start_perf_now() if perf_enabled else None
+            remote_fill_started = serving_perf_now() if perf_enabled else None
             if perf_enabled:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "remote_fill_decoder_init_start",
                     rank=self.metadata.worker_id,
                 )
             self._initialize_decoder_remote_fill()
             if perf_enabled:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "remote_fill_decoder_init_complete",
                     started=remote_fill_started,
@@ -762,12 +762,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         req_id: str,
     ) -> None:
         """Load exact persistent Group-1 pages into final vLLM HBM blocks."""
-        perf_enabled = cold_start_perf_enabled()
-        load_started = cold_start_perf_now() if perf_enabled else 0.0
+        perf_enabled = serving_perf_enabled()
+        load_started = serving_perf_now() if perf_enabled else 0.0
         load_thread_started = time.thread_time_ns() if perf_enabled else 0
         if not self._persistent_direct_hbm_split_group_enabled():
             raise RuntimeError("Group-1 direct-HBM mode is disabled")
-        phase_started = cold_start_perf_now() if perf_enabled else 0.0
+        phase_started = serving_perf_now() if perf_enabled else 0.0
         plans = list(
             self.token_database.process_tokens(
                 tokens=tokens,
@@ -776,19 +776,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         )
         token_plan_ms = (
-            (cold_start_perf_now() - phase_started) * 1000
+            (serving_perf_now() - phase_started) * 1000
             if perf_enabled
             else 0.0
         )
         if not plans or plans[-1][1] != len(tokens):
             raise RuntimeError("Group-1 persistent page plan is incomplete")
-        phase_started = cold_start_perf_now() if perf_enabled else 0.0
+        phase_started = serving_perf_now() if perf_enabled else 0.0
         self._ensure_layerwise_connector_layout(
             kvcaches=kvcaches,
             kv_group=1,
         )
         layout_ms = (
-            (cold_start_perf_now() - phase_started) * 1000
+            (serving_perf_now() - phase_started) * 1000
             if perf_enabled
             else 0.0
         )
@@ -802,10 +802,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         starts = [start for start, _, _ in plans]
         ends = [end for _, end, _ in plans]
         keys = [key for _, _, key in plans]
-        phase_started = cold_start_perf_now() if perf_enabled else 0.0
+        phase_started = serving_perf_now() if perf_enabled else 0.0
         planned = planner(kvcaches, slot_mapping, starts, ends, 1)
         destination_plan_ms = (
-            (cold_start_perf_now() - phase_started) * 1000
+            (serving_perf_now() - phase_started) * 1000
             if perf_enabled
             else 0.0
         )
@@ -827,20 +827,20 @@ class AscendLMCacheEngine(LMCacheEngine):
         try:
             # This strict API returns only after native DMA reaches a known
             # terminal status; an unrelated Ascend stream event adds no fence.
-            phase_started = cold_start_perf_now() if perf_enabled else 0.0
+            phase_started = serving_perf_now() if perf_enabled else 0.0
             load_pages(keys, ptrs, sizes, owners, req_id)
             native_load_ms = (
-                (cold_start_perf_now() - phase_started) * 1000
+                (serving_perf_now() - phase_started) * 1000
                 if perf_enabled
                 else 0.0
             )
             elapsed_ms = (
-                (cold_start_perf_now() - load_started) * 1000
+                (serving_perf_now() - load_started) * 1000
                 if perf_enabled
                 else 0.0
             )
             if perf_enabled and elapsed_ms >= 100.0:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "group1_direct_hbm_load_slow",
                     started=load_started,
@@ -1039,13 +1039,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             metrics.abandon(result.reason, allocation=allocation)
             if result.armed or result.reason == "native transfer failed":
                 metrics.failure(result.reason)
-            cold_start_perf_log(
-                logger,
-                "remote_fill_direct_abandoned",
-                reason=result.reason,
-                armed=bool(result.armed),
-                fatal_restart_required=bool(result.fatal_restart_required),
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "remote_fill_direct_abandoned",
+                    reason=result.reason,
+                    armed=bool(result.armed),
+                    fatal_restart_required=bool(result.fatal_restart_required),
+                )
             fatal = bool(result.fatal_restart_required)
             handoff = state.remote_fill_handoff
             log_remote_fill_diagnostic(
@@ -1159,14 +1160,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         state.remote_fill_source_generation = secrets.randbits(63) or 1
         metrics.add_gauge("direct_viable", 1)
         state.remote_fill_viable_counted = True
-        cold_start_perf_log(
-            logger,
-            "remote_fill_producer_decision",
-            req_id=req_id,
-            enabled=True,
-            destination_dp_rank=handoff.destination_dp_rank,
-            destination_tp_size=handoff.destination_tp_size,
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_producer_decision",
+                req_id=req_id,
+                enabled=True,
+                destination_dp_rank=handoff.destination_dp_rank,
+                destination_tp_size=handoff.destination_tp_size,
+            )
         return True
 
     def _remote_fill_circuit_allows(self) -> bool:
@@ -1717,15 +1719,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                         if result.reason != "cached-prefix hole":
                             self._remote_fill_record_failure()
                     self._record_remote_fill_window_metrics(state, result)
-                    cold_start_perf_log(
-                        logger,
-                        "remote_fill_probe_complete",
-                        req_id=session.request_id,
-                        window_id=window_id,
-                        page_count=len(control_pages),
-                        direct_satisfied=result.direct_satisfied,
-                        reason=result.reason,
-                    )
+                    if serving_perf_enabled():
+                        serving_perf_log(
+                            logger,
+                            "remote_fill_probe_complete",
+                            req_id=session.request_id,
+                            window_id=window_id,
+                            page_count=len(control_pages),
+                            direct_satisfied=result.direct_satisfied,
+                            reason=result.reason,
+                        )
                     if not result.direct_satisfied:
                         break
                 return tuple(results)
@@ -1860,13 +1863,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             metrics = self._get_remote_fill_producer_metrics()
             metrics.abandon("producer backpressure", allocation=True)
-            cold_start_perf_log(
-                logger,
-                "remote_fill_batch_skipped",
-                req_id=batch.req_id,
-                reason="producer_backpressure",
-                bytes=byte_count,
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "remote_fill_batch_skipped",
+                    req_id=batch.req_id,
+                    reason="producer_backpressure",
+                    bytes=byte_count,
+                )
             return
         if metrics.timing_enabled:
             metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
@@ -1891,13 +1895,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             self._remote_fill_record_failure()
             return
-        cold_start_perf_log(
-            logger,
-            "remote_fill_source_ready",
-            req_id=batch.req_id,
-            page_count=len(control_pages),
-            bytes=byte_count,
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_source_ready",
+                req_id=batch.req_id,
+                page_count=len(control_pages),
+                bytes=byte_count,
+            )
         executor = getattr(self, "_remote_fill_producer_executor", None)
         if executor is None:
             try:
@@ -1973,49 +1978,48 @@ class AscendLMCacheEngine(LMCacheEngine):
                         ):
                             self._remote_fill_record_failure()
                     self._record_remote_fill_window_metrics(state, result)
-                    cold_start_perf_log(
-                        logger,
-                        "remote_fill_window_complete",
-                        req_id=batch.req_id,
-                        transfer_id=state.remote_fill_handoff.transfer_id,
-                        window_id=window_id,
-                        page_count=len(window_pages),
-                        chunk_start=chunk_start,
-                        chunk_end=chunk_end,
-                        window_tokens=window_tokens,
-                        full_window=(
-                            window_tokens
-                            == int(self.config.remote_fill_window_tokens)
-                        ),
-                        bytes=sum(
-                            page.expected_bytes for page in window_pages
-                        ),
-                        armed=result.armed,
-                        direct_satisfied=result.direct_satisfied,
-                        reason=result.reason,
-                        reserve_ms=round(result.reserve_seconds * 1000, 3),
-                        arm_ms=round(result.arm_seconds * 1000, 3),
-                        source_event_wait_ms=round(
-                            result.source_event_wait_seconds * 1000, 3
-                        ),
-                        source_fences_ready_monotonic_ms=round(
-                            result.source_fences_ready_monotonic * 1000, 3
-                        ),
-                        source_registration_ms=round(
-                            result.source_registration_seconds * 1000, 3
-                        ),
-                        native_slot_wait_ms=round(
-                            result.native_slot_wait_seconds * 1000, 3
-                        ),
-                        native_ms=round(result.native_seconds * 1000, 3),
-                        report_ms=round(result.report_seconds * 1000, 3),
-                        native_started_monotonic_ms=round(
-                            result.native_started_monotonic * 1000, 3
-                        ),
-                        native_ended_monotonic_ms=round(
-                            result.native_ended_monotonic * 1000, 3
-                        ),
-                    )
+                    if serving_perf_enabled():
+                        serving_perf_log(
+                            logger,
+                            "remote_fill_window_complete",
+                            req_id=batch.req_id,
+                            transfer_id=state.remote_fill_handoff.transfer_id,
+                            window_id=window_id,
+                            page_count=len(window_pages),
+                            chunk_start=chunk_start,
+                            chunk_end=chunk_end,
+                            window_tokens=window_tokens,
+                            full_window=(
+                                window_tokens
+                                == int(self.config.remote_fill_window_tokens)
+                            ),
+                            bytes=sum(page.expected_bytes for page in window_pages),
+                            armed=result.armed,
+                            direct_satisfied=result.direct_satisfied,
+                            reason=result.reason,
+                            reserve_ms=round(result.reserve_seconds * 1000, 3),
+                            arm_ms=round(result.arm_seconds * 1000, 3),
+                            source_event_wait_ms=round(
+                                result.source_event_wait_seconds * 1000, 3
+                            ),
+                            source_fences_ready_monotonic_ms=round(
+                                result.source_fences_ready_monotonic * 1000, 3
+                            ),
+                            source_registration_ms=round(
+                                result.source_registration_seconds * 1000, 3
+                            ),
+                            native_slot_wait_ms=round(
+                                result.native_slot_wait_seconds * 1000, 3
+                            ),
+                            native_ms=round(result.native_seconds * 1000, 3),
+                            report_ms=round(result.report_seconds * 1000, 3),
+                            native_started_monotonic_ms=round(
+                                result.native_started_monotonic * 1000, 3
+                            ),
+                            native_ended_monotonic_ms=round(
+                                result.native_ended_monotonic * 1000, 3
+                            ),
+                        )
                     if not result.direct_satisfied:
                         break
                 return tuple(results)
@@ -2025,12 +2029,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                     metrics = self._get_remote_fill_producer_metrics()
                     metrics.failure("fatal restart")
                     metrics.abandon("fatal restart")
-                    cold_start_perf_log(
-                        logger,
-                        "remote_fill_fatal_restart",
-                        req_id=batch.req_id,
-                        phase="native_or_control_terminal",
-                    )
+                    if serving_perf_enabled():
+                        serving_perf_log(
+                            logger,
+                            "remote_fill_fatal_restart",
+                            req_id=batch.req_id,
+                            phase="native_or_control_terminal",
+                        )
                     raise
                 state.remote_fill_disabled_reason = type(error).__name__
                 if state.remote_fill_session is not None:
@@ -2089,14 +2094,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         persistent_common_end = min(
             state.committed_end.get(group, 0) for group in (0, 1)
         )
-        cold_start_perf_log(
-            logger,
-            "remote_fill_persistent_complete",
-            req_id=req_id,
-            transfer_id=state.remote_fill_handoff.transfer_id,
-            persistent_common_end=persistent_common_end,
-            required_store_end=required_store_end,
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_persistent_complete",
+                req_id=req_id,
+                transfer_id=state.remote_fill_handoff.transfer_id,
+                persistent_common_end=persistent_common_end,
+                required_store_end=required_store_end,
+            )
         finish_control_seconds = 0.0
         metrics = self._get_remote_fill_producer_metrics()
         try:
@@ -2167,27 +2173,29 @@ class AscendLMCacheEngine(LMCacheEngine):
                 reason=state.remote_fill_disabled_reason or terminal.outcome,
                 severity="warning",
             )
-        cold_start_perf_log(
-            logger,
-            "remote_fill_producer_terminal",
-            req_id=req_id,
-            transfer_id=state.remote_fill_handoff.transfer_id,
-            outcome=terminal.outcome,
-            direct_satisfied=terminal.direct_satisfied,
-            persistent_common_end=persistent_common_end,
-            required_store_end=required_store_end,
-            finish_control_ms=round(finish_control_seconds * 1000, 3),
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_producer_terminal",
+                req_id=req_id,
+                transfer_id=state.remote_fill_handoff.transfer_id,
+                outcome=terminal.outcome,
+                direct_satisfied=terminal.direct_satisfied,
+                persistent_common_end=persistent_common_end,
+                required_store_end=required_store_end,
+                finish_control_ms=round(finish_control_seconds * 1000, 3),
+            )
         completed = getattr(self, "_completed_remote_fill_results", None)
         if completed is None:
             completed = {}
             self._completed_remote_fill_results = completed
         completed[req_id] = terminal
-        cold_start_perf_log(
-            logger,
-            "remote_fill_producer_metrics_snapshot",
-            metrics=metrics.snapshot(),
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_producer_metrics_snapshot",
+                metrics=metrics.snapshot(),
+            )
 
     def _wait_direct_backpressure(self) -> None:
         limit = self._store_queue_maxsize or 2
@@ -2230,7 +2238,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def _submit_direct_page_batch(self, batch: _DirectPageBatch) -> Future:
         assert self.storage_manager is not None
         self._wait_direct_backpressure()
-        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        started = serving_perf_now() if serving_perf_enabled() else None
         state = self._direct_store_states.setdefault(
             batch.req_id, _DirectStoreRequestState()
         )
@@ -2273,7 +2281,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         state.submitted_legacy_objects += legacy_objects
         state.submitted_bytes += sum(map(sum, batch.sizes))
         if started is not None:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "direct_npu_submit",
                 started=started,
@@ -2849,30 +2857,34 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> bool:
         builder = self._live_source_builders.pop(req_id, None)
         if builder is None or builder["invalid"]:
-            cold_start_perf_log(
-                logger,
-                "live_source_finalize_detail",
-                req_id=req_id,
-                token_count=token_count,
-                tp_rank=tp_rank,
-                dp_rank=dp_rank,
-                finalized=False,
-                reason=("missing_builder" if builder is None else "invalid_builder"),
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason=(
+                        "missing_builder" if builder is None else "invalid_builder"
+                    ),
+                )
             return False
         groups = builder["groups"]
         if any(builder["ends"].get(group, 0) != token_count for group in groups):
-            cold_start_perf_log(
-                logger,
-                "live_source_finalize_detail",
-                req_id=req_id,
-                token_count=token_count,
-                tp_rank=tp_rank,
-                dp_rank=dp_rank,
-                finalized=False,
-                reason="incomplete_coverage",
-                group_ends=builder["ends"],
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason="incomplete_coverage",
+                    group_ends=builder["ends"],
+                )
             return False
         totals = [0, 0]
         compact_layers = builder["compact_layers"]
@@ -2890,17 +2902,18 @@ class AscendLMCacheEngine(LMCacheEngine):
         for segment in builder["segments"]:
             totals[segment["group_id"]] += segment["length"]
         if any(not totals[group] for group in groups):
-            cold_start_perf_log(
-                logger,
-                "live_source_finalize_detail",
-                req_id=req_id,
-                token_count=token_count,
-                tp_rank=tp_rank,
-                dp_rank=dp_rank,
-                finalized=False,
-                reason="empty_group",
-                group_byte_totals=totals,
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason="empty_group",
+                    group_byte_totals=totals,
+                )
             return False
         descriptor = {
             "group_byte_totals": totals,
@@ -2956,21 +2969,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "tp_rank": tp_rank,
                 "dp_rank": dp_rank,
             }
-        cold_start_perf_log(
-            logger,
-            "live_source_finalize_detail",
-            req_id=req_id,
-            token_count=token_count,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
-            finalized=True,
-            segments=len(builder["segments"]),
-            compact_layers=len(compact_layers or ()),
-            compact_runs=len(builder["compact_runs"]),
-            latent_layers=len(latent_layers or ()),
-            latent_pages=len(builder["latent_pages"]),
-            group_byte_totals=totals,
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "live_source_finalize_detail",
+                req_id=req_id,
+                token_count=token_count,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                finalized=True,
+                segments=len(builder["segments"]),
+                compact_layers=len(compact_layers or ()),
+                compact_runs=len(builder["compact_runs"]),
+                latent_layers=len(latent_layers or ()),
+                latent_pages=len(builder["latent_pages"]),
+                group_byte_totals=totals,
+            )
         return True
 
     def finalize_live_source_readiness(self, req_ids: Iterable[str]) -> None:
@@ -3212,17 +3226,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 req_id,
                 error,
             )
-            cold_start_perf_log(
-                logger,
-                "live_source_capture_failure",
-                req_id=req_id,
-                token_count=len(tokens),
-                groups=sorted(group_caches),
-                slot_mapping_base=slot_mapping_base,
-                final=final,
-                reason=type(error).__name__,
-                detail=str(error),
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_capture_failure",
+                    req_id=req_id,
+                    token_count=len(tokens),
+                    groups=sorted(group_caches),
+                    slot_mapping_base=slot_mapping_base,
+                    final=final,
+                    reason=type(error).__name__,
+                    detail=str(error),
+                )
 
     def _submit_direct_tail(
         self,
@@ -3236,7 +3251,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         slot_mapping_base: int = 0,
     ) -> bool:
         """Publish the unaligned suffix as one exact-size page per KV group."""
-        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        started = serving_perf_now() if serving_perf_enabled() else None
         start = state.planned_end
         if start >= len(tokens):
             return True
@@ -3405,7 +3420,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if not keys and not (remote_fill and remote_keys):
             return True
         if started is not None:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "direct_npu_plan",
                 started=started,
@@ -3569,14 +3584,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._get_remote_fill_producer_metrics().abandon(
                 "no addressable source page"
             )
-            cold_start_perf_log(
-                logger,
-                "remote_fill_direct_abandoned",
-                req_id=req_id,
-                reason="no_addressable_source_page",
-                slot_mapping_base=slot_mapping_base,
-                accepted_store_end=len(tokens),
-            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "remote_fill_direct_abandoned",
+                    req_id=req_id,
+                    reason="no_addressable_source_page",
+                    slot_mapping_base=slot_mapping_base,
+                    accepted_store_end=len(tokens),
+                )
             remote_fill = False
         complete_ready_events = self._direct_source_ready_events(
             state, len(tokens)
@@ -3690,7 +3706,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             if group not in state.submitted_end:
                 state.submitted_end[group] = verified_prefix_end
                 state.committed_end[group] = verified_prefix_end
-        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        started = serving_perf_now() if serving_perf_enabled() else None
         cpu_fallback_s = 0.0
         plans = self._direct_suffix_plans(
             state, tokens, group_caches, request_configs
@@ -3920,7 +3936,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         state.fallback_reasons[group] = fallback_reason
                     self.wait_for_direct_stores((req_id,))
                     fallback_started = (
-                        cold_start_perf_now() if cold_start_perf_enabled() else None
+                        serving_perf_now() if serving_perf_enabled() else None
                     )
                     committed = self._store_direct_cpu_group(
                         req_id,
@@ -3935,9 +3951,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     state.committed_end[group] = committed
                     state.submitted_end[group] = committed
                     if fallback_started is not None:
-                        fallback_elapsed = cold_start_perf_now() - fallback_started
+                        fallback_elapsed = serving_perf_now() - fallback_started
                         cpu_fallback_s += fallback_elapsed
-                        cold_start_perf_log(
+                        serving_perf_log(
                             logger,
                             "direct_npu_cpu_fallback",
                             started=fallback_started,
@@ -4000,9 +4016,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     remote_group_ends[group] = full[-1][1]
 
         if started is not None:
-            elapsed_s = cold_start_perf_now() - started
+            elapsed_s = serving_perf_now() - started
             plan_only_ms = max(elapsed_s - cpu_fallback_s, 0.0) * 1000
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "direct_npu_plan",
                 req_id=req_id,
@@ -4101,7 +4117,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ),
                 )
             except Exception as error:
-                retry_started = cold_start_perf_now()
+                retry_started = serving_perf_now()
                 self.wait_for_direct_stores((req_id,))
                 self._retry_direct_cpu(
                     req_id,
@@ -4112,8 +4128,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     state,
                     slot_mapping_base,
                 )
-                if cold_start_perf_enabled():
-                    cold_start_perf_log(
+                if serving_perf_enabled():
+                    serving_perf_log(
                         logger,
                         "direct_npu_cpu_retry",
                         started=retry_started,
@@ -4213,7 +4229,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         state.committed_end.setdefault(group, required_end)
                         state.submitted_end.setdefault(group, required_end)
                         continue
-                    repair_started = cold_start_perf_now()
+                    repair_started = serving_perf_now()
                     repaired_end = self._store_direct_cpu_group(
                         req_id,
                         tokens,
@@ -4227,8 +4243,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     state.committed_end[group] = repaired_end
                     state.submitted_end[group] = repaired_end
                     repaired = True
-                    if cold_start_perf_enabled():
-                        cold_start_perf_log(
+                    if serving_perf_enabled():
+                        serving_perf_log(
                             logger,
                             "direct_npu_cpu_retry",
                             started=repair_started,
@@ -4267,7 +4283,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             state = self._direct_store_states.get(req_id)
             if state is None:
                 continue
-            started = cold_start_perf_now() if cold_start_perf_enabled() else None
+            started = serving_perf_now() if serving_perf_enabled() else None
             remote_wait_started = started if state.remote_fill_metrics_started else None
             if (
                 started is not None
@@ -4275,7 +4291,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and not state.remote_fill_backlog_logged
             ):
                 now = time.perf_counter()
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "remote_fill_backlog_at_prefill_end",
                     req_id=req_id,
@@ -4330,7 +4346,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     failed.append((future, retry, error))
 
             if failed:
-                retry_started = cold_start_perf_now()
+                retry_started = serving_perf_now()
                 logger.warning(
                     "Direct NPU page store failed for %s; retrying through the "
                     "CPU layerwise path after draining %d direct job(s): %s",
@@ -4401,8 +4417,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                             else:
                                 self._pending_store_reqs[req_id] = count
                         self._store_cv.notify_all()
-                if cold_start_perf_enabled():
-                    cold_start_perf_log(
+                if serving_perf_enabled():
+                    serving_perf_log(
                         logger,
                         "direct_npu_cpu_retry",
                         started=retry_started,
@@ -4434,7 +4450,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
             waited.add(req_id)
             if started is not None:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "direct_npu_final_wait",
                     started=started,
@@ -4463,12 +4479,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                             state.remote_fill_session.abort(
                                 "prefiller released request before FINISH"
                             )
-                            cold_start_perf_log(
-                                logger,
-                                "remote_fill_abort",
-                                req_id=req_id,
-                                reason="request_released_before_finish",
-                            )
+                            if serving_perf_enabled():
+                                serving_perf_log(
+                                    logger,
+                                    "remote_fill_abort",
+                                    req_id=req_id,
+                                    reason="request_released_before_finish",
+                                )
                         except RemoteFillFatalError:
                             self._latch_remote_fill_producer_fatal(state)
                             raise
@@ -4479,12 +4496,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 exc_info=True,
                             )
                     state.remote_fill_session.close()
-                    cold_start_perf_log(
-                        logger,
-                        "remote_fill_release",
-                        req_id=req_id,
-                        terminal=state.remote_fill_terminal is not None,
-                    )
+                    if serving_perf_enabled():
+                        serving_perf_log(
+                            logger,
+                            "remote_fill_release",
+                            req_id=req_id,
+                            terminal=state.remote_fill_terminal is not None,
+                        )
                 if (
                     state.remote_fill_metrics_started
                     and state.remote_fill_terminal is None
@@ -4712,7 +4730,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     mem_obj.ref_count_down()
             raise
 
-        if cold_start_perf_enabled():
+        if serving_perf_enabled():
             tot_time = store_stats.time_to_store()
             logger.info(
                 "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
@@ -4779,7 +4797,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             if not pending_at_start:
                 return direct_waited
 
-            perf_enabled = cold_start_perf_enabled()
+            perf_enabled = serving_perf_enabled()
             if perf_enabled:
                 pending_counts = {
                     req_id: self._pending_store_reqs[req_id]
@@ -5206,8 +5224,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         exact_chunk_locations: Optional[list[str]] = None,
     ) -> tuple[list[list[MemoryObj]], int]:
         """Resolve exact-size full or partial layer pages with legacy fallback."""
-        perf_enabled = cold_start_perf_enabled()
-        resolve_started = cold_start_perf_now() if perf_enabled else 0.0
+        perf_enabled = serving_perf_enabled()
+        resolve_started = serving_perf_now() if perf_enabled else 0.0
         resolve_thread_started = time.thread_time_ns() if perf_enabled else 0
         local_get_ms = legacy_probe_ms = remote_probe_ms = remote_get_ms = 0.0
         tail_resolve_ms = validate_pin_ms = 0.0
@@ -5237,19 +5255,19 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         local = self._shared_local_cpu_backend()
         assert self.storage_manager is not None
-        phase_started = cold_start_perf_now() if perf_enabled else 0.0
+        phase_started = serving_perf_now() if perf_enabled else 0.0
         pages, local_count = local.batched_get_layer_page_prefix(page_keys)
         if perf_enabled:
-            local_get_ms = (cold_start_perf_now() - phase_started) * 1000
+            local_get_ms = (serving_perf_now() - phase_started) * 1000
         owned: list[MemoryObj] = list(pages)
         pinned: list[MemoryObj] = []
         try:
-            phase_started = cold_start_perf_now() if perf_enabled else 0.0
+            phase_started = serving_perf_now() if perf_enabled else 0.0
             legacy_suffix = local_count < page_chunks and local.contains_all_exact(
                 page_keys[local_count].split_layers(self.num_layers)
             )
             if perf_enabled:
-                legacy_probe_ms = (cold_start_perf_now() - phase_started) * 1000
+                legacy_probe_ms = (serving_perf_now() - phase_started) * 1000
             tail_start = local_count
             if local_count < page_chunks and not legacy_suffix:
                 remote = self.storage_manager.storage_backends.get("RemoteBackend")
@@ -5258,19 +5276,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if not callable(contains) or not callable(retrieve):
                     raise RuntimeError("RemoteBackend does not support layer pages")
                 remote_keys = page_keys[local_count:page_chunks]
-                phase_started = cold_start_perf_now() if perf_enabled else 0.0
+                phase_started = serving_perf_now() if perf_enabled else 0.0
                 remote_count = contains(remote_keys)
                 if perf_enabled:
                     remote_probe_ms = (
-                        cold_start_perf_now() - phase_started
+                        serving_perf_now() - phase_started
                     ) * 1000
                 if not 0 <= remote_count <= len(remote_keys):
                     raise ValueError("Remote layer-page lookup returned invalid count")
-                phase_started = cold_start_perf_now() if perf_enabled else 0.0
+                phase_started = serving_perf_now() if perf_enabled else 0.0
                 fetched = retrieve(remote_keys[:remote_count]) if remote_count else []
                 if perf_enabled:
                     remote_get_ms = (
-                        cold_start_perf_now() - phase_started
+                        serving_perf_now() - phase_started
                     ) * 1000
                 if len(fetched) != remote_count:
                     raise ValueError("Remote layer-page result count is inconsistent")
@@ -5297,7 +5315,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 + list(keys_layer_major[layer_id][page_chunks:])
                 for layer_id in range(self.num_layers)
             ]
-            phase_started = cold_start_perf_now() if perf_enabled else 0.0
+            phase_started = serving_perf_now() if perf_enabled else 0.0
             tail = (
                 # This retains the legacy layerwise fallback, but measures it
                 # separately from merged-page retrieval.
@@ -5312,7 +5330,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             if perf_enabled:
                 tail_resolve_ms = (
-                    cold_start_perf_now() - phase_started
+                    serving_perf_now() - phase_started
                 ) * 1000
             tail_objects = [obj for layer in tail for obj in layer]
             owned.extend(tail_objects)
@@ -5321,7 +5339,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 raise ValueError(
                     f"Layer-page result count {len(pages)} != {tail_start}"
                 )
-            phase_started = cold_start_perf_now() if perf_enabled else 0.0
+            phase_started = serving_perf_now() if perf_enabled else 0.0
             invalid_page = False
             for chunk_index, page in enumerate(pages):
                 token_count = int(getattr(page, "valid_tokens", 0))
@@ -5347,11 +5365,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
             if perf_enabled:
                 validate_pin_ms = (
-                    cold_start_perf_now() - phase_started
+                    serving_perf_now() - phase_started
                 ) * 1000
-                elapsed_ms = (cold_start_perf_now() - resolve_started) * 1000
+                elapsed_ms = (serving_perf_now() - resolve_started) * 1000
                 if elapsed_ms >= 100.0:
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "rank0_page_resolve_slow",
                         started=resolve_started,
@@ -5434,7 +5452,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if ret_mask is None or ret_mask.numel() != len(tokens):
             ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
             kwargs["ret_mask"] = ret_mask
-        started = cold_start_perf_now()
+        started = serving_perf_now() if serving_perf_enabled() else None
         location, _, _, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -5472,15 +5490,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             raise ValueError("Group-1 prefetch page coverage is incomplete")
         try:
-            cold_start_perf_log(
-                logger,
-                "group1_persistent_prefetch_complete",
-                started=started,
-                req_id=kwargs.get("req_id", "unspecified"),
-                pages=required_chunks,
-                layers=self.num_layers,
-                location=location,
-            )
+            if started is not None:
+                serving_perf_log(
+                    logger,
+                    "group1_persistent_prefetch_complete",
+                    started=started,
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    pages=required_chunks,
+                    layers=self.num_layers,
+                    location=location,
+                )
             cached_memory_objs[:] = memory_objs
             # Preserve the physical page layout for the later materialization
             # pass. Without this marker the cached page is treated as one
@@ -5535,13 +5554,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 return False
             planned = planner(kvcaches, slot_mapping, starts, ends, 1)
             if planned is None:
-                if cold_start_perf_enabled():
+                if serving_perf_enabled():
                     rejection = getattr(
                         self.gpu_connector,
                         "direct_page_plan_rejection",
                         None,
                     )
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "cold_compact_indexer_fallback",
                         req_id=req_id,
@@ -5581,8 +5600,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Direct Mooncake-to-NPU indexer load failed; using CPU-staged path",
                 exc_info=True,
             )
-            if cold_start_perf_enabled():
-                cold_start_perf_log(
+            if serving_perf_enabled():
+                serving_perf_log(
                     logger,
                     "cold_compact_indexer_fallback",
                     req_id=req_id,
@@ -7223,7 +7242,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
             try:
-                store_perf_enabled = cold_start_perf_enabled()
+                store_perf_enabled = serving_perf_enabled()
                 t_start = time.perf_counter() if store_perf_enabled else 0.0
                 page_first_store = mooncake_page_layout_enabled(self.config)
                 group_store = getattr(
@@ -7249,15 +7268,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                     for _ in range(self.num_layers):
                         yield
                     group_started = (
-                        cold_start_perf_now()
-                        if cold_start_perf_enabled()
+                        serving_perf_now()
+                        if serving_perf_enabled()
                         else None
                     )
                     host_pointer_rows, layer_chunk_ptrs_npu = group_store(
                         memory_objs, starts, ends, **kwargs
                     )
                     if group_started is not None:
-                        cold_start_perf_log(
+                        serving_perf_log(
                             logger,
                             "npu_group_submit_cpu",
                             started=group_started,
@@ -7466,7 +7485,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         kv_group = kwargs.get("kv_group", 0)
         req_id = kwargs.get("req_id", "unspecified")
         phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         cached_keys = kwargs.get("cached_keys")
         cached_starts = kwargs.get("cached_starts")
@@ -7478,7 +7497,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_shared_handles = kwargs.get("cached_shared_handles")
         append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
 
-        metadata_started = cold_start_perf_now() if perf_enabled else 0.0
+        metadata_started = serving_perf_now() if perf_enabled else 0.0
         metadata_warm = bool(
             kwargs.get("_retrieve_metadata_warm")
             and cached_keys
@@ -7530,7 +7549,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
         required_chunks = len(starts)
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "metadata_prepare",
                 started=metadata_started,
@@ -7644,7 +7663,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         page_view_build_s = 0.0
         pointer_seal_s = 0.0
         compact_materialize_started = (
-            cold_start_perf_now() if perf_enabled else 0.0
+            serving_perf_now() if perf_enabled else 0.0
         )
         compact_materialize_thread_started = (
             time.thread_time_ns() if perf_enabled else 0
@@ -7697,7 +7716,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         compact_batch = envelope.batch
                         if compact_batch is not None:
                             page_started = (
-                                cold_start_perf_now() if perf_enabled else 0.0
+                                serving_perf_now() if perf_enabled else 0.0
                             )
                             compact_pages = self._make_passive_layer_page_views(
                                 compact_batch,
@@ -7711,7 +7730,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             )
                             if page_started:
                                 page_view_build_s = (
-                                    cold_start_perf_now() - page_started
+                                    serving_perf_now() - page_started
                                 )
                             if npu_content_diagnostics_enabled():
                                 log_shared_page_source_fingerprint(
@@ -7741,7 +7760,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 and callable(prepare_page_ptrs)
                             ):
                                 pointer_started = (
-                                    cold_start_perf_now() if perf_enabled else 0.0
+                                    serving_perf_now() if perf_enabled else 0.0
                                 )
                                 prepared_compact_ptrs = bool(
                                     prepare_page_ptrs(
@@ -7774,7 +7793,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     )
                                 if pointer_started:
                                     pointer_seal_s = (
-                                        cold_start_perf_now() - pointer_started
+                                        serving_perf_now() - pointer_started
                                     )
                         elif len(envelope.handles) != missing_chunks:
                             raise ValueError(
@@ -7783,7 +7802,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 f"{len(envelope.handles)} != {missing_chunks}"
                             )
                     prepare_started = (
-                        cold_start_perf_now()
+                        serving_perf_now()
                         if perf_enabled
                         else 0.0
                     )
@@ -7911,7 +7930,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         cached_prefix_chunks,
                     )
                     if perf_enabled:
-                        elapsed_s = cold_start_perf_now() - prepare_started
+                        elapsed_s = serving_perf_now() - prepare_started
                         prepare_count += 1
                         prepare_sum_s += elapsed_s
                         prepare_max_s = max(prepare_max_s, elapsed_s)
@@ -7930,7 +7949,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         raise ValueError("Duplicate shared sparse prepare request")
 
                 dispatch_started = (
-                    cold_start_perf_now()
+                    serving_perf_now()
                     if perf_enabled
                     else 0.0
                 )
@@ -7947,13 +7966,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     )
                 if perf_enabled:
-                    elapsed_s = cold_start_perf_now() - dispatch_started
+                    elapsed_s = serving_perf_now() - dispatch_started
                     dispatch_count += 1
                     dispatch_sum_s += elapsed_s
                     dispatch_max_s = max(dispatch_max_s, elapsed_s)
             if perf_enabled:
                 if prepare_count:
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "passive_layer_prepare",
                         req_id=req_id,
@@ -7965,7 +7984,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         max_ms=round(prepare_max_s * 1000, 3),
                         elapsed_ms=round(prepare_sum_s * 1000, 3),
                     )
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "npu_layer_submit_cpu",
                     req_id=req_id,
@@ -8010,7 +8029,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
             if pending_materialized_layers:
                 pointer_started = (
-                    cold_start_perf_now()
+                    serving_perf_now()
                     if perf_enabled and compact_pages
                     else 0.0
                 )
@@ -8030,13 +8049,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                     pointer_seal_ms = round(
                         (
                             pointer_seal_s
-                            + cold_start_perf_now()
+                            + serving_perf_now()
                             - pointer_started
                         )
                         * 1000,
                         3,
                     )
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "passive_compact_materialize",
                         started=pointer_started,
@@ -8051,7 +8070,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         pointer_seal_ms=pointer_seal_ms,
                         total_materialize_ms=round(
                             (
-                                cold_start_perf_now()
+                                serving_perf_now()
                                 - compact_materialize_started
                             )
                             * 1000,
@@ -8217,7 +8236,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
 
         kv_group = kwargs.get("kv_group", 0)
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
         kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
         direct_external_pages = bool(
             kv_group == 1 and kwargs.get("direct_external_pages", False)
@@ -8296,7 +8315,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_memory_objs,
         )
 
-        metadata_started = cold_start_perf_now() if perf_enabled else 0.0
+        metadata_started = serving_perf_now() if perf_enabled else 0.0
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -8310,7 +8329,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         kwargs.pop("_use_cached_retrieve", None)
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "metadata_prepare",
                 started=metadata_started,
@@ -8608,7 +8627,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             and any(missing_keys)
         ):
             probe_started = (
-                cold_start_perf_now() if perf_enabled else 0.0
+                serving_perf_now() if perf_enabled else 0.0
             )
             missing_locations: list[tuple[int, int]] = []
             if remote_fill_exact_locations is not None:
@@ -8702,7 +8721,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     for locations in shared_chunk_locations_layer_major
                     for location in locations
                 )
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "location_probe",
                     started=probe_started,
@@ -8756,7 +8775,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             else:
                 try:
                     capacity_started = (
-                        cold_start_perf_now()
+                        serving_perf_now()
                         if perf_enabled
                         else 0.0
                     )
@@ -8789,7 +8808,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         ],
                     )
                     if perf_enabled:
-                        cold_start_perf_log(
+                        serving_perf_log(
                             logger,
                             "capacity_preflight",
                             started=capacity_started,
@@ -8845,7 +8864,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         ):
                             release_local_prefix_layers()
                             materialize_started = (
-                                cold_start_perf_now() if perf_enabled else 0.0
+                                serving_perf_now() if perf_enabled else 0.0
                             )
                             materialize_thread_started = (
                                 time.thread_time_ns() if perf_enabled else 0
@@ -8866,7 +8885,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 ),
                             )
                             if perf_enabled:
-                                cold_start_perf_log(
+                                serving_perf_log(
                                     logger,
                                     "rank0_page_materialize",
                                     started=materialize_started,
@@ -9060,12 +9079,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             and cached_prefix_chunks < required_chunks
         ):
             if perf_enabled:
-                group_cache_started = source_view_started = cold_start_perf_now()
+                group_cache_started = source_view_started = serving_perf_now()
                 group_cache_thread_started = time.thread_time_ns()
                 handle_batch_ms = handle_cache_append_ms = 0.0
 
                 def elapsed_ms(started: float) -> float:
-                    return round((cold_start_perf_now() - started) * 1000, 3)
+                    return round((serving_perf_now() - started) * 1000, 3)
 
                 def thread_cpu_ms(started: int) -> float:
                     return round((time.thread_time_ns() - started) / 1_000_000, 3)
@@ -9090,7 +9109,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 if perf_enabled:
                     source_view_ms = elapsed_ms(source_view_started)
-                    group_cache_append_started = cold_start_perf_now()
+                    group_cache_append_started = serving_perf_now()
                     group_cache_append_thread_started = time.thread_time_ns()
                 self._append_retrieve_group_cache(
                     page_sources,
@@ -9110,7 +9129,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 group_cache_prepared = True
                 if publish_shared_handles:
                     if perf_enabled:
-                        handle_batch_started = cold_start_perf_now()
+                        handle_batch_started = serving_perf_now()
                     compact_handle_batch = self._make_shared_handle_batch(
                         pre_resolved_shared_mem_layers,
                         missing_keys,
@@ -9119,7 +9138,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         handle_batch_ms = elapsed_ms(handle_batch_started)
                     if compact_handle_batch is not None:
                         if perf_enabled:
-                            handle_cache_started = cold_start_perf_now()
+                            handle_cache_started = serving_perf_now()
                         if cached_memory_objs is None:
                             raise ValueError(
                                 "Compact shared publication requires retained "
@@ -9156,7 +9175,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 handle_cache_started
                             )
                 if perf_enabled:
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "rank0_group_cache_prepare",
                         started=group_cache_started,
@@ -9731,7 +9750,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         raise ValueError("Duplicate shared sparse prepare request")
 
                 dispatch_started = (
-                    cold_start_perf_now()
+                    serving_perf_now()
                     if perf_enabled
                     else 0.0
                 )
@@ -9750,13 +9769,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     )
                 if perf_enabled:
-                    elapsed_s = cold_start_perf_now() - dispatch_started
+                    elapsed_s = serving_perf_now() - dispatch_started
                     dispatch_count += 1
                     dispatch_sum_s += elapsed_s
                     dispatch_max_s = max(dispatch_max_s, elapsed_s)
 
             if perf_enabled:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "npu_layer_submit_cpu",
                     req_id=kwargs.get("req_id", "unspecified"),

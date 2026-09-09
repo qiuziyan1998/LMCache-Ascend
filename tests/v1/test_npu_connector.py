@@ -2998,10 +2998,10 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
 def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
     perf_events = []
-    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: True)
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: True)
     monkeypatch.setattr(
         npu_connectors,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: perf_events.append((event, fields)),
     )
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
@@ -3289,9 +3289,9 @@ def test_prepared_chunk_validation_is_reused_safely(
     }
     connector._sparse_lmc_host_interleaved = lambda group: False
     connector._get_or_create_sparse_destination_plan = MagicMock()
-    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: False)
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: False)
     monkeypatch.setattr(
-        npu_connectors, "cold_start_perf_detailed_enabled", lambda: False
+        npu_connectors, "serving_perf_detailed_enabled", lambda: False
     )
     monkeypatch.setattr(
         npu_connectors, "npu_content_diagnostics_enabled", lambda: False
@@ -3335,7 +3335,7 @@ def test_prepared_chunk_validation_is_reused_safely(
 def test_pointer_append_skips_perf_clocks_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: False)
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: False)
     monkeypatch.setattr(
         npu_connectors,
         "time",
@@ -3505,7 +3505,7 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     connector._sparse_h2d_stall_watchdog = _Watchdog()
 
     connector._sparse_direct_validated_layers = set()
-    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: True)
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: True)
     monkeypatch.setattr(
         npu_connectors.torch,
         "npu",
@@ -3639,7 +3639,7 @@ def test_sparse_h2d_watchdog_captures_stalled_python_stack(monkeypatch) -> None:
             sum(range(64))
         watchdog.end_host(state)
 
-    monkeypatch.setattr(npu_connectors, "cold_start_perf_log", capture)
+    monkeypatch.setattr(npu_connectors, "serving_perf_log", capture)
     watchdog = npu_connectors._SparseH2DStallWatchdog(0.01)
     worker = threading.Thread(target=stalled_submission, args=(watchdog,))
     worker.start()
@@ -3699,7 +3699,7 @@ def test_sparse_h2d_watchdog_failures_do_not_affect_submission(monkeypatch) -> N
 
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector._sparse_h2d_stall_watchdog = None
-    monkeypatch.setattr(npu_connectors, "cold_start_perf_enabled", lambda: True)
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: True)
 
     def fail_watchdog(_timeout):
         raise RuntimeError("thread creation failed")

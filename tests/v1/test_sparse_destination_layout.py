@@ -204,7 +204,7 @@ def test_sealed_destination_generators_forward_current_request_payloads(monkeypa
         connector, "_run_prepared_sparse_direct_kv_transfer_layer", transfer
     )
     monkeypatch.setattr(
-        npu_connectors, "cold_start_perf_detailed_enabled", lambda: False
+        npu_connectors, "serving_perf_detailed_enabled", lambda: False
     )
     monkeypatch.setattr(
         npu_connectors, "npu_content_diagnostics_enabled", lambda: False

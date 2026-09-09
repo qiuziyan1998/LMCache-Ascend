@@ -14,7 +14,7 @@ constexpr double kSlowPathMs = 100.0;
 
 inline const std::string &mode() {
   static const std::string value = []() -> std::string {
-    const char *raw = std::getenv("LMCACHE_COLD_START_PERF");
+    const char *raw = std::getenv("PD_SERVING_PERF");
     if (raw == nullptr) {
       return "0";
     }
