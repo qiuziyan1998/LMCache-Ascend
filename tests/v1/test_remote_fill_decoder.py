@@ -20,8 +20,13 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
 from lmcache.v1.remote_fill import (
     ControlPage,
+    InProcessRemoteFillTransport,
+    NegotiateRequest,
+    OperationIdentity,
     PageDisposition,
+    RemoteFillClient,
     ReservedPageView,
+    ResultCode,
     UnsafePageLifecycleError,
     content_digest,
 )
@@ -45,11 +50,67 @@ from lmcache_ascend.v1.remote_fill import (
     RemoteFillDecoderLayout,
     RemoteFillGroupLayout,
     build_decoder_layout,
+    build_remote_fill_negotiation_spec,
     create_decoder_remote_fill_runtime,
     remote_fill_token_hash_identity,
+    remote_fill_tp_independent,
 )
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
 from lmcache_ascend.v1.remote_fill_coordinator import ProducerRequestState, RemoteFillCoordinator
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        None,
+        "topology",
+        "mla",
+        "groups",
+        "sparse",
+        "mode",
+        "ownership",
+        "pages",
+        "dtype",
+    ],
+)
+def test_tp_independent_requires_local_replicated_split_pages(
+    override: str | None,
+) -> None:
+    config = SimpleNamespace(
+        use_layerwise=True,
+        dsa_two_groups=True,
+        enable_sparse_attention=True,
+        dsa_group1_load_mode="persistent_direct_hbm",
+        remote_url="mooncakestore://host",
+        extra_config=dict(
+            enable_shared_cpu_cache=True,
+            save_only_first_rank=True,
+            mooncake_page_first_multi_buffer=True,
+            mooncake_layer_merged_page_objects=True,
+        ),
+    )
+    metadata = SimpleNamespace(
+        mla_cache_tp_replicated=True,
+        use_mla=True,
+        get_dtypes=lambda: [torch.bfloat16, torch.bfloat16],
+    )
+    if override == "topology":
+        del metadata.mla_cache_tp_replicated
+    elif override == "mla":
+        metadata.use_mla = False
+    elif override == "groups":
+        config.dsa_two_groups = False
+    elif override == "sparse":
+        config.enable_sparse_attention = False
+    elif override == "mode":
+        config.dsa_group1_load_mode = "p2p_preferred"
+    elif override == "ownership":
+        config.extra_config["save_only_first_rank"] = False
+    elif override == "pages":
+        config.extra_config["mooncake_page_first_multi_buffer"] = False
+    elif override == "dtype":
+        metadata.get_dtypes = lambda: [torch.bfloat16, torch.int8]
+    assert remote_fill_tp_independent(config, metadata) is (override is None)
 
 
 def test_post_init_emits_startup_stage_timings() -> None:
@@ -1764,6 +1825,97 @@ def _metadata(*, world_size: int, first: bool = True) -> SimpleNamespace:
         engine_id="decoder",
         is_first_rank=lambda: first,
     )
+
+
+@pytest.mark.parametrize("replicated", [False, True])
+@pytest.mark.parametrize("shared_group1", [False, True])
+@pytest.mark.parametrize("source_tp", [4, 8])
+def test_runtime_tp_qualification_matches_negotiated_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    replicated: bool,
+    shared_group1: bool,
+    source_tp: int,
+) -> None:
+    """Runtime negotiation, including its legacy default, must keep paired TP strict."""
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    config = _config(shared=True)
+    config.dsa_group1_load_mode = "persistent_direct_hbm"
+    config.remote_url = "mooncakestore://host"
+    config.extra_config = dict(
+        save_only_first_rank=True,
+        mooncake_page_first_multi_buffer=True,
+        mooncake_layer_merged_page_objects=True,
+    )
+    metadata = _metadata(world_size=4)
+    metadata.mla_cache_tp_replicated = replicated
+    metadata.get_dtypes = lambda: [torch.bfloat16, torch.bfloat16]
+    layout = _layout()
+    runtime = create_decoder_remote_fill_runtime(
+        config=config,
+        metadata=metadata,
+        local_backend=Mock(),
+        layout=layout,
+        destination_engine_epoch=7,
+        destination_dp_rank=3,
+        destination_dp_size=4,
+        destination_remote_session="decoder:1234",
+        control_host="127.0.0.1",
+        control_advertise_host="10.0.0.2",
+        control_port=19000,
+        shared_cache_generation=11,
+        capacity_available=lambda _: pytest.fail("NEGOTIATE must not allocate"),
+        fatal_restart=lambda _: pytest.fail("NEGOTIATE must not transfer"),
+        global_te_push=True,
+        save_only_first_rank=True,
+        save_indexer_only_first_rank=True,
+        shared_cpu_cache_strict=True,
+        chunk_hash_type=int,
+        chunk_hash_bytes=None,
+        server_factory=lambda service: _FakeServer(),
+        **({} if shared_group1 else {"shared_group1": False}),
+    )
+    try:
+        spec = build_remote_fill_negotiation_spec(
+            config,
+            SimpleNamespace(**(vars(metadata) | {"world_size": source_tp})),
+            layout=layout,
+            destination_engine_id="decoder",
+            destination_dp_rank=3,
+            dp_size=4,
+            global_te_push=True,
+            destination_remote_session="decoder:1234",
+            chunk_hash_type=int,
+            chunk_hash_bytes=None,
+            shared_group1=shared_group1,
+        )
+        request = NegotiateRequest(
+            common=OperationIdentity(
+                protocol_version=1,
+                operation_id="negotiate",
+                operation_sequence=1,
+                payload_digest="",
+                transfer_id="transfer",
+                request_attempt=1,
+                destination_engine_epoch=7,
+                shared_cache_generation=11,
+            ),
+            **{
+                name: getattr(spec, name)
+                for name in NegotiateRequest.__struct_fields__
+                if name != "common"
+            },
+        )
+        client = RemoteFillClient(InProcessRemoteFillTransport(runtime.service))
+        response = client.execute(request)
+        accepted = source_tp == 4 or (replicated and not shared_group1)
+        assert response.code is (
+            ResultCode.OK if accepted else ResultCode.RESERVATION_REJECTED
+        )
+        assert runtime.placement.destination_tp_size == 4
+        assert runtime.placement.destination_dp_size == 4
+        assert runtime.lifecycle.direct_groups == ((0, 1) if shared_group1 else (0,))
+    finally:
+        runtime.close()
 
 
 def test_runtime_requires_tp0_and_strict_shared_storage_for_tp_gt_one(

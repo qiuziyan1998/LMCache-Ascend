@@ -102,6 +102,7 @@ from lmcache_ascend.v1.remote_fill import (
     RemoteFillDecoderLayout,
     build_decoder_layout,
     create_decoder_remote_fill_runtime,
+    remote_fill_tp_independent,
 )
 from lmcache_ascend.v1.remote_fill_coordinator import (
     ProducerSessionContext,
@@ -862,6 +863,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tp_size=int(self.metadata.world_size),
                 storage_manager=self.storage_manager,
                 fatal_reporter=self._remote_fill_require_paired_restart,
+                tp_independent=remote_fill_tp_independent(self.config, self.metadata),
             )
             self._remote_fill_coordinator = coordinator
         return coordinator
