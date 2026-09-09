@@ -4,13 +4,15 @@
 # Standard
 from collections import deque
 from concurrent.futures import Future
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from threading import Condition, RLock
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 import logging
 import time
 
+import msgspec
 import pytest
 
 from lmcache.v1.remote_fill import (
@@ -20,11 +22,17 @@ from lmcache.v1.remote_fill import (
     DestinationNativeState,
     DestinationPageDescriptor,
     FinishRequest,
+    InProcessRemoteFillTransport,
+    NegotiationSpec,
     NegotiateRequest,
     OpenRequest,
     OperationKind,
     PageDisposition,
     PagePreparationStatus,
+    PreparedPage,
+    RemoteFillClient,
+    RemoteFillService,
+    RemoteFillStateCore,
     RemoteFillResponse,
     ReportTransferCompleteRequest,
     ReplyLostError,
@@ -515,6 +523,167 @@ def test_static_negotiation_is_cached_for_decoder_epoch() -> None:
         isinstance(item, NegotiateRequest) for item in second_client.requests
     )
     assert sum(isinstance(item, OpenRequest) for item in second_client.requests) == 1
+
+
+def test_negotiation_cache_distinguishes_destination_tp() -> None:
+    cache = RemoteFillNegotiationCache()
+    spec = _static_spec(shared_group1=False)
+    cache.record(cache.key(_handoff(destination_tp_size=4), spec))
+    assert cache.contains(cache.key(_handoff(destination_tp_size=4), spec))
+    assert not cache.contains(cache.key(_handoff(destination_tp_size=8), spec))
+
+
+@pytest.mark.parametrize("source_tp,destination_tp", [(8, 4), (4, 8), (1, 4), (4, 4)])
+@pytest.mark.parametrize("qualified", [False, True])
+def test_coordinator_qualifies_tp_mismatch_only(
+    source_tp: int, destination_tp: int, qualified: bool
+) -> None:
+    coordinator = RemoteFillCoordinator(
+        config=SimpleNamespace(
+            enable_remote_lmcache_store=True, remote_fill_circuit_breaker_enabled=False
+        ),
+        tp_size=source_tp,
+        tp_independent=qualified,
+        storage_manager=None,
+        fatal_reporter=RemoteFillProducerMetrics().snapshot,
+    )
+    state = ProducerRequestState()
+    handoff = _handoff(destination_tp_size=destination_tp, destination_dp_size=4)
+    assert coordinator.prepare_request(
+        "request", {"lmcache.remote_fill": asdict(handoff)}, state
+    ) is (qualified or source_tp == destination_tp)
+    assert state.disabled_reason == (
+        "" if qualified or source_tp == destination_tp else "incompatible_tp_mapping"
+    )
+
+
+@pytest.mark.parametrize("source_tp,destination_tp", [(8, 4), (4, 8), (1, 4), (4, 4)])
+@pytest.mark.parametrize("destination_dp_rank", range(4))
+@pytest.mark.parametrize("qualified", [False, True])
+@pytest.mark.parametrize("valid_tokens", [1024, 754])
+def test_asymmetric_tp_uses_existing_control_lifecycle(
+    source_tp: int,
+    destination_tp: int,
+    destination_dp_rank: int,
+    qualified: bool,
+    valid_tokens: int,
+) -> None:
+    """Real encoded P/D control flow preserves ranks, lengths and ARM ordering."""
+    spec = replace(_static_spec(shared_group1=False), tp_size=source_tp, dp_size=4)
+    handoff = _handoff(
+        destination_tp_size=destination_tp,
+        destination_dp_size=4,
+        destination_dp_rank=destination_dp_rank,
+    )
+    page = msgspec.structs.replace(
+        _pages()[0],
+        chunk_end=valid_tokens,
+        valid_tokens=valid_tokens,
+        expected_bytes=79 * valid_tokens * 576 * 2,
+    )
+    source = replace(
+        _source_plan(),
+        pages=(
+            replace(_source_plan().pages[0], source_lengths=(page.expected_bytes,)),
+        ),
+    )
+    lifecycle = Mock()
+    lifecycle.prepare_pages.side_effect = (
+        lambda transfer_id, window_id, pages, reserve_missing: tuple(
+            PreparedPage(
+                handle=page.canonical_key,
+                destination_ptr=0x1000,
+                destination_length=page.expected_bytes,
+                reservation_base=0x1000,
+                reservation_length=page.expected_bytes,
+            )
+            for page in pages
+        )
+    )
+    lifecycle.commit_pages.return_value = True
+    state = RemoteFillStateCore(
+        destination_engine_epoch=_EPOCH,
+        shared_cache_generation=_GENERATION,
+        descriptor_verification_key=_SECRET,
+        page_lifecycle=lifecycle,
+        tp_independent=qualified,
+        negotiation=NegotiationSpec(
+            **asdict(replace(spec, tp_size=destination_tp)),
+            destination_engine_id="decoder",
+            destination_dp_rank=destination_dp_rank,
+            destination_remote_session=_SESSION,
+        ),
+    )
+    real_client = RemoteFillClient(
+        InProcessRemoteFillTransport(RemoteFillService(state))
+    )
+    requests = []
+
+    def execute(request: Any) -> RemoteFillResponse:
+        requests.append(request)
+        return real_client.execute(request)
+
+    session = RemoteFillProducerSession(
+        request_id="request-1",
+        handoff=handoff,
+        static_spec=spec,
+        client=SimpleNamespace(execute=execute),
+        secret=_SECRET,
+        planned_window_count_hint=1,
+        required_store_end_hint=valid_tokens,
+    )
+
+    def submit(**kwargs: Any) -> Future:
+        assert isinstance(requests[-1], ArmWindowRequest)
+        assert kwargs["remote_session"] == _SESSION
+        (descriptor,) = kwargs["destination_descriptors"]
+        assert descriptor.destination_dp_rank == destination_dp_rank
+        assert descriptor.destination_tp_rank == 0
+        assert descriptor.destination_length == page.expected_bytes
+        assert kwargs["source_plan"].pages == source.pages
+        future = Future()
+        future.set_result(
+            NativeDirectPushResult(
+                native_transfer_attempt_id=requests[-1].native_transfer_attempt_id,
+                return_code=0,
+                vector_count=1,
+                transferred_bytes=descriptor.destination_length,
+                elapsed_ms=0.0,
+            )
+        )
+        return future
+
+    result = session.transfer_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=(page,),
+        source_plan=source,
+        submitter=submit,
+        activation_factory=lambda attempt: None,
+    )
+    if not qualified and source_tp != destination_tp:
+        assert not result.direct_satisfied
+        assert len(requests) == 1 and isinstance(requests[0], NegotiateRequest)
+        lifecycle.prepare_pages.assert_not_called()
+        return
+    assert result.direct_satisfied, (result.reason, requests)
+    terminal = session.finish(
+        required_store_end=valid_tokens,
+        persistent_common_end=valid_tokens,
+        final_partial_valid_tokens=valid_tokens % 1024,
+    )
+    assert terminal.direct_satisfied and terminal.outcome == "PERSISTENT_ONLY"
+    assert [type(request) for request in requests] == [
+        NegotiateRequest,
+        OpenRequest,
+        ReserveWindowRequest,
+        ArmWindowRequest,
+        ReportTransferCompleteRequest,
+        FinishRequest,
+    ]
+    assert requests[0].tp_size == source_tp and requests[0].dp_size == 4
+    lifecycle.commit_pages.assert_called_once()
+    lifecycle.release_pages.assert_not_called()
 
 
 @pytest.mark.parametrize(
