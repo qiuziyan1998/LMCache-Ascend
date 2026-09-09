@@ -2164,3 +2164,72 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
     assert caplog.text.count('"decision":"retain_deferred_sources"') == 2
     assert '"decision":"release_deferred_sources"' in caplog.text
     assert '"reason":"complete_request_matched_fence"' in caplog.text
+
+
+@pytest.mark.parametrize("return_code", [0, -1])
+@pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
+def test_terminal_window_preserves_all_evidence(monkeypatch, return_code, mode):
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode)
+    reads = []
+
+    def clock():
+        reads.append(100.0 + len(reads) * 0.25)
+        return reads[-1]
+
+    monkeypatch.setattr(producer_module, "time", SimpleNamespace(perf_counter=clock))
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.ALLOCATED)
+    )
+    session = _session(client)
+    native = NativeDirectPushResult(
+        native_transfer_attempt_id="native-attempt",
+        return_code=return_code,
+        vector_count=1,
+        transferred_bytes=64 if return_code == 0 else 0,
+        elapsed_ms=7.0,
+        source_event_wait_ms=2.0,
+        source_fences_ready_monotonic=90.0,
+        source_registration_ms=3.0,
+        native_slot_wait_ms=4.0,
+        native_started_monotonic=91.0,
+        native_ended_monotonic=91.007,
+    )
+
+    def submitter(**_kwargs):
+        future = Future()
+        if return_code == 0:
+            future.set_result(native)
+        else:
+            future.set_exception(NativeDirectPushTerminalError(native))
+        return future
+
+    result = session.transfer_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=_pages(),
+        source_plan=_source_plan(),
+        submitter=submitter,
+        activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+    )
+    optional_duration = 0.0 if mode == "0" else 0.25
+    assert asdict(result) == {
+        "window_id": 0,
+        "direct_satisfied": return_code == 0,
+        "armed": True,
+        "fatal_restart_required": False,
+        "reason": "" if return_code == 0 else "native transfer failed",
+        "reserve_seconds": optional_duration,
+        "arm_seconds": optional_duration,
+        "source_event_wait_seconds": 0.002,
+        "source_fences_ready_monotonic": 90.0,
+        "source_registration_seconds": 0.003,
+        "native_slot_wait_seconds": 0.004,
+        "native_seconds": 0.007,
+        "report_seconds": optional_duration,
+        "native_started_monotonic": 91.0,
+        "native_ended_monotonic": 91.007,
+        "submitted_bytes": 64,
+        "existing_pages": 1,
+    }
+    assert session.direct_viable is (return_code == 0)
+    assert len(reads) == (2 if mode == "0" else 8)

@@ -1160,29 +1160,14 @@ class RemoteFillProducerSession:
                     "prove the reported result"
                 ) from status_error
         report_seconds = time.perf_counter() - report_started if perf_enabled else 0.0
-        if return_code != 0 or not report_succeeded:
+        direct_satisfied = return_code == 0 and report_succeeded
+        if not direct_satisfied:
             self.direct_viable = False
-            return self._abandoned_window(
-                window_id,
-                "native transfer failed",
-                True,
-                reserve_seconds=reserve_seconds,
-                arm_seconds=arm_seconds,
-                source_event_wait_seconds=source_event_wait_seconds,
-                source_fences_ready_monotonic=source_fences_ready_monotonic,
-                source_registration_seconds=source_registration_seconds,
-                native_slot_wait_seconds=native_slot_wait_seconds,
-                native_seconds=native_seconds,
-                report_seconds=report_seconds,
-                native_started_monotonic=native_started_monotonic,
-                native_ended_monotonic=native_ended_monotonic,
-                submitted_bytes=submitted_bytes,
-                existing_pages=existing_pages,
-            )
         return RemoteFillWindowResult(
             window_id,
+            direct_satisfied,
             True,
-            True,
+            reason="" if direct_satisfied else "native transfer failed",
             reserve_seconds=reserve_seconds,
             arm_seconds=arm_seconds,
             source_event_wait_seconds=source_event_wait_seconds,
