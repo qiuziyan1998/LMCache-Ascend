@@ -1129,8 +1129,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._latest_live_source_ready_event_source = "missing"
         getattr(self, "_latest_direct_source_ready_events", {}).clear()
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
+            perf_enabled = serving_perf_enabled()
+            pending_sync_started = time.perf_counter() if perf_enabled else 0.0
             try:
                 self.lmcache_engine.wait_for_pending_sync_stores()
+                if perf_enabled:
+                    pending_sync_wait_ms = (
+                        time.perf_counter() - pending_sync_started
+                    ) * 1000
             finally:
                 completed = self._completed_layerwise_stores
                 self._completed_layerwise_stores = {}
@@ -1167,7 +1173,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 handoff_status = "target_mismatch"
             elif isinstance(handoff, tuple) and handoff[1] is None:
                 handoff_status = "missing_event"
-            if serving_perf_enabled():
+            if perf_enabled:
                 for request in requests:
                     remote_fill_eligible = bool(
                         getattr(request, "_lmcache_remote_fill_qualified", False)
@@ -1178,6 +1184,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         logger,
                         "remote_fill_producer_fence_decision",
                         req_id=request.req_id,
+                        pending_sync_wait_ms=round(pending_sync_wait_ms, 3),
                         handoff_status=handoff_status,
                         expected_layer_count=len(expected_direct_layers),
                         observed_layer_count=len(

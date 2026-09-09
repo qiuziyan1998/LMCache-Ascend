@@ -3,7 +3,7 @@
 
 # Standard
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 # Third Party
 import pytest
@@ -244,6 +244,7 @@ def test_finish_save_batch_passes_handoff_event_to_live_descriptor() -> None:
         adapter_mod.logger,
         "remote_fill_producer_fence_decision",
         req_id="req-1",
+        pending_sync_wait_ms=ANY,
         handoff_status="adopted",
         expected_layer_count=4,
         observed_layer_count=0,
@@ -302,6 +303,7 @@ def test_finish_save_batch_handoff_supersedes_partial_callback_fence() -> None:
         adapter_mod.logger,
         "remote_fill_producer_fence_decision",
         req_id="req-1",
+        pending_sync_wait_ms=ANY,
         handoff_status="adopted",
         expected_layer_count=4,
         observed_layer_count=1,
@@ -368,6 +370,7 @@ def test_finish_save_batch_mismatched_handoff_does_not_authorize_remote_fill(
         adapter_mod.logger,
         "remote_fill_producer_fence_decision",
         req_id="req-1",
+        pending_sync_wait_ms=ANY,
         handoff_status="target_mismatch",
         expected_layer_count=4,
         observed_layer_count=4,
@@ -420,6 +423,7 @@ def test_finish_save_batch_logs_absent_handoff_without_completing_fence() -> Non
         adapter_mod.logger,
         "remote_fill_producer_fence_decision",
         req_id="req-1",
+        pending_sync_wait_ms=ANY,
         handoff_status="absent",
         expected_layer_count=4,
         observed_layer_count=0,
@@ -432,6 +436,55 @@ def test_finish_save_batch_logs_absent_handoff_without_completing_fence() -> Non
         submission_mode="final_deferred",
         remote_fill_eligible=True,
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("fail_wait", [False, True])
+def test_pending_sync_timing_is_gated_and_preserves_the_wait(
+    monkeypatch, enabled, fail_wait
+):
+    clock = MagicMock(side_effect=[1.0, 1.125])
+    monkeypatch.setattr(adapter_mod.time, "perf_counter", clock)
+    monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: enabled)
+    log = MagicMock()
+    monkeypatch.setattr(adapter_mod, "serving_perf_log", log)
+    wait = MagicMock()
+    request = SimpleNamespace(
+        req_id="r",
+        token_ids=[1],
+        is_last_prefill=False,
+        _lmcache_remote_fill_qualified=True,
+    )
+    adapter = SimpleNamespace(
+        kv_role="kv_producer",
+        config=SimpleNamespace(dsa_two_groups=True),
+        lmcache_engine=SimpleNamespace(wait_for_pending_sync_stores=wait),
+        _direct_store_observed_layers=set(),
+        _latent_layer_names=[],
+        _indexer_layer_names=[],
+        _completed_layerwise_stores={},
+        _parent=SimpleNamespace(_get_connector_metadata=SimpleNamespace),
+        _direct_prefill_requests=lambda: [request],
+        _producer_fence_handoff_targets=lambda requests: (),
+        _submit_direct_prefill_requests=MagicMock(),
+    )
+    if fail_wait:
+        wait.side_effect = RuntimeError("original wait failure")
+        adapter._completed_layerwise_stores = {("r", 0): object()}
+        with pytest.raises(RuntimeError, match="original wait failure"):
+            adapter_mod.LMCacheAscendConnectorV1Impl._finish_save_batch(adapter, {})
+        assert adapter._completed_layerwise_stores == {}
+        assert clock.call_count == int(enabled)
+        log.assert_not_called()
+        adapter._submit_direct_prefill_requests.assert_not_called()
+        return
+    adapter_mod.LMCacheAscendConnectorV1Impl._finish_save_batch(adapter, {})
+    wait.assert_called_once_with()
+    assert clock.call_count == (2 if enabled else 0)
+    assert log.call_count == int(enabled)
+    if enabled:
+        assert log.call_args.kwargs["pending_sync_wait_ms"] == 125.0
+    adapter._submit_direct_prefill_requests.assert_called_once()
 
 
 def test_frontier_change_between_arm_and_capture_fails_closed() -> None:
