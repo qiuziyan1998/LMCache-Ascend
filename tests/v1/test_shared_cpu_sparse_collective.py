@@ -197,7 +197,7 @@ def test_persistent_direct_group1_load_uses_native_terminal_return() -> None:
     owner = object()
     calls = []
     engine.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_direct_hbm"
+        dsa_index_transfer_mode="persistent_direct_hbm"
     )
     engine.metadata = SimpleNamespace(worker_id=0)
     engine._is_passive = lambda: False
@@ -242,7 +242,7 @@ def test_persistent_direct_group1_load_uses_native_terminal_return() -> None:
 def test_persistent_direct_group1_slow_log_sums_page_buffers() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     key = CacheEngineKey("model", 1, 0, 7, torch.float16)
-    engine.config = SimpleNamespace(dsa_group1_load_mode="persistent_direct_hbm")
+    engine.config = SimpleNamespace(dsa_index_transfer_mode="persistent_direct_hbm")
     engine.metadata = SimpleNamespace(worker_id=0)
     engine._is_passive = lambda: False
     engine.token_database = SimpleNamespace(
@@ -283,7 +283,7 @@ def test_persistent_direct_group1_slow_log_sums_page_buffers() -> None:
 def test_persistent_direct_group1_preflight_skips_sender() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         pd_role="sender",
     )
     engine.gpu_connector = SimpleNamespace(
@@ -302,7 +302,7 @@ def test_persistent_direct_group1_preflight_rolls_back_startup_resources() -> No
     runtime = MagicMock()
     reader = MagicMock()
     engine.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         pd_role="receiver",
     )
     engine.metadata = SimpleNamespace(world_size=1)
@@ -327,7 +327,7 @@ def test_persistent_direct_group1_preflight_rolls_back_startup_resources() -> No
 def test_persistent_direct_group1_rejects_incomplete_page_plan() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_direct_hbm"
+        dsa_index_transfer_mode="persistent_direct_hbm"
     )
     engine.token_database = SimpleNamespace(
         process_tokens=lambda **_kwargs: [(0, 3, object())]

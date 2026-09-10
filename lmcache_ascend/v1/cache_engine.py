@@ -547,7 +547,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._persistent_direct_hbm_split_group_enabled()
                 and (
                     self.config.pd_role != "sender"
-                    or getattr(self.config, "prefill_group0_direct_hbm", False)
+                    or getattr(self.config, "prefill_latent_direct_load", False)
                 )
                 and self._is_passive()
             ):
@@ -691,7 +691,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         Called at KV-cache registration; raises RuntimeError uniformly when
         any rank rejects the layout, reader or predecessor-fence capability.
         """
-        if getattr(self.config, "prefill_group0_direct_hbm", False):
+        if getattr(self.config, "prefill_latent_direct_load", False):
             self._preflight_direct_hbm(kvcaches, 0)
 
     def _preflight_direct_hbm(self, kvcaches: list, kv_group: int) -> None:
@@ -896,7 +896,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         metrics = None
         try:
             if (
-                not getattr(self.config, "prefill_group0_direct_hbm", False)
+                not getattr(self.config, "prefill_latent_direct_load", False)
                 or self.config.pd_role != "sender"
                 or not self.is_healthy()
             ):

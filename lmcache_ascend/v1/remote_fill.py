@@ -77,7 +77,7 @@ def remote_fill_tp_independent(
         and metadata.use_mla
         and config.dsa_two_groups
         and config.enable_sparse_attention
-        and config.dsa_group1_load_mode == "persistent_direct_hbm"
+        and config.dsa_index_transfer_mode == "persistent_direct_hbm"
         and mooncake_layer_pages_enabled(config)
     ):
         return False

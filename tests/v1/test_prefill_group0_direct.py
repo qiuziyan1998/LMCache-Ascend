@@ -33,8 +33,8 @@ def _engine(monkeypatch: pytest.MonkeyPatch, rank: int = 0, world: int = 4) -> A
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(
         pd_role="sender",
-        prefill_group0_direct_hbm=True,
-        dsa_group1_load_mode="persistent_direct_hbm",
+        prefill_latent_direct_load=True,
+        dsa_index_transfer_mode="persistent_direct_hbm",
         chunk_size=4,
     )
     engine.metadata = SimpleNamespace(worker_id=rank, world_size=world, first_rank=0)
@@ -281,7 +281,7 @@ def test_sender_reader_startup_and_preflight(
     monkeypatch: Any, enabled: Any, rank: Any
 ) -> None:
     engine, _, read, _ = _engine(monkeypatch, rank)
-    engine.config.prefill_group0_direct_hbm = enabled
+    engine.config.prefill_latent_direct_load = enabled
     engine.is_store_async = False
     engine._direct_store_enabled = False
     engine._initialize_decoder_remote_fill = Mock()

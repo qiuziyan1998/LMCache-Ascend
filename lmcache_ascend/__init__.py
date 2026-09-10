@@ -49,12 +49,12 @@ def _patch_config():
             config.save_unfull_chunk = True
             extra_config = dict(config.extra_config or {})
             if (
-                getattr(config, "dsa_group1_load_mode", "")
+                getattr(config, "dsa_index_transfer_mode", "")
                 == "persistent_direct_hbm"
                 and bool(extra_config.get("save_chunk_meta", False))
             ):
                 raise ValueError(
-                    "dsa_group1_load_mode=persistent_direct_hbm requires "
+                    "dsa_index_transfer_mode=persistent_direct_hbm requires "
                     "extra_config.save_chunk_meta=false"
                 )
             extra_config.update(

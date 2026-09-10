@@ -80,7 +80,7 @@ def test_tp_independent_requires_local_replicated_split_pages(
         use_layerwise=True,
         dsa_two_groups=True,
         enable_sparse_attention=True,
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         remote_url="mooncakestore://host",
         extra_config=dict(
             enable_shared_cpu_cache=True,
@@ -103,7 +103,7 @@ def test_tp_independent_requires_local_replicated_split_pages(
     elif override == "sparse":
         config.enable_sparse_attention = False
     elif override == "mode":
-        config.dsa_group1_load_mode = "p2p_preferred"
+        config.dsa_index_transfer_mode = "p2p_preferred"
     elif override == "ownership":
         config.extra_config["save_only_first_rank"] = False
     elif override == "pages":
@@ -117,7 +117,7 @@ def test_post_init_emits_startup_stage_timings() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.metadata = SimpleNamespace(worker_id=1)
     engine.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         pd_role="receiver",
     )
     engine.is_store_async = False
@@ -1839,7 +1839,7 @@ def test_runtime_tp_qualification_matches_negotiated_groups(
     """Runtime negotiation, including its legacy default, must keep paired TP strict."""
     monkeypatch.setenv("PYTHONHASHSEED", "0")
     config = _config(shared=True)
-    config.dsa_group1_load_mode = "persistent_direct_hbm"
+    config.dsa_index_transfer_mode = "persistent_direct_hbm"
     config.remote_url = "mooncakestore://host"
     config.extra_config = dict(
         save_only_first_rank=True,

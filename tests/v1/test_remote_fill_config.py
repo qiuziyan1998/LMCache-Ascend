@@ -64,7 +64,7 @@ def test_direct_hbm_rejects_explicit_chunk_metadata_before_normalization() -> No
     config = LMCacheEngineConfig.from_defaults(
         enable_remote_lmcache_store=True,
         enable_dsa_cold_compact_load=True,
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         pd_role="sender",
         remote_url="mooncakestore://metadata",
         extra_config={"save_chunk_meta": True},
@@ -77,7 +77,7 @@ def test_direct_hbm_rejects_explicit_chunk_metadata_before_normalization() -> No
 def test_direct_hbm_sender_does_not_require_decoder_cold_slab() -> None:
     config = LMCacheEngineConfig.from_defaults(
         enable_remote_lmcache_store=True,
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         pd_role="sender",
         remote_url="mooncakestore://metadata",
     )

@@ -1868,7 +1868,7 @@ def test_multi_window_batch_charges_all_retained_group0_bytes(
 
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         # Each retained window is 10 bytes, but their one producer job owns
         # both source windows until terminal completion.
         remote_fill_max_inflight_bytes=15,
@@ -2228,7 +2228,7 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
     engine.config = SimpleNamespace(
         chunk_size=1024,
         dsa_two_groups=True,
-        dsa_group1_load_mode="p2p_preferred",
+        dsa_index_transfer_mode="p2p_preferred",
         remote_fill_submission_mode=submission_mode,
         get_extra_config_value=lambda _name, default: default,
     )
@@ -2643,7 +2643,7 @@ def test_coordinator_session_validation_stays_in_ordered_worker(monkeypatch):
         remote_fill_window_tokens=1024,
         remote_fill_native_hard_timeout_ms=120000,
         chunk_size=1024,
-        dsa_group1_load_mode="p2p_preferred",
+        dsa_index_transfer_mode="p2p_preferred",
     )
     engine.config = SimpleNamespace(**options)
     engine.metadata = SimpleNamespace(world_size=8)
