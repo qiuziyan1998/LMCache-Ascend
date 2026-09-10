@@ -246,6 +246,10 @@ PYBIND11_MODULE(c_ops, m) {
           for (const py::handle object : objects) {
             states.push_back(py::cast<SparseDirectLayerState &>(object));
           }
+          // Python sequence conversion requires the GIL. The launch below
+          // only uses retained C++ states/tensors and must not block Python
+          // lookup/completion threads while submitting every layer.
+          py::gil_scoped_release release;
           dense_mla_dsa_group_direct_kv_transfer_fast(
               states, slots, pointers, offsets, sizes, tokens,
               interleaved, true, validate, fixed_chunk_size);

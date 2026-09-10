@@ -64,7 +64,9 @@ checkpoint configuration cannot silently become degraded recomputation.
    the last sampled token and rejected speculative positions are excluded.
 5. Reuse an exact CPU prefix page or fetch its old persistent partial key, then
    persist the extended pages. Preserve layer/plane/token order when concatenating
-   CPU prefix and captured suffix spans.
+   CPU prefix and captured suffix spans. Storage keys must cover the complete seal
+   for both groups; a token database that omits a required partial chunk produces
+   a failed checkpoint, not a ready frontier beyond the stored pages.
 6. Publish checkpoint readiness only after persistence. Resume performs an
    authoritative two-group lookup and uses the existing cold load/readiness path.
 7. A full restore with one real token remaining can use ordinary MTP graph
@@ -83,6 +85,8 @@ unavailable and preserves bounded recovery. An uncertain native DMA completion
 is fatal: buffers remain quarantined rather than being reused unsafely.
 Cancellation prevents publication but does not free buffers still used by I/O.
 Control-only batches can process seal, cancel and completion messages.
+Checkpoint control envelopes preserve the ordinary cold-load trigger, including
+when a new prefix load and a checkpoint message share a no-forward batch.
 The scheduler also bounds waiting for a missing acknowledgement with
 `blocking_timeout_secs`. A failed restore invalidates the checkpoint proof and
 returns to the original prefix/recompute path. Old generations cannot seal using
@@ -98,6 +102,8 @@ entry point; ordinary steps do not poll a fatal-state flag.
 Ordinary group stores retain their existing blocking publication behavior. The
 checkpoint path does not use their per-layer publication generator. Pressure-based
 speculative pre-copy is intentionally not enabled; measure the exposed stall first.
+The prepared native binding releases the GIL after converting Python arguments;
+the capture completion fence still must finish before HBM reuse.
 
 With `PD_SERVING_PERF` enabled, `decoder_preemption_checkpoint` reports generation,
 status, end and refusal reason without reading device tensors.

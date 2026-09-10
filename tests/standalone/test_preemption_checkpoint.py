@@ -5,6 +5,7 @@ Run with --confcutdir=tests/standalone to avoid the NPU bootstrap.
 """
 
 import ctypes
+import ast
 import gc
 import importlib.util
 from pathlib import Path
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 import weakref
-from types import ModuleType, SimpleNamespace as NS
+from types import MethodType, ModuleType, SimpleNamespace as NS
 
 import pytest
 import torch
@@ -64,6 +65,13 @@ class Page:
         self.stride = tokens * sum(widths)
         self.refs = 1
         self.metadata = NS(fmt="test")
+        self.valid_tokens, self.num_layers = tokens, layers
+
+    def is_valid(self):
+        return self.refs > 0
+
+    def ref_count_up(self):
+        self.refs += 1
 
     def get_dtype(self):
         return torch.uint8
@@ -226,6 +234,86 @@ def test_persistence_reconstructs_prefix_and_never_exports_speculative_tail(api)
     store.close()
 
 
+@pytest.mark.parametrize("local_state", ["valid", "wrong_format", "missing"])
+def test_prefix_source_choice_retains_local_owner_or_falls_back_to_mooncake(
+    api, local_state
+):
+    control, _ = api
+
+    def method(path, name, namespace):
+        fn = next(
+            n
+            for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+        future = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[future, fn], type_ignores=[])
+                ),
+                str(path),
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace[name]
+
+    class Key(tuple):
+        def split_layers(self, layers):
+            return [(self, layer) for layer in range(layers)]
+
+    engine = fake_engine()
+    original_tokens = engine.token_database.process_tokens
+
+    def tokens(**kwargs):
+        for start, end, key in original_tokens(**kwargs):
+            yield start, end, Key(key)
+
+    engine.token_database.process_tokens = tokens
+    prefix = Page(1, 3, (1,))
+    if local_state == "wrong_format":
+        prefix.metadata.fmt = "wrong"
+    key = Key((0, 0, 3, tuple(range(3))))
+    local = NS(
+        cpu_lock=threading.Lock(),
+        hot_cache={} if local_state == "missing" else {(key, 0): prefix},
+    )
+    get_local = method(
+        ROOT.parent / "LMCache-NPU/lmcache/v1/storage_backend/local_cpu_backend.py",
+        "batched_get_layer_page_prefix",
+        {"LayerPageMemoryObj": Page},
+    )
+    local.batched_get_layer_page_prefix = MethodType(get_local, local)
+    engine._shared_local_cpu_backend = lambda: local
+    engine._shared_cpu_dtype_for_kv_group = lambda group: torch.uint8
+    engine._memory_format_for_kv_group = lambda group: "test"
+    engine.gpu_connector = NS(checkpoint_plane_widths=lambda group: (1,))
+    get_prefix = method(
+        ROOT / "lmcache_ascend/v1/cache_engine.py", "get_checkpoint_prefix", {}
+    )
+    engine.get_checkpoint_prefix = MethodType(get_prefix, engine)
+    loads = []
+    original_get = engine.storage_manager.batched_get_external_pages
+
+    def get(*args):
+        loads.append(args[0])
+        original_get(*args)
+
+    engine.storage_manager.batched_get_external_pages = get
+    store, _ = captured_job(api, engine)
+    store.seal(control.SealSpec("r", 1, tuple(range(6))))
+    assert [result.status for result in finish(store)] == ["ready"]
+    assert len(loads) == (0 if local_state == "valid" else 1)
+    assert prefix.refs == 1  # The LocalCPU cache owner remains; job pins retired.
+    assert engine.storage_manager.payloads[0][1][:3] == (
+        bytes([0, 1, 2]) if local_state == "valid" else bytes([123] * 3)
+    )
+    store.close()
+
+
 def test_cancel_during_persistence_keeps_owners_until_terminal(api):
     control, _ = api
     engine = fake_engine()
@@ -249,6 +337,28 @@ def test_persistent_failure_does_not_publish_ready(api):
     store, _ = captured_job(api, engine)
     store.seal(control.SealSpec("r", 1, tuple(range(6))))
     assert [r.status for r in finish(store)] == ["failed"]
+    store.close()
+
+
+@pytest.mark.parametrize("base", [0, 4])
+def test_omitted_partial_chunk_cannot_publish_a_longer_checkpoint(api, base):
+    control, module = api
+    engine = fake_engine()
+    original = engine.token_database.process_tokens
+
+    def full_chunks_only(**kwargs):
+        yield from (chunk for chunk in original(**kwargs) if chunk[1] - chunk[0] == 4)
+
+    # Reproduce ChunkedTokenDatabase with save_unfull_chunk=false.
+    engine.token_database.process_tokens = full_chunks_only
+    store = module.CheckpointWorker(engine)
+    capture = control.CaptureSpec("r", 1, base, 7, base, ((1, 2), (3, 4)))
+    job = module.CaptureJob(capture)
+    job.fragments = {g: [(base, 7, Page(1, 7 - base, (1,)), (1,))] for g in (0, 1)}
+    store.jobs[("r", 1)] = job
+    store.seal(control.SealSpec("r", 1, tuple(range(6))))
+    assert [result.status for result in finish(store)] == ["failed"]
+    assert engine.storage_manager.payloads == []
     store.close()
 
 

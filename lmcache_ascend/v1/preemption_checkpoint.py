@@ -343,6 +343,7 @@ class CheckpointWorker:
                         )
             keys, pointers, sizes = [], [], []
             for group in (0, 1):
+                covered_end = spec.base
                 for start, end, key in database.process_tokens(
                     tokens=list(seal.tokens),
                     request_configs=spec.request_configs,
@@ -350,12 +351,17 @@ class CheckpointWorker:
                 ):
                     if start < spec.base:
                         continue
+                    if start != covered_end:
+                        raise ValueError("Checkpoint storage keys have a coverage gap")
                     ptrs, lengths = fragment_vectors(
                         job.fragments[group], start, end, self.engine.num_layers
                     )
                     keys.append(key)
                     pointers.append(ptrs)
                     sizes.append(lengths)
+                    covered_end = end
+                if covered_end != len(seal.tokens):
+                    raise ValueError("Checkpoint storage keys omit the accepted partial tail")
             owners = tuple(
                 page.raw_data
                 for fragments in job.fragments.values()
