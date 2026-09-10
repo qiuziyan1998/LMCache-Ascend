@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 from weakref import WeakMethod
 import logging
@@ -32,6 +32,8 @@ from lmcache.v1.remote_fill import (
 from lmcache.v1.remote_fill.native import (
     DIRECT_PUSH_H0_QUALIFICATION_V1,
     NativeDirectPushActivation,
+    DirectPushSourcePlan,
+    PreparedDirectPushSource,
 )
 from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 
@@ -107,6 +109,10 @@ class ProducerRequestState:
     active_counted: bool = False
     submitted_bytes: int = 0
     persistent_started_at: float = 0.0
+    # Full dense mappings only; borrowed until the existing request drain.
+    prefix_source: tuple[dict[int, list], dict[int, Any]] | None = field(
+        default=None, repr=False
+    )
 
 
 class RemoteFillCoordinator:
@@ -473,8 +479,10 @@ class RemoteFillCoordinator:
         self,
         state: ProducerRequestState,
         byte_count: int,
+        *,
+        windows: int = 1,
     ) -> bool:
-        """Acquire bounded producer admission before retaining queued work."""
+        """Charge source bytes; windows=0 extends an already admitted prefix job."""
 
         if byte_count < 0 or byte_count > int(
             self.config.remote_fill_max_inflight_bytes
@@ -498,19 +506,19 @@ class RemoteFillCoordinator:
                 return False
             global_bytes = int(getattr(self, "_queued_bytes", 0))
             if (
-                state.queued_windows
-                >= int(self.config.remote_fill_max_inflight_windows_per_request)
+                state.queued_windows + windows
+                > int(self.config.remote_fill_max_inflight_windows_per_request)
                 or state.queued_bytes + byte_count > request_byte_limit
                 or global_bytes + byte_count > global_byte_limit
             ):
                 return False
-            state.queued_windows += 1
+            state.queued_windows += windows
             state.queued_bytes += byte_count
             metrics = self.get_metrics()
-            if state.queued_windows == 1 and metrics.timing_enabled:
+            if windows and state.queued_windows == 1 and metrics.timing_enabled:
                 state.oldest_enqueued_at = time.perf_counter()
             self._queued_bytes = global_bytes + byte_count
-            metrics.add_gauge("inflight_windows", 1)
+            metrics.add_gauge("inflight_windows", windows)
             metrics.add_gauge("inflight_bytes", byte_count)
             return True
 
@@ -518,12 +526,14 @@ class RemoteFillCoordinator:
         self,
         state: ProducerRequestState,
         byte_count: int,
+        *,
+        windows: int = 1,
     ) -> None:
         condition = getattr(self, "_queue_condition", None)
         if condition is None:
             return
         with condition:
-            state.queued_windows = max(0, state.queued_windows - 1)
+            state.queued_windows = max(0, state.queued_windows - windows)
             state.queued_bytes = max(0, state.queued_bytes - byte_count)
             if state.queued_windows == 0:
                 state.oldest_enqueued_at = 0.0
@@ -532,7 +542,7 @@ class RemoteFillCoordinator:
                 int(getattr(self, "_queued_bytes", 0)) - byte_count,
             )
             metrics = self.get_metrics()
-            metrics.add_gauge("inflight_windows", -1)
+            metrics.add_gauge("inflight_windows", -windows)
             metrics.add_gauge("inflight_bytes", -byte_count)
 
     def _static_spec(
@@ -655,8 +665,10 @@ class RemoteFillCoordinator:
         *,
         maximum: int,
         context: ProducerSessionContext,
+        source_factory: Callable[[tuple[ControlPage, ...]], DirectPushSourcePlan]
+        | None = None,
     ) -> None:
-        """Queue bounded, ordered cached-prefix probes before direct writes."""
+        """Queue ordered prefix windows, optionally preparing missing sources only."""
 
         if not pages or state.handoff is None:
             return
@@ -706,17 +718,74 @@ class RemoteFillCoordinator:
                 if not session.direct_viable:
                     return None
                 results = []
+                charged_bytes = 0
+                source_refused = False
+                if source_factory is not None:
+
+                    def prepare_sources(
+                        missing: tuple[ControlPage, ...],
+                    ) -> PreparedDirectPushSource:
+                        nonlocal charged_bytes, source_refused
+                        byte_count = sum(page.expected_bytes for page in missing)
+                        if not self._acquire_queue_capacity(
+                            state, byte_count, windows=0
+                        ):
+                            source_refused = True
+                            raise RuntimeError(
+                                "prefix repair source byte capacity exhausted"
+                            )
+                        charged_bytes = byte_count
+                        return self.storage_manager.prepare_remote_fill_source(
+                            source_factory(missing)
+                        ).result(timeout=session.native_hard_timeout_seconds)
+
                 for window_offset, control_pages in enumerate(control_windows):
                     window_id = first_window_id + window_offset
-                    result = session.probe_window(
-                        window_id=window_id,
-                        source_generation=state.source_generation,
-                        control_pages=control_pages,
-                    )
+                    charged_bytes = 0
+                    source_refused = False
+                    try:
+                        if source_factory is None:
+                            result = session.probe_window(
+                                window_id=window_id,
+                                source_generation=state.source_generation,
+                                control_pages=control_pages,
+                            )
+                        else:
+                            result = session.transfer_window(
+                                window_id=window_id,
+                                source_generation=state.source_generation,
+                                control_pages=control_pages,
+                                source_plan=None,
+                                source_plan_factory=prepare_sources,
+                                submitter=getattr(
+                                    self,
+                                    "_direct_submitter",
+                                    self.storage_manager.submit_remote_fill_direct_push,
+                                ),
+                                activation_factory=getattr(
+                                    self,
+                                    "_activation_factory",
+                                    lambda attempt: NativeDirectPushActivation(
+                                        h0_qualification=DIRECT_PUSH_H0_QUALIFICATION_V1,
+                                        native_transfer_attempt_id=attempt,
+                                        arm_acknowledged=True,
+                                    ),
+                                ),
+                            )
+                    finally:
+                        if charged_bytes:
+                            self._release_queue_capacity(
+                                state, charged_bytes, windows=0
+                            )
+                    if source_refused:
+                        result = replace(result, reason="producer backpressure")
                     results.append(result)
                     if not result.direct_satisfied:
                         state.disabled_reason = result.reason
-                        if result.reason != "cached-prefix hole":
+                        if result.reason not in (
+                            "cached-prefix hole",
+                            "producer backpressure",
+                        ):
                             self._record_failure()
                     self._record_window_metrics(state, result)
                     if serving_perf_enabled():

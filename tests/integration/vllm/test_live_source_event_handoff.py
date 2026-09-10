@@ -79,6 +79,47 @@ def _request(
     )
 
 
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("prefix", [0, 1024])
+def test_direct_store_forwards_full_prefix_mapping_by_reference(
+    monkeypatch, sparse, prefix
+):
+    monkeypatch.setattr(
+        adapter_mod, "_prepare_remote_fill_persistent_placement", lambda *a, **k: False
+    )
+    req = _request(
+        "r", live_source_requested=False, remote_fill_qualified=True, token_count=1100
+    )
+    full0, full1, window0, window1 = object(), object(), object(), object()
+    req.slot_mapping, req.indexer_slot_mapping = [full0], [full1]
+    req.is_sparse_decode = sparse
+    req.load_spec = SimpleNamespace(lmcache_cached_tokens=prefix)
+    req.request_configs = {}
+    store = MagicMock()
+    groups = {0: [object()], 1: [object()]}
+    windows = {0: window0, 1: window1}
+    adapter = SimpleNamespace(
+        _unfenced_live_stores={},
+        _remote_store_requested=True,
+        _direct_group_caches=lambda: groups,
+        _direct_request_inputs=lambda request, caches: (groups, windows, 1024),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        config=SimpleNamespace(dsa_group1_load_mode="persistent_direct_hbm"),
+        lmcache_engine=SimpleNamespace(
+            discard_live_source_descriptor=MagicMock(),
+            direct_prefill_store_enabled=lambda: True,
+            store_direct_prefill=store,
+        ),
+    )
+    adapter_mod.LMCacheAscendConnectorV1Impl._submit_direct_prefill_requests(
+        adapter, [req], finish_batch=True, source_ready_events=(object(),)
+    )
+    assert store.call_args.args[3] is windows
+    expected = {0: full0, 1: full1} if prefix and not sparse else None
+    assert store.call_args.kwargs["prefix_slot_mappings"] == expected
+    assert store.call_args.kwargs["slot_mapping_base"] == 1024
+
+
 def test_final_deferred_targets_include_only_final_requests() -> None:
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
     adapter.config = SimpleNamespace(remote_fill_submission_mode="final_deferred")

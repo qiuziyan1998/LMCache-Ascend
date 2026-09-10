@@ -3,14 +3,19 @@
 
 # Standard
 from collections import deque
-from concurrent.futures import Future
-from dataclasses import asdict
-from threading import Condition, RLock
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, replace
+from threading import Condition, Event, RLock
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 import logging
 import time
+import ctypes
+import gc
+import weakref
 
+import msgspec
 import pytest
 
 from lmcache.v1.remote_fill import (
@@ -20,6 +25,12 @@ from lmcache.v1.remote_fill import (
     DestinationNativeState,
     DestinationPageDescriptor,
     FinishRequest,
+    InProcessRemoteFillTransport,
+    NegotiationSpec,
+    PreparedPage,
+    RemoteFillClient,
+    RemoteFillService,
+    RemoteFillStateCore,
     NegotiateRequest,
     OpenRequest,
     OperationKind,
@@ -828,6 +839,524 @@ def test_ordinary_persistent_only_is_not_internal_direct_success() -> None:
 
     assert terminal.outcome == "PERSISTENT_ONLY"
     assert terminal.direct_satisfied is False
+
+
+class _PrefixRepairHarness:
+    """Real encoded control protocol with byte-addressable host transfer buffers."""
+
+    def __init__(self, groups=(0,), present=()) -> None:
+        self.events, self.transferred, self.source_refs = [], [], []
+        self.now = 1000.0
+        self.hidden = {}
+        self.pages = tuple(
+            msgspec.structs.replace(
+                _pages()[group],
+                canonical_key=f"g{group}-chunk{chunk}",
+                chunk_index=chunk,
+                chunk_start=chunk * 4,
+                chunk_end=chunk * 4 + count,
+                valid_tokens=count,
+                layer_count=2,
+                expected_bytes=2 * count * (7 if group == 0 else 3) * 2,
+            )
+            for chunk, count in enumerate((4, 2))
+            for group in groups
+        )
+        self.payload = {
+            p.canonical_key: bytes([i + 1]) * p.expected_bytes
+            for i, p in enumerate(self.pages)
+        }
+        self.cached = {
+            self.pages[i].canonical_key: self.payload[self.pages[i].canonical_key]
+            for i in present
+        }
+        self.lifecycle = Mock()
+        self.lifecycle.prepare_pages.side_effect = self.allocate
+        self.lifecycle.commit_pages.side_effect = self.commit
+        self.lifecycle.release_pages.side_effect = (
+            lambda pages, reason: self.hidden.clear()
+        )
+        spec = replace(
+            _static_spec(shared_group1=1 in groups),
+            chunk_size=4,
+            layer_count=2,
+            group_dimensions=(7, 3),
+        )
+        self.handoff = _handoff()
+        core = RemoteFillStateCore(
+            destination_engine_epoch=_EPOCH,
+            shared_cache_generation=_GENERATION,
+            descriptor_verification_key=_SECRET,
+            clock=lambda: self.now,
+            page_lifecycle=self.lifecycle,
+            negotiation=NegotiationSpec(
+                **asdict(spec),
+                destination_engine_id="decoder",
+                destination_dp_rank=1,
+                destination_remote_session=_SESSION,
+            ),
+        )
+        self.client = RemoteFillClient(
+            InProcessRemoteFillTransport(RemoteFillService(core))
+        )
+        self.session = RemoteFillProducerSession(
+            request_id="prefix",
+            handoff=self.handoff,
+            static_spec=spec,
+            client=SimpleNamespace(execute=self.execute),
+            secret=_SECRET,
+            planned_window_count_hint=1,
+            required_store_end_hint=6,
+        )
+
+    def execute(self, request):
+        self.events.append(type(request).__name__)
+        response = self.client.execute(request)
+        if isinstance(request, ArmWindowRequest):
+            self.attempt = request.native_transfer_attempt_id
+        return response
+
+    def allocate(self, transfer_id, window_id, pages, reserve_missing):
+        prepared = []
+        for page in pages:
+            if page.canonical_key in self.cached:
+                prepared.append(
+                    PreparedPage(handle=None, disposition=PageDisposition.EXISTING)
+                )
+            elif not reserve_missing:
+                prepared.append(
+                    PreparedPage(handle=None, disposition=PageDisposition.MISSING)
+                )
+            else:
+                buf = ctypes.create_string_buffer(page.expected_bytes)
+                self.hidden[page.canonical_key] = buf
+                prepared.append(
+                    PreparedPage(
+                        handle=buf,
+                        destination_ptr=ctypes.addressof(buf),
+                        destination_length=page.expected_bytes,
+                        reservation_base=ctypes.addressof(buf),
+                        reservation_length=page.expected_bytes,
+                    )
+                )
+        return tuple(prepared)
+
+    def commit(self, transfer_id, required, reservations, finish):
+        assert "FinishRequest" == self.events[-1]
+        if any(
+            p.canonical_key not in self.cached and p.canonical_key not in self.hidden
+            for p in required
+        ):
+            return False
+        self.cached.update({key: buf.raw for key, buf in self.hidden.items()})
+        self.hidden.clear()
+        return True
+
+    def make_plan(self, missing):
+        self.events.append("plan_missing")
+        owners = tuple(
+            ctypes.create_string_buffer(self.payload[p.canonical_key], p.expected_bytes)
+            for p in missing
+        )
+        self.source_refs.extend(weakref.ref(owner) for owner in owners)
+        return DirectPushSourcePlan(
+            pages=tuple(
+                DirectPushPageSource(
+                    canonical_key=p.canonical_key,
+                    kv_group=p.kv_group,
+                    source_ptrs=(ctypes.addressof(owner),),
+                    source_lengths=(p.expected_bytes,),
+                )
+                for p, owner in zip(missing, owners, strict=True)
+            ),
+            owners=owners,
+            producer_events=(object(),),
+        )
+
+    def prepare(self, source):
+        self.events.append("prepare_source")
+        future = Future()
+        future.set_result(PreparedDirectPushSource(source, 0.0, 0.0, 0.0))
+        return future
+
+    def submit(self, *, source_plan, destination_descriptors, **kwargs):
+        assert self.events[-1] == "ArmWindowRequest"
+        assert isinstance(source_plan, PreparedDirectPushSource)
+        self.events.append("native_copy")
+        for page, dest in zip(
+            source_plan.source_plan.pages, destination_descriptors, strict=True
+        ):
+            assert page.canonical_key == dest.canonical_key
+            assert dest.canonical_key not in self.cached
+            ctypes.memmove(
+                dest.destination_ptr, page.source_ptrs[0], dest.destination_length
+            )
+            self.transferred.append(dest.canonical_key)
+        future = Future()
+        future.set_result(
+            NativeDirectPushResult(
+                self.attempt,
+                0,
+                len(destination_descriptors),
+                sum(d.destination_length for d in destination_descriptors),
+                0.0,
+            )
+        )
+        return future
+
+    def finish(self):
+        return self.session.finish(
+            required_store_end=6, persistent_common_end=6, final_partial_valid_tokens=2
+        )
+
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+@pytest.mark.parametrize("resident", ["none", "first", "last", "all"])
+@pytest.mark.parametrize("auto_gc", [False, True])
+def test_lazy_prefix_repair_copies_only_holes_and_preserves_bytes(
+    groups, resident, auto_gc
+):
+    count = 2 * len(groups)
+    present = {
+        "none": (),
+        "first": (0,),
+        "last": (count - 1,),
+        "all": tuple(range(count)),
+    }[resident]
+    h = _PrefixRepairHarness(groups, present)
+    previous_gc = gc.isenabled()
+    (gc.enable if auto_gc else gc.disable)()
+    try:
+        result = h.session.transfer_window(
+            window_id=0,
+            source_generation=44,
+            control_pages=h.pages,
+            source_plan=None,
+            source_plan_factory=lambda missing: h.prepare(
+                h.make_plan(missing)
+            ).result(),
+            submitter=h.submit,
+            activation_factory=lambda _: None,
+        )
+        assert result.direct_satisfied
+        assert h.finish().direct_satisfied
+        assert h.cached == h.payload
+        assert set(h.transferred) == {
+            p.canonical_key for i, p in enumerate(h.pages) if i not in present
+        }
+        assert all(ref() is None for ref in h.source_refs)
+        if resident == "all":
+            assert "plan_missing" not in h.events and "ArmWindowRequest" not in h.events
+        else:
+            assert (
+                h.events.index("ReserveWindowRequest")
+                < h.events.index("prepare_source")
+                < h.events.index("ArmWindowRequest")
+            )
+    finally:
+        (gc.enable if previous_gc else gc.disable)()
+
+
+@pytest.mark.parametrize("failure", ["plan", "prepare", "invalid", "length"])
+def test_lazy_prefix_source_failure_never_arms(failure):
+    h = _PrefixRepairHarness(present=(0,))
+
+    def source(missing):
+        if failure == "plan":
+            raise ValueError("bad source mapping")
+        if failure == "invalid":
+            return None
+        plan = h.make_plan(missing)
+        if failure == "prepare":
+            raise RuntimeError("registration failed")
+        if failure == "length":
+            plan = replace(plan, pages=(replace(plan.pages[0], source_lengths=(1,)),))
+        return h.prepare(plan).result()
+
+    result = h.session.transfer_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=h.pages,
+        source_plan=None,
+        source_plan_factory=source,
+        submitter=h.submit,
+        activation_factory=lambda _: None,
+    )
+    assert not result.direct_satisfied
+    assert not h.finish().direct_satisfied
+    assert "ArmWindowRequest" not in h.events
+    assert not h.hidden
+
+
+@pytest.mark.parametrize("byte_limit", [1, 256])
+def test_coordinator_prefix_repair_reuses_job_slot_and_balances_bytes(byte_limit):
+    h = _PrefixRepairHarness(present=(0,))
+    config = SimpleNamespace(
+        remote_fill_direct_worker_count=2,
+        remote_fill_max_inflight_windows_per_request=2,
+        remote_fill_max_inflight_bytes=byte_limit,
+        remote_fill_max_bytes_per_request=byte_limit,
+        remote_fill_circuit_breaker_enabled=True,
+        remote_fill_circuit_breaker_failure_threshold=1,
+        remote_fill_circuit_breaker_cooldown_sec=60,
+        remote_fill_native_hard_timeout_ms=3000,
+    )
+    coordinator = RemoteFillCoordinator(
+        config=config,
+        tp_size=8,
+        fatal_reporter=RemoteFillProducerMetrics().snapshot,
+        storage_manager=SimpleNamespace(
+            prepare_remote_fill_source=h.prepare,
+            submit_remote_fill_direct_push=h.submit,
+        ),
+    )
+    state = ProducerRequestState(handoff=h.handoff, session=h.session)
+    assert coordinator._acquire_queue_capacity(state, 0)  # Another already-queued job.
+    try:
+        coordinator.submit_probe(
+            "prefix",
+            state,
+            h.pages,
+            6,
+            maximum=2,
+            context=None,
+            source_factory=h.make_plan,
+        )
+        (result,) = state.last_future.result(timeout=3)
+        assert result.direct_satisfied is (byte_limit == 256)
+        assert (
+            coordinator.get_metrics().snapshot()["gauges"]["circuit_breaker_state"] == 0
+        )
+        if byte_limit == 1:
+            assert result.reason == "producer backpressure"
+        assert state.queued_windows == 1 and state.queued_bytes == 0
+        assert h.finish().direct_satisfied is (byte_limit == 256)
+        assert not h.hidden
+    finally:
+        coordinator._release_queue_capacity(state, 0)
+        coordinator.close(())
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_coordinator_prefix_snapshot_survives_until_native_drain(abort):
+    """Request drop cannot release an armed repair, even with cyclic GC off."""
+    h = _PrefixRepairHarness(present=(0,))
+    entered, wait_entered = Event(), Event()
+    native = Future()
+    transfer_args = {}
+
+    def pause_native(**kwargs):
+        transfer_args.update(kwargs)
+        entered.set()
+        return native
+
+    config = SimpleNamespace(
+        remote_fill_direct_worker_count=2,
+        remote_fill_max_inflight_windows_per_request=2,
+        remote_fill_max_inflight_bytes=256,
+        remote_fill_max_bytes_per_request=256,
+        remote_fill_native_hard_timeout_ms=3000,
+        remote_fill_circuit_breaker_enabled=False,
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = config
+    coordinator = RemoteFillCoordinator(
+        config=config,
+        tp_size=8,
+        fatal_reporter=engine._remote_fill_require_paired_restart,
+        storage_manager=SimpleNamespace(
+            prepare_remote_fill_source=h.prepare,
+            submit_remote_fill_direct_push=pause_native,
+        ),
+    )
+
+    class SourceOwner:
+        pass
+
+    owner = SourceOwner()
+    owner_ref = weakref.ref(owner)
+    state = ProducerRequestState(
+        handoff=h.handoff, session=h.session, prefix_source=({0: [owner]}, {0: owner})
+    )
+    marker = object()
+    engine._direct_store_states = {
+        "prefix": _DirectStoreRequestState(
+            remote_fill=state,
+            source_ready_event=marker,
+            source_ready_token_end=6,
+            source_ready_event_source="forward_context.sfa_reshape_cache_event",
+            source_ready_events=(marker,),
+            source_ready_events_token_end=6,
+        )
+    }
+    engine._get_remote_fill_coordinator = lambda: coordinator
+    engine._remote_fill_pages_per_window = lambda: 2
+    engine._remote_fill_session_context = lambda: None
+    engine._remote_fill_prefix_source_plan = lambda pages, source, events: h.make_plan(
+        pages
+    )
+    engine._live_source_builders, engine._completed_live_sources = {}, {}
+
+    def wait_remote(request_state):
+        wait_entered.set()
+        coordinator.wait(request_state.remote_fill)
+
+    engine._wait_remote_fill_windows = wait_remote
+    del owner
+    was_enabled = gc.isenabled()
+    gc.disable()
+    waiter = ThreadPoolExecutor(max_workers=1)
+    try:
+        engine._schedule_remote_fill_probe_pages(
+            "prefix", engine._direct_store_states["prefix"], h.pages, 6
+        )
+        assert entered.wait(3)
+        waited = waiter.submit(engine.wait_for_direct_stores, ("prefix",))
+        assert wait_entered.wait(3) and not waited.done()
+        if abort:
+            h.session.abort("injected preemption")
+        engine.drop_direct_store_states(("prefix",))
+        assert "prefix" in engine._direct_store_states and owner_ref() is not None
+        assert state.queued_bytes > 0 and h.hidden
+        for source, destination in zip(
+            transfer_args["source_plan"].source_plan.pages,
+            transfer_args["destination_descriptors"],
+            strict=True,
+        ):
+            ctypes.memmove(
+                destination.destination_ptr,
+                source.source_ptrs[0],
+                destination.destination_length,
+            )
+        native.set_result(NativeDirectPushResult(h.attempt, 0, 1, 56, 0.0))
+        assert waited.result(timeout=3) == {"prefix"}
+        assert state.queued_bytes == 0 and state.queued_windows == 0
+        engine.drop_direct_store_states(("prefix",))
+        assert "prefix" not in engine._direct_store_states and not h.hidden
+        del state
+        coordinator.close(())
+        assert owner_ref() is None
+    finally:
+        if not native.done():
+            native.set_exception(NativeDirectPushPreSubmitError("test cleanup"))
+        waiter.shutdown(wait=True)
+        coordinator.close(())
+        if was_enabled:
+            gc.enable()
+
+
+def test_repaired_prefix_and_eager_suffix_publish_complete_coverage():
+    h = _PrefixRepairHarness()
+    prefix = h.session.transfer_window(
+        window_id=0,
+        source_generation=44,
+        control_pages=h.pages[:1],
+        source_plan=None,
+        source_plan_factory=lambda missing: h.prepare(h.make_plan(missing)).result(),
+        submitter=h.submit,
+        activation_factory=lambda _: None,
+    )
+    assert prefix.direct_satisfied and not h.cached
+    suffix = h.session.transfer_window(
+        window_id=1,
+        source_generation=44,
+        control_pages=h.pages[1:],
+        source_plan=h.make_plan(h.pages[1:]),
+        preparer=h.prepare,
+        submitter=h.submit,
+        activation_factory=lambda _: None,
+    )
+    assert suffix.direct_satisfied and not h.cached
+    assert h.finish().direct_satisfied
+    assert h.cached == h.payload
+    h.session.close()
+    assert all(ref() is None for ref in h.source_refs)
+
+
+@pytest.mark.parametrize("fault", ["expired", "descriptor", "prepare_future"])
+def test_lazy_prefix_reservation_faults_never_write(fault):
+    h = _PrefixRepairHarness(present=(0,))
+    if fault == "descriptor":
+        execute = h.client.execute
+
+        def invalid_descriptor(request):
+            response = execute(request)
+            return (
+                msgspec.structs.replace(response, destination_descriptor_digest="bad")
+                if isinstance(request, ReserveWindowRequest)
+                else response
+            )
+
+        h.client.execute = invalid_descriptor
+
+    def fail_preparation(plan):
+        future = Future()
+        future.set_exception(NativeDirectPushPreSubmitError("registration failed"))
+        return future
+
+    def source(missing):
+        if fault == "prepare_future":
+            return fail_preparation(h.make_plan(missing)).result()
+        plan = h.prepare(h.make_plan(missing)).result()
+        h.now += 60  # Reservation expires after source preparation, before ARM.
+        return plan
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        result = h.session.transfer_window(
+            window_id=0,
+            source_generation=44,
+            control_pages=h.pages,
+            source_plan=None,
+            source_plan_factory=source,
+            submitter=h.submit,
+            activation_factory=lambda _: None,
+        )
+        assert not result.direct_satisfied
+        assert not h.finish().direct_satisfied
+        assert not h.transferred and not h.hidden
+        assert all(ref() is None for ref in h.source_refs)
+        if fault == "descriptor":
+            assert "plan_missing" not in h.events
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_lazy_prefix_native_failure_releases_sources_with_gc_disabled():
+    h = _PrefixRepairHarness(present=(0,))
+
+    def fail_native(**kwargs):
+        future = Future()
+        future.set_exception(
+            NativeDirectPushTerminalError(
+                NativeDirectPushResult(h.attempt, -1, 1, 0, 0.0)
+            )
+        )
+        return future
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        result = h.session.transfer_window(
+            window_id=0,
+            source_generation=44,
+            control_pages=h.pages,
+            source_plan=None,
+            source_plan_factory=lambda missing: h.prepare(
+                h.make_plan(missing)
+            ).result(),
+            submitter=fail_native,
+            activation_factory=lambda _: None,
+        )
+        assert not result.direct_satisfied
+        assert not h.finish().direct_satisfied
+        assert not h.hidden
+        assert all(ref() is None for ref in h.source_refs)
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_probe_hole_latches_persistent_only_without_arm() -> None:

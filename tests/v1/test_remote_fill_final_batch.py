@@ -268,7 +268,7 @@ def fixture(
     engine._store_direct_cpu_group = lambda req, tokens, *a: len(tokens)
     fences = (object(), object())
 
-    def invoke(end=2116, final=True, events=None):
+    def invoke(end=2116, final=True, events=None, prefix_slots=None):
         source_events = fences if events is None else events
         return engine.store_direct_prefill(
             "r",
@@ -278,6 +278,7 @@ def fixture(
             final=final,
             slot_mapping_base=prefix,
             verified_prefix_end=prefix,
+            prefix_slot_mappings=prefix_slots,
             source_ready_event=fences[0],
             source_ready_event_source="forward_context.sfa_reshape_cache_event",
             source_ready_events=source_events,
@@ -297,6 +298,37 @@ def fixture(
         invoke=invoke,
         drain=drain,
     )
+
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+@pytest.mark.parametrize("mapping", ["full", "window", "absent"])
+def test_fully_cached_prefix_requires_full_sources_for_repair(groups, mapping):
+    f = fixture(groups=groups, prefix=2080, tail_behavior="existing")
+    f.state.remote_fill.session = None
+    probes = []
+    f.coordinator.submit_probe = lambda *a, **kw: probes.append(
+        kw.get("source_factory")
+    )
+    slots = (
+        None
+        if mapping == "absent"
+        else {
+            group: SimpleNamespace(
+                ndim=1, numel=lambda: 2080 if mapping == "full" else 32
+            )
+            for group in groups
+        }
+    )
+    assert f.invoke(end=2080, prefix_slots=slots)
+    if mapping == "full":
+        assert f.state.remote_fill.prefix_source is not None
+        assert not f.state.remote_fill.disabled_reason
+        assert len(probes) == 2 and all(callable(probe) for probe in probes)
+        assert f.persistent == []
+    else:
+        assert f.state.remote_fill.prefix_source is None
+        assert f.state.remote_fill.disabled_reason == "no_addressable_source_page"
+        assert not probes
 
 
 @pytest.mark.parametrize("groups", [(0,), (0, 1)])

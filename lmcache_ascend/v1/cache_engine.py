@@ -67,6 +67,8 @@ from lmcache.v1.remote_fill import (
     log_remote_fill_diagnostic,
 )
 from lmcache.v1.remote_fill.native import (
+    DirectPushPageSource,
+    DirectPushSourcePlan,
     NativeExternalPageTransferUnknownError,
 )
 from lmcache.v1.shared_cpu_cache import (
@@ -920,6 +922,17 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         if not pages or state.remote_fill is None or state.remote_fill.handoff is None:
             return
+        source = state.remote_fill.prefix_source
+        events = (
+            self._remote_fill_source_ready_events(state, required_store_end_hint)
+            if source
+            else ()
+        )
+        source_factory = None
+        if source and events:
+            source_factory = lambda missing: self._remote_fill_prefix_source_plan(
+                missing, source, events
+            )
         self._get_remote_fill_coordinator().submit_probe(
             req_id,
             state.remote_fill,
@@ -927,6 +940,56 @@ class AscendLMCacheEngine(LMCacheEngine):
             required_store_end_hint,
             maximum=self._remote_fill_pages_per_window(),
             context=self._remote_fill_session_context(),
+            source_factory=source_factory,
+        )
+
+    def _remote_fill_prefix_source_plan(
+        self,
+        pages: tuple[ControlPage, ...],
+        source: tuple[dict[int, list], dict[int, torch.Tensor]],
+        events: tuple[Any, ...],
+    ) -> DirectPushSourcePlan:
+        """Plan only missing prefix pages using full, dense request mappings."""
+        caches, mappings = source
+        if not pages or not events:
+            raise ValueError("prefix repair requires pages and complete source fences")
+        planned_pages = []
+        owners = {}
+        for group in sorted({page.kv_group for page in pages}):
+            group_pages = [page for page in pages if page.kv_group == group]
+            mapping = mappings[group]
+            if (
+                mapping.ndim != 1
+                or max(page.chunk_end for page in group_pages) > mapping.numel()
+            ):
+                raise ValueError("prefix page is outside the full source mapping")
+            planned = self.gpu_connector.plan_direct_page_sources(
+                caches[group],
+                mapping,
+                [page.chunk_start for page in group_pages],
+                [page.chunk_end for page in group_pages],
+                group,
+                slot_mapping_base=0,
+            )
+            if planned is None:
+                raise ValueError("prefix source layout is not supported")
+            pointers, sizes, group_owners = planned
+            owners.update((id(owner), owner) for owner in group_owners)
+            for page, ptrs, lengths in zip(group_pages, pointers, sizes, strict=True):
+                if sum(lengths) != page.expected_bytes:
+                    raise ValueError("prefix source page byte layout changed")
+                planned_pages.append(
+                    DirectPushPageSource(
+                        canonical_key=page.canonical_key,
+                        kv_group=group,
+                        source_ptrs=tuple(ptrs),
+                        source_lengths=tuple(lengths),
+                    )
+                )
+        return DirectPushSourcePlan(
+            pages=tuple(planned_pages),
+            owners=tuple(owners.values()),
+            producer_events=events,
         )
 
     def _schedule_remote_fill_batch(
@@ -2530,6 +2593,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         source_ready_event: Any = None,
         source_ready_event_source: str = "missing",
         source_ready_events: tuple[Any, ...] = (),
+        prefix_slot_mappings: Optional[dict[int, torch.Tensor]] = None,
     ) -> bool:
         """Publish newly completed pages and the final tail directly from NPU."""
         if not self._direct_store_enabled or not group_caches:
@@ -2581,6 +2645,20 @@ class AscendLMCacheEngine(LMCacheEngine):
         if remote_fill and set(group_caches) != {0, 1}:
             state.remote_fill.disabled_reason = "incomplete_groups"
             remote_fill = False
+        if (
+            remote_fill and verified_prefix_end > 0
+            and state.remote_fill.prefix_source is None
+            and prefix_slot_mappings
+            and all(
+                group in prefix_slot_mappings
+                and prefix_slot_mappings[group].ndim == 1
+                and prefix_slot_mappings[group].numel() >= len(tokens)
+                for group in self._remote_fill_direct_groups()
+            )
+        ):
+            state.remote_fill.prefix_source = (
+                dict(group_caches), dict(prefix_slot_mappings)
+            )
         previous_remote_work = bool(
             state.remote_fill is not None
             and (
@@ -2593,6 +2671,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if (
             remote_fill
             and not previous_remote_work
+            and state.remote_fill.prefix_source is None
             and not self._remote_fill_has_addressable_source_page(
                 len(tokens),
                 slot_mapping_base,

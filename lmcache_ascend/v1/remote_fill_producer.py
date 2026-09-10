@@ -808,22 +808,31 @@ class RemoteFillProducerSession:
         submitter: DirectPushSubmitter,
         activation_factory: Callable[[str], Any],
         preparer: DirectPushPreparer | None = None,
+        source_plan_factory: Callable[
+            [tuple[ControlPage, ...]], PreparedDirectPushSource
+        ] | None = None,
     ) -> RemoteFillWindowResult:
-        """Reserve, arm, transfer, and report one authoritative page window."""
+        """Reserve, arm, transfer, and report one authoritative page window.
+
+        With no source_plan, source_plan_factory prepares only allocated pages
+        after descriptor validation and before ARM. All-hit windows need no source.
+        Eager source plans retain their existing preparation-before-RESERVE path.
+        """
 
         if not self.direct_viable or not self.open():
             return self._abandoned_window(window_id, "open rejected")
         source_by_identity = {
-            (page.canonical_key, page.kv_group): page for page in source_plan.pages
+            (page.canonical_key, page.kv_group): page
+            for page in (source_plan.pages if source_plan is not None else ())
         }
-        if any(
+        if (source_plan is not None or source_plan_factory is None) and any(
             (page.canonical_key, page.kv_group) not in source_by_identity
             for page in control_pages
         ):
             self.direct_viable = False
             return self._abandoned_window(window_id, "source coverage mismatch")
         prepared_source: PreparedDirectPushSource | None = None
-        if preparer is not None:
+        if preparer is not None and source_plan is not None:
             try:
                 cached_prepared = self._prepared_sources.get(id(source_plan))
                 if cached_prepared is not None and cached_prepared[0] is source_plan:
@@ -914,6 +923,22 @@ class RemoteFillProducerSession:
             descriptor_digest = destination_descriptor_digest(descriptors)
             if descriptor_digest != reserved.destination_descriptor_digest:
                 raise ValueError("destination descriptor digest changed")
+            if source_plan is None:
+                # Prefix sources are needed only for allocated destinations.
+                # Fence/register them before ARM using the existing preparation API.
+                missing = {(page.canonical_key, page.kv_group) for page in descriptors}
+                assert source_plan_factory is not None
+                prepared_source = source_plan_factory(tuple(
+                    page for page in control_pages
+                    if (page.canonical_key, page.kv_group) in missing
+                ))
+                if not isinstance(prepared_source, PreparedDirectPushSource):
+                    raise TypeError("prefix source factory returned invalid evidence")
+                source_plan = prepared_source.source_plan
+                source_by_identity = {
+                    (page.canonical_key, page.kv_group): page
+                    for page in source_plan.pages
+                }
             selected_sources = tuple(
                 source_by_identity[(descriptor.canonical_key, descriptor.kv_group)]
                 for descriptor in descriptors
@@ -1129,6 +1154,10 @@ class RemoteFillProducerSession:
                 native_started_monotonic,
                 float(getattr(result, "native_ended_monotonic", 0.0)),
             )
+            # Failed futures/tracebacks can retain this frame and its source
+            # owners with cyclic GC off. Native termination is already proven.
+            native_error = None
+            future = None
 
         report_succeeded: bool
         report_started = time.perf_counter() if perf_enabled else 0.0
