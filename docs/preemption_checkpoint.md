@@ -1,0 +1,166 @@
+# Decoder recovery on the 96.8 ms baseline
+
+This implementation belongs to `fix/decoder-resume-dp-sync`. It does not include
+the unrelated optimizations from the integration branch. CPU contract tests pass;
+native compilation, multi-DP collective compatibility and NPU performance still
+require qualification on the deployment.
+
+## Phase 1: bounded MC2 recovery
+
+The Ascend recompute scheduler limits qualified MoE/EP decoder batches to the
+worker's MC2 token capacity (32 for the baseline TP4, 16-sequence, one-MTP-token
+configuration). This bounds model computation, not the number of KV tokens loaded.
+Both running and resumed requests share the budget. Original prompt lengths,
+lookahead allocation and intermediate-prefill output suppression are preserved.
+
+The no-sync decision requires an actual bounded scheduler. Unsupported parallel
+configurations and draft paths that expand target inputs retain DP metadata
+agreement. The qualified speculative path is padded MTP without parallel drafting.
+The Ascend worker invokes the
+connector preemption hook before block zeroing, state replacement and new loads.
+
+No new launch option is needed for phase 1. It applies to the existing
+`recompute_scheduler_enable` decoder setup. It does not make every recovery pass
+graph-compatible and can require multiple native passes when KV is missing.
+
+## Phase 2: generated KV checkpoints
+
+Add this **only to the decoder LMCache YAML**:
+
+```yaml
+decode_preemption_checkpoint: true
+```
+
+It defaults to false. The qualified path uses the existing `kv_both` decoder,
+`pd_role: receiver`, `store_async: true`, two-group MLA/DSA shared CPU cache,
+`enable_dsa_cold_compact_load: true`, and
+`dsa_group1_load_mode: persistent_direct_hbm`. PP, PCP and DCP must be one.
+The initial storage implementation uses the existing replicated MLA first-rank
+writer for both groups; other writer layouts cannot publish checkpoints.
+Use `LMCacheAscendConnectorV1Dynamic`, directly or inside `AscendMultiConnector`.
+The dynamic wrapper delegates preemption explicitly; other composite children
+receive their ordinary hook without early binding of next-step metadata.
+The implementation factory is resolved at connector construction, so importing
+the dynamic wrapper before Ascend installs its patch cannot retain the base
+implementation accidentally.
+
+These are the **baseline** option names. Do not substitute configuration names
+introduced by the later performance branch.
+
+Rebuild/reinstall the LMCache-Ascend native extension with the deployment's usual
+build procedure. The new prepared group binding is required, and startup rejects
+an older extension when checkpointing is enabled. Deploy matching changes from
+all four repositories, including vLLM's internal checkpoint proof field.
+Validation runs before manager/service initialization, so an incompatible
+checkpoint configuration cannot silently become degraded recomputation.
+
+### Ordering and memory ownership
+
+1. Before scheduler preemption, copy both original block tables and the generation.
+2. Before worker block reuse, capture resident generated KV with the existing dense
+   group D2H kernels. Both groups enqueue before the final capture fence.
+3. After this fence, HBM can be reused. No CPU checkpoint is yet lookup-authoritative.
+4. After older async outputs are consumed, seal the exact accepted/computed end;
+   the last sampled token and rejected speculative positions are excluded.
+5. Reuse an exact CPU prefix page or fetch its old persistent partial key, then
+   persist the extended pages. Preserve layer/plane/token order when concatenating
+   CPU prefix and captured suffix spans.
+6. Publish checkpoint readiness only after persistence. Resume performs an
+   authoritative two-group lookup and uses the existing cold load/readiness path.
+7. A full restore with one real token remaining can use ordinary MTP graph
+   admission. Incomplete recovery retains native attention and the MC2 bound.
+
+Checkpoint CPU buffers are a lazily allocated, reusable reserve carved out of
+the existing registered LMCache allocator. Allocation never evicts or busy-waits.
+Each buffer covers at most one resolved decode-save window plus one chunk.
+The maximum number of jobs uses `store_async_max_queue_size` (two if zero);
+each job can require two Group-0 buffers and one Group-1 buffer. Initial pool
+preparation is not free. No additional model KV HBM pool is reserved; device
+metadata remains generation-owned until its completion event.
+
+Buffer refusal, absent coverage or persistent failure makes the checkpoint
+unavailable and preserves bounded recovery. An uncertain native DMA completion
+is fatal: buffers remain quarantined rather than being reused unsafely.
+Cancellation prevents publication but does not free buffers still used by I/O.
+Control-only batches can process seal, cancel and completion messages.
+The scheduler also bounds waiting for a missing acknowledgement with
+`blocking_timeout_secs`. A failed restore invalidates the checkpoint proof and
+returns to the original prefix/recompute path. Old generations cannot seal using
+new history, and stale replies cannot clear a newer lookup. Explicit request
+`lmcache.skip_save` and engine freeze remain authoritative.
+
+Known terminal errors drop exception tracebacks so GC-disabled deployments do
+not retain failed jobs. Quarantined native owners remain visible through cancel
+and shutdown. A failed preemption hook latches the model runner against already
+queued work before it can zero or reuse blocks. Failure replaces the execution
+entry point; ordinary steps do not poll a fatal-state flag.
+
+Ordinary group stores retain their existing blocking publication behavior. The
+checkpoint path does not use their per-layer publication generator. Pressure-based
+speculative pre-copy is intentionally not enabled; measure the exposed stall first.
+
+With `PD_SERVING_PERF` enabled, `decoder_preemption_checkpoint` reports generation,
+status, end and refusal reason without reading device tensors.
+
+### Ordinary decode path
+
+The scheduler notifies checkpoint support from its existing victim-selection
+branch, before freeing either block table. Only this event or a checkpoint reply
+arms a one-shot connector-metadata builder. That builder restores the actual
+derived class method after emission; pending/ready checkpoint records do not
+cause a scan on every scheduler iteration. Ordinary scheduler and LMCache
+metadata keep their baseline fields. Checkpoint controls use a metadata subclass.
+
+The worker activates checkpoint seal/cancel/poll handling after an actual capture
+arrives. It remains active while that preemption owns work, including control-only
+batches, and restores ordinary methods after retirement. Weak receivers avoid
+adding ownership cycles when cyclic GC is disabled. Merely enabling the option
+does not cause checkpoint polling. Completed cold loads are promoted only in
+the existing resumed-request branch, not checked for every running request.
+
+MC2 eligibility is computed at startup from the fixed target/draft configurations
+and allocation. The effective scheduler budget is set once. Ordinary steps use
+the existing budget assignment and assertion rather than an additional min/check.
+Graph/MTP metadata retains its ordinary structure: a cold resume alone constructs
+a boolean tuple carrying verified frontiers, preserved by existing slicing/copying.
+
+The ordinary dense group store, Ascend load entry, ordinary worker metadata
+builder, finished-store routine, attention-metadata builder and common attention
+metadata class were compared with the baseline and have identical syntax trees.
+The draft metadata propagation file has no production diff.
+
+This is not a claim of literally zero added Python operations across all events:
+the Ascend runner restores native vLLM's preemption-ID test before block reuse,
+and nonempty worker-result aggregation/dispatch can inspect checkpoint results.
+Neither performs checkpoint I/O on an ordinary decode step. A bounded decoder
+also intentionally changes admission/recomputation when a batch would exceed
+MC2 capacity. Exact throughput equivalence requires an NPU comparison; no added
+device operation, synchronization or checkpoint poll is expected in steady decode.
+
+## Qualification
+
+Run the CPU tests independently of the repository NPU bootstraps:
+
+```bash
+# vllm-ascend
+python -m pytest tests/standalone -q
+# LMCache-NPU and LMCache-Ascend (run in each repository)
+python -m pytest --confcutdir=tests/standalone tests/standalone -q
+```
+
+These tests execute production control, route and submission functions with mocked
+device/storage boundaries. They do not certify the native kernel or HCCL behavior.
+
+On NPU, first test phase 1 with checkpointing disabled. Force preemption on one DP
+while peers decode in graphs, then with idle peers and simultaneous preemptions.
+Exercise padded counts around the actual MC2 bound and cache-load failures.
+
+Then enable phase 2. Cover chunk ends K-1/K/K+1, MTP rejection, queued async outputs,
+immediate block reuse, repeated preemption, storage eviction, one-group failure,
+and cancellation during persistence and restore. Compare restored KV/next-token
+logits and output accounting with an uninterrupted reference.
+
+Measure warm throughput/TPOT, exposed capture wait, persistence and restore times,
+checkpoint success rate, native recovery passes and MTP acceptance separately.
+Use repeated identical workloads. Negligible amortized throughput loss is a target,
+not a result established by the CPU tests.

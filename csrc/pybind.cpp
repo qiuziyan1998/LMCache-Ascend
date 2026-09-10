@@ -236,6 +236,20 @@ py::tuple dense_mla_dsa_group_direct_kv_transfer_fast_wrapper(
 }
 
 PYBIND11_MODULE(c_ops, m) {
+  m.def("dense_mla_dsa_group_direct_kv_transfer_prepared",
+        [](const py::sequence &objects, torch::Tensor &slots,
+           torch::Tensor &pointers, torch::Tensor &offsets,
+           torch::Tensor &sizes, int64_t tokens, bool interleaved,
+           bool validate, int64_t fixed_chunk_size) {
+          std::vector<SparseDirectLayerState> states;
+          states.reserve(py::len(objects));
+          for (const py::handle object : objects) {
+            states.push_back(py::cast<SparseDirectLayerState &>(object));
+          }
+          dense_mla_dsa_group_direct_kv_transfer_fast(
+              states, slots, pointers, offsets, sizes, tokens,
+              interleaved, true, validate, fixed_chunk_size);
+        });
   m.def(
       "get_device_ptr",
       [](uintptr_t ptr_addr, size_t required_size) {

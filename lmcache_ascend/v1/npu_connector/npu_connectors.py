@@ -71,6 +71,25 @@ logger = init_logger(__name__)
 _COLD_PERF_SLOW_MS = 100.0
 
 
+@dataclass
+class PreparedGroupCapture:
+    """Own raw-pointer operands until the capture completion fence finishes."""
+
+    states: list[Any]
+    tensors: list[list[torch.Tensor]]
+    slots: torch.Tensor
+    pointers: torch.Tensor
+    offsets: torch.Tensor
+    sizes: torch.Tensor
+    host_metadata: tuple[torch.Tensor, ...]
+    host_rows: list[list[int]]
+    total_tokens: int
+    interleaved: bool
+    fixed_chunk_size: int
+    validation_keys: list[Any]
+    validate: bool
+
+
 def _log_cold_perf_slow(
     event: str, started: float, thread_started: int, **fields: Any
 ) -> None:
@@ -4260,6 +4279,140 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if validate_inputs:
             self._sparse_direct_validated_layers.update(validation_keys)
         return host_pointer_rows, layer_chunk_ptrs_npu
+
+    def checkpoint_plane_widths(self, kv_group: int) -> tuple[int, ...]:
+        """Return the registered CPU format's per-token plane widths."""
+        layout = self._group_layouts[kv_group]
+        widths = ((layout.dsa_hidden_dims,) if kv_group == 1
+                  else tuple(x for x in (layout.k_hidden_dims, layout.v_hidden_dims) if x))
+        if self._sparse_lmc_host_interleaved(kv_group):
+            return (sum(widths),)
+        return widths
+
+    def finish_checkpoint_capture(self) -> None:
+        """Fence submitted capture operands, including a partially failed launch."""
+        self.store_stream.synchronize()
+
+    def supports_preemption_capture(self) -> bool:
+        """Whether the installed native extension has prepared group capture."""
+        return hasattr(lmc_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared")
+
+    def prepare_group_capture(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs: Any,
+    ) -> PreparedGroupCapture:
+        """Prepare one private checkpoint fragment using the dense group kernel.
+
+        The checkpoint writer owns one registered slab per group. Ordinary
+        multi-chunk stores retain their original preparation and dispatch.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        caches = self.kvcaches
+        group = int(kwargs.get("kv_group", 0))
+        slots = kwargs["slot_mapping"]
+        base = int(kwargs.get("slot_mapping_base", 0))
+        if (
+            len(starts) != 1
+            or len(ends) != 1
+            or base < 0
+            or starts[0] != base
+            or ends[0] - base != len(slots)
+            or not len(slots)
+        ):
+            raise ValueError("Checkpoint capture requires one exact resident fragment")
+        if (
+            caches is None
+            or len(caches) < self.num_layers
+            or len(memory_objs) != self.num_layers
+        ):
+            raise ValueError("Checkpoint capture layer count mismatch")
+        layout = self._lazy_initialize_buffer_with_staging(
+            caches, kv_group=group, init_staging=False
+        )
+        if not self.supports_batched_from_gpu_group(group):
+            raise ValueError(
+                "Checkpoint capture requires the dense MLA/DSA group kernel"
+            )
+        self._check_layerwise_transfer_invariants(
+            operation="store",
+            kv_group=group,
+            slot_mapping_full=slots,
+            kvcaches_ref=caches,
+        )
+        fmt = self._expected_memory_format(group)
+        tensors = []
+        for layer, objects in enumerate(memory_objs):
+            if len(objects) != 1 or objects[0].metadata.fmt != fmt:
+                raise ValueError(
+                    "Checkpoint capture requires one correctly formatted slab per layer"
+                )
+            tensors.append([_layer_memory_tensor(objects[0], layer)])
+        device_slots = self._slot_mapping_on_kv_device(slots, self.store_stream)
+        states = [
+            prepare_sparse_direct_layer_state(
+                row[0],
+                caches[layer],
+                device_slots,
+                self._layerwise_token_major(group),
+                layout.vllm_two_major,
+                layout.kv_format.value,
+                layout.k_hidden_dims,
+                layout.v_hidden_dims,
+                layout.dsa_hidden_dims,
+                len(slots),
+            )
+            for layer, row in enumerate(tensors)
+        ]
+        rows = [
+            [
+                int(lmc_ops.get_device_ptr(t.data_ptr(), t.numel() * t.element_size()))
+                for t in row
+            ]
+            for row in tensors
+        ]
+        if any(not pointer for row in rows for pointer in row):
+            raise ValueError("Checkpoint CPU destination is not registered")
+        offsets = torch.tensor([0], dtype=torch.int32, pin_memory=True)
+        sizes = torch.tensor([len(slots)], dtype=torch.int32, pin_memory=True)
+        pointers = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
+        with self._stream_context_or_null(self.store_stream):
+            offsets_npu = offsets.to(self.kv_device, non_blocking=True)
+            sizes_npu = sizes.to(self.kv_device, non_blocking=True)
+            pointers_npu = pointers.to(self.kv_device, non_blocking=True)
+        return PreparedGroupCapture(
+            states,
+            tensors,
+            device_slots,
+            pointers_npu,
+            offsets_npu,
+            sizes_npu,
+            (offsets, sizes, pointers, slots),
+            rows,
+            len(slots),
+            self._sparse_lmc_host_interleaved(group),
+            0,
+            [],
+            getattr(self, "enable_npu_transfer_validation", True),
+        )
+
+    def enqueue_group_capture(self, plan: PreparedGroupCapture) -> Any:
+        """Enqueue D2H behind producer work; caller retains plan until done."""
+        current = torch.npu.current_stream()
+        with self._stream_context_or_null(self.store_stream):
+            self.store_stream.wait_stream(current)
+            lmc_ops.dense_mla_dsa_group_direct_kv_transfer_prepared(
+                plan.states, plan.slots, plan.pointers, plan.offsets, plan.sizes,
+                plan.total_tokens, plan.interleaved, plan.validate, plan.fixed_chunk_size,
+            )
+            event = torch.npu.Event()
+            event.record(self.store_stream)
+        if plan.validate:
+            self._sparse_direct_validated_layers.update(plan.validation_keys)
+        return event
+
 
     def _lmc_plane_num_tokens(
         self, lmc_tensor: torch.Tensor, kv_group: Optional[int] = None

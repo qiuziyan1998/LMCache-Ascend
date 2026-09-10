@@ -10,6 +10,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     ReqMeta,
 )
+from lmcache.integration.vllm.preemption_checkpoint import CheckpointResult
 from lmcache.logging import init_logger
 from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 from lmcache.v1.cache_engine import LayerwiseStoreResult
@@ -170,6 +171,7 @@ class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
     remote_fill_results: dict[str, dict[str, str | int]] = field(
         default_factory=dict
     )
+    checkpoint_results = ()
 
     def aggregate(
         self, other: KVConnectorWorkerMetadata
@@ -187,7 +189,14 @@ class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
                     "Tensor-parallel ranks reported different remote-fill outcomes"
                 )
             results[req_id] = dict(result)
+        if self.checkpoint_results or other.checkpoint_results:
+            return CheckpointWorkerMetadata(merged, results, self.checkpoint_results + other.checkpoint_results)
         return LiveSourceWorkerMetadata(merged, results)
+
+
+@dataclass
+class CheckpointWorkerMetadata(LiveSourceWorkerMetadata):
+    checkpoint_results: tuple[CheckpointResult, ...] = ()
 
 
 @dataclass(slots=True)
@@ -198,6 +207,7 @@ class _LiveSourceReadyFence:
 
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
+    supports_preemption_checkpoint = True
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -206,6 +216,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
         super().__init__(vllm_config, role, parent)
+        checkpoint_worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
+        if checkpoint_worker is not None:
+            checkpoint_worker.configure_capacity(self._decode_window_save_window_size, self._lmcache_chunk_size)
         # LMCache-NPU initializes this field only for worker connectors;
         # EngineCore also constructs this implementation for the scheduler.
         self.use_layerwise = bool(
@@ -1011,6 +1024,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self, metadata: KVConnectorWorkerMetadata, active_req_ids: set[str]
     ) -> None:
         if isinstance(metadata, LiveSourceWorkerMetadata):
+            for result in metadata.checkpoint_results:
+                self.accept_preemption_result(result)
             for req_id, descriptors in metadata.descriptors.items():
                 active = req_id in active_req_ids
                 tracked = req_id in self._unfinished_requests
@@ -1352,6 +1367,20 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
         if self.lmcache_engine is None:
             return
+        worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
+        if worker is not None and self._parent.has_connector_metadata():
+            metadata = self._parent._get_connector_metadata()
+            for req_id, generation in metadata.preemption_cancels:
+                worker.cancel(req_id, generation)
+            captures = metadata.preemption_captures
+            if captures:
+                self._activate_checkpoint_io()
+                self.lmcache_engine.wait_for_pending_stores(preempted_req_ids)
+                self.lmcache_engine.wait_for_direct_stores(preempted_req_ids)
+                caches = self._direct_group_caches()
+                for capture in captures:
+                    if capture.req_id in preempted_req_ids:
+                        worker.capture(capture, caches, self._block_size)
 
         logger.debug(
             "LMCache-Ascend handling preemptions: req_ids=%s",
@@ -1485,3 +1514,88 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params
+
+    def _activate_checkpoint_io(self) -> None:
+        """Poll only while a real preemption owns capture/persistence work."""
+        if "_checkpoint_io_originals" in self.__dict__:
+            return
+        from types import MethodType
+        from weakref import proxy
+
+        self._checkpoint_io_originals = (
+            type(self).start_load_kv,
+            type(self).build_connector_worker_meta,
+            type(self.lmcache_engine).get_finished_stores,
+        )
+        # Weak method receivers avoid new ownership cycles with Python GC off.
+        receiver = proxy(self)
+        self.start_load_kv = MethodType(type(self)._checkpoint_start_load, receiver)
+        self.build_connector_worker_meta = MethodType(
+            type(self)._checkpoint_worker_meta, receiver
+        )
+        self.lmcache_engine.get_finished_stores = MethodType(type(self)._checkpoint_finished_stores, receiver)
+
+    def _checkpoint_start_load(self, forward_context: Any, **kwargs: Any) -> None:
+        worker = self.lmcache_engine.checkpoint_worker
+        metadata = self._parent._get_connector_metadata()
+        for req_id, generation in metadata.preemption_cancels:
+            worker.cancel(req_id, generation)
+        for seal in metadata.preemption_seals:
+            worker.seal(seal)
+        self._checkpoint_io_originals[0](self, forward_context, **kwargs)
+
+    def _checkpoint_finished_stores(self, finished_req_ids: set) -> set:
+        for req_id in finished_req_ids:
+            self.lmcache_engine.checkpoint_worker.cancel(req_id)
+        return self._checkpoint_io_originals[2](self.lmcache_engine, finished_req_ids)
+
+    def _checkpoint_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        metadata = self._checkpoint_io_originals[1](self)
+        worker = self.lmcache_engine.checkpoint_worker
+        results = worker.poll()
+        if results:
+            if metadata is None:
+                metadata = CheckpointWorkerMetadata(checkpoint_results=results)
+            else:
+                metadata = CheckpointWorkerMetadata(
+                    metadata.descriptors, metadata.remote_fill_results, results
+                )
+        if not worker.jobs:
+            # Reveal the original class methods, rather than retaining bound
+            # instance methods/cycles when cyclic GC is disabled.
+            del self.start_load_kv, self.build_connector_worker_meta
+            del self.lmcache_engine.get_finished_stores
+            del self._checkpoint_io_originals
+        return metadata
+
+    def _validate_preemption_checkpoint_setup(self, config: Any, vllm_config: Any) -> None:
+        """Reject unsupported checkpoint setups before manager/service creation."""
+        parallel = vllm_config.parallel_config
+        spec = vllm_config.speculative_config
+        shared_cpu = config.get_extra_config_value("enable_shared_cpu_cache", config.enable_shared_cpu_cache)
+        if not (
+            self.kv_role == "kv_both" and config.pd_role == "receiver"
+            and config.store_async and config.use_layerwise and shared_cpu
+            and config.enable_sparse_attention and config.dsa_two_groups
+            and config.enable_dsa_cold_compact_load
+            and config.get_extra_config_value("save_only_first_rank", True)
+            and not vllm_config.cache_config.enable_prefix_caching
+            and config.dsa_group1_load_mode == "persistent_direct_hbm"
+            and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size
+            == parallel.decode_context_parallel_size == 1
+            and (spec is None or (
+                spec.method in ("mtp", "deepseek_mtp") and spec.num_speculative_tokens == 1
+                and not spec.parallel_drafting and not spec.disable_padded_drafter_batch
+            ))
+        ):
+            raise ValueError("decode_preemption_checkpoint requires the two-group shared-CPU "
+                             "kv_both decoder with async stores, cold-compact persistent_direct_hbm "
+                             "loading, PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding")
+        if not callable(getattr(type(self._parent), "handle_preemptions_with_metadata", None)):
+            raise ValueError("decode_preemption_checkpoint requires the dynamic LMCache checkpoint connector")
+        if self._role == KVConnectorRole.WORKER:
+            # Lazy worker-only import; the scheduler must not initialize NPU ops.
+            from lmcache_ascend import c_ops
+
+            if not hasattr(c_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared"):
+                raise ValueError("Rebuild LMCache-Ascend native extension before enabling decode_preemption_checkpoint")

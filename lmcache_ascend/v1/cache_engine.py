@@ -97,6 +97,7 @@ from lmcache_ascend.v1.direct_store_plan import (
     merge_deferred_remote_fill_batches,
     select_remote_fill_batch_pages,
 )
+from lmcache_ascend.v1.preemption_checkpoint import CheckpointWorker
 from lmcache_ascend.v1.remote_fill import (
     DecoderRemoteFillRuntime,
     RemoteFillDecoderLayout,
@@ -453,6 +454,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self.is_store_async = self.config.store_async
         self._pending_sync_store_futures: set[Future] = set()
+        self.checkpoint_worker = (
+            CheckpointWorker(self)
+            if getattr(self.config, "decode_preemption_checkpoint", False)
+            and self.metadata.is_first_rank()
+            else None
+        )
         self._require_store_completion = False
         self._direct_store_enabled = bool(
             self.is_store_async
@@ -524,6 +531,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._store_worker_thread.start()
 
     def post_init(self, **kwargs) -> None:
+        if getattr(self, "checkpoint_worker", None) is not None and not (
+            callable(getattr(self.gpu_connector, "supports_preemption_capture", None))
+            and self.gpu_connector.supports_preemption_capture()
+        ):
+            raise ValueError("Rebuild LMCache-Ascend native extension before enabling decode_preemption_checkpoint")
         perf_enabled = serving_perf_enabled()
         base_started = serving_perf_now() if perf_enabled else None
         if perf_enabled:
@@ -9543,8 +9555,47 @@ class AscendLMCacheEngine(LMCacheEngine):
             severity="critical",
         )
 
+    def allocate_checkpoint_fragment(
+        self, group: int, tokens: int, caches: Optional[list] = None
+    ) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
+        """Allocate registered capture storage without eviction or busy retry."""
+        if not self.save_only_first_rank or not self.save_indexer_only_first_rank:
+            raise ValueError("Checkpoint requires replicated MLA group writer ownership")
+        if caches is not None:
+            self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
+        local = self._shared_local_cpu_backend()
+        if local is None or tokens <= 0 or not self.gpu_connector.supports_batched_from_gpu_group(group):
+            raise ValueError("Checkpoint registered group capture is unavailable")
+        shape = self.gpu_connector.get_shape(tokens, kv_group=group)
+        widths = self.gpu_connector.checkpoint_plane_widths(group)
+        pages = local.batched_allocate_layer_pages(
+            [shape], [self._shared_cpu_dtype_for_kv_group(group)], 1,
+            self.num_layers, self._memory_format_for_kv_group(group),
+            busy_loop=False, eviction=False, valid_tokens=tokens, full_tokens=tokens,
+        )
+        if not pages:
+            raise MemoryError("Checkpoint CPU staging allocation refused")
+        return pages[0], widths
+
+    def get_checkpoint_prefix(self, key: CacheEngineKey, group: int, tokens: int) -> Any:
+        """Retain an exact CPU page, or let checkpoint persistence fetch it."""
+        local = self._shared_local_cpu_backend()
+        pages, count = local.batched_get_layer_page_prefix([key.split_layers(self.num_layers)[0]])
+        if not count:
+            return None
+        page = pages[0]
+        if (page.is_valid() and page.valid_tokens == tokens and page.num_layers == self.num_layers
+                and page.get_dtype() == self._shared_cpu_dtype_for_kv_group(group)
+                and page.metadata.fmt == self._memory_format_for_kv_group(group)):
+            return page, self.gpu_connector.checkpoint_plane_widths(group)
+        page.ref_count_down()
+        return None
+
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
+        if getattr(self, "checkpoint_worker", None) is not None:
+            self.checkpoint_worker.close()
+            self.checkpoint_worker = None
         if getattr(self, "_failed_sparse_loads", None):
             # Do not tear down storage or its allocator while an unfenced DMA
             # may still read it. The engine owns the quarantined inputs.
