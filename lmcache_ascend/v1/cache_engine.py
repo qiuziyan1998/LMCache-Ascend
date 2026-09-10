@@ -61,7 +61,6 @@ from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
     mooncake_page_layout_enabled,
     mooncake_payload_layout,
-    mooncake_valid_tokens,
 )
 from lmcache.v1.remote_fill import (
     ControlPage,
@@ -433,6 +432,13 @@ class _SparseCacheAppend:
 class AscendLMCacheEngine(LMCacheEngine):
     """Ascend NPU variant of ``LMCacheEngine`` with an async store path."""
 
+    @classmethod
+    def prefill_direct_type(cls) -> type:
+        """Return the sender implementation selected only during construction."""
+        from lmcache_ascend.prefill_direct import PrefillDirectLMCacheEngine
+
+        return PrefillDirectLMCacheEngine
+
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -544,21 +550,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         try:
             if (
                 self._persistent_direct_hbm_split_group_enabled()
-                and (
-                    self.config.pd_role != "sender"
-                    or getattr(self.config, "prefill_group0_direct_hbm", False)
-                )
+                and self.config.pd_role != "sender"
                 and self._is_passive()
             ):
                 reader_started = serving_perf_now() if perf_enabled else None
                 if perf_enabled:
                     serving_perf_log(
                         logger,
-                        (
-                            "group0_external_reader_init_start"
-                            if getattr(self.config, "prefill_group0_direct_hbm", False)
-                            else "group1_external_reader_init_start"
-                        ),
+                        "group1_external_reader_init_start",
                         rank=self.metadata.worker_id,
                     )
                 self._group1_external_page_reader = RemoteExternalPageReader(
@@ -568,11 +567,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if perf_enabled:
                     serving_perf_log(
                         logger,
-                        (
-                            "group0_external_reader_init_complete"
-                            if getattr(self.config, "prefill_group0_direct_hbm", False)
-                            else "group1_external_reader_init_complete"
-                        ),
+                        "group1_external_reader_init_complete",
                         started=reader_started,
                         rank=self.metadata.worker_id,
                     )
@@ -595,21 +590,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             log_remote_fill_diagnostic(
                 logger,
                 event="remote_fill_startup_failure",
-                code=(
-                    "RF-P-000"
-                    if getattr(self.config, "prefill_group0_direct_hbm", False)
-                    else "RF-D-000"
-                ),
-                stage=(
-                    "prefill_direct_load_startup"
-                    if getattr(self.config, "prefill_group0_direct_hbm", False)
-                    else "decoder_startup_validation"
-                ),
+                code="RF-D-000",
+                stage="decoder_startup_validation",
                 action="STARTUP_ABORT",
                 reason=(
-                    "Prefill direct-load invariants were not satisfied"
-                    if getattr(self.config, "prefill_group0_direct_hbm", False)
-                    else "RemoteFill was enabled but its decoder invariants were "
+                    "RemoteFill was enabled but its decoder invariants were "
                     "not satisfied; the endpoint was not advertised"
                 ),
                 error=error,
@@ -847,243 +832,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "decoder Group-1 external-page DMA state is unknown"
             ) from error
 
-    def preflight_prefill_group0_direct_hbm(self, kvcaches: list) -> None:
-        """Validate opted-in P destinations and readers uniformly across TP."""
-        if not getattr(self.config, "prefill_group0_direct_hbm", False):
-            return
-        local_error: Optional[BaseException] = None
-        try:
-            if (
-                self.config.pd_role != "sender"
-                or self.metadata.first_rank != 0
-                or kvcaches[0][0].device.type != "npu"
-                or not callable(
-                    getattr(self.gpu_connector, "record_dense_load_readiness", None)
-                )
-                or not callable(
-                    getattr(
-                        self.gpu_connector, "synchronize_dense_load_readiness", None
-                    )
-                )
-            ):
-                raise RuntimeError(
-                    "Prefill Group-0 direct-HBM capabilities are unavailable"
-                )
-            check = getattr(
-                self.gpu_connector,
-                "direct_page_load_supported",
-                None,
-            )
-            if not callable(check) or not check(kvcaches, 0):
-                raise RuntimeError("Group-0 direct-HBM layout is unsupported")
-            if not callable(self._group1_external_page_load()):
-                raise RuntimeError("External page loader is unavailable")
-        except BaseException as error:
-            local_error = error
-        ready = local_error is None
-        if self.metadata.world_size > 1:
-            try:
-                collective = getattr(self, "collective_all_true_fn", None)
-                if not callable(collective):
-                    raise RuntimeError("Group-0 direct-HBM startup lacks TP consensus")
-                ready = bool(collective(ready))
-            except BaseException as error:
-                local_error = local_error or error
-                ready = False
-        if not ready:
-            detail = (
-                f": {type(local_error).__name__}: {local_error}"
-                if local_error is not None
-                else " on another TP rank"
-            )
-            failure = RuntimeError("Group-0 direct-HBM preflight failed" + detail)
-            try:
-                self._rollback_group1_direct_hbm_startup()
-            except BaseException as rollback_error:
-                raise RuntimeError(
-                    f"{failure}; startup rollback also failed"
-                ) from rollback_error
-            raise failure
-
-    def retrieve_prefill_group0_direct(
-        self,
-        tokens: Union[torch.Tensor, list[int]],
-        mask: Optional[torch.Tensor],
-        *,
-        kvcaches: list,
-        slot_mapping: torch.Tensor,
-        req_id: str,
-        request_configs: Optional[dict],
-        shared_cpu_request_preflight_state: dict[str, Any],
-    ) -> Generator[Optional[torch.Tensor], None, None]:
-        """Restore a sender's dense G0 prefix without LocalCPU payload pages.
-
-        Tokens/mask and CPU slots follow the ordinary dense-prefix contract.
-        The preflight dictionary shares exact hashes with the G1 retriever.
-        Yields L+1 placeholders and the final CPU mask for L cache layers.
-        Raises before the first yield if any TP rank fails; unknown DMA keeps
-        native destination ownership latched until the existing restart path.
-        """
-        perf_enabled = serving_perf_enabled()
-        started = serving_perf_now() if perf_enabled else 0.0
-        local_error: Optional[BaseException] = None
-        metrics = None
-        try:
-            if (
-                not getattr(self.config, "prefill_group0_direct_hbm", False)
-                or self.config.pd_role != "sender"
-                or not self.is_healthy()
-            ):
-                raise RuntimeError("Prefill Group-0 direct-HBM load is unavailable")
-            ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
-            plans = list(
-                self._dense_retrieve_token_results(
-                    tokens,
-                    mask,
-                    request_configs,
-                    0,
-                    {
-                        "shared_cpu_request_preflight_state": (
-                            shared_cpu_request_preflight_state
-                        )
-                    },
-                )
-            )
-            previous_end = plans[0][0] if plans else len(tokens)
-            for start, end, key in plans:
-                if (
-                    start != previous_end
-                    or not 0 <= start < end <= len(tokens)
-                    or key.kv_group != 0
-                    or mooncake_valid_tokens(key, self.config.chunk_size) != end - start
-                ):
-                    raise ValueError("Prefill Group-0 page ranges are invalid")
-                ret_mask[start:end] = True
-                previous_end = end
-            expected = (
-                mask.to(device="cpu", dtype=torch.bool) if mask is not None else None
-            )
-            if previous_end != len(tokens) or (
-                not torch.equal(ret_mask, expected)
-                if expected is not None
-                else not bool(torch.all(ret_mask))
-            ):
-                raise ValueError(
-                    "Prefill Group-0 page plan does not cover the load mask"
-                )
-            if plans and not self._is_passive():
-                proof = self._remote_fill_retrieve_plan(req_id, plans, 0)
-                if proof is None or any(
-                    item != ("RemoteBackend", True) for item in proof
-                ):
-                    raise ValueError(
-                        "Prefill Group-0 load lacks its persistent prefix proof"
-                    )
-            plan_ms = (serving_perf_now() - started) * 1000 if perf_enabled else 0.0
-            if plans:
-                metrics = self._load_prefill_group0_page_plan(
-                    plans,
-                    slot_mapping,
-                    kvcaches,
-                    req_id,
-                    perf_enabled=perf_enabled,
-                )
-        except BaseException as error:
-            local_error = error
-        decision_started = serving_perf_now() if perf_enabled else 0.0
-        try:
-            ready = local_error is None
-            if self.metadata.world_size > 1:
-                ready = bool(self.collective_all_true_fn(ready))
-            if not ready:
-                if local_error is not None:
-                    raise local_error
-                raise RuntimeError(
-                    "Prefill Group-0 direct load failed on another TP rank"
-                )
-        finally:
-            # A propagated exception must not retain itself through this frame
-            # when cyclic GC is disabled.
-            local_error = None
-        if perf_enabled and (serving_perf_now() - started) * 1000 >= 100.0:
-            layout_ms, destination_ms, read_ms, predecessor_ms, sizes = (
-                metrics if metrics is not None else (0.0, 0.0, 0.0, 0.0, [])
-            )
-            serving_perf_log(
-                logger,
-                "prefill_group0_direct_load_slow",
-                started=started,
-                req_id=req_id,
-                rank=self.metadata.worker_id,
-                pages=len(plans),
-                bytes=sum(map(sum, sizes)),
-                plan_ms=round(plan_ms + layout_ms + destination_ms, 3),
-                predecessor_wait_ms=round(predecessor_ms, 3),
-                read_call_ms=round(read_ms, 3),
-                tp_decision_ms=round((serving_perf_now() - decision_started) * 1000, 3),
-            )
-        for _ in range(self.num_layers + 1):
-            yield None
-        yield ret_mask
-
-    def _load_prefill_group0_page_plan(
-        self,
-        plans: list[tuple[int, int, CacheEngineKey]],
-        slot_mapping: torch.Tensor,
-        kvcaches: list,
-        req_id: str,
-        *,
-        perf_enabled: bool,
-    ) -> Optional[tuple[float, float, float, float, list[list[int]]]]:
-        """Read P Group 0 after its compute predecessor reaches readiness."""
-        kv_group = 0
-        phase_started = serving_perf_now() if perf_enabled else 0.0
-        self._ensure_layerwise_connector_layout(kvcaches=kvcaches, kv_group=kv_group)
-        layout_ms = (serving_perf_now() - phase_started) * 1000 if perf_enabled else 0.0
-        planner = getattr(self.gpu_connector, "plan_direct_page_destinations", None)
-        if not callable(planner):
-            raise RuntimeError(f"Group-{kv_group} direct-HBM planner is unavailable")
-        starts = [start for start, _, _ in plans]
-        ends = [end for _, end, _ in plans]
-        keys = [key for _, _, key in plans]
-        phase_started = serving_perf_now() if perf_enabled else 0.0
-        planned = planner(kvcaches, slot_mapping, starts, ends, kv_group)
-        destination_ms = (
-            (serving_perf_now() - phase_started) * 1000 if perf_enabled else 0.0
-        )
-        if planned is None:
-            rejection = getattr(self.gpu_connector, "direct_page_plan_rejection", None)
-            reason = rejection(kv_group) if callable(rejection) else None
-            raise RuntimeError(
-                f"Group-{kv_group} direct-HBM destination plan failed: "
-                f"{reason or 'unsupported_layout'}"
-            )
-        ptrs, sizes, owners = planned
-        if len(ptrs) != len(keys) or len(sizes) != len(keys):
-            raise RuntimeError(f"Group-{kv_group} direct-HBM page count is invalid")
-        load_pages = self._group1_external_page_load()
-        phase_started = serving_perf_now() if perf_enabled else 0.0
-        # External DMA is not ordered by an event recorded after the read.
-        ready = self.gpu_connector.record_dense_load_readiness(
-            stream=torch.npu.current_stream()
-        )
-        self.gpu_connector.synchronize_dense_load_readiness(ready)
-        predecessor_ms = (
-            (serving_perf_now() - phase_started) * 1000 if perf_enabled else 0.0
-        )
-        try:
-            phase_started = serving_perf_now() if perf_enabled else 0.0
-            load_pages(keys, ptrs, sizes, owners, req_id)
-            if perf_enabled:
-                native_ms = (serving_perf_now() - phase_started) * 1000
-                return layout_ms, destination_ms, native_ms, predecessor_ms, sizes
-            return None
-        except NativeExternalPageTransferUnknownError as error:
-            self._remote_fill_require_paired_restart((req_id,))
-            raise RemoteFillFatalError(
-                "prefiller Group-0 external-page DMA state is unknown"
-            ) from error
-
     def direct_prefill_plan_supported(
         self,
         group_caches: dict[int, list],
@@ -1242,10 +990,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 activation_factory=activation_factory,
             )
 
+
     def drain_remote_fill_terminal_results(self) -> dict[str, dict[str, str | int]]:
         """Drain sanitized producer outcomes for the existing adapter handoff."""
         coordinator = getattr(self, "_remote_fill_coordinator", None)
         return {} if coordinator is None else coordinator.drain_terminal_results()
+
 
 
     def _latch_remote_fill_producer_fatal(
@@ -1258,6 +1008,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if handoff is None:
             raise RuntimeError("remote-fill fatal state lacks a transfer identity")
         self._remote_fill_require_paired_restart((handoff.transfer_id,))
+
 
 
 
@@ -1285,6 +1036,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached = (layout_tag, layout)
                 self._remote_fill_layout_cache = cached
             return cached
+
 
 
     def _remote_fill_control_pages(
@@ -1436,6 +1188,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     _remote_fill_source_plan = staticmethod(build_remote_fill_source_plan)
 
     _merge_deferred_remote_fill_batches = staticmethod(merge_deferred_remote_fill_batches)
+
 
     def _wait_remote_fill_windows(self, state: _DirectStoreRequestState) -> None:
         if state.remote_fill is not None:

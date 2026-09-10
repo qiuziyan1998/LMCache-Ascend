@@ -20,8 +20,9 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.mooncake_layout import mooncake_valid_tokens
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
-from lmcache_ascend.v1 import cache_engine as engine_module
+from lmcache_ascend import prefill_direct as engine_module
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
+from lmcache_ascend.prefill_direct import PrefillDirectLMCacheEngine
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     KVCacheFormat,
@@ -29,11 +30,15 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
 )
 
 
-def _engine(monkeypatch: pytest.MonkeyPatch, rank: int = 0, world: int = 4) -> Any:
-    engine = object.__new__(AscendLMCacheEngine)
+def _engine(
+    monkeypatch: pytest.MonkeyPatch, rank: int = 0, world: int = 4, enabled: bool = True
+) -> Any:
+    engine = object.__new__(
+        PrefillDirectLMCacheEngine if enabled else AscendLMCacheEngine
+    )
     engine.config = SimpleNamespace(
         pd_role="sender",
-        prefill_group0_direct_hbm=True,
+        prefill_group0_direct_hbm=enabled,
         dsa_group1_load_mode="persistent_direct_hbm",
         chunk_size=4,
     )
@@ -280,8 +285,7 @@ def test_invalid_mask_or_page_ranges_never_submit(
 def test_sender_reader_startup_and_preflight(
     monkeypatch: Any, enabled: Any, rank: Any
 ) -> None:
-    engine, _, read, _ = _engine(monkeypatch, rank)
-    engine.config.prefill_group0_direct_hbm = enabled
+    engine, _, read, _ = _engine(monkeypatch, rank, enabled=enabled)
     engine.is_store_async = False
     engine._direct_store_enabled = False
     engine._initialize_decoder_remote_fill = Mock()
@@ -292,7 +296,10 @@ def test_sender_reader_startup_and_preflight(
         engine.post_init()
     assert factory.call_count == int(enabled and rank != 0)
     caches = [(SimpleNamespace(device=SimpleNamespace(type="npu")),)]
-    engine.preflight_prefill_group0_direct_hbm(caches)
+    if enabled:
+        engine.preflight_prefill_group0_direct_hbm(caches)
+    else:
+        assert not hasattr(engine, "preflight_prefill_group0_direct_hbm")
     assert engine.gpu_connector.direct_page_load_supported.call_count == int(enabled)
 
 
@@ -495,3 +502,90 @@ def test_direct_load_capability_honors_disable_without_disabling_store(
     monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", True)
     assert not connector.direct_page_load_supported([], 0)
     assert connector.direct_page_layout_supported([], 0)
+
+
+@pytest.mark.parametrize("pin", [False, True])
+@pytest.mark.parametrize(
+    "local1,remote_pairs", [(0, 2), (1, 2), (2, 2), (2, 1), (2, 0)]
+)
+def test_direct_prefix_lookup_keeps_pair_proof_and_only_pins_index(
+    monkeypatch: pytest.MonkeyPatch, pin: bool, local1: int, remote_pairs: int
+) -> None:
+    from collections import defaultdict
+    from threading import RLock
+
+    engine, _, _, _ = _engine(monkeypatch)
+    engine._engine_state_lock = RLock()
+    engine.use_layerwise = True
+    engine.enable_shared_cpu_cache = True
+    engine.save_only_first_rank = True
+    engine.save_indexer_only_first_rank = True
+    engine.shared_cpu_cache_strict = False
+    engine.shared_cpu_cache_generation = 1
+    engine.metadata.use_mla = True
+    engine.metadata.is_first_rank = lambda: True
+    engine.config.dsa_two_groups = True
+    engine.config.use_layerwise = True
+    engine.config.enable_shared_cpu_cache = True
+    engine.config.enable_remote_lmcache_store = True
+    engine.config.remote_url = "mooncakestore://test"
+    engine.config.extra_config = {
+        "save_only_first_rank": True,
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+    }
+    engine.retrieve_locations = ["LocalCPUBackend", "RemoteBackend"]
+    engine.lookup_pins = defaultdict(lambda: defaultdict(list))
+    engine._remote_fill_lookup_plans = {}
+    engine.stats_monitor = SimpleNamespace(
+        on_lookup_request=lambda tokens: None, on_lookup_finished=lambda *args: None
+    )
+    engine.token_database._make_key_by_hash = (
+        lambda value,
+        request_configs=None,
+        kv_group=0,
+        valid_tokens=None: CacheEngineKey(
+            "model", 1, 0, value, torch.float16, request_configs, kv_group=kv_group
+        )
+    )
+    page_groups = []
+
+    def pairs(group0: Any, group1: Any, search_range: Any, pin: bool) -> Any:
+        assert search_range == ["RemoteBackend"]
+        count = min(remote_pairs, len(group0))
+        keys = [
+            k for pair in zip(group0[:count], group1[:count], strict=True) for k in pair
+        ]
+        return count, {"RemoteBackend": keys} if keys else {}
+
+    def local(keys: Any, search_range: Any, pin: bool) -> Any:
+        assert search_range == ["LocalCPUBackend"]
+        keys = list(keys)
+        page_groups.append(keys[0].kv_group)
+        count = min(local1, len(keys))
+        return count, {"LocalCPUBackend": keys[:count]} if count else {}
+
+    engine.storage_manager = SimpleNamespace(
+        batched_contains_two_group_layer_pages=pairs,
+        batched_contains_layer_pages=local,
+        batched_unpin=Mock(),
+        touch_cache=lambda: None,
+    )
+    assert (
+        engine.lookup(list(range(8)), lookup_id="request", pin=pin) == 4 * remote_pairs
+    )
+    assert page_groups == ([1] if pin and remote_pairs else [])
+    if pin and remote_pairs:
+        assert [
+            chunk.locations_by_group
+            for chunk in engine._remote_fill_lookup_plans["request"].chunks
+        ] == [
+            ("RemoteBackend", "LocalCPUBackend" if i < local1 else "RemoteBackend")
+            for i in range(remote_pairs)
+        ]
+        assert all(
+            k.kv_group == 1
+            for k in engine.lookup_pins["request"].get("LocalCPUBackend", [])
+        )
+        engine.lookup_unpin("request")
+    assert engine.lookup_pins == {}

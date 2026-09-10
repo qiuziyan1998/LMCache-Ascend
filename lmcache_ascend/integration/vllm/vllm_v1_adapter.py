@@ -198,6 +198,13 @@ class _LiveSourceReadyFence:
 
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
+    @classmethod
+    def prefill_direct_type(cls) -> type:
+        """Return the sender implementation selected only during construction."""
+        from lmcache_ascend.prefill_direct import PrefillDirectConnector
+
+        return PrefillDirectConnector
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
