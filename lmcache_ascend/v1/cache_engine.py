@@ -488,9 +488,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         # readback cannot hide whether that event was initially incomplete.
         self._pending_live_source_diagnostics: dict[str, dict[str, Any]] = {}
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
+        # close() also runs for synchronous stores and before lazy worker startup.
+        self._store_queue: Optional[queue.Queue] = None
+        self._store_worker_thread: Optional[threading.Thread] = None
         if self.is_store_async:
-            self._store_queue: Optional[queue.Queue] = None
-            self._store_worker_thread: Optional[threading.Thread] = None
             self._store_lock = threading.Lock()
             self._store_cv = threading.Condition(self._store_lock)
 
