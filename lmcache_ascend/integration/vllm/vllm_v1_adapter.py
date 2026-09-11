@@ -1280,6 +1280,18 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         return True
 
+    def _finish_aborted_cold_load(self, req_id: str) -> None:
+        """Retire the aborted receiver's stores before its send acknowledgement."""
+        # Match request_finished(): these modes never promise a send ack.
+        if not self.store_async or self.kv_role == "kv_consumer":
+            return
+        if self.lmcache_engine is None:
+            super()._finish_aborted_cold_load(req_id)
+            return
+        self._late_finished_sending.update(
+            self._finalize_worker_requests_after_store({req_id})
+        )
+
     def _finalize_worker_requests_after_store(
         self, finished_req_ids: set[str]
     ) -> set[str]:
