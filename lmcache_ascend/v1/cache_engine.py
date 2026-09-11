@@ -3627,6 +3627,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     break
 
+                # Flat MLA/DSA shapes encode elements, not a token dimension.
+                memory_obj.metadata.valid_tokens = num_tokens
                 starts.append(start)
                 ends.append(end)
                 keys.append(key)
@@ -6022,6 +6024,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     fmt=memory_format,
                     busy_loop=force_store_wait,
                 )
+                if memory_objs_multi_layer is not None:
+                    # Legacy flat chunks (including page-allocation fallback)
+                    # need the logical count just like LayerPageMemoryObj does.
+                    for memory_obj in memory_objs_multi_layer:
+                        memory_obj.metadata.valid_tokens = num_tokens
 
             if memory_objs_multi_layer is None:
                 logger.warning(
