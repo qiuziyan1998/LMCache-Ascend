@@ -159,7 +159,7 @@ class CheckpointWorker:
                 widths = self.buffer_widths[group]
             else:
                 # Group 0 can need a separate old partial-page prefix; Group 1
-                # is entirely resident. Pool growth never evicts the CPU cache.
+                # is entirely resident. Pressure reclamation runs outside this lock.
                 limit = self.max_jobs * (2 if group == 0 else 1)
                 if self.buffer_counts[group] >= limit:
                     raise MemoryError("Checkpoint capture buffers are busy")
@@ -171,7 +171,12 @@ class CheckpointWorker:
 
         def release(page: Any) -> None:
             with self.buffer_lock:
-                self.free_buffers[group].append(page)
+                # Retain one warm slab per group, not the peak concurrency.
+                if self.free_buffers[group]:
+                    self.buffer_counts[group] -= 1
+                    page.ref_count_down()
+                else:
+                    self.free_buffers[group].append(page)
 
         return CaptureBufferLease(page, tokens, widths, release), widths
 
@@ -206,27 +211,46 @@ class CheckpointWorker:
                 start = spec.resident_start if group == 0 else spec.base
                 if not spec.base <= start < spec.end:
                     raise ValueError("checkpoint has no resident suffix")
-                page, widths = self._allocate_fragment(
-                    group, spec.end - start, caches[group]
-                )
-                job.fragments[group] = [(start, spec.end, page, widths)]
+                if spec.end - start > self.capacity_tokens:
+                    raise ValueError(
+                        "Checkpoint fragment exceeds bounded staging capacity"
+                    )
                 blocks = spec.blocks[group]
                 if (spec.end + block_size - 1) // block_size > len(blocks):
                     raise ValueError("checkpoint exceeds original block table")
-                slots = torch.tensor(
-                    [
-                        blocks[i // block_size] * block_size + i % block_size
-                        for i in range(start, spec.end)
-                    ],
-                    dtype=torch.long,
-                    pin_memory=True,
-                )
+                slots = [
+                    blocks[i // block_size] * block_size + i % block_size
+                    for i in range(start, spec.end)
+                ]
                 if any(blocks[i // block_size] <= 0 for i in range(start, spec.end)):
                     raise ValueError("checkpoint source includes released/null blocks")
-                cpu_plans.append((group, start, page, slots))
+                cpu_plans.append((group, start, slots))
+            for attempt in range(2):
+                try:
+                    for group, start, _ in cpu_plans:
+                        if group not in job.fragments:
+                            page, widths = self._allocate_fragment(
+                                group, spec.end - start, caches[group]
+                            )
+                            job.fragments[group] = [(start, spec.end, page, widths)]
+                    break
+                except MemoryError:
+                    with self.buffer_lock:
+                        missing = {
+                            group: caches[group]
+                            for group in (0, 1)
+                            if group not in job.fragments
+                            and not self.free_buffers[group]
+                        }
+                    if attempt or not self.engine.reclaim_checkpoint_capacity(
+                        self.capacity_tokens, missing
+                    ):
+                        raise
             # Admit both groups before uploading any metadata. A second-group
             # OOM must not cause a device wait for an unusable first-group plan.
-            for group, start, page, slots in cpu_plans:
+            for group, start, slots in cpu_plans:
+                page = job.fragments[group][0][2]
+                slots = torch.tensor(slots, dtype=torch.long, pin_memory=True)
                 device_work_started = True
                 plan = self.engine.gpu_connector.prepare_group_capture(
                     [
@@ -331,7 +355,17 @@ class CheckpointWorker:
                         if get_prefix is not None
                         else None
                     )
-                    page, widths = cached or self._allocate_fragment(0, end - start)
+                    if cached is not None:
+                        page, widths = cached
+                    else:
+                        try:
+                            page, widths = self._allocate_fragment(0, end - start)
+                        except MemoryError:
+                            if not self.engine.reclaim_checkpoint_capacity(
+                                self.capacity_tokens, {0: None}
+                            ):
+                                raise
+                            page, widths = self._allocate_fragment(0, end - start)
                     fragment = (start, end, page, widths)
                     job.fragments[0].append(fragment)
                     ptrs, sizes = fragment_vectors(
@@ -361,7 +395,9 @@ class CheckpointWorker:
                     sizes.append(lengths)
                     covered_end = end
                 if covered_end != len(seal.tokens):
-                    raise ValueError("Checkpoint storage keys omit the accepted partial tail")
+                    raise ValueError(
+                        "Checkpoint storage keys omit the accepted partial tail"
+                    )
             owners = tuple(
                 page.raw_data
                 for fragments in job.fragments.values()

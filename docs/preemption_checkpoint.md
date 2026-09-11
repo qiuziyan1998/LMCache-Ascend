@@ -72,12 +72,15 @@ checkpoint configuration cannot silently become degraded recomputation.
 7. A full restore with one real token remaining can use ordinary MTP graph
    admission. Incomplete recovery retains native attention and the MC2 bound.
 
-Checkpoint CPU buffers are a lazily allocated, reusable reserve carved out of
-the existing registered LMCache allocator. Allocation never evicts or busy-waits.
+Checkpoint CPU buffers are allocated lazily from the existing registered LMCache
+allocator. If initial admission fails, one bounded LRU reclamation attempt covers
+the groups still needing buffers, followed by one allocation retry. Both groups
+must be admitted before D2H starts; the allocator's eviction/retry loop remains off.
 Each buffer covers at most one resolved decode-save window plus one chunk.
 The maximum number of jobs uses `store_async_max_queue_size` (two if zero);
-each job can require two Group-0 buffers and one Group-1 buffer. Initial pool
-preparation is not free. No additional model KV HBM pool is reserved; device
+each job can require two Group-0 buffers and one Group-1 buffer. Only one idle
+slab per group is retained after retirement; excess slabs return to the allocator.
+Initial pool preparation and reclamation are not free. No additional model KV HBM pool is reserved; device
 metadata remains generation-owned until its completion event.
 
 Buffer refusal, absent coverage or persistent failure makes the checkpoint
@@ -92,6 +95,9 @@ The scheduler also bounds waiting for a missing acknowledgement with
 returns to the original prefix/recompute path. Old generations cannot seal using
 new history, and stale replies cannot clear a newer lookup. Explicit request
 `lmcache.skip_save` and engine freeze remain authoritative.
+
+See [bounded staging reclamation](checkpoint_staging_reclaim.md) for the candidate
+limit, cache-lock behavior, legacy-layer ownership protection and diagnostics.
 
 Known terminal errors drop exception tracebacks so GC-disabled deployments do
 not retain failed jobs. Quarantined native owners remain visible through cancel

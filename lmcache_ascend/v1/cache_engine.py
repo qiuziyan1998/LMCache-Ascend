@@ -116,6 +116,7 @@ from lmcache_ascend.v1.remote_fill_producer import (
 
 logger = init_logger(__name__)
 REMOTE_FILL_DEFAULT_CONTROL_PORT = 19000
+_CHECKPOINT_RECLAIM_SCAN_ENTRIES = 4096
 _REMOTE_FILL_REQUEST_HANDOFF_EVENT_SOURCE = (
     "forward_context.sfa_reshape_cache_event"
 )
@@ -9553,6 +9554,40 @@ class AscendLMCacheEngine(LMCacheEngine):
             ),
             memory_safety_uncertain=True,
             severity="critical",
+        )
+
+    def reclaim_checkpoint_capacity(
+        self, tokens: int, group_caches: dict[int, Optional[list]]
+    ) -> bool:
+        """Reclaim once for the missing staging groups, without allocation or waits."""
+        local = self._shared_local_cpu_backend()
+        if local is None or tokens <= 0 or not group_caches:
+            return False
+        allocator = local.get_memory_allocator()
+        round_size = getattr(
+            getattr(allocator, "address_manager", None), "compute_aligned_size", None
+        )
+        required_bytes = 0
+        for group, caches in group_caches.items():
+            if caches is not None:
+                self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
+            raw_size = (
+                self.gpu_connector.get_shape(tokens, kv_group=group).numel()
+                * self._shared_cpu_dtype_for_kv_group(group).itemsize
+                * self.num_layers
+            )
+            if round_size is not None:
+                required_bytes += round_size(raw_size)
+            else:
+                alignment = allocator.align_bytes
+                required_bytes += (raw_size + alignment - 1) // alignment * alignment
+        return local.reclaim_evictable_capacity(
+            required_bytes,
+            min_free_bytes=0,
+            min_free_ratio=0,
+            num_layers=self.num_layers,
+            cause="checkpoint_capacity_reclaim",
+            max_scan_entries=_CHECKPOINT_RECLAIM_SCAN_ENTRIES,
         )
 
     def allocate_checkpoint_fragment(

@@ -190,6 +190,7 @@ def fake_engine():
         num_layers=1,
         is_frozen=lambda: False,
         allocate_checkpoint_fragment=alloc,
+        reclaim_checkpoint_capacity=lambda tokens, groups: False,
     )
 
 
@@ -420,6 +421,163 @@ def test_busy_capture_refusal_does_not_synchronize_device(api):
     store.capture(
         control.CaptureSpec("r", 1, 0, 6, 0, ((1, 2), (3, 4))), {0: [1], 1: [2]}, 4
     )
+    assert store.poll()[0].status == "failed"
+    store.close()
+
+
+@pytest.mark.parametrize("failed_group", [0, 1])
+@pytest.mark.parametrize("retry_succeeds", [False, True])
+def test_capture_reclaims_missing_groups_once_before_any_device_work(
+    api, monkeypatch, failed_group, retry_succeeds
+):
+    control, module = api
+    engine = fake_engine()
+    original = engine.allocate_checkpoint_fragment
+    attempts, reclaims, launches = [], [], []
+    store = module.CheckpointWorker(engine)
+
+    def allocate(group, *args):
+        attempts.append(group)
+        if group == failed_group and (not reclaims or not retry_succeeds):
+            raise MemoryError("Checkpoint CPU staging allocation refused")
+        return original(group, *args)
+
+    def reclaim(tokens, groups):
+        assert not launches
+        assert store.buffer_lock.acquire(blocking=False)
+        store.buffer_lock.release()
+        reclaims.append((tokens, set(groups)))
+        return True
+
+    def tensor(values, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return torch.tensor(values, **kwargs)
+
+    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
+    engine.allocate_checkpoint_fragment, engine.reclaim_checkpoint_capacity = (
+        allocate,
+        reclaim,
+    )
+    engine.gpu_connector = NS(
+        prepare_group_capture=lambda *a, **kw: launches.append("prepare"),
+        enqueue_group_capture=lambda plan: NS(
+            synchronize=lambda: launches.append("fence")
+        ),
+        finish_checkpoint_capture=lambda: pytest.fail(
+            "failed CPU admission submitted device work"
+        ),
+    )
+    store.capture(
+        control.CaptureSpec("r", 1, 0, 6, 0, ((1, 2), (3, 4))), {0: [1], 1: [2]}, 4
+    )
+    assert reclaims == [(store.capacity_tokens, {0, 1} if failed_group == 0 else {1})]
+    assert attempts.count(failed_group) == 2
+    assert launches == (["prepare", "prepare", "fence"] if retry_succeeds else [])
+    assert store.poll()[0].status == ("captured" if retry_succeeds else "failed")
+    store.cancel("r")
+    store.close()
+
+
+def test_reclaim_budget_excludes_an_already_reusable_group_buffer(api, monkeypatch):
+    control, module = api
+    engine = fake_engine()
+    store = module.CheckpointWorker(engine)
+    lease, _ = store._allocate_fragment(1, 6)
+    lease.ref_count_down()
+    original = engine.allocate_checkpoint_fragment
+    reclaims = []
+
+    def allocate(group, *args):
+        if not reclaims:
+            raise MemoryError("staging full")
+        return original(group, *args)
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = (
+        lambda tokens, groups: reclaims.append(set(groups)) or True
+    )
+    original_tensor = torch.tensor
+
+    def tensor(values, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return original_tensor(values, **kwargs)
+
+    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
+    engine.gpu_connector = NS(
+        prepare_group_capture=lambda *a, **kw: None,
+        enqueue_group_capture=lambda plan: NS(synchronize=lambda: None),
+    )
+    store.capture(
+        control.CaptureSpec("r", 1, 0, 6, 0, ((1, 2), (3, 4))), {0: [1], 1: [2]}, 4
+    )
+    assert reclaims == [{0}]
+    assert store.poll()[0].status == "captured"
+    store.cancel("r")
+    store.close()
+
+
+def test_excess_idle_staging_returns_to_allocator(api):
+    _, module = api
+    store = module.CheckpointWorker(fake_engine())
+    leases = [store._allocate_fragment(0, 3)[0] for _ in range(3)]
+    pages = [lease.page for lease in leases]
+    for lease in leases:
+        lease.ref_count_down()
+    assert store.buffer_counts[0] == 1 and len(store.free_buffers[0]) == 1
+    assert [page.refs for page in pages] == [1, 0, 0]
+    store.close()
+    assert [page.refs for page in pages] == [0, 0, 0]
+
+
+def test_background_prefix_allocation_reclaims_once_without_releasing_captured_kv(api):
+    control, _ = api
+    engine = fake_engine()
+    store, job = captured_job(api, engine)
+    original = engine.allocate_checkpoint_fragment
+    allocations, reclaims = [], []
+
+    def allocate(*args):
+        allocations.append(args[0])
+        if len(allocations) == 1:
+            raise MemoryError("prefix staging full")
+        return original(*args)
+
+    def reclaim(tokens, groups):
+        assert all(
+            page.refs == 1
+            for fragments in job.fragments.values()
+            for _, _, page, _ in fragments
+        )
+        assert store.buffer_lock.acquire(blocking=False)
+        store.buffer_lock.release()
+        reclaims.append((tokens, groups))
+        return True
+
+    engine.allocate_checkpoint_fragment, engine.reclaim_checkpoint_capacity = (
+        allocate,
+        reclaim,
+    )
+    store.seal(control.SealSpec("r", 1, tuple(range(6))))
+    assert [result.status for result in finish(store)] == ["ready"]
+    assert allocations == [0, 0] and reclaims == [(store.capacity_tokens, {0: None})]
+    assert engine.storage_manager.payloads[0][1] == bytes([123, 123, 123, 0])
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "end,blocks", [(6, ((0, 2), (3, 4))), (6, ((1, 2), (3,))), (50, ((1, 2), (3, 4)))]
+)
+def test_invalid_capture_source_does_not_evict_or_allocate(api, end, blocks):
+    control, module = api
+    engine = fake_engine()
+    engine.allocate_checkpoint_fragment = lambda *a: pytest.fail(
+        "invalid source allocated staging"
+    )
+    engine.reclaim_checkpoint_capacity = lambda *a: pytest.fail(
+        "invalid source evicted cache"
+    )
+    store = module.CheckpointWorker(engine)
+    store.capture(control.CaptureSpec("r", 1, 0, end, 0, blocks), {0: [1], 1: [2]}, 4)
     assert store.poll()[0].status == "failed"
     store.close()
 
