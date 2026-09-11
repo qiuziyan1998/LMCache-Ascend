@@ -204,6 +204,8 @@ def test_mla_dense_multi_chunk_direct_kernel_loads_and_offloads_all_tokens(
     )
     from lmcache_ascend.v1.npu_connector.utils import (
         dense_mla_dsa_batched_direct_kv_transfer,
+        dense_mla_dsa_batched_direct_kv_transfer_prepared,
+        prepare_sparse_direct_destination_state,
     )
 
     ensure_ascend_host_memory_registered()
@@ -274,23 +276,24 @@ def test_mla_dense_multi_chunk_direct_kernel_loads_and_offloads_all_tokens(
         slot_mapping_full = torch.tensor(slots, dtype=torch.long, device=device)
         dummy_metadata = torch.empty(1, dtype=torch.int32, device=device)
 
-        dense_mla_dsa_batched_direct_kv_transfer(
-            source_chunks,
+        destination_state = prepare_sparse_direct_destination_state(
             (k_dst, v_dst),
             slot_mapping_full,
-            dummy_metadata,
-            dummy_metadata,
-            total_tokens,
             kv_format,
-            False,
-            False,
             k_hidden_dims,
             v_hidden_dims,
             0,
-            False,
-            False,
+        )
+        dense_mla_dsa_batched_direct_kv_transfer_prepared(
+            destination_state,
+            slot_mapping_full,
             build_chunk_ptrs_npu(source_chunks, device),
-            chunk_size,
+            dummy_metadata,
+            dummy_metadata,
+            total_tokens,
+            False,
+            validate_inputs=True,
+            fixed_chunk_size=chunk_size,
         )
         torch.npu.synchronize()
 

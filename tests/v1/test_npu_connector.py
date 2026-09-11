@@ -6,9 +6,23 @@ from concurrent.futures import Future
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from weakref import WeakSet
+import ctypes
 import threading
+
+from lmcache.utils import CacheEngineKey
+from lmcache.v1.cache_engine import LayerwiseStoreResult
+from lmcache.v1.gpu_connector.sparse import (
+    PreparedSparseSource,
+    PreparedSparseSourceLayer,
+    build_prepared_sparse_source,
+)
+from lmcache.v1.memory_management import (
+    LayerPageSource,
+    MemoryFormat,
+    TensorMemoryAllocator,
+)
 
 # Third Party
 from lmcache_tests.v1.test_gpu_connector import (
@@ -20,28 +34,19 @@ from lmcache_tests.v1.test_gpu_connector import (
 from lmcache_tests.v1.test_gpu_connector import (
     test_vllm_paged_connector_v2_to_gpu_bench as original_test_vllm_paged_connector_v2_to_gpu_bench,
 )
-from lmcache.v1.gpu_connector.sparse import (
-    PreparedSparseSource,
-    PreparedSparseSourceLayer,
-)
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import (
-    LayerPageSource,
-    MemoryFormat,
-    TensorMemoryAllocator,
-)
 import pytest
 import torch
+
+from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
 # First Party
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
 )
-from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
+import lmcache_ascend.c_ops as lmc_ops
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
-import lmcache_ascend.c_ops as lmc_ops
 
 
 def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
@@ -52,6 +57,8 @@ def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=8,
+        full_tokens=8,
     )
     suffix = allocator.allocate(
         torch.Size([4]),
@@ -88,6 +95,8 @@ def test_layer_page_pointer_resolution_uses_selected_layer(monkeypatch) -> None:
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=8,
+        full_tokens=8,
     )
     assert pages is not None
     monkeypatch.setattr(lmc_ops, "get_device_ptr", lambda address: address + 7)
@@ -99,6 +108,81 @@ def test_layer_page_pointer_resolution_uses_selected_layer(monkeypatch) -> None:
 
     assert pointer == pages[0].layer_data_ptr(1) + 7
     pages[0].ref_count_down()
+
+
+def test_layer_page_pointer_resolution_validates_registered_span(monkeypatch) -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=8,
+        full_tokens=8,
+    )
+    assert pages is not None
+    calls = []
+    monkeypatch.setattr(
+        lmc_ops,
+        "get_device_ptr",
+        lambda address, size: calls.append((address, size)) or address + 7,
+    )
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.enable_npu_transfer_validation = True
+
+    connector._resolve_registered_cpu_source_device_ptr(
+        pages[0], layer_id=1, chunk_index=0, source="test"
+    )
+
+    assert calls == [(pages[0].layer_data_ptr(1), pages[0].layer_size)]
+    pages[0].ref_count_down()
+
+
+@pytest.mark.parametrize(
+    "kv_group,width,fmt",
+    (
+        (0, 9, MemoryFormat.KV_MLA_LATENT_FMT),
+        (1, 3, MemoryFormat.KV_DSA_INDEX_FMT),
+    ),
+)
+def test_ascend_shared_page_metadata_allocates_full_and_tail_pages(
+    kv_group, width, fmt
+) -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.gpu_connector = SimpleNamespace(
+        get_shape=lambda tokens, kv_group=None: torch.Size([tokens * width])
+    )
+    engine._shared_cpu_dtype_for_kv_group = lambda _group: torch.float16
+    engine._memory_format_for_kv_group = lambda _group: fmt
+
+    shape, dtype, actual_fmt = engine._expected_shared_cpu_chunk_metadata(
+        kv_group=kv_group, num_tokens=4
+    )
+
+    assert shape == torch.Size([4 * width])
+    assert dtype == torch.float16
+    assert actual_fmt == fmt
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        shape,
+        dtype,
+        batch_size=2,
+        num_layers=2,
+        fmt=fmt,
+        valid_tokens=[4, 3],
+        full_tokens=4,
+    )
+    assert pages is not None
+    assert [page.valid_tokens for page in pages] == [4, 3]
+    for page, tokens in zip(pages, (4, 3), strict=True):
+        expected_shape = torch.Size([tokens * width])
+        assert page.get_shape() == expected_shape
+        for layer in range(2):
+            expected = torch.arange(tokens * width, dtype=dtype)
+            page.layer_tensor(layer).copy_(expected)
+            assert torch.equal(page.layer_tensor(layer).reshape(-1), expected)
+        page.ref_count_down()
 
 
 def test_direct_page_planner_preserves_layer_plane_run_order() -> None:
@@ -153,6 +237,173 @@ def test_direct_page_planner_preserves_layer_plane_run_order() -> None:
     )
     assert relative is not None
     assert relative[:2] == planned[:2]
+
+
+def test_direct_page_planner_reports_layout_rejection() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.DSA_INDEX,
+        k_hidden_dims=0,
+        v_hidden_dims=0,
+        dsa_hidden_dims=2,
+    )
+    connector._group_layouts = {1: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    unsupported = [(torch.empty((4, 2), dtype=torch.float16),)]
+
+    assert (
+        connector.plan_direct_page_sources(
+            unsupported, torch.arange(4), [0], [4], kv_group=1
+        )
+        is None
+    )
+    assert connector.direct_page_plan_rejection(1) == "unsupported_tensor_layout"
+
+
+def test_direct_page_planner_rejects_ragged_layer_planes() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.MLA_LATENT,
+    )
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    tensor = torch.empty((2, 2, 1, 2), dtype=torch.float16)
+
+    assert not connector.direct_page_layout_supported(
+        [(tensor, tensor, tensor), (tensor,)], 0
+    )
+    assert connector.direct_page_plan_rejection(0) == "owner_layout_mismatch"
+
+
+def test_direct_store_preflight_rejects_metadata_byte_mismatch() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.DSA_INDEX,
+    )
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    connector.get_shape = lambda *_args, **_kwargs: torch.Size([3])
+    tensor = torch.empty((2, 2, 1, 2), dtype=torch.float16)
+
+    assert not connector.direct_page_layout_supported([(tensor,)], 1)
+    assert connector.direct_page_plan_rejection(1) == "page_byte_layout_mismatch"
+
+
+def test_direct_page_token_widths_preserve_plane_order() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    layout = SimpleNamespace(
+        kv_format=npu_connectors.KVCacheFormat.MLA_LATENT,
+    )
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    connector.get_shape = lambda *_args, **_kwargs: torch.Size([3])
+    k = torch.empty((2, 2, 1, 2), dtype=torch.float16)
+    v = torch.empty((2, 2, 1, 1), dtype=torch.float16)
+
+    assert connector.direct_page_token_widths([(k, v)], 0) == (4, 2)
+
+
+def test_direct_store_preflight_checks_each_group_layout_once() -> None:
+    calls = []
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.gpu_connector = SimpleNamespace(
+        direct_page_layout_supported=lambda caches, group: (
+            calls.append((caches, group)) or True
+        )
+    )
+
+    supported = engine.direct_prefill_plan_supported(
+        {0: ["latent"], 1: ["index"]},
+    )
+
+    assert supported is True
+    assert calls == [
+        (["latent"], 0),
+        (["index"], 1),
+    ]
+
+
+@pytest.mark.parametrize("slots", ([0, 1, 2, 3], [0, 1, 4]))
+@pytest.mark.parametrize("kv_group,planes", ((0, 2), (1, 1)))
+def test_direct_page_planner_stream_matches_slot_order(
+    slots, kv_group: int, planes: int
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    layout = SimpleNamespace(
+        kv_format=(
+            npu_connectors.KVCacheFormat.MLA_LATENT
+            if kv_group == 0
+            else npu_connectors.KVCacheFormat.DSA_INDEX
+        ),
+        k_hidden_dims=2,
+        v_hidden_dims=1 if kv_group == 0 else 0,
+        dsa_hidden_dims=2 if kv_group == 1 else 0,
+    )
+    connector._group_layouts = {kv_group: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    kvcaches = []
+    for layer_id in range(connector.num_layers):
+        tensors = []
+        for plane in range(planes):
+            width = plane + 1 if kv_group == 0 else 2
+            tensor = torch.arange(8 * width, dtype=torch.float16).reshape(
+                2, 4, 1, width
+            )
+            tensor.add_(100 * layer_id + 10 * plane)
+            tensors.append(tensor)
+        kvcaches.append(tuple(tensors))
+
+    planned = connector.plan_direct_page_sources(
+        kvcaches,
+        torch.tensor(slots),
+        [0],
+        [len(slots)],
+        kv_group,
+    )
+    destinations = connector.plan_direct_page_destinations(
+        kvcaches,
+        torch.tensor(slots),
+        [0],
+        [len(slots)],
+        kv_group,
+    )
+
+    assert planned is not None
+    assert destinations is not None
+    ptrs, sizes, owners = planned
+    destination_ptrs, destination_sizes, destination_owners = destinations
+    assert destination_ptrs == ptrs
+    assert destination_sizes == sizes
+    assert all(
+        destination is source
+        for destination, source in zip(destination_owners, owners, strict=True)
+    )
+    actual = b"".join(
+        ctypes.string_at(pointer, size)
+        for pointer, size in zip(ptrs[0], sizes[0], strict=True)
+    )
+    expected = b""
+    for tensor in owners:
+        token_bytes = tensor[0, 0].numel() * tensor.element_size()
+        expected += b"".join(
+            ctypes.string_at(tensor.data_ptr() + slot * token_bytes, token_bytes)
+            for slot in slots
+        )
+    runs = 1 if slots == [0, 1, 2, 3] else 2
+    assert len(ptrs[0]) == connector.num_layers * planes * runs
+    assert actual == expected
+
+
+def test_direct_page_destination_planner_honors_disable(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", True)
+
+    assert (
+        connector.plan_direct_page_destinations([], torch.tensor([]), [], [], 1)
+        is None
+    )
 
 
 def test_direct_page_planner_rejects_invalid_slots() -> None:
@@ -404,6 +655,124 @@ def test_direct_retry_replays_success_between_failed_windows() -> None:
     assert state.committed_end == {0: 5}
 
 
+def test_direct_retry_rejects_unverified_gap_before_window() -> None:
+    future = Future()
+    future.set_exception(RuntimeError("window failed"))
+    state = ascend_cache_engine._DirectStoreRequestState(
+        futures=deque((future,)),
+        pending_keys={"window"},
+        submitted_end={0: 6},
+        committed_end={0: 0},
+    )
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_states = {"request": state}
+    engine._pending_store_reqs = {"request": 1}
+    engine._direct_completed_futures = WeakSet()
+    engine._store_cv = threading.Condition(threading.Lock())
+    engine.config = SimpleNamespace(blocking_timeout_secs=1)
+    engine._direct_retry_args = {
+        future: (
+            "request",
+            [0] * 6,
+            {0: [0]},
+            {0: [0]},
+            None,
+            4,
+            {"window"},
+            {0: 6},
+        )
+    }
+    engine._store_direct_cpu_group = lambda *args: (_ for _ in ()).throw(
+        AssertionError("an unverified gap must fail before CPU repair")
+    )
+
+    with pytest.raises(RuntimeError, match="unverified prefix gap"):
+        engine.wait_for_direct_stores(("request",))
+
+
+def test_completed_layerwise_store_seeds_direct_progress() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine._direct_store_states = {}
+    result = LayerwiseStoreResult(
+        request_id="request",
+        kv_group=1,
+        starts=[0, 2, 4],
+        ends=[2, 4, 5],
+        keys=[
+            [
+                CacheEngineKey("model", 1, 0, 11, torch.float16, kv_group=1),
+                CacheEngineKey("model", 1, 0, 22, torch.float16, kv_group=1),
+                CacheEngineKey("model", 1, 0, 33, torch.float16, kv_group=1),
+            ]
+        ],
+        committed_end=5,
+    )
+
+    engine.adopt_completed_layerwise_store(result)
+
+    state = engine._direct_store_states["request"]
+    assert state.submitted_end == {1: 5}
+    assert state.committed_end == {1: 5}
+    assert (state.planned_end, state.planned_hash) == (4, 22)
+
+
+def test_adopted_layerwise_prefix_skips_direct_rehash() -> None:
+    class _TokenDatabase:
+        def process_tokens(self, **kwargs):
+            raise AssertionError("completed prefix must not be rehashed")
+
+        def process_tokens_from_prefix(self, *args, **kwargs):
+            raise AssertionError("completed prefix must not be rehashed")
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine.token_database = _TokenDatabase()
+    state = ascend_cache_engine._DirectStoreRequestState(
+        submitted_end={0: 4, 1: 4},
+        committed_end={0: 4, 1: 4},
+    )
+
+    plans = engine._direct_suffix_plans(
+        state, [1, 2, 3, 4], (0, 1), None
+    )
+
+    assert plans == {0: [], 1: []}
+
+
+def test_completed_layerwise_groups_require_matching_hash_frontier() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine._direct_store_states = {}
+
+    for group, chunk_hash in ((0, 11), (1, 12)):
+        result = LayerwiseStoreResult(
+            request_id="request",
+            kv_group=group,
+            starts=[0],
+            ends=[2],
+            keys=[
+                [
+                    CacheEngineKey(
+                        "model",
+                        1,
+                        0,
+                        chunk_hash,
+                        torch.float16,
+                        kv_group=group,
+                    )
+                ]
+            ],
+            committed_end=2,
+        )
+        if group == 0:
+            engine.adopt_completed_layerwise_store(result)
+        else:
+            with pytest.raises(RuntimeError, match="hash frontier"):
+                engine.adopt_completed_layerwise_store(result)
+    assert engine._direct_store_states["request"].committed_end == {0: 2}
+
+
 def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
     monkeypatch,
 ) -> None:
@@ -478,6 +847,9 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
     engine._pending_store_reqs = {}
     engine._store_queue_maxsize = 2
     engine._store_cv = threading.Condition(threading.Lock())
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.begin_live_source_descriptor("request")
     engine.config = SimpleNamespace(
         chunk_size=2,
         blocking_timeout_secs=5,
@@ -488,16 +860,24 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
     engine.storage_manager = _StorageManager()
     engine.gpu_connector = _GPUConnector()
     slots = torch.arange(4)
+    producer_event = object()
 
     assert engine.store_direct_prefill(
         "request",
         [1, 2, 3, 4],
         {0: [object()], 1: [object()]},
         {0: slots, 1: slots},
+        source_ready_event=producer_event,
+        source_ready_event_source="reshape_cache_event",
     )
 
     assert len(engine.storage_manager.submissions) == 1
     assert len(engine.storage_manager.submissions[0][0]) == 2
+    assert engine.storage_manager.submissions[0][4] is producer_event
+    assert (
+        engine._direct_store_states["request"].source_ready_event_source
+        == "reshape_cache_event"
+    )
     assert engine.token_database.calls[1] == (1, [11, 22], [2, 2])
     engine.wait_for_direct_stores(("request",))
     assert engine._direct_store_states["request"].committed_end == {0: 4, 1: 4}
@@ -586,7 +966,7 @@ def test_direct_suffix_planning_hashes_only_new_complete_chunks() -> None:
         )
 
 
-def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:
+def test_direct_tail_uses_one_merged_partial_page_per_group(monkeypatch) -> None:
     class _Event:
         def record(self) -> None:
             pass
@@ -609,12 +989,9 @@ def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:
         hit_groups = set()
 
         @staticmethod
-        def batched_contains(keys, search_range=None):
-            assert search_range == ["RemoteBackend"]
-            return (
-                len(keys) if keys[0].kv_group in _StorageManager.hit_groups else 0,
-                {},
-            )
+        def batched_external_pages_exist(keys):
+            assert len(keys) == 1 and not hasattr(keys[0], "layer_id")
+            return [keys[0].kv_group in _StorageManager.hit_groups]
 
         def batched_put_external_pages(self, *args):
             self.submissions.append(args)
@@ -625,11 +1002,19 @@ def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:
     monkeypatch.setattr(torch.npu, "Event", _Event)
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    engine.begin_live_source_descriptor("request")
     engine.token_database = _TokenDatabase()
     engine.storage_manager = _StorageManager()
+    producer_event = object()
     engine._direct_store_states = {
         "request": ascend_cache_engine._DirectStoreRequestState(
-            planned_end=4, planned_hash=22
+            planned_end=4,
+            planned_hash=22,
+            source_ready_event=producer_event,
+            source_ready_event_source="reshape_cache_event",
+            source_ready_token_end=5,
         )
     }
     engine._direct_store_jobs = deque()
@@ -642,11 +1027,12 @@ def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:
         blocking_timeout_secs=5,
         get_extra_config_value=lambda name, default: default,
     )
-    owner = torch.empty(1)
+    owner = torch.empty(8, dtype=torch.uint8)
+    owner_base = owner.data_ptr()
 
     def planner(*args, **kwargs):
-        assert kwargs == {"layerwise": True, "slot_mapping_base": 0}
-        return [[1], [2]], [[4], [4]], (owner,)
+        assert kwargs == {"slot_mapping_base": 0}
+        return [[owner_base, owner_base + 4]], [[4, 4]], (owner,)
 
     assert engine._submit_direct_tail(
         "request",
@@ -668,9 +1054,14 @@ def test_direct_tail_uses_legacy_layer_keys(monkeypatch) -> None:
     )
     submission = engine.storage_manager.submissions[0]
     assert len(engine.storage_manager.submissions) == 1
-    assert len(submission[0]) == 4
-    assert [key.layer_id for key in submission[0]] == [0, 1, 0, 1]
-    assert [key.kv_group for key in submission[0]] == [0, 0, 1, 1]
+    assert len(submission[0]) == 2
+    assert [key.kv_group for key in submission[0]] == [0, 1]
+    assert submission[1] == [
+        [owner_base, owner_base + 4],
+        [owner_base, owner_base + 4],
+    ]
+    assert submission[2] == [[4, 4], [4, 4]]
+    assert submission[4] is producer_event
     assert submission[-1] == "request"
     engine.wait_for_direct_stores(("request",))
     assert engine._direct_store_states["request"].committed_end == {0: 5, 1: 5}
@@ -776,7 +1167,137 @@ def test_direct_prefill_skips_disabled_unfull_tail() -> None:
         {0: torch.arange(2)},
         slot_mapping_base=4,
     )
-    assert engine.direct_store_committed_ends("window") == {0: 4}
+    assert engine.direct_store_committed_ends("window") == {0: 0}
+
+    assert engine.store_direct_prefill(
+        "verified-window",
+        list(range(6)),
+        {0: [object()]},
+        {0: torch.arange(2)},
+        slot_mapping_base=4,
+        verified_prefix_end=4,
+    )
+    assert engine.direct_store_committed_ends("verified-window") == {0: 4}
+
+
+def test_direct_prefill_rejects_missing_prefix_before_window() -> None:
+    class _TokenDatabase:
+        @staticmethod
+        def process_tokens(tokens=None, kv_group=0, **kwargs):
+            for start in range(0, len(tokens), 2):
+                yield (
+                    start,
+                    start + 2,
+                    CacheEngineKey(
+                        "model", 1, 0, start, torch.float16, kv_group=kv_group
+                    ),
+                )
+
+    class _StorageManager:
+        @staticmethod
+        def batched_external_pages_exist(keys):
+            return [False] * len(keys)
+
+    class _GPUConnector:
+        @staticmethod
+        def plan_direct_page_sources(*args, **kwargs):
+            raise AssertionError("unaddressable prefix must fail before planning")
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_enabled = True
+    engine._direct_store_states = {}
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine.token_database = _TokenDatabase()
+    engine.storage_manager = _StorageManager()
+    engine.gpu_connector = _GPUConnector()
+
+    with pytest.raises(RuntimeError, match="uncommitted prefix"):
+        engine.store_direct_prefill(
+            "window",
+            list(range(6)),
+            {0: [object()]},
+            {0: torch.arange(2)},
+            slot_mapping_base=4,
+        )
+
+
+def test_direct_prefill_checks_chunk_crossing_unaligned_verified_prefix() -> None:
+    class _TokenDatabase:
+        @staticmethod
+        def process_tokens(tokens=None, kv_group=0, **kwargs):
+            for start in range(0, len(tokens), 2):
+                yield (
+                    start,
+                    start + 2,
+                    CacheEngineKey(
+                        "model", 1, 0, start, torch.float16, kv_group=kv_group
+                    ),
+                )
+
+    class _StorageManager:
+        @staticmethod
+        def batched_external_pages_exist(keys):
+            assert [key.chunk_hash for key in keys] == [2, 4]
+            return [False, False]
+
+    class _GPUConnector:
+        @staticmethod
+        def plan_direct_page_sources(*args, **kwargs):
+            raise AssertionError("crossing missing page is outside the save window")
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._direct_store_enabled = True
+    engine._direct_store_states = {}
+    engine.config = SimpleNamespace(chunk_size=2)
+    engine.token_database = _TokenDatabase()
+    engine.storage_manager = _StorageManager()
+    engine.gpu_connector = _GPUConnector()
+
+    with pytest.raises(RuntimeError, match="uncommitted prefix"):
+        engine.store_direct_prefill(
+            "window",
+            list(range(6)),
+            {0: [object()]},
+            {0: torch.arange(3)},
+            slot_mapping_base=3,
+            verified_prefix_end=3,
+        )
+
+
+def test_direct_cpu_fallback_rejects_unaddressable_prefix() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+
+    with pytest.raises(RuntimeError, match="CPU fallback cannot address"):
+        engine._store_direct_cpu_group(
+            "window",
+            list(range(6)),
+            [object()],
+            torch.arange(2),
+            0,
+            0,
+            None,
+            slot_mapping_base=4,
+        )
+
+
+def test_direct_cpu_fallback_uses_all_layer_transfer() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    calls = []
+
+    def store_layer(_tokens, **kwargs):
+        calls.append(kwargs)
+        yield LayerwiseStoreResult(request_id="request", committed_end=4)
+
+    engine.store_layer = store_layer
+    engine.wait_for_pending_sync_stores = lambda: None
+    engine._require_store_completion = False
+
+    committed = engine._store_direct_cpu_group(
+        "request", [0] * 4, [object()], torch.arange(4), 1, 0, None
+    )
+
+    assert committed == 4
+    assert calls[0]["all_layers_ready"] is True
 
 
 def _make_layer_page_sources():
@@ -787,6 +1308,8 @@ def _make_layer_page_sources():
         batch_size=2,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=2,
+        full_tokens=2,
     )
     suffix = [
         allocator.allocate(
@@ -841,6 +1364,113 @@ def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
         obj.ref_count_down()
 
 
+def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(32768, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=[2, 1],
+        full_tokens=2,
+    )
+    assert pages is not None
+    sources = [
+        LayerPageSource(tuple(pages), layer_id) for layer_id in range(2)
+    ]
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    calls = []
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda page, *, layer_id, chunk_index, required_bytes, **_kwargs: (
+            calls.append((page, layer_id, chunk_index, required_bytes))
+            or page.data_ptr
+        ),
+    )
+
+    host_rows = []
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, None)
+
+    assert calls == [
+        (page, 0, chunk_index, page.get_size())
+        for chunk_index, page in enumerate(pages)
+    ]
+    assert host_rows == [
+        [page.layer_data_ptr(layer_id) for page in pages]
+        for layer_id in range(2)
+    ]
+    for page in pages:
+        page.ref_count_down()
+
+
+def test_prepare_page_pointer_cache_is_one_copy_and_rejects_suffix(
+    monkeypatch,
+) -> None:
+    _allocator, pages, suffix, sources = _make_layer_page_sources()
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda page, *, layer_id, **_kwargs: page.layer_data_ptr(layer_id),
+    )
+    tensor_calls = 0
+    original_tensor = torch.tensor
+
+    def counted_tensor(*args, **kwargs):
+        nonlocal tensor_calls
+        tensor_calls += 1
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", counted_tensor)
+    host_rows, npu_rows = [], []
+
+    assert connector.prepare_sparse_page_ptr_cache_for_layers(
+        [LayerPageSource(tuple(pages), layer) for layer in range(2)],
+        host_rows,
+        npu_rows,
+    )
+    assert tensor_calls == 1
+    assert host_rows == [
+        [page.layer_data_ptr(layer) for page in pages] for layer in range(2)
+    ]
+    assert [row.tolist() for row in npu_rows] == host_rows
+
+    unchanged_host = [[7], [8]]
+    unchanged_npu = [torch.tensor([7]), torch.tensor([8])]
+    assert not connector.prepare_sparse_page_ptr_cache_for_layers(
+        sources, unchanged_host, unchanged_npu
+    )
+    assert unchanged_host == [[7], [8]]
+    assert [row.tolist() for row in unchanged_npu] == [[7], [8]]
+    for obj in [*pages, *suffix]:
+        obj.ref_count_down()
+
+
+def test_group_pointer_append_validates_complete_page_span(monkeypatch) -> None:
+    _allocator, pages, suffix, sources = _make_layer_page_sources()
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    connector.enable_npu_transfer_validation = True
+    calls = []
+    monkeypatch.setattr(
+        lmc_ops,
+        "get_device_ptr",
+        lambda address, size: calls.append((address, size)) or address + 1000,
+    )
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, [], [])
+
+    assert calls[: len(pages)] == [
+        (page.data_ptr, page.get_size()) for page in pages
+    ]
+    for obj in [*pages, *suffix]:
+        obj.ref_count_down()
+
+
 def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     connector = _make_sparse_pack_connector()
     connector.num_layers = 2
@@ -848,8 +1478,8 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     monkeypatch.setattr(
         connector,
         "_resolve_registered_cpu_source_device_ptr",
-        lambda source, *, layer_id, chunk_index, **_kwargs: calls.append(
-            (source, layer_id, chunk_index)
+        lambda source_obj, *, layer_id, chunk_index, **_kwargs: calls.append(
+            (source_obj, layer_id, chunk_index)
         )
         or 100 * layer_id
         + chunk_index,
@@ -861,6 +1491,56 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
 
     assert host_rows == [[0, 1], [100, 101]]
     assert len(calls) == 4
+
+
+def test_group_pointer_append_can_defer_copy_to_dense_stream(monkeypatch) -> None:
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    connector.kv_device = SimpleNamespace(type="npu")
+    connector._resolve_registered_cpu_source_device_ptr = (
+        lambda _source, *, layer_id, chunk_index, **_kwargs: (
+            100 * layer_id + chunk_index
+        )
+    )
+    stage = MagicMock(side_effect=lambda tensor, **_kwargs: tensor)
+    monkeypatch.setattr(connector, "stage_dense_load_tensor", stage)
+    host_rows, npu_rows = [], []
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        [[object()], [object()]],
+        host_rows,
+        npu_rows,
+        defer_copy=True,
+    )
+
+    stage.assert_called_once()
+    assert stage.call_args.args[0].device.type == "cpu"
+    assert host_rows == [[0], [100]]
+    assert [row.tolist() for row in npu_rows] == host_rows
+
+
+def test_dense_metadata_staging_is_pinned_nonblocking_and_streamed() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.kv_device = SimpleNamespace(type="npu")
+    connector.load_stream = object()
+    connector._stream_context_or_null = MagicMock(return_value=nullcontext())
+    tensor = MagicMock()
+    tensor.device.type = "cpu"
+    converted = tensor.to.return_value
+    converted.is_pinned.return_value = False
+    pinned = converted.pin_memory.return_value
+    staged = pinned.to.return_value
+
+    assert connector.stage_dense_load_tensor(tensor, dtype=torch.long) is staged
+
+    tensor.to.assert_called_once_with(dtype=torch.long)
+    converted.pin_memory.assert_called_once_with()
+    connector._stream_context_or_null.assert_called_once_with(connector.load_stream)
+    pinned.to.assert_called_once_with(
+        device=connector.kv_device,
+        dtype=torch.long,
+        non_blocking=True,
+    )
 
 
 def test_group_pointer_append_falls_back_for_malformed_page_layout(
@@ -915,6 +1595,36 @@ def test_sparse_pointer_resolution_prefers_complete_npu_cache(monkeypatch) -> No
     )
 
     assert resolved is cached
+
+
+def test_layer_pointer_append_uploads_only_new_pointers(monkeypatch) -> None:
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 2
+    host_rows = [[101, 202], [404]]
+    npu_rows = [torch.tensor(row, dtype=torch.long) for row in host_rows]
+    other_row = npu_rows[1]
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda *_args, **_kwargs: 303,
+    )
+    uploaded = []
+    tensor = torch.tensor
+
+    def track_tensor(values, **kwargs):
+        uploaded.append(list(values))
+        return tensor(values, **kwargs)
+
+    monkeypatch.setattr(npu_connectors.torch, "tensor", track_tensor)
+
+    connector.append_sparse_chunk_ptr_cache_for_layer(
+        0, [object()], host_rows, npu_rows
+    )
+
+    assert uploaded == [[303]]
+    assert host_rows == [[101, 202, 303], [404]]
+    assert npu_rows[0].tolist() == [101, 202, 303]
+    assert npu_rows[1] is other_row
 
 
 def test_sparse_pointer_resolution_rebuilds_npu_cache_from_host_row(
@@ -1098,6 +1808,13 @@ class _TrackingEvent:
     def record(self, stream):
         self.records.append(stream.name)
 
+    def synchronize(self):
+        self.records.append("synchronize")
+
+    def query(self):
+        self.records.append("query")
+        return True
+
 
 class _DenseLayout:
     k_hidden_dims = 1
@@ -1105,6 +1822,7 @@ class _DenseLayout:
     dsa_hidden_dims = 0
     kv_format = type("_Fmt", (), {"value": 0})()
     vllm_two_major = False
+    kv_device = torch.device("cpu")
     gpu_buffer_allocator = None
 
 
@@ -1163,14 +1881,72 @@ def test_shared_cpu_store_publication_fences_store_stream() -> None:
     assert connector.store_stream.events == ["synchronize"]
 
 
-def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
+def test_dense_load_readiness_records_and_waits_without_host_sync(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.load_stream = _TrackingStream("dense-load")
+    producer_stream = _TrackingStream("producer")
+    compute_stream = _TrackingStream("compute")
+    event = _TrackingEvent("dense-ready")
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(
+            Event=lambda: event,
+            current_stream=lambda: compute_stream,
+        ),
+    )
+
+    readiness = connector.record_dense_load_readiness(producer_stream)
+    connector.consume_dense_load_readiness(readiness)
+
+    assert readiness is event
+    assert event.records == ["producer"]
+    assert compute_stream.events == [("wait_event", "dense-ready")]
+    assert connector.load_stream.events == []
+
+
+def test_dense_load_readiness_synchronizes_exact_event() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    event = _TrackingEvent("dense-ready")
+
+    connector.synchronize_dense_load_readiness(event)
+
+    assert event.records == ["synchronize"]
+
+
+def test_dense_load_readiness_query_does_not_synchronize() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    event = _TrackingEvent("dense-ready")
+
+    assert connector.query_dense_load_readiness(event)
+
+    assert event.records == ["query"]
+
+
+def test_dense_load_readiness_defaults_to_legacy_load_stream(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.load_stream = _TrackingStream("dense-load")
+    event = _TrackingEvent("dense-ready")
+    monkeypatch.setattr(
+        npu_connectors.torch,
+        "npu",
+        SimpleNamespace(Event=lambda: event),
+    )
+
+    connector.record_dense_load_readiness()
+
+    assert event.records == ["dense-load"]
+
+
+def test_sparse_direct_state_key_tracks_source_and_destination(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector._sparse_direct_layer_states = None
+    connector.enable_npu_transfer_validation = True
     kvcaches_ref = [
-        (
+        [
             torch.zeros((1, 4), dtype=torch.bfloat16),
             torch.zeros((1, 4), dtype=torch.bfloat16),
-        )
+        ]
     ]
     slot_mapping = torch.arange(4, dtype=torch.long)
     source = torch.zeros(8, dtype=torch.bfloat16)
@@ -1257,12 +2033,56 @@ def test_sparse_direct_state_key_includes_source_layout(monkeypatch) -> None:
         sparse_v_hidden_dims=1,
         sparse_dsa_hidden_dims=0,
     )
+    kvcaches_ref[0][0] = torch.zeros((1, 4), dtype=torch.bfloat16)
+    replaced_destination = connector._get_or_create_sparse_direct_layer_state(
+        kvcaches_ref=kvcaches_ref,
+        kv_group=0,
+        layer_id=0,
+        layer_tensors=[source],
+        slot_mapping_ref=slot_mapping,
+        total_tokens=4,
+        sparse_kv_format=0,
+        sparse_token_major=False,
+        sparse_vllm_two_major=False,
+        sparse_k_hidden_dims=1,
+        sparse_v_hidden_dims=1,
+        sparse_dsa_hidden_dims=0,
+    )
 
     assert first is same
     assert same_shape_new_source is first
     assert same_shape_new_slot_mapping is first
     assert changed is not first
-    assert len(prepared) == 2
+    assert replaced_destination is not first
+    assert len(prepared) == 3
+
+
+def test_layerwise_slot_validation_rejects_out_of_range_cpu_mapping() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.dsa_two_groups = True
+    connector.num_layers = 1
+    connector.enable_npu_transfer_validation = True
+
+    with pytest.raises(ValueError, match="slot mapping is out of range"):
+        connector.validate_layerwise_slot_mapping(
+            torch.tensor([0, 4], dtype=torch.long),
+            [[torch.empty((1, 4, 1, 1))]],
+            kv_group=1,
+        )
+
+    connector.enable_npu_transfer_validation = False
+    connector.validate_layerwise_slot_mapping(
+        torch.tensor([0, 4], dtype=torch.long),
+        [[torch.empty((1, 4, 1, 1))]],
+        kv_group=1,
+    )
+    with pytest.raises(RuntimeError, match="mismatched layer counts"):
+        connector._check_layerwise_transfer_invariants(
+            operation="retrieve",
+            kv_group=1,
+            slot_mapping_full=torch.empty(0, dtype=torch.long),
+            kvcaches_ref=[],
+        )
 
 
 def test_sparse_pack_requires_compact_scratch_slot_mapping() -> None:
@@ -1475,6 +2295,130 @@ def test_sparse_transfer_topk_limits_aligned_views(monkeypatch) -> None:
     assert slots.numel() == selected.numel() == 4
 
 
+@pytest.mark.parametrize(
+    "selection",
+    [None, [], torch.empty(0, dtype=torch.int32)],
+)
+def test_sparse_transfer_topk_preserves_implicit_dense_bootstrap(
+    monkeypatch,
+    selection,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    connector = _make_sparse_pack_connector()
+    slots = torch.arange(4, dtype=torch.long)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selection,
+        None,
+    )
+    packed_slots, packed_selected = connector._pack_sparse_layer_inputs(
+        slots,
+        normalized,
+        0,
+    )
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=None,
+        )
+    )
+
+    assert has_explicit_selection is False
+    assert limited_slots.tolist() == [0, 1, 2, 3]
+    assert limited_selected.tolist() == [0, 1, 2, 3]
+
+
+def test_sparse_transfer_topk_limits_only_simple_explicit_selection(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    connector = _make_sparse_pack_connector()
+    slots = torch.arange(4, dtype=torch.long)
+    selected = torch.tensor([3, 2, 1, 0], dtype=torch.int32)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selected,
+        None,
+    )
+    packed_slots, packed_selected = connector._pack_sparse_layer_inputs(
+        slots,
+        normalized,
+        0,
+    )
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=None,
+        )
+    )
+
+    assert has_explicit_selection is True
+    assert limited_slots.tolist() == [0, 1]
+    assert limited_selected.tolist() == [3, 2]
+
+
+def test_sparse_transfer_topk_preserves_target_mapped_selection_counts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    connector = _make_sparse_pack_connector()
+    selected = torch.tensor([[3, 2, 1, 0]], dtype=torch.int32)
+    target_slots = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    selected_counts = torch.tensor([4], dtype=torch.int32)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selected,
+        target_slots,
+    )
+    packed_slots, packed_selected, packed_counts = (
+        connector._pack_sparse_explicit_slot_inputs(
+            normalized,
+            target_slots,
+            selected_counts,
+        )
+    )
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=packed_counts,
+        )
+    )
+
+    assert has_explicit_selection is True
+    assert limited_slots.tolist() == [[10, 11, 12, 13]]
+    assert limited_selected.tolist() == [[3, 2, 1, 0]]
+
+
+def test_empty_target_mapped_selection_remains_explicit_noop() -> None:
+    connector = _make_sparse_pack_connector()
+    selected = torch.empty((1, 0), dtype=torch.int32)
+    target_slots = torch.empty((1, 0), dtype=torch.long)
+    selected_counts = torch.tensor([0], dtype=torch.int32)
+
+    normalized, has_explicit_selection = connector._normalize_sparse_selection(
+        selected,
+        target_slots,
+    )
+    packed_slots, packed_selected, packed_counts = (
+        connector._pack_sparse_explicit_slot_inputs(
+            normalized,
+            target_slots,
+            selected_counts,
+        )
+    )
+
+    assert has_explicit_selection is True
+    assert packed_slots.numel() == 0
+    assert packed_selected.numel() == 0
+    assert packed_counts.tolist() == [0]
+
+
 @pytest.mark.parametrize("limit", [0, 4, 8])
 def test_sparse_transfer_topk_preserves_shorter_inputs(
     monkeypatch,
@@ -1495,11 +2439,37 @@ def test_sparse_transfer_topk_preserves_shorter_inputs(
     assert limited_selected is selected
 
 
+@pytest.mark.parametrize(
+    ("chunks", "total_tokens"),
+    [(74, 18879), (2, 257), (2, 512), (1, 256)],
+)
+def test_sparse_fixed_chunk_coverage_accepts_exact_tail(
+    chunks: int, total_tokens: int
+) -> None:
+    VLLMPagedMemLayerwiseNPUConnector._validate_sparse_fixed_chunk_coverage(
+        chunks, 256, total_tokens
+    )
+
+
+@pytest.mark.parametrize(
+    ("chunks", "total_tokens"),
+    [(73, 18879), (75, 18879), (1, 257), (3, 257), (3, 512)],
+)
+def test_sparse_fixed_chunk_coverage_rejects_missing_or_extra_tail(
+    chunks: int, total_tokens: int
+) -> None:
+    with pytest.raises(ValueError, match="exact full/tail chunk coverage"):
+        VLLMPagedMemLayerwiseNPUConnector._validate_sparse_fixed_chunk_coverage(
+            chunks, 256, total_tokens
+        )
+
+
 def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")
     connector._sparse_direct_layer_states = None
     connector._sparse_direct_validated_layers = set()
+    connector.enable_npu_transfer_validation = True
 
     class _Stream:
         def wait_stream(self, stream):
@@ -1516,9 +2486,13 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
             self._numel = numel
             self.dtype = torch.long
             self.device = torch.device("cpu")
+            self.recorded_streams = []
 
         def numel(self):
             return self._numel
+
+        def record_stream(self, stream):
+            self.recorded_streams.append(stream)
 
     fast_calls = []
     slow_calls = []
@@ -1547,6 +2521,7 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     slot_mapping = _TensorLike(2)
     selected = _TensorLike(2)
     chunk_ptrs = _TensorLike(1)
+    selected_counts = _TensorLike(1)
 
     transfer_kwargs = dict(
         kvcaches_ref=[(object(), object())],
@@ -1570,18 +2545,28 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         layer_tensors=[lmc_chunk],
         slot_mapping_ref=slot_mapping,
         cpu_tensors=[lmc_chunk],
+        selected_token_counts=selected_counts,
     )
     first_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
     second_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
+    connector.enable_npu_transfer_validation = False
+    connector._sparse_direct_validated_layers.clear()
+    third_kernel = connector._run_sparse_direct_kv_transfer_layer(**transfer_kwargs)
 
     assert first_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
     assert second_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
-    assert len(fast_calls) == 2
+    assert third_kernel == "sparse_mla_dsa_batched_direct_kv_transfer_fast"
+    assert len(fast_calls) == 3
     assert slow_calls == []
     assert fast_calls[0][0][0] is layer_state
     assert fast_calls[1][0][0] is layer_state
     assert fast_calls[0][0][7] is True
     assert fast_calls[1][0][7] is False
+    assert fast_calls[2][0][7] is False
+    assert slot_mapping.recorded_streams == [transfer_kwargs["load_stream"]] * 3
+    assert selected.recorded_streams == [transfer_kwargs["load_stream"]] * 3
+    assert chunk_ptrs.recorded_streams == [transfer_kwargs["load_stream"]] * 3
+    assert selected_counts.recorded_streams == [transfer_kwargs["load_stream"]] * 3
 
 
 def test_dense_direct_fast_state_cache_separates_load_and_store(
@@ -1591,8 +2576,8 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     connector._sparse_direct_layer_states = None
     connector._sparse_direct_validated_layers = set()
 
-    transfer_stream = _NoopStream()
-    current_stream = _NoopStream()
+    transfer_stream = _TrackingStream("load")
+    current_stream = _TrackingStream("producer")
     slot_mapping = _RecordableTensor(8)
     chunk_ptrs = _RecordableTensor(2)
     chunk_offsets = _RecordableTensor(2, dtype=torch.int32)
@@ -1653,23 +2638,103 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
         **common_kwargs,
         direction=True,
     )
+    connector._run_dense_direct_kv_transfer_layer(
+        **{**common_kwargs, "current_stream": transfer_stream},
+        direction=False,
+    )
 
     assert len(prepared) == 2
-    assert len(fast_calls) == 2
+    assert len(fast_calls) == 3
     assert fast_calls[0][0][0] is prepared[0]
     assert fast_calls[1][0][0] is prepared[1]
     assert fast_calls[0][0][7] is False
     assert fast_calls[1][0][7] is True
+    assert transfer_stream.events == [
+        ("wait_stream", "producer"),
+        ("wait_stream", "producer"),
+    ]
+    assert current_stream.events == [
+        ("wait_stream", "load"),
+        ("wait_stream", "load"),
+    ]
     for transfer_input in (
         slot_mapping,
         chunk_ptrs,
         chunk_offsets,
         chunk_sizes,
     ):
-        assert transfer_input.recorded_streams == [
-            transfer_stream,
-            transfer_stream,
-        ]
+        assert transfer_input.recorded_streams == [transfer_stream] * 3
+
+
+def test_prepared_dense_load_bypasses_shape_cache_and_validates_once(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.enable_npu_transfer_validation = True
+    connector._sparse_direct_layer_states = {}
+    stream = _TrackingStream("load")
+    states = (object(), object())
+    plan = npu_connectors._SparseDestinationPlan([], (), states)
+    calls = []
+
+    monkeypatch.setattr(
+        connector,
+        "_stream_context_or_null",
+        lambda _stream: nullcontext(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_dense_direct_pointer_cache_signature",
+        lambda **_kwargs: pytest.fail("prepared dense load built a shape key"),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_direct_layer_state",
+        lambda **_kwargs: pytest.fail("prepared dense load used hybrid state"),
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "dense_mla_dsa_batched_direct_kv_transfer_prepared",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    slot_mapping = _RecordableTensor(273)
+    chunk_ptrs = _RecordableTensor(2)
+    chunk_offsets = _RecordableTensor(1, dtype=torch.int32)
+    chunk_sizes = _RecordableTensor(1, dtype=torch.int32)
+    common = dict(
+        kvcaches_ref=[],
+        kv_group=1,
+        transfer_stream=stream,
+        current_stream=stream,
+        slot_mapping_full=slot_mapping,
+        chunk_ptrs_npu=chunk_ptrs,
+        chunk_offsets_npu=chunk_offsets,
+        chunk_sizes_npu=chunk_sizes,
+        total_tokens=273,
+        fixed_chunk_size=256,
+        dense_kv_format=0,
+        dense_token_major=False,
+        dense_vllm_two_major=False,
+        dense_k_hidden_dims=1,
+        dense_v_hidden_dims=1,
+        dense_dsa_hidden_dims=0,
+        dense_host_interleaved=False,
+        layer_tensors=[],
+        direction=False,
+        destination_plan=plan,
+    )
+    connector._run_dense_direct_kv_transfer_layer(layer_id=0, **common)
+    connector._run_dense_direct_kv_transfer_layer(layer_id=1, **common)
+
+    assert [call[0][0] for call in calls] == list(states)
+    assert [call[1]["validate_inputs"] for call in calls] == [True, False]
+    assert all(call[1]["fixed_chunk_size"] == 256 for call in calls)
+    assert connector._sparse_direct_layer_states == {}
+    assert slot_mapping.recorded_streams == [stream]
+    assert chunk_offsets.recorded_streams == [stream]
+    assert chunk_sizes.recorded_streams == [stream]
+    assert chunk_ptrs.recorded_streams == [stream, stream]
 
 
 def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
@@ -1902,6 +2967,8 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
         batch_size=1,
         num_layers=1,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=4,
+        full_tokens=4,
     )
     assert pages is not None
     page_gen = connector.batched_to_gpu_head_token_wise(
@@ -1930,6 +2997,13 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
 
 def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
+    perf_events = []
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: True)
+    monkeypatch.setattr(
+        npu_connectors,
+        "serving_perf_log",
+        lambda _logger, event, **fields: perf_events.append((event, fields)),
+    )
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
     connector.lmcache_chunk_size = 256
@@ -2043,14 +3117,234 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
     assert all("chunk_size" not in call for call in plan_calls)
     assert len(transfer_calls) == 2
     assert all(call["plan"] is destination_plan for call in transfer_calls)
-    assert all(call["source_layer"] is source_layer for call in transfer_calls)
+    assert all(call["chunk_ptrs_npu"] is source_layer.chunk_ptrs_npu for call in transfer_calls)
     assert all(
         "load_stream" not in call and "current_stream" not in call
         for call in transfer_calls
     )
+    assert perf_events == []
+
+    monkeypatch.setattr(npu_connectors, "_COLD_PERF_SLOW_MS", -1.0)
+    slow_generator = connector.batched_to_gpu_head_token_wise(
+        prepared_sparse_source=source,
+        kvcaches=[(object(), object())],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+    )
+    next(slow_generator)
+    slow_generator.send(
+        {
+            "selected_token_ids": selected,
+            "token_start_index": 0,
+            "payload_event": object(),
+        }
+    )
+    assert [event for event, _ in perf_events] == [
+        "prepared_sparse_submit_summary"
+    ]
+    assert perf_events[0][1]["sum_ms"] >= perf_events[0][1]["max_ms"] >= 0
+    slow_generator.close()
 
     for generator in generators:
         generator.close()
+
+
+def test_prepared_sparse_group0_registers_request_source_probe(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.lmcache_chunk_size = 4
+    connector.kv_device = torch.device("cpu")
+    connector._group_layouts = {
+        0: SimpleNamespace(
+            k_hidden_dims=2,
+            v_hidden_dims=1,
+            dsa_hidden_dims=0,
+            kv_format=SimpleNamespace(value=0),
+            vllm_two_major=False,
+            kv_device=torch.device("cpu"),
+        )
+    }
+    connector._layerwise_token_major = lambda _group: False
+    connector._sparse_lmc_host_interleaved = lambda _group: False
+    connector._get_or_create_sparse_destination_plan = lambda **_kwargs: object()
+    operation_order = []
+    connector._run_prepared_sparse_direct_kv_transfer_layer = (
+        lambda **_kwargs: operation_order.append("transfer")
+    )
+
+    source_tensor = torch.arange(12, dtype=torch.bfloat16)
+    source_layer = PreparedSparseSourceLayer(
+        tensors=(source_tensor,),
+        chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+    )
+    source = PreparedSparseSource(
+        layers=(source_layer,),
+        total_tokens=4,
+        chunk_token_counts=(4,),
+    )
+    layer_cache = (
+        torch.zeros((1, 4, 1, 2), dtype=torch.bfloat16),
+        torch.zeros((1, 4, 1, 1), dtype=torch.bfloat16),
+    )
+    probe_calls = []
+
+    def register_probe(**kwargs):
+        operation_order.append("probe")
+        probe_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        npu_connectors,
+        "npu_content_diagnostics_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        npu_connectors,
+        "register_group0_source_probe",
+        register_probe,
+    )
+
+    generator = connector.batched_to_gpu_head_token_wise(
+        prepared_sparse_source=source,
+        kvcaches=[layer_cache],
+        slot_mapping=torch.arange(4, dtype=torch.long),
+        sync=False,
+        kv_group=0,
+        req_id="request-1",
+        lmcache_cached_tokens=4,
+    )
+    next(generator)
+    selected = torch.tensor([[0, 2]], dtype=torch.int32)
+    selected_count = torch.tensor([2], dtype=torch.int32)
+    generator.send(
+        {
+            "selected_token_ids": selected,
+            "target_slot_mapping": torch.tensor([[8, 9]], dtype=torch.long),
+            "selected_token_counts": selected_count,
+        }
+    )
+
+    assert len(probe_calls) == 1
+    probe = probe_calls[0]
+    assert probe["req_id"] == "request-1"
+    assert probe["layer_id"] == 0
+    assert len(probe["source_chunks"]) == 1
+    assert probe["source_chunks"][0] is source_tensor
+    assert torch.equal(probe["selected_tokens"], selected)
+    assert torch.equal(probe["selected_count"], selected_count)
+    assert probe["total_tokens"] == 4
+    assert probe["layer_cache"] is layer_cache
+    assert operation_order == ["probe", "transfer"]
+    generator.close()
+
+
+def test_prepared_sparse_rejects_nonstandard_chunk_coverage() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.lmcache_chunk_size = 4
+    connector._group_layouts = {
+        0: SimpleNamespace(
+            k_hidden_dims=1,
+            v_hidden_dims=1,
+            dsa_hidden_dims=0,
+            kv_format=SimpleNamespace(value=0),
+            kv_device=torch.device("cpu"),
+        )
+    }
+    connector._sparse_lmc_host_interleaved = lambda _group: False
+    source = PreparedSparseSource(
+        layers=(),
+        total_tokens=6,
+        chunk_token_counts=(3, 3),
+    )
+    generator = connector._batched_to_gpu_head_token_wise_prepared(
+        {
+            "prepared_sparse_source": source,
+            "kvcaches": [],
+            "slot_mapping": torch.empty(0, dtype=torch.int64),
+        }
+    )
+
+    with pytest.raises(ValueError, match="full non-tail chunks"):
+        next(generator)
+
+
+@pytest.mark.parametrize("sealed,chunk_size", [(True, 4), (True, 2), (False, 4)])
+def test_prepared_chunk_validation_is_reused_safely(
+    sealed: bool,
+    chunk_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.lmcache_chunk_size = chunk_size
+    connector._group_layouts = {
+        0: SimpleNamespace(
+            k_hidden_dims=1,
+            v_hidden_dims=1,
+            dsa_hidden_dims=0,
+            kv_format=SimpleNamespace(value=0),
+            kv_device=torch.device("cpu"),
+        )
+    }
+    connector._sparse_lmc_host_interleaved = lambda group: False
+    connector._get_or_create_sparse_destination_plan = MagicMock()
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: False)
+    monkeypatch.setattr(
+        npu_connectors, "serving_perf_detailed_enabled", lambda: False
+    )
+    monkeypatch.setattr(
+        npu_connectors, "npu_content_diagnostics_enabled", lambda: False
+    )
+    if sealed:
+        source = build_prepared_sparse_source(
+            [[torch.empty(1), torch.empty(1)]],
+            [torch.tensor([1, 2], dtype=torch.long)],
+            num_layers=1,
+            total_tokens=6,
+            chunk_token_counts=(4, 2),
+            chunk_size=4,
+        )
+        assert source is not None
+    else:
+        source = PreparedSparseSource(
+            layers=(), total_tokens=4, chunk_token_counts=(2, 2)
+        )
+    generator = connector._batched_to_gpu_head_token_wise_prepared(
+        {
+            "prepared_sparse_source": source,
+            "kvcaches": [],
+            "slot_mapping": torch.empty(0, dtype=torch.long),
+        }
+    )
+    if sealed and chunk_size == 4:
+
+        def no_chunk_scan(*args: Any) -> None:
+            pytest.fail("warm reuse rescanned sealed chunk metadata")
+
+        monkeypatch.setattr(npu_connectors, "any", no_chunk_scan, raising=False)
+        assert next(generator) is None
+        generator.close()
+        connector._get_or_create_sparse_destination_plan.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="full non-tail chunks"):
+            next(generator)
+        connector._get_or_create_sparse_destination_plan.assert_not_called()
+
+
+def test_pointer_append_skips_perf_clocks_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: False)
+    monkeypatch.setattr(
+        npu_connectors,
+        "time",
+        SimpleNamespace(
+            perf_counter=MagicMock(side_effect=AssertionError("disabled perf clock")),
+            thread_time_ns=MagicMock(side_effect=AssertionError("disabled CPU clock")),
+        ),
+    )
+    test_group_pointer_append_can_defer_copy_to_dense_stream(monkeypatch)
 
 
 def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> None:
@@ -2074,12 +3368,16 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
         "sparse_dsa_hidden_dims": 0,
         "expected_device": torch.device("cpu"),
     }
+    first_diagnostics = {}
     first = connector._get_or_create_sparse_destination_plan(
         slot_mapping_ref=torch.arange(4, dtype=torch.long),
+        diagnostics=first_diagnostics,
         **plan_kwargs,
     )
+    second_diagnostics = {}
     second = connector._get_or_create_sparse_destination_plan(
         slot_mapping_ref=torch.arange(32, dtype=torch.long),
+        diagnostics=second_diagnostics,
         **plan_kwargs,
     )
 
@@ -2087,6 +3385,43 @@ def test_sparse_destination_plan_is_reused_across_step_sizes(monkeypatch) -> Non
     assert len(prepare_calls) == 2
     assert not hasattr(first, "validated")
     assert not hasattr(first, "source")
+    assert first_diagnostics["destination_plan_cache_hit"] is False
+    assert second_diagnostics["destination_plan_cache_hit"] is True
+    assert first_diagnostics["destination_plan_resolve_ms"] >= 0
+    assert second_diagnostics["destination_plan_resolve_ms"] >= 0
+
+
+def test_sparse_destination_plan_rebuilds_after_tensor_replacement(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.enable_npu_transfer_validation = True
+    connector._sparse_destination_plans = {}
+    kvcaches = [[torch.zeros((1, 4)), torch.zeros((1, 4))]]
+    prepare_calls = []
+    monkeypatch.setattr(
+        npu_connectors,
+        "prepare_sparse_direct_destination_state",
+        lambda *args: prepare_calls.append(args) or object(),
+    )
+    kwargs = {
+        "kvcaches_ref": kvcaches,
+        "kv_group": 0,
+        "slot_mapping_ref": torch.arange(4, dtype=torch.long),
+        "sparse_kv_format": 0,
+        "sparse_k_hidden_dims": 1,
+        "sparse_v_hidden_dims": 1,
+        "sparse_dsa_hidden_dims": 0,
+        "expected_device": torch.device("cpu"),
+    }
+
+    first = connector._get_or_create_sparse_destination_plan(**kwargs)
+    kvcaches[0][0] = torch.zeros((1, 4))
+    second = connector._get_or_create_sparse_destination_plan(**kwargs)
+
+    assert second is not first
+    assert len(prepare_calls) == 2
 
 
 def test_prepared_sparse_launch_avoids_load_stream_handoff(
@@ -2118,9 +3453,15 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
         lambda *args: calls.append(args),
     )
 
+    def fail_tensor_work(*_args, **_kwargs):
+        raise AssertionError("prepared launch copied or read back tensor inputs")
+
+    for operation in ("to", "copy_", "cpu", "item", "sum"):
+        monkeypatch.setattr(torch.Tensor, operation, fail_tensor_work)
+
     connector._run_prepared_sparse_direct_kv_transfer_layer(
         plan=plan,
-        source_layer=source_layer,
+        chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
         layer_id=0,
         slot_mapping_packed=slots,
         selected_token_idx=selected,
@@ -2135,7 +3476,7 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     assert args[1] is slots
     assert args[2] is selected
     assert args[3] is chunk_ptrs
-    assert args[4:] == (256, 4, True)
+    assert args[4:] == (256, 4, True, None, 0)
 
 
 def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
@@ -2145,15 +3486,32 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     compute_stream = _TrackingStream("compute")
     load_streams = [_TrackingStream("load-0"), _TrackingStream("load-1")]
     done_events = [_TrackingEvent("done-0"), _TrackingEvent("done-1")]
+
     connector.load_stream_list = load_streams
     connector._sparse_load_done_events = done_events
     connector._active_sparse_load_join = None
+    host_stages = []
+
+    class _Watchdog:
+        def begin_host(self, **fields):
+            return fields
+
+        def update_host(self, _state, stage):
+            host_stages.append(stage)
+
+        def end_host(self, _state):
+            host_stages.append("done")
+
+    connector._sparse_h2d_stall_watchdog = _Watchdog()
 
     connector._sparse_direct_validated_layers = set()
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: True)
     monkeypatch.setattr(
         npu_connectors.torch,
         "npu",
-        SimpleNamespace(current_stream=lambda: compute_stream),
+        SimpleNamespace(
+            current_stream=lambda: compute_stream,
+        ),
         raising=False,
     )
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
@@ -2181,11 +3539,11 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
             load_stream=load_streams[stream_index],
             load_stream_idx=stream_index,
             current_stream=compute_stream,
-            slot_mapping_packed=torch.arange(2, dtype=torch.long),
-            selected_token_idx=torch.arange(2, dtype=torch.int32),
+            slot_mapping_packed=_RecordableTensor(2),
+            selected_token_idx=_RecordableTensor(2, dtype=torch.int32),
             chunk_size=256,
             total_tokens=4,
-            chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+            chunk_ptrs_npu=_RecordableTensor(1, dtype=torch.int64),
             sparse_kv_format=0,
             sparse_token_major=False,
             sparse_vllm_two_major=False,
@@ -2214,6 +3572,8 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
         ("wait_event", "done-0"),
         ("wait_event", "done-1"),
     ]
+    assert host_stages.count("native_return") == 2
+    assert host_stages.count("done") == 2
     assert connector._active_sparse_load_join is None
 
     load_streams[0].events.clear()
@@ -2261,6 +3621,91 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
     assert load_streams[0].events[-1] == "synchronize"
     assert load_streams[1].events[-1] == "synchronize"
     assert connector._active_sparse_load_join is None
+
+
+def test_sparse_h2d_watchdog_captures_stalled_python_stack(monkeypatch) -> None:
+    reports = []
+    reported = threading.Event()
+    release = threading.Event()
+
+    def capture(_logger, event, **fields):
+        reports.append((event, fields))
+        reported.set()
+
+    def stalled_submission(watchdog):
+        state = watchdog.begin_host(layer=16)
+        watchdog.update_host(state, "resolve_layer_state")
+        while not release.is_set():
+            sum(range(64))
+        watchdog.end_host(state)
+
+    monkeypatch.setattr(npu_connectors, "serving_perf_log", capture)
+    watchdog = npu_connectors._SparseH2DStallWatchdog(0.01)
+    worker = threading.Thread(target=stalled_submission, args=(watchdog,))
+    worker.start()
+
+    try:
+        assert reported.wait(1)
+        assert reports[0][0] == "sparse_h2d_python_stall"
+        assert reports[0][1]["pending_stage"] == "resolve_layer_state"
+        assert reports[0][1]["layer"] == 16
+        assert reports[0][1]["timeout_seconds"] == 0.01
+        assert any(
+            frame["function"] == "stalled_submission"
+            for frame in reports[0][1]["python_stack"]
+        )
+    finally:
+        release.set()
+        worker.join(1)
+    assert watchdog.begin_host(layer=18) is None
+
+    reports.clear()
+    reported.clear()
+    watchdog = npu_connectors._SparseH2DStallWatchdog(0.01)
+    state = watchdog.begin_host(layer=17)
+    watchdog.update_host(state, "native_return")
+    watchdog.end_host(state)
+
+    assert not reported.wait(0.05)
+    assert reports == []
+
+
+def test_sparse_h2d_watchdog_failures_do_not_affect_submission(monkeypatch) -> None:
+    class _BrokenWatchdog:
+        def begin_host(self, **_fields):
+            return {}
+
+        def update_host(self, _state, _stage):
+            raise RuntimeError("diagnostic update failed")
+
+        def end_host(self, _state):
+            raise RuntimeError("diagnostic cleanup failed")
+
+    class _Connector:
+        _active_sparse_load_join = SimpleNamespace(
+            host_state=None,
+            watchdog=_BrokenWatchdog(),
+        )
+
+        @npu_connectors._trace_sparse_h2d_python
+        def submit(self, **_kwargs):
+            npu_connectors._sparse_h2d_python_stage(
+                self._active_sparse_load_join,
+                "native_fast_submit",
+            )
+            return "ok"
+
+    assert _Connector().submit(layer_id=3) == "ok"
+
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_h2d_stall_watchdog = None
+    monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: True)
+
+    def fail_watchdog(_timeout):
+        raise RuntimeError("thread creation failed")
+
+    monkeypatch.setattr(npu_connectors, "_SparseH2DStallWatchdog", fail_watchdog)
+    assert connector._get_sparse_h2d_stall_watchdog() is None
 
 
 def test_sparse_destination_plan_replaces_destination_per_group(
@@ -2526,6 +3971,18 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         ),
     )
 
+    slot_device_calls = []
+
+    def _slot_mapping_on_kv_device(slot_mapping, stream):
+        slot_device_calls.append((slot_mapping, stream))
+        return slot_mapping
+
+    monkeypatch.setattr(
+        connector,
+        "_slot_mapping_on_kv_device",
+        _slot_mapping_on_kv_device,
+    )
+
     pointer_calls = []
 
     def _resolve_chunk_ptrs(
@@ -2535,6 +3992,7 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         expected_num_chunks=None,
         cached_chunk_dev_ptrs=None,
         source_objs=None,
+        stream=None,
     ):
         pointer_calls.append(
             (
@@ -2556,6 +4014,14 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
         connector,
         "_resolve_sparse_chunk_ptrs_npu",
         _resolve_chunk_ptrs,
+    )
+
+    destination_plan = object()
+    plan_calls = []
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **kwargs: plan_calls.append(kwargs) or destination_plan,
     )
 
     direct_calls = []
@@ -2585,6 +4051,11 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     gen.close()
 
     assert init_staging_values == [False]
+    assert len(slot_device_calls) == 1
+    assert slot_device_calls[0][1] is connector.load_stream
+    assert torch.equal(
+        slot_device_calls[0][0], torch.arange(273, dtype=torch.long)
+    )
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is cached_chunk_ptrs_npu
     assert len(pointer_calls[0][1]) == 1
@@ -2595,11 +4066,12 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert direct_calls[0]["total_tokens"] == 273
     assert direct_calls[0]["fixed_chunk_size"] == 256
     assert direct_calls[0]["kvcaches_ref"] is request_kvcaches
+    assert direct_calls[0]["destination_plan"] is destination_plan
 
     cached_gen = connector.batched_to_gpu(
         [0, 256],
-        [256, 273],
-        slot_mapping=torch.arange(273, dtype=torch.long),
+        [256, 300],
+        slot_mapping=torch.arange(300, dtype=torch.long),
         sync=False,
         kv_group=0,
         cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
@@ -2609,12 +4081,47 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     cached_gen.send(
         [
             _MemoryObj(torch.zeros(256, dtype=torch.bfloat16)),
-            _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
+            _MemoryObj(torch.zeros(44, dtype=torch.bfloat16)),
         ]
     )
     cached_gen.close()
+    assert direct_calls[1]["total_tokens"] == 300
+    assert direct_calls[1]["destination_plan"] is destination_plan
     assert len(pointer_calls[-1][1]) == 1
     assert pointer_calls[-1][3] == 2
+
+    producer_stream = _TrackingStream("producer")
+    connector.load_stream = _TrackingStream("load")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: producer_stream)
+    readiness = object()
+    record = MagicMock(return_value=readiness)
+    monkeypatch.setattr(connector, "record_dense_load_readiness", record)
+    readiness_out = []
+    deferred_gen = connector.batched_to_gpu(
+        [0, 256],
+        [256, 273],
+        slot_mapping=torch.arange(273, dtype=torch.long),
+        sync=True,
+        kv_group=0,
+        cached_chunk_ptrs_npu=[],
+        kvcaches=request_kvcaches,
+        _dense_load_readiness_out=readiness_out,
+    )
+    next(deferred_gen)
+    deferred_gen.send(
+        [
+            _MemoryObj(torch.zeros(256, dtype=torch.bfloat16)),
+            _MemoryObj(torch.zeros(17, dtype=torch.bfloat16)),
+        ]
+    )
+    next(deferred_gen)
+    deferred_gen.close()
+
+    assert readiness_out == [readiness]
+    assert connector.load_stream.events == [("wait_stream", "producer")]
+    assert direct_calls[-1]["current_stream"] is connector.load_stream
+    assert all(call["kvcaches_ref"] is request_kvcaches for call in plan_calls)
+    record.assert_called_once_with()
 
 
 def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
@@ -2669,6 +4176,12 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
             [111, 222, 333], dtype=torch.long
         ),
     )
+    destination_plan = object()
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **_kwargs: destination_plan,
+    )
 
     direct_calls = []
     monkeypatch.setattr(
@@ -2700,6 +4213,7 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["direction"] is False
     assert direct_calls[0]["fixed_chunk_size"] == 0
     assert direct_calls[0]["total_tokens"] == 401
+    assert direct_calls[0]["destination_plan"] is destination_plan
     assert direct_calls[0]["chunk_offsets_npu"].tolist() == starts
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
 
@@ -2767,6 +4281,18 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
         ),
     )
 
+    slot_device_calls = []
+
+    def _slot_mapping_on_kv_device(slot_mapping, stream):
+        slot_device_calls.append((slot_mapping, stream))
+        return slot_mapping
+
+    monkeypatch.setattr(
+        connector,
+        "_slot_mapping_on_kv_device",
+        _slot_mapping_on_kv_device,
+    )
+
     pointer_calls = []
 
     def _resolve_chunk_ptrs(
@@ -2816,6 +4342,7 @@ def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     gen.close()
 
     assert init_staging_values == [False]
+    assert slot_device_calls == [(local_slot_mapping, connector.store_stream)]
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is None
     assert len(direct_calls) == 1
@@ -3020,3 +4547,96 @@ def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
 
     with patch(target_patch, new=VLLMPagedMemNPUConnectorV2):
         original_test_vllm_paged_connector_v2_to_gpu_bench(benchmark)
+
+
+def test_compact_page_layout_keeps_layers_and_runs_independent() -> None:
+    connector = VLLMPagedMemLayerwiseNPUConnector.__new__(
+        VLLMPagedMemLayerwiseNPUConnector
+    )
+    owners = (torch.empty(1), torch.empty(1))
+    connector._direct_page_tensor_layout = MagicMock(
+        return_value=([(1000, 8), (2000, 8)], owners, 32)
+    )
+
+    layers, runs, retained = connector.plan_compact_page_layout(
+        [], torch.tensor([2, 3, 7, 8]), [0], [4], 1
+    )
+
+    assert layers == [
+        {
+            "layer_id": 0,
+            "buffer_base": 1000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+        {
+            "layer_id": 1,
+            "buffer_base": 2000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+    ]
+    assert runs == [
+        {"logical_token_start": 0, "physical_slot_start": 2, "token_count": 2},
+        {"logical_token_start": 2, "physical_slot_start": 7, "token_count": 2},
+    ]
+    assert retained is owners
+
+
+def test_compact_latent_page_layout_preserves_page_run_boundaries() -> None:
+    connector = VLLMPagedMemLayerwiseNPUConnector.__new__(
+        VLLMPagedMemLayerwiseNPUConnector
+    )
+    owners = (torch.empty(1), torch.empty(1))
+    connector._direct_page_tensor_layout = MagicMock(
+        return_value=([(1000, 8), (2000, 8)], owners, 32)
+    )
+
+    layers, pages, retained = connector.plan_compact_latent_page_layout(
+        [], torch.tensor([2, 3, 7, 8, 9]), [0, 3], [3, 5]
+    )
+
+    assert layers == [
+        {
+            "layer_id": 0,
+            "buffer_base": 1000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+        {
+            "layer_id": 1,
+            "buffer_base": 2000,
+            "token_bytes": 8,
+            "slot_capacity": 32,
+        },
+    ]
+    assert pages == [
+        {
+            "logical_token_start": 0,
+            "token_count": 3,
+            "runs": [
+                {
+                    "logical_token_start": 0,
+                    "physical_slot_start": 2,
+                    "token_count": 2,
+                },
+                {
+                    "logical_token_start": 2,
+                    "physical_slot_start": 7,
+                    "token_count": 1,
+                },
+            ],
+        },
+        {
+            "logical_token_start": 3,
+            "token_count": 2,
+            "runs": [
+                {
+                    "logical_token_start": 3,
+                    "physical_slot_start": 8,
+                    "token_count": 2,
+                }
+            ],
+        },
+    ]
+    assert retained is owners

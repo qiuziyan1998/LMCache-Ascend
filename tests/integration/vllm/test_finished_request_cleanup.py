@@ -17,18 +17,19 @@ base_adapter_mod = pytest.importorskip(
 )
 
 
-def _make_adapter(*, store_async: bool, requests=None):
+def _make_adapter(*, store_async: bool, requests=None, kv_role="kv_both"):
     engine = MagicMock()
     metadata = base_adapter_mod.LMCacheConnectorMetadata(requests=requests or [])
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
     adapter.store_async = store_async
-    adapter.kv_role = "kv_both"
+    adapter.kv_role = kv_role
     adapter._manager = SimpleNamespace(lmcache_engine=engine)
     adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
     adapter._wait_for_save_done = True
     adapter._finished_req_ids_waiting_for_save = set()
     adapter._late_finished_sending = set()
     adapter._release_finished_worker_requests = MagicMock()
+    adapter._drop_worker_retrieve_state = MagicMock()
     return adapter, engine
 
 
@@ -49,9 +50,60 @@ def test_async_get_finished_releases_only_completed_stores() -> None:
 
     assert adapter.get_finished({"req-1"}) == (None, None)
     adapter._release_finished_worker_requests.assert_not_called()
+    adapter._drop_worker_retrieve_state.assert_called_once_with("req-1")
+    engine.drop_direct_store_states.assert_not_called()
 
     assert adapter.get_finished(set()) == ({"req-1"}, None)
     adapter._release_finished_worker_requests.assert_called_once_with({"req-1"})
+    adapter._drop_worker_retrieve_state.assert_called_once_with("req-1")
+    engine.drop_direct_store_states.assert_called_once_with({"req-1"})
+
+
+def test_async_consumer_releases_retrieval_without_store_completion() -> None:
+    adapter, engine = _make_adapter(
+        store_async=True,
+        kv_role="kv_consumer",
+    )
+    engine.get_finished_stores.return_value = set()
+
+    assert adapter.get_finished({"req-1"}) == (None, None)
+
+    adapter._drop_worker_retrieve_state.assert_called_once_with("req-1")
+    adapter._release_finished_worker_requests.assert_not_called()
+    engine.drop_direct_store_states.assert_not_called()
+
+
+def test_async_no_store_completion_releases_all_state() -> None:
+    adapter, engine = _make_adapter(store_async=True)
+    engine.get_finished_stores.return_value = {"req-1"}
+
+    assert adapter.get_finished({"req-1"}) == ({"req-1"}, None)
+
+    adapter._release_finished_worker_requests.assert_called_once_with({"req-1"})
+    adapter._drop_worker_retrieve_state.assert_not_called()
+    engine.drop_direct_store_states.assert_called_once_with({"req-1"})
+
+
+def test_pending_store_releases_real_retrieval_lease_eagerly() -> None:
+    adapter, engine = _make_adapter(store_async=True)
+    state = base_adapter_mod.WorkerRetrieveState(req_id="req-1")
+    adapter._worker_retrieve_state = {"req-1": state}
+    adapter._worker_retrieve_registry_version = 0
+    adapter._drop_worker_retrieve_state = (
+        base_adapter_mod.LMCacheConnectorV1Impl._drop_worker_retrieve_state.__get__(
+            adapter
+        )
+    )
+    engine.get_finished_stores.side_effect = [set(), {"req-1"}]
+
+    assert adapter.get_finished({"req-1"}) == (None, None)
+    assert adapter._worker_retrieve_state == {}
+    engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
+    engine.lookup_unpin.assert_called_once_with("req-1")
+
+    assert adapter.get_finished(set()) == ({"req-1"}, None)
+    engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
+    engine.lookup_unpin.assert_called_once_with("req-1")
 
 
 def test_finish_before_wait_releases_during_save_completion() -> None:

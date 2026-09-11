@@ -337,6 +337,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     total_tokens: int,
     lmc_host_interleaved: bool,
     selected_token_counts: Optional[torch.Tensor] = None,
+    diagnostic_layer_id: int = -1,
 ) -> None:
     lmc_ops.sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         destination_state,
@@ -347,6 +348,7 @@ def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
         total_tokens,
         lmc_host_interleaved,
         selected_token_counts,
+        diagnostic_layer_id,
     )
 
 
@@ -410,6 +412,30 @@ def dense_mla_dsa_batched_direct_kv_transfer_fast(
         total_tokens,
         lmc_host_interleaved,
         direction,
+        validate_inputs,
+        fixed_chunk_size,
+    )
+
+
+def dense_mla_dsa_batched_direct_kv_transfer_prepared(
+    destination_state,
+    slot_mapping_full: torch.Tensor,
+    chunk_ptrs_npu: torch.Tensor,
+    chunk_offsets_npu: torch.Tensor,
+    chunk_sizes_npu: torch.Tensor,
+    total_tokens: int,
+    lmc_host_interleaved: bool,
+    validate_inputs: bool = False,
+    fixed_chunk_size: int = 0,
+) -> None:
+    lmc_ops.dense_mla_dsa_batched_direct_kv_transfer_prepared(
+        destination_state,
+        slot_mapping_full,
+        chunk_ptrs_npu,
+        chunk_offsets_npu,
+        chunk_sizes_npu,
+        total_tokens,
+        lmc_host_interleaved,
         validate_inputs,
         fixed_chunk_size,
     )

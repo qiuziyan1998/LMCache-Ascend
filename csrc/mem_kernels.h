@@ -262,7 +262,8 @@ void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
     torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
     const int64_t total_tokens, const bool lmc_host_interleaved,
-    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
+    const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt,
+    const int64_t diagnostic_layer_id = -1);
 
 // Dense MLA/DSA direct transfer between CPU pinned chunks and paged KV.
 // direction=false: host chunks -> paged KV; direction=true: paged KV -> host chunks.
@@ -284,6 +285,15 @@ void dense_mla_dsa_batched_direct_kv_transfer_fast(
     torch::Tensor &chunk_ptrs_npu, torch::Tensor &chunk_offsets_npu,
     torch::Tensor &chunk_sizes_npu, const int64_t total_tokens,
     const bool lmc_host_interleaved, const bool direction,
+    const bool validate_inputs = false, const int64_t fixed_chunk_size = 0);
+
+// Prepared H2D path: destination state is process-owned; request metadata is
+// supplied dynamically and never becomes part of a prepared-state cache key.
+void dense_mla_dsa_batched_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_ptrs_npu,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    const int64_t total_tokens, const bool lmc_host_interleaved,
     const bool validate_inputs = false, const int64_t fixed_chunk_size = 0);
 
 // Group hot path: one host dispatch runs the existing per-layer direct kernel.

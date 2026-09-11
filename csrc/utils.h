@@ -161,7 +161,7 @@ struct SparseDirectLayerState {
   SingleLayerKVConfig config;
 };
 
-// Process-lifetime destination state for prepared MLA/DSA sparse retrieve.
+// Process-lifetime destination state for prepared MLA/DSA direct retrieve.
 // Request source metadata and per-step launch data are deliberately excluded.
 struct SparseDirectDestinationState {
   uint8_t *vllm_k_ptr;
