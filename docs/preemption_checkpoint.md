@@ -81,7 +81,7 @@ outputs are considered even with periodic decode save disabled.
 Capture prepares all admitted chunks together: one native submission per group
 and one final fence. The existing prepared native binding supports the chunk
 pointer matrix, so this follow-up requires no C++ rebuild beyond the earlier
-checkpoint extension. Deploy matching LMCache-NPU and LMCache-Ascend Python code.
+checkpoint extension. Deploy matching Python code in all four repositories for idle release-control dispatch.
 
 Waiting offers hold keys, not pins. Group-0 pages adopted as active sparse-decode
 sources remain protected by the running request. Group-1 CPU ownership retires

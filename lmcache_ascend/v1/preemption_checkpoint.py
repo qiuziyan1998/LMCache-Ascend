@@ -66,6 +66,7 @@ class CheckpointWorker:
         self.engine = engine
         self.jobs: dict[tuple[str, int], CaptureJob] = {}
         self.results: list[CheckpointResult] = []
+        self.restore_owners: dict[tuple[str, int, int], list[Any]] = {}
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="checkpoint-store"
         )
@@ -73,6 +74,23 @@ class CheckpointWorker:
         self.timeout = float(engine.config.blocking_timeout_secs)
         self.chunk_size = int(engine.config.chunk_size)
         self.local = LocalCheckpointStore(engine)
+
+    def begin_restore(self, req_id: str, generation: int, load_generation: int) -> None:
+        """Keep release controls active until the scheduler acknowledges every TP."""
+        self.restore_owners.setdefault((req_id, generation, load_generation), [])
+
+    def hold_restore(
+        self, req_id: str, generation: int, load_generation: int, owners: list[Any]
+    ) -> None:
+        """Transfer normalized-source ownership before starting any consumer."""
+        self.restore_owners[req_id, generation, load_generation].extend(owners)
+
+    def release_restore(
+        self, req_id: str, generation: int, load_generation: int
+    ) -> None:
+        """Retire one attempt only after its all-worker receive acknowledgement."""
+        for page in self.restore_owners.pop((req_id, generation, load_generation), ()):
+            page.ref_count_down()
 
     def _allocate_fragment(
         self, group: int, tokens: int, caches: Any = None
@@ -96,7 +114,7 @@ class CheckpointWorker:
                 CheckpointResult(
                     *key,
                     "failed" if job.cancelled else "captured",
-                    spec.end,
+                    job.captured_end,
                     "duplicate generation",
                 )
             )
@@ -390,6 +408,10 @@ class CheckpointWorker:
 
     def close(self) -> None:
         """Drain background readers before retiring registered buffers."""
+        if self.restore_owners:
+            raise RuntimeError(
+                "Checkpoint restores still await all-worker acknowledgement"
+            )
         for req_id, generation in tuple(self.jobs):
             self.cancel(req_id, generation)
         self.executor.shutdown(wait=True)

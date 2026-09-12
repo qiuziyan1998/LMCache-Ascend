@@ -18,7 +18,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 from urllib.parse import urlsplit
-from weakref import WeakSet
+from weakref import WeakSet, proxy
 import json
 import logging
 import os
@@ -9557,6 +9557,124 @@ class AscendLMCacheEngine(LMCacheEngine):
             severity="critical",
         )
 
+    def enable_checkpoint_prefix_agreement(self) -> None:
+        """Arm ordered checkpoint control reception on an actual preemption."""
+        if hasattr(self, "_checkpoint_envelope_reader"):
+            return
+        self._checkpoint_prefix_results = {}
+        reader = type(self)._receive_shared_envelope
+        self._checkpoint_envelope_reader = reader
+        receiver = proxy(self)
+        self._receive_shared_envelope = lambda: receiver._receive_checkpoint_envelope(
+            reader
+        )
+        self._remote_fill_all_ranks_materialized = (
+            lambda local_ready, **kwargs: receiver._checkpoint_remote_fill_agreement(
+                local_ready, **kwargs
+            )
+        )
+
+    def _checkpoint_prefix_result(self, identity: tuple) -> Future:
+        condition, _, _ = self._shared_envelope_mailbox()
+        with condition:
+            return self._checkpoint_prefix_results.setdefault(identity, Future())
+
+    def _receive_checkpoint_envelope(self, reader: Callable) -> Any:
+        envelope = reader(self)
+        if envelope.phase not in ("checkpoint_index_prefix", "checkpoint_remote_fill"):
+            return envelope
+        identity = dict(
+            req_id=envelope.request_id,
+            phase=envelope.phase,
+            request_ordinal=envelope.request_ordinal,
+            layer_id=0,
+            kv_group=envelope.kv_group,
+        )
+        self._validate_shared_layerwise_envelope(envelope, **identity)
+        result = self._checkpoint_prefix_result(
+            self._shared_envelope_identity(envelope)
+        )
+        # The mailbox keeps receive_active set across this ordered all-reduce.
+        # All earlier Group-0 envelopes are already buffered and remain consumable.
+        # Native reads already have a bounded drain deadline, potentially longer
+        # than blocking_timeout_secs. Do not leave the collective before that
+        # reader reports its terminal status.
+        ready = self.collective_all_true_fn(result.result())
+        return replace(
+            envelope,
+            status="skipped" if ready else "error",
+            message=None if ready else "checkpoint prefix failed on a TP rank",
+        )
+
+    def finish_checkpoint_prefix(self, request: Any, ready: bool) -> bool:
+        """Agree on TP participation before entering the CPU index-tail stage.
+
+        The marker and reduction share the existing ordered envelope transport;
+        an unrelated broadcast cannot overtake the reduction on any TP rank.
+        This is background TP load coordination, never per-step DP agreement.
+        """
+        return self._ordered_checkpoint_agreement(
+            request.req_id,
+            "checkpoint_index_prefix",
+            request.load_spec.dsa_cold_load_generation,
+            1,
+            ready,
+        )
+
+    def _checkpoint_remote_fill_agreement(
+        self, ready: bool, *, req_id: str, kv_group: int
+    ) -> bool:
+        # RemoteFill already reduces on this CPU group. Route its reduction
+        # through the same ordering so it cannot race a checkpoint marker.
+        result = self._ordered_checkpoint_agreement(
+            req_id, "checkpoint_remote_fill", 0, kv_group, ready
+        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_materialization_consensus",
+                req_id=req_id,
+                kv_group=kv_group,
+                rank=self.metadata.worker_id,
+                local_ready=bool(ready),
+                all_ranks_ready=result,
+            )
+        return result
+
+    def _ordered_checkpoint_agreement(
+        self, req_id: str, phase: str, ordinal: int, kv_group: int, ready: bool
+    ) -> bool:
+        self.enable_checkpoint_prefix_agreement()
+        identity = dict(
+            req_id=req_id,
+            phase=phase,
+            request_ordinal=ordinal,
+            layer_id=0,
+            kv_group=kv_group,
+        )
+        marker = replace(
+            self._shared_layerwise_error_envelope(**identity, message=""),
+            status="skipped",
+        )
+        if self.metadata.is_first_rank():
+            condition, _, _ = self._shared_envelope_mailbox()
+            with condition:
+                self._broadcast_shared_envelope(marker)
+                return bool(self.collective_all_true_fn(ready))
+        key = self._shared_envelope_identity(marker)
+        result = self._checkpoint_prefix_result(key)
+        result.set_result(ready)
+        try:
+            envelope = self._receive_matching_shared_envelope(**identity)
+            self._validate_shared_layerwise_envelope(
+                replace(envelope, status="skipped"), **identity
+            )
+            return envelope.status == "skipped"
+        finally:
+            condition, _, _ = self._shared_envelope_mailbox()
+            with condition:
+                self._checkpoint_prefix_results.pop(key, None)
+
     def forget_checkpoint_request(self, req_id: str) -> None:
         """Retire local offer metadata on the existing request-finished event."""
         if self.checkpoint_worker is not None:
@@ -9733,7 +9851,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._validate_shared_layerwise_envelope(envelope, **identity)
         if envelope.status != "skipped":
             if isinstance(error, NativeExternalPageTransferUnknownError):
-                self.mark_init_failed("checkpoint prefix DMA completion is unknown")
+                self._remote_fill_require_paired_restart((request.req_id,))
                 raise error
             raise RuntimeError(
                 f"Local checkpoint restore unavailable: {envelope.message}"

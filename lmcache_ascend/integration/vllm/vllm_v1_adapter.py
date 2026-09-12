@@ -1380,8 +1380,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.lmcache_engine is None:
             return
         worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
-        if worker is not None and self._parent.has_connector_metadata():
-            metadata = self._parent._get_connector_metadata()
+        metadata = (
+            self._parent._get_connector_metadata()
+            if self._parent.has_connector_metadata()
+            else None
+        )
+        if metadata is not None and metadata.preemption_captures:
+            self.lmcache_engine.enable_checkpoint_prefix_agreement()
+        if worker is not None and metadata is not None:
             for req_id, generation in metadata.preemption_cancels:
                 worker.cancel(req_id, generation)
             captures = metadata.preemption_captures
@@ -1532,6 +1538,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             # The local index tail uses the existing CPU-load stream/fences.
             # Preserve the existing guard against concurrent runtime graph capture.
             request.load_spec.dsa_group1_direct_hbm = False
+            worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
+            if worker is not None:
+                worker.begin_restore(
+                    request.req_id,
+                    request.load_spec.checkpoint_generation,
+                    request.load_spec.dsa_cold_load_generation,
+                )
+                self._activate_checkpoint_io()
         super()._submit_dsa_cold_compact_load(request)
 
     def _run_dsa_cold_compact_load(
@@ -1559,7 +1573,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     previous_latent_future.exception()
                 except BaseException:
                     pass  # Preserve ordering without inheriting an older failure.
-            _, owners = self.lmcache_engine.prepare_checkpoint_restore(plan["request"])
+            request = plan["request"]
+            _, owners = self.lmcache_engine.prepare_checkpoint_restore(request)
+            if owners:
+                self.lmcache_engine.checkpoint_worker.hold_restore(
+                    request.req_id,
+                    request.load_spec.checkpoint_generation,
+                    request.load_spec.dsa_cold_load_generation,
+                    owners,
+                )
+                owners = []
             return super()._run_dsa_cold_compact_load(
                 plan,
                 npu_device_id,
@@ -1580,23 +1603,32 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         request = plan["request"]
         if not hasattr(request.load_spec, "checkpoint_generation"):
             return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
-        plan["latent_shared_ready"].result()
-        if npu_device_id is not None:
-            torch.npu.set_device(npu_device_id)
-        chunk = self._lmcache_chunk_size
-        base = request.load_spec.checkpoint_prefix_end // chunk * chunk
-        if base:
-            self.lmcache_engine.load_group1_pages_direct(
-                plan["tokens"][:base],
-                plan["indexer_slots_cpu"][:base],
-                plan["indexer_kvcaches"],
-                request.request_configs,
-                request.req_id,
-            )
-        tail = dict(plan)
-        tail["token_mask"] = plan["token_mask"].clone()
-        tail["token_mask"][:base] = False
-        tail["token_count"] -= base
+        error = None
+        try:
+            plan["latent_shared_ready"].result()
+            if npu_device_id is not None:
+                torch.npu.set_device(npu_device_id)
+            chunk = self._lmcache_chunk_size
+            base = request.load_spec.checkpoint_prefix_end // chunk * chunk
+            if base:
+                self.lmcache_engine.load_group1_pages_direct(
+                    plan["tokens"][:base],
+                    plan["indexer_slots_cpu"][:base],
+                    plan["indexer_kvcaches"],
+                    request.request_configs,
+                    request.req_id,
+                )
+            tail = dict(plan)
+            tail["token_mask"] = plan["token_mask"].clone()
+            tail["token_mask"][:base] = False
+            tail["token_count"] -= base
+        except BaseException as exc:
+            error = exc
+        agreed = self.lmcache_engine.finish_checkpoint_prefix(request, error is None)
+        if error is not None:
+            raise error
+        if not agreed:
+            raise RuntimeError("Checkpoint prefix failed on another TP rank")
         result = super()._run_dsa_cold_indexer_load(tail, npu_device_id)
         # Both the persistent prefix and the CPU tail have reached readiness.
         return plan["token_mask"], result[1], result[2], result[3]
@@ -1626,6 +1658,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         metadata = self._parent._get_connector_metadata()
         for req_id, generation in metadata.preemption_cancels:
             worker.cancel(req_id, generation)
+        for release in metadata.preemption_releases:
+            worker.release_restore(*release)
         for seal in metadata.preemption_seals:
             worker.seal(seal)
         self._checkpoint_io_originals[0](self, forward_context, **kwargs)
@@ -1646,7 +1680,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 metadata = CheckpointWorkerMetadata(
                     metadata.descriptors, metadata.remote_fill_results, results
                 )
-        if not worker.jobs:
+        if not worker.jobs and not worker.restore_owners:
             # Reveal the original class methods, rather than retaining bound
             # instance methods/cycles when cyclic GC is disabled.
             del self.start_load_kv, self.build_connector_worker_meta

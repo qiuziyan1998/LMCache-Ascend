@@ -4,6 +4,9 @@ Branch: `fix/decoder-resume-dp-sync`. This replaces the fixed staging slab and
 generated-tail Mooncake publication path. It does not change MC2 recovery limits,
 model graph eligibility or the ordinary persistent prefix-cache contract.
 
+See the [September 12 follow-up audit](local_checkpoint_audit_20260912.md) for
+ordered TP agreement, all-worker source releases and idle control dispatch.
+
 ## Evidence and objective
 
 The September 11 logs showed a 186,384,384-byte contiguous Group-0 allocation
@@ -85,7 +88,9 @@ universal checkpoint success nor negligible throughput cost is guaranteed.
 
 ## Scope and normal decoding
 
-Implementation is in the two LMCache repositories. `local_checkpoint.py` owns
+The checkpoint implementation is in the two LMCache repositories. An idle-only
+scheduler hook and multi-connector delegation ensure that release acknowledgements
+are delivered even after the last request finishes. `local_checkpoint.py` owns
 offers, acquisition and CPU boundary assembly; `preemption_checkpoint.py` owns
 capture and publication. The Ascend engine provides allocator/lookup/shared
 transport bridges. The adapter extends only checkpoint controls, resumed lookup,
@@ -107,7 +112,7 @@ guard-induced delay require NPU measurement.
 
 Use the existing decoder-only `decode_preemption_checkpoint: true`. Periodic
 decode save is not required. No additional pool size or policy knob is added.
-Update both LMCache Python repositories and restart decoder workers. The native
+Update all four matching Python repositories and restart decoder workers. The native
 extension built for the preceding checkpoint implementation is reused.
 
 Focused CPU tests exercise actual control, dispatch and allocation/submission
@@ -116,11 +121,12 @@ multiple pointer columns, one fence, speculative trimming, original/remap prefix
 boundaries, two-group holes, eviction races, repeated preemption, cancellation,
 cache-alias retirement, mixed-source masks and ordinary dispatch.
 
-The implementation and separate audit passed 135 focused CPU tests: 35 in
+The initial implementation and separate audit passed 135 focused CPU tests: 35 in
 LMCache-NPU, 58 in LMCache-Ascend, 16 in vLLM and 26 in vLLM-Ascend. Parsing,
 targeted Ruff checks and whitespace checks passed. Ten existing allocator,
 ordinary transfer, sparse-decode and Ascend dispatch methods are AST-identical
-to their committed versions. vLLM and vLLM-Ascend have no production changes.
+to their committed versions. The later idle-control integration is documented
+in the follow-up audit.
 
 The separate audit corrected an immutable-envelope construction error, preserved
 the exact original prefix when its remap frontier is one token earlier, and

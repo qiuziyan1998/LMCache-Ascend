@@ -172,6 +172,7 @@ def adapter(calls):
             ("persistent_prefix", len(a[0]))
         )
     )
+    obj.lmcache_engine.finish_checkpoint_prefix = lambda request, ready: ready
     return obj
 
 
@@ -185,6 +186,7 @@ def plan():
             token_ids=list(range(11)),
             load_spec=NS(
                 checkpoint_generation=1,
+                dsa_cold_load_generation=7,
                 checkpoint_prefix_end=7,
                 dsa_group1_direct_hbm=False,
             ),
@@ -229,10 +231,17 @@ def test_normalized_owners_outlive_the_whole_paired_load_and_previous_cancel_doe
     obj, p = adapter(calls), plan()
     owner = NS(ref_count_down=lambda: calls.append(("release",)))
     obj.lmcache_engine.prepare_checkpoint_restore = lambda req: (4, [owner])
+    retained = []
+    obj.lmcache_engine.checkpoint_worker = NS(
+        hold_restore=lambda *args: retained.extend(args[-1])
+    )
     previous = Future()
     previous.cancel()
     assert obj._run_dsa_cold_compact_load(p, None, Future(), previous) == "state"
-    assert calls == [("ordinary_latent", None), ("release",)]
+    assert calls == [("ordinary_latent", None)]
+    assert retained == [owner]
+    retained.pop().ref_count_down()
+    assert calls[-1] == ("release",)
 
 
 def test_local_h2d_keeps_existing_runtime_graph_capture_safety_guard():
@@ -387,3 +396,158 @@ def test_index_tail_ownership_retires_only_at_the_completed_resume_branch(
         if not resumed
         else ["check"] + ([{"owned_groups": {1: []}}] if ready else [])
     )
+
+
+def test_asymmetric_persistent_prefix_failure_never_enters_tail_collectives():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+
+    barrier, lock = Barrier(4), Lock()
+    ready, per_rank = [], [[] for _ in range(4)]
+
+    def run(rank):
+        calls = per_rank[rank]
+        obj = adapter(calls)
+        p = plan()
+
+        def prefix(*args):
+            if rank == 2:
+                raise ValueError("prefix read failed")
+
+        def agree(request, success):
+            with lock:
+                ready.append(success)
+            barrier.wait(timeout=2)
+            return all(ready)
+
+        obj.lmcache_engine.load_group1_pages_direct = prefix
+        obj.lmcache_engine.finish_checkpoint_prefix = agree
+        try:
+            obj._run_dsa_cold_indexer_load(p, None)
+        except (ValueError, RuntimeError):
+            pass
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(run, range(4)))
+    assert ready.count(False) == 1 and len(ready) == 4
+    assert per_rank == [[], [], [], []]
+
+
+def test_normalization_protects_the_existing_compatible_canonical_page(
+    api, monkeypatch
+):
+    from types import MethodType
+    from threading import Lock
+    from test_preemption_checkpoint import Page, fill
+
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    publish(api, store, 12)
+    canonical = list(
+        engine.token_database.process_tokens(tokens=list(range(12)), kv_group=0)
+    )[1][2]
+    resident = Page(2, 4, (2, 1))
+    fill(resident, 4, 0)
+    engine.backend.pages[canonical] = resident
+    source = ROOT.parent / "LMCache-NPU/lmcache/v1/storage_backend/local_cpu_backend.py"
+    node = next(
+        n
+        for n in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
+        if isinstance(n, ast.FunctionDef) and n.name == "batched_submit_layer_pages"
+    )
+    prefix = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    ns = {}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[prefix, node], type_ignores=[])),
+            str(source),
+            "exec",
+        ),
+        ns,
+    )
+    backend = engine.backend
+    backend.hot_cache = backend.pages
+    backend.use_hot = True
+    backend.cpu_lock = Lock()
+    backend._compatible_layer_page = lambda old, new: old is not None
+    backend._record_external_retention_mutation_locked = lambda *a, **kw: None
+    backend.cache_policy = NS(
+        update_on_put_many=lambda *a: None, update_on_force_evict=lambda *a: None
+    )
+    backend.batched_msg_sender = None
+    backend.batched_submit_layer_pages = MethodType(
+        ns["batched_submit_layer_pages"], backend
+    )
+    _, owners = store.local.normalize("r", 1, list(range(12)), None)
+    try:
+        assert resident.refs > 1, (
+            "restore only owns the discarded duplicate, not the actual source"
+        )
+        assert not backend.evict(canonical)
+    finally:
+        for page in owners:
+            page.ref_count_down()
+        store.close()
+
+
+def test_missing_normalized_partial_tail_is_rejected_before_handoff(api, monkeypatch):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    publish(api, store, 11)
+    original = engine.token_database.process_tokens
+    engine.token_database.process_tokens = lambda **kw: (
+        entry for entry in original(**kw) if entry[1] != 11
+    )
+    with pytest.raises(ValueError, match="coverage"):
+        store.local.normalize("r", 1, list(range(11)), None)
+    store.close()
+
+
+def test_unknown_checkpoint_prefix_dma_latches_existing_restart_guard():
+    class Unknown(RuntimeError):
+        pass
+
+    cls = implementation(
+        "lmcache_ascend/v1/cache_engine.py",
+        "AscendLMCacheEngine",
+        {"prepare_checkpoint_restore"},
+        object,
+        NativeExternalPageTransferUnknownError=Unknown,
+    )
+    engine = cls()
+    fault = Unknown("DMA unknown")
+    fatal = []
+    engine._is_passive = lambda: False
+    engine.checkpoint_worker = NS(
+        local=NS(normalize=lambda *a: (_ for _ in ()).throw(fault))
+    )
+    engine._shared_layerwise_error_envelope = lambda **kw: NS(
+        status="error", message=kw["message"]
+    )
+    engine._broadcast_shared_envelope = lambda envelope: None
+    engine.mark_init_failed = lambda message: None
+    engine._remote_fill_require_paired_restart = lambda ids: fatal.append(ids)
+    with pytest.raises(Unknown):
+        engine.prepare_checkpoint_restore(plan()["request"])
+    assert fatal == [("r",)]
+
+
+def test_failed_leader_does_not_retire_normalized_sources_before_peer_completion():
+    calls = []
+    obj = adapter(calls)
+    p = plan()
+    retained = []
+    owner = NS(ref_count_down=lambda: calls.append("released"))
+    obj.lmcache_engine.prepare_checkpoint_restore = lambda req: (4, [owner])
+    obj.lmcache_engine.checkpoint_worker = NS(
+        hold_restore=lambda *args: retained.extend(args[-1])
+    )
+    base = type(obj).__mro__[1]
+    base._run_dsa_cold_compact_load = lambda *a: (_ for _ in ()).throw(
+        ValueError("local failure")
+    )
+    with pytest.raises(ValueError, match="local failure"):
+        obj._run_dsa_cold_compact_load(p, None, Future())
+    assert calls == [] and retained == [owner]

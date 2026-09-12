@@ -130,6 +130,7 @@ def fixture():
     replies = []
     worker = NS(
         jobs={},
+        restore_owners={},
         poll=lambda: tuple(replies),
         seal=lambda seal: calls.append(("seal", seal)),
         cancel=lambda *ids: calls.append(("cancel", ids)),
@@ -142,6 +143,7 @@ def fixture():
 
     worker.capture = capture
     engine.checkpoint_worker = worker
+    engine.enable_checkpoint_prefix_agreement = lambda: None
     engine.wait_for_pending_stores = lambda ids: calls.append("drain")
     engine.wait_for_direct_stores = lambda ids: calls.append("direct-drain")
     engine.drop_direct_store_states = lambda ids: calls.append("drop-store")
@@ -191,7 +193,11 @@ def test_actual_ascend_dynamic_mro_enters_capture_and_restores_idle_dispatch():
     assert "start_load_kv" in impl.__dict__
     replies.append(NS(req_id="r", generation=1, status="captured"))
     assert impl.build_connector_worker_meta().checkpoint_results == tuple(replies)
-    dynamic.metadata = NS(preemption_seals=("accepted-history",), preemption_cancels=())
+    dynamic.metadata = NS(
+        preemption_seals=("accepted-history",),
+        preemption_cancels=(),
+        preemption_releases=(),
+    )
     impl.start_load_kv(None)
     assert calls[-2:] == [("seal", "accepted-history"), "ordinary-load"]
     impl.lmcache_engine.get_finished_stores({"r"})
@@ -213,3 +219,27 @@ def test_checkpoint_results_survive_both_tp_aggregation_orders():
         assert merged.descriptors == {"a": [1]}
         assert merged.checkpoint_results == ("checkpoint-ready",)
     assert [f.name for f in fields(plain)] == ["descriptors", "remote_fill_results"]
+
+
+def test_release_only_control_frame_retires_restore_owners_and_restores_idle_methods():
+    impl, dynamic, _, _, calls, _, _ = fixture()
+    worker = impl.lmcache_engine.checkpoint_worker
+    key = ("r", 1, 7)
+    worker.restore_owners[key] = [object()]
+    worker.release_restore = lambda *ids: (
+        calls.append(("release", ids)),
+        worker.restore_owners.pop(ids, None),
+    )
+    impl._activate_checkpoint_io()
+    impl.build_connector_worker_meta()
+    assert "start_load_kv" in impl.__dict__
+    dynamic.metadata = NS(
+        preemption_cancels=(),
+        preemption_seals=(),
+        preemption_releases=(key,),
+        requests=[],
+    )
+    impl.start_load_kv(None)
+    assert calls[-2:] == [("release", key), "ordinary-load"]
+    impl.build_connector_worker_meta()
+    assert "start_load_kv" not in impl.__dict__

@@ -586,3 +586,40 @@ def test_prefix_remap_boundary_can_precede_original_prompt_without_fabricating_a
     for page in owners:
         page.ref_count_down()
     store.close()
+
+
+def test_duplicate_partial_capture_reports_the_actual_captured_frontier(
+    api, monkeypatch
+):
+    engine = fake_engine()
+    original = engine.allocate_checkpoint_fragment
+    engine.allocate_checkpoint_fragment = lambda group, n, caches=None: (
+        original(group, n, caches)
+        if n <= 2
+        else (_ for _ in ()).throw(MemoryError("fragmented"))
+    )
+    store, spec, _ = start_capture(api, monkeypatch, engine, prefix=0)
+    assert store.poll()[0].end == 2
+    store.capture(spec, {0: [1], 1: [2]}, 4)
+    assert store.poll()[0].end == 2
+    store.close()
+
+
+def test_restore_sources_wait_for_all_worker_ack_even_on_cancel_and_failed_local_load(
+    api,
+):
+    _, module = api
+    store = module.CheckpointWorker(fake_engine())
+    page = Page(2, 4, (2, 1))
+    store.begin_restore("r", 1, 7)
+    store.hold_restore("r", 1, 7, [page])
+    store.cancel("r")
+    assert page.refs == 1 and store.restore_owners
+    with pytest.raises(RuntimeError, match="acknowledgement"):
+        store.close()
+    store.release_restore("r", 1, 6)  # Stale completion cannot free the active attempt.
+    assert page.refs == 1
+    store.release_restore("r", 1, 7)
+    assert page.refs == 0 and not store.restore_owners
+    store.release_restore("r", 1, 7)  # Duplicate ack is harmless.
+    store.close()

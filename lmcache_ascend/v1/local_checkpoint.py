@@ -153,11 +153,16 @@ class LocalCheckpointStore:
                     prefix_stop = min(manifest.prefix_end, sources[0][0].start)
                     sources.insert(0, (CheckpointPage(base, prefix_stop, None), prefix))
                 keys, pages, normalized = [], [], []
+                covered = base
                 for start, end, key in self.engine.token_database.process_tokens(
                     tokens=tokens, request_configs=request_configs, kv_group=group
                 ):
                     if start < base:
                         continue
+                    if start != covered or not start < end <= len(tokens):
+                        raise ValueError(
+                            "Normalized checkpoint coverage has a gap or overlap"
+                        )
                     selected = [
                         (source, page)
                         for source, page in sources
@@ -186,7 +191,24 @@ class LocalCheckpointStore:
                     keys.append(key.split_layers(self.engine.num_layers)[0])
                     pages.append(page)
                     normalized.append(CheckpointPage(start, end, keys[-1]))
+                    covered = end
+                if covered != len(tokens):
+                    raise ValueError(
+                        "Normalized checkpoint coverage omits the partial tail"
+                    )
                 self.engine.checkpoint_backend().batched_submit_layer_pages(keys, pages)
+                # Admission can retain an already-compatible canonical object.
+                # Own the actual cache sources, not only our discarded duplicate.
+                installed, count = (
+                    self.engine.checkpoint_backend().batched_get_layer_page_prefix(keys)
+                )
+                owners.extend(installed)
+                if count != len(keys):
+                    raise ValueError(
+                        "Normalized checkpoint was evicted during admission"
+                    )
+                for page in installed:
+                    self.engine.validate_checkpoint_page(group, page)
                 # Move checkpoint-owned cache references instead of creating
                 # two cache aliases that would permanently make refs > 1.
                 updated = list(manifest.groups)
