@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded checkpoint capture and background persistence, owned by one worker.
+"""Partial checkpoint capture and local publication, owned by one worker.
 
 Only the existing replicated MLA writer creates storage entries. Captured
 fragments are private until accepted token IDs arrive from EngineCore.
@@ -7,9 +7,14 @@ fragments are private until accepted token IDs arrive from EngineCore.
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from threading import Lock
 from types import SimpleNamespace
 from typing import Any
+
+from lmcache_ascend.v1.local_checkpoint import (
+    CheckpointPage,
+    LocalCheckpoint,
+    LocalCheckpointStore,
+)
 import time
 
 from lmcache.integration.vllm.preemption_checkpoint import (
@@ -44,82 +49,18 @@ class CaptureJob:
         default_factory=dict
     )
     plans: list[Any] = field(default_factory=list)
+    prefix_sources: tuple[CheckpointPage, ...] = ()
+    captured_end: int = 0
     future: Future | None = None
     cancelled: bool = False
     started: float = field(default_factory=time.monotonic)
     quarantined: bool = False
-    persist_started: float = 0.0
-    persist_finished: float = 0.0
-
-
-class CaptureBufferLease:
-    """Logical fragment over a reusable, allocator-accounted registered slab."""
-
-    def __init__(
-        self, page: Any, tokens: int, widths: tuple[int, ...], release: Any
-    ) -> None:
-        self.page, self.tokens, self.widths, self.release = (
-            page,
-            tokens,
-            widths,
-            release,
-        )
-        self.raw_data, self.metadata = page.raw_data, page.metadata
-
-    def get_dtype(self) -> Any:
-        return self.page.get_dtype()
-
-    def layer_data_ptr(self, layer: int) -> int:
-        return self.page.layer_data_ptr(layer)
-
-    def layer_tensor(self, layer: int) -> Any:
-        return self.page.layer_tensor(layer)[: self.tokens * sum(self.widths)]
-
-    def ref_count_down(self) -> None:
-        if self.release is None:
-            raise RuntimeError("Checkpoint buffer lease released twice")
-        release, self.release = self.release, None
-        release(self.page)
-
-
-def fragment_vectors(
-    fragments: list, start: int, end: int, layers: int
-) -> tuple[list[int], list[int]]:
-    """Describe a logical page as layer/plane/token-ordered owned CPU spans."""
-    selected = [
-        (max(start, a), min(end, b), a, b, page, widths)
-        for a, b, page, widths in fragments
-        if a < end and b > start
-    ]
-    selected.sort(key=lambda item: item[0])
-    cursor = start
-    for a, b, *_ in selected:
-        if a != cursor:
-            raise ValueError("Checkpoint fragment coverage has a hole or overlap")
-        cursor = b
-    if cursor != end or not selected:
-        raise ValueError("Checkpoint fragment coverage is incomplete")
-    widths = selected[0][-1]
-    if any(item[-1] != widths for item in selected):
-        raise ValueError("Checkpoint CPU fragments have incompatible layouts")
-    pointers, sizes = [], []
-    for layer in range(layers):
-        preceding_width = 0
-        for width in widths:
-            for a, b, origin, limit, page, _ in selected:
-                item_size = page.get_dtype().itemsize
-                pointers.append(
-                    page.layer_data_ptr(layer)
-                    + ((limit - origin) * preceding_width + (a - origin) * width)
-                    * item_size
-                )
-                sizes.append((b - a) * width * item_size)
-            preceding_width += width
-    return pointers, sizes
+    publish_started: float = 0.0
+    publish_finished: float = 0.0
 
 
 class CheckpointWorker:
-    """Capture synchronously at HBM reuse; persist CPU-owned spans in background."""
+    """Capture synchronously at HBM reuse; publish accepted CPU-owned spans locally."""
 
     def __init__(self, engine: Any) -> None:
         self.engine = engine
@@ -130,58 +71,22 @@ class CheckpointWorker:
         )
         self.max_jobs = max(1, int(engine.config.store_async_max_queue_size or 2))
         self.timeout = float(engine.config.blocking_timeout_secs)
-        chunk = int(engine.config.chunk_size)
-        self.capacity_tokens = (
-            max(
-                chunk,
-                int(
-                    engine.config.get_extra_config_value(
-                        "decode_window_save_window_size", chunk
-                    )
-                    or chunk
-                ),
-            )
-            + chunk
-        )
-        self.buffer_lock = Lock()
-        self.free_buffers: dict[int, list] = {0: [], 1: []}
-        self.buffer_counts = {0: 0, 1: 0}
-        self.buffer_widths: dict[int, tuple[int, ...]] = {}
+        self.chunk_size = int(engine.config.chunk_size)
+        self.local = LocalCheckpointStore(engine)
 
     def _allocate_fragment(
         self, group: int, tokens: int, caches: Any = None
     ) -> tuple[Any, tuple[int, ...]]:
-        if not 0 < tokens <= self.capacity_tokens:
-            raise MemoryError("Checkpoint fragment exceeds bounded staging capacity")
-        with self.buffer_lock:
-            if self.free_buffers[group]:
-                page = self.free_buffers[group].pop()
-                widths = self.buffer_widths[group]
-            else:
-                # Group 0 can need a separate old partial-page prefix; Group 1
-                # is entirely resident. Pressure reclamation runs outside this lock.
-                limit = self.max_jobs * (2 if group == 0 else 1)
-                if self.buffer_counts[group] >= limit:
-                    raise MemoryError("Checkpoint capture buffers are busy")
-                page, widths = self.engine.allocate_checkpoint_fragment(
-                    group, self.capacity_tokens, caches
-                )
-                self.buffer_counts[group] += 1
-                self.buffer_widths[group] = widths
-
-        def release(page: Any) -> None:
-            with self.buffer_lock:
-                # Retain one warm slab per group, not the peak concurrency.
-                if self.free_buffers[group]:
-                    self.buffer_counts[group] -= 1
-                    page.ref_count_down()
-                else:
-                    self.free_buffers[group].append(page)
-
-        return CaptureBufferLease(page, tokens, widths, release), widths
+        if not 0 < tokens <= self.chunk_size:
+            raise MemoryError("Checkpoint fragment exceeds one chunk")
+        return self.engine.allocate_checkpoint_fragment(group, tokens, caches)
 
     def capture(
-        self, spec: CaptureSpec, caches: dict[int, list], block_size: int
+        self,
+        spec: CaptureSpec,
+        caches: dict[int, list],
+        block_size: int,
+        prefix_state: Any = None,
     ) -> None:
         """Take a private snapshot before the model runner can reuse source HBM."""
         key = (spec.req_id, spec.generation)
@@ -198,7 +103,6 @@ class CheckpointWorker:
             return
         job = CaptureJob(spec)
         events = []
-        cpu_plans = []
         device_work_started = False
         try:
             if self.engine.is_frozen():
@@ -207,50 +111,99 @@ class CheckpointWorker:
                 raise ValueError("checkpoint staging is busy")
             if set(caches) != {0, 1}:
                 raise ValueError("checkpoint requires both KV groups")
+            if not (
+                0 <= spec.base <= spec.prefix_end <= spec.end
+                and spec.base <= spec.resident_start <= spec.end
+            ):
+                raise ValueError("Invalid checkpoint frontiers")
+            if prefix_state is not None and prefix_state.cached_keys:
+                job.prefix_sources = tuple(
+                    CheckpointPage(a, min(b, spec.resident_start), key)
+                    for a, b, key in zip(
+                        prefix_state.cached_starts,
+                        prefix_state.cached_ends,
+                        prefix_state.cached_keys[0],
+                        strict=True,
+                    )
+                    if b > spec.prefix_end and a < spec.resident_start
+                )
             for group in (0, 1):
                 start = spec.resident_start if group == 0 else spec.base
-                if not spec.base <= start < spec.end:
-                    raise ValueError("checkpoint has no resident suffix")
-                if spec.end - start > self.capacity_tokens:
-                    raise ValueError(
-                        "Checkpoint fragment exceeds bounded staging capacity"
-                    )
                 blocks = spec.blocks[group]
-                if (spec.end + block_size - 1) // block_size > len(blocks):
-                    raise ValueError("checkpoint exceeds original block table")
-                slots = [
-                    blocks[i // block_size] * block_size + i % block_size
-                    for i in range(start, spec.end)
-                ]
-                if any(blocks[i // block_size] <= 0 for i in range(start, spec.end)):
-                    raise ValueError("checkpoint source includes released/null blocks")
-                cpu_plans.append((group, start, slots))
-            for attempt in range(2):
-                try:
-                    for group, start, _ in cpu_plans:
-                        if group not in job.fragments:
-                            page, widths = self._allocate_fragment(
-                                group, spec.end - start, caches[group]
+                if (spec.end + block_size - 1) // block_size > len(blocks) or any(
+                    blocks[i // block_size] <= 0 for i in range(start, spec.end)
+                ):
+                    raise ValueError("Checkpoint source includes released/null blocks")
+            cursor, reclaimed = spec.base, False
+            while cursor < spec.end:
+                desired_end = min(
+                    spec.end, (cursor // self.chunk_size + 1) * self.chunk_size
+                )
+                end = desired_end
+                while end > cursor:
+                    candidate = {}
+                    try:
+                        for group in (0, 1):
+                            start = (
+                                max(cursor, spec.resident_start)
+                                if group == 0
+                                else cursor
                             )
-                            job.fragments[group] = [(start, spec.end, page, widths)]
-                    break
-                except MemoryError:
-                    with self.buffer_lock:
-                        missing = {
-                            group: caches[group]
-                            for group in (0, 1)
-                            if group not in job.fragments
-                            and not self.free_buffers[group]
-                        }
-                    if attempt or not self.engine.reclaim_checkpoint_capacity(
-                        self.capacity_tokens, missing
-                    ):
+                            if start >= end:
+                                continue
+                            try:
+                                page, widths = self._allocate_fragment(
+                                    group, end - start, caches[group]
+                                )
+                            except MemoryError:
+                                if reclaimed:
+                                    raise
+                                reclaimed = True
+                                missing = {
+                                    g: caches[g]
+                                    for g in (group, 1)
+                                    if g not in candidate
+                                }
+                                if not self.engine.reclaim_checkpoint_capacity(
+                                    end - cursor, missing
+                                ):
+                                    raise
+                                page, widths = self._allocate_fragment(
+                                    group, end - start, caches[group]
+                                )
+                            candidate[group] = (start, end, page, widths)
+                    except MemoryError:
+                        for _, _, page, _ in candidate.values():
+                            page.ref_count_down()
+                        end = cursor + (end - cursor) // 2
+                        continue
+                    except BaseException:
+                        for _, _, page, _ in candidate.values():
+                            page.ref_count_down()
                         raise
-            # Admit both groups before uploading any metadata. A second-group
-            # OOM must not cause a device wait for an unusable first-group plan.
-            for group, start, slots in cpu_plans:
-                page = job.fragments[group][0][2]
-                slots = torch.tensor(slots, dtype=torch.long, pin_memory=True)
+                    for group, fragment in candidate.items():
+                        job.fragments.setdefault(group, []).append(fragment)
+                    cursor = end
+                    break
+                if end != desired_end:
+                    break  # Keep one smaller tail; bound failed-allocation work.
+            if cursor <= spec.prefix_end:
+                raise MemoryError("Checkpoint CPU staging allocation refused")
+            job.captured_end = cursor
+            # Admit the entire selected paired prefix before device preparation.
+            for group, fragments in job.fragments.items():
+                starts = [a for a, _, _, _ in fragments]
+                ends = [b for _, b, _, _ in fragments]
+                blocks = spec.blocks[group]
+                slots = torch.tensor(
+                    [
+                        blocks[i // block_size] * block_size + i % block_size
+                        for a, b in zip(starts, ends, strict=True)
+                        for i in range(a, b)
+                    ],
+                    dtype=torch.long,
+                    pin_memory=True,
+                )
                 device_work_started = True
                 plan = self.engine.gpu_connector.prepare_group_capture(
                     [
@@ -258,13 +211,14 @@ class CheckpointWorker:
                             SimpleNamespace(
                                 tensor=page.layer_tensor(layer), metadata=page.metadata
                             )
+                            for _, _, page, _ in fragments
                         ]
                         for layer in range(self.engine.num_layers)
                     ],
-                    [start],
-                    [spec.end],
+                    starts,
+                    ends,
                     slot_mapping=slots,
-                    slot_mapping_base=start,
+                    slot_mapping_base=starts[0],
                     kv_group=group,
                     kvcaches=caches[group],
                 )
@@ -283,7 +237,7 @@ class CheckpointWorker:
                 CheckpointResult(
                     *key,
                     "captured",
-                    spec.end,
+                    job.captured_end,
                     timings_ms={
                         "prepare_ms": (prepared_at - job.started) * 1000,
                         "enqueue_ms": (enqueued_at - prepared_at) * 1000,
@@ -314,104 +268,56 @@ class CheckpointWorker:
         if job is None or job.cancelled or job.future is not None:
             return
         if (
-            not max(job.spec.base, job.spec.resident_start)
+            not max(job.spec.base, job.spec.prefix_end)
             < len(seal.tokens)
-            <= job.spec.end
+            <= job.captured_end
         ):
             self.cancel(*key)
             self.results.append(
                 CheckpointResult(*key, "failed", reason="invalid seal frontier")
             )
             return
-        job.future = self.executor.submit(self._persist, job, seal)
+        job.future = self.executor.submit(self._publish_local, job, seal)
 
     def configure_capacity(self, window_size: int, chunk_size: int) -> None:
-        """Use the adapter's resolved window setting, including its env override."""
-        if self.jobs or any(self.buffer_counts.values()):
-            raise RuntimeError("Cannot resize checkpoint buffers after capture starts")
-        self.capacity_tokens = max(window_size, chunk_size) + chunk_size
+        """Keep the existing setup API; allocation follows actual chunk ranges."""
+        if self.jobs:
+            raise RuntimeError("Cannot resize checkpoint chunks during capture")
+        self.chunk_size = chunk_size
 
-    def _persist(self, job: CaptureJob, seal: SealSpec) -> int:
-        job.persist_started = time.monotonic()
-        spec = job.spec
-        storage = self.engine.storage_manager
-        database = self.engine.token_database
-        try:
-            if self.engine.is_frozen():
-                raise ValueError("checkpoint persistence refused while cache is frozen")
-            # Recover the nonresident portion of the first extended chunk only
-            # after releasing HBM. Use the old exact partial key, not the new key.
-            if spec.resident_start > spec.base:
-                for start, end, key in database.process_tokens(
-                    tokens=list(seal.tokens[: spec.resident_start]),
-                    request_configs=spec.request_configs,
-                    kv_group=0,
-                ):
-                    if start < spec.base:
-                        continue
-                    get_prefix = getattr(self.engine, "get_checkpoint_prefix", None)
-                    cached = (
-                        get_prefix(key, 0, end - start)
-                        if get_prefix is not None
-                        else None
-                    )
-                    if cached is not None:
-                        page, widths = cached
-                    else:
-                        try:
-                            page, widths = self._allocate_fragment(0, end - start)
-                        except MemoryError:
-                            if not self.engine.reclaim_checkpoint_capacity(
-                                self.capacity_tokens, {0: None}
-                            ):
-                                raise
-                            page, widths = self._allocate_fragment(0, end - start)
-                    fragment = (start, end, page, widths)
-                    job.fragments[0].append(fragment)
-                    ptrs, sizes = fragment_vectors(
-                        [fragment], start, end, self.engine.num_layers
-                    )
-                    if cached is None:
-                        storage.batched_get_external_pages(
-                            [key], [ptrs], [sizes], (page.raw_data,), spec.req_id
-                        )
-            keys, pointers, sizes = [], [], []
-            for group in (0, 1):
-                covered_end = spec.base
-                for start, end, key in database.process_tokens(
-                    tokens=list(seal.tokens),
-                    request_configs=spec.request_configs,
-                    kv_group=group,
-                ):
-                    if start < spec.base:
-                        continue
-                    if start != covered_end:
-                        raise ValueError("Checkpoint storage keys have a coverage gap")
-                    ptrs, lengths = fragment_vectors(
-                        job.fragments[group], start, end, self.engine.num_layers
-                    )
-                    keys.append(key)
-                    pointers.append(ptrs)
-                    sizes.append(lengths)
-                    covered_end = end
-                if covered_end != len(seal.tokens):
-                    raise ValueError(
-                        "Checkpoint storage keys omit the accepted partial tail"
-                    )
-            owners = tuple(
-                page.raw_data
-                for fragments in job.fragments.values()
-                for _, _, page, _ in fragments
-            )
-            storage.batched_put_external_pages(
-                keys, pointers, sizes, owners, None, spec.req_id
-            ).result()
-            job.persist_finished = time.monotonic()
-            return len(seal.tokens)
-        except NativeExternalPageTransferUnknownError:
-            # Unknown DMA completion cannot retire registered sources safely.
-            job.quarantined = True
-            raise
+    def _publish_local(self, job: CaptureJob, seal: SealSpec) -> int:
+        """Seal into the ordinary local cache; never persist generated KV."""
+        job.publish_started = time.monotonic()
+        if self.engine.is_frozen():
+            raise ValueError("checkpoint publication refused while cache is frozen")
+        spec, end = job.spec, len(seal.tokens)
+        groups: list[list[CheckpointPage]] = [list(job.prefix_sources), []]
+        keys, pages = [], []
+        for group, fragments in job.fragments.items():
+            for start, stop, page, _ in fragments:
+                if start >= end:
+                    continue
+                key = self.engine.checkpoint_page_key(spec, group, start, stop)
+                groups[group].append(CheckpointPage(start, min(stop, end), key))
+                keys.append(key)
+                pages.append(page)
+        if job.cancelled:
+            return 0
+        # Later intervals enter LRU first, preserving useful leading coverage.
+        self.engine.checkpoint_backend().batched_submit_layer_pages(
+            keys[::-1], pages[::-1]
+        )
+        self.local.publish(
+            spec.req_id,
+            spec.generation,
+            LocalCheckpoint(
+                seal.tokens,
+                spec.prefix_end,
+                tuple(tuple(sorted(g, key=lambda p: p.start)) for g in groups),
+            ),
+        )
+        job.publish_finished = time.monotonic()
+        return end
 
     def poll(self) -> tuple[CheckpointResult, ...]:
         """Advance control-only requests and retire completed buffer owners."""
@@ -430,12 +336,12 @@ class CheckpointWorker:
                                 "ready",
                                 end,
                                 timings_ms={
-                                    "persist_ms": (
-                                        job.persist_finished - job.persist_started
+                                    "local_publish_ms": (
+                                        job.publish_finished - job.publish_started
                                     )
                                     * 1000,
                                     "publish_delay_ms": (
-                                        time.monotonic() - job.persist_finished
+                                        time.monotonic() - job.publish_finished
                                     )
                                     * 1000,
                                 },
@@ -452,6 +358,8 @@ class CheckpointWorker:
                         )
                     clear_failure_tracebacks(error)
                 job.future = None
+                if job.cancelled:
+                    self.local.forget(*key)
                 self._release(job)
                 del self.jobs[key]
             elif time.monotonic() - job.started > self.timeout and not job.cancelled:
@@ -467,6 +375,7 @@ class CheckpointWorker:
 
     def cancel(self, req_id: str, generation: int | None = None) -> None:
         """Stop publication, retaining any buffers still owned by native I/O."""
+        self.local.forget(req_id, generation)
         for key, job in tuple(self.jobs.items()):
             if key[0] != req_id or (generation is not None and key[1] != generation):
                 continue
@@ -485,11 +394,6 @@ class CheckpointWorker:
             self.cancel(req_id, generation)
         self.executor.shutdown(wait=True)
         self.poll()
-        with self.buffer_lock:
-            for pages in self.free_buffers.values():
-                for page in pages:
-                    page.ref_count_down()
-                pages.clear()
 
     @staticmethod
     def _release(job: CaptureJob) -> None:

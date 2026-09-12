@@ -159,3 +159,22 @@ def test_checkpoint_enqueue_does_not_wait_or_populate_warm_state_cache():
     assert events == ["dependency", "native", "event"]
     assert not obj._sparse_direct_validated_layers
     assert len(plan.host_metadata) == 4
+
+
+def test_fragmented_group_capture_builds_one_pointer_matrix_without_extra_fences():
+    obj, rows, events, calls = fixture()
+    rows = [[row[0], row[0], row[0]] for row in rows]
+    plan = obj.prepare_group_capture(
+        rows,
+        [8, 12, 16],
+        [12, 16, 18],
+        slot_mapping=torch.arange(10),
+        slot_mapping_base=8,
+        kv_group=0,
+    )
+    assert plan.pointers.shape == (2, 3)
+    assert plan.offsets.tolist() == [0, 4, 8]
+    assert plan.sizes.tolist() == [4, 4, 2]
+    assert len(plan.states) == 2 and events == []
+    obj.enqueue_group_capture(plan)
+    assert events == ["dependency", "native", "event"]

@@ -1392,7 +1392,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 caches = self._direct_group_caches()
                 for capture in captures:
                     if capture.req_id in preempted_req_ids:
-                        worker.capture(capture, caches, self._block_size)
+                        worker.capture(capture, caches, self._block_size, self._worker_retrieve_state.get(capture.req_id))
 
         logger.debug(
             "LMCache-Ascend handling preemptions: req_ids=%s",
@@ -1526,6 +1526,80 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params
+
+    def _submit_dsa_cold_compact_load(self, request: ReqMeta) -> None:
+        if hasattr(request.load_spec, "checkpoint_generation"):
+            # The local index tail uses the existing CPU-load stream/fences.
+            # Preserve the existing guard against concurrent runtime graph capture.
+            request.load_spec.dsa_group1_direct_hbm = False
+        super()._submit_dsa_cold_compact_load(request)
+
+    def _run_dsa_cold_compact_load(
+        self,
+        plan: Any,
+        npu_device_id: Any,
+        indexer_future: Any,
+        previous_latent_future: Any = None,
+        live_state: Any = None,
+    ) -> Any:
+        if not hasattr(plan["request"].load_spec, "checkpoint_generation"):
+            return super()._run_dsa_cold_compact_load(
+                plan,
+                npu_device_id,
+                indexer_future,
+                previous_latent_future,
+                live_state,
+            )
+        owners = []
+        try:
+            if npu_device_id is not None:
+                torch.npu.set_device(npu_device_id)
+            if previous_latent_future is not None:
+                try:
+                    previous_latent_future.exception()
+                except BaseException:
+                    pass  # Preserve ordering without inheriting an older failure.
+            _, owners = self.lmcache_engine.prepare_checkpoint_restore(plan["request"])
+            return super()._run_dsa_cold_compact_load(
+                plan,
+                npu_device_id,
+                indexer_future,
+                None,
+                live_state,
+            )
+        except BaseException as error:
+            gate = plan["latent_shared_ready"]
+            if not gate.done():
+                gate.set_exception(error)
+            raise
+        finally:
+            for page in owners:
+                page.ref_count_down()
+
+    def _run_dsa_cold_indexer_load(self, plan: Any, npu_device_id: Any) -> Any:
+        request = plan["request"]
+        if not hasattr(request.load_spec, "checkpoint_generation"):
+            return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
+        plan["latent_shared_ready"].result()
+        if npu_device_id is not None:
+            torch.npu.set_device(npu_device_id)
+        chunk = self._lmcache_chunk_size
+        base = request.load_spec.checkpoint_prefix_end // chunk * chunk
+        if base:
+            self.lmcache_engine.load_group1_pages_direct(
+                plan["tokens"][:base],
+                plan["indexer_slots_cpu"][:base],
+                plan["indexer_kvcaches"],
+                request.request_configs,
+                request.req_id,
+            )
+        tail = dict(plan)
+        tail["token_mask"] = plan["token_mask"].clone()
+        tail["token_mask"][:base] = False
+        tail["token_count"] -= base
+        result = super()._run_dsa_cold_indexer_load(tail, npu_device_id)
+        # Both the persistent prefix and the CPU tail have reached readiness.
+        return plan["token_mask"], result[1], result[2], result[3]
 
     def _activate_checkpoint_io(self) -> None:
         """Poll only while a real preemption owns capture/persistence work."""

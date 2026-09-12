@@ -62,31 +62,38 @@ checkpoint configuration cannot silently become degraded recomputation.
 3. After this fence, HBM can be reused. No CPU checkpoint is yet lookup-authoritative.
 4. After older async outputs are consumed, seal the exact accepted/computed end;
    the last sampled token and rejected speculative positions are excluded.
-5. Reuse an exact CPU prefix page or fetch its old persistent partial key, then
-   persist the extended pages. Preserve layer/plane/token order when concatenating
-   CPU prefix and captured suffix spans. Storage keys must cover the complete seal
-   for both groups; a token database that omits a required partial chunk produces
-   a failed checkpoint, not a ready frontier beyond the stored pages.
-6. Publish checkpoint readiness only after persistence. Resume performs an
-   authoritative two-group lookup and uses the existing cold load/readiness path.
+5. Seal the captured prefix into ordinary LocalCPU pages and publish an
+   evictable, request/generation-scoped offer. Generated KV is not written to
+   Mooncake. The original prompt retains its existing persistent source.
+6. Resume probes the persistent prompt plus the available two-group local tail.
+   After HBM admission, the worker revalidates and owns the local pages, assembles
+   boundary pages only when necessary, and reuses the existing cold loaders.
 7. A full restore with one real token remaining can use ordinary MTP graph
-   admission. Incomplete recovery retains native attention and the MC2 bound.
+   admission. Partial coverage retains native recovery within the MC2 bound.
 
-Checkpoint CPU buffers are allocated lazily from the existing registered LMCache
-allocator. If initial admission fails, one bounded LRU reclamation attempt covers
-the groups still needing buffers, followed by one allocation retry. Both groups
-must be admitted before D2H starts; the allocator's eviction/retry loop remains off.
-Each buffer covers at most one resolved decode-save window plus one chunk.
-The maximum number of jobs uses `store_async_max_queue_size` (two if zero);
-each job can require two Group-0 buffers and one Group-1 buffer. Only one idle
-slab per group is retained after retirement; excess slabs return to the allocator.
-Initial pool preparation and reclamation are not free. No additional model KV HBM pool is reserved; device
-metadata remains generation-owned until its completion event.
+The local policy is described in [local checkpoint design and audit](local_preemption_checkpoints.md).
+No dedicated tail pool is reserved. Capture allocates actual fragments no larger
+than a chunk, reclaims unused cache entries once, and retains the completed
+paired prefix if a later allocation fails. It may select one smaller final
+fragment. The original fixed decode-save-window rejection is removed, so long
+outputs are considered even with periodic decode save disabled.
 
-Buffer refusal, absent coverage or persistent failure makes the checkpoint
-unavailable and preserves bounded recovery. An uncertain native DMA completion
-is fatal: buffers remain quarantined rather than being reused unsafely.
-Cancellation prevents publication but does not free buffers still used by I/O.
+Capture prepares all admitted chunks together: one native submission per group
+and one final fence. The existing prepared native binding supports the chunk
+pointer matrix, so this follow-up requires no C++ rebuild beyond the earlier
+checkpoint extension. Deploy matching LMCache-NPU and LMCache-Ascend Python code.
+
+Waiting offers hold keys, not pins. Group-0 pages adopted as active sparse-decode
+sources remain protected by the running request. Group-1 CPU ownership retires
+on the resumed dispatch after all-worker receive completion. No active source
+is forcibly evicted. The existing cold CPU-load guard against concurrent runtime
+graph capture remains enabled for checkpoint restores.
+
+CPU allocation/refusal, stale pages or read failure preserve a safe fallback.
+A failed restore can retry once at a strictly shorter chunk boundary; repeated
+invalid-block reports cannot consume that allowance twice. Thereafter the request
+uses ordinary prefix recovery. Unknown DMA completion retains source owners and
+refuses unsafe allocator teardown.
 Control-only batches can process seal, cancel and completion messages.
 Checkpoint control envelopes preserve the ordinary cold-load trigger, including
 when a new prefix load and a checkpoint message share a no-forward batch.
@@ -112,7 +119,7 @@ The prepared native binding releases the GIL after converting Python arguments;
 the capture completion fence still must finish before HBM reuse.
 
 With `PD_SERVING_PERF` enabled, `decoder_preemption_checkpoint` reports generation,
-status, end and refusal reason without reading device tensors.
+status, end, local_publish_ms and refusal reason without reading device tensors.
 
 ### Ordinary decode path
 

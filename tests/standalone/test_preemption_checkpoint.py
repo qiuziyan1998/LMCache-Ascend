@@ -4,16 +4,13 @@
 Run with --confcutdir=tests/standalone to avoid the NPU bootstrap.
 """
 
-import ctypes
-import ast
 import gc
 import importlib.util
 from pathlib import Path
 import sys
 import threading
 import time
-import weakref
-from types import MethodType, ModuleType, SimpleNamespace as NS
+from types import ModuleType, SimpleNamespace as NS
 
 import pytest
 import torch
@@ -24,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture
 def api(monkeypatch):
     for name in (
+        "lmcache_ascend",
+        "lmcache_ascend.v1",
         "lmcache",
         "lmcache.integration",
         "lmcache.integration.vllm",
@@ -49,6 +48,10 @@ def api(monkeypatch):
     control = load(
         "lmcache.integration.vllm.preemption_checkpoint",
         ROOT.parent / "LMCache-NPU/lmcache/integration/vllm/preemption_checkpoint.py",
+    )
+    load(
+        "lmcache_ascend.v1.local_checkpoint",
+        ROOT / "lmcache_ascend/v1/local_checkpoint.py",
     )
     worker = load(
         "checkpoint_worker_under_test",
@@ -87,42 +90,6 @@ class Page:
         return self.raw_data[layer * self.stride : (layer + 1) * self.stride]
 
 
-def read_vectors(vectors):
-    ptrs, sizes = vectors
-    return b"".join(ctypes.string_at(p, n) for p, n in zip(ptrs, sizes, strict=True))
-
-
-def test_crops_rejected_tokens_in_every_plane_and_layer(api):
-    _, worker = api
-    page = Page(2, 5, (2, 1))
-    actual = read_vectors(worker.fragment_vectors([(10, 15, page, (2, 1))], 11, 14, 2))
-    # Layer0 K[1:4], V[1:4], then Layer1 K[1:4], V[1:4].
-    assert actual == bytes(
-        [2, 3, 4, 5, 6, 7, 11, 12, 13, 17, 18, 19, 20, 21, 22, 26, 27, 28]
-    )
-
-
-def test_assembles_planes_across_cpu_prefix_and_captured_suffix(api):
-    _, worker = api
-    prefix, suffix = Page(1, 2, (2, 1)), Page(1, 3, (2, 1))
-    suffix.raw_data.add_(20)
-    actual = read_vectors(
-        worker.fragment_vectors(
-            [(2, 5, suffix, (2, 1)), (0, 2, prefix, (2, 1))], 0, 4, 1
-        )
-    )
-    assert actual == bytes([0, 1, 2, 3, 20, 21, 22, 23, 4, 5, 26, 27])
-
-
-@pytest.mark.parametrize("ranges", [[(0, 2), (3, 4)], [(0, 3), (2, 4)], [(0, 2)]])
-def test_holes_overlaps_and_short_coverage_rejected(api, ranges):
-    _, worker = api
-    with pytest.raises(ValueError, match="coverage"):
-        worker.fragment_vectors(
-            [(a, b, Page(1, b - a, (1,)), (1,)) for a, b in ranges], 0, 4, 1
-        )
-
-
 def test_generation_and_completion_are_not_max_frontiers(api):
     control, _ = api
     capture = control.CaptureSpec("r", 3, 0, 20, 0, ((1,), (2,)))
@@ -139,64 +106,142 @@ def test_generation_and_completion_are_not_max_frontiers(api):
     assert control.choose_checkpoint_end(30, capture) == 20
 
 
-class Storage:
+class LocalCPU:
     def __init__(self):
-        self.payloads = []
-        self.started, self.release = threading.Event(), threading.Event()
-        self.release.set()
-        self.error = None
+        self.pages = {}
+        self.before_put = lambda: None
 
-    def batched_get_external_pages(self, keys, ptrs, sizes, owners, req_id):
-        for p, n in zip(ptrs[0], sizes[0], strict=True):
-            ctypes.memset(p, 123, n)
+    def batched_submit_layer_pages(self, keys, pages):
+        self.before_put()
+        for key, page in zip(keys, pages, strict=True):
+            if key in self.pages:
+                self.pages[key].ref_count_down()
+            page.ref_count_up()
+            self.pages[key] = page
 
-    def batched_put_external_pages(self, keys, ptrs, sizes, owners, events, req_id):
-        from concurrent.futures import Future
+    def batched_get_layer_page_prefix(self, keys):
+        result = []
+        for key in keys:
+            if key not in self.pages:
+                break
+            page = self.pages[key]
+            page.ref_count_up()
+            result.append(page)
+        return result, len(result)
 
-        self.started.set()
-        self.release.wait(5)
-        self.payloads = [
-            (key, read_vectors((p, n)))
-            for key, p, n in zip(keys, ptrs, sizes, strict=True)
-        ]
-        f = Future()
-        if self.error:
-            f.set_exception(self.error)
-        else:
-            f.set_result(None)
-        return f
+    def evict(self, key):
+        page = self.pages[key]
+        if page.refs != 1:
+            return False
+        del self.pages[key]
+        page.ref_count_down()
+        return True
+
+    def remove(self, key):
+        page = self.pages.pop(key, None)
+        if page is not None:
+            page.ref_count_down()
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Key:
+    group: int
+    start: int
+    end: int
+    tokens: tuple
+
+    def split_layers(self, layers):
+        return [self] * layers
+
+
+def fill(page, start, group):
+    widths = (2, 1) if group == 0 else (1,)
+    for layer in range(page.num_layers):
+        row, offset = page.layer_tensor(layer), 0
+        for plane, width in enumerate(widths):
+            for i in range(page.valid_tokens):
+                row[offset + i * width : offset + (i + 1) * width] = (
+                    start + i + layer * 31 + plane * 7 + group * 83
+                ) % 256
+            offset += page.valid_tokens * width
 
 
 def fake_engine():
-    storage = Storage()
+    backend = LocalCPU()
+    allocated, calls = [], []
 
-    def tokens(*, tokens, request_configs, kv_group):
+    def tokens(*, tokens, request_configs=None, kv_group=0):
         for start in range(0, len(tokens), 4):
             end = min(start + 4, len(tokens))
-            yield start, end, (kv_group, start, end, tuple(tokens[:end]))
+            yield start, end, Key(kv_group, start, end, tuple(tokens[:end]))
 
-    def alloc(group, length, caches=None):
-        return Page(1, length, (1,)), (1,)
+    def allocate(group, length, caches=None):
+        widths = (2, 1) if group == 0 else (1,)
+        page = Page(2, length, widths)
+        allocated.append(page)
+        return page, widths
+
+    def prefix(tokens, group, configs):
+        length = len(tokens) % 4 or 4
+        page, _ = allocate(group, length)
+        fill(page, len(tokens) - length, group)
+        return page
+
+    def prepare(rows, starts, ends, **kw):
+        calls.append(("prepare", kw["kv_group"], len(starts)))
+        return rows, starts, ends, kw["kv_group"]
+
+    def enqueue(plan):
+        rows, starts, ends, group = plan
+        calls.append(("enqueue", group))
+        widths = (2, 1) if group == 0 else (1,)
+        for layer, row in enumerate(rows):
+            for obj, start, end in zip(row, starts, ends, strict=True):
+                offset = 0
+                for plane, width in enumerate(widths):
+                    for i in range(end - start):
+                        obj.tensor[offset + i * width : offset + (i + 1) * width] = (
+                            start + i + layer * 31 + plane * 7 + group * 83
+                        ) % 256
+                    offset += (end - start) * width
+        return NS(synchronize=lambda: calls.append(("fence",)))
 
     return NS(
-        config=NS(
-            store_async_max_queue_size=2,
-            blocking_timeout_secs=10,
-            chunk_size=4,
-            get_extra_config_value=lambda name, default: default,
+        config=NS(store_async_max_queue_size=2, blocking_timeout_secs=10, chunk_size=4),
+        checkpoint_backend=lambda: backend,
+        validate_checkpoint_page=lambda group, page: None,
+        is_checkpoint_page_key=lambda key: isinstance(key, tuple),
+        checkpoint_page_key=lambda spec, group, start, end: (
+            "local",
+            spec.req_id,
+            spec.generation,
+            group,
+            start,
+            end,
         ),
-        storage_manager=storage,
         token_database=NS(process_tokens=tokens),
-        num_layers=1,
+        num_layers=2,
         is_frozen=lambda: False,
-        allocate_checkpoint_fragment=alloc,
+        allocate_checkpoint_fragment=allocate,
+        load_checkpoint_prefix=prefix,
         reclaim_checkpoint_capacity=lambda tokens, groups: False,
+        gpu_connector=NS(
+            prepare_group_capture=prepare,
+            enqueue_group_capture=enqueue,
+            finish_checkpoint_capture=lambda: calls.append(("failure-fence",)),
+        ),
+        allocated=allocated,
+        calls=calls,
+        backend=backend,
     )
 
 
 def finish(worker):
     until = time.monotonic() + 5
-    results = []
+    results = list(worker.poll())
     while worker.jobs and time.monotonic() < until:
         results.extend(worker.poll())
         time.sleep(0.001)
@@ -204,466 +249,340 @@ def finish(worker):
     return results
 
 
-def captured_job(api, engine):
-    control, worker = api
-    capture = control.CaptureSpec("r", 1, 0, 7, 3, ((1,), (2,)))
-    job = worker.CaptureJob(capture)
-    job.fragments = {
-        0: [(3, 7, Page(1, 4, (1,)), (1,))],
-        1: [(0, 7, Page(1, 7, (1,)), (1,))],
-    }
-    store = worker.CheckpointWorker(engine)
-    store.jobs[("r", 1)] = job
-    return store, job
-
-
-def test_persistence_reconstructs_prefix_and_never_exports_speculative_tail(api):
-    control, _ = api
-    engine = fake_engine()
-    store, job = captured_job(api, engine)
-    pages = [f[2] for fs in job.fragments.values() for f in fs]
-    store.seal(control.SealSpec("r", 1, tuple(range(6))))
-    results = finish(store)
-    assert [(r.status, r.end) for r in results] == [("ready", 6)]
-    assert [(k[:3], v) for k, v in engine.storage_manager.payloads] == [
-        ((0, 0, 4), bytes([123, 123, 123, 0])),
-        ((0, 4, 6), bytes([1, 2])),
-        ((1, 0, 4), bytes([0, 1, 2, 3])),
-        ((1, 4, 6), bytes([4, 5])),
-    ]
-    assert all(p.refs == 0 for p in pages)
-    store.close()
-
-
-@pytest.mark.parametrize("local_state", ["valid", "wrong_format", "missing"])
-def test_prefix_source_choice_retains_local_owner_or_falls_back_to_mooncake(
-    api, local_state
+def start_capture(
+    api, monkeypatch, engine=None, end=13, prefix=3, resident=None, state=None
 ):
-    control, _ = api
-
-    def method(path, name, namespace):
-        fn = next(
-            n
-            for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-            if isinstance(n, ast.FunctionDef) and n.name == name
-        )
-        future = ast.ImportFrom(
-            module="__future__", names=[ast.alias(name="annotations")], level=0
-        )
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(body=[future, fn], type_ignores=[])
-                ),
-                str(path),
-                "exec",
-            ),
-            namespace,
-        )
-        return namespace[name]
-
-    class Key(tuple):
-        def split_layers(self, layers):
-            return [(self, layer) for layer in range(layers)]
-
-    engine = fake_engine()
-    original_tokens = engine.token_database.process_tokens
-
-    def tokens(**kwargs):
-        for start, end, key in original_tokens(**kwargs):
-            yield start, end, Key(key)
-
-    engine.token_database.process_tokens = tokens
-    prefix = Page(1, 3, (1,))
-    if local_state == "wrong_format":
-        prefix.metadata.fmt = "wrong"
-    key = Key((0, 0, 3, tuple(range(3))))
-    local = NS(
-        cpu_lock=threading.Lock(),
-        hot_cache={} if local_state == "missing" else {(key, 0): prefix},
-    )
-    get_local = method(
-        ROOT.parent / "LMCache-NPU/lmcache/v1/storage_backend/local_cpu_backend.py",
-        "batched_get_layer_page_prefix",
-        {"LayerPageMemoryObj": Page},
-    )
-    local.batched_get_layer_page_prefix = MethodType(get_local, local)
-    engine._shared_local_cpu_backend = lambda: local
-    engine._shared_cpu_dtype_for_kv_group = lambda group: torch.uint8
-    engine._memory_format_for_kv_group = lambda group: "test"
-    engine.gpu_connector = NS(checkpoint_plane_widths=lambda group: (1,))
-    get_prefix = method(
-        ROOT / "lmcache_ascend/v1/cache_engine.py", "get_checkpoint_prefix", {}
-    )
-    engine.get_checkpoint_prefix = MethodType(get_prefix, engine)
-    loads = []
-    original_get = engine.storage_manager.batched_get_external_pages
-
-    def get(*args):
-        loads.append(args[0])
-        original_get(*args)
-
-    engine.storage_manager.batched_get_external_pages = get
-    store, _ = captured_job(api, engine)
-    store.seal(control.SealSpec("r", 1, tuple(range(6))))
-    assert [result.status for result in finish(store)] == ["ready"]
-    assert len(loads) == (0 if local_state == "valid" else 1)
-    assert prefix.refs == 1  # The LocalCPU cache owner remains; job pins retired.
-    assert engine.storage_manager.payloads[0][1][:3] == (
-        bytes([0, 1, 2]) if local_state == "valid" else bytes([123] * 3)
-    )
-    store.close()
-
-
-def test_cancel_during_persistence_keeps_owners_until_terminal(api):
-    control, _ = api
-    engine = fake_engine()
-    engine.storage_manager.release.clear()
-    store, job = captured_job(api, engine)
-    page = job.fragments[1][0][2]
-    store.seal(control.SealSpec("r", 1, tuple(range(6))))
-    assert engine.storage_manager.started.wait(2)
-    store.cancel("r", 1)
-    assert page.refs == 1 and store.poll() == ()
-    engine.storage_manager.release.set()
-    assert finish(store) == []
-    assert page.refs == 0
-    store.close()
-
-
-def test_persistent_failure_does_not_publish_ready(api):
-    control, _ = api
-    engine = fake_engine()
-    engine.storage_manager.error = ValueError("missing group")
-    store, _ = captured_job(api, engine)
-    store.seal(control.SealSpec("r", 1, tuple(range(6))))
-    assert [r.status for r in finish(store)] == ["failed"]
-    store.close()
-
-
-@pytest.mark.parametrize("base", [0, 4])
-def test_omitted_partial_chunk_cannot_publish_a_longer_checkpoint(api, base):
     control, module = api
-    engine = fake_engine()
-    original = engine.token_database.process_tokens
+    engine = engine or fake_engine()
+    original_tensor = torch.tensor
 
-    def full_chunks_only(**kwargs):
-        yield from (chunk for chunk in original(**kwargs) if chunk[1] - chunk[0] == 4)
+    def tensor(values, **kw):
+        kw.pop("pin_memory", None)
+        return original_tensor(values, **kw)
 
-    # Reproduce ChunkedTokenDatabase with save_unfull_chunk=false.
-    engine.token_database.process_tokens = full_chunks_only
+    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
     store = module.CheckpointWorker(engine)
-    capture = control.CaptureSpec("r", 1, base, 7, base, ((1, 2), (3, 4)))
-    job = module.CaptureJob(capture)
-    job.fragments = {g: [(base, 7, Page(1, 7 - base, (1,)), (1,))] for g in (0, 1)}
-    store.jobs[("r", 1)] = job
-    store.seal(control.SealSpec("r", 1, tuple(range(6))))
-    assert [result.status for result in finish(store)] == ["failed"]
-    assert engine.storage_manager.payloads == []
-    store.close()
-
-
-def test_group_capture_has_one_completion_wait_and_reuses_cpu_buffers(api, monkeypatch):
-    control, worker = api
-    engine = fake_engine()
-    events = []
-    allocations = []
-    allocate = engine.allocate_checkpoint_fragment
-
-    def alloc(*args, **kwargs):
-        result = allocate(*args, **kwargs)
-        allocations.append(result[0])
-        return result
-
-    engine.allocate_checkpoint_fragment = alloc
-
-    # Native/pinned allocation boundary; all orchestration remains production.
-    def tensor(values, **kwargs):
-        kwargs.pop("pin_memory", None)
-        return torch.tensor(values, **kwargs)
-
-    monkeypatch.setattr(worker, "torch", NS(tensor=tensor, long=torch.long))
-
-    def prepare(rows, starts, ends, **kwargs):
-        events.append("prepare")
-        return rows
-
-    def enqueue(plan):
-        events.append("enqueue")
-        return NS(synchronize=lambda: events.append("complete"))
-
-    engine.gpu_connector = NS(
-        prepare_group_capture=prepare,
-        enqueue_group_capture=enqueue,
-        finish_checkpoint_capture=lambda: events.append("exception_fence"),
+    blocks = tuple(range(1, (end + 3) // 4 + 1))
+    spec = control.CaptureSpec(
+        "r",
+        1,
+        prefix // 4 * 4,
+        end,
+        prefix if resident is None else resident,
+        (blocks, blocks),
+        prefix_end=prefix,
     )
-    store = worker.CheckpointWorker(engine)
-    for generation in (1, 2):
-        spec = control.CaptureSpec("r", generation, 0, 6, 0, ((1, 2), (3, 4)))
-        store.capture(spec, {0: [1], 1: [2]}, 4)
-        assert store.poll()[0].status == "captured"
-        store.cancel("r", generation)
-    assert events == ["prepare", "prepare", "enqueue", "enqueue", "complete"] * 2
-    assert len(allocations) == 2
-    assert all(page.refs == 1 for page in allocations)
-    store.close()
-    assert all(page.refs == 0 for page in allocations)
+    store.capture(spec, {0: [1], 1: [2]}, 4, state)
+    return store, spec, engine
 
 
-def test_busy_capture_refusal_does_not_synchronize_device(api):
-    control, worker = api
-    engine = fake_engine()
-    engine.gpu_connector = NS(
-        finish_checkpoint_capture=lambda: pytest.fail("unexpected device sync")
-    )
-    store = worker.CheckpointWorker(engine)
-    store.max_jobs = 0
-    store.capture(
-        control.CaptureSpec("r", 1, 0, 6, 0, ((1, 2), (3, 4))), {0: [1], 1: [2]}, 4
-    )
-    assert store.poll()[0].status == "failed"
+def publish(api, store, end):
+    control, _ = api
+    store.seal(control.SealSpec("r", 1, tuple(range(end))))
+    results = finish(store)
+    assert [(r.status, r.end) for r in results] == [("ready", end)]
+
+
+def test_fragmented_capture_uses_chunk_pages_two_submissions_one_fence(
+    api, monkeypatch
+):
+    store, _, engine = start_capture(api, monkeypatch)
+    assert [(r.status, r.end) for r in store.poll()] == [("captured", 13)]
+    assert all(p.valid_tokens <= 4 for p in engine.allocated)
+    assert [c[0] for c in engine.calls] == [
+        "prepare",
+        "prepare",
+        "enqueue",
+        "enqueue",
+        "fence",
+    ]
+    publish(api, store, 12)
+    assert all(p.refs in (0, 1) for p in engine.allocated)
+    assert store.local.available("r", 1, 12) == 12
     store.close()
 
 
 @pytest.mark.parametrize("failed_group", [0, 1])
-@pytest.mark.parametrize("retry_succeeds", [False, True])
-def test_capture_reclaims_missing_groups_once_before_any_device_work(
-    api, monkeypatch, failed_group, retry_succeeds
-):
-    control, module = api
+def test_partial_allocation_preserves_completed_pairs(api, monkeypatch, failed_group):
     engine = fake_engine()
-    original = engine.allocate_checkpoint_fragment
-    attempts, reclaims, launches = [], [], []
-    store = module.CheckpointWorker(engine)
+    original, reclaims = engine.allocate_checkpoint_fragment, []
+    counts = [0, 0]
 
-    def allocate(group, *args):
-        attempts.append(group)
-        if group == failed_group and (not reclaims or not retry_succeeds):
-            raise MemoryError("Checkpoint CPU staging allocation refused")
-        return original(group, *args)
-
-    def reclaim(tokens, groups):
-        assert not launches
-        assert store.buffer_lock.acquire(blocking=False)
-        store.buffer_lock.release()
-        reclaims.append((tokens, set(groups)))
-        return True
-
-    def tensor(values, **kwargs):
-        kwargs.pop("pin_memory", None)
-        return torch.tensor(values, **kwargs)
-
-    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
-    engine.allocate_checkpoint_fragment, engine.reclaim_checkpoint_capacity = (
-        allocate,
-        reclaim,
-    )
-    engine.gpu_connector = NS(
-        prepare_group_capture=lambda *a, **kw: launches.append("prepare"),
-        enqueue_group_capture=lambda plan: NS(
-            synchronize=lambda: launches.append("fence")
-        ),
-        finish_checkpoint_capture=lambda: pytest.fail(
-            "failed CPU admission submitted device work"
-        ),
-    )
-    store.capture(
-        control.CaptureSpec("r", 1, 0, 6, 0, ((1, 2), (3, 4))), {0: [1], 1: [2]}, 4
-    )
-    assert reclaims == [(store.capacity_tokens, {0, 1} if failed_group == 0 else {1})]
-    assert attempts.count(failed_group) == 2
-    assert launches == (["prepare", "prepare", "fence"] if retry_succeeds else [])
-    assert store.poll()[0].status == ("captured" if retry_succeeds else "failed")
-    store.cancel("r")
-    store.close()
-
-
-def test_reclaim_budget_excludes_an_already_reusable_group_buffer(api, monkeypatch):
-    control, module = api
-    engine = fake_engine()
-    store = module.CheckpointWorker(engine)
-    lease, _ = store._allocate_fragment(1, 6)
-    lease.ref_count_down()
-    original = engine.allocate_checkpoint_fragment
-    reclaims = []
-
-    def allocate(group, *args):
-        if not reclaims:
-            raise MemoryError("staging full")
-        return original(group, *args)
+    def allocate(group, length, caches=None):
+        counts[group] += 1
+        if group == failed_group and counts[group] >= 3:
+            raise MemoryError("pressure")
+        return original(group, length, caches)
 
     engine.allocate_checkpoint_fragment = allocate
     engine.reclaim_checkpoint_capacity = (
-        lambda tokens, groups: reclaims.append(set(groups)) or True
+        lambda n, g: reclaims.append((n, set(g))) or False
     )
-    original_tensor = torch.tensor
+    store, _, engine = start_capture(api, monkeypatch, engine)
+    result = store.poll()[0]
+    assert result.status == "captured" and result.end == 8
+    assert len(reclaims) == 1
+    publish(api, store, 8)
+    assert store.local.available("r", 1, 8) == 8
+    assert all(p.refs <= 1 for p in engine.allocated)
+    store.close()
 
-    def tensor(values, **kwargs):
-        kwargs.pop("pin_memory", None)
-        return original_tensor(values, **kwargs)
 
-    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
-    engine.gpu_connector = NS(
-        prepare_group_capture=lambda *a, **kw: None,
-        enqueue_group_capture=lambda plan: NS(synchronize=lambda: None),
-    )
-    store.capture(
-        control.CaptureSpec("r", 1, 0, 6, 0, ((1, 2), (3, 4))), {0: [1], 1: [2]}, 4
-    )
-    assert reclaims == [{0}]
-    assert store.poll()[0].status == "captured"
+def test_waiting_checkpoint_is_evictable_and_one_group_hole_shortens_frontier(
+    api, monkeypatch
+):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    publish(api, store, 12)
+    key = ("local", "r", 1, 1, 8, 12)
+    assert engine.backend.evict(key)
+    assert store.local.available("r", 1, 12) == 8
+    assert all(p.refs <= 1 for p in engine.allocated)
+    store.close()
+
+
+def test_acquired_sources_cannot_be_evicted_until_restore_releases(api, monkeypatch):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    publish(api, store, 12)
+    manifest = store.local.manifest("r", 1)
+    end, held = store.local.acquire(manifest, 12)
+    assert end == 12
+    assert not engine.backend.evict(held[0][0][0].key)
+    key = held[0][0][0].key
+    store.local.release(held)
+    assert engine.backend.evict(key)
+    store.close()
+
+
+def test_local_restore_normalizes_boundary_and_rejected_speculative_tail(
+    api, monkeypatch
+):
+    store, _, engine = start_capture(api, monkeypatch, end=14)
+    store.poll()
+    publish(api, store, 11)
+    base, owners = store.local.normalize("r", 1, list(range(11)), None)
+    assert base == 0
+    for group in (0, 1):
+        for start, end, key in engine.token_database.process_tokens(
+            tokens=list(range(11)), kv_group=group
+        ):
+            actual = engine.backend.pages[key]
+            expected = Page(2, end - start, (2, 1) if group == 0 else (1,))
+            fill(expected, start, group)
+            assert torch.equal(actual.raw_data, expected.raw_data)
+    for page in owners:
+        page.ref_count_down()
+    store.close()
+
+
+def test_eviction_between_probe_and_acquire_refuses_restore_without_leaking(
+    api, monkeypatch
+):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    publish(api, store, 12)
+    assert store.local.available("r", 1, 12) == 12
+    engine.backend.evict(("local", "r", 1, 0, 4, 8))
+    with pytest.raises(ValueError, match="evicted"):
+        store.local.normalize("r", 1, list(range(12)), None)
+    assert all(p.refs <= 1 for p in engine.allocated)
+    store.close()
+
+
+def test_generation_and_history_mismatch_cannot_restore(api, monkeypatch):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    publish(api, store, 12)
+    assert store.local.available("r", 2, 12) == 0
+    with pytest.raises(ValueError, match="history"):
+        store.local.normalize("r", 1, [99] * 12, None)
+    store.close()
+
+
+def test_cancel_during_local_publication_does_not_release_live_owners(api, monkeypatch):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    started, release = threading.Event(), threading.Event()
+    engine.backend.before_put = lambda: (started.set(), release.wait(5))
+    store.seal(api[0].SealSpec("r", 1, tuple(range(12))))
+    assert started.wait(2)
     store.cancel("r")
+    assert any(p.refs for p in engine.allocated)
+    release.set()
+    assert not finish(store)
+    assert store.local.manifest("r", 1) is None
     store.close()
 
 
-def test_excess_idle_staging_returns_to_allocator(api):
-    _, module = api
-    store = module.CheckpointWorker(fake_engine())
-    leases = [store._allocate_fragment(0, 3)[0] for _ in range(3)]
-    pages = [lease.page for lease in leases]
-    for lease in leases:
-        lease.ref_count_down()
-    assert store.buffer_counts[0] == 1 and len(store.free_buffers[0]) == 1
-    assert [page.refs for page in pages] == [1, 0, 0]
-    store.close()
-    assert [page.refs for page in pages] == [0, 0, 0]
-
-
-def test_background_prefix_allocation_reclaims_once_without_releasing_captured_kv(api):
-    control, _ = api
+def test_capture_fence_failure_quarantines_sources(api, monkeypatch):
     engine = fake_engine()
-    store, job = captured_job(api, engine)
-    original = engine.allocate_checkpoint_fragment
-    allocations, reclaims = [], []
-
-    def allocate(*args):
-        allocations.append(args[0])
-        if len(allocations) == 1:
-            raise MemoryError("prefix staging full")
-        return original(*args)
-
-    def reclaim(tokens, groups):
-        assert all(
-            page.refs == 1
-            for fragments in job.fragments.values()
-            for _, _, page, _ in fragments
-        )
-        assert store.buffer_lock.acquire(blocking=False)
-        store.buffer_lock.release()
-        reclaims.append((tokens, groups))
-        return True
-
-    engine.allocate_checkpoint_fragment, engine.reclaim_checkpoint_capacity = (
-        allocate,
-        reclaim,
+    engine.gpu_connector.enqueue_group_capture = lambda plan: NS(
+        synchronize=lambda: (_ for _ in ()).throw(RuntimeError("device"))
     )
-    store.seal(control.SealSpec("r", 1, tuple(range(6))))
-    assert [result.status for result in finish(store)] == ["ready"]
-    assert allocations == [0, 0] and reclaims == [(store.capacity_tokens, {0: None})]
-    assert engine.storage_manager.payloads[0][1] == bytes([123, 123, 123, 0])
+    engine.gpu_connector.finish_checkpoint_capture = lambda: (_ for _ in ()).throw(
+        RuntimeError("still running")
+    )
+    with pytest.raises(RuntimeError, match="retained"):
+        start_capture(api, monkeypatch, engine)
+    assert all(p.refs == 1 for p in engine.allocated)
+
+
+def test_unsealed_capture_deadline_releases_without_normal_decode_polling(
+    api, monkeypatch
+):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    store.timeout = 0
+    store.jobs["r", 1].started -= 1
+    results = store.poll()
+    assert results[0].status == "failed"
+    assert not store.jobs and all(p.refs == 0 for p in engine.allocated)
     store.close()
 
 
-@pytest.mark.parametrize(
-    "end,blocks", [(6, ((0, 2), (3, 4))), (6, ((1, 2), (3,))), (50, ((1, 2), (3, 4)))]
-)
-def test_invalid_capture_source_does_not_evict_or_allocate(api, end, blocks):
-    control, module = api
-    engine = fake_engine()
-    engine.allocate_checkpoint_fragment = lambda *a: pytest.fail(
-        "invalid source allocated staging"
-    )
-    engine.reclaim_checkpoint_capacity = lambda *a: pytest.fail(
-        "invalid source evicted cache"
-    )
-    store = module.CheckpointWorker(engine)
-    store.capture(control.CaptureSpec("r", 1, 0, end, 0, blocks), {0: [1], 1: [2]}, 4)
-    assert store.poll()[0].status == "failed"
-    store.close()
-
-
-def test_unsealed_capture_deadline_progresses_without_model_tokens(api):
-    _, _worker = api
-    store, job = captured_job(api, fake_engine())
-    page = job.fragments[1][0][2]
-    job.started -= store.timeout + 1
-    assert store.poll()[0].status == "failed"
-    assert page.refs == 0 and not store.jobs
-    store.close()
-
-
-def test_failed_checkpoint_retires_job_with_gc_disabled(api):
-    control, _ = api
-    engine = fake_engine()
-    engine.storage_manager.error = ValueError("store failure")
+def test_freeze_before_local_publication_and_gc_disabled_cleanup(api, monkeypatch):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    engine.is_frozen = lambda: True
     enabled = gc.isenabled()
     gc.disable()
     try:
-        store, job = captured_job(api, engine)
-        ref = weakref.ref(job)
-        store.seal(control.SealSpec("r", 1, tuple(range(6))))
+        store.seal(api[0].SealSpec("r", 1, tuple(range(12))))
         assert [r.status for r in finish(store)] == ["failed"]
-        del job
-        store.close()
-        assert ref() is None
+        assert all(p.refs == 0 for p in engine.allocated)
     finally:
         if enabled:
             gc.enable()
-
-
-def test_quarantined_capture_cannot_be_cancelled_away_before_shutdown(api):
-    store, job = captured_job(api, fake_engine())
-    page = job.fragments[1][0][2]
-    job.quarantined = True
-    try:
-        store.cancel("r", 1)
-        assert ("r", 1) in store.jobs
-        with pytest.raises(RuntimeError, match="unresolved"):
-            store.close()
-        assert page.refs == 1
-    finally:
-        job.quarantined = False
-        store.cancel("r", 1)
         store.close()
 
 
-def test_second_group_oom_refuses_before_any_device_preparation(api, monkeypatch):
-    control, worker = api
+def test_smaller_final_fragment_uses_fragmented_space_without_discarding_progress(
+    api, monkeypatch
+):
     engine = fake_engine()
-    allocation = engine.allocate_checkpoint_fragment
-
-    def allocate(group, *args, **kwargs):
-        if group == 1:
-            raise MemoryError("indexer staging full")
-        return allocation(group, *args, **kwargs)
-
-    engine.allocate_checkpoint_fragment = allocate
-    calls = []
-    engine.gpu_connector = NS(
-        prepare_group_capture=lambda *a, **kw: calls.append("prepare"),
-        finish_checkpoint_capture=lambda: calls.append("sync"),
+    original = engine.allocate_checkpoint_fragment
+    engine.allocate_checkpoint_fragment = lambda group, n, caches=None: (
+        original(group, n, caches)
+        if n <= 2
+        else (_ for _ in ()).throw(MemoryError("fragmented"))
     )
-
-    def tensor(values, **kwargs):
-        kwargs.pop("pin_memory", None)
-        return torch.tensor(values, **kwargs)
-
-    monkeypatch.setattr(worker, "torch", NS(tensor=tensor, long=torch.long))
-    store = worker.CheckpointWorker(engine)
-    store.capture(
-        control.CaptureSpec("r", 1, 0, 6, 0, ((1, 2), (3, 4))), {0: [1], 1: [2]}, 4
-    )
-    assert store.poll()[0].status == "failed"
-    assert calls == []
+    store, _, _ = start_capture(api, monkeypatch, engine, prefix=0)
+    assert [(r.status, r.end) for r in store.poll()] == [("captured", 2)]
+    publish(api, store, 2)
+    assert store.local.available("r", 1, 2) == 2
     store.close()
 
 
-def test_freeze_before_persistence_prevents_checkpoint_writes(api):
-    control, _ = api
+def test_repeated_preemption_reuses_local_group0_and_recaptures_resident_group1(
+    api, monkeypatch
+):
+    control, module = api
+    first, _, engine = start_capture(api, monkeypatch, end=14)
+    first.poll()
+    publish(api, first, 11)
+    _, held = first.local.normalize("r", 1, list(range(11)), None)
+    # Model's active Group-0 CPU sources remain held; checkpoint does not evict them.
+    sources = list(
+        engine.token_database.process_tokens(tokens=list(range(11)), kv_group=0)
+    )
+    state = NS(
+        cached_starts=[a for a, b, k in sources],
+        cached_ends=[b for a, b, k in sources],
+        cached_keys=[[k for a, b, k in sources]],
+    )
+    second = module.CheckpointWorker(engine)
+    blocks = (tuple(range(1, 5)),) * 2
+    second.capture(
+        control.CaptureSpec("r", 2, 0, 15, 11, blocks, prefix_end=3),
+        {0: [1], 1: [2]},
+        4,
+        state,
+    )
+    assert second.poll()[0].status == "captured"
+    second.seal(control.SealSpec("r", 2, tuple(range(14))))
+    assert [(x.status, x.end) for x in finish(second)] == [("ready", 14)]
+    _, restored = second.local.normalize("r", 2, list(range(14)), None)
+    for group in (0, 1):
+        for a, b, key in engine.token_database.process_tokens(
+            tokens=list(range(14)), kv_group=group
+        ):
+            page = engine.backend.pages[key]
+            expected = Page(2, b - a, (2, 1) if group == 0 else (1,))
+            fill(expected, a, group)
+            assert torch.equal(page.raw_data, expected.raw_data)
+    for page in restored + held:
+        page.ref_count_down()
+    first.close()
+    second.close()
+
+
+def test_invalid_block_table_refuses_before_allocation_or_device_work(api, monkeypatch):
+    control, module = api
     engine = fake_engine()
-    engine.is_frozen = lambda: True
-    store, _ = captured_job(api, engine)
-    store.seal(control.SealSpec("r", 1, tuple(range(6))))
-    assert [r.status for r in finish(store)] == ["failed"]
-    assert not engine.storage_manager.started.is_set()
+    store = module.CheckpointWorker(engine)
+    store.capture(
+        control.CaptureSpec("r", 1, 0, 8, 0, ((1, 2), (1, 0))), {0: [1], 1: [2]}, 4
+    )
+    assert store.poll()[0].status == "failed"
+    assert not engine.allocated and not engine.calls
+    store.close()
+
+
+def test_boundary_assembly_reclaims_once_and_keeps_acquired_sources_protected(
+    api, monkeypatch
+):
+    store, _, engine = start_capture(api, monkeypatch)
+    store.poll()
+    publish(api, store, 12)
+    original = engine.allocate_checkpoint_fragment
+    attempts = []
+    reclaims = []
+
+    def allocate(group, n, caches=None):
+        attempts.append((group, n))
+        if len(attempts) == 1:
+            raise MemoryError("capacity")
+        return original(group, n, caches)
+
+    def reclaim(n, groups):
+        assert all(p.refs >= 2 for p in engine.backend.pages.values())
+        reclaims.append((n, groups))
+        return True
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = reclaim
+    _, owners = store.local.normalize("r", 1, list(range(12)), None)
+    assert len(reclaims) == 1
+    for page in owners:
+        page.ref_count_down()
+    store.close()
+
+
+@pytest.mark.parametrize("resident", [0, 2, 3])
+def test_prefix_remap_boundary_can_precede_original_prompt_without_fabricating_a_storage_key(
+    api, monkeypatch, resident
+):
+    store, _, engine = start_capture(api, monkeypatch, resident=resident)
+    store.poll()
+    publish(api, store, 11)
+    original = engine.load_checkpoint_prefix
+    prefix_reads = []
+
+    def prefix(tokens, group, configs):
+        prefix_reads.append(len(tokens))
+        return original(tokens, group, configs)
+
+    engine.load_checkpoint_prefix = prefix
+    _, owners = store.local.normalize("r", 1, list(range(11)), None)
+    assert all(n == 3 for n in prefix_reads)
+    for group in (0, 1):
+        for a, b, key in engine.token_database.process_tokens(
+            tokens=list(range(11)), kv_group=group
+        ):
+            expected = Page(2, b - a, (2, 1) if group == 0 else (1,))
+            fill(expected, a, group)
+            assert torch.equal(engine.backend.pages[key].raw_data, expected.raw_data)
+    for page in owners:
+        page.ref_count_down()
     store.close()

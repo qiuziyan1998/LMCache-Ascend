@@ -15,7 +15,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 from urllib.parse import urlsplit
 from weakref import WeakSet
@@ -29,6 +29,7 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
+from lmcache.integration.vllm.preemption_checkpoint import LOCAL_CHECKPOINT_CONFIG
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
@@ -9556,6 +9557,189 @@ class AscendLMCacheEngine(LMCacheEngine):
             severity="critical",
         )
 
+    def forget_checkpoint_request(self, req_id: str) -> None:
+        """Retire local offer metadata on the existing request-finished event."""
+        if self.checkpoint_worker is not None:
+            self.checkpoint_worker.local.forget(req_id)
+
+    def checkpoint_backend(self) -> Any:
+        """Return the existing registered LocalCPU heap for checkpoint pages."""
+        local = self._shared_local_cpu_backend()
+        if local is None or not local.use_hot:
+            raise RuntimeError("Local checkpoint storage is unavailable")
+        return local
+
+    def checkpoint_page_key(
+        self, spec: Any, group: int, start: int, end: int
+    ) -> CacheEngineKey:
+        """Make an isolated local-only key; unsealed bytes cannot be prefix hits."""
+        return CacheEngineKey(
+            self.metadata.model_name,
+            self.metadata.world_size,
+            self.metadata.worker_id,
+            secrets.token_bytes(16),
+            self._shared_cpu_dtype_for_kv_group(group),
+            {
+                "lmcache.tag.checkpoint": f"{spec.req_id}:{spec.generation}:{start}:{end}"
+            },
+            kv_group=group,
+        ).split_layers(self.num_layers)[0]
+
+    @staticmethod
+    def is_checkpoint_page_key(key: CacheEngineKey) -> bool:
+        """Identify private staging keys without touching canonical prefix keys."""
+        return "lmcache.tag.checkpoint" in (key.request_configs or {})
+
+    def validate_checkpoint_page(self, group: int, page: LayerPageMemoryObj) -> None:
+        """Reject incompatible local layouts before constructing transfer operands."""
+        if (
+            page.num_layers != self.num_layers
+            or page.get_dtype() != self._shared_cpu_dtype_for_kv_group(group)
+            or page.metadata.fmt != self._memory_format_for_kv_group(group)
+        ):
+            raise ValueError("Local checkpoint page layout mismatch")
+
+    def load_checkpoint_prefix(
+        self, tokens: tuple[int, ...], group: int, configs: Any
+    ) -> Any:
+        """Retain the exact original boundary page, fetching only that page on miss."""
+        start, end, key = list(
+            self.token_database.process_tokens(
+                tokens=list(tokens),
+                request_configs=configs,
+                kv_group=group,
+            )
+        )[-1]
+        cached = self.get_checkpoint_prefix(key, group, end - start)
+        if cached is not None:
+            return cached[0]
+        page, _ = self.allocate_checkpoint_fragment(group, end - start)
+        try:
+            self.storage_manager.batched_get_external_pages(
+                [key],
+                [[page.layer_data_ptr(i) for i in range(self.num_layers)]],
+                [
+                    [
+                        page.layer_tensor(i).numel() * page.get_dtype().itemsize
+                        for i in range(self.num_layers)
+                    ]
+                ],
+                (page.raw_data,),
+                "checkpoint-prefix",
+            )
+            return page
+        except NativeExternalPageTransferUnknownError:
+            self._checkpoint_quarantined_owners = getattr(
+                self, "_checkpoint_quarantined_owners", []
+            )
+            self._checkpoint_quarantined_owners.append(page)
+            raise
+        except BaseException:
+            page.ref_count_down()
+            raise
+
+    def _lookup_remote_fill_two_group_prefix(
+        self,
+        chunks: list,
+        *,
+        search_range: list,
+        lookup_id: str | None,
+        pin: bool,
+        request_configs: Any = None,
+        diagnostics: Any = None,
+    ) -> int:
+        generation = (request_configs or {}).get(LOCAL_CHECKPOINT_CONFIG)
+        if generation is None:
+            return super()._lookup_remote_fill_two_group_prefix(
+                chunks,
+                search_range=search_range,
+                lookup_id=lookup_id,
+                pin=pin,
+                request_configs=request_configs,
+                diagnostics=diagnostics,
+            )
+        worker = self.checkpoint_worker
+        manifest = worker.local.manifest(lookup_id, int(generation)) if worker else None
+        if manifest is None or not chunks:
+            return 0
+        configs = dict(request_configs)
+        configs.pop(LOCAL_CHECKPOINT_CONFIG)
+        prefix = list(
+            self.token_database.process_tokens(
+                tokens=list(manifest.tokens[: manifest.prefix_end]),
+                request_configs=configs,
+            )
+        )
+        hit = (
+            super()._lookup_remote_fill_two_group_prefix(
+                prefix,
+                search_range=search_range,
+                lookup_id=None,
+                pin=False,
+                request_configs=configs,
+            )
+            if prefix
+            else 0
+        )
+        if hit != manifest.prefix_end:
+            return hit
+        expected = list(
+            self.token_database.process_tokens(
+                tokens=list(manifest.tokens[: chunks[-1][1]]),
+                request_configs=configs,
+            )
+        )
+        if chunks != expected:
+            return 0
+        return worker.local.available(lookup_id, int(generation), chunks[-1][1])
+
+    def prepare_checkpoint_restore(self, request: Any) -> tuple[int, list[Any]]:
+        """Normalize on TP0 and broadcast terminal admission before ordinary loads."""
+        spec = request.load_spec
+        identity = dict(
+            req_id=request.req_id,
+            phase="checkpoint_restore",
+            request_ordinal=spec.checkpoint_generation,
+            layer_id=0,
+            kv_group=0,
+        )
+        owners, error = [], None
+        if not self._is_passive():
+            try:
+                base, owners = self.checkpoint_worker.local.normalize(
+                    request.req_id,
+                    spec.checkpoint_generation,
+                    request.token_ids,
+                    request.request_configs,
+                )
+            except Exception as exc:
+                error = exc
+            envelope = self._shared_layerwise_error_envelope(
+                **identity,
+                message=str(error) if error else "",
+            )
+            if error is None:
+                envelope = replace(
+                    envelope, status="skipped", error_details={"base": base}
+                )
+            try:
+                self._broadcast_shared_envelope(envelope)
+            except BaseException:
+                for page in owners:
+                    page.ref_count_down()
+                raise
+        else:
+            envelope = self._receive_matching_shared_envelope(**identity)
+            self._validate_shared_layerwise_envelope(envelope, **identity)
+        if envelope.status != "skipped":
+            if isinstance(error, NativeExternalPageTransferUnknownError):
+                self.mark_init_failed("checkpoint prefix DMA completion is unknown")
+                raise error
+            raise RuntimeError(
+                f"Local checkpoint restore unavailable: {envelope.message}"
+            ) from error
+        return int(envelope.error_details["base"]), owners
+
     def reclaim_checkpoint_capacity(
         self, tokens: int, group_caches: dict[int, Optional[list]]
     ) -> bool:
@@ -9628,6 +9812,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
+        if getattr(self, "_checkpoint_quarantined_owners", None):
+            raise RuntimeError("Checkpoint prefix DMA is unresolved; allocator owners retained")
         if getattr(self, "checkpoint_worker", None) is not None:
             self.checkpoint_worker.close()
             self.checkpoint_worker = None

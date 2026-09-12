@@ -135,7 +135,7 @@ def fixture():
         cancel=lambda *ids: calls.append(("cancel", ids)),
     )
 
-    def capture(spec, caches, block_size):
+    def capture(spec, caches, block_size, prefix_state=None):
         assert "drop-state" not in calls
         calls.append("capture")
         worker.jobs[(spec.req_id, spec.generation)] = object()
@@ -151,6 +151,7 @@ def fixture():
     impl.store_async, impl.kv_role = True, "kv_both"
     impl._unfenced_live_stores = {}
     impl._block_size = 16
+    impl._worker_retrieve_state = {}
     impl._direct_group_caches = lambda: {0: [object()], 1: [object()]}
     impl._drop_worker_retrieve_state = lambda req: calls.append("drop-state")
     dynamic = ns["LMCacheAscendConnectorV1Dynamic"]()

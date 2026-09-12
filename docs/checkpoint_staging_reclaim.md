@@ -1,5 +1,9 @@
 # Eviction-assisted checkpoint staging
 
+The original slab policy below is historical. The current implementation uses
+[partial local checkpoints](local_preemption_checkpoints.md), retaining the
+bounded reclaim helper while removing the fixed slab pool and tail persistence.
+
 The 2026-09-11 run entered checkpoint capture but all eight reported attempts
 failed with `Checkpoint CPU staging allocation refused`. The previous lazy pool
 could not reclaim unused cache storage. This change adds one bounded reclamation

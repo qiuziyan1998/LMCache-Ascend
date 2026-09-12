@@ -4304,9 +4304,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ends: List[int],
         **kwargs: Any,
     ) -> PreparedGroupCapture:
-        """Prepare one private checkpoint fragment using the dense group kernel.
+        """Prepare fragmented checkpoint pages in one dense group submission.
 
-        The checkpoint writer owns one registered slab per group. Ordinary
+        The checkpoint writer owns registered pages for each interval. Ordinary
         multi-chunk stores retain their original preparation and dispatch.
         """
         self.initialize_kvcaches_ptr(**kwargs)
@@ -4315,14 +4315,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slots = kwargs["slot_mapping"]
         base = int(kwargs.get("slot_mapping_base", 0))
         if (
-            len(starts) != 1
-            or len(ends) != 1
+            not starts
+            or len(starts) != len(ends)
             or base < 0
             or starts[0] != base
-            or ends[0] - base != len(slots)
+            or ends[-1] - base != len(slots)
+            or any(a >= b for a, b in zip(starts, ends, strict=True))
+            or any(a != b for a, b in zip(starts[1:], ends[:-1], strict=True))
             or not len(slots)
         ):
-            raise ValueError("Checkpoint capture requires one exact resident fragment")
+            raise ValueError("Checkpoint capture requires contiguous resident intervals")
         if (
             caches is None
             or len(caches) < self.num_layers
@@ -4345,11 +4347,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         fmt = self._expected_memory_format(group)
         tensors = []
         for layer, objects in enumerate(memory_objs):
-            if len(objects) != 1 or objects[0].metadata.fmt != fmt:
+            if len(objects) != len(starts) or any(obj.metadata.fmt != fmt for obj in objects):
                 raise ValueError(
-                    "Checkpoint capture requires one correctly formatted slab per layer"
+                    "Checkpoint capture requires correctly formatted pages per layer"
                 )
-            tensors.append([_layer_memory_tensor(objects[0], layer)])
+            tensors.append([_layer_memory_tensor(obj, layer) for obj in objects])
         device_slots = self._slot_mapping_on_kv_device(slots, self.store_stream)
         states = [
             prepare_sparse_direct_layer_state(
@@ -4375,8 +4377,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ]
         if any(not pointer for row in rows for pointer in row):
             raise ValueError("Checkpoint CPU destination is not registered")
-        offsets = torch.tensor([0], dtype=torch.int32, pin_memory=True)
-        sizes = torch.tensor([len(slots)], dtype=torch.int32, pin_memory=True)
+        offsets = torch.tensor(
+            [a - base for a in starts], dtype=torch.int32, pin_memory=True
+        )
+        sizes = torch.tensor([b - a for a, b in zip(starts, ends, strict=True)], dtype=torch.int32, pin_memory=True)
         pointers = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
         with self._stream_context_or_null(self.store_stream):
             offsets_npu = offsets.to(self.kv_device, non_blocking=True)
