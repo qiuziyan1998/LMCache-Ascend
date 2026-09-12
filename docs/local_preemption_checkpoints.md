@@ -89,12 +89,15 @@ universal checkpoint success nor negligible throughput cost is guaranteed.
 ## Scope and normal decoding
 
 The checkpoint implementation is in the two LMCache repositories. An idle-only
-scheduler hook and multi-connector delegation ensure that release acknowledgements
+Ascend recompute-scheduler hook and multi-connector delegation ensure that release acknowledgements
 are delivered even after the last request finishes. `local_checkpoint.py` owns
 offers, acquisition and CPU boundary assembly; `preemption_checkpoint.py` owns
 capture and publication. The Ascend engine provides allocator/lookup/shared
 transport bridges. The adapter extends only checkpoint controls, resumed lookup,
 cold-load dispatch and existing completion/preemption branches.
+The Ascend scheduler also clears the lazy request proof before preemption. The
+base vLLM request and scheduler do not own checkpoint-specific state or controls;
+vLLM retains the generic receive/send lifetime correction.
 
 No model/token/scheduler/graph kernel was changed. The original NPU dense group
 store remains unchanged. New source validation and lookup work runs on admission,

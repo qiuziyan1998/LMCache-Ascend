@@ -4338,6 +4338,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 pages.extend(fetched)
                 owned.extend(fetched)
                 tail_start += remote_count
+                if tail_start < page_chunks:
+                    # A checkpoint tail exists only in LocalCPU, even when
+                    # its original prompt prefix had to come from Mooncake.
+                    fetched, count = local.batched_get_layer_page_prefix(
+                        page_keys[tail_start:page_chunks]
+                    )
+                    pages.extend(fetched)
+                    owned.extend(fetched)
+                    tail_start += count
 
             legacy_page_layers = (
                 [
@@ -9701,7 +9710,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "lmcache.tag.checkpoint": f"{spec.req_id}:{spec.generation}:{start}:{end}"
             },
             kv_group=group,
-        ).split_layers(self.num_layers)[0]
+        )
 
     @staticmethod
     def is_checkpoint_page_key(key: CacheEngineKey) -> bool:
@@ -9917,7 +9926,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def get_checkpoint_prefix(self, key: CacheEngineKey, group: int, tokens: int) -> Any:
         """Retain an exact CPU page, or let checkpoint persistence fetch it."""
         local = self._shared_local_cpu_backend()
-        pages, count = local.batched_get_layer_page_prefix([key.split_layers(self.num_layers)[0]])
+        pages, count = local.batched_get_layer_page_prefix([key])
         if not count:
             return None
         page = pages[0]

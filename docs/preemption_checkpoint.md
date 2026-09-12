@@ -37,6 +37,9 @@ It defaults to false. The qualified path uses the existing `kv_both` decoder,
 `dsa_group1_load_mode: persistent_direct_hbm`. PP, PCP and DCP must be one.
 The initial storage implementation uses the existing replicated MLA first-rank
 writer for both groups; other writer layouts cannot publish checkpoints.
+Use the Ascend `RecomputeScheduler` or `AsyncRecomputeScheduler`, selected by
+`recompute_scheduler_enable`. These schedulers own checkpoint proof invalidation
+and idle release-control dispatch.
 Use `LMCacheAscendConnectorV1Dynamic`, directly or inside `AscendMultiConnector`.
 The dynamic wrapper delegates preemption explicitly; other composite children
 receive their ordinary hook without early binding of next-step metadata.
@@ -50,7 +53,8 @@ introduced by the later performance branch.
 Rebuild/reinstall the LMCache-Ascend native extension with the deployment's usual
 build procedure. The new prepared group binding is required, and startup rejects
 an older extension when checkpointing is enabled. Deploy matching changes from
-all four repositories, including vLLM's internal checkpoint proof field.
+all four repositories. vLLM retains only the generic receive/send lifetime fix;
+checkpoint proof state is created lazily on the request by the Ascend scheduler.
 Validation runs before manager/service initialization, so an incompatible
 checkpoint configuration cannot silently become degraded recomputation.
 
@@ -81,7 +85,9 @@ outputs are considered even with periodic decode save disabled.
 Capture prepares all admitted chunks together: one native submission per group
 and one final fence. The existing prepared native binding supports the chunk
 pointer matrix, so this follow-up requires no C++ rebuild beyond the earlier
-checkpoint extension. Deploy matching Python code in all four repositories for idle release-control dispatch.
+checkpoint extension. Deploy matching Python code: vLLM-Ascend supplies idle
+release-control dispatch, while vLLM preserves blocks until both receive and
+send obligations retire.
 
 Waiting offers hold keys, not pins. Group-0 pages adopted as active sparse-decode
 sources remain protected by the running request. Group-1 CPU ownership retires

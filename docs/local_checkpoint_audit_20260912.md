@@ -87,3 +87,83 @@ two-rank transport, plus four-rank asymmetric prefix outcomes. They cover a mark
 received by an unrelated thread, reverse RemoteFill/checkpoint arrival order,
 failure propagation, and the external read's existing completion deadline. These
 are reproducible Python contract tests, not substitutes for NPU qualification.
+
+## Follow-up: decoder errors at 11:58 and 12:00
+
+The 11:58 trace reaches Group-0 materialization, then attempts 158 legacy
+per-layer reads (two chunks across 79 layers) with zero bytes read. Production
+key classes reproduce a checkpoint handoff defect: normalization admitted merged
+pages under `LayerCacheEngineKey(layer_id=0)`, whereas page readers request the
+unequal, layer-independent `CacheEngineKey`. Checkpoint publication and original
+boundary lookup now use the same physical-page key contract as ordinary loaders.
+The earlier simplified test key returned itself from `split_layers`, hiding this
+distinction; the new regression tests execute the production key classes.
+
+A second reproducer covers a remote original prefix followed by a local-only
+checkpoint tail. The merged-page resolver previously sent that tail to the
+legacy remote suffix path after fetching the remote prefix. It now acquires any
+following LocalCPU page prefix before legacy fallback. Existing reference and
+pin cleanup applies to both sources. Complete local and complete remote page
+hits retain their original lookup counts; warm prepared decoding is untouched.
+
+The 12:00 trace is different: normalization fails to allocate a boundary/cropped
+page, including its single post-reclaim retry. Capture success does not reserve
+this additional assembly workspace. Correcting the original-prefix lookup avoids
+a redundant staging allocation when that exact page is already cached, but the
+trace does not establish whether the failed assembly allocation lacked total
+space or contiguous space. No change claims to eliminate genuine CPU capacity
+refusals. A failure test verifies bounded retry, preserved source bytes and
+reference cleanup without reclaiming active sources.
+
+`tests/standalone/test_checkpoint_page_keys.py` covers both KV groups, full and
+partial pages, mixed local/remote placement, unavailable tails and allocation
+refusal. Device operations remain controlled test boundaries; NPU qualification
+is still required.
+
+## Related-path follow-up
+
+- Repeated preemption copied layer-specific Group-0 keys from
+  `WorkerRetrieveState.cached_keys[0]` into physical-page descriptors. Convert
+  these to their layer-independent keys during capture. A two-generation test
+  using production key classes previously lost the generated prefix; it now
+  verifies both groups' restored bytes, including the cropped tail.
+- The base LMCache merged-page resolver had the same remote-prefix/local-tail
+  assumption as the Ascend override. Apply the same local-tail acquisition to
+  both and run the same source-selection and ownership tests against both
+  implementations. This does not change ordinary lookup authority or persist
+  generated tokens.
+- Restore normalization rebuilt boundaries before checking whether an exact
+  canonical page already existed. Reuse that page through the existing checked
+  checkpoint lookup; defer the original partial-page read until assembly is
+  needed. The reproducer restores successfully with allocation unavailable and
+  forbids an unnecessary original-boundary read. Genuine allocation failure
+  retains its bounded reclaim/retry and cleanup behavior.
+
+The affected standalone suites pass 136 tests (LMCache-NPU 37,
+LMCache-Ascend 99). Changes remain in those two repositories. vLLM scheduling,
+vLLM-Ascend graph routing, ordinary adapter dispatch, prepared sparse decoding
+and direct-HBM transfer methods are unchanged. No per-token check, collective,
+device fence or dedicated memory pool is added.
+
+## Scheduler ownership migration
+
+Checkpoint proof invalidation and idle release dispatch now live in
+`vllm_ascend/core/recompute_scheduler.py`. `RecomputeScheduler` overrides
+`_preempt_request` and `has_requests`; the existing `AsyncRecomputeScheduler`
+MRO inherits both. The request proof is initialized lazily during preemption,
+before the base implementation releases blocks. No `Request` subclass, global
+monkey patch or per-request initialization hook is needed.
+
+vLLM's `SchedulerInterface` is restored to `dsa-two-groups`. Its remaining
+production delta is the generic receive/send lifetime correction: 18 added and
+5 removed lines across `scheduler.py` and `request.py`. The corresponding
+16 lifetime tests stay in vLLM. The idle-control tests move to vLLM-Ascend and
+cover both scheduler classes, active/finished short-circuiting, actual connector
+delegation, first and repeated preemption, forced prefix reset and invalid
+preemption. The vLLM-Ascend standalone suite passes 46 tests.
+
+This migration adds no model-step callback or synchronization. The checkpoint
+feature continues to require the Ascend recompute scheduler; other schedulers
+retain vLLM's generic transfer-lifetime behavior. The earlier sections describe
+the original audit state; this section supersedes their placement of the idle
+hook in the base scheduler.

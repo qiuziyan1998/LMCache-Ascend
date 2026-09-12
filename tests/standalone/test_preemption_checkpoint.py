@@ -156,6 +156,9 @@ class Key:
     def split_layers(self, layers):
         return [self] * layers
 
+    def without_layer(self):
+        return self
+
 
 def fill(page, start, group):
     widths = (2, 1) if group == 0 else (1,)
@@ -189,6 +192,14 @@ def fake_engine():
         page, _ = allocate(group, length)
         fill(page, len(tokens) - length, group)
         return page
+
+    def cached_prefix(key, group, length):
+        pages, count = backend.batched_get_layer_page_prefix([key])
+        if count:
+            if pages[0].valid_tokens == length:
+                return pages[0], (2, 1) if group == 0 else (1,)
+            pages[0].ref_count_down()
+        return None
 
     def prepare(rows, starts, ends, **kw):
         calls.append(("prepare", kw["kv_group"], len(starts)))
@@ -227,6 +238,7 @@ def fake_engine():
         is_frozen=lambda: False,
         allocate_checkpoint_fragment=allocate,
         load_checkpoint_prefix=prefix,
+        get_checkpoint_prefix=cached_prefix,
         reclaim_checkpoint_capacity=lambda tokens, groups: False,
         gpu_connector=NS(
             prepare_group_capture=prepare,

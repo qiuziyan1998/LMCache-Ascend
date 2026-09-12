@@ -136,7 +136,7 @@ class CheckpointWorker:
                 raise ValueError("Invalid checkpoint frontiers")
             if prefix_state is not None and prefix_state.cached_keys:
                 job.prefix_sources = tuple(
-                    CheckpointPage(a, min(b, spec.resident_start), key)
+                    CheckpointPage(a, min(b, spec.resident_start), key.without_layer())
                     for a, b, key in zip(
                         prefix_state.cached_starts,
                         prefix_state.cached_ends,

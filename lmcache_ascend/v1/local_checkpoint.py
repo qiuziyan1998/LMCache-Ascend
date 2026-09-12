@@ -135,23 +135,6 @@ class LocalCheckpointStore:
             base = manifest.prefix_end // chunk * chunk
             for group in (0, 1):
                 sources = list(groups[group])
-                if base < manifest.prefix_end and (
-                    not sources or sources[0][0].start > base
-                ):
-                    # Preserve the actual original prefix key/length. A remap
-                    # frontier one token earlier is not another stored object.
-                    prefix = reserve(
-                        lambda: self.engine.load_checkpoint_prefix(
-                            manifest.tokens[: manifest.prefix_end],
-                            group,
-                            request_configs,
-                        ),
-                        group,
-                        manifest.prefix_end - base,
-                    )
-                    owners.append(prefix)
-                    prefix_stop = min(manifest.prefix_end, sources[0][0].start)
-                    sources.insert(0, (CheckpointPage(base, prefix_stop, None), prefix))
                 keys, pages, normalized = [], [], []
                 covered = base
                 for start, end, key in self.engine.token_database.process_tokens(
@@ -177,18 +160,44 @@ class LocalCheckpointStore:
                         page = selected[0][1]
                         page.ref_count_up()
                     else:
-                        page, widths = reserve(
-                            lambda: self.engine.allocate_checkpoint_fragment(
-                                group, end - start
-                            ),
-                            group,
-                            end - start,
+                        cached = self.engine.get_checkpoint_prefix(
+                            key, group, end - start
                         )
-                        owners.append(page)
-                        self._assemble(page, widths, selected, start, end)
-                        page = owners.pop()
+                        if cached is not None:
+                            page, _ = cached
+                        else:
+                            if start == base and sources[0][0].start > base:
+                                # Fetch the exact original partial page only
+                                # when assembling a boundary that is not cached.
+                                prefix = reserve(
+                                    lambda: self.engine.load_checkpoint_prefix(
+                                        manifest.tokens[: manifest.prefix_end],
+                                        group,
+                                        request_configs,
+                                    ),
+                                    group,
+                                    manifest.prefix_end - base,
+                                )
+                                owners.append(prefix)
+                                prefix_stop = min(
+                                    manifest.prefix_end, sources[0][0].start
+                                )
+                                selected.insert(
+                                    0,
+                                    (CheckpointPage(base, prefix_stop, None), prefix),
+                                )
+                            page, widths = reserve(
+                                lambda: self.engine.allocate_checkpoint_fragment(
+                                    group, end - start
+                                ),
+                                group,
+                                end - start,
+                            )
+                            owners.append(page)
+                            self._assemble(page, widths, selected, start, end)
+                            page = owners.pop()
                     owners.append(page)
-                    keys.append(key.split_layers(self.engine.num_layers)[0])
+                    keys.append(key)
                     pages.append(page)
                     normalized.append(CheckpointPage(start, end, keys[-1]))
                     covered = end
