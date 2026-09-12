@@ -321,6 +321,7 @@ def test_checkpoint_control_acknowledgement_passes_real_shared_envelope_validati
         {"prepare_checkpoint_restore"},
         Base,
         NativeExternalPageTransferUnknownError=type("Unknown", (RuntimeError,), {}),
+        CheckpointRestoreMiss=type("Miss", (ValueError,), {}),
     )
     wire = []
     leader, passive = cls(), cls()
@@ -433,8 +434,9 @@ def test_asymmetric_persistent_prefix_failure_never_enters_tail_collectives():
     assert per_rank == [[], [], [], []]
 
 
+@pytest.mark.parametrize("evict_during_admission", [False, True])
 def test_normalization_protects_the_existing_compatible_canonical_page(
-    api, monkeypatch
+    api, monkeypatch, evict_during_admission
 ):
     from types import MethodType
     from threading import Lock
@@ -480,6 +482,23 @@ def test_normalization_protects_the_existing_compatible_canonical_page(
     backend.batched_submit_layer_pages = MethodType(
         ns["batched_submit_layer_pages"], backend
     )
+    if evict_during_admission:
+        put = backend.batched_submit_layer_pages
+
+        def evict_after_put(keys, pages):
+            put(keys, pages)
+            assert backend.evict(canonical)
+
+        backend.batched_submit_layer_pages = evict_after_put
+        with pytest.raises(api[0].CheckpointRestoreMiss) as caught:
+            store.local.normalize("r", 1, list(range(12)), None)
+        assert caught.value.available_end == 4
+        assert all(p.refs == 1 for p in backend.pages.values()), (
+            "failed admission leaked cache aliases"
+        )
+        assert store.local.available("r", 1, 12) == 4
+        store.close()
+        return
     _, owners = store.local.normalize("r", 1, list(range(12)), None)
     try:
         assert resident.refs > 1, (
@@ -515,6 +534,7 @@ def test_unknown_checkpoint_prefix_dma_latches_existing_restart_guard():
         {"prepare_checkpoint_restore"},
         object,
         NativeExternalPageTransferUnknownError=Unknown,
+        CheckpointRestoreMiss=type("Miss", (ValueError,), {}),
     )
     engine = cls()
     fault = Unknown("DMA unknown")

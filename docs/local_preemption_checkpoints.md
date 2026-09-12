@@ -115,6 +115,13 @@ guard-induced delay require NPU measurement.
 
 Use the existing decoder-only `decode_preemption_checkpoint: true`. Periodic
 decode save is not required. No additional pool size or policy knob is added.
+Missing local pages or unavailable boundary workspace before device restore
+produce a coordinated `CHECKPOINT_RESTORE_MISS`, not invalid-block errors. After
+all TP workers finish, the scheduler releases the unused allocation and retries
+one shorter common prefix; a further miss falls back to prompt-based bounded
+recovery. Genuine transfer/integrity failures retain the configured failure
+policy. Both Ascend recompute schedulers implement this protocol; startup rejects
+an older scheduler without support.
 Update all four matching Python repositories and restart decoder workers. The native
 extension built for the preceding checkpoint implementation is reused.
 

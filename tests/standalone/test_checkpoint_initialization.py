@@ -106,6 +106,7 @@ def configs():
         ),
         speculative_config=None,
         cache_config=NS(enable_prefix_caching=False),
+        scheduler_config=NS(get_scheduler_cls=lambda: NS(supports_checkpoint_restore_retry=True)),
     )
     parent = type(
         "CheckpointConnector", (), {"handle_preemptions_with_metadata": lambda *a: None}
@@ -146,4 +147,13 @@ def test_connector_without_checkpoint_delegation_is_rejected():
     cls, calls, _ = init_api(config)
     with pytest.raises(ValueError, match="dynamic"):
         cls(vllm, Role.SCHEDULER, object())
+    assert calls == []
+
+
+def test_scheduler_without_retry_support_is_rejected_before_services_start():
+    config, vllm, parent = configs()
+    vllm.scheduler_config.get_scheduler_cls = lambda: object
+    cls, calls, _ = init_api(config)
+    with pytest.raises(ValueError, match="safe restore retries"):
+        cls(vllm, Role.SCHEDULER, parent)
     assert calls == []

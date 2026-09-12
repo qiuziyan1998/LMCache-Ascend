@@ -29,7 +29,7 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.integration.vllm.preemption_checkpoint import LOCAL_CHECKPOINT_CONFIG
+from lmcache.integration.vllm.preemption_checkpoint import LOCAL_CHECKPOINT_CONFIG, CheckpointRestoreMiss
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
@@ -9849,6 +9849,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 envelope = replace(
                     envelope, status="skipped", error_details={"base": base}
                 )
+            elif isinstance(error, CheckpointRestoreMiss):
+                envelope = replace(
+                    envelope,
+                    status="skipped",
+                    error_details={"checkpoint_miss_end": error.available_end},
+                )
             try:
                 self._broadcast_shared_envelope(envelope)
             except BaseException:
@@ -9858,6 +9864,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         else:
             envelope = self._receive_matching_shared_envelope(**identity)
             self._validate_shared_layerwise_envelope(envelope, **identity)
+        if (
+            envelope.status == "skipped"
+            and "checkpoint_miss_end" in envelope.error_details
+        ):
+            end = envelope.error_details["checkpoint_miss_end"]
+            if type(end) is not int or not 0 <= end < len(request.token_ids):
+                raise ValueError("Invalid checkpoint miss frontier")
+            raise CheckpointRestoreMiss(end, envelope.message) from error
         if envelope.status != "skipped":
             if isinstance(error, NativeExternalPageTransferUnknownError):
                 self._remote_fill_require_paired_restart((request.req_id,))

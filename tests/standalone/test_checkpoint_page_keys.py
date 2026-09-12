@@ -302,8 +302,11 @@ def test_boundary_allocation_refusal_is_bounded_and_keeps_checkpoint_data(
     )[1]
     engine.allocate_checkpoint_fragment = refuse
     engine.reclaim_checkpoint_capacity = lambda *args: calls.append("reclaim") or True
-    with pytest.raises(MemoryError, match="allocation refused"):
+    with pytest.raises(
+        api[0].CheckpointRestoreMiss, match="workspace is unavailable"
+    ) as caught:
         store.local.normalize("r", 1, list(range(11)), None)
+    assert caught.value.available_end == 0
     assert calls == ["allocate", "reclaim", "allocate"]
     assert original_prefix.refs == 1
     original_prefix.ref_count_down()

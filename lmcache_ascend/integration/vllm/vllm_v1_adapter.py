@@ -10,7 +10,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     ReqMeta,
 )
-from lmcache.integration.vllm.preemption_checkpoint import CheckpointResult
+from lmcache.integration.vllm.preemption_checkpoint import CheckpointResult, CheckpointRestoreMiss
 from lmcache.logging import init_logger
 from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 from lmcache.v1.cache_engine import LayerwiseStoreResult
@@ -1633,6 +1633,28 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # Both the persistent prefix and the CPU tail have reached readiness.
         return plan["token_mask"], result[1], result[2], result[3]
 
+    def _record_checkpoint_restore_miss(
+        self, request: Any, generation: int, error: BaseException
+    ) -> bool:
+        """Report only the pretransfer miss shared by every TP rank."""
+        if not isinstance(error, CheckpointRestoreMiss) or not hasattr(
+            request.load_spec, "checkpoint_generation"
+        ):
+            return False
+        worker = self.lmcache_engine.checkpoint_worker
+        if worker is not None:
+            worker.results.append(
+                CheckpointResult(
+                    request.req_id,
+                    request.load_spec.checkpoint_generation,
+                    "restore_miss",
+                    error.available_end,
+                    str(error),
+                    load_generation=generation,
+                )
+            )
+        return True
+
     def _activate_checkpoint_io(self) -> None:
         """Poll only while a real preemption owns capture/persistence work."""
         if "_checkpoint_io_originals" in self.__dict__:
@@ -1713,6 +1735,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                              "loading, PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding")
         if not callable(getattr(type(self._parent), "handle_preemptions_with_metadata", None)):
             raise ValueError("decode_preemption_checkpoint requires the dynamic LMCache checkpoint connector")
+        scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        if not getattr(scheduler, "supports_checkpoint_restore_retry", False):
+            raise ValueError(
+                "decode_preemption_checkpoint requires the updated Ascend "
+                "RecomputeScheduler or AsyncRecomputeScheduler for safe restore retries"
+            )
         if self._role == KVConnectorRole.WORKER:
             # Lazy worker-only import; the scheduler must not initialize NPU ops.
             from lmcache_ascend import c_ops

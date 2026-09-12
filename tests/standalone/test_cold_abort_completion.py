@@ -61,6 +61,7 @@ def test_aborted_cold_load_eventually_acknowledges_send_after_all_owners_retire(
         "get_finished",
         "_publish_completed_cold_load",
         "_fail_completed_cold_load",
+        "_record_checkpoint_restore_miss",
         "_finish_aborted_cold_load",
     }
     definitions(LN / "lmcache/integration/vllm/vllm_v1_adapter.py", names, ns)

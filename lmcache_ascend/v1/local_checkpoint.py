@@ -5,6 +5,8 @@ from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Any
 
+from lmcache.integration.vllm.preemption_checkpoint import CheckpointRestoreMiss
+
 
 @dataclass(frozen=True)
 class CheckpointPage:
@@ -110,11 +112,14 @@ class LocalCheckpointStore:
         admitted by reference. No generated KV is sent to persistent storage.
         """
         manifest = self.manifest(req_id, generation)
-        if manifest is None or tuple(tokens) != manifest.tokens[: len(tokens)]:
+        if manifest is None:
+            raise CheckpointRestoreMiss(0, "Local checkpoint offer is unavailable")
+        if tuple(tokens) != manifest.tokens[: len(tokens)]:
             raise ValueError("Local checkpoint generation/history is unavailable")
         common, groups = self.acquire(manifest, len(tokens))
         owners: list[Any] = []
         reclaimed = False
+        covered = manifest.prefix_end
 
         def reserve(factory: Any, group: int, count: int) -> Any:
             nonlocal reclaimed
@@ -130,7 +135,9 @@ class LocalCheckpointStore:
 
         try:
             if common != len(tokens):
-                raise ValueError("Local checkpoint was evicted before restore")
+                raise CheckpointRestoreMiss(
+                    common, "Local checkpoint was evicted before restore"
+                )
             chunk = int(self.engine.config.chunk_size)
             base = manifest.prefix_end // chunk * chunk
             for group in (0, 1):
@@ -206,18 +213,6 @@ class LocalCheckpointStore:
                         "Normalized checkpoint coverage omits the partial tail"
                     )
                 self.engine.checkpoint_backend().batched_submit_layer_pages(keys, pages)
-                # Admission can retain an already-compatible canonical object.
-                # Own the actual cache sources, not only our discarded duplicate.
-                installed, count = (
-                    self.engine.checkpoint_backend().batched_get_layer_page_prefix(keys)
-                )
-                owners.extend(installed)
-                if count != len(keys):
-                    raise ValueError(
-                        "Normalized checkpoint was evicted during admission"
-                    )
-                for page in installed:
-                    self.engine.validate_checkpoint_page(group, page)
                 # Move checkpoint-owned cache references instead of creating
                 # two cache aliases that would permanently make refs > 1.
                 updated = list(manifest.groups)
@@ -229,10 +224,31 @@ class LocalCheckpointStore:
                 for source, _ in groups[group]:
                     if self.engine.is_checkpoint_page_key(source.key):
                         self.engine.checkpoint_backend().remove(source.key)
+                # The offer remains advisory. Retain the actual canonical
+                # winners before device work, even when admission kept a
+                # compatible existing page instead of our duplicate.
+                installed, count = (
+                    self.engine.checkpoint_backend().batched_get_layer_page_prefix(keys)
+                )
+                owners.extend(installed)
+                if count != len(keys):
+                    raise CheckpointRestoreMiss(
+                        normalized[count].start,
+                        "Normalized checkpoint was evicted during admission",
+                    )
+                for page in installed:
+                    self.engine.validate_checkpoint_page(group, page)
             return base, owners
-        except BaseException:
+        except BaseException as error:
             for page in owners:
                 page.ref_count_down()
+            if isinstance(error, MemoryError):
+                # No device restore has started. Retry only before the failed
+                # boundary; the scheduler re-proves both groups on that retry.
+                raise CheckpointRestoreMiss(
+                    min(covered, common, len(tokens) - 1),
+                    "Local checkpoint boundary workspace is unavailable",
+                ) from error
             raise
         finally:
             self.release(groups)

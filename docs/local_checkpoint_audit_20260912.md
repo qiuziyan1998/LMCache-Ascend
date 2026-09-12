@@ -167,3 +167,92 @@ feature continues to require the Ascend recompute scheduler; other schedulers
 retain vLLM's generic transfer-lifetime behavior. The earlier sections describe
 the original audit state; this section supersedes their placement of the idle
 hook in the base scheduler.
+
+## Dense partial checkpoint page — 22:05 failure
+
+The Group-1 checkpoint loader completed the persistent prefix and then logged
+two tail chunks but only one physical page (`partial_pages=0`). Its legacy
+fallback requested 79 layer objects for a 137-token chunk and read zero bytes.
+The request subsequently failed under the configured `kv_load_failure_policy=fail`;
+the worker processes remained alive.
+
+The base engine's dense `retrieve_layer` planner truncated its merged-page
+candidates at the first non-full chunk. Per-layer location lookup could still
+find that partial page through aliases, but `planned_page_chunks` excluded it,
+so materialization incorrectly treated it as legacy layer objects. Remove that
+candidate truncation: exact-size merged-page keys already encode valid tokens,
+and both rank0 and passive page loaders support partial pages. The existing
+location and legacy fallback checks remain authoritative.
+
+Eight partial-page regression cases failed before this correction while full
+pages passed. The expanded planner tests cover both groups, nonzero tail masks,
+local/remote merged pages, legacy tails and missing suffixes (64 cases). A
+missing suffix still produces only the contiguous retrieved prefix at this
+loader boundary; it is not reported as complete data.
+
+This change does not alter global LRU, lifetime pins, failure policy, or downgrade
+exceptions. Checkpoint lookup already probes the common available prefix of both
+groups. A loss between lookup and restore admission still needs a coordinated
+shorter-frontier retry; suppressing a post-admission failure without correcting
+scheduler accounting would be unsafe. The reported trace is a representation
+selection defect, not evidence of ordinary LRU eviction.
+
+## Recoverable checkpoint loss before transfer
+
+Expected loss of evictable LocalCPU checkpoint pages is now distinct from a
+transfer or integrity failure. This supersedes the generic failure behavior
+described above for losses between lookup and restore admission.
+
+1. Lookup selects the common contiguous prefix of both groups. Normalization
+   rechecks it after HBM admission. An absent offer, evicted suffix, or refused
+   CPU assembly allocation produces `CheckpointRestoreMiss` with a smaller
+   available frontier. History/layout mismatches remain errors.
+2. TP0 broadcasts the miss through the existing checkpoint control envelope.
+   Every rank validates its identity and reports the same typed outcome before
+   entering the device restore. No restore device work has been submitted, so
+   this outcome does not require a dense-load stream fence.
+3. The existing worker metadata carries a `restore_miss` result tagged with both
+   preemption and load generations. It does not report invalid HBM blocks or
+   trigger the generic `kv_load_failure_policy=fail` path. Workers log one
+   `CHECKPOINT_RESTORE_MISS` summary instead of exception stacks.
+4. Scheduler-side LMCache waits for the existing all-worker receive completion
+   before accepting the miss. It retires the old source lease, invalidates the
+   old lookup/proof, and arms a lazy retry marker. Cancelled or stale generations
+   cannot arm another request's retry or be marked successfully loaded.
+5. The Ascend scheduler's receive-promotion hook marks the unused destination as
+   having zero computed/external tokens and uses the base scheduler's existing
+   failed-receive cleanup to free its blocks. Prompt and generated token history
+   are unchanged. Cached-token accounting and stale bootstrap/final-hidden state
+   are cleared as in the compact-load failure path. The next lookup re-proves
+   the shorter local prefix.
+6. There is at most one shorter local restore retry per preemption generation.
+   Another miss, or no usable generated prefix, falls back to ordinary prompt
+   lookup plus bounded MC2 recovery. There is no unbounded checkpoint retry loop.
+
+An admission race can evict a compatible existing canonical page before the
+restore retains it. Its manifest update and private-alias removal now precede
+the final acquisition check, so this miss neither leaks duplicate cache owners
+nor falsely reports complete data. Waiting offers remain evictable; active
+source ownership and global LRU policy are unchanged.
+
+A repeated preemption can restore less KV than its preceding successful
+generation. `RequestTracker.update(preempted=True)` now clears the old block
+table's nonresident/remap frontier; successful cold restoration installs the new
+frontier. A regression test reproduced the old mismatch (8 restored tokens but
+a retained frontier of 12). Warm updates preserve their existing frontier.
+
+Only known local losses before device transfer use this path. Native-unknown
+DMA, malformed metadata, and post-admission transfer failures retain their
+existing error, fencing and restart behavior. No new per-token model callback,
+collective or configuration knob is introduced; base vLLM is unchanged.
+
+Tests cover delayed TP completion using the production aggregator, both KV
+groups, missing suffixes, partial frontiers, refused allocation, admission
+eviction, stale/cancelled replies, bounded retry and successful retry promotion.
+They verify unchanged token history and prevent incomplete data from reaching
+the scheduler's successful-cache path. NPU output and throughput qualification
+remain necessary. Deploy matching LMCache-NPU, LMCache-Ascend and vLLM-Ascend
+Python revisions; this follow-up requires no native rebuild.
+Startup verifies that the selected scheduler supports this retry protocol.
+An older or unsupported scheduler is rejected before services start, so it cannot
+mistake a terminal miss for a successful KV load.
