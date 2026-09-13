@@ -3,7 +3,6 @@
 
 # Standard
 from collections.abc import Sequence
-from typing import Any
 
 # Third Party
 import torch
@@ -13,7 +12,7 @@ from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
     prepare_sparse_direct_destination_state,
-    sparse_mla_dsa_batched_direct_kv_transfer_prepared,
+    sparse_graph_kv_transfer,
 )
 
 
@@ -24,9 +23,10 @@ class SparseGraphTransfer:
     Source ownership is provided by LMCache's request lease, NOT this object.
     Callers must fence replay before finalizing or replacing that lease.
 
-    K and PE use two single-plane kernels. This deliberately avoids capturing
-    a host-side tail length into the two-plane kernel's PE offset. Pointer
-    tables, token limits and tail offsets can change without recapture.
+    One kernel copies K and PE using separate device pointer tables. Physical
+    tail offsets and logical token limits can change without recapture. It also
+    handles request lanes and masks invalid selections, with no torch where,
+    index conversion or temporary payload tensors in the captured graph.
     """
 
     def __init__(
@@ -53,7 +53,6 @@ class SparseGraphTransfer:
             raise ValueError("Graph request capacity exceeds int32 token addressing")
         self.request_capacity = request_capacity
         self.device = kv_caches[0].device
-        self.slot_dtype = slot_mapping.dtype
         self.k_bytes = (
             kv_caches[0].shape[-2]
             * kv_caches[0].shape[-1]
@@ -65,15 +64,8 @@ class SparseGraphTransfer:
         self.valid_tokens = torch.zeros(
             (request_capacity, 1), dtype=torch.int32, device=self.device
         )
-        self.lane_offsets = torch.arange(
-            request_capacity, dtype=torch.int32, device=self.device
-        ).view(-1, 1)
-        self.lane_offsets.mul_(self.capacity * chunk_size)
-        self.states: tuple[Any, ...] = tuple(
-            prepare_sparse_direct_destination_state(
-                [cache], slot_mapping, KVCacheFormat.DSA_INDEX.value, 0, 0, 0
-            )
-            for cache in kv_caches
+        self.state = prepare_sparse_direct_destination_state(
+            list(kv_caches), slot_mapping, KVCacheFormat.MLA_LATENT.value, 0, 0, 0
         )
 
     def bind(self, source: PreparedSparseSource, layer_id: int) -> None:
@@ -139,30 +131,22 @@ class SparseGraphTransfer:
         counts: torch.Tensor,
         slots: torch.Tensor,
     ) -> None:
-        """Capture device top-k -> masked sparse copy, with no host inspection."""
+        """Capture device top-k -> one K/PE copy, without payload preprocessing."""
         if (
             selected.shape[0] != self.request_capacity
             or slots.shape != selected.shape
             or counts.shape[0] != self.request_capacity
         ):
             raise ValueError("Graph payload does not match request capacity")
-        valid = (selected >= 0) & (selected < self.valid_tokens)
-        virtual_selected = selected.to(torch.int32) + self.lane_offsets
-        safe_selected = torch.where(valid, virtual_selected, 0).contiguous()
-        safe_slots = torch.where(valid, slots, -1).to(self.slot_dtype).contiguous()
-        active = self.valid_tokens if counts.ndim == 2 else self.valid_tokens.view(-1)
-        safe_counts = torch.where(active > 0, counts, 0).to(torch.int32).contiguous()
-        for plane, state in enumerate(self.states):
-            sparse_mla_dsa_batched_direct_kv_transfer_prepared(
-                state,
-                safe_slots,
-                safe_selected,
-                self.ptrs[plane],
-                self.chunk_size,
-                self.request_capacity * self.capacity * self.chunk_size,
-                False,
-                safe_counts,
-            )
+        sparse_graph_kv_transfer(
+            self.state,
+            slots,
+            selected,
+            counts,
+            self.ptrs,
+            self.valid_tokens,
+            self.chunk_size,
+        )
 
     def clear_source(self) -> None:
         """Disable transfers for no-offload steps without changing graph inputs."""

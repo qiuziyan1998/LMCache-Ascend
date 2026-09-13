@@ -18,13 +18,13 @@ def transfer_module(monkeypatch):
     modules = {
         "lmcache.v1.gpu_connector.sparse": {"PreparedSparseSource": object},
         "lmcache_ascend.v1.kv_format": {
-            "KVCacheFormat": SimpleNamespace(DSA_INDEX=SimpleNamespace(value=6))
+            "KVCacheFormat": SimpleNamespace(MLA_LATENT=SimpleNamespace(value=5))
         },
         "lmcache_ascend.v1.npu_connector.utils": {
-            "prepare_sparse_direct_destination_state": lambda caches, *args: caches[0],
-            "sparse_mla_dsa_batched_direct_kv_transfer_prepared": lambda *args: (
-                calls.append(args)
+            "prepare_sparse_direct_destination_state": lambda caches, *args: tuple(
+                caches
             ),
+            "sparse_graph_kv_transfer": lambda *args: calls.append(args),
         },
     }
     for name, attrs in modules.items():
@@ -72,22 +72,32 @@ def test_tail_growth_and_request_replacement_keep_addresses(transfer_module):
     assert addresses == (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
 
 
-def test_device_selection_masks_invalid_tokens_and_empty_source(transfer_module):
+def test_load_passes_live_inputs_once_without_tensor_preprocessing(transfer_module):
     module, calls = transfer_module
     transfer = make_transfer(module)
     transfer.bind(make_source([1000], [13]), 0)
     selected = torch.tensor([[0, 12, 13, -1]])
-    counts = torch.tensor([4])
+    counts = torch.tensor([4], dtype=torch.int32)
     slots = torch.tensor([[1, 2, 3, 4]])
-    transfer.load(selected, counts, slots)
-    assert len(calls) == 2  # K and PE, not two graph replays.
-    for call in calls:
-        assert call[2].dtype == torch.int32 and call[-1].dtype == torch.int32
-        assert torch.equal(call[1], torch.tensor([[1, 2, -1, -1]]))
-        assert torch.equal(call[2], torch.tensor([[0, 12, 0, 0]], dtype=torch.int32))
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class NoTensorOps(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            pytest.fail(f"Graph load added a preprocessing operator: {func}")
+
+    with NoTensorOps():
+        transfer.load(selected, counts, slots)
+    assert len(calls) == 1
+    state, sent_slots, sent_selected, sent_counts, ptrs, limits, chunk = calls[0]
+    assert state is transfer.state and len(state) == 2
+    assert sent_slots is slots and sent_selected is selected and sent_counts is counts
+    assert ptrs is transfer.ptrs and limits is transfer.valid_tokens and chunk == 256
+    # Invalid/empty selections are interpreted by the fused device kernel, not
+    # by separately launched masks/conversions. No host data read is required.
     transfer.clear_source()
     transfer.load(selected, counts.zero_(), slots)
-    assert calls[-1][1].eq(-1).all()
+    assert calls[-1][4] is transfer.ptrs and calls[-1][5].eq(0).all()
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -168,16 +178,15 @@ def test_batch_lanes_never_read_another_request_or_padding(transfer_module, capa
     slots = torch.arange(capacity * 4).reshape(capacity, 4)
     counts = torch.full((capacity, 16), 4, dtype=torch.int32)
     transfer.load(selected, counts, slots)
-    assert len(calls) == 2
+    assert len(calls) == 1
     sent = calls[-1]
-    assert sent[2][0].tolist() == [0, 12, 256, 0]
-    assert sent[2][2].tolist() == [2048, 2060, 0, 0]
-    assert sent[1][1].eq(-1).all() and sent[-1][1].eq(0).all()
-    assert sent[1][3:].eq(-1).all() and sent[-1][3:].eq(0).all()
-    assert sent[5] == capacity * 1024
+    assert sent[1] is slots and sent[2] is selected and sent[3] is counts
+    assert sent[4] is transfer.ptrs and sent[5] is transfer.valid_tokens
+    assert sent[5].view(-1).tolist() == [273, 0, 13] + [0] * (capacity - 3)
+    assert transfer.ptrs[1, 8] == 1000 + 13 * 512 * 4
     transfer.bind_batch((source_a, source_b), 0)
     assert transfer.valid_tokens[2:].eq(0).all()
     assert addresses == (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
     transfer.clear_source()
     transfer.load(selected, counts, slots)
-    assert calls[-1][1].eq(-1).all() and calls[-1][-1].eq(0).all()
+    assert calls[-1][5].eq(0).all()

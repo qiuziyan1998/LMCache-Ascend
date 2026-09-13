@@ -33,7 +33,9 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
-add_subdirectory(third_party/kvcache-ops)
+# Build upstream kernels and our graph-specific kernel in the same library.
+# The submodule itself remains unmodified.
+add_subdirectory(csrc/graph)
 
 if(DEFINED ENV{USE_MINDSPORE})
   find_package(Threads REQUIRED)
