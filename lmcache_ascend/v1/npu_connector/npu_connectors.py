@@ -35,8 +35,8 @@ import torch
 # First Party
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
-    batched_fused_sparse_single_layer_kv_transfer,
     batched_fused_single_layer_kv_transfer,
+    batched_fused_sparse_single_layer_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer,
     dense_mla_dsa_batched_direct_kv_transfer_fast,
     dense_mla_dsa_group_direct_kv_transfer_fast,
@@ -47,7 +47,6 @@ from lmcache_ascend.v1.npu_connector.utils import (
     sparse_mla_dsa_batched_direct_kv_transfer_prepared,
 )
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
-
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -86,6 +85,63 @@ def _layer_source_memory_objs(
             )
         return (*source.pages, *source.suffix)
     return source
+
+
+def _resolve_layerwise_slot_mapping(
+    layer_request: Any,
+    default_mapping: torch.Tensor,
+    default_base: int = 0,
+) -> tuple[torch.Tensor, int]:
+    if layer_request is None:
+        return default_mapping, default_base
+    if not isinstance(layer_request, dict) or "slot_mapping" not in layer_request:
+        raise TypeError(
+            "Layerwise transfer request must be a dict containing slot_mapping"
+        )
+    slot_mapping = layer_request["slot_mapping"]
+    if not isinstance(slot_mapping, torch.Tensor):
+        raise TypeError("Layerwise slot_mapping must be a torch.Tensor")
+    slot_mapping_base = int(layer_request.get("slot_mapping_base", 0))
+    if slot_mapping_base < 0:
+        raise ValueError(
+            "slot_mapping_base must be non-negative, "
+            f"got {slot_mapping_base}"
+        )
+    return slot_mapping, slot_mapping_base
+
+
+def _slice_layerwise_slot_mapping(
+    slot_mapping: torch.Tensor,
+    starts: Sequence[int],
+    ends: Sequence[int],
+    slot_mapping_base: int = 0,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    if len(starts) != len(ends):
+        raise ValueError(
+            "Layerwise transfer chunk starts/ends length mismatch: "
+            f"starts={len(starts)}, ends={len(ends)}"
+        )
+    chunks: list[torch.Tensor] = []
+    for start, end in zip(starts, ends, strict=True):
+        local_start = start - slot_mapping_base
+        local_end = end - slot_mapping_base
+        if (
+            local_start < 0
+            or local_end < local_start
+            or local_end > len(slot_mapping)
+        ):
+            raise ValueError(
+                "Layerwise transfer chunk is outside the provided slot-mapping "
+                "window: "
+                f"chunk=[{start}, {end}), base={slot_mapping_base}, "
+                f"mapping_tokens={len(slot_mapping)}, "
+                f"local_chunk=[{local_start}, {local_end})"
+            )
+        chunks.append(slot_mapping[local_start:local_end])
+    if not chunks:
+        return chunks, slot_mapping.new_empty((0,))
+    full = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+    return chunks, full
 
 
 def _payload_event_list(payload_event: Any) -> list[Any]:
@@ -631,12 +687,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         This function is a generator that moves the KV cache from the paged GPU
         memory to the memory objects. The first iteration will prepare some
         related metadata and initiate the transfer in the first layer. In each
-        of the following iterations, it will first wait until the storing of
-        previous layer finishes, and then initiate string the KV cache of the
-        current layer one. The storing process of the KV cache is paged GPU
-        memory -> GPU buffer -> memory objects. The last iteration simply waits
-        for the last layer to finish.
-        In total, this the generator will yield num_layers + 1 times.
+        of the following iterations, it waits for the previous layer and starts
+        the current layer transfer. The storing process is paged GPU memory ->
+        GPU buffer -> memory objects. The final iteration waits for the last
+        layer.
 
         :param memory_objs: The memory objects to store the KV cache. The first
             dimension is the number of layers, and the second dimension is the
@@ -1489,6 +1543,11 @@ class _SparseLoadJoin:
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     supports_layer_page_source = True
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        """Whether the connector can honor the two-bank transfer protocol."""
+        return not (_DENSE_DIRECT_LOAD_DISABLE or _DENSE_DIRECT_STORE_DISABLE)
+
     def __init__(
         self,
         hidden_dim_size: int,
@@ -1557,11 +1616,163 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int, tuple[tuple, list[tuple[int, int]]]
         ] = {}
 
+        # Dense layerwise-prefill transfers reuse a small number of physical
+        # KV banks.  Save completion must therefore be visible to both the
+        # load stream (before it overwrites a bank) and the compute stream
+        # (when there is no load for the layer that is about to use it).
+        # Keep the state per KV group: latent and indexer own independent
+        # physical banks even though they share the connector streams.
+        self._layerwise_prefill_bank_counts: dict[int, int] = {}
+        self._layerwise_prefill_transfer_generations: dict[int, int] = {}
+        self._layerwise_prefill_save_done_events: dict[
+            tuple[int, int], tuple[int, Any]
+        ] = {}
+        self._layerwise_prefill_load_done_events: dict[
+            tuple[int, int], tuple[int, Any]
+        ] = {}
+
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
 
     def synchronize_dense_load_stream(self) -> None:
         self.load_stream.synchronize()
+
+    def _layerwise_prefill_transfer_state(
+        self,
+    ) -> tuple[
+        dict[int, int],
+        dict[int, int],
+        dict[tuple[int, int], tuple[int, Any]],
+        dict[tuple[int, int], tuple[int, Any]],
+    ]:
+        """Return lazily initialized state used by P-node bank hand-offs."""
+        bank_counts = getattr(self, "_layerwise_prefill_bank_counts", None)
+        if bank_counts is None:
+            bank_counts = {}
+            self._layerwise_prefill_bank_counts = bank_counts
+        generations = getattr(
+            self,
+            "_layerwise_prefill_transfer_generations",
+            None,
+        )
+        if generations is None:
+            generations = {}
+            self._layerwise_prefill_transfer_generations = generations
+        save_done = getattr(self, "_layerwise_prefill_save_done_events", None)
+        if save_done is None:
+            save_done = {}
+            self._layerwise_prefill_save_done_events = save_done
+        load_done = getattr(self, "_layerwise_prefill_load_done_events", None)
+        if load_done is None:
+            load_done = {}
+            self._layerwise_prefill_load_done_events = load_done
+        return bank_counts, generations, save_done, load_done
+
+    def _layerwise_prefill_transfer_generation(self, kv_group: int) -> int:
+        _, generations, _, _ = self._layerwise_prefill_transfer_state()
+        return generations.setdefault(int(kv_group), 0)
+
+    def _check_layerwise_prefill_transfer_generation(
+        self,
+        kv_group: int,
+        generation: int,
+    ) -> None:
+        current = self._layerwise_prefill_transfer_generation(kv_group)
+        if generation != current:
+            raise RuntimeError(
+                "Layerwise-prefill transfer belongs to a reset step: "
+                f"kv_group={kv_group}, transfer_generation={generation}, "
+                f"current_generation={current}"
+            )
+
+    def reset_layerwise_prefill_transfer_state(
+        self,
+        kv_group: Optional[int] = None,
+        *,
+        synchronize: bool = True,
+    ) -> None:
+        """Invalidate layerwise-prefill events at a request/step boundary.
+
+        Abort and cancellation callers should keep ``synchronize=True`` so
+        already submitted H2D/D2H work is complete before its banks or host
+        buffers are reused.  A normal step boundary may pass ``False`` only
+        after the regular load/store drains have completed.
+        """
+        if synchronize:
+            self.load_stream.synchronize()
+            self.store_stream.synchronize()
+
+        bank_counts, generations, save_done, load_done = (
+            self._layerwise_prefill_transfer_state()
+        )
+        if kv_group is None:
+            groups = set(bank_counts) | set(generations)
+            groups.update(group for group, _ in save_done)
+            groups.update(group for group, _ in load_done)
+        else:
+            groups = {int(kv_group)}
+
+        for group in groups:
+            generations[group] = generations.get(group, 0) + 1
+        save_done_keys = [key for key in save_done if key[0] in groups]
+        load_done_keys = [key for key in load_done if key[0] in groups]
+        for key in save_done_keys:
+            del save_done[key]
+        for key in load_done_keys:
+            del load_done[key]
+
+    def _set_layerwise_prefill_bank_count(
+        self,
+        kv_group: int,
+        bank_count: int,
+    ) -> None:
+        if bank_count <= 0:
+            raise ValueError("layerwise_prefill_bank_count must be positive")
+        bank_counts, _, save_done, load_done = (
+            self._layerwise_prefill_transfer_state()
+        )
+        previous = bank_counts.get(kv_group)
+        if previous is not None and previous != bank_count:
+            if any(group == kv_group for group, _ in save_done) or any(
+                group == kv_group for group, _ in load_done
+            ):
+                raise RuntimeError(
+                    "Cannot change layerwise-prefill bank count while transfer "
+                    f"events are live: kv_group={kv_group}, previous={previous}, "
+                    f"requested={bank_count}"
+                )
+        bank_counts[kv_group] = bank_count
+
+    def _layerwise_prefill_bank(self, layer_id: int, kv_group: int) -> int:
+        bank_counts, _, _, _ = self._layerwise_prefill_transfer_state()
+        bank_count = bank_counts.get(kv_group, 2)
+        return int(layer_id) % bank_count
+
+    def wait_for_layerwise_prefill_load(
+        self,
+        layer_id: int,
+        kv_group: int,
+    ) -> None:
+        """Order a layer consumer after its asynchronous P-node bank hand-off.
+
+        A completed load already includes its load-stream wait on the previous
+        save of the destination bank.  Still join the current-generation save
+        explicitly before the load: this makes an accidentally retained stale
+        load event unable to bypass the newest bank-lifetime dependency.  If
+        this layer has no load, the save wait alone protects bank reuse.
+        """
+        _, generations, save_done, load_done = (
+            self._layerwise_prefill_transfer_state()
+        )
+        generation = generations.setdefault(int(kv_group), 0)
+        current_stream = torch.npu.current_stream()
+        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        save_record = save_done.get((kv_group, bank))
+        if save_record is not None and save_record[0] == generation:
+            current_stream.wait_event(save_record[1])
+        load_record = load_done.pop((kv_group, int(layer_id)), None)
+        if load_record is not None and load_record[0] == generation:
+            current_stream.wait_event(load_record[1])
 
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
@@ -2138,6 +2349,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_dsa_hidden_dims: int,
         source_signature: Optional[tuple] = None,
         return_key: bool = False,
+        require_prepared: bool = False,
     ):
         if kvcaches_ref is None:
             return (None, None) if return_key else None
@@ -2172,6 +2384,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         state = self._sparse_direct_layer_states.get(state_key)
         if state is not None:
             return (state, state_key) if return_key else state
+
+        if require_prepared:
+            raise RuntimeError(
+                "Ascend dense-direct layer state was not prepared before the "
+                "layerwise-prefill transfer window: "
+                f"kv_group={kv_group}, layer={layer_id}"
+            )
 
         state = prepare_sparse_direct_layer_state(
             layer_tensors[0],
@@ -2984,43 +3203,57 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_host_interleaved: bool,
         layer_tensors: List[torch.Tensor],
         direction: bool,
+        defer_consumer_wait: bool = False,
+        require_prepared_state: bool = False,
+        prepared_layer_state: Any = None,
+        prepared_validation_key: Optional[tuple] = None,
     ) -> None:
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
 
-        source_signature = self._dense_direct_pointer_cache_signature(
-            chunk_ptrs_npu=chunk_ptrs_npu,
-            chunk_offsets_npu=chunk_offsets_npu,
-            chunk_sizes_npu=chunk_sizes_npu,
-            slot_mapping_ref=slot_mapping_full,
-            source_layout_ref=layer_tensors[0] if layer_tensors else None,
-            total_tokens=total_tokens,
-            fixed_chunk_size=fixed_chunk_size,
-            dense_kv_format=dense_kv_format,
-            dense_token_major=dense_token_major,
-            dense_vllm_two_major=dense_vllm_two_major,
-            dense_k_hidden_dims=dense_k_hidden_dims,
-            dense_v_hidden_dims=dense_v_hidden_dims,
-            dense_dsa_hidden_dims=dense_dsa_hidden_dims,
-            direction=direction,
-        )
-        layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
-            kvcaches_ref=kvcaches_ref,
-            kv_group=kv_group,
-            layer_id=layer_id,
-            layer_tensors=layer_tensors,
-            slot_mapping_ref=slot_mapping_full,
-            total_tokens=total_tokens,
-            sparse_kv_format=dense_kv_format,
-            sparse_token_major=dense_token_major,
-            sparse_vllm_two_major=dense_vllm_two_major,
-            sparse_k_hidden_dims=dense_k_hidden_dims,
-            sparse_v_hidden_dims=dense_v_hidden_dims,
-            sparse_dsa_hidden_dims=dense_dsa_hidden_dims,
-            source_signature=source_signature,
-            return_key=True,
-        )
+        if prepared_layer_state is not None:
+            if prepared_validation_key is None:
+                raise RuntimeError(
+                    "A prepared dense-direct layer state requires its "
+                    f"validation key: kv_group={kv_group}, layer={layer_id}"
+                )
+            layer_state = prepared_layer_state
+            validate_key = prepared_validation_key
+        else:
+            source_signature = self._dense_direct_pointer_cache_signature(
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                chunk_offsets_npu=chunk_offsets_npu,
+                chunk_sizes_npu=chunk_sizes_npu,
+                slot_mapping_ref=slot_mapping_full,
+                source_layout_ref=layer_tensors[0] if layer_tensors else None,
+                total_tokens=total_tokens,
+                fixed_chunk_size=fixed_chunk_size,
+                dense_kv_format=dense_kv_format,
+                dense_token_major=dense_token_major,
+                dense_vllm_two_major=dense_vllm_two_major,
+                dense_k_hidden_dims=dense_k_hidden_dims,
+                dense_v_hidden_dims=dense_v_hidden_dims,
+                dense_dsa_hidden_dims=dense_dsa_hidden_dims,
+                direction=direction,
+            )
+            layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
+                kvcaches_ref=kvcaches_ref,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                layer_tensors=layer_tensors,
+                slot_mapping_ref=slot_mapping_full,
+                total_tokens=total_tokens,
+                sparse_kv_format=dense_kv_format,
+                sparse_token_major=dense_token_major,
+                sparse_vllm_two_major=dense_vllm_two_major,
+                sparse_k_hidden_dims=dense_k_hidden_dims,
+                sparse_v_hidden_dims=dense_v_hidden_dims,
+                sparse_dsa_hidden_dims=dense_dsa_hidden_dims,
+                source_signature=source_signature,
+                return_key=True,
+                require_prepared=require_prepared_state,
+            )
         if validate_key is None:
             validate_key = ("dense", kv_group, layer_id)
 
@@ -3063,7 +3296,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     chunk_ptrs_npu=chunk_ptrs_npu,
                     fixed_chunk_size=fixed_chunk_size,
                 )
-        current_stream.wait_stream(transfer_stream)
+        # Ordinary loads/stores preserve the legacy immediate consumer wait.
+        # P-node layerwise prefill instead publishes an explicit completion
+        # event: the next layer waits at its entry, leaving the intervening
+        # compute/communication window free for the transfer.
+        if not defer_consumer_wait:
+            current_stream.wait_stream(transfer_stream)
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
         return (
@@ -4022,6 +4260,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         is_mla_dsa = self._is_mla_dsa_format(kv_group)
         dense_direct = is_mla_dsa and not _DENSE_DIRECT_LOAD_DISABLE
+        deferred_layerwise_get = bool(
+            kwargs.get("deferred_layerwise_get", False)
+        )
+        deferred_dense_direct_get = deferred_layerwise_get and dense_direct
+        layerwise_prefill_bank_count = int(
+            kwargs.get("layerwise_prefill_bank_count", 2) or 2
+        )
+        if deferred_dense_direct_get:
+            self._set_layerwise_prefill_bank_count(
+                kv_group,
+                layerwise_prefill_bank_count,
+            )
+            layerwise_prefill_generation = (
+                self._layerwise_prefill_transfer_generation(kv_group)
+            )
+        else:
+            layerwise_prefill_generation = None
 
         if not dense_direct:
             if is_mla_dsa and not self.use_gpu:
@@ -4036,21 +4291,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     init_staging=True,
                 )
 
-        slot_mapping_chunks = []
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
         for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
             chunk_size = end - start
             chunk_offsets.append(current_offset)
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        slot_mapping_full = (
-            slot_mapping_chunks[0]
-            if len(slot_mapping_chunks) == 1
-            else torch.cat(slot_mapping_chunks, dim=0)
+        _, slot_mapping_full = _slice_layerwise_slot_mapping(
+            slot_mapping,
+            starts,
+            ends,
         )
 
         num_tokens = len(slot_mapping_full)
@@ -4102,10 +4355,49 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             )
 
+        deferred_load_submitted = False
+        deferred_load_completed = False
         try:
             validated_page_ids: set[int] = set()
             for layer_id in range(self._expected_group_layers(kv_group)):
-                memory_objs_layer = yield
+                layer_payload = yield
+                if layerwise_prefill_generation is not None:
+                    self._check_layerwise_prefill_transfer_generation(
+                        kv_group,
+                        layerwise_prefill_generation,
+                    )
+                layer_request = None
+                if isinstance(layer_payload, dict) and "memory_objs" in layer_payload:
+                    memory_objs_layer = layer_payload["memory_objs"]
+                    layer_request = layer_payload.get("layer_request")
+                else:
+                    memory_objs_layer = layer_payload
+                layer_slot_mapping, layer_slot_mapping_base = (
+                    _resolve_layerwise_slot_mapping(
+                        layer_request,
+                        slot_mapping,
+                    )
+                )
+                layer_slot_mapping_chunks, layer_slot_mapping_full = (
+                    _slice_layerwise_slot_mapping(
+                        layer_slot_mapping,
+                        starts,
+                        ends,
+                        layer_slot_mapping_base,
+                    )
+                )
+                if len(layer_slot_mapping_full) != num_tokens:
+                    raise RuntimeError(
+                        "Layerwise retrieve changed transfer token count: "
+                        f"layer={layer_id}, expected={num_tokens}, "
+                        f"actual={len(layer_slot_mapping_full)}"
+                    )
+                self._check_layerwise_transfer_invariants(
+                    operation="retrieve",
+                    kv_group=kv_group,
+                    slot_mapping_full=layer_slot_mapping_full,
+                    kvcaches_ref=kvcaches_snapshot,
+                )
                 source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
                 page_checks: tuple[MemoryObj, ...] = ()
                 format_sources = source_objs
@@ -4130,12 +4422,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # The generator is resumed from vLLM's attention path; refresh the
                 # active compute stream per layer before ordering load -> compute.
                 current_stream = torch.cuda.current_stream()
-                if sync:
+                if sync and not deferred_dense_direct_get:
                     current_stream.wait_stream(self.load_stream)
                 if layer_id > 0 and logger.isEnabledFor(10):
                     logger.debug("Finished loading layer %d", layer_id - 1)
                 # memobj -> gpu_buffer -> kvcaches
                 if dense_direct:
+                    if deferred_dense_direct_get:
+                        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+                        _, _, save_done, _ = (
+                            self._layerwise_prefill_transfer_state()
+                        )
+                        previous_save = save_done.get((kv_group, bank))
+                        if (
+                            previous_save is not None
+                            and previous_save[0] == layerwise_prefill_generation
+                        ):
+                            with self._stream_context_or_null(self.load_stream):
+                                self.load_stream.wait_event(previous_save[1])
                     if pointer_first:
                         chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                             layer_id,
@@ -4154,13 +4458,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                     assert chunk_offsets_npu is not None
                     assert chunk_sizes_npu is not None
+                    if deferred_dense_direct_get:
+                        # The direct op may enqueue work before raising.  Its
+                        # close/error path must therefore conservatively fence
+                        # the load stream once launch starts.
+                        deferred_load_submitted = True
                     self._run_dense_direct_kv_transfer_layer(
                         kvcaches_ref=kvcaches_snapshot,
                         kv_group=kv_group,
                         layer_id=layer_id,
                         transfer_stream=self.load_stream,
                         current_stream=current_stream,
-                        slot_mapping_full=slot_mapping_full,
+                        slot_mapping_full=layer_slot_mapping_full,
                         chunk_ptrs_npu=chunk_ptrs_npu,
                         chunk_offsets_npu=chunk_offsets_npu,
                         chunk_sizes_npu=chunk_sizes_npu,
@@ -4175,7 +4484,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         dense_host_interleaved=dense_host_interleaved,
                         layer_tensors=cpu_tensors,
                         direction=False,
+                        defer_consumer_wait=deferred_dense_direct_get,
                     )
+                    if deferred_dense_direct_get:
+                        load_done_event = torch.npu.Event()
+                        load_done_event.record(self.load_stream)
+                        _, _, _, load_done = (
+                            self._layerwise_prefill_transfer_state()
+                        )
+                        self._check_layerwise_prefill_transfer_generation(
+                            kv_group,
+                            layerwise_prefill_generation,
+                        )
+                        load_done[(kv_group, layer_id)] = (
+                            layerwise_prefill_generation,
+                            load_done_event,
+                        )
                 else:
                     with torch.cuda.stream(self.load_stream):
                         if self.use_gpu:
@@ -4184,7 +4508,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 cpu_tensors,  # CPU memory objects
                                 staging_tensor,  # GPU staging buffer
                                 kvcaches_snapshot[layer_id],
-                                slot_mapping_full,
+                                layer_slot_mapping_full,
                                 chunk_offsets,  # offset for each chunk
                                 chunk_sizes,  # size for each chunk
                                 False,  # to_gpu
@@ -4197,13 +4521,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             )
 
                         else:
-                            for start, end, tensor in zip(
-                                starts, ends, cpu_tensors, strict=False
+                            for mapping_chunk, tensor in zip(
+                                layer_slot_mapping_chunks,
+                                cpu_tensors,
+                                strict=False,
                             ):
                                 lmc_ops.single_layer_kv_transfer(
                                     tensor,
                                     kvcaches_snapshot[layer_id],
-                                    slot_mapping[start:end],
+                                    mapping_chunk,
                                     False,
                                     kv_format_value,
                                     token_major,
@@ -4219,14 +4545,28 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     logger.debug("Finished loading layer %d", layer_id)
             yield
 
-            # synchronize the last layer
-            if sync:
+            # The deferred outer LMCache generator resumes this terminal gate
+            # only at the last-layer entry.  Its pinned host MemoryObjs are
+            # released immediately after this ``next()`` returns, so complete
+            # the final direct H2D on the host here.  Doing this at the gate
+            # (rather than when N-1 submits the final load) preserves the
+            # load(N) / HCOM(N-1) overlap while preventing source-buffer UAF.
+            if deferred_dense_direct_get and deferred_load_submitted:
+                self.load_stream.synchronize()
+            elif sync:
                 current_stream.wait_stream(self.load_stream)
             if tmp_gpu_buffer_obj is not None:
                 tmp_gpu_buffer_obj.ref_count_down()
                 tmp_gpu_buffer_obj = None
+            deferred_load_completed = True
             yield
         finally:
+            if (
+                deferred_dense_direct_get
+                and deferred_load_submitted
+                and not deferred_load_completed
+            ):
+                self.load_stream.synchronize()
             if tmp_gpu_buffer_obj is not None:
                 tmp_gpu_buffer_obj.ref_count_down()
 
@@ -4927,13 +5267,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
         This function is a generator that moves the KV cache from the paged GPU
         memory to the memory objects. The first iteration will prepare some
-        related metadata and initiate the transfer in the first layer. In each
-        of the following iterations, it will first wait until the storing of
-        previous layer finishes, and then initiate string the KV cache of the
-        current layer one. The storing process of the KV cache is paged GPU
-        memory -> GPU buffer -> memory objects. The last iteration simply waits
-        for the last layer to finish.
-        In total, this the generator will yield num_layers + 1 times.
+        related metadata and initiate the transfer in the first layer. Normal
+        callers preserve the legacy per-layer wait. Deferred layerwise-prefill
+        callers rotate physical KV banks, overlap D2H with later layer compute,
+        and report a source layer complete when its bank is about to be reused.
+        The storing process is paged GPU memory -> GPU buffer -> memory objects.
+        Deferred callers may need multiple drain iterations for the remaining
+        bank events after the last layer.
 
         :param memory_objs: The memory objects to store the KV cache. The first
             dimension is the number of layers, and the second dimension is the
@@ -4988,35 +5328,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     init_staging=True,
                 )
 
-        slot_mapping_chunks = []
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
         for start, end in zip(starts, ends, strict=False):
-            local_start = start - slot_mapping_base
-            local_end = end - slot_mapping_base
-            if (
-                local_start < 0
-                or local_end < local_start
-                or local_end > len(slot_mapping)
-            ):
-                raise ValueError(
-                    "Layerwise store chunk is outside the provided slot-mapping "
-                    "window: "
-                    f"chunk=[{start}, {end}), base={slot_mapping_base}, "
-                    f"mapping_tokens={len(slot_mapping)}, "
-                    f"local_chunk=[{local_start}, {local_end})"
-                )
-            slot_mapping_chunks.append(slot_mapping[local_start:local_end])
             chunk_size = end - start
             chunk_offsets.append(current_offset)
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        slot_mapping_full = (
-            slot_mapping_chunks[0]
-            if len(slot_mapping_chunks) == 1
-            else torch.cat(slot_mapping_chunks, dim=0)
+        _, slot_mapping_full = _slice_layerwise_slot_mapping(
+            slot_mapping,
+            starts,
+            ends,
+            slot_mapping_base,
         )
 
         num_tokens = len(slot_mapping_full)
@@ -5098,26 +5423,267 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             )
 
-        current_stream = torch.npu.current_stream()
+        def log_completed_store_layer(layer_id: int) -> None:
+            if not (_mtp_dw_deep_diag_enabled() and layer_id == 0):
+                return
+            store_req_id = kwargs.get("req_id")
+            if store_req_id is None:
+                return
+            store_tensors = [
+                memory_obj.tensor
+                for memory_obj in memory_objs[layer_id]
+                if memory_obj.tensor is not None
+            ]
+            chunk_ranges = []
+            for chunk_index, tensor in enumerate(store_tensors):
+                range_start = (
+                    int(starts[chunk_index])
+                    if chunk_index < len(starts)
+                    else None
+                )
+                range_end = (
+                    int(ends[chunk_index])
+                    if chunk_index < len(ends)
+                    else None
+                )
+                chunk_ranges.append(
+                    {
+                        "start": range_start,
+                        "end": range_end,
+                        "fingerprint": _bounded_tensor_fingerprint(tensor),
+                    }
+                )
+            _mtp_dw_event(
+                "deep",
+                event="content_store",
+                req=str(store_req_id),
+                kv_group=kv_group,
+                layer=layer_id,
+                window_start=kwargs.get("decode_window_start"),
+                window_end=kwargs.get("decode_window_end"),
+                chunk_ranges=chunk_ranges,
+            )
 
+        store_transfer_pending = False
         try:
-            for layer_id in range(expected_layers):
-                memory_objs_layer = memory_objs[layer_id]
-                # kvcaches -> gpu_buffer -> memobj
-                if dense_direct:
-                    cpu_tensors = []
-                    for memory_obj in memory_objs_layer:
-                        assert memory_obj.tensor is not None
+            deferred_layerwise_put = bool(
+                kwargs.get("deferred_layerwise_put", False)
+            )
+            layerwise_prefill_bank_count = int(
+                kwargs.get("layerwise_prefill_bank_count", 2) or 2
+            )
+            if layerwise_prefill_bank_count <= 0:
+                raise ValueError(
+                    "layerwise_prefill_bank_count must be positive"
+                )
+            # The fallback path reuses one staging tensor for every layer, so
+            # it cannot safely pipeline multiple source banks. Keep its
+            # original one-layer fence; the MLA/DSA direct path has no shared
+            # staging tensor and can use the configured bank rotation.
+            source_bank_count = (
+                layerwise_prefill_bank_count if dense_direct else 1
+            )
+            if deferred_layerwise_put and dense_direct:
+                self._set_layerwise_prefill_bank_count(
+                    kv_group,
+                    source_bank_count,
+                )
+                layerwise_prefill_generation = (
+                    self._layerwise_prefill_transfer_generation(kv_group)
+                )
+            else:
+                layerwise_prefill_generation = None
+
+            # Deferred P-node saves are resumed from the latency-sensitive
+            # pre-HCOM callback.  Resolve every registered host pointer, upload
+            # one dense pointer table, and build every native layer state now,
+            # before the generator's priming yield.  The per-layer callback may
+            # then only select an already prepared row and launch the transfer.
+            deferred_dense_layer_tensors: Optional[List[List[torch.Tensor]]] = None
+            deferred_dense_chunk_dev_ptrs: List[List[int]] = []
+            deferred_dense_chunk_ptrs_npu: List[Optional[torch.Tensor]] = []
+            deferred_dense_layer_states: List[Any] = []
+            deferred_dense_validation_keys: List[tuple] = []
+            if deferred_layerwise_put and dense_direct:
+                deferred_dense_layer_tensors = []
+                for layer_id, memory_objs_layer in enumerate(memory_objs):
+                    layer_tensors = []
+                    for chunk_index, memory_obj in enumerate(memory_objs_layer):
+                        tensor = memory_obj.tensor
+                        if tensor is None:
+                            raise ValueError(
+                                "Dense direct layerwise store received a "
+                                "MemoryObj without a tensor at "
+                                f"layer={layer_id}, chunk={chunk_index}."
+                            )
                         if memory_obj.metadata.fmt != expected_fmt:
                             raise ValueError(
                                 f"Expected memory format {expected_fmt}, "
                                 f"got {memory_obj.metadata.fmt}."
                             )
-                        cpu_tensors.append(memory_obj.tensor)
-                    chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
-                        layer_id,
-                        cpu_tensors,
+                        layer_tensors.append(tensor)
+                    if len(layer_tensors) != len(starts):
+                        raise ValueError(
+                            "Dense direct layerwise store chunk count mismatch: "
+                            f"layer={layer_id}, tensors={len(layer_tensors)}, "
+                            f"ranges={len(starts)}"
+                        )
+                    deferred_dense_layer_tensors.append(layer_tensors)
+
+                self.append_sparse_chunk_ptr_cache_for_layers(
+                    memory_objs,
+                    deferred_dense_chunk_dev_ptrs,
+                    deferred_dense_chunk_ptrs_npu,
+                )
+                assert chunk_offsets_npu is not None
+                assert chunk_sizes_npu is not None
+                for layer_id, layer_tensors in enumerate(
+                    deferred_dense_layer_tensors
+                ):
+                    chunk_ptrs_npu = deferred_dense_chunk_ptrs_npu[layer_id]
+                    if chunk_ptrs_npu is None:
+                        raise RuntimeError(
+                            "Dense direct layerwise store pointer row was not "
+                            f"prepared for layer {layer_id}."
+                        )
+                    source_signature = self._dense_direct_pointer_cache_signature(
+                        chunk_ptrs_npu=chunk_ptrs_npu,
+                        chunk_offsets_npu=chunk_offsets_npu,
+                        chunk_sizes_npu=chunk_sizes_npu,
+                        slot_mapping_ref=slot_mapping_full,
+                        source_layout_ref=(
+                            layer_tensors[0] if layer_tensors else None
+                        ),
+                        total_tokens=num_tokens,
+                        fixed_chunk_size=dense_fixed_chunk_size,
+                        dense_kv_format=kv_format_value,
+                        dense_token_major=token_major,
+                        dense_vllm_two_major=vllm_two_major,
+                        dense_k_hidden_dims=k_hidden_dims,
+                        dense_v_hidden_dims=v_hidden_dims,
+                        dense_dsa_hidden_dims=dsa_hidden_dims,
+                        direction=True,
                     )
+                    layer_state, validation_key = (
+                        self._get_or_create_sparse_direct_layer_state(
+                            kvcaches_ref=kvcaches_snapshot,
+                            kv_group=kv_group,
+                            layer_id=layer_id,
+                            layer_tensors=layer_tensors,
+                            slot_mapping_ref=slot_mapping_full,
+                            total_tokens=num_tokens,
+                            sparse_kv_format=kv_format_value,
+                            sparse_token_major=token_major,
+                            sparse_vllm_two_major=vllm_two_major,
+                            sparse_k_hidden_dims=k_hidden_dims,
+                            sparse_v_hidden_dims=v_hidden_dims,
+                            sparse_dsa_hidden_dims=dsa_hidden_dims,
+                            source_signature=source_signature,
+                            return_key=True,
+                        )
+                    )
+                    if layer_state is None or validation_key is None:
+                        raise RuntimeError(
+                            "Dense direct layerwise store state preparation "
+                            f"failed for layer {layer_id}."
+                        )
+                    deferred_dense_layer_states.append(layer_state)
+                    deferred_dense_validation_keys.append(validation_key)
+            bank_done_events: list[Optional[Any]] = [
+                None
+            ] * source_bank_count
+            pending_layer_by_bank: list[Optional[int]] = [
+                None
+            ] * source_bank_count
+            layer_request = None
+            if deferred_layerwise_put:
+                layer_request = yield None
+            for layer_id in range(expected_layers):
+                if layerwise_prefill_generation is not None:
+                    self._check_layerwise_prefill_transfer_generation(
+                        kv_group,
+                        layerwise_prefill_generation,
+                    )
+                # save_kv_layer resumes this generator from the active layer's
+                # attention callback.  Capture that stream per layer so graph
+                # or runtime stream changes do not attach dependencies to a
+                # stale stream from the first layer.
+                current_stream = torch.npu.current_stream()
+                completed_layer = None
+                bank = layer_id % source_bank_count
+                if deferred_layerwise_put:
+                    completed_layer = pending_layer_by_bank[bank]
+                if completed_layer is not None:
+                    # The compute stream was fenced before this bank's reuse.
+                    # Synchronize only that bank's old D2H event so its CPU
+                    # objects can be published without draining newer stores.
+                    completed_event = bank_done_events[bank]
+                    assert completed_event is not None
+                    completed_event.synchronize()
+                    pending_layer_by_bank[bank] = None
+                    bank_done_events[bank] = None
+                    log_completed_store_layer(completed_layer)
+
+                layer_slot_mapping, layer_slot_mapping_base = (
+                    _resolve_layerwise_slot_mapping(
+                        layer_request,
+                        slot_mapping,
+                        slot_mapping_base,
+                    )
+                )
+                layer_slot_mapping_chunks, layer_slot_mapping_full = (
+                    _slice_layerwise_slot_mapping(
+                        layer_slot_mapping,
+                        starts,
+                        ends,
+                        layer_slot_mapping_base,
+                    )
+                )
+                if len(layer_slot_mapping_full) != num_tokens:
+                    raise RuntimeError(
+                        "Layerwise store changed transfer token count: "
+                        f"layer={layer_id}, expected={num_tokens}, "
+                        f"actual={len(layer_slot_mapping_full)}"
+                    )
+                self._check_layerwise_transfer_invariants(
+                    operation="store",
+                    kv_group=kv_group,
+                    slot_mapping_full=layer_slot_mapping_full,
+                    kvcaches_ref=kvcaches_snapshot,
+                )
+                memory_objs_layer = memory_objs[layer_id]
+                # kvcaches -> gpu_buffer -> memobj
+                # Mark before launching so exception cleanup also fences a
+                # partially enqueued transfer.
+                store_transfer_pending = True
+                if dense_direct:
+                    if deferred_layerwise_put:
+                        assert deferred_dense_layer_tensors is not None
+                        cpu_tensors = deferred_dense_layer_tensors[layer_id]
+                        chunk_ptrs_npu = deferred_dense_chunk_ptrs_npu[layer_id]
+                        if (
+                            chunk_ptrs_npu is None
+                            or chunk_ptrs_npu.numel() != len(cpu_tensors)
+                        ):
+                            raise RuntimeError(
+                                "Dense direct layerwise store pointer row was "
+                                "not completely prepared before the transfer "
+                                f"window at layer {layer_id}."
+                            )
+                    else:
+                        cpu_tensors = []
+                        for memory_obj in memory_objs_layer:
+                            assert memory_obj.tensor is not None
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                            cpu_tensors.append(memory_obj.tensor)
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id,
+                            cpu_tensors,
+                        )
                     assert chunk_offsets_npu is not None
                     assert chunk_sizes_npu is not None
                     self._run_dense_direct_kv_transfer_layer(
@@ -5126,7 +5692,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         layer_id=layer_id,
                         transfer_stream=self.store_stream,
                         current_stream=current_stream,
-                        slot_mapping_full=slot_mapping_full,
+                        slot_mapping_full=layer_slot_mapping_full,
                         chunk_ptrs_npu=chunk_ptrs_npu,
                         chunk_offsets_npu=chunk_offsets_npu,
                         chunk_sizes_npu=chunk_sizes_npu,
@@ -5141,6 +5707,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         dense_host_interleaved=dense_host_interleaved,
                         layer_tensors=cpu_tensors,
                         direction=True,
+                        defer_consumer_wait=deferred_layerwise_put,
+                        require_prepared_state=deferred_layerwise_put,
+                        prepared_layer_state=(
+                            deferred_dense_layer_states[layer_id]
+                            if deferred_layerwise_put
+                            else None
+                        ),
+                        prepared_validation_key=(
+                            deferred_dense_validation_keys[layer_id]
+                            if deferred_layerwise_put
+                            else None
+                        ),
                     )
                     logger.debug("Finished offloading layer %d", layer_id)
                 else:
@@ -5157,7 +5735,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 cpu_tensors,
                                 staging_tensor,
                                 kvcaches_snapshot[layer_id],
-                                slot_mapping_full,
+                                layer_slot_mapping_full,
                                 chunk_offsets,
                                 chunk_sizes,
                                 True,  # from_gpu
@@ -5169,15 +5747,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 dsa_hidden_dims,
                             )
                         else:
-                            for start, end, memory_obj in zip(
-                                starts, ends, memory_objs_layer, strict=False
+                            for mapping_chunk, memory_obj in zip(
+                                layer_slot_mapping_chunks,
+                                memory_objs_layer,
+                                strict=False,
                             ):
                                 assert memory_obj.tensor is not None
 
                                 lmc_ops.single_layer_kv_transfer(
                                     memory_obj.tensor,
                                     kvcaches_snapshot[layer_id],
-                                    slot_mapping[start:end],
+                                    mapping_chunk,
                                     True,
                                     kv_format_value,
                                     token_major,
@@ -5187,66 +5767,69 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                     dsa_hidden_dims,
                                 )
                         logger.debug("Finished offloading layer %d", layer_id)
-                yield
-
-                # store_layer publishes the CPU MemoryObjs immediately after the
-                # generator advances, so the layer's D2H copy must be complete
-                # before returning control regardless of the caller's sync hint.
-                self.store_stream.synchronize()
-                if _mtp_dw_deep_diag_enabled() and layer_id == 0:
-                    store_req_id = kwargs.get("req_id")
-                    if store_req_id is not None:
-                        store_tensors = [
-                            memory_obj.tensor
-                            for memory_obj in memory_objs_layer
-                            if memory_obj.tensor is not None
-                        ]
-                        store_starts = list(starts)
-                        store_ends = list(ends)
-                        chunk_ranges = []
-                        for chunk_index, tensor in enumerate(store_tensors):
-                            range_start = (
-                                int(store_starts[chunk_index])
-                                if chunk_index < len(store_starts)
-                                else None
-                            )
-                            range_end = (
-                                int(store_ends[chunk_index])
-                                if chunk_index < len(store_ends)
-                                else None
-                            )
-                            chunk_ranges.append(
-                                {
-                                    "start": range_start,
-                                    "end": range_end,
-                                    "fingerprint": _bounded_tensor_fingerprint(
-                                        tensor
-                                    ),
-                                }
-                            )
-                        _mtp_dw_event(
-                            "deep",
-                            event="content_store",
-                            req=str(store_req_id),
-                            kv_group=kv_group,
-                            layer=layer_id,
-                            window_start=kwargs.get("decode_window_start"),
-                            window_end=kwargs.get("decode_window_end"),
-                            chunk_ranges=chunk_ranges,
+                if deferred_layerwise_put:
+                    bank_done_event = torch.npu.Event()
+                    bank_done_event.record(self.store_stream)
+                    bank_done_events[bank] = bank_done_event
+                    pending_layer_by_bank[bank] = layer_id
+                    if dense_direct:
+                        _, _, save_done, _ = (
+                            self._layerwise_prefill_transfer_state()
                         )
+                        self._check_layerwise_prefill_transfer_generation(
+                            kv_group,
+                            layerwise_prefill_generation,
+                        )
+                        save_done[(kv_group, bank)] = (
+                            layerwise_prefill_generation,
+                            bank_done_event,
+                        )
+                    else:
+                        # The fallback path owns only one reusable staging
+                        # tensor and has no compute-entry bank protocol.
+                        # Preserve its legacy fence before the next layer.
+                        current_stream.wait_event(bank_done_event)
+                if deferred_layerwise_put:
+                    layer_request = yield completed_layer
+                else:
+                    yield
+                    # Legacy store_layer publishes the CPU objects immediately
+                    # after this generator advances.
+                    self.store_stream.synchronize()
+                    store_transfer_pending = False
+                    log_completed_store_layer(layer_id)
+
+            if deferred_layerwise_put:
+                remaining_layers = sorted(
+                    layer_id
+                    for layer_id in pending_layer_by_bank
+                    if layer_id is not None
+                )
+                for completed_layer in remaining_layers:
+                    bank = completed_layer % source_bank_count
+                    completed_event = bank_done_events[bank]
+                    assert completed_event is not None
+                    completed_event.synchronize()
+                    pending_layer_by_bank[bank] = None
+                    bank_done_events[bank] = None
+                    log_completed_store_layer(completed_layer)
+                    yield completed_layer
+                store_transfer_pending = False
 
             # free the buffer memory
             if self.use_gpu and tmp_gpu_buffer_obj is not None:
                 tmp_gpu_buffer_obj.ref_count_down()
                 tmp_gpu_buffer_obj = None
-            yield
+            if not deferred_layerwise_put:
+                yield None
         finally:
+            if store_transfer_pending:
+                self.store_stream.synchronize()
             if (
                 self.use_gpu
                 and tmp_gpu_buffer_obj is not None
                 and tmp_gpu_buffer_obj.is_valid()
             ):
-                self.store_stream.synchronize()
                 tmp_gpu_buffer_obj.ref_count_down()
 
 

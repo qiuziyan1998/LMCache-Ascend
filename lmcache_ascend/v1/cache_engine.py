@@ -2968,11 +2968,24 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group=int(kwargs.get("kv_group", 0) or 0),
         )
         kv_group = store_result.kv_group
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        deferred_layerwise_put = bool(
+            kwargs.get("deferred_layerwise_put", False)
+        )
 
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
-            for _ in range(self._num_layers_for_kv_group(kv_group)):
+            if deferred_layerwise_put:
+                # Prime once before the model forward, then preserve distinct
+                # pre- and post-HCOM suspension points for every layer.
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+                yield store_result
+                return
+            for layer_id in range(num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
             yield store_result
@@ -2985,7 +2998,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger.debug(
                 "Passive rank (save_only_first_rank), skipping store_layer"
             )
-            for _ in range(self._num_layers_for_kv_group(kv_group)):
+            if deferred_layerwise_put:
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+                yield store_result
+                return
+            for layer_id in range(num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
             yield store_result
@@ -3021,8 +3041,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Freeze mode enabled, skipping store_layer for %d tokens",
                 num_to_store_tokens,
             )
+            if deferred_layerwise_put:
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+                yield store_result
+                return
             # Still need to yield to avoid StopIteration
-            for layer_id in range(self._num_layers_for_kv_group(kv_group)):
+            for layer_id in range(num_layers):
                 yield
             yield store_result
             return
@@ -3305,6 +3332,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     and all_chunks_publishable
                 )
                 if use_group_store:
+                    if deferred_layerwise_put:
+                        raise RuntimeError(
+                            "Deferred layerwise prefill save does not support "
+                            "the decode-window group-store path"
+                        )
                     for _ in range(num_layers):
                         yield
                     host_pointer_rows, layer_chunk_ptrs_npu = group_store(
@@ -3333,9 +3365,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                         memory_objs, starts, ends, **kwargs
                     )
                     next(mem_obj_generator)
-                    for layer_id in range(num_layers):
-                        yield
-                        next(mem_obj_generator)
+
+                    def publish_completed_layer(layer_id: int) -> None:
                         self._append_layer_store_tensors(
                             layer_id,
                             memory_objs,
@@ -3346,7 +3377,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             kv_group=kv_group,
                         )
                         if page_first_store:
-                            continue
+                            return
                         required_futures = self.storage_manager.batched_put(
                             keys[layer_id],
                             memory_objs[layer_id],
@@ -3355,6 +3386,73 @@ class AscendLMCacheEngine(LMCacheEngine):
                         self._track_sync_store_futures(required_futures)
                         for mem_obj in memory_objs[layer_id]:
                             pending_store_release.pop(id(mem_obj), None)
+
+                    if deferred_layerwise_put:
+                        persisted_layers: set[int] = set()
+                        # Priming the outer storer stops here. Each model-layer
+                        # save sends its bank-specific mapping into the NPU
+                        # consumer and returns immediately after D2H launch.
+                        layer_request = yield
+                        for layer_id in range(num_layers):
+                            source_done_layer = mem_obj_generator.send(
+                                layer_request
+                            )
+                            # Pre-HCOM save returns here. The explicit finish
+                            # hook resumes only after HCOM has been submitted.
+                            yield
+                            if source_done_layer is not None:
+                                if not isinstance(source_done_layer, int):
+                                    raise TypeError(
+                                        "Deferred layerwise NPU connector must "
+                                        "yield a completed layer index or None"
+                                    )
+                                if source_done_layer in persisted_layers:
+                                    raise RuntimeError(
+                                        "Layerwise NPU source completion was "
+                                        "reported twice: "
+                                        f"layer={source_done_layer}"
+                                    )
+                                publish_completed_layer(source_done_layer)
+                                persisted_layers.add(source_done_layer)
+                            if layer_id + 1 < num_layers:
+                                layer_request = yield
+                            else:
+                                # Do not drain final bank events or storage
+                                # futures inside the last attention callback.
+                                yield
+
+                        while len(persisted_layers) < num_layers:
+                            try:
+                                source_done_layer = next(mem_obj_generator)
+                            except StopIteration as exc:
+                                raise RuntimeError(
+                                    "Layerwise NPU connector ended before all "
+                                    "source buffers completed"
+                                ) from exc
+                            if source_done_layer is None:
+                                continue
+                            if not isinstance(source_done_layer, int):
+                                raise TypeError(
+                                    "Deferred layerwise NPU connector must "
+                                    "yield a completed layer index or None"
+                                )
+                            if source_done_layer in persisted_layers:
+                                raise RuntimeError(
+                                    "Layerwise NPU source completion was "
+                                    "reported twice: "
+                                    f"layer={source_done_layer}"
+                                )
+                            publish_completed_layer(source_done_layer)
+                            persisted_layers.add(source_done_layer)
+                        try:
+                            next(mem_obj_generator)
+                        except StopIteration:
+                            pass
+                    else:
+                        for layer_id in range(num_layers):
+                            yield
+                            next(mem_obj_generator)
+                            publish_completed_layer(layer_id)
 
                 if page_first_store:
                     flattened_keys = [key for layer_keys in keys for key in layer_keys]
@@ -3401,8 +3499,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
-            for layer_id in range(num_layers):
+            if deferred_layerwise_put:
                 yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+            else:
+                for layer_id in range(num_layers):
+                    yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         if store_complete:
