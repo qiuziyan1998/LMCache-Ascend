@@ -192,6 +192,7 @@ class LocalCheckpointStore:
                         if cached is not None:
                             page, _ = cached
                         else:
+                            prefix_owner_index = None
                             if start == base and sources[0][0].start > base:
                                 # Fetch the exact original partial page only
                                 # when assembling a boundary that is not cached.
@@ -204,6 +205,7 @@ class LocalCheckpointStore:
                                     group,
                                     manifest.prefix_end - base,
                                 )
+                                prefix_owner_index = len(owners)
                                 owners.append(prefix)
                                 prefix_stop = min(
                                     manifest.prefix_end, sources[0][0].start
@@ -221,6 +223,10 @@ class LocalCheckpointStore:
                             )
                             owners.append(page)
                             self._assemble(page, widths, selected, start, end)
+                            if prefix_owner_index is not None:
+                                # CPU copy finished; keep the destination owned
+                                # for pointer preparation and all-worker restore.
+                                owners.pop(prefix_owner_index).ref_count_down()
                             page = owners.pop()
                     owners.append(page)
                     keys.append(key)

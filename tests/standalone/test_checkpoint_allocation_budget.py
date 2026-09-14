@@ -78,6 +78,7 @@ def test_capacity_plan_rounds_each_group_allocation_independently(address_manage
                 num_layers=2,
                 cause="checkpoint_capacity_reclaim",
                 max_scan_entries=4096,
+                allocation_failed=True,
             ),
         )
     ]
@@ -100,3 +101,19 @@ def test_allocation_remains_single_attempt_without_implicit_eviction_or_wait():
         engine.allocate_checkpoint_fragment(0, 8, ["latent"])
     assert len(attempts) == 1 and not calls
     assert attempts[0]["busy_loop"] is False and attempts[0]["eviction"] is False
+
+
+@pytest.mark.parametrize("group", [0, 1])
+def test_ascend_helper_enters_fragmentation_reclaim_in_localcpu(monkeypatch, group):
+    monkeypatch.syspath_prepend(str(ROOT.parent / "LMCache-NPU/tests/standalone"))
+    import test_checkpoint_reclaim as reclaim_tests
+
+    engine, local, _ = engine_fixture(True)
+    backend, pool, removed = reclaim_tests.backend()
+    backend.get_memory_allocator = local.get_memory_allocator
+    engine._shared_local_cpu_backend = lambda: backend
+    pool.free = 500  # Above either aligned request size; ordinary reclaim skips.
+    backend.hot_cache["in_use"] = reclaim_tests.LayerPage(pool, 192, refs=2)
+    backend.hot_cache["idle"] = reclaim_tests.LayerPage(pool, 192)
+    assert engine.reclaim_checkpoint_capacity(8, {group: ["cache"]})
+    assert removed == ["idle"] and backend.hot_cache["in_use"].refs == 2

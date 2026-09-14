@@ -9884,7 +9884,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def reclaim_checkpoint_capacity(
         self, tokens: int, group_caches: dict[int, Optional[list]]
     ) -> bool:
-        """Reclaim once for the missing staging groups, without allocation or waits."""
+        """Reclaim once after allocation failure, including fragmented free space."""
         local = self._shared_local_cpu_backend()
         if local is None or tokens <= 0 or not group_caches:
             return False
@@ -9913,6 +9913,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             num_layers=self.num_layers,
             cause="checkpoint_capacity_reclaim",
             max_scan_entries=_CHECKPOINT_RECLAIM_SCAN_ENTRIES,
+            allocation_failed=True,
         )
 
     def allocate_checkpoint_fragment(
