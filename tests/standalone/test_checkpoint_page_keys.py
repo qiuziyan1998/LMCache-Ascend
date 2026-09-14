@@ -59,9 +59,13 @@ def key_types():
 def use_real_keys(engine, key_types):
     key_cls, _ = key_types
 
-    def tokens(*, tokens, request_configs=None, kv_group=0):
-        for start in range(0, len(tokens), 4):
-            end = min(start + 4, len(tokens))
+    def tokens(*, tokens=None, hashes=None, offsets=None, request_configs=None, kv_group=0):
+        if hashes is None:
+            hashes = [bytes(tokens[:min(a+4, len(tokens))]) for a in range(0, len(tokens), 4)]
+            offsets = [min(4, len(tokens)-a) for a in range(0, len(tokens), 4)]
+        start = 0
+        for h, count in zip(hashes, offsets, strict=True):
+            end = start + count
             configs = dict(request_configs or {}, **{"lmcache.tag.payload_v3": "test"})
             if end - start < 4:
                 configs["lmcache.tag.internal.valid_tokens"] = end - start
@@ -72,12 +76,13 @@ def use_real_keys(engine, key_types):
                     "model",
                     1,
                     0,
-                    bytes(tokens[:end]),
+                    h,
                     torch.uint8,
                     configs,
                     kv_group=kv_group,
                 ),
             )
+            start = end
 
     engine.token_database.process_tokens = tokens
 

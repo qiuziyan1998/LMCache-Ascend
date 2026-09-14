@@ -1398,7 +1398,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 caches = self._direct_group_caches()
                 for capture in captures:
                     if capture.req_id in preempted_req_ids:
-                        worker.capture(capture, caches, self._block_size, self._worker_retrieve_state.get(capture.req_id))
+                        worker.capture(
+                            capture,
+                            caches,
+                            self._block_size,
+                            self._worker_retrieve_state.get(capture.req_id),
+                            reuse_prefix=(
+                                getattr(self, "_decode_window_save_window_size", 0) <= 0
+                            ),
+                        )
 
         logger.debug(
             "LMCache-Ascend handling preemptions: req_ids=%s",

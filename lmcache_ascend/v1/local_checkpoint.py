@@ -15,11 +15,28 @@ class CheckpointPage:
     key: Any
 
 
+def checkpoint_group1_pages(
+    database: Any, sources: tuple, request_configs: Any
+) -> tuple:
+    """Derive index keys from latent hashes, preserving absolute source ranges."""
+    keys = database.process_tokens(
+        hashes=[p.key.chunk_hash for p in sources],
+        offsets=[p.end - p.start for p in sources],
+        request_configs=request_configs,
+        kv_group=1,
+    )
+    return tuple(
+        replace(p, key=key) for p, (_, _, key) in zip(sources, keys, strict=True)
+    )
+
+
 @dataclass(frozen=True)
 class LocalCheckpoint:
     tokens: tuple[int, ...]
     prefix_end: int
     groups: tuple[tuple[CheckpointPage, ...], tuple[CheckpointPage, ...]]
+    known_chunks: tuple[CheckpointPage, ...] = ()
+    key_seed: tuple[int, int | bytes] | None = None
 
 
 class LocalCheckpointStore:
@@ -140,15 +157,17 @@ class LocalCheckpointStore:
                 )
             chunk = int(self.engine.config.chunk_size)
             base = manifest.prefix_end // chunk * chunk
+            plans = self._token_plans(manifest, tokens, request_configs, base)
             for group in (0, 1):
                 sources = list(groups[group])
                 keys, pages, normalized = [], [], []
                 covered = base
-                for start, end, key in self.engine.token_database.process_tokens(
-                    tokens=tokens, request_configs=request_configs, kv_group=group
-                ):
-                    if start < base:
-                        continue
+                for source_plan in plans[group]:
+                    start, end, key = (
+                        source_plan.start,
+                        source_plan.end,
+                        source_plan.key,
+                    )
                     if start != covered or not start < end <= len(tokens):
                         raise ValueError(
                             "Normalized checkpoint coverage has a gap or overlap"
@@ -238,6 +257,7 @@ class LocalCheckpointStore:
                     )
                 for page in installed:
                     self.engine.validate_checkpoint_page(group, page)
+            self.touch(manifest.groups)
             return base, owners
         except BaseException as error:
             for page in owners:
@@ -252,6 +272,56 @@ class LocalCheckpointStore:
             raise
         finally:
             self.release(groups)
+
+    def touch(self, groups: tuple) -> None:
+        """Prefer keeping leading checkpoint pages without extending ownership."""
+        self.engine.checkpoint_backend().try_touch_layer_pages(
+            [
+                p.key
+                for p in sorted(
+                    (p for group in groups for p in group),
+                    key=lambda p: p.start,
+                    reverse=True,
+                )
+            ]
+        )
+
+    def _token_plans(
+        self, manifest: LocalCheckpoint, tokens: list, configs: Any, base: int
+    ) -> tuple:
+        database = self.engine.token_database
+        seed, prefix = manifest.key_seed, []
+        if seed is not None and seed[0] == base:
+            for page in manifest.known_chunks:
+                if page.end > len(tokens):
+                    break
+                if (
+                    page.start != seed[0]
+                    or page.end - page.start != self.engine.config.chunk_size
+                ):
+                    seed = None
+                    break
+                prefix.append(page)
+                seed = page.end, page.key.chunk_hash
+        else:
+            seed = None
+        if seed is None:
+            prefix = []
+            suffix = database.process_tokens(
+                tokens=tokens, request_configs=configs, kv_group=0
+            )
+        else:
+            suffix = database.process_tokens_from_prefix(
+                tokens,
+                prefix_token_count=seed[0],
+                prefix_hash=seed[1],
+                request_configs=configs,
+                kv_group=0,
+            )
+        sources = tuple(
+            prefix + [CheckpointPage(a, b, k) for a, b, k in suffix if a >= base]
+        )
+        return sources, checkpoint_group1_pages(database, sources, configs)
 
     @staticmethod
     def _assemble(

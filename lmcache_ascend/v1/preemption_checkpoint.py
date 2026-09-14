@@ -6,15 +6,9 @@ fragments are private until accepted token IDs arrive from EngineCore.
 """
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
-
-from lmcache_ascend.v1.local_checkpoint import (
-    CheckpointPage,
-    LocalCheckpoint,
-    LocalCheckpointStore,
-)
 import time
 
 from lmcache.integration.vllm.preemption_checkpoint import (
@@ -24,6 +18,13 @@ from lmcache.integration.vllm.preemption_checkpoint import (
 )
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 import torch
+
+from lmcache_ascend.v1.local_checkpoint import (
+    CheckpointPage,
+    LocalCheckpoint,
+    LocalCheckpointStore,
+    checkpoint_group1_pages,
+)
 
 
 def clear_failure_tracebacks(error: BaseException) -> None:
@@ -50,6 +51,11 @@ class CaptureJob:
     )
     plans: list[Any] = field(default_factory=list)
     prefix_sources: tuple[CheckpointPage, ...] = ()
+    index_sources: tuple[CheckpointPage, ...] = ()
+    source_owners: list[Any] = field(default_factory=list)
+    known_chunks: tuple[CheckpointPage, ...] = ()
+    key_seed: tuple[int, int | bytes] | None = None
+    reused_end: int = 0
     captured_end: int = 0
     future: Future | None = None
     cancelled: bool = False
@@ -105,6 +111,8 @@ class CheckpointWorker:
         caches: dict[int, list],
         block_size: int,
         prefix_state: Any = None,
+        *,
+        reuse_prefix: bool = True,
     ) -> None:
         """Take a private snapshot before the model runner can reuse source HBM."""
         key = (spec.req_id, spec.generation)
@@ -134,7 +142,14 @@ class CheckpointWorker:
                 and spec.base <= spec.resident_start <= spec.end
             ):
                 raise ValueError("Invalid checkpoint frontiers")
-            if prefix_state is not None and prefix_state.cached_keys:
+            start1, limit = spec.base, spec.end
+            if (
+                reuse_prefix
+                and getattr(prefix_state, "prepared_sparse_sources", {}).get(0)
+                is not None
+            ):
+                start1, limit = self._plan_prefix_reuse(job, prefix_state)
+            elif prefix_state is not None and prefix_state.cached_keys:
                 job.prefix_sources = tuple(
                     CheckpointPage(a, min(b, spec.resident_start), key.without_layer())
                     for a, b, key in zip(
@@ -145,17 +160,28 @@ class CheckpointWorker:
                     )
                     if b > spec.prefix_end and a < spec.resident_start
                 )
+            if limit <= spec.prefix_end:
+                raise MemoryError("No contiguous generated checkpoint prefix")
             for group in (0, 1):
-                start = spec.resident_start if group == 0 else spec.base
+                start = spec.resident_start if group == 0 else start1
                 blocks = spec.blocks[group]
-                if (spec.end + block_size - 1) // block_size > len(blocks) or any(
-                    blocks[i // block_size] <= 0 for i in range(start, spec.end)
+                if (
+                    job.reused_end != limit
+                    and start < limit
+                    and (
+                        (limit + block_size - 1) // block_size > len(blocks)
+                        or any(
+                            blocks[i // block_size] <= 0 for i in range(start, limit)
+                        )
+                    )
                 ):
                     raise ValueError("Checkpoint source includes released/null blocks")
-            cursor, reclaimed = spec.base, False
-            while cursor < spec.end:
+            cursor, reclaimed = start1, False
+            if job.reused_end == limit:
+                cursor = limit
+            while cursor < limit:
                 desired_end = min(
-                    spec.end, (cursor // self.chunk_size + 1) * self.chunk_size
+                    limit, (cursor // self.chunk_size + 1) * self.chunk_size
                 )
                 end = desired_end
                 while end > cursor:
@@ -205,6 +231,13 @@ class CheckpointWorker:
                     break
                 if end != desired_end:
                     break  # Keep one smaller tail; bound failed-allocation work.
+            if cursor <= job.reused_end:
+                # A failed replacement must not discard a usable old partial.
+                for fragments in job.fragments.values():
+                    for _, _, page, _ in fragments:
+                        page.ref_count_down()
+                job.fragments.clear()
+                cursor = job.reused_end
             if cursor <= spec.prefix_end:
                 raise MemoryError("Checkpoint CPU staging allocation refused")
             job.captured_end = cursor
@@ -247,7 +280,8 @@ class CheckpointWorker:
             enqueued_at = time.monotonic()
             # Both groups use one store stream. The last event covers the whole
             # capture. No layer/group payload is read by the host before this.
-            events[-1].synchronize()
+            if events:
+                events[-1].synchronize()
             captured_at = time.monotonic()
             job.plans.clear()
             self.jobs[key] = job
@@ -309,9 +343,26 @@ class CheckpointWorker:
         if self.engine.is_frozen():
             raise ValueError("checkpoint publication refused while cache is frozen")
         spec, end = job.spec, len(seal.tokens)
-        groups: list[list[CheckpointPage]] = [list(job.prefix_sources), []]
+        reuse_index = end <= job.reused_end
+        index_end = (
+            (end if reuse_index else job.fragments[1][0][0]) if job.index_sources else 0
+        )
+        groups = [
+            [
+                replace(p, end=min(p.end, end))
+                for p in job.prefix_sources
+                if p.start < end
+            ],
+            [
+                replace(p, end=min(p.end, end))
+                for p in job.index_sources
+                if p.start < index_end and (reuse_index or p.end <= index_end)
+            ],
+        ]
         keys, pages = [], []
         for group, fragments in job.fragments.items():
+            if group == 1 and reuse_index:
+                continue
             for start, stop, page, _ in fragments:
                 if start >= end:
                     continue
@@ -322,9 +373,10 @@ class CheckpointWorker:
         if job.cancelled:
             return 0
         # Later intervals enter LRU first, preserving useful leading coverage.
-        self.engine.checkpoint_backend().batched_submit_layer_pages(
-            keys[::-1], pages[::-1]
-        )
+        if keys:
+            self.engine.checkpoint_backend().batched_submit_layer_pages(
+                keys[::-1], pages[::-1]
+            )
         self.local.publish(
             spec.req_id,
             spec.generation,
@@ -332,8 +384,11 @@ class CheckpointWorker:
                 seal.tokens,
                 spec.prefix_end,
                 tuple(tuple(sorted(g, key=lambda p: p.start)) for g in groups),
+                job.known_chunks,
+                job.key_seed,
             ),
         )
+        self.local.touch(groups)
         job.publish_finished = time.monotonic()
         return end
 
@@ -417,6 +472,78 @@ class CheckpointWorker:
         self.executor.shutdown(wait=True)
         self.poll()
 
+    def _plan_prefix_reuse(self, job: CaptureJob, state: Any) -> tuple[int, int]:
+        """Borrow a paired CPU prefix; repair index holes only from resident HBM."""
+        spec, chunk = job.spec, self.chunk_size
+        generation = self.engine.shared_cpu_cache_generation
+        if (
+            state.req_id != spec.req_id
+            or not state.shared_request_active
+            or state.shared_generation != generation
+            or (state.pointer_cache_generation or state.shared_generation) != generation
+            or state.prepared_sparse_sources[0].total_tokens != state.token_count
+            or not state.indexer_npu_resident
+            or state.indexer_npu_materialization_pending
+        ):
+            raise ValueError("Invalid active checkpoint reuse state")
+        sources, known, cursor = [], [], 0
+        for start, end, key in zip(
+            state.cached_starts, state.cached_ends, state.cached_keys[0], strict=True
+        ):
+            if start != cursor or start % chunk or not 0 < end - start <= chunk:
+                raise ValueError("Invalid checkpoint source coverage")
+            cursor = end
+            source = CheckpointPage(start, end, key.without_layer())
+            if end == spec.base and end - start == chunk:
+                job.key_seed = end, source.key.chunk_hash
+            if (
+                start >= spec.base
+                and end <= spec.resident_start
+                and end - start == chunk
+            ):
+                known.append(source)
+            if end > spec.prefix_end and start < spec.resident_start:
+                sources.append(source)
+        if cursor != state.token_count or spec.resident_start > cursor:
+            raise ValueError("Checkpoint frontier exceeds its prepared source")
+        job.known_chunks = tuple(known)
+        backend = self.engine.checkpoint_backend()
+        limit = spec.end
+        for group, candidates in enumerate(
+            (
+                tuple(sources),
+                checkpoint_group1_pages(
+                    self.engine.token_database, tuple(sources), spec.request_configs
+                ),
+            )
+        ):
+            pages, count = (
+                backend.batched_get_layer_page_prefix([p.key for p in candidates])
+                if candidates
+                else ([], 0)
+            )
+            job.source_owners.extend(pages)
+            for source, page in zip(candidates[:count], pages, strict=True):
+                self.engine.validate_checkpoint_page(group, page)
+                if (
+                    not page.is_valid()
+                    or page.valid_tokens != source.end - source.start
+                ):
+                    raise ValueError("Invalid checkpoint reuse page length")
+            retained = tuple(
+                replace(p, end=min(p.end, spec.resident_start))
+                for p in candidates[:count]
+            )
+            if group == 0:
+                job.prefix_sources = retained
+                if count < len(candidates):
+                    limit = min(limit, max(spec.prefix_end, candidates[count].start))
+            else:
+                job.index_sources = retained
+                end = retained[-1].end if retained else spec.prefix_end
+        job.reused_end = min(end, limit)
+        return min(max(spec.base, end // chunk * chunk), limit), limit
+
     @staticmethod
     def _release(job: CaptureJob) -> None:
         if job.quarantined:
@@ -426,3 +553,6 @@ class CheckpointWorker:
                 page.ref_count_down()
         job.fragments.clear()
         job.plans.clear()
+        for page in job.source_owners:
+            page.ref_count_down()
+        job.source_owners.clear()

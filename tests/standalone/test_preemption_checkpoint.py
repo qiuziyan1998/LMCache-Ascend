@@ -111,6 +111,9 @@ class LocalCPU:
         self.pages = {}
         self.before_put = lambda: None
 
+    def try_touch_layer_pages(self, keys):
+        return True
+
     def batched_submit_layer_pages(self, keys, pages):
         self.before_put()
         for key, page in zip(keys, pages, strict=True):
@@ -153,6 +156,10 @@ class Key:
     end: int
     tokens: tuple
 
+    @property
+    def chunk_hash(self):
+        return self.tokens
+
     def split_layers(self, layers):
         return [self] * layers
 
@@ -176,7 +183,13 @@ def fake_engine():
     backend = LocalCPU()
     allocated, calls = [], []
 
-    def tokens(*, tokens, request_configs=None, kv_group=0):
+    def tokens(*, tokens=None, hashes=None, offsets=None, request_configs=None, kv_group=0):
+        if hashes is not None:
+            pos = 0
+            for h, count in zip(hashes, offsets, strict=True):
+                yield pos, pos + count, Key(kv_group, len(h) - count, len(h), h)
+                pos += count
+            return
         for start in range(0, len(tokens), 4):
             end = min(start + 4, len(tokens))
             yield start, end, Key(kv_group, start, end, tuple(tokens[:end]))

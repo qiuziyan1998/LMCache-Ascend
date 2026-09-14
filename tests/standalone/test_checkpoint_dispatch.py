@@ -136,8 +136,9 @@ def fixture():
         cancel=lambda *ids: calls.append(("cancel", ids)),
     )
 
-    def capture(spec, caches, block_size, prefix_state=None):
+    def capture(spec, caches, block_size, prefix_state=None, *, reuse_prefix=True):
         assert "drop-state" not in calls
+        worker.reuse_prefix = reuse_prefix
         calls.append("capture")
         worker.jobs[(spec.req_id, spec.generation)] = object()
 
@@ -170,8 +171,10 @@ def fixture():
     return impl, dynamic, multi, MultiMetadata, calls, replies, ns
 
 
-def test_actual_ascend_dynamic_mro_enters_capture_and_restores_idle_dispatch():
+@pytest.mark.parametrize("window", [0, 8])
+def test_actual_ascend_dynamic_mro_enters_capture_and_restores_idle_dispatch(window):
     impl, dynamic, multi, MultiMetadata, calls, replies, ns = fixture()
+    impl._decode_window_save_window_size = window
     assert type(dynamic).__mro__[1].__name__ == "LMCacheConnectorV1Dynamic"
     assert multi.supports_preemption_checkpoint
     worker = impl.lmcache_engine.checkpoint_worker
@@ -188,6 +191,7 @@ def test_actual_ascend_dynamic_mro_enters_capture_and_restores_idle_dispatch():
         preemption_captures=(capture,), preemption_seals=(), preemption_cancels=()
     )
     multi.handle_preemptions_with_metadata({"r"}, MultiMetadata(metadata))
+    assert worker.reuse_prefix is (window == 0)
     assert calls[:4] == ["drain", "direct-drain", "capture", "drop-state"]
     assert dynamic.metadata is None
     assert "start_load_kv" in impl.__dict__
