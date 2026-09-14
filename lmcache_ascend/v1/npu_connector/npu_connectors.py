@@ -5534,6 +5534,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     memory_objs,
                     deferred_dense_chunk_dev_ptrs,
                     deferred_dense_chunk_ptrs_npu,
+                    kv_group=kv_group,
                 )
                 assert chunk_offsets_npu is not None
                 assert chunk_sizes_npu is not None
