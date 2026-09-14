@@ -148,6 +148,37 @@ def assert_bytes(engine, end, base=4):
             assert torch.equal(engine.backend.pages[key].raw_data, expected.raw_data)
 
 
+def test_aligned_repeated_preemption_never_assembles_the_previous_cpu_tail(
+    api, monkeypatch, key_types
+):
+    engine, store, spec = setup_saved(api, monkeypatch, key_types)
+    monkeypatch.setattr(
+        store.local, "_assemble", lambda *a: pytest.fail("CPU assembly")
+    )
+    engine.load_checkpoint_prefix = lambda *a: pytest.fail("prompt-tail fetch")
+    restored = 13
+    for end in (19, 25, 30):
+        state = active_state(engine, restored)
+        start = restored // 4 * 4
+        old_tail = engine.backend.pages[state.cached_keys[0][-1].without_layer()]
+        store.cancel("r", spec.generation)
+        spec = replace(spec, generation=spec.generation + 1, resident_start=start,
+                       end=end, blocks=(tuple(range(1, (end + 3) // 4 + 1)),) * 2)
+        store.capture(spec, {0: [1], 1: [2]}, 4, state)
+        assert store.poll()[0].status == "captured"
+        job = store.jobs["r", spec.generation]
+        assert all(a >= start and a % 4 == 0 for a, _, _, _ in job.fragments[0])
+        assert all(page is not old_tail for page in job.source_owners)
+        store.seal(api[0].SealSpec("r", spec.generation, tuple(range(end))))
+        assert finish(store)[0].end == end
+        _, owners = store.local.normalize("r", spec.generation, list(range(end)), None)
+        assert_bytes(engine, end)
+        for page in owners:
+            page.ref_count_down()
+        restored = end
+    store.close()
+
+
 @pytest.mark.parametrize(
     "missing_start,expected_start", [(None, 12), (4, 4), (8, 8), (12, 12)]
 )

@@ -102,6 +102,7 @@ def fixture():
         {
             "LMCacheConnectorV1Dynamic": {
                 "supports_preemption_checkpoint",
+                "preemption_checkpoint_chunk_size",
                 "handle_preemptions",
                 "handle_preemptions_with_metadata",
                 "prepare_preemption_checkpoint",
@@ -120,6 +121,7 @@ def fixture():
         {
             "AscendMultiConnector": {
                 "supports_preemption_checkpoint",
+                "preemption_checkpoint_chunk_size",
                 "handle_preemptions_with_metadata",
                 "prepare_preemption_checkpoint",
             }
@@ -150,7 +152,7 @@ def fixture():
     engine.drop_direct_store_states = lambda ids: calls.append("drop-store")
     impl = ns["LMCacheAscendConnectorV1Impl"]()
     impl.lmcache_engine = engine
-    impl.config = NS(decode_preemption_checkpoint=True)
+    impl.config = NS(decode_preemption_checkpoint=True, chunk_size=1024)
     impl.store_async, impl.kv_role = True, "kv_both"
     impl._unfenced_live_stores = {}
     impl._block_size = 16
@@ -177,6 +179,8 @@ def test_actual_ascend_dynamic_mro_enters_capture_and_restores_idle_dispatch(win
     impl._decode_window_save_window_size = window
     assert type(dynamic).__mro__[1].__name__ == "LMCacheConnectorV1Dynamic"
     assert multi.supports_preemption_checkpoint
+    assert dynamic.preemption_checkpoint_chunk_size == 1024
+    assert multi.preemption_checkpoint_chunk_size == 1024
     worker = impl.lmcache_engine.checkpoint_worker
     worker.poll = lambda: pytest.fail("checkpoint polling in ordinary decode")
     for _ in range(20):

@@ -9765,6 +9765,48 @@ class AscendLMCacheEngine(LMCacheEngine):
             page.ref_count_down()
             raise
 
+    def load_checkpoint_resident_tail(
+        self, state: Any, slots: torch.Tensor, caches: list
+    ) -> Any:
+        """Restore one aligned latent boundary on the existing dense load stream.
+
+        The cold-load state owns the CPU pages until the caller's final readiness
+        event completes. Its ordinary failure path fences this stream on error.
+        """
+        count = len(slots)
+        chunks = len(state.cached_starts)
+        pointers = getattr(state, "cached_chunk_dev_ptrs", ()) or ()
+        if (
+            not 0 < count <= self.config.chunk_size
+            or not chunks
+            or len(state.cached_ends) != chunks
+            or state.cached_starts[-1] % self.config.chunk_size
+            or state.cached_ends[-1] - state.cached_starts[-1] != count
+            or len(state.cached_memory_objs) != self.num_layers
+            or any(len(row) != chunks for row in state.cached_memory_objs)
+        ):
+            raise ValueError("Resident checkpoint boundary has incomplete CPU coverage")
+        tail_pointers = (
+            [row[-1:] for row in pointers]
+            if len(pointers) == self.num_layers
+            and all(len(row) == chunks for row in pointers)
+            else None
+        )
+        readiness: list[Any] = []
+        consumer = self.gpu_connector.batched_to_gpu(
+            [0], [count], slot_mapping=slots, sync=True, kv_group=0,
+            kvcaches=caches, _dense_load_readiness_out=readiness,
+            cached_chunk_dev_ptrs=tail_pointers,
+        )
+        try:
+            next(consumer)
+            for row in state.cached_memory_objs:
+                consumer.send([row[-1]])
+            next(consumer)
+        finally:
+            consumer.close()
+        return readiness[0]
+
     def _lookup_remote_fill_two_group_prefix(
         self,
         chunks: list,

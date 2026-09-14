@@ -401,6 +401,30 @@ def test_local_restore_normalizes_boundary_and_rejected_speculative_tail(
     store.close()
 
 
+@pytest.mark.parametrize("end", [7, 11, 15])
+def test_aligned_capture_restores_without_prompt_fetch_or_cpu_assembly(
+    api, monkeypatch, end
+):
+    store, _, engine = start_capture(api, monkeypatch, prefix=3, resident=0, end=end)
+    store.poll()
+    publish(api, store, end)
+    monkeypatch.setattr(
+        store.local, "_assemble", lambda *a: pytest.fail("CPU tail assembly")
+    )
+    engine.load_checkpoint_prefix = lambda *a: pytest.fail("original prompt-tail fetch")
+    _, owners = store.local.normalize("r", 1, list(range(end)), None)
+    for group in (0, 1):
+        for start, stop, key in engine.token_database.process_tokens(
+            tokens=list(range(end)), kv_group=group
+        ):
+            expected = Page(2, stop - start, (2, 1) if group == 0 else (1,))
+            fill(expected, start, group)
+            assert torch.equal(engine.backend.pages[key].raw_data, expected.raw_data)
+    for page in owners:
+        page.ref_count_down()
+    store.close()
+
+
 def test_eviction_between_probe_and_acquire_refuses_restore_without_leaking(
     api, monkeypatch
 ):
