@@ -5542,13 +5542,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=kv_group,
                 )
             new_chunk_plan: Optional[list[tuple[int, int, Any]]] = (
+                # Full rebuilds already include the prefix in token_results.
                 [
                     (
                         int(cached_starts[index]),
                         int(cached_ends[index]),
                         cached_keys[0][index].chunk_hash,
                     )
-                    for index in range(len(cached_starts))
+                    for index in range(chunk_index_base)
                 ]
                 if sampled_worker_retrieve
                 and kv_group == 0
