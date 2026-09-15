@@ -72,6 +72,48 @@ def test_tail_growth_and_request_replacement_keep_addresses(transfer_module):
     assert addresses == (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "counts,total",
+    [([1], 1), ([256], 17), ([256, 1], 257), ([256, 255], 500), ([256, 256], 263)],
+)
+def test_bind_uses_device_pointer_arithmetic_without_count_upload(
+    transfer_module,
+    monkeypatch,
+    dtype,
+    counts,
+    total,
+):
+    module, _ = transfer_module
+    transfer = module.SparseGraphTransfer(
+        (
+            torch.zeros((2, 16, 1, 512), dtype=dtype),
+            torch.zeros((2, 16, 1, 64), dtype=dtype),
+        ),
+        torch.zeros((1, 4), dtype=torch.int64),
+        256,
+        1024,
+    )
+    source = make_source(
+        [2**55 + i * 1234567 for i in range(len(counts))], counts, total
+    )
+    expected = source.layers[0].chunk_ptrs_npu + torch.tensor(counts) * transfer.k_bytes
+    addresses = (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            module.torch,
+            "tensor",
+            Mock(side_effect=AssertionError("CPU count tensor upload")),
+        )
+        transfer.bind(source, 0)
+    torch.testing.assert_close(
+        transfer.ptrs[1, : len(counts)], expected, rtol=0, atol=0
+    )
+    assert transfer.valid_tokens.item() == total
+    assert transfer.ptrs[:, len(counts) :].eq(0).all()
+    assert addresses == (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
+
+
 def test_load_passes_live_inputs_once_without_tensor_preprocessing(transfer_module):
     module, calls = transfer_module
     transfer = make_transfer(module)

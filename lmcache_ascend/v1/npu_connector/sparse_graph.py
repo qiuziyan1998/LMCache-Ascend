@@ -116,13 +116,18 @@ class SparseGraphTransfer:
                 continue
             counts = source.chunk_token_counts
             layer = source.layers[layer_id]
-            count_tensor = torch.tensor(counts, dtype=torch.int64, device=self.device)
             start = lane * self.capacity
             end = start + len(counts)
             self.ptrs[0, start:end].copy_(layer.chunk_ptrs_npu)
-            self.ptrs[1, start:end].copy_(
-                layer.chunk_ptrs_npu + count_tensor * self.k_bytes
+            # Validation guarantees full physical chunks except possibly the tail.
+            torch.add(
+                layer.chunk_ptrs_npu, self.chunk_size * self.k_bytes,
+                out=self.ptrs[1, start:end],
             )
+            if counts[-1] != self.chunk_size:
+                self.ptrs[1, end - 1:end].add_(
+                    (counts[-1] - self.chunk_size) * self.k_bytes
+                )
             self.valid_tokens[lane].fill_(source.total_tokens)
 
     def load(
