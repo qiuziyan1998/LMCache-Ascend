@@ -69,3 +69,23 @@ def test_preimported_dynamic_wrapper_reaches_ascend_with_runtime_topology(monkey
         (LMCacheAscendConnectorV1Impl, topology, wrapper)
         for wrapper in (LMCacheConnectorV1Dynamic, LMCacheAscendConnectorV1Dynamic)
     ]
+
+
+def test_graph_entry_forwards_to_the_ascend_impl_with_exact_request_order(monkeypatch):
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import LMCacheAscendConnectorV1Impl
+    from lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1 import LMCacheAscendConnectorV1Dynamic
+
+    calls = []
+    sources = (object(), None, object())
+
+    def prepare(self, names, **kwargs):
+        calls.append((type(self), names, kwargs))
+        return sources
+
+    monkeypatch.setattr(LMCacheAscendConnectorV1Impl, "prepare_sparse_graph_step", prepare)
+    wrapper = object.__new__(LMCacheAscendConnectorV1Dynamic)
+    wrapper._lmcache_engine = object.__new__(LMCacheAscendConnectorV1Impl)
+    names, requests, frontiers = ("l0", "l1"), ("b", "empty", "a"), (4096, 0, 8192)
+    assert wrapper.prepare_sparse_graph_step(names, request_ids=requests, frontiers=frontiers) is sources
+    assert calls == [(LMCacheAscendConnectorV1Impl, names,
+                      dict(allow_empty=False, request_ids=requests, frontiers=frontiers))]
