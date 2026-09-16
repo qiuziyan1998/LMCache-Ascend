@@ -497,9 +497,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         # readback cannot hide whether that event was initially incomplete.
         self._pending_live_source_diagnostics: dict[str, dict[str, Any]] = {}
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
+        # close() also runs for synchronous stores and before lazy worker startup.
+        self._store_queue: Optional[queue.Queue] = None
+        self._store_worker_thread: Optional[threading.Thread] = None
         if self.is_store_async:
-            self._store_queue: Optional[queue.Queue] = None
-            self._store_worker_thread: Optional[threading.Thread] = None
             self._store_lock = threading.Lock()
             self._store_cv = threading.Condition(self._store_lock)
 
@@ -3704,6 +3705,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     break
 
+                # Flat MLA/DSA shapes encode elements, not a token dimension.
+                memory_obj.metadata.valid_tokens = num_tokens
                 starts.append(start)
                 ends.append(end)
                 keys.append(key)
@@ -5732,13 +5735,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group=kv_group,
                 )
             new_chunk_plan: Optional[list[tuple[int, int, Any]]] = (
+                # Full rebuilds already include the prefix in token_results.
                 [
                     (
                         int(cached_starts[index]),
                         int(cached_ends[index]),
                         cached_keys[0][index].chunk_hash,
                     )
-                    for index in range(len(cached_starts))
+                    for index in range(chunk_index_base)
                 ]
                 if sampled_worker_retrieve
                 and kv_group == 0
@@ -6222,6 +6226,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     fmt=memory_format,
                     busy_loop=force_store_wait,
                 )
+                if memory_objs_multi_layer is not None:
+                    # Legacy flat chunks (including page-allocation fallback)
+                    # need the logical count just like LayerPageMemoryObj does.
+                    for memory_obj in memory_objs_multi_layer:
+                        memory_obj.metadata.valid_tokens = num_tokens
 
             if memory_objs_multi_layer is None:
                 logger.warning(
@@ -7331,7 +7340,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**retrieve_kwargs)
         next(consumer)
         try:
-            for _ in prepared_source.layers:
+            start_layer = int(retrieve_kwargs.get("prepared_start_layer", 0))
+            if not 0 <= start_layer < len(prepared_source.layers):
+                raise ValueError("prepared_start_layer is outside the source")
+            for _ in prepared_source.layers[start_layer:]:
                 sparse_request = yield ret_mask
                 consumer.send(sparse_request)
             next(consumer)

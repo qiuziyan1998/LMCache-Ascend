@@ -328,6 +328,21 @@ def sparse_mla_dsa_batched_direct_kv_transfer_fast(
     )
 
 
+def sparse_graph_kv_transfer(
+    destination_state,
+    slots: torch.Tensor,
+    selected: torch.Tensor,
+    counts: torch.Tensor,
+    ptrs: torch.Tensor,
+    limits: torch.Tensor,
+    chunk_size: int,
+) -> None:
+    """Capture one two-plane copy; all request-dependent data stays on device."""
+    lmc_ops.sparse_graph_kv_transfer(
+        destination_state, slots, selected, counts, ptrs, limits, chunk_size
+    )
+
+
 def sparse_mla_dsa_batched_direct_kv_transfer_prepared(
     destination_state,
     slot_mapping_packed: torch.Tensor,

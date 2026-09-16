@@ -255,6 +255,12 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
     const bool lmc_host_interleaved, const bool validate_inputs = false,
     const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
+// Capture one bounds-aware K/PE copy using replay-time device source tables.
+void sparse_graph_kv_transfer(
+    const SparseDirectDestinationState &state,
+    torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
+    torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size);
+
 // Prepared warm path: destination state is process-owned; all request and step
 // inputs are supplied by the decode generator at launch time.
 void sparse_mla_dsa_batched_direct_kv_transfer_prepared(

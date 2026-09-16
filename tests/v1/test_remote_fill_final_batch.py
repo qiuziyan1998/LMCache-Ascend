@@ -121,6 +121,7 @@ def fixture(
         "fixture",
         SimpleNamespace(
             num_layers=layers,
+            num_layers_for_group=lambda group: layers,
             group=lambda group: SimpleNamespace(
                 expected_bytes=lambda tokens, layers: tokens * byte_width[group]
             ),

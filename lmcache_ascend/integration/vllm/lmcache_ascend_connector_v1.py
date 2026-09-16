@@ -25,6 +25,7 @@ else:
 
 # Third Party
 from lmcache.integration.vllm.lmcache_connector_v1 import LMCacheConnectorV1Dynamic
+from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 
 logger = init_logger(__name__)
 
@@ -69,6 +70,22 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             transfer.kv_connector_extra_config = extra
         super().__init__(
             vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
+        )
+
+    def prepare_sparse_graph_step(
+        self,
+        target_layer_names: tuple[str, ...],
+        *,
+        allow_empty: bool = False,
+        request_ids: tuple[str, ...] | None = None,
+        frontiers: tuple[int, ...] | None = None,
+    ) -> PreparedSparseSource | None | tuple[PreparedSparseSource | None, ...]:
+        """Prepare and lease graph sources, leaving MTP draft loads independent."""
+        return self._lmcache_engine.prepare_sparse_graph_step(
+            target_layer_names,
+            allow_empty=allow_empty,
+            request_ids=request_ids,
+            frontiers=frontiers,
         )
 
     def capture_live_source_event_handoff(self, forward_context: Any) -> bool:

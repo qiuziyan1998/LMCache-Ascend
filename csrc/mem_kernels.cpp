@@ -1,9 +1,11 @@
 #include "mem_kernels.h"
+#include "graph/sparse_graph_kernel.h"
 #include "common/slow_path_diagnostics.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <memory>
@@ -744,6 +746,79 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
         config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
         total_tokens_i, lmc_host_interleaved, counts_ptr, row_width,
         request_count, selected_count_stride);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void sparse_graph_kv_transfer(
+    const SparseDirectDestinationState &state,
+    torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
+    torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size) {
+  // Host metadata checks run at eager warmup/capture only, never on replay.
+  TORCH_CHECK(selected.dim() == 2 && selected.is_contiguous(),
+              "Graph selected tokens must be a contiguous matrix");
+  TORCH_CHECK(slots.sizes() == selected.sizes() && slots.is_contiguous(),
+              "Graph slots must match selected tokens");
+  TORCH_CHECK(selected.scalar_type() == at::kInt || selected.scalar_type() == at::kLong,
+              "Graph selected tokens must be int32/int64");
+  TORCH_CHECK(slots.scalar_type() == at::kInt || slots.scalar_type() == at::kLong,
+              "Graph slots must be int32/int64");
+  const int64_t requests = selected.size(0);
+  TORCH_CHECK(requests > 0 && selected.size(1) > 0 &&
+                  selected.numel() <= std::numeric_limits<int32_t>::max(),
+              "Graph payload exceeds int32 packed addressing");
+  TORCH_CHECK((counts.dim() == 1 || (counts.dim() == 2 && counts.size(1) > 0)) &&
+                  counts.size(0) == requests && counts.scalar_type() == at::kInt &&
+                  counts.stride(0) > 0 && counts.stride(0) <= std::numeric_limits<int32_t>::max(),
+              "Graph counts must have one int32 count per row");
+  TORCH_CHECK(limits.numel() == requests && limits.is_contiguous() &&
+                  limits.scalar_type() == at::kInt,
+              "Graph limits must have one contiguous int32 value per row");
+  TORCH_CHECK(ptrs.dim() == 2 && ptrs.size(0) == 2 && ptrs.size(1) > 0 &&
+                  ptrs.size(1) % requests == 0 && ptrs.is_contiguous() &&
+                  ptrs.scalar_type() == at::kLong,
+              "Graph sources must be two contiguous int64 plane tables");
+  TORCH_CHECK(chunk_size > 0 && chunk_size <= std::numeric_limits<int32_t>::max() &&
+                  ptrs.size(1) <= std::numeric_limits<int32_t>::max() / chunk_size,
+              "Graph source capacity exceeds int32 token addressing");
+  TORCH_CHECK(state.scalar_type_num == kvcache_ops::AscendType::FP16 ||
+                  state.scalar_type_num == kvcache_ops::AscendType::BF16,
+              "Graph KV transfer supports FP16/BF16");
+  const int64_t k_bytes = state.k_hidden_dims * 2;
+  const int64_t pe_bytes = state.v_hidden_dims * 2;
+  TORCH_CHECK(state.vllm_k_ptr && state.vllm_v_ptr && k_bytes > 0 && pe_bytes > 0 &&
+                  k_bytes % 32 == 0 && pe_bytes % 32 == 0 &&
+                  k_bytes <= 16384 && pe_bytes <= 16384,
+              "Graph K/PE token widths must be 32-byte aligned and fit copy queues");
+  TORCH_CHECK(selected.device().is_privateuseone() && slots.device() == selected.device() &&
+                  counts.device() == selected.device() && ptrs.device() == selected.device() &&
+                  limits.device() == selected.device(),
+              "Graph transfer inputs must be on the same NPU");
+  const c10::OptionalDeviceGuard guard(device_of(selected));
+  const uint32_t cores = direct_aiv_num(static_cast<int32_t>(selected.numel()));
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  auto *slot_ptr = static_cast<uint8_t *>(slots.data_ptr());
+  auto *selected_ptr = static_cast<uint8_t *>(selected.data_ptr());
+  auto *counts_ptr = static_cast<uint8_t *>(counts.data_ptr());
+  auto *ptr_table = static_cast<uint8_t *>(ptrs.data_ptr());
+  auto *limit_ptr = static_cast<uint8_t *>(limits.data_ptr());
+  const bool index64 = selected.scalar_type() == at::kLong;
+  const bool slot64 = slots.scalar_type() == at::kLong;
+  const int32_t chunks_per_request = ptrs.size(1) / requests;
+  const int32_t row_width = selected.size(1);
+  const int32_t count_stride = counts.stride(0);
+  const int64_t destination_slots = std::min(state.vllm_k_bytes / k_bytes,
+                                            state.vllm_v_bytes / pe_bytes);
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_graph_kv_transfer");
+  cmd.SetCustomHandler([=]() -> int {
+    lmc::launch_sparse_graph_transfer(
+        cores, stream, index64, slot64, state.vllm_k_ptr, state.vllm_v_ptr,
+        slot_ptr, selected_ptr, counts_ptr, ptr_table, limit_ptr,
+        static_cast<int32_t>(chunk_size), chunks_per_request,
+        static_cast<int32_t>(requests), row_width, count_stride,
+        static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots);
     return 0;
   });
   cmd.Run();
