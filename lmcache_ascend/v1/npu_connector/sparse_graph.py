@@ -99,33 +99,80 @@ class SparseGraphTransfer:
         if layer.chunk_ptrs_npu.device != self.device:
             raise ValueError("Source pointer table is on the wrong device")
 
+    def plan_bind_update(
+        self,
+        sources: Sequence[PreparedSparseSource | None],
+        changed_lanes: tuple[int, ...],
+    ) -> tuple[int, ...] | None:
+        """Choose fewer tensor writes; None preserves the full-bind path."""
+        if not changed_lanes:
+            return ()
+        full_cost = 2  # Whole pointer and limit clears.
+        lane_costs = []
+        for source in sources:
+            if source is None:
+                lane_costs.append(2)
+                continue
+            counts = source.chunk_token_counts
+            if not counts:
+                return None  # Let normal validation report malformed geometry.
+            writes = 3 + int(counts[-1] != self.chunk_size)
+            full_cost += writes
+            lane_costs.append(writes + int(len(counts) < self.capacity))
+        cost = sum(lane_costs[i] if i < len(lane_costs) else 2 for i in changed_lanes)
+        return changed_lanes if cost < full_cost else None
+
     def bind_batch(
-        self, sources: Sequence[PreparedSparseSource | None], layer_id: int
+        self,
+        sources: Sequence[PreparedSparseSource | None],
+        layer_id: int,
+        *,
+        lanes: tuple[int, ...] | None = None,
     ) -> None:
         """Bind ordered request lanes; None and padded lanes cannot transfer KV."""
         if len(sources) > self.request_capacity:
             raise ValueError("Graph sources exceed request capacity")
-        # Validate every lane before overwriting any captured state.
-        for source in sources:
+        if lanes is not None and (
+            len(set(lanes)) != len(lanes)
+            or any(
+                not isinstance(i, int) or not 0 <= i < self.request_capacity
+                for i in lanes
+            )
+        ):
+            raise ValueError("Invalid or duplicate graph source lane")
+        selected = range(len(sources)) if lanes is None else lanes
+        # Validate all affected lanes before overwriting this layer's state.
+        for lane in selected:
+            source = sources[lane] if lane < len(sources) else None
             if source is not None:
                 self._validate_source(source, layer_id)
-        self.ptrs.zero_()
-        self.valid_tokens.zero_()
-        for lane, source in enumerate(sources):
+        if lanes is None:
+            self.ptrs.zero_()
+            self.valid_tokens.zero_()
+        for lane in selected:
+            source = sources[lane] if lane < len(sources) else None
             if source is None:
+                if lanes is not None:
+                    self.ptrs[
+                        :, lane * self.capacity : (lane + 1) * self.capacity
+                    ].zero_()
+                    self.valid_tokens[lane].zero_()
                 continue
             counts = source.chunk_token_counts
             layer = source.layers[layer_id]
             start = lane * self.capacity
             end = start + len(counts)
+            if lanes is not None and len(counts) < self.capacity:
+                self.ptrs[:, end : start + self.capacity].zero_()
             self.ptrs[0, start:end].copy_(layer.chunk_ptrs_npu)
             # Validation guarantees full physical chunks except possibly the tail.
             torch.add(
-                layer.chunk_ptrs_npu, self.chunk_size * self.k_bytes,
+                layer.chunk_ptrs_npu,
+                self.chunk_size * self.k_bytes,
                 out=self.ptrs[1, start:end],
             )
             if counts[-1] != self.chunk_size:
-                self.ptrs[1, end - 1:end].add_(
+                self.ptrs[1, end - 1 : end].add_(
                     (counts[-1] - self.chunk_size) * self.k_bytes
                 )
             self.valid_tokens[lane].fill_(source.total_tokens)

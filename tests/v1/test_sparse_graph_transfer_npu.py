@@ -17,6 +17,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("incremental", [False, True])
 @pytest.mark.parametrize("request_capacity", [1, 4, 16])
 @pytest.mark.parametrize(
     "payload",
@@ -28,7 +29,7 @@ pytestmark = pytest.mark.skipif(
     ],
 )
 def test_one_capture_replays_live_topk_and_growing_cpu_history(
-    request_capacity, payload
+    request_capacity, payload, incremental
 ):
     from lmcache.v1.gpu_connector.sparse import (
         PreparedSparseSource,
@@ -121,14 +122,29 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
             selected = torch.topk(scores, 4).indices.to(selected_dtype)
             transfer.load(selected, counts, slots)
         addresses = (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
+        previous = None
+        lane_cases = [cases[0]] * request_capacity
         for step in range(len(cases)):
-            lane_cases = [
-                cases[(step + lane) % len(cases)] for lane in range(request_capacity)
-            ]
+            if incremental:
+                lane_cases[step % max(1, request_capacity - 1)] = cases[step]
+            else:
+                lane_cases = [
+                    cases[(step + lane) % len(cases)]
+                    for lane in range(request_capacity)
+                ]
             sources = [case[0] for case in lane_cases]
             if request_capacity > 1:
                 sources[-1] = None
-            transfer.bind_batch(sources, 0)
+            lanes = None
+            if incremental and previous is not None:
+                changed = tuple(
+                    i
+                    for i, (old, new) in enumerate(zip(previous, sources, strict=True))
+                    if old is not new
+                )
+                lanes = transfer.plan_bind_update(sources, changed)
+            transfer.bind_batch(sources, 0, lanes=lanes)
+            previous = tuple(sources)
             scores.fill_(-1000)
             for lane, (_, tokens, _) in enumerate(lane_cases):
                 for rank, token in enumerate(tokens):

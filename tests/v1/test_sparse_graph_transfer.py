@@ -49,12 +49,13 @@ def make_source(ptrs, counts, total=None):
     )
 
 
-def make_transfer(module):
+def make_transfer(module, capacity=1):
     return module.SparseGraphTransfer(
         (torch.zeros((2, 16, 1, 512)), torch.zeros((2, 16, 1, 64))),
-        torch.zeros((1, 4), dtype=torch.int64),
+        torch.zeros((capacity, 4), dtype=torch.int64),
         256,
         1024,
+        request_capacity=capacity,
     )
 
 
@@ -232,3 +233,129 @@ def test_batch_lanes_never_read_another_request_or_padding(transfer_module, capa
     transfer.clear_source()
     transfer.load(selected, counts, slots)
     assert calls[-1][5].eq(0).all()
+
+
+@pytest.mark.parametrize("capacity", [1, 4, 16])
+def test_incremental_tables_match_full_binding_through_transitions(
+    transfer_module, capacity
+):
+    import random
+
+    module, _ = transfer_module
+    full, delta = make_transfer(module, capacity), make_transfer(module, capacity)
+    addresses = delta.ptrs.data_ptr(), delta.valid_tokens.data_ptr()
+    rng = random.Random(918)
+    previous, sources = None, []
+    used_delta = False
+    for step in range(100):
+        if not sources or rng.random() < 0.25:
+            sources = [None] * rng.randrange(capacity + 1)
+        elif rng.random() < 0.3:
+            rng.shuffle(sources)
+        if sources:
+            lane = rng.randrange(len(sources))
+            count = rng.randrange(1, 5)
+            sources[lane] = (
+                None
+                if rng.random() < 0.2
+                else make_source(
+                    [10000 * (step + 1) + i * 1000 for i in range(count)],
+                    [256] * (count - 1) + [rng.randrange(1, 257)],
+                )
+            )
+        full.bind_batch(sources, 0)
+        lanes = (
+            None
+            if previous is None
+            else tuple(
+                i
+                for i in range(max(len(previous), len(sources)))
+                if (previous[i] if i < len(previous) else None)
+                is not (sources[i] if i < len(sources) else None)
+            )
+        )
+        selected = None if lanes is None else delta.plan_bind_update(sources, lanes)
+        used_delta |= selected is not None
+        delta.bind_batch(sources, 0, lanes=selected)
+        torch.testing.assert_close(delta.ptrs, full.ptrs, rtol=0, atol=0)
+        torch.testing.assert_close(
+            delta.valid_tokens, full.valid_tokens, rtol=0, atol=0
+        )
+        assert addresses == (delta.ptrs.data_ptr(), delta.valid_tokens.data_ptr())
+        previous = tuple(sources)
+    assert used_delta
+
+
+@pytest.mark.parametrize("lanes", [(-1,), (4,), (1, 1), ("0",)])
+def test_bad_delta_lanes_fail_before_writing(transfer_module, lanes):
+    module, _ = transfer_module
+    transfer = make_transfer(module, 4)
+    transfer.ptrs.fill_(77)
+    transfer.valid_tokens.fill_(33)
+    with pytest.raises(ValueError, match="lane"):
+        transfer.bind_batch([], 0, lanes=lanes)
+    assert torch.all(transfer.ptrs == 77) and torch.all(transfer.valid_tokens == 33)
+
+
+def test_delta_plan_avoids_more_writes_and_preserves_unchanged_lanes(transfer_module):
+    module, _ = transfer_module
+    transfer = make_transfer(module, 4)
+    sources = [make_source([1000 + i], [256]) for i in range(4)]
+    transfer.bind_batch(sources, 0)
+    old = transfer.ptrs.clone()
+    sources[1] = make_source([9000, 10000], [256, 17])
+    assert transfer.plan_bind_update(sources, (1,)) == (1,)
+    assert transfer.plan_bind_update(sources, (0, 1, 2, 3)) is None
+    transfer.bind_batch(sources, 0, lanes=(1,))
+    assert torch.equal(old[:, :4], transfer.ptrs[:, :4])
+    assert torch.equal(old[:, 8:], transfer.ptrs[:, 8:])
+    sources[1] = None
+    transfer.bind_batch(sources, 0, lanes=(1,))
+    assert transfer.ptrs[:, 4:8].eq(0).all() and transfer.valid_tokens[1] == 0
+    assert transfer.plan_bind_update(sources, ()) == ()
+
+
+def test_delta_validates_all_affected_sources_before_clearing(transfer_module):
+    module, _ = transfer_module
+    transfer = make_transfer(module, 4)
+    transfer.ptrs.fill_(77)
+    with pytest.raises(ValueError, match="bounded chunk prefix"):
+        transfer.bind_batch(
+            [None, make_source([1000, 2000], [17, 256])], 0, lanes=(0, 1)
+        )
+    assert transfer.ptrs.eq(77).all()
+
+
+def test_single_lane_update_reduces_table_write_dispatches(transfer_module):
+    from collections import Counter
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    module, _ = transfer_module
+    transfer = make_transfer(module, 16)
+    sources = [
+        make_source([1000 + i * 100 + j for j in range(4)], [256] * 4)
+        for i in range(16)
+    ]
+    operations = Counter()
+
+    class Writes(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if str(func) in {
+                "aten.zero_.default",
+                "aten.copy_.default",
+                "aten.add.out",
+                "aten.fill_.Scalar",
+            }:
+                operations[str(func)] += 1
+            return func(*args, **(kwargs or {}))
+
+    with Writes():
+        transfer.bind_batch(sources, 0)
+    assert sum(operations.values()) == 50
+    sources[3] = make_source([9000, 10000, 11000, 12000], [256] * 4)
+    lanes = transfer.plan_bind_update(sources, (3,))
+    assert lanes == (3,)
+    operations.clear()
+    with Writes():
+        transfer.bind_batch(sources, 0, lanes=lanes)
+    assert sum(operations.values()) == 3
