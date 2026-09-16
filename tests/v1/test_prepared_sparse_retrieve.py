@@ -100,8 +100,27 @@ def test_prepared_sparse_retrieve_uses_source_token_count() -> None:
 def test_dense_store_prepares_sparse_pointer_cache_without_shared_cpu() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     calls = []
+
+    def append_ptrs(
+        layer_id,
+        new_sources,
+        cached_chunk_dev_ptrs,
+        cached_chunk_ptrs_npu,
+        *,
+        kv_group,
+    ):
+        calls.append(
+            (
+                layer_id,
+                new_sources,
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+                kv_group,
+            )
+        )
+
     engine.gpu_connector = SimpleNamespace(
-        append_sparse_chunk_ptr_cache_for_layer=(lambda *args: calls.append(args))
+        append_sparse_chunk_ptr_cache_for_layer=append_ptrs
     )
     tensor = torch.zeros(4)
     cached_tensors = []
@@ -114,6 +133,7 @@ def test_dense_store_prepares_sparse_pointer_cache_without_shared_cpu() -> None:
         cached_tensors,
         cached_chunk_dev_ptrs,
         cached_chunk_ptrs_npu,
+        kv_group=1,
     )
 
     assert len(calls) == 1
@@ -121,3 +141,4 @@ def test_dense_store_prepares_sparse_pointer_cache_without_shared_cpu() -> None:
     assert calls[0][1][0] is tensor
     assert calls[0][2] is cached_chunk_dev_ptrs
     assert calls[0][3] is cached_chunk_ptrs_npu
+    assert calls[0][4] == 1

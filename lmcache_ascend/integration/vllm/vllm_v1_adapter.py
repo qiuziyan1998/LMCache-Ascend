@@ -37,6 +37,7 @@ from lmcache_ascend.v1.remote_fill_producer import parse_remote_fill_handoff
 
 if TYPE_CHECKING:
     # Third Party
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -213,9 +214,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
-        super().__init__(vllm_config, role, parent)
+        super().__init__(
+            vllm_config,
+            role,
+            parent,
+            **(
+                {"kv_cache_config": kv_cache_config}
+                if kv_cache_config is not None
+                else {}
+            ),
+        )
         checkpoint_worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
         if checkpoint_worker is not None:
             checkpoint_worker.configure_capacity(self._decode_window_save_window_size, self._lmcache_chunk_size)

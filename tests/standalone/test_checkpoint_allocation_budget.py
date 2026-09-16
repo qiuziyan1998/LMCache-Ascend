@@ -45,6 +45,8 @@ def engine_fixture(address_manager):
     )
     obj = NS(
         num_layers=2,
+        _num_layers_for_kv_group=lambda group: 2,
+        metadata=NS(runtime_kv_group_layer_counts=None),
         save_only_first_rank=True,
         save_indexer_only_first_rank=True,
         _shared_local_cpu_backend=lambda: local,

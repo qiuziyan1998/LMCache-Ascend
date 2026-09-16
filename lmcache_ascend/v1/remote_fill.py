@@ -27,6 +27,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.mooncake_layout import (
     MOONCAKE_VALID_TOKENS_TAG,
     mooncake_valid_tokens,
@@ -254,6 +255,17 @@ class RemoteFillDecoderLayout:
     chunk_size: int
     num_layers: int
     groups: tuple[RemoteFillGroupLayout, RemoteFillGroupLayout]
+    group_layer_counts: tuple[int, int] | None = None
+
+    def num_layers_for_group(self, kv_group: int) -> int:
+        """Return the trusted physical row count of one group."""
+        if kv_group not in (0, 1):
+            raise ValueError(f"Invalid KV group: {kv_group}")
+        return (
+            self.num_layers
+            if self.group_layer_counts is None
+            else self.group_layer_counts[kv_group]
+        )
 
     def group(self, kv_group: int) -> RemoteFillGroupLayout:
         """Return layout for ``kv_group``.
@@ -390,6 +402,11 @@ def build_decoder_layout(
         raise ValueError("remote-fill layout identity must not be empty")
     if num_layers <= 0:
         raise ValueError("remote-fill layer count must be positive")
+    counts = getattr(metadata, "runtime_kv_group_layer_counts", None)
+    if counts is not None:
+        counts = validate_two_group_layer_counts(counts)
+        if counts[0] != num_layers:
+            raise ValueError("RemoteFill latent layers disagree with runtime topology")
     dtypes = metadata.get_dtypes()
     group0_dtype = dtypes[0] if dtypes else metadata.kv_dtype
     group1_dtype = dtypes[1] if len(dtypes) > 1 else group0_dtype
@@ -411,6 +428,7 @@ def build_decoder_layout(
         ),
         chunk_size=int(config.chunk_size),
         num_layers=num_layers,
+        group_layer_counts=counts,
         groups=(
             RemoteFillGroupLayout(
                 kv_group=0,
@@ -743,7 +761,7 @@ class AscendRemoteFillPageLifecycle:
                     [group_layout.full_shape(self._layout.chunk_size)],
                     [group_layout.dtype],
                     len(indices),
-                    self._layout.num_layers,
+                    self._layout.num_layers_for_group(kv_group),
                     group_layout.fmt,
                     busy_loop=False,
                     valid_tokens=[pages[index].valid_tokens for index in indices],
@@ -1072,7 +1090,7 @@ class AscendRemoteFillPageLifecycle:
             raise ValueError("remote-fill page key world size mismatch")
         if page.destination_tp_rank != 0:
             raise ValueError("remote-fill destination TP rank must be zero")
-        if page.layer_count != self._layout.num_layers:
+        if page.layer_count != self._layout.num_layers_for_group(page.kv_group):
             raise ValueError("remote-fill page layer count mismatch")
         if page.layout_tag != self._layout.layout_tag:
             raise ValueError("remote-fill page layout tag mismatch")
@@ -1091,7 +1109,7 @@ class AscendRemoteFillPageLifecycle:
             raise ValueError("remote-fill page key dtype mismatch")
         expected_bytes = group.expected_bytes(
             page.valid_tokens,
-            self._layout.num_layers,
+            self._layout.num_layers_for_group(page.kv_group),
         )
         if page.expected_bytes != expected_bytes:
             raise ValueError("remote-fill page expected byte count mismatch")
@@ -1552,6 +1570,7 @@ def create_decoder_remote_fill_runtime(
         descriptor_verification_capability
     )
     state = RemoteFillStateCore(
+        group_layer_counts=layout.group_layer_counts,
         destination_engine_epoch=destination_engine_epoch,
         shared_cache_generation=shared_cache_generation,
         descriptor_verification_key=verification_capability,

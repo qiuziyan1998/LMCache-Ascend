@@ -39,6 +39,11 @@ issues = "https://github.com/LMCache/LMCache-Ascend"
 
 [tool.setuptools_scm]
 version_file = "lmcache_ascend/_version.py"
+# Ignore benchmark/checkpoint tags before SCM version parsing.
+git_describe_command = [
+    "git", "describe", "--dirty", "--tags", "--long",
+    "--match", "v[0-9]*.[0-9]*", "--match", "[0-9]*.[0-9]*",
+]
 # do not include +gREV local version, required for Test PyPI upload
 local_scheme = "no-local-version"
 
