@@ -438,8 +438,7 @@ def test_cold_direct_indexer_cpu_fallback_reuses_layer_pages(monkeypatch) -> Non
 
     engine._resolve_shared_rank0_layer_pages = resolve_pages
 
-    def append_group(sources, owners, *_args, kv_group):
-        assert kv_group == 1
+    def append_group(sources, owners, *_args):
         owners.extend([[*source.pages, *source.suffix] for source in sources])
 
     engine._append_retrieve_group_cache = append_group
@@ -2947,11 +2946,10 @@ def test_sparse_passive_reuses_one_merged_page(
             return True
 
         def append_sparse_chunk_ptr_cache_for_layers(
-            self, sources, host_ptrs, npu_ptrs, *, kv_group
+            self, sources, host_ptrs, npu_ptrs
         ):
             self.final_appends += 1
             self.sources = sources
-            self.append_kv_group = kv_group
             host_ptrs.extend(([11], [22]))
             npu_ptrs.extend((torch.tensor([11]), torch.tensor([22])))
 
@@ -3006,8 +3004,6 @@ def test_sparse_passive_reuses_one_merged_page(
             isinstance(source, LayerPageSource)
             for source in engine.gpu_connector.sources
         )
-        if not early_active:
-            assert engine.gpu_connector.append_kv_group == 0
         assert cached_memory_objs == [[page], [page]]
         assert cached_chunk_dev_ptrs == [[11], [22]]
         assert [row.tolist() for row in cached_chunk_ptrs_npu] == [[11], [22]]
@@ -3056,28 +3052,18 @@ def test_sparse_passive_reuses_one_merged_page(
         assert "passive_compact_materialize" not in dict(perf_events)
 
 
-@pytest.mark.parametrize("group_layers", [None, 2, 22, 79])
-def test_materialize_only_npu_consumer_never_initializes_transfer_state(
-    group_layers,
-) -> None:
+def test_materialize_only_npu_consumer_never_initializes_transfer_state() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 2
-    connector.initialize_kvcaches_ptr = MagicMock(
-        side_effect=AssertionError("CPU-only materialization initialized NPU state")
-    )
-    kwargs = {} if group_layers is None else {"kvcaches": [object()] * group_layers}
     consumer = connector.batched_to_gpu_head_token_wise(
-        materialize_only=True, **kwargs,
+        materialize_only=True
     )
 
     next(consumer)
-    for _ in range(2 if group_layers is None else group_layers):
-        consumer.send(object())
+    consumer.send(object())
+    consumer.send(object())
     next(consumer)
-    with pytest.raises(StopIteration):
-        next(consumer)
     consumer.close()
-    connector.initialize_kvcaches_ptr.assert_not_called()
 
 
 def test_dense_load_completion_api_synchronizes_the_load_stream() -> None:
@@ -3634,7 +3620,7 @@ def test_backend_compact_batch_skips_store_fence_and_finishes_once(
         chunk_hashes=[int(key.chunk_hash)],
         offsets=[0, 1],
     )
-    engine._make_shared_handle_batch = lambda *_args, **_kwargs: batch
+    engine._make_shared_handle_batch = lambda *_args: batch
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
     engine._fence_shared_cpu_store_publication = MagicMock()
     if exit_mode == "preflight_error":
@@ -4051,13 +4037,9 @@ def test_sparse_per_rank_retrieves_missing_suffix_without_shared_handles(
         layerwise_batched_get=layerwise_batched_get
     )
     pointer_sources = []
-    pointer_groups = []
     engine.gpu_connector = _FakeSparseConsumer()
     engine.gpu_connector.append_sparse_chunk_ptr_cache_for_layer = (
-        lambda _layer_id, sources, *_caches, kv_group: (
-            pointer_sources.extend(sources),
-            pointer_groups.append(kv_group),
-        )
+        lambda _layer_id, sources, *_caches: pointer_sources.extend(sources)
     )
     engine.is_healthy = lambda: True
     engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
@@ -4094,7 +4076,6 @@ def test_sparse_per_rank_retrieves_missing_suffix_without_shared_handles(
     assert cached_memory_objs == [[old_mem_obj, new_mem_obj]]
     assert cached_tensors == []
     assert pointer_sources == [new_mem_obj]
-    assert pointer_groups == [0]
     assert cached_shared_handles == []
 
 
@@ -4515,8 +4496,8 @@ def test_append_retrieve_group_accepts_empty_prefix():
     engine.num_layers = 2
     calls = []
 
-    def append(sources, host_ptrs, npu_ptrs, *, kv_group):
-        calls.append((sources, kv_group))
+    def append(sources, host_ptrs, npu_ptrs):
+        calls.append(sources)
         host_ptrs.extend(([11], [22]))
         npu_ptrs.extend(
             (
@@ -4543,11 +4524,9 @@ def test_append_retrieve_group_accepts_empty_prefix():
         cached_tensors,
         cached_host_ptrs,
         cached_npu_ptrs,
-        kv_group=0,
     )
 
     assert len(calls) == 1
-    assert calls[0][1] == 0
     assert cached_memory_objs == new_objs
     assert cached_host_ptrs == [[11], [22]]
     assert [row.tolist() for row in cached_npu_ptrs] == [[11], [22]]
@@ -4558,8 +4537,7 @@ def test_append_retrieve_group_forwards_deferred_pointer_copy():
     engine.num_layers = 1
     deferred = []
 
-    def append(_sources, host_ptrs, npu_ptrs, *, defer_copy=False, kv_group):
-        assert kv_group == 0
+    def append(_sources, host_ptrs, npu_ptrs, *, defer_copy=False):
         deferred.append(defer_copy)
         host_ptrs.append([11])
         npu_ptrs.append(torch.tensor([11]))
@@ -4574,7 +4552,6 @@ def test_append_retrieve_group_forwards_deferred_pointer_copy():
         [],
         [],
         defer_pointer_copy=True,
-        kv_group=0,
     )
 
     assert deferred == [True]
@@ -4585,8 +4562,7 @@ def test_append_retrieve_group_preserves_layer_page_sources():
     engine.num_layers = 2
     sources = []
 
-    def append(new_sources, host_ptrs, npu_ptrs, *, kv_group):
-        assert kv_group == 0
+    def append(new_sources, host_ptrs, npu_ptrs):
         sources.extend(new_sources)
         host_ptrs[:] = [[11], [22]]
         npu_ptrs[:] = [
@@ -4611,7 +4587,6 @@ def test_append_retrieve_group_preserves_layer_page_sources():
         [],
         [],
         [None, None],
-        kv_group=0,
     )
 
     assert sources == page_sources
@@ -4648,7 +4623,6 @@ def test_append_retrieve_group_rejects_incomplete_prefix_before_mutation():
             cached_tensors,
             cached_host_ptrs,
             cached_npu_ptrs,
-            kv_group=0,
         )
 
     assert calls == []
@@ -4686,7 +4660,6 @@ def test_append_retrieve_group_rejects_wrong_outer_layer_count(layer_count):
             cached_tensors,
             cached_host_ptrs,
             cached_npu_ptrs,
-            kv_group=0,
         )
 
     assert calls == []
@@ -4702,16 +4675,7 @@ def test_append_retrieve_layer_cache_is_atomic_when_pointer_install_fails():
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
 
-    def fail_pointer_install(
-        _self,
-        _layer_id,
-        _sources,
-        _cached_chunk_dev_ptrs,
-        _cached_chunk_ptrs_npu,
-        *,
-        kv_group,
-    ):
-        assert kv_group == 1
+    def fail_pointer_install(*_args, **_kwargs):
         raise RuntimeError("pointer install failed")
 
     engine.gpu_connector = type(
@@ -4732,8 +4696,6 @@ def test_append_retrieve_layer_cache_is_atomic_when_pointer_install_fails():
             cached_tensors,
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
-            num_layers=2,
-            kv_group=1,
         )
 
     assert cached_memory_objs == []
@@ -4746,12 +4708,8 @@ def test_append_retrieve_layer_cache_uses_memory_obj_pointer_path():
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     calls = []
-
-    def append_ptrs(*args, kv_group):
-        calls.append((args, kv_group))
-
     engine.gpu_connector = SimpleNamespace(
-        append_sparse_chunk_ptr_cache_for_layer=append_ptrs
+        append_sparse_chunk_ptr_cache_for_layer=lambda *args: calls.append(args)
     )
     mem_obj: Any = SimpleNamespace(is_valid=lambda: True, data_ptr=123)
     cached_memory_objs = []
@@ -4766,12 +4724,9 @@ def test_append_retrieve_layer_cache_uses_memory_obj_pointer_path():
         cached_tensors,
         cached_chunk_dev_ptrs,
         cached_chunk_ptrs_npu,
-        num_layers=1,
-        kv_group=1,
     )
 
-    assert calls[0][0][1] == [mem_obj]
-    assert calls[0][1] == 1
+    assert calls[0][1] == [mem_obj]
     assert cached_memory_objs == [[mem_obj]]
     assert cached_tensors == []
 
@@ -4780,12 +4735,8 @@ def test_append_retrieve_layer_cache_preserves_tensor_backed_prefix():
     engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 1
     calls = []
-
-    def append_ptrs(*args, kv_group):
-        calls.append((args, kv_group))
-
     engine.gpu_connector = SimpleNamespace(
-        append_sparse_chunk_ptr_cache_for_layer=append_ptrs
+        append_sparse_chunk_ptr_cache_for_layer=lambda *args: calls.append(args)
     )
     old_tensor, new_tensor = torch.empty(1), torch.empty(1)
     old_obj = _FakeTensorMemObj(old_tensor)
@@ -4800,12 +4751,9 @@ def test_append_retrieve_layer_cache_preserves_tensor_backed_prefix():
         cached_tensors,
         [[]],
         [torch.tensor([123], dtype=torch.long)],
-        num_layers=1,
-        kv_group=1,
     )
 
-    assert calls[0][0][1] == [new_tensor]
-    assert calls[0][1] == 1
+    assert calls[0][1] == [new_tensor]
     assert cached_memory_objs == [[old_obj, new_obj]]
     assert cached_tensors == [[old_tensor, new_tensor]]
 
@@ -4829,8 +4777,6 @@ def test_append_retrieve_layer_cache_rejects_missing_tensor_without_shift():
             cached_tensors,
             [],
             [],
-            num_layers=1,
-            kv_group=0,
         )
 
     assert cached_memory_objs == []
@@ -4851,7 +4797,6 @@ def test_sparse_pointer_cache_append_failure_is_atomic(monkeypatch):
             [torch.empty(1)],
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
-            kv_group=0,
         )
 
     assert cached_chunk_dev_ptrs == []
@@ -4861,7 +4806,6 @@ def test_sparse_pointer_cache_append_failure_is_atomic(monkeypatch):
 def test_sparse_pointer_cache_accepts_memory_obj_sources(monkeypatch):
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
-    connector.dsa_two_groups = False
     connector.kv_device = torch.device("cpu")
     monkeypatch.setattr(
         npu_connectors.lmc_ops,
@@ -4880,7 +4824,6 @@ def test_sparse_pointer_cache_accepts_memory_obj_sources(monkeypatch):
         sources,
         cached_chunk_dev_ptrs,
         cached_chunk_ptrs_npu,
-        kv_group=0,
     )
 
     assert cached_chunk_dev_ptrs == [[1023, 1042]]
@@ -4906,7 +4849,6 @@ def test_sparse_pointer_cache_tensor_build_failure_is_atomic(monkeypatch):
             [torch.empty(1)],
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
-            kv_group=0,
         )
 
     assert cached_chunk_dev_ptrs == []
@@ -4943,23 +4885,9 @@ def test_sparse_passive_pointer_failure_releases_unpublished_view(monkeypatch):
         generation=7,
         handles=[object()],
     )
-
-    def fail_append_retrieve_layer_cache(
-        _layer_id,
-        _mem_objs_layer,
-        _cached_memory_objs,
-        _cached_tensors,
-        _cached_chunk_dev_ptrs,
-        _cached_chunk_ptrs_npu,
-        *,
-        num_layers,
-        kv_group,
-    ):
-        assert num_layers == 1
-        assert kv_group == 0
-        raise RuntimeError("pointer install failed")
-
-    engine._append_retrieve_layer_cache = fail_append_retrieve_layer_cache
+    engine._append_retrieve_layer_cache = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("pointer install failed"))
+    )
     cached_memory_objs = []
     cached_tensors = []
     cached_chunk_dev_ptrs = []

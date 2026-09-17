@@ -2,8 +2,6 @@
 """Validate checkpoint admission before resource initialization, using real init code."""
 
 import ast
-from functools import partial
-import runpy
 from enum import Enum
 from pathlib import Path
 import sys
@@ -39,12 +37,7 @@ def init_api(config):
         n
         for n in init.body
         if isinstance(n, ast.FunctionDef)
-        and n.name
-        in {
-            "__init__",
-            "_validate_preemption_checkpoint_setup",
-            "_derive_runtime_kv_group_layer_counts",
-        }
+        and n.name in {"__init__", "_validate_preemption_checkpoint_setup"}
     ]
     validate = next(
         n
@@ -66,10 +59,6 @@ def init_api(config):
         LMCacheEngineConfig=Config,
         VllmServiceFactory=factory,
         KVConnectorRole=Role,
-        logger=NS(info=lambda *a, **kw: None),
-        validate_two_group_layer_counts=runpy.run_path(
-            str(ROOT.parent / "LMCache-NPU/lmcache/v1/kv_layer_groups.py")
-        )["validate_two_group_layer_counts"],
     )
     prefix = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
@@ -92,9 +81,7 @@ def init_api(config):
             "_validate_preemption_checkpoint_setup": ns[validate.name],
         },
     )
-    kv = NS(kv_cache_groups=[NS(layer_names=["model.layers.0.self_attn.attn"]),
-                            NS(layer_names=["model.layers.0.self_attn.indexer.k_cache"])])
-    return partial(cls, kv_cache_config=kv), calls, ResourcesStarted
+    return cls, calls, ResourcesStarted
 
 
 def configs():

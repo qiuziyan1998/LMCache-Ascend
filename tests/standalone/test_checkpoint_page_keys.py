@@ -131,7 +131,6 @@ def test_cached_original_boundary_needs_no_allocation(key_types, group):
     )
     obj = cls()
     obj.num_layers = engine.num_layers
-    obj._num_layers_for_kv_group = engine.num_layers_for_group
     obj.token_database = engine.token_database
     obj._shared_local_cpu_backend = lambda: engine.backend
     obj._shared_cpu_dtype_for_kv_group = lambda group: torch.uint8
@@ -196,8 +195,6 @@ def test_page_source_selection_and_failure_cleanup(
     )
     obj = cls()
     obj.num_layers = engine.num_layers
-    obj.num_layers_for_group = engine.num_layers_for_group
-    obj._num_layers_for_kv_group = engine.num_layers_for_group
     obj.config = engine.config
     keys = [
         entry[2]

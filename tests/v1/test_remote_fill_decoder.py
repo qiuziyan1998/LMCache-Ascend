@@ -4,7 +4,7 @@
 # Standard
 from collections import deque
 from concurrent.futures import Future
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from threading import Event
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -30,7 +30,6 @@ from lmcache.v1.storage_backend.local_cpu_backend import (
     LayerPageAdmissionRollbackError,
 )
 import pytest
-import msgspec
 import torch
 
 # First Party
@@ -614,10 +613,8 @@ class _FakeCapabilityEngine:
         return None
 
     def _make_shared_handle_batch(
-        self, memory_objs: list[list[Any]], keys: list[list[CacheEngineKey]],
-        *, kv_group: int,
+        self, memory_objs: list[list[Any]], keys: list[list[CacheEngineKey]]
     ) -> SharedHandleBatch:
-        assert kv_group == 1
         assert all(layer == [self._page] for layer in memory_objs)
         return SharedHandleBatch(
             shm_name="remote-fill-test",
@@ -764,47 +761,6 @@ def test_startup_rejects_group_layout_not_matching_decoder_metadata() -> None:
         engine._validate_remote_fill_decoder_layout(incompatible)
 
 
-@pytest.mark.parametrize("counts", [(2, 2), (3, 1), (79, 22)])
-def test_group1_startup_compacts_using_its_physical_layer_count(
-    monkeypatch: pytest.MonkeyPatch, counts: tuple[int, int]
-) -> None:
-    """Exercise the real compactor, not a cardinality-blind startup double."""
-    import lmcache.v1.cache_engine as core_engine
-
-    page = _capability_page()
-    page.num_layers = counts[1]
-    page.size = page.layer_size * counts[1]
-    page.physical_size = max(64, page.size)
-    page.meta = page.metadata
-    monkeypatch.setattr(core_engine, "LayerPageMemoryObj", _FakeCapabilityPage)
-
-    def pin_many(pages: list[_FakeCapabilityPage]) -> bool:
-        for item in pages:
-            item.pins += 1
-        return True
-
-    monkeypatch.setattr(LayerPageMemoryObj, "pin_many", staticmethod(pin_many))
-    published = []
-
-    def broadcast(payload: Any, source_rank: int) -> Any:
-        if isinstance(payload, dict) and "batch" in payload:
-            published.append(payload)
-        return payload
-
-    engine = _FakeCapabilityEngine(rank=0, broadcast=broadcast, page=page)
-    engine.shared_cpu_cache_name = "remote-fill-test"
-    engine.num_layers_for_group = lambda group: counts[group]
-    engine._make_shared_handle_batch = LMCacheEngine._make_shared_handle_batch.__get__(
-        engine
-    )
-    layout = replace(_layout(), num_layers=counts[0], group_layer_counts=counts)
-    engine._preflight_remote_fill_shared_group1(layout, {})
-
-    assert engine._remote_fill_shared_group1_supported
-    assert len(published) == 1
-    assert page.refs == page.pins == 0
-
-
 def test_group1_shared_startup_fails_closed_on_passive_rank_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -897,7 +853,6 @@ def _lifecycle(
     chunk_hash_type: type[int] | type[bytes] = int,
     chunk_hash_bytes: int | None = None,
     direct_groups: tuple[int, ...] = (0, 1),
-    layout: RemoteFillDecoderLayout | None = None,
 ) -> AscendRemoteFillPageLifecycle:
     def pin_pages(pages: list[_FakePage]) -> bool:
         for page in pages:
@@ -906,7 +861,7 @@ def _lifecycle(
 
     return AscendRemoteFillPageLifecycle(
         local_backend=local,
-        layout=layout or _layout(),
+        layout=_layout(),
         capacity_available=(
             capacity
             if callable(capacity)
@@ -2084,30 +2039,3 @@ def test_remote_fill_control_host_uses_existing_global_te_identity(
     session: str, host: str
 ) -> None:
     assert _remote_fill_advertise_host_from_session(session) == host
-
-
-def test_unequal_group_pages_allocate_and_publish_exact_bytes():
-    local = _FakeLocalBackend()
-    layout = replace(_layout(), group_layer_counts=(2, 1))
-    lifecycle = _lifecycle(local, layout=layout)
-    controls = tuple(
-        msgspec.structs.replace(
-            _control_page(chunk, group, valid_tokens=count),
-            layer_count=layout.num_layers_for_group(group),
-            expected_bytes=layout.group(group).expected_bytes(
-                count, layout.num_layers_for_group(group)
-            ),
-        )
-        for chunk, count in ((0, 4), (1, 2))
-        for group in (0, 1)
-    )
-    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
-    assert [item.destination_length for item in prepared] == [64, 16, 32, 8]
-    assert local.hot == {}
-    assert lifecycle.commit_pages(
-        "transfer", controls, _views(controls, prepared), _finish(6, partial=2)
-    )
-    assert len(local.hot) == 4
-    for call in local.allocations:
-        for page in call["pages"]:
-            assert page.refs == 1 and page.pins == 0

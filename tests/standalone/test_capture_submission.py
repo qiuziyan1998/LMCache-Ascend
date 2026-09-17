@@ -105,7 +105,6 @@ def fixture():
     )
     obj = NS(
         num_layers=2,
-        _expected_group_layers=lambda group: 2,
         kvcaches=[object(), object()],
         kv_device=torch.device("cpu"),
         store_stream=stream,

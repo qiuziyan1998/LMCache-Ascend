@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any, TYPE_CHECKING, Optional
+from typing import Any
 
 # Third Party
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
-
-if TYPE_CHECKING:
-    # Third Party
-    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 # First Party
 from lmcache_ascend import _build_info
@@ -49,12 +45,7 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             and getattr(config, "enable_sparse_attention", False)
         )
 
-    def __init__(
-        self,
-        vllm_config: "VllmConfig",
-        role: KVConnectorRole,
-        kv_cache_config: Optional["KVCacheConfig"] = None,
-    ) -> None:
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole) -> None:
         transfer = getattr(vllm_config, "kv_transfer_config", None)
         parallel = getattr(vllm_config, "parallel_config", None)
         if transfer is not None and parallel is not None:
@@ -67,9 +58,7 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
                 getattr(parallel, "data_parallel_size", 1) or 1
             )
             transfer.kv_connector_extra_config = extra
-        super().__init__(
-            vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
-        )
+        super().__init__(vllm_config=vllm_config, role=role)
 
     def capture_live_source_event_handoff(self, forward_context: Any) -> bool:
         """Forward an armed post-forward producer event to the implementation."""

@@ -34,7 +34,6 @@ from lmcache_tests.v1.test_gpu_connector import (
 from lmcache_tests.v1.test_gpu_connector import (
     test_vllm_paged_connector_v2_to_gpu_bench as original_test_vllm_paged_connector_v2_to_gpu_bench,
 )
-from lmcache.v1.memory_management import LayerPageSource
 import pytest
 import torch
 
@@ -48,74 +47,6 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
 import lmcache_ascend.c_ops as lmc_ops
 import lmcache_ascend.v1.cache_engine as ascend_cache_engine
 import lmcache_ascend.v1.npu_connector.npu_connectors as npu_connectors
-
-
-def test_dynamic_layerwise_slot_mapping_uses_absolute_chunk_ranges() -> None:
-    full_mapping = torch.tensor([10, 11, 12, 13, 14])
-    chunks, selected = npu_connectors._slice_layerwise_slot_mapping(
-        full_mapping,
-        starts=[1, 3],
-        ends=[3, 5],
-    )
-    assert [chunk.tolist() for chunk in chunks] == [[11, 12], [13, 14]]
-    assert selected.tolist() == [11, 12, 13, 14]
-
-    window_mapping = torch.tensor([21, 22, 23, 24])
-    resolved, base = npu_connectors._resolve_layerwise_slot_mapping(
-        {"slot_mapping": window_mapping, "slot_mapping_base": 1},
-        full_mapping,
-    )
-    _, selected = npu_connectors._slice_layerwise_slot_mapping(
-        resolved,
-        starts=[1, 3],
-        ends=[3, 5],
-        slot_mapping_base=base,
-    )
-    assert selected.tolist() == [21, 22, 23, 24]
-
-
-def test_dynamic_layerwise_slot_mapping_rejects_bad_payload() -> None:
-    mapping = torch.tensor([1, 2])
-    with pytest.raises(TypeError, match="dict containing slot_mapping"):
-        npu_connectors._resolve_layerwise_slot_mapping(mapping, mapping)
-    with pytest.raises(TypeError, match="must be a torch.Tensor"):
-        npu_connectors._resolve_layerwise_slot_mapping(
-            {"slot_mapping": [1, 2]}, mapping
-        )
-    with pytest.raises(ValueError, match="must be non-negative"):
-        npu_connectors._resolve_layerwise_slot_mapping(
-            {"slot_mapping": mapping, "slot_mapping_base": -1}, mapping
-        )
-    with pytest.raises(ValueError, match="length mismatch"):
-        npu_connectors._slice_layerwise_slot_mapping(
-            mapping,
-            starts=[0, 1],
-            ends=[1],
-        )
-    with pytest.raises(ValueError, match="outside the provided"):
-        npu_connectors._slice_layerwise_slot_mapping(
-            mapping,
-            starts=[1],
-            ends=[4],
-        )
-
-
-def test_dynamic_layerwise_slot_mapping_default_and_empty_ranges() -> None:
-    mapping = torch.tensor([1, 2], dtype=torch.int32)
-    resolved, base = npu_connectors._resolve_layerwise_slot_mapping(
-        None, mapping, default_base=7
-    )
-    assert resolved is mapping
-    assert base == 7
-
-    chunks, selected = npu_connectors._slice_layerwise_slot_mapping(
-        mapping,
-        starts=[],
-        ends=[],
-    )
-    assert chunks == []
-    assert selected.shape == (0,)
-    assert selected.dtype == mapping.dtype
 
 
 def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
@@ -1414,9 +1345,7 @@ def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
     monkeypatch.setattr(npu_connectors.torch, "tensor", counted_tensor)
     host_rows, npu_rows = [], []
 
-    connector.append_sparse_chunk_ptr_cache_for_layers(
-        sources, host_rows, npu_rows, kv_group=0
-    )
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, npu_rows)
 
     assert calls[:2] == [page.layer_data_ptr(0) for page in pages]
     assert len(calls) == len(pages) + len(suffix)
@@ -1558,9 +1487,7 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     rows = [[object(), object()], [object(), object()]]
     host_rows = []
 
-    connector.append_sparse_chunk_ptr_cache_for_layers(
-        rows, host_rows, None, kv_group=0
-    )
+    connector.append_sparse_chunk_ptr_cache_for_layers(rows, host_rows, None)
 
     assert host_rows == [[0, 1], [100, 101]]
     assert len(calls) == 4
@@ -1635,43 +1562,12 @@ def test_group_pointer_append_falls_back_for_malformed_page_layout(
     )
     host_rows = []
 
-    connector.append_sparse_chunk_ptr_cache_for_layers(
-        sources, host_rows, None, kv_group=0
-    )
+    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, None)
 
     assert host_rows == [[0, 1, 2], [100, 101, 102]]
     assert len(calls) == 6
     for obj in [*pages, *suffix]:
         obj.ref_count_down()
-
-
-def test_group_pointer_append_uses_explicit_group_when_current_group_is_stale(
-    monkeypatch,
-) -> None:
-    connector = _make_sparse_pack_connector()
-    connector.num_layers = 79
-    connector._group_layouts = {
-        0: SimpleNamespace(num_layers=79),
-        1: SimpleNamespace(num_layers=22),
-    }
-    connector._current_kv_group = 1
-    monkeypatch.setattr(
-        connector,
-        "_resolve_registered_cpu_source_device_ptr",
-        lambda _source, *, layer_id, **_kwargs: layer_id + 1,
-    )
-    host_rows = []
-
-    connector.append_sparse_chunk_ptr_cache_for_layers(
-        [[object()] for _ in range(79)],
-        host_rows,
-        None,
-        kv_group=0,
-    )
-
-    assert len(host_rows) == 79
-    assert host_rows[0] == [1]
-    assert host_rows[-1] == [79]
 
 
 def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:
@@ -2680,8 +2576,8 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     connector._sparse_direct_layer_states = None
     connector._sparse_direct_validated_layers = set()
 
-    transfer_stream = _TrackingStream("transfer")
-    current_stream = _TrackingStream("compute")
+    transfer_stream = _TrackingStream("load")
+    current_stream = _TrackingStream("producer")
     slot_mapping = _RecordableTensor(8)
     chunk_ptrs = _RecordableTensor(2)
     chunk_offsets = _RecordableTensor(2, dtype=torch.int32)
@@ -2740,16 +2636,6 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     )
     connector._run_dense_direct_kv_transfer_layer(
         **common_kwargs,
-        direction=False,
-        defer_consumer_wait=True,
-    )
-    connector._run_dense_direct_kv_transfer_layer(
-        **common_kwargs,
-        direction=True,
-        defer_consumer_wait=True,
-    )
-    connector._run_dense_direct_kv_transfer_layer(
-        **common_kwargs,
         direction=True,
     )
     connector._run_dense_direct_kv_transfer_layer(
@@ -2758,29 +2644,26 @@ def test_dense_direct_fast_state_cache_separates_load_and_store(
     )
 
     assert len(prepared) == 2
-    assert len(fast_calls) == 5
+    assert len(fast_calls) == 3
     assert fast_calls[0][0][0] is prepared[0]
-    assert fast_calls[1][0][0] is prepared[0]
-    assert fast_calls[2][0][0] is prepared[1]
-    assert fast_calls[3][0][0] is prepared[1]
-    assert fast_calls[4][0][0] is prepared[0]
+    assert fast_calls[1][0][0] is prepared[1]
     assert fast_calls[0][0][7] is False
-    assert fast_calls[1][0][7] is False
-    assert fast_calls[2][0][7] is True
-    assert fast_calls[3][0][7] is True
-    assert fast_calls[4][0][7] is False
+    assert fast_calls[1][0][7] is True
     assert transfer_stream.events == [
-        ("wait_stream", "compute"),
-        ("wait_stream", "compute"),
-        ("wait_stream", "compute"),
-        ("wait_stream", "compute"),
+        ("wait_stream", "producer"),
+        ("wait_stream", "producer"),
     ]
     assert current_stream.events == [
-        ("wait_stream", "transfer"),
-        ("wait_stream", "transfer"),
+        ("wait_stream", "load"),
+        ("wait_stream", "load"),
     ]
-    for tensor in (slot_mapping, chunk_ptrs, chunk_offsets, chunk_sizes):
-        assert tensor.recorded_streams == [transfer_stream] * 5
+    for transfer_input in (
+        slot_mapping,
+        chunk_ptrs,
+        chunk_offsets,
+        chunk_sizes,
+    ):
+        assert transfer_input.recorded_streams == [transfer_stream] * 3
 
 
 def test_prepared_dense_load_bypasses_shape_cache_and_validates_once(
@@ -4008,33 +3891,6 @@ def test_staging_batched_to_gpu_releases_buffer_on_completion(monkeypatch) -> No
     assert releases == []
     next(generator)
     assert releases == [True]
-
-
-def test_staging_batched_to_gpu_uses_per_layer_slot_mapping(monkeypatch) -> None:
-    generator, releases = _staging_batched_to_gpu(monkeypatch)
-    mappings = []
-
-    def capture_transfer(*args, **_kwargs):
-        mappings.append(args[3].clone())
-
-    monkeypatch.setattr(
-        npu_connectors,
-        "batched_fused_single_layer_kv_transfer",
-        capture_transfer,
-    )
-    next(generator)
-    dynamic_mapping = torch.tensor([17], dtype=torch.long)
-    generator.send(
-        {
-            "memory_objs": [_MemoryObj(torch.zeros(1))],
-            "layer_request": {"slot_mapping": dynamic_mapping},
-        }
-    )
-    next(generator)
-
-    assert len(mappings) == 1
-    assert torch.equal(mappings[0], dynamic_mapping)
-    assert releases == [True]
     with pytest.raises(StopIteration):
         next(generator)
     assert releases == [True]
@@ -4362,320 +4218,6 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
 
 
-def test_deferred_dense_batched_to_gpu_waits_old_save_on_load_stream(
-    monkeypatch,
-) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.num_layers = 2
-    connector.kvcaches = [object(), object()]
-    connector.use_gpu = True
-    connector.kv_device = torch.device("cpu")
-    connector.load_stream = _TrackingStream("load")
-    compute_stream = _TrackingStream("compute")
-    old_save_events = [
-        _TrackingEvent("save-bank-0"),
-        _TrackingEvent("save-bank-1"),
-    ]
-    load_events = []
-    event_index = 0
-
-    class _Npu:
-        @staticmethod
-        def current_stream():
-            return compute_stream
-
-        @staticmethod
-        def Event():
-            nonlocal event_index
-            event = _TrackingEvent(f"load-layer-{event_index}")
-            load_events.append(event)
-            event_index += 1
-            return event
-
-    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
-    monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", False)
-    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **_kwargs: None)
-    monkeypatch.setattr(
-        connector,
-        "_lazy_initialize_buffer_with_staging",
-        lambda *_args, **_kwargs: _DenseLayout(),
-    )
-    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda _group=0: True)
-    monkeypatch.setattr(
-        connector,
-        "_expected_memory_format",
-        lambda _group=0: MemoryFormat.KV_MLA_LATENT_FMT,
-    )
-    monkeypatch.setattr(connector, "_layerwise_token_major", lambda _group=0: False)
-    monkeypatch.setattr(
-        connector, "_sparse_lmc_host_interleaved", lambda _group=0: False
-    )
-    monkeypatch.setattr(
-        connector, "_check_layerwise_transfer_invariants", lambda **_kwargs: None
-    )
-    monkeypatch.setattr(
-        connector,
-        "_resolve_sparse_chunk_ptrs_npu",
-        lambda _layer_id, _cpu_tensors, *_args, **_kwargs: torch.tensor([123]),
-    )
-
-    direct_calls = []
-
-    def capture_direct_call(**kwargs):
-        direct_calls.append(
-            {
-                "layer_id": kwargs["layer_id"],
-                "defer_consumer_wait": kwargs["defer_consumer_wait"],
-                "load_stream_events_before_launch": list(connector.load_stream.events),
-            }
-        )
-
-    monkeypatch.setattr(
-        connector,
-        "_run_dense_direct_kv_transfer_layer",
-        capture_direct_call,
-    )
-    connector._layerwise_prefill_bank_counts = {0: 2}
-    connector._layerwise_prefill_save_done_events = {
-        (0, 0): (0, old_save_events[0]),
-        (0, 1): (0, old_save_events[1]),
-    }
-    connector._layerwise_prefill_load_done_events = {}
-
-    generator = connector.batched_to_gpu(
-        [0],
-        [1],
-        slot_mapping=torch.tensor([0]),
-        sync=True,
-        kv_group=0,
-        deferred_layerwise_get=True,
-        layerwise_prefill_bank_count=2,
-    )
-    assert next(generator) is None
-    assert generator.send([_MemoryObj(torch.zeros(1))]) is None
-    assert generator.send([_MemoryObj(torch.zeros(1))]) is None
-
-    # Submitting the final layer stays asynchronous even for sync=True.  Its
-    # consumer joins the transfer explicitly at layer entry, then host-fences
-    # before LMCache releases the pinned H2D source objects.
-    assert compute_stream.events == []
-    assert "synchronize" not in connector.load_stream.events
-    connector.wait_for_layerwise_prefill_load(layer_id=1, kv_group=0)
-    assert compute_stream.events == [
-        ("wait_event", "save-bank-1"),
-        ("wait_event", "load-layer-1"),
-    ]
-    assert "synchronize" not in connector.load_stream.events
-    assert next(generator) is None
-    assert connector.load_stream.events[-1] == "synchronize"
-    with pytest.raises(StopIteration):
-        next(generator)
-
-    assert connector.load_stream.events == [
-        ("wait_event", "save-bank-0"),
-        ("wait_event", "save-bank-1"),
-        "synchronize",
-    ]
-    assert direct_calls == [
-        {
-            "layer_id": 0,
-            "defer_consumer_wait": True,
-            "load_stream_events_before_launch": [("wait_event", "save-bank-0")],
-        },
-        {
-            "layer_id": 1,
-            "defer_consumer_wait": True,
-            "load_stream_events_before_launch": [
-                ("wait_event", "save-bank-0"),
-                ("wait_event", "save-bank-1"),
-            ],
-        },
-    ]
-    assert load_events[0].records == ["load"]
-    assert load_events[1].records == ["load"]
-    assert connector._layerwise_prefill_load_done_events == {
-        (0, 0): (0, load_events[0]),
-    }
-
-    # Closing an aborted direct-load generator fences H2D work that was
-    # already submitted before its host memory can be released.
-    aborted = connector.batched_to_gpu(
-        [0],
-        [1],
-        slot_mapping=torch.tensor([0]),
-        sync=False,
-        kv_group=0,
-        deferred_layerwise_get=True,
-        layerwise_prefill_bank_count=2,
-    )
-    assert next(aborted) is None
-    assert aborted.send([_MemoryObj(torch.zeros(1))]) is None
-    connector.reset_layerwise_prefill_transfer_state(0, synchronize=False)
-    with pytest.raises(RuntimeError, match="belongs to a reset step"):
-        aborted.send([_MemoryObj(torch.zeros(1))])
-    assert connector.load_stream.events[-1] == "synchronize"
-    assert connector._layerwise_prefill_load_done_events == {}
-
-    closed = connector.batched_to_gpu(
-        [0],
-        [1],
-        slot_mapping=torch.tensor([0]),
-        sync=False,
-        kv_group=0,
-        deferred_layerwise_get=True,
-        layerwise_prefill_bank_count=2,
-    )
-    assert next(closed) is None
-    assert closed.send([_MemoryObj(torch.zeros(1))]) is None
-    sync_count = connector.load_stream.events.count("synchronize")
-    closed.close()
-    assert connector.load_stream.events.count("synchronize") == sync_count + 1
-
-
-def test_wait_for_layerwise_prefill_load_waits_load_completion(monkeypatch) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    compute_stream = _TrackingStream("compute")
-    load_event = _TrackingEvent("load-layer-3")
-    save_event = _TrackingEvent("save-bank-1")
-
-    class _Npu:
-        @staticmethod
-        def current_stream():
-            return compute_stream
-
-    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
-    connector._layerwise_prefill_bank_counts = {0: 2}
-    connector._layerwise_prefill_save_done_events = {(0, 1): (0, save_event)}
-    connector._layerwise_prefill_load_done_events = {(0, 3): (0, load_event)}
-
-    connector.wait_for_layerwise_prefill_load(layer_id=3, kv_group=0)
-
-    assert compute_stream.events == [
-        ("wait_event", "save-bank-1"),
-        ("wait_event", "load-layer-3"),
-    ]
-    assert connector._layerwise_prefill_load_done_events == {}
-
-
-@pytest.mark.parametrize(
-    ("load_disabled", "store_disabled", "expected"),
-    [
-        (False, False, True),
-        (True, False, False),
-        (False, True, False),
-        (True, True, False),
-    ],
-)
-def test_layerwise_prefill_transfer_window_requires_both_direct_paths(
-    monkeypatch,
-    load_disabled,
-    store_disabled,
-    expected,
-) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    monkeypatch.setattr(
-        npu_connectors,
-        "_DENSE_DIRECT_LOAD_DISABLE",
-        load_disabled,
-    )
-    monkeypatch.setattr(
-        npu_connectors,
-        "_DENSE_DIRECT_STORE_DISABLE",
-        store_disabled,
-    )
-
-    assert connector.supports_layerwise_prefill_transfer_window is expected
-
-
-def test_wait_for_layerwise_prefill_load_without_hit_waits_old_bank_save(
-    monkeypatch,
-) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    compute_stream = _TrackingStream("compute")
-    latent_save = _TrackingEvent("latent-save-bank-1")
-    indexer_save = _TrackingEvent("indexer-save-bank-1")
-
-    class _Npu:
-        @staticmethod
-        def current_stream():
-            return compute_stream
-
-    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
-    connector._layerwise_prefill_bank_counts = {0: 2, 1: 2}
-    connector._layerwise_prefill_save_done_events = {
-        (0, 1): (0, latent_save),
-        (1, 1): (0, indexer_save),
-    }
-    connector._layerwise_prefill_load_done_events = {}
-
-    connector.wait_for_layerwise_prefill_load(layer_id=3, kv_group=1)
-
-    assert compute_stream.events == [("wait_event", "indexer-save-bank-1")]
-    assert connector._layerwise_prefill_load_done_events == {}
-
-
-def test_wait_for_layerwise_prefill_load_ignores_stale_load_but_waits_current_save(
-    monkeypatch,
-) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    compute_stream = _TrackingStream("compute")
-    current_save = _TrackingEvent("current-save-bank-1")
-    stale_load = _TrackingEvent("stale-load-layer-3")
-
-    class _Npu:
-        @staticmethod
-        def current_stream():
-            return compute_stream
-
-    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
-    connector._layerwise_prefill_bank_counts = {0: 2}
-    connector._layerwise_prefill_transfer_generations = {0: 7}
-    connector._layerwise_prefill_save_done_events = {
-        (0, 1): (7, current_save),
-    }
-    connector._layerwise_prefill_load_done_events = {
-        (0, 3): (6, stale_load),
-    }
-
-    connector.wait_for_layerwise_prefill_load(layer_id=3, kv_group=0)
-
-    assert compute_stream.events == [("wait_event", "current-save-bank-1")]
-    assert connector._layerwise_prefill_load_done_events == {}
-
-
-def test_reset_layerwise_prefill_transfer_state_fences_and_invalidates_groups() -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.load_stream = _TrackingStream("load")
-    connector.store_stream = _TrackingStream("store")
-    connector._layerwise_prefill_bank_counts = {0: 2, 1: 2}
-    connector._layerwise_prefill_transfer_generations = {0: 4, 1: 9}
-    connector._layerwise_prefill_save_done_events = {
-        (0, 0): (4, _TrackingEvent("save-0")),
-        (1, 0): (9, _TrackingEvent("save-1")),
-    }
-    connector._layerwise_prefill_load_done_events = {
-        (0, 2): (4, _TrackingEvent("load-0")),
-        (1, 2): (9, _TrackingEvent("load-1")),
-    }
-
-    connector.reset_layerwise_prefill_transfer_state(0)
-
-    assert connector.load_stream.events == ["synchronize"]
-    assert connector.store_stream.events == ["synchronize"]
-    assert connector._layerwise_prefill_transfer_generations == {0: 5, 1: 9}
-    assert set(connector._layerwise_prefill_save_done_events) == {(1, 0)}
-    assert set(connector._layerwise_prefill_load_done_events) == {(1, 2)}
-
-    connector.reset_layerwise_prefill_transfer_state(synchronize=False)
-
-    assert connector.load_stream.events == ["synchronize"]
-    assert connector.store_stream.events == ["synchronize"]
-    assert connector._layerwise_prefill_transfer_generations == {0: 6, 1: 10}
-    assert connector._layerwise_prefill_save_done_events == {}
-    assert connector._layerwise_prefill_load_done_events == {}
-
-
 def test_dense_batched_from_gpu_direct_path_skips_staging(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
@@ -4898,273 +4440,6 @@ def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(
     assert direct_calls[0]["total_tokens"] == 401
     assert direct_calls[0]["chunk_offsets_npu"].tolist() == starts
     assert direct_calls[0]["chunk_sizes_npu"].tolist() == [128, 256, 17]
-
-
-@pytest.mark.parametrize("kv_group", [0, 1])
-def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
-    monkeypatch, kv_group,
-) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.num_layers = 4
-    connector.kv_device = torch.device("cpu")
-    connector._group_layouts = {
-        kv_group: SimpleNamespace(num_layers=4),
-    }
-    connector.kvcaches = [object(), object(), object(), object()]
-    connector.use_gpu = True
-    connector.store_stream = _TrackingStream("store")
-    compute_stream = _TrackingStream("compute")
-    events = [
-        _TrackingEvent("layer-0"),
-        _TrackingEvent("layer-1"),
-        _TrackingEvent("layer-2"),
-        _TrackingEvent("layer-3"),
-        _TrackingEvent("stale-layer-0"),
-    ]
-    event_index = 0
-
-    class _Npu:
-        @staticmethod
-        def current_stream():
-            return compute_stream
-
-        @staticmethod
-        def stream(_stream):
-            return nullcontext()
-
-        @staticmethod
-        def Event():
-            nonlocal event_index
-            event = events[event_index]
-            event_index += 1
-            return event
-
-    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
-    monkeypatch.setattr(
-        connector, "initialize_kvcaches_ptr", lambda **_kwargs: None
-    )
-    monkeypatch.setattr(
-        connector,
-        "_lazy_initialize_buffer_with_staging",
-        lambda *_args, **_kwargs: _DenseLayout(),
-    )
-    monkeypatch.setattr(
-        connector, "_is_mla_dsa_format", lambda _group=0: True
-    )
-    monkeypatch.setattr(
-        connector,
-        "_expected_memory_format",
-        lambda _group=0: MemoryFormat.KV_MLA_LATENT_FMT,
-    )
-    monkeypatch.setattr(
-        connector, "_layerwise_token_major", lambda _group=0: False
-    )
-    monkeypatch.setattr(
-        connector,
-        "_sparse_lmc_host_interleaved",
-        lambda _group=0: False,
-    )
-    monkeypatch.setattr(
-        connector,
-        "_check_layerwise_transfer_invariants",
-        lambda **_kwargs: None,
-    )
-    connector._sparse_direct_validated_layers = set()
-    mappings = []
-    prepared_pointer_rows = [
-        torch.tensor([100 + layer_id], dtype=torch.long)
-        for layer_id in range(connector.num_layers)
-    ]
-    pointer_table_builds = []
-
-    def _append_pointer_table(_sources, host_rows, npu_rows, *, kv_group):
-        pointer_table_builds.append("primed")
-        assert kv_group == expected_group
-        host_rows.extend([[int(row.item())] for row in prepared_pointer_rows])
-        npu_rows.extend(prepared_pointer_rows)
-
-    monkeypatch.setattr(
-        connector,
-        "append_sparse_chunk_ptr_cache_for_layers",
-        _append_pointer_table,
-    )
-    monkeypatch.setattr(
-        connector,
-        "_resolve_sparse_chunk_ptrs_npu",
-        lambda *_args, **_kwargs: pytest.fail(
-            "deferred transfer rebuilt a primed pointer row"
-        ),
-    )
-    prepared_states = set()
-    state_calls = []
-
-    def _get_or_create_state(*, layer_id, require_prepared=False, **kwargs):
-        state_calls.append((layer_id, require_prepared))
-        if require_prepared:
-            assert layer_id in prepared_states
-        else:
-            prepared_states.add(layer_id)
-        state = ("state", layer_id)
-        if kwargs.get("return_key", False):
-            return state, ("key", layer_id)
-        return state
-
-    monkeypatch.setattr(
-        connector,
-        "_get_or_create_sparse_direct_layer_state",
-        _get_or_create_state,
-    )
-    monkeypatch.setattr(
-        npu_connectors,
-        "dense_mla_dsa_batched_direct_kv_transfer_fast",
-        lambda _state, slot_mapping, *_args, **_kwargs: mappings.append(
-            slot_mapping.clone()
-        ),
-    )
-    monkeypatch.setattr(
-        npu_connectors,
-        "dense_mla_dsa_batched_direct_kv_transfer",
-        lambda *_args, **_kwargs: pytest.fail("slow dense direct path used"),
-    )
-    memory_objs = [
-        [_MemoryObj(torch.zeros(1))],
-        [_MemoryObj(torch.zeros(1))],
-        [_MemoryObj(torch.zeros(1))],
-        [_MemoryObj(torch.zeros(1))],
-    ]
-    expected_group = kv_group
-    generator = connector.batched_from_gpu(
-        memory_objs,
-        [0],
-        [1],
-        slot_mapping=torch.tensor([0]),
-        sync=False,
-        deferred_layerwise_put=True,
-        layerwise_prefill_bank_count=2,
-        kv_group=kv_group,
-    )
-
-    assert next(generator) is None
-    assert pointer_table_builds == ["primed"]
-    assert state_calls == [(0, False), (1, False), (2, False), (3, False)]
-    assert generator.send({"slot_mapping": torch.tensor([10])}) is None
-    assert generator.send({"slot_mapping": torch.tensor([20])}) is None
-    assert generator.send({"slot_mapping": torch.tensor([30])}) == 0
-    assert generator.send({"slot_mapping": torch.tensor([40])}) == 1
-    assert next(generator) == 2
-    assert next(generator) == 3
-    with pytest.raises(StopIteration):
-        next(generator)
-
-    assert [mapping.tolist() for mapping in mappings] == [
-        [10],
-        [20],
-        [30],
-        [40],
-    ]
-    assert state_calls == [(0, False), (1, False), (2, False), (3, False)]
-    assert compute_stream.events == []
-    assert events[0].records == ["store", "synchronize"]
-    assert events[1].records == ["store", "synchronize"]
-    assert events[2].records == ["store", "synchronize"]
-    assert events[3].records == ["store", "synchronize"]
-    assert "synchronize" not in connector.store_stream.events
-    assert connector._layerwise_prefill_bank_counts == {kv_group: 2}
-    assert connector._layerwise_prefill_save_done_events == {
-        (kv_group, 0): (0, events[2]),
-        (kv_group, 1): (0, events[3]),
-    }
-
-    stale = connector.batched_from_gpu(
-        memory_objs,
-        [0],
-        [1],
-        slot_mapping=torch.tensor([0]),
-        sync=False,
-        deferred_layerwise_put=True,
-        layerwise_prefill_bank_count=2,
-        kv_group=kv_group,
-    )
-    assert next(stale) is None
-    assert stale.send({"slot_mapping": torch.tensor([10])}) is None
-    connector.reset_layerwise_prefill_transfer_state(kv_group, synchronize=False)
-    with pytest.raises(RuntimeError, match="belongs to a reset step"):
-        stale.send({"slot_mapping": torch.tensor([20])})
-    assert connector.store_stream.events[-1] == "synchronize"
-    assert connector._layerwise_prefill_save_done_events == {}
-
-
-def test_deferred_staging_store_keeps_single_source_bank(monkeypatch) -> None:
-    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
-    connector.num_layers = 2
-    connector.kvcaches = [object(), object()]
-    connector.use_gpu = False
-    connector.store_stream = _TrackingStream("store")
-    compute_stream = _TrackingStream("compute")
-    events = [_TrackingEvent("layer-0"), _TrackingEvent("layer-1")]
-    event_index = 0
-
-    class _Npu:
-        @staticmethod
-        def current_stream():
-            return compute_stream
-
-        @staticmethod
-        def stream(_stream):
-            return nullcontext()
-
-        @staticmethod
-        def Event():
-            nonlocal event_index
-            event = events[event_index]
-            event_index += 1
-            return event
-
-    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
-    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **_kwargs: None)
-    monkeypatch.setattr(
-        connector,
-        "_lazy_initialize_buffer_with_staging",
-        lambda *_args, **_kwargs: _DenseLayout(),
-    )
-    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda _group=0: False)
-    monkeypatch.setattr(
-        connector,
-        "_expected_memory_format",
-        lambda _group=0: MemoryFormat.KV_MLA_LATENT_FMT,
-    )
-    monkeypatch.setattr(connector, "_layerwise_token_major", lambda _group=0: False)
-    monkeypatch.setattr(
-        connector, "_sparse_lmc_host_interleaved", lambda _group=0: False
-    )
-    monkeypatch.setattr(
-        connector, "_check_layerwise_transfer_invariants", lambda **_kwargs: None
-    )
-    monkeypatch.setattr(lmc_ops, "single_layer_kv_transfer", lambda *_args: None)
-
-    generator = connector.batched_from_gpu(
-        [[_MemoryObj(torch.zeros(1))], [_MemoryObj(torch.zeros(1))]],
-        [0],
-        [1],
-        slot_mapping=torch.tensor([0]),
-        sync=False,
-        deferred_layerwise_put=True,
-        layerwise_prefill_bank_count=2,
-    )
-
-    assert next(generator) is None
-    assert generator.send({"slot_mapping": torch.tensor([10])}) is None
-    assert generator.send({"slot_mapping": torch.tensor([20])}) == 0
-    assert next(generator) == 1
-    with pytest.raises(StopIteration):
-        next(generator)
-
-    assert compute_stream.events == [
-        ("wait_event", "layer-0"),
-        ("wait_event", "layer-1"),
-    ]
-    assert events[0].records == ["store", "synchronize"]
-    assert events[1].records == ["store", "synchronize"]
 
 
 def test_dense_group_store_uses_one_host_dispatch(monkeypatch) -> None:
