@@ -303,8 +303,11 @@ def fixture(
 
 @pytest.mark.parametrize("groups", [(0,), (0, 1)])
 @pytest.mark.parametrize("mapping", ["full", "window", "absent"])
-def test_fully_cached_prefix_requires_full_sources_for_repair(groups, mapping):
+@pytest.mark.parametrize("repair", [None, False, True])
+def test_fully_cached_prefix_requires_full_sources_for_repair(groups, mapping, repair):
     f = fixture(groups=groups, prefix=2080, tail_behavior="existing")
+    if repair is not None:
+        f.engine.config.remote_fill_prefix_hole_repair = repair
     f.state.remote_fill.session = None
     probes = []
     f.coordinator.submit_probe = lambda *a, **kw: probes.append(
@@ -321,7 +324,7 @@ def test_fully_cached_prefix_requires_full_sources_for_repair(groups, mapping):
         }
     )
     assert f.invoke(end=2080, prefix_slots=slots)
-    if mapping == "full":
+    if mapping == "full" and repair:
         assert f.state.remote_fill.prefix_source is not None
         assert not f.state.remote_fill.disabled_reason
         assert len(probes) == 2 and all(callable(probe) for probe in probes)
@@ -330,6 +333,28 @@ def test_fully_cached_prefix_requires_full_sources_for_repair(groups, mapping):
         assert f.state.remote_fill.prefix_source is None
         assert f.state.remote_fill.disabled_reason == "no_addressable_source_page"
         assert not probes
+
+
+@pytest.mark.parametrize("repair", [None, False])
+def test_disabled_repair_keeps_normal_remote_fill_without_retaining_prefix(repair):
+    f = fixture()
+    if repair is not None:
+        f.config.remote_fill_prefix_hole_repair = repair
+    factories = []
+    submit_probe = f.coordinator.submit_probe
+
+    def probe(*args, **kwargs):
+        factories.append(kwargs.get("source_factory"))
+        return submit_probe(*args, **kwargs)
+
+    f.coordinator.submit_probe = probe
+    slots = {group: SimpleNamespace(ndim=1, numel=lambda: 2116) for group in (0, 1)}
+    assert f.invoke(prefix_slots=slots)
+    f.drain({"r"})
+    assert factories and all(factory is None for factory in factories)
+    assert f.state.remote_fill.prefix_source is None
+    assert f.transfers and f.persistent
+    assert not f.state.remote_fill.disabled_reason
 
 
 @pytest.mark.parametrize("groups", [(0,), (0, 1)])

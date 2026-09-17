@@ -988,6 +988,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                             for group in selected
                         }
                         if remote_fill_request and verified_prefix_end > 0
+                        and getattr(
+                            self.config, "remote_fill_prefix_hole_repair", False
+                        )
                         and not request.is_sparse_decode
                         and request.slot_mapping and request.indexer_slot_mapping
                         else None

@@ -9,18 +9,38 @@ import lmcache_ascend  # noqa: F401
 from lmcache.v1.config import LMCacheEngineConfig
 
 
-def _config(role: str) -> LMCacheEngineConfig:
+def _config(role: str, repair=None) -> LMCacheEngineConfig:
     options = {
         "enable_remote_lmcache_store": True,
         "pd_role": role,
         "remote_url": "mooncakestore://metadata",
         "chunk_size": 1024,
     }
+    if repair is not None:
+        options["remote_fill_prefix_hole_repair"] = repair
     if role == "receiver":
         options.update(local_cpu=True, max_local_cpu_size=1.0)
     config = LMCacheEngineConfig.from_defaults(**options)
     config.validate()
     return config
+
+
+@pytest.mark.parametrize("role", ["sender", "receiver"])
+@pytest.mark.parametrize("repair", [None, False, True])
+def test_prefix_hole_repair_is_default_off_and_not_forced_by_remote_fill(role, repair):
+    config = _config(role, repair)
+    assert config.enable_remote_lmcache_store is True
+    assert config.remote_fill_prefix_hole_repair is (repair is True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefix_hole_repair_yaml_and_environment(tmp_path, monkeypatch, enabled):
+    path = tmp_path / "lmcache.yaml"
+    path.write_text(f"remote_fill_prefix_hole_repair: {str(enabled).lower()}\n")
+    config = LMCacheEngineConfig.from_file(str(path))
+    assert config.remote_fill_prefix_hole_repair is enabled
+    monkeypatch.setenv("LMCACHE_REMOTE_FILL_PREFIX_HOLE_REPAIR", str(enabled).lower())
+    assert LMCacheEngineConfig.from_env().remote_fill_prefix_hole_repair is enabled
 
 
 def test_remote_fill_sender_implies_fixed_direct_store_contract() -> None:

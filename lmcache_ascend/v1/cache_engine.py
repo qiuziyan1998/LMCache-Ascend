@@ -2662,6 +2662,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             remote_fill = False
         if (
             remote_fill and verified_prefix_end > 0
+            and getattr(self.config, "remote_fill_prefix_hole_repair", False)
             and state.remote_fill.prefix_source is None
             and prefix_slot_mappings
             and all(
