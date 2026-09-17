@@ -3102,9 +3102,25 @@ class AscendLMCacheEngine(LMCacheEngine):
             # source. Without this fence the DMA can read slots before the
             # attention scatter of the current forward lands (deterministically
             # the youngest layer, e.g. the last DSA index layer).
-            persistent_fence_events = complete_ready_events or (
-                (ready_event,) if ready_event is not None else ()
-            )
+            if complete_ready_events:
+                persistent_fence_events = complete_ready_events
+            else:
+                persistent_fence_events = (
+                    (ready_event,) if ready_event is not None else ()
+                )
+                if not getattr(
+                    self, "_incomplete_producer_fence_warned", False
+                ):
+                    self._incomplete_producer_fence_warned = True
+                    logger.warning(
+                        "[DSA-DIRECT-STORE] req=%s persistent put runs without "
+                        "a complete producer fence (single_event=%s, "
+                        "source=%s): DMA may read NPU slots before the "
+                        "current forward's attention scatter lands",
+                        req_id,
+                        ready_event is not None,
+                        ready_event_source,
+                    )
             batch = _DirectPageBatch(
                 req_id,
                 keys,
