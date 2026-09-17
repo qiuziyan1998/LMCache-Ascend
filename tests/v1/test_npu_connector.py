@@ -1345,7 +1345,9 @@ def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
     monkeypatch.setattr(npu_connectors.torch, "tensor", counted_tensor)
     host_rows, npu_rows = [], []
 
-    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, npu_rows)
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        sources, host_rows, npu_rows, kv_group=0
+    )
 
     assert calls[:2] == [page.layer_data_ptr(0) for page in pages]
     assert len(calls) == len(pages) + len(suffix)
@@ -1487,7 +1489,9 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     rows = [[object(), object()], [object(), object()]]
     host_rows = []
 
-    connector.append_sparse_chunk_ptr_cache_for_layers(rows, host_rows, None)
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        rows, host_rows, None, kv_group=0
+    )
 
     assert host_rows == [[0, 1], [100, 101]]
     assert len(calls) == 4
@@ -1562,12 +1566,43 @@ def test_group_pointer_append_falls_back_for_malformed_page_layout(
     )
     host_rows = []
 
-    connector.append_sparse_chunk_ptr_cache_for_layers(sources, host_rows, None)
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        sources, host_rows, None, kv_group=0
+    )
 
     assert host_rows == [[0, 1, 2], [100, 101, 102]]
     assert len(calls) == 6
     for obj in [*pages, *suffix]:
         obj.ref_count_down()
+
+
+def test_group_pointer_append_uses_explicit_group_when_current_group_is_stale(
+    monkeypatch,
+) -> None:
+    connector = _make_sparse_pack_connector()
+    connector.num_layers = 79
+    connector._group_layouts = {
+        0: SimpleNamespace(num_layers=79),
+        1: SimpleNamespace(num_layers=22),
+    }
+    connector._current_kv_group = 1
+    monkeypatch.setattr(
+        connector,
+        "_resolve_registered_cpu_source_device_ptr",
+        lambda _source, *, layer_id, **_kwargs: layer_id + 1,
+    )
+    host_rows = []
+
+    connector.append_sparse_chunk_ptr_cache_for_layers(
+        [[object()] for _ in range(79)],
+        host_rows,
+        None,
+        kv_group=0,
+    )
+
+    assert len(host_rows) == 79
+    assert host_rows[0] == [1]
+    assert host_rows[-1] == [79]
 
 
 def _make_sparse_pack_connector() -> VLLMPagedMemLayerwiseNPUConnector:

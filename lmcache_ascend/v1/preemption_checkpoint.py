@@ -264,7 +264,7 @@ class CheckpointWorker:
                             )
                             for _, _, page, _ in fragments
                         ]
-                        for layer in range(self.engine.num_layers)
+                        for layer in range(self.engine.num_layers_for_group(group))
                     ],
                     starts,
                     ends,

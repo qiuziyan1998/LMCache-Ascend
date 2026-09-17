@@ -1498,6 +1498,9 @@ class _GroupLayout:
         "kv_device",
         "gpu_buffer_allocator",
         "staging_bytes_per_slot",
+        "num_layers",
+        "layer_indices",
+        "layout_signature",
     )
 
     def __init__(self) -> None:
@@ -1512,6 +1515,9 @@ class _GroupLayout:
         self.kv_device: Optional[torch.device] = None
         self.gpu_buffer_allocator: Optional[GPUMemoryAllocator] = None
         self.staging_bytes_per_slot: int = 0
+        self.num_layers: int = 0
+        self.layer_indices: tuple[int, ...] = ()
+        self.layout_signature: Optional[str] = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -1712,6 +1718,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
+        self.runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
         self.enable_npu_transfer_validation = bool(
             kwargs.get("enable_npu_transfer_validation", True)
         )
@@ -1909,6 +1916,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         new_sources: List[Union[torch.Tensor, MemoryObj]],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        kv_group: int,
     ) -> None:
         """Resolve and append NPU device ptrs for newly retrieved chunks only."""
         if not new_sources:
@@ -1940,7 +1949,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 else torch.cat((existing, new_ptrs_npu), dim=0)
             )
 
-        num_layers = self.num_layers
+        # Use the call's group rather than mutable connector state because
+        # interleaved group generators can leave that state stale.
+        num_layers = self._expected_group_layers(kv_group)
         if not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
         while len(cached_chunk_dev_ptrs) <= layer_id:
@@ -1969,6 +1980,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
         *,
         defer_copy: bool = False,
+        kv_group: Optional[int] = None,
     ) -> None:
         """Atomically refresh every layer pointer row with one H2D copy."""
         diagnose = serving_perf_enabled()
@@ -1976,10 +1988,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         thread_started = time.thread_time_ns() if diagnose else 0
         if not new_sources_by_layer:
             return
-        if len(new_sources_by_layer) != self.num_layers:
+        # The caller passes exactly this group's layer rows; use that length
+        # instead of the last-wins mirrored instance count.
+        num_layers = len(new_sources_by_layer)
+        expected_layers = self._expected_group_layers(kv_group)
+        if num_layers != expected_layers:
             raise ValueError(
                 "Sparse group pointer append must cover every layer: "
-                f"layers={len(new_sources_by_layer)}, expected={self.num_layers}"
+                f"layers={num_layers}, "
+                f"expected={expected_layers}, kv_group={kv_group}"
             )
         suffix_counts = {
             len(sources.pages) + len(sources.suffix)
@@ -2066,6 +2083,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         defer_copy: bool = False,
     ) -> None:
         """Append complete host rows and refresh their shared NPU table."""
+        num_layers = len(staged_rows)
         diagnose = serving_perf_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
@@ -2073,7 +2091,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             len(cached_chunk_dev_ptrs[layer_id])
             if layer_id < len(cached_chunk_dev_ptrs)
             else 0
-            for layer_id in range(self.num_layers)
+            for layer_id in range(num_layers)
         }
         if len(prefix_counts) != 1:
             raise ValueError(
@@ -2084,7 +2102,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             list(cached_chunk_dev_ptrs[layer_id]) + staged_rows[layer_id]
             if layer_id < len(cached_chunk_dev_ptrs)
             else staged_rows[layer_id]
-            for layer_id in range(self.num_layers)
+            for layer_id in range(num_layers)
         ]
         row_views = None
         table_started = time.perf_counter() if diagnose else 0.0
@@ -2109,15 +2127,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             table_ms = unbind_ms = 0.0
 
         if not cached_chunk_dev_ptrs:
-            cached_chunk_dev_ptrs.extend([] for _ in range(self.num_layers))
-        while len(cached_chunk_dev_ptrs) < self.num_layers:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) < num_layers:
             cached_chunk_dev_ptrs.append([])
         if cached_chunk_ptrs_npu is not None:
             if not cached_chunk_ptrs_npu:
-                cached_chunk_ptrs_npu.extend(None for _ in range(self.num_layers))
-            while len(cached_chunk_ptrs_npu) < self.num_layers:
+                cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+            while len(cached_chunk_ptrs_npu) < num_layers:
                 cached_chunk_ptrs_npu.append(None)
-        for layer_id in range(self.num_layers):
+        for layer_id in range(num_layers):
             cached_chunk_dev_ptrs[layer_id].extend(staged_rows[layer_id])
             if cached_chunk_ptrs_npu is not None:
                 assert row_views is not None
@@ -2153,6 +2171,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         first = rows[0]
         assert isinstance(first, LayerPageSource)
         pages = first.pages
+        # The batch covers exactly this group's layer rows.
+        page_layers = len(rows)
         if any(
             len(source.pages) != len(pages)
             or any(
@@ -2181,13 +2201,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             if (
                 not page.valid
-                or page.num_layers != self.num_layers
+                or page.num_layers != page_layers
                 or page.layer_size <= 0
                 or prefixes
-                != tuple(i * page.layer_size for i in range(self.num_layers + 1))
-                or len(shapes) != self.num_layers
+                != tuple(i * page.layer_size for i in range(page_layers + 1))
+                or len(shapes) != page_layers
                 or len(set(shapes)) != 1
-                or len(dtypes) != self.num_layers
+                or len(dtypes) != page_layers
                 or len(set(dtypes)) != 1
                 or page_layout[2] is None
                 or (
@@ -2199,7 +2219,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             compatible_layout = page_layout
 
         validation_ms = (time.perf_counter() - started) * 1000 if diagnose else 0.0
-        result = [[] for _ in range(self.num_layers)]
+        result = [[] for _ in range(page_layers)]
         for chunk_index, page in enumerate(pages):
             base = self._resolve_registered_cpu_source_device_ptr(
                 page,
@@ -2425,7 +2445,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
         if not self.enable_npu_transfer_validation:
             return None
-        if len(kvcaches_ref) != self.num_layers:
+        # Sealing follows graph capture, before the first latent transfer may
+        # initialize its lazy layout. Use the already validated runtime count;
+        # the mirrored num_layers may describe the preflighted indexer group.
+        runtime_counts = self.runtime_kv_group_layer_counts
+        if runtime_counts is None:
+            expected_layers = self._expected_group_layers(0)
+        else:
+            expected_layers = runtime_counts[0]
+            initialized_layers = self.get_num_layers(0)
+            if initialized_layers is not None and initialized_layers != expected_layers:
+                raise ValueError(
+                    "Sparse destination layout disagrees with runtime layers"
+                )
+        if len(kvcaches_ref) != expected_layers:
             raise ValueError("Cannot seal sparse destinations with wrong layer count")
         signature = tuple(
             self._vllm_layer_cache_identity_signature(layer) for layer in kvcaches_ref
@@ -2464,10 +2497,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         resolve_started = time.perf_counter() if diagnostics is not None else 0.0
         if expected_device is None:
             raise RuntimeError(f"kv_group={kv_group} has no initialized NPU device")
-        if len(kvcaches_ref) != self.num_layers:
+        num_layers = len(kvcaches_ref)
+        if num_layers != self._expected_group_layers(kv_group):
             raise ValueError(
                 "Prepared sparse destination has the wrong layer count: "
-                f"kvcaches={len(kvcaches_ref)}, connector={self.num_layers}"
+                f"kvcaches={num_layers}, "
+                f"expected={self._expected_group_layers(kv_group)}"
             )
         if slot_mapping_ref.device != expected_device:
             raise ValueError(
@@ -2534,7 +2569,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 sparse_v_hidden_dims,
                 sparse_dsa_hidden_dims,
             )
-            for layer_id in range(self.num_layers)
+            for layer_id in range(num_layers)
         )
         if (
             binding is not None
@@ -3689,8 +3724,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kv_group, f"unsupported_format:{layout.kv_format}"
                 )
             planes = 2 if kv_group == 0 else 1
-            layers = kvcaches[: self.num_layers]
-            if len(layers) != self.num_layers or any(
+            layers = kvcaches[: self._expected_group_layers(kv_group)]
+            if len(layers) != self._expected_group_layers(kv_group) or any(
                 len(layer) != planes for layer in layers
             ):
                 return self._reject_direct_page_plan(
@@ -3761,7 +3796,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             expected_token_bytes = (
                 self.get_shape(1, kv_group).numel()
                 * owners[0].element_size()
-                * self.num_layers
+                * self._expected_group_layers(kv_group)
             )
             if (
                 sum(token_bytes for _, token_bytes in tensor_meta)
@@ -3984,6 +4019,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 return None
             tensor_meta, owners, slot_capacity = direct_layout
             planes = 2 if kv_group == 0 else 1
+            group_layers = len(tensor_meta) // planes
             if not starts or len(starts) != len(ends):
                 return self._reject_direct_page_plan(kv_group, "invalid_ranges")
             slot_base, slot_end = min(starts), max(ends)
@@ -4027,7 +4063,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
 
                 page_ptrs, page_sizes = [], []
-                for layer in range(self.num_layers if layerwise else 1):
+                for layer in range(group_layers if layerwise else 1):
                     ptrs: List[int] = []
                     sizes: List[int] = []
                     metadata = (
@@ -4047,7 +4083,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 metadata_bytes = (
                     self.get_shape(end - start, kv_group).numel()
                     * owners[0].element_size()
-                    * self.num_layers
+                    * group_layers
                 )
                 if sum(map(sum, page_sizes)) != expected or expected != metadata_bytes:
                     return self._reject_direct_page_plan(
@@ -4185,15 +4221,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping_full = self._slot_mapping_on_kv_device(
             slot_mapping_full, self.store_stream
         )
-        if len(memory_objs) != self.num_layers:
+        expected_layers = self._expected_group_layers(kv_group)
+        if len(memory_objs) != expected_layers:
             raise RuntimeError(
                 "NPU group store memory object layer count mismatch: "
-                f"got {len(memory_objs)}, expected {self.num_layers}"
+                f"got {len(memory_objs)}, expected {expected_layers}"
             )
-        if len(self.kvcaches) < self.num_layers:
+        if len(self.kvcaches) < expected_layers:
             raise RuntimeError(
                 "NPU group store KV cache layer count mismatch: "
-                f"got {len(self.kvcaches)}, expected at least {self.num_layers}"
+                f"got {len(self.kvcaches)}, expected at least {expected_layers}"
             )
 
         expected_fmt = self._expected_memory_format(kv_group)
@@ -4312,6 +4349,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self.initialize_kvcaches_ptr(**kwargs)
         caches = self.kvcaches
         group = int(kwargs.get("kv_group", 0))
+        group_layers = self._expected_group_layers(group)
         slots = kwargs["slot_mapping"]
         base = int(kwargs.get("slot_mapping_base", 0))
         if (
@@ -4327,8 +4365,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("Checkpoint capture requires contiguous resident intervals")
         if (
             caches is None
-            or len(caches) < self.num_layers
-            or len(memory_objs) != self.num_layers
+            or len(caches) < group_layers
+            or len(memory_objs) != group_layers
         ):
             raise ValueError("Checkpoint capture layer count mismatch")
         layout = self._lazy_initialize_buffer_with_staging(
@@ -4475,6 +4513,66 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group = self._current_kv_group
         return self._group_layouts.get(kv_group)
 
+    def get_num_layers(self, kv_group: int = 0) -> Optional[int]:
+        """Return the authoritative layer count of a KV group.
+
+        The count comes from the registered group caches captured at layout
+        initialization (e.g. 79 for latent, 22 for indexer under
+        dsa_two_groups). This is stable across interleaved per-group calls,
+        unlike the mirrored ``self.num_layers``.
+
+        Args:
+            kv_group: The KV group index.
+
+        Returns:
+            The group's layer count, or None when the group layout has not
+            been initialized yet (callers fall back to legacy resolution).
+        """
+        layouts = getattr(self, "_group_layouts", None)
+        if not layouts:
+            return None
+        layout = layouts.get(kv_group)
+        if layout is None or layout.num_layers <= 0:
+            return None
+        return layout.num_layers
+
+    def get_layer_indices(self, kv_group: int = 0) -> Optional[tuple[int, ...]]:
+        """Return the group-local layer indices of a KV group.
+
+        Args:
+            kv_group: The KV group index.
+
+        Returns:
+            The group-local layer index tuple, or None when the group layout
+            has not been initialized yet.
+        """
+        layouts = getattr(self, "_group_layouts", None)
+        if not layouts:
+            return None
+        layout = layouts.get(kv_group)
+        if layout is None or not layout.layer_indices:
+            return None
+        return layout.layer_indices
+
+    def _expected_group_layers(self, kv_group: Optional[int]) -> int:
+        """Resolve the per-group transfer row count for invariant checks.
+
+        Prefers the authoritative layout cardinality and falls back to the
+        mirrored instance count (legacy single-group contract) when the
+        layout has not been initialized.
+        """
+        if kv_group is None:
+            kv_group = getattr(self, "_current_kv_group", 0)
+        group_layers = self.get_num_layers(kv_group)
+        if group_layers is not None:
+            return group_layers
+        if self.dsa_two_groups:
+            raise RuntimeError(
+                "DSA transfer cannot resolve layer cardinality before the "
+                f"kv_group={kv_group} layout is initialized"
+            )
+        return self.num_layers
+
     def set_layerwise_staging_concurrency(self, n: int) -> None:
         """Size per-group staging pools for concurrent layerwise transfers."""
         n = max(1, int(n))
@@ -4555,10 +4653,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if not self.dsa_two_groups or kv_group not in (0, 1):
             return
         kvcaches_len = len(kvcaches_ref) if kvcaches_ref is not None else 0
-        if kvcaches_len != self.num_layers:
+        expected_layers = self._expected_group_layers(kv_group)
+        if kvcaches_len != expected_layers:
             message = (
                 f"{operation} layerwise transfer has mismatched layer counts: "
-                f"kv_group={kv_group} connector_num_layers={self.num_layers} "
+                f"kv_group={kv_group} expected_group_layers={expected_layers} "
                 f"kvcaches_len={kvcaches_len}"
             )
             logger.error(
@@ -4596,7 +4695,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"{operation} layerwise transfer slot mapping is out of range: "
                 f"kv_group={kv_group} slot_min={slot_min} slot_max={slot_max} "
                 f"kvcaches_capacity={capacity} kvcaches_shape={shape} "
-                f"connector_num_layers={self.num_layers} "
+                f"expected_group_layers={expected_layers} "
                 f"kvcaches_len={kvcaches_len}"
             )
             logger.error(message)
@@ -4734,6 +4833,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._reset_sparse_direct_layer_states()
             first_layer_cache = kv_caches[0]
 
+            # Authoritative per-group cardinality: the registered group caches
+            # are the runtime truth of how many layer rows this group
+            # transfers (GLM-5.2: latent=79, indexer=22). The mirrored
+            # instance self.num_layers is last-wins across interleaved group
+            # calls, so per-group readers must use layout.num_layers.
+            layout.num_layers = len(kv_caches)
+            layout.layer_indices = tuple(range(len(kv_caches)))
+
             if layout.kv_format == KVCacheFormat.SEPARATE_KV:
                 key_tensor = first_layer_cache[0]
                 value_tensor = first_layer_cache[1]
@@ -4828,24 +4935,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
                 payload = {
                     "format": layout.kv_format.name,
-                    "layers": self.num_layers,
+                    "layers": layout.num_layers,
                     "chunk_size": self.lmcache_chunk_size,
                     "planes": planes,
                     "page_bytes": (
                         sum(plane["token_bytes"] for plane in planes)
                         * self.lmcache_chunk_size
-                        * self.num_layers
+                        * layout.num_layers
                     ),
                 }
                 encoded = json.dumps(
                     payload, sort_keys=True, separators=(",", ":")
                 )
+                layout.layout_signature = hashlib.blake2b(
+                    encoded.encode(), digest_size=8
+                ).hexdigest()
                 logger.info(
                     "LMCache NPU payload layout: "
                     "signature=%s kv_group=%d schema=%s",
-                    hashlib.blake2b(
-                        encoded.encode(), digest_size=8
-                    ).hexdigest(),
+                    layout.layout_signature,
                     kv_group,
                     payload,
                 )
@@ -5116,7 +5224,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         try:
             validated_page_ids: set[int] = set()
-            for layer_id in range(self.num_layers):
+            for layer_id in range(self._expected_group_layers(kv_group)):
                 memory_objs_layer = yield
                 source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
                 page_checks: tuple[MemoryObj, ...] = ()
@@ -5530,7 +5638,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # Preserve the layerwise generator protocol while deliberately
             # skipping every CPU-to-NPU payload. The cache engine still
             # resolves, owns, and seals the complete CPU latent source.
-            for _ in range(self.num_layers):
+            kvcaches = kwargs.get("kvcaches")
+            num_layers = len(kvcaches) if kvcaches is not None else self.num_layers
+            for _ in range(num_layers):
                 yield
             yield
             yield
@@ -5620,7 +5730,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 expected_device=layout.kv_device,
                 diagnostics=diagnostics,
             )
-        for layer_id in range(self.num_layers):
+        for layer_id in range(
+            self._expected_group_layers(kv_group)
+        ):
             sparse_request = yield
             # The generator is resumed from vLLM's attention path; refresh the
             # active compute stream per layer before ordering load -> compute.
@@ -6249,14 +6361,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 total_tokens=num_tokens,
                 kv_group=kv_group,
             )
-        if len(memory_objs) != self.num_layers:
+        expected_layers = self._expected_group_layers(kv_group)
+        if len(memory_objs) != expected_layers:
             logger.error(
                 "NPU layerwise store received wrong memory object layer count: "
                 "kv_group=%s memory_layers=%d expected=%d chunk_count=%d "
                 "starts=%s ends=%s fmt=%s kvcaches_layers=%d",
                 kv_group,
                 len(memory_objs),
-                self.num_layers,
+                expected_layers,
                 len(starts),
                 starts,
                 ends,
@@ -6265,20 +6378,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             raise RuntimeError(
                 "NPU layerwise store memory object layer count mismatch: "
-                f"got {len(memory_objs)}, expected {self.num_layers}"
+                f"got {len(memory_objs)}, expected {expected_layers}"
             )
-        if len(kvcaches_snapshot) < self.num_layers:
+        if len(kvcaches_snapshot) < expected_layers:
             logger.error(
                 "NPU layerwise store has fewer kv cache layers than expected: "
                 "kv_group=%s kvcaches_layers=%d expected=%d fmt=%s",
                 kv_group,
                 len(kvcaches_snapshot),
-                self.num_layers,
+                expected_layers,
                 expected_fmt,
             )
             raise RuntimeError(
                 "NPU layerwise store kv cache layer count mismatch: "
-                f"got {len(kvcaches_snapshot)}, expected {self.num_layers}"
+                f"got {len(kvcaches_snapshot)}, expected {expected_layers}"
             )
 
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
@@ -6296,7 +6409,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         current_stream = torch.npu.current_stream()
 
         try:
-            for layer_id in range(self.num_layers):
+            for layer_id in range(expected_layers):
                 memory_objs_layer = memory_objs[layer_id]
                 # kvcaches -> gpu_buffer -> memobj
                 if dense_direct:

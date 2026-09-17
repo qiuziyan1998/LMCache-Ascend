@@ -554,6 +554,9 @@ class TestAscendStoreLayerCompletion:
         engine.is_healthy.return_value = True
         engine.is_frozen.return_value = False
         engine.num_layers = 1
+        # Per-group cardinality resolution: single-layer mock groups.
+        engine._num_layers_for_kv_group.return_value = 1
+        engine._num_transfer_layers_for_call.return_value = 1
         engine._get_req_id.return_value = "test"
         engine.stats_monitor.on_store_request.return_value = "monitor"
         engine.config.extra_config = {}
@@ -972,6 +975,7 @@ def test_sparse_window_store_cache_publishes_only_full_chunks() -> None:
         memory_objs,
         cached_tensors,
         cache_chunk_indices=[0],
+        kv_group=0,
     )
 
     assert cached_starts == [0]
@@ -3914,16 +3918,27 @@ class TestRetrieverPairAdvancement:
     @staticmethod
     def _bind_wait_protocol(fake, dsa_two_groups):
         fake.config = SimpleNamespace(dsa_two_groups=dsa_two_groups)
-        fake._indexer_layer_names = []
+        fake._indexer_layer_names = (
+            [
+                f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+                for layer_id in range(fake.num_layers)
+            ]
+            if dsa_two_groups
+            else []
+        )
         fake._layerwise_waited_groups = set()
-        fake._layerwise_required_wait_groups_cache = None
+        fake._record_sparse_retrieve_stats = lambda *_args: None
+        fake._abort_layerwise_retrieve_step = lambda *_args: None
         return _bind_real(
             fake,
             "_is_dsa_two_groups",
             "_is_indexer_layer_wait",
             "_layerwise_wait_group",
+            "_layerwise_layer_id_from_name",
+            "_layerwise_has_indexer_model_layer",
             "_layerwise_required_wait_groups",
             "_layerwise_wait_should_advance",
+            "_sparse_retrieve_state_guard",
         )
 
     def test_prefix_advances_both_retrievers(self):
@@ -3958,9 +3973,13 @@ class TestRetrieverPairAdvancement:
             ),
             dsa_two_groups=True,
         )
-        _adapter_method("wait_for_layer_load")(fake, layer_name="layer.0")
+        _adapter_method("wait_for_layer_load")(
+            fake, layer_name="model.layers.0.self_attn.attn"
+        )
         assert fake.current_layer == 0
-        _adapter_method("wait_for_layer_load")(fake, layer_name="indexer.0")
+        _adapter_method("wait_for_layer_load")(
+            fake, layer_name="model.layers.0.self_attn.indexer.k_cache"
+        )
         assert fake.current_layer == 1
 
     def test_sparse_advances_primary_only(self):
@@ -3998,6 +4017,84 @@ class TestRetrieverPairAdvancement:
             request_ids=["r1"],
         )
         assert fake.current_layer == 1
+
+    def test_sparse_two_group_indexer_advances_only_physical_layers(self):
+        """Consumer latent waits must not consume the 22-row indexer stream."""
+        from lmcache.integration.vllm.vllm_v1_adapter import (
+            LMCacheConnectorMetadata,
+        )
+
+        producer_layers = (0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38,
+                           42, 46, 50, 54, 58, 62, 66, 70, 74, 78)
+        latent_sends = []
+        indexer_sends = []
+
+        def _retriever(sends, count):
+            for layer_id in range(count):
+                payload = yield None
+                sends.append((layer_id, payload))
+            yield None
+
+        latent_retriever = _retriever(latent_sends, 79)
+        indexer_retriever = _retriever(indexer_sends, 22)
+        next(latent_retriever)
+        next(indexer_retriever)
+        request = SimpleNamespace(
+            req_id="r1",
+            load_spec=SimpleNamespace(can_load=True),
+            is_sparse_decode=True,
+        )
+        meta = LMCacheConnectorMetadata(requests=[request])
+        fake = SimpleNamespace(
+            config=SimpleNamespace(dsa_two_groups=True),
+            _indexer_layer_names=[
+                f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+                for layer_id in producer_layers
+            ],
+            layerwise_retrievers=[(latent_retriever, indexer_retriever)],
+            _layerwise_retriever_is_sparse=[True],
+            _layerwise_requests=[request],
+            _layerwise_sparse_req_ids=["r1"],
+            _layerwise_sparse_shared_ordered=[False],
+            _layerwise_sparse_indexer_sent_layers=set(),
+            _layerwise_waited_groups=set(),
+            current_layer=0,
+            num_layers=79,
+            _parent=SimpleNamespace(_get_connector_metadata=lambda: meta),
+            _finalize_worker_retrieve_state_from_metadata=lambda _: None,
+            _record_sparse_retrieve_stats=lambda *_args: None,
+            _abort_layerwise_retrieve_step=lambda *_args: None,
+            _drain_layerwise_retrievers=lambda *_args, **_kwargs: None,
+            _cold_perf_dense_load_started={},
+            _cold_perf_load_started={},
+        )
+        fake = _bind_real(
+            fake,
+            "_is_dsa_two_groups",
+            "_is_indexer_layer_wait",
+            "_layerwise_wait_group",
+            "_layerwise_required_wait_groups",
+            "_layerwise_wait_should_advance",
+            "_layerwise_layer_id_from_name",
+            "_layerwise_has_indexer_model_layer",
+            "_sparse_retrieve_state_guard",
+        )
+
+        for layer_id in range(79):
+            if layer_id in producer_layers:
+                _adapter_method("wait_for_layer_load")(
+                    fake,
+                    layer_name=(
+                        f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+                    ),
+                )
+            _adapter_method("wait_for_layer_load")(
+                fake,
+                layer_name=f"model.layers.{layer_id}.self_attn.attn",
+            )
+
+        assert len(latent_sends) == 79
+        assert len(indexer_sends) == 22
 
 
 # ---------------------------------------------------------------------------
@@ -4184,7 +4281,6 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         _layerwise_sparse_req_ids=[],
         _layerwise_waited_groups=set(),
         _layerwise_sparse_indexer_sent_layers=set(),
-        _layerwise_required_wait_groups_cache=None,
         _decode_window_save_completed_groups=set(),
         _decode_window_save_expected_start={},
         _completed_decode_window_saves={},

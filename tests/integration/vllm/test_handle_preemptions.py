@@ -130,6 +130,78 @@ def test_dynamic_connector_advertises_staged_sparse_load_by_role(
     assert connector.supports_staged_sfa_sparse_load is False
 
 
+def test_dynamic_connector_forwards_vllm_kv_cache_config(monkeypatch):
+    pytest.importorskip("lmcache")
+    pytest.importorskip("vllm")
+    connector_mod = pytest.importorskip(
+        "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1"
+    )
+    captured = {}
+    vllm_config = object()
+    role = object()
+    kv_cache_config = object()
+
+    def fake_init(self, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        connector_mod.LMCacheConnectorV1Dynamic,
+        "__init__",
+        fake_init,
+    )
+
+    connector_mod.LMCacheAscendConnectorV1Dynamic(
+        vllm_config,
+        role,
+        kv_cache_config,
+    )
+
+    assert captured == {
+        "vllm_config": vllm_config,
+        "role": role,
+        "kv_cache_config": kv_cache_config,
+    }
+
+
+def test_ascend_impl_forwards_vllm_kv_cache_config(monkeypatch):
+    pytest.importorskip("lmcache")
+    pytest.importorskip("vllm")
+    adapter_mod = pytest.importorskip(
+        "lmcache_ascend.integration.vllm.vllm_v1_adapter"
+    )
+    captured = {}
+    vllm_config = object()
+    role = object()
+    parent = object()
+    kv_cache_config = object()
+
+    def fake_init(self, *args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        self.config = SimpleNamespace(
+            use_layerwise=False,
+            store_async=False,
+            extra_config={},
+        )
+        self.kv_role = "kv_consumer"
+
+    monkeypatch.setattr(
+        adapter_mod.LMCacheConnectorV1Impl,
+        "__init__",
+        fake_init,
+    )
+
+    adapter_mod.LMCacheAscendConnectorV1Impl(
+        vllm_config,
+        role,
+        parent,
+        kv_cache_config=kv_cache_config,
+    )
+
+    assert captured["args"] == (vllm_config, role, parent)
+    assert captured["kwargs"]["kv_cache_config"] is kv_cache_config
+
+
 def test_lmcache_connector_preemption_patch_handles_no_inner_impl():
     """The Ascend patch should tolerate inner implementations without a hook."""
     LMCacheConnectorV1 = _import_and_patch_vllm_connector()

@@ -179,7 +179,7 @@ def fill(page, start, group):
             offset += page.valid_tokens * width
 
 
-def fake_engine():
+def fake_engine(group_layers=(2, 2)):
     backend = LocalCPU()
     allocated, calls = [], []
 
@@ -196,7 +196,7 @@ def fake_engine():
 
     def allocate(group, length, caches=None):
         widths = (2, 1) if group == 0 else (1,)
-        page = Page(2, length, widths)
+        page = Page(group_layers[group], length, widths)
         allocated.append(page)
         return page, widths
 
@@ -247,7 +247,11 @@ def fake_engine():
             end,
         ),
         token_database=NS(process_tokens=tokens),
-        num_layers=2,
+        num_layers=group_layers[0],
+        num_layers_for_group=lambda group: group_layers[group],
+        _num_layers_for_kv_group=lambda group: group_layers[group],
+        _num_transfer_layers_for_call=lambda group, kwargs: group_layers[group],
+        metadata=NS(runtime_kv_group_layer_counts=None),
         is_frozen=lambda: False,
         allocate_checkpoint_fragment=allocate,
         load_checkpoint_prefix=prefix,
@@ -422,6 +426,31 @@ def test_aligned_capture_restores_without_prompt_fetch_or_cpu_assembly(
             assert torch.equal(engine.backend.pages[key].raw_data, expected.raw_data)
     for page in owners:
         page.ref_count_down()
+    store.close()
+
+
+@pytest.mark.parametrize("counts", [(3, 1), (79, 22)])
+def test_checkpoint_roundtrip_preserves_each_groups_physical_rows(
+    api, monkeypatch, counts
+):
+    engine = fake_engine(counts)
+    store, _, _ = start_capture(api, monkeypatch, engine=engine, end=14)
+    store.poll()
+    publish(api, store, 11)
+    base, owners = store.local.normalize("r", 1, list(range(11)), None)
+    assert base == 0
+    for group, count in enumerate(counts):
+        for start, end, key in engine.token_database.process_tokens(
+            tokens=list(range(11)), kv_group=group
+        ):
+            actual = engine.backend.pages[key]
+            expected = Page(count, end - start, (2, 1) if group == 0 else (1,))
+            fill(expected, start, group)
+            assert actual.num_layers == count
+            assert torch.equal(actual.raw_data, expected.raw_data)
+    for page in owners:
+        page.ref_count_down()
+    assert [call[0] for call in engine.calls].count("fence") == 1
     store.close()
 
 

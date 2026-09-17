@@ -71,6 +71,9 @@ def CreateNPUConnector(
                 conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
+                conn.runtime_kv_group_layer_counts = getattr(
+                    metadata, "runtime_kv_group_layer_counts", None
+                )
             conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
             conn.enable_npu_transfer_validation = getattr(
                 config, "enable_npu_transfer_validation", True

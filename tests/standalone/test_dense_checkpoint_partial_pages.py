@@ -56,6 +56,8 @@ def test_dense_loader_plans_full_and_partial_local_pages(
     )
     obj = cls()
     obj.num_layers, obj.config = 2, engine.config
+    obj._num_transfer_layers_for_call = engine._num_transfer_layers_for_call
+    obj.num_layers_for_group = engine.num_layers_for_group
     obj.is_healthy = lambda: True
     obj._is_passive = lambda: False
     obj._should_use_shared_layerwise_retrieve = lambda group: True
