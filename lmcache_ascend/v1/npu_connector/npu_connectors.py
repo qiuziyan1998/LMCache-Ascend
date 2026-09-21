@@ -1946,8 +1946,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # physical banks even though they share the connector streams.
         self._layerwise_prefill_bank_counts: dict[int, int] = {}
         self._layerwise_prefill_transfer_generations: dict[int, int] = {}
+        # Keep one D2H completion fence per group/bank/layer.  A bank page
+        # contains every layer, but a layer consumer only reads its own plane.
+        # Tracking only (group, bank) made layer 0 wait on the FIFO store
+        # stream's last event for that bank (often the final model layer),
+        # exposing the whole preceding D2H queue before the first SFA.
         self._layerwise_prefill_save_done_events: dict[
-            tuple[int, int], tuple[int, Any]
+            tuple[int, int, int], tuple[int, Any]
         ] = {}
         self._layerwise_prefill_load_done_events: dict[
             tuple[int, int], tuple[int, Any]
@@ -2035,7 +2040,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return watchdog
 
     def layerwise_prefill_store_fences(self, kv_group: int) -> tuple[Any, ...]:
-        """Borrow the current generation's actual D2H bank-completion events.
+        """Borrow the current generation's actual per-layer D2H events.
 
         Call only after draining batched_from_gpu for the entire KV group.
         Events were already recorded on the store stream; this creates no new
@@ -2046,21 +2051,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if generation is None:
             return ()
         save_done = getattr(self, "_layerwise_prefill_save_done_events", {})
-        return tuple(
-            event
-            for (group, _bank), (epoch, event) in save_done.items()
+        current = [
+            (layer, event)
+            for (group, _bank, layer), (epoch, event) in save_done.items()
             if group == kv_group and epoch == generation
-        )
+        ]
+        current.sort(key=lambda item: item[0])
+        return tuple(event for _, event in current)
 
     def _layerwise_prefill_transfer_state(
         self,
     ) -> tuple[
         dict[int, int],
         dict[int, int],
-        dict[tuple[int, int], tuple[int, Any]],
+        dict[tuple[int, int, int], tuple[int, Any]],
         dict[tuple[int, int], tuple[int, Any]],
     ]:
-        """Return lazily initialized state used by P-node bank hand-offs."""
+        """Return lazily initialized state used by P-node bank hand-offs.
+
+        ``save_done`` is keyed by ``(kv_group, bank, layer_id)``.  The
+        store stream is FIFO, but a bank page is layer-major: a load of one
+        layer must depend on that layer's D2H fence, not on the last layer
+        submitted to the same bank.
+        """
         bank_counts = getattr(self, "_layerwise_prefill_bank_counts", None)
         if bank_counts is None:
             bank_counts = {}
@@ -2126,7 +2139,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         if kv_group is None:
             groups = set(bank_counts) | set(generations)
-            groups.update(group for group, _ in save_done)
+            groups.update(group for group, *_ in save_done)
             groups.update(group for group, _ in load_done)
         else:
             groups = {int(kv_group)}
@@ -2152,7 +2165,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         previous = bank_counts.get(kv_group)
         if previous is not None and previous != bank_count:
-            if any(group == kv_group for group, _ in save_done) or any(
+            if any(group == kv_group for group, *_ in save_done) or any(
                 group == kv_group for group, _ in load_done
             ):
                 raise RuntimeError(
@@ -2192,11 +2205,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         """Order a layer consumer after its asynchronous P-node bank hand-off.
 
-        A completed load already includes its load-stream wait on the previous
-        save of the destination bank.  Join the load completion on the compute
-        stream when it exists.  Only a layer with no current-generation load
-        falls back to the save fence (for example, a cache miss); otherwise a
-        second compute-stream wait would expose the store-stream backlog.
+        A completed load already includes its load-stream wait on the exact
+        layer's previous save.  Join the load completion on the compute stream
+        when it exists.  Only a layer with no current-generation load falls
+        back to that layer's save fence (for example, a cache miss); a bank
+        tail fence would expose unrelated later-layer D2H work.
         """
         _, generations, save_done, load_done = (
             self._layerwise_prefill_transfer_state()
@@ -2204,7 +2217,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         generation = generations.setdefault(int(kv_group), 0)
         current_stream = torch.npu.current_stream()
         bank = self._layerwise_prefill_bank(layer_id, kv_group)
-        save_record = save_done.get((kv_group, bank))
+        # The page is layer-major.  Waiting on the bank's last event would
+        # also wait for later layer planes that this consumer does not read.
+        save_record = save_done.get((kv_group, bank, int(layer_id)))
         diagnose_first_bank = prefill_start_timing_enabled() and layer_id == 0
         if diagnose_first_bank:
             wait_started = time.perf_counter()
@@ -5825,7 +5840,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     assert dma_plans is not None
                     bank = self._layerwise_prefill_bank(layer_id, kv_group)
                     _, _, save_done, _ = self._layerwise_prefill_transfer_state()
-                    previous_save = save_done.get((kv_group, bank))
+                    previous_save = save_done.get(
+                        (kv_group, bank, int(layer_id))
+                    )
                     bound = bind_incremental_copy_addresses(
                         dma_plans[bank], source_objs, starts, ends,
                         [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
@@ -5868,7 +5885,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         _, _, save_done, _ = (
                             self._layerwise_prefill_transfer_state()
                         )
-                        previous_save = save_done.get((kv_group, bank))
+                        previous_save = save_done.get(
+                            (kv_group, bank, int(layer_id))
+                        )
                         if (
                             previous_save is not None
                             and previous_save[0] == layerwise_prefill_generation
@@ -7479,7 +7498,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             kv_group,
                             layerwise_prefill_generation,
                         )
-                        save_done[(kv_group, bank)] = (
+                        save_done[(kv_group, bank, layer_id)] = (
                             layerwise_prefill_generation,
                             bank_done_event,
                         )

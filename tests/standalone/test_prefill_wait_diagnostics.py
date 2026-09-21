@@ -78,11 +78,13 @@ def test_first_bank_diagnostics_only_read_completed_events():
     exec(compile(ast.fix_missing_locations(unit), str(path), "exec"), namespace)
     connector = namespace["VLLMPagedMemLayerwiseNPUConnector"]()
     save, load = Event(), Event()
-    connector._layerwise_prefill_save_done_events = {(0, 0): (0, save)}
+    connector._layerwise_prefill_save_done_events = {(0, 0, 0): (0, save)}
     connector._layerwise_prefill_load_done_events = {(0, 0): (0, load)}
 
     connector.wait_for_layerwise_prefill_load(layer_id=0, kv_group=0)
-    assert stream.waited == [save, load]
+    # A completed H2D load already carries the exact layer's save dependency;
+    # joining the save again would re-expose the store-stream backlog.
+    assert stream.waited == [load]
     assert [stage for stage, _ in records] == ["first_bank_wait_enqueue"]
 
     connector._flush_prefill_first_bank_timing_events()

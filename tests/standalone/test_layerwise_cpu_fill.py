@@ -488,10 +488,12 @@ def test_bank_fences_are_borrowed_only_from_current_group_generation():
     assert obj.layerwise_prefill_store_fences(0) == ()
     obj._layerwise_prefill_transfer_generations = {0: 3, 1: 2}
     first, second = object(), object()
+    middle = object()
     obj._layerwise_prefill_save_done_events = {
-        (0, 0): (3, first),
-        (0, 1): (2, object()),
-        (1, 0): (2, second),
+        (0, 0, 2): (3, middle),
+        (0, 0, 0): (3, first),
+        (0, 1, 1): (2, object()),
+        (1, 0, 0): (2, second),
     }
-    assert obj.layerwise_prefill_store_fences(0) == (first,)
+    assert obj.layerwise_prefill_store_fences(0) == (first, middle)
     assert obj.layerwise_prefill_store_fences(1) == (second,)

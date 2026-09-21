@@ -4306,9 +4306,9 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> bool:
         """Return whether P-node DMA stores can publish without a host fence.
 
-        The dense prefill DMA path already records per-bank D2H events.  A
+        The dense prefill DMA path already records per-layer D2H events.  A
         local CPU backend only installs the MemoryObj pointer, so subsequent
-        same-process H2D is protected by those bank events.  Page-first
+        same-process H2D is protected by those layer events.  Page-first
         storage additionally forwards the events to the external-page
         backend.  Legacy tensor puts to a remote backend have no readiness
         argument and must keep the synchronous drain.

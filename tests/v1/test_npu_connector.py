@@ -4438,8 +4438,8 @@ def test_deferred_dense_batched_to_gpu_waits_old_save_on_load_stream(
     )
     connector._layerwise_prefill_bank_counts = {0: 2}
     connector._layerwise_prefill_save_done_events = {
-        (0, 0): (0, old_save_events[0]),
-        (0, 1): (0, old_save_events[1]),
+        (0, 0, 0): (0, old_save_events[0]),
+        (0, 1, 1): (0, old_save_events[1]),
     }
     connector._layerwise_prefill_load_done_events = {}
 
@@ -4462,10 +4462,7 @@ def test_deferred_dense_batched_to_gpu_waits_old_save_on_load_stream(
     assert compute_stream.events == []
     assert "synchronize" not in connector.load_stream.events
     connector.wait_for_layerwise_prefill_load(layer_id=1, kv_group=0)
-    assert compute_stream.events == [
-        ("wait_event", "save-bank-1"),
-        ("wait_event", "load-layer-1"),
-    ]
+    assert compute_stream.events == [("wait_event", "load-layer-1")]
     assert "synchronize" not in connector.load_stream.events
     assert next(generator) is None
     assert connector.load_stream.events[-1] == "synchronize"
@@ -4546,7 +4543,9 @@ def test_wait_for_layerwise_prefill_load_waits_load_completion(monkeypatch) -> N
 
     monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
     connector._layerwise_prefill_bank_counts = {0: 2}
-    connector._layerwise_prefill_save_done_events = {(0, 1): (0, save_event)}
+    connector._layerwise_prefill_save_done_events = {
+        (0, 1, 3): (0, save_event)
+    }
     connector._layerwise_prefill_load_done_events = {(0, 3): (0, load_event)}
 
     connector.wait_for_layerwise_prefill_load(layer_id=3, kv_group=0)
@@ -4556,6 +4555,33 @@ def test_wait_for_layerwise_prefill_load_waits_load_completion(monkeypatch) -> N
     # entire D2H backlog before SFA.
     assert compute_stream.events == [("wait_event", "load-layer-3")]
     assert connector._layerwise_prefill_load_done_events == {}
+
+
+def test_wait_for_layerwise_prefill_load_uses_exact_layer_save_fence(
+    monkeypatch,
+) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    compute_stream = _TrackingStream("compute")
+    layer_zero_save = _TrackingEvent("save-layer-0")
+    later_same_bank_save = _TrackingEvent("save-layer-2")
+
+    class _Npu:
+        @staticmethod
+        def current_stream():
+            return compute_stream
+
+    monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
+    connector._layerwise_prefill_bank_counts = {0: 2}
+    connector._layerwise_prefill_save_done_events = {
+        (0, 0, 0): (0, layer_zero_save),
+        (0, 0, 2): (0, later_same_bank_save),
+    }
+    connector._layerwise_prefill_load_done_events = {}
+
+    connector.wait_for_layerwise_prefill_load(layer_id=0, kv_group=0)
+
+    # Layer 0 must not inherit the later layer 2 tail of the same bank.
+    assert compute_stream.events == [("wait_event", "save-layer-0")]
 
 
 @pytest.mark.parametrize(
@@ -4604,8 +4630,8 @@ def test_wait_for_layerwise_prefill_load_without_hit_waits_old_bank_save(
     monkeypatch.setattr(torch, "npu", _Npu(), raising=False)
     connector._layerwise_prefill_bank_counts = {0: 2, 1: 2}
     connector._layerwise_prefill_save_done_events = {
-        (0, 1): (0, latent_save),
-        (1, 1): (0, indexer_save),
+        (0, 1, 3): (0, latent_save),
+        (1, 1, 3): (0, indexer_save),
     }
     connector._layerwise_prefill_load_done_events = {}
 
@@ -4632,7 +4658,7 @@ def test_wait_for_layerwise_prefill_load_ignores_stale_load_but_waits_current_sa
     connector._layerwise_prefill_bank_counts = {0: 2}
     connector._layerwise_prefill_transfer_generations = {0: 7}
     connector._layerwise_prefill_save_done_events = {
-        (0, 1): (7, current_save),
+        (0, 1, 3): (7, current_save),
     }
     connector._layerwise_prefill_load_done_events = {
         (0, 3): (6, stale_load),
@@ -4651,8 +4677,8 @@ def test_reset_layerwise_prefill_transfer_state_fences_and_invalidates_groups() 
     connector._layerwise_prefill_bank_counts = {0: 2, 1: 2}
     connector._layerwise_prefill_transfer_generations = {0: 4, 1: 9}
     connector._layerwise_prefill_save_done_events = {
-        (0, 0): (4, _TrackingEvent("save-0")),
-        (1, 0): (9, _TrackingEvent("save-1")),
+        (0, 0, 0): (4, _TrackingEvent("save-0")),
+        (1, 0, 2): (9, _TrackingEvent("save-1")),
     }
     connector._layerwise_prefill_load_done_events = {
         (0, 2): (4, _TrackingEvent("load-0")),
@@ -4664,7 +4690,7 @@ def test_reset_layerwise_prefill_transfer_state_fences_and_invalidates_groups() 
     assert connector.load_stream.events == ["synchronize"]
     assert connector.store_stream.events == ["synchronize"]
     assert connector._layerwise_prefill_transfer_generations == {0: 5, 1: 9}
-    assert set(connector._layerwise_prefill_save_done_events) == {(1, 0)}
+    assert set(connector._layerwise_prefill_save_done_events) == {(1, 0, 2)}
     assert set(connector._layerwise_prefill_load_done_events) == {(1, 2)}
 
     connector.reset_layerwise_prefill_transfer_state(synchronize=False)
@@ -5079,8 +5105,10 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     assert "synchronize" not in connector.store_stream.events
     assert connector._layerwise_prefill_bank_counts == {kv_group: 2}
     assert connector._layerwise_prefill_save_done_events == {
-        (kv_group, 0): (0, events[2]),
-        (kv_group, 1): (0, events[3]),
+        (kv_group, 0, 0): (0, events[0]),
+        (kv_group, 1, 1): (0, events[1]),
+        (kv_group, 0, 2): (0, events[2]),
+        (kv_group, 1, 3): (0, events[3]),
     }
 
     stale = connector.batched_from_gpu(
