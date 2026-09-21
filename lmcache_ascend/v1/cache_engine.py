@@ -3117,6 +3117,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                 persistent_fence_events,
             )
             if npu_content_diagnostics_enabled():
+                log_npu_content_diagnostic_event(
+                    "falconkv_store_plan",
+                    req_id=req_id,
+                    page_ranges=[list(item) for item in ranges],
+                    groups=sorted(int(group) for group in group_caches),
+                    persistent_groups=sorted(
+                        int(key.kv_group) for key in keys
+                    ),
+                    page_count=len(keys),
+                    bytes=sum(map(sum, batch.sizes)),
+                    ready_event_source=ready_event_source,
+                    put_producer_event_count=len(batch.ready_events),
+                    producer_fence_event_count=len(complete_ready_events),
+                    slot_mapping_base=slot_mapping_base,
+                    final=final,
+                )
                 try:
                     queue_store_time_source_fingerprint(
                         req_id=req_id,
