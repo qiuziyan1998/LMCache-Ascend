@@ -4301,6 +4301,60 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"Timed out waiting for {len(pending)} remote store operation(s)"
             )
 
+    def _layerwise_prefill_async_store_supported(
+        self, *, page_first_store: bool
+    ) -> bool:
+        """Return whether P-node DMA stores can publish without a host fence.
+
+        The dense prefill DMA path already records per-bank D2H events.  A
+        local CPU backend only installs the MemoryObj pointer, so subsequent
+        same-process H2D is protected by those bank events.  Page-first
+        storage additionally forwards the events to the external-page
+        backend.  Legacy tensor puts to a remote backend have no readiness
+        argument and must keep the synchronous drain.
+        """
+        cache = getattr(self, "_layerwise_prefill_async_store_support", None)
+        if cache is None:
+            cache = {}
+            self._layerwise_prefill_async_store_support = cache
+        cache_key = bool(page_first_store)
+        if cache_key in cache:
+            return bool(cache[cache_key])
+
+        if not callable(
+            getattr(self.gpu_connector, "layerwise_prefill_store_fences", None)
+        ):
+            cache[cache_key] = False
+            return False
+        storage_manager = self.storage_manager
+        if storage_manager is None:
+            cache[cache_key] = False
+            return False
+        if page_first_store:
+            supports_pages = getattr(
+                storage_manager, "supports_batched_put_layer_pages", None
+            )
+            supported = bool(
+                callable(supports_pages)
+                and supports_pages(location=self.store_location)
+            )
+            cache[cache_key] = supported
+            return supported
+
+        get_active = getattr(storage_manager, "get_active_storage_backends", None)
+        if not callable(get_active):
+            cache[cache_key] = False
+            return False
+        active = list(get_active(location=self.store_location))
+        # Only LocalCPUBackend admits an ordinary MemoryObj by pointer.  Any
+        # backend which copies/serializes the payload needs a producer fence.
+        supported = bool(active) and all(
+            type(backend).__name__ == "LocalCPUBackend"
+            for _, backend in active
+        )
+        cache[cache_key] = supported
+        return supported
+
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
         if self.kv_events_enabled and self.kv_events:
             return self.kv_events.drain()
@@ -6972,6 +7026,18 @@ class AscendLMCacheEngine(LMCacheEngine):
                 store_perf_enabled = serving_perf_enabled()
                 t_start = time.perf_counter() if store_perf_enabled else 0.0
                 page_first_store = mooncake_page_layout_enabled(self.config)
+                async_layerwise_store = bool(
+                    deferred_layerwise_put
+                    and self._layerwise_prefill_async_store_supported(
+                        page_first_store=page_first_store
+                    )
+                )
+                transfer_kwargs = kwargs
+                if deferred_layerwise_put:
+                    transfer_kwargs = dict(kwargs)
+                    transfer_kwargs[
+                        "layerwise_prefill_async_store"
+                    ] = async_layerwise_store
                 group_store = getattr(
                     self.gpu_connector, "batched_from_gpu_group", None
                 )
@@ -7042,7 +7108,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 pending_store_release.pop(id(mem_obj), None)
                 else:
                     mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                        memory_objs, starts, ends, **kwargs
+                        memory_objs, starts, ends, **transfer_kwargs
                     )
                     next(mem_obj_generator)
 
@@ -7145,6 +7211,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                             next(mem_obj_generator)
                             publish_completed_layer(layer_id)
 
+                layerwise_store_fences: tuple[Any, ...] = ()
+                if async_layerwise_store and page_first_store:
+                    fences_fn = getattr(
+                        self.gpu_connector,
+                        "layerwise_prefill_store_fences",
+                        None,
+                    )
+                    if callable(fences_fn):
+                        layerwise_store_fences = tuple(fences_fn(kv_group))
+
                 if page_first_store:
                     async_pages = bool(
                         self._force_layerwise_prefill_store
@@ -7197,6 +7273,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     location=self.store_location,
                                     req_id=req_id,
                                     publish_local_early=async_pages,
+                                    producer_events=layerwise_store_fences,
                                 )
                             except Exception as error:
                                 if async_pages:

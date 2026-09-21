@@ -1958,9 +1958,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._prefill_dma_slot_snapshots: dict[
             str, dict[tuple[int, int], torch.Tensor]
         ] = {}
+        # Async P-node stores can publish the CPU object before the D2H event
+        # completes.  Keep the latest event per request/group so request
+        # teardown fences the source KV cache exactly once.
+        self._layerwise_prefill_async_store_events: dict[
+            str, dict[int, Any]
+        ] = {}
 
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
+        pending_events = getattr(
+            self, "_layerwise_prefill_async_store_events", {}
+        ).pop(req_id, None)
+        if pending_events:
+            for event in pending_events.values():
+                event.synchronize()
         self._prefill_dma_bound_loads.pop(req_id, None)
         self._prefill_dma_slot_snapshots.pop(req_id, None)
 
@@ -6941,10 +6953,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             current_offset += chunk_size
 
         deferred_layerwise_put = bool(kwargs.get("deferred_layerwise_put", False))
+        # P-node prefill DMA records one completion event per physical bank.
+        # The caller can publish the CPU objects before the host observes the
+        # final event; same-process H2D and remote page puts consume those
+        # events as dependencies.  Non-DMA/fallback paths retain the old
+        # synchronous drain because their staging buffer is reused.
+        async_layerwise_store = bool(
+            deferred_layerwise_put
+            and kwargs.get("layerwise_prefill_async_store", False)
+        )
         prefill_dma = bool(
             deferred_layerwise_put and dense_direct
             and kwargs.get("prefill_dma_block_ids_by_bank") is not None
         )
+        async_layerwise_store = async_layerwise_store and prefill_dma
         if kwargs.get("prefill_dma_block_ids_by_bank") is not None and not dense_direct:
             raise RuntimeError("Layerwise prefill DMA requires dense direct store")
         if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
@@ -7474,9 +7496,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             if deferred_layerwise_put:
                 # FIFO store_stream: the last event covers every submitted
-                # layer. Publish only during the existing chunk-end drain,
-                # after CPU contents are ready for local/remote consumers.
-                if last_store_event is not None:
+                # layer. Legacy paths wait here; the P-node DMA path keeps the
+                # event for bank/remote consumers and lets the host continue.
+                if async_layerwise_store and last_store_event is not None:
+                    req_id = kwargs.get("req_id")
+                    if req_id is not None:
+                        pending_events = getattr(
+                            self,
+                            "_layerwise_prefill_async_store_events",
+                            None,
+                        )
+                        if pending_events is None:
+                            pending_events = {}
+                            self._layerwise_prefill_async_store_events = (
+                                pending_events
+                            )
+                        pending_events.setdefault(str(req_id), {})[
+                            int(kv_group)
+                        ] = last_store_event
+                if last_store_event is not None and not async_layerwise_store:
                     store_publish_sync_started = (
                         time.perf_counter()
                         if prefill_start_timing_enabled() else 0.0

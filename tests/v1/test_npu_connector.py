@@ -4901,8 +4901,9 @@ def test_dense_batched_from_gpu_direct_path_passes_variable_chunk_metadata(
 
 
 @pytest.mark.parametrize("kv_group", [0, 1])
+@pytest.mark.parametrize("async_store", [False, True])
 def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
-    monkeypatch, kv_group,
+    monkeypatch, kv_group, async_store,
 ) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 4
@@ -5041,6 +5042,7 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
         sync=False,
         deferred_layerwise_put=True,
         layerwise_prefill_bank_count=2,
+        layerwise_prefill_async_store=async_store,
         kv_group=kv_group,
     )
 
@@ -5071,7 +5073,9 @@ def test_deferred_batched_from_gpu_rotates_two_banks_and_reports_completion(
     assert events[0].records == ["store"]
     assert events[1].records == ["store"]
     assert events[2].records == ["store"]
-    assert events[3].records == ["store", "synchronize"]
+    assert events[3].records == (
+        ["store"] if async_store else ["store", "synchronize"]
+    )
     assert "synchronize" not in connector.store_stream.events
     assert connector._layerwise_prefill_bank_counts == {kv_group: 2}
     assert connector._layerwise_prefill_save_done_events == {
