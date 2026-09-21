@@ -2193,10 +2193,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Order a layer consumer after its asynchronous P-node bank hand-off.
 
         A completed load already includes its load-stream wait on the previous
-        save of the destination bank.  Still join the current-generation save
-        explicitly before the load: this makes an accidentally retained stale
-        load event unable to bypass the newest bank-lifetime dependency.  If
-        this layer has no load, the save wait alone protects bank reuse.
+        save of the destination bank.  Join the load completion on the compute
+        stream when it exists.  Only a layer with no current-generation load
+        falls back to the save fence (for example, a cache miss); otherwise a
+        second compute-stream wait would expose the store-stream backlog.
         """
         _, generations, save_done, load_done = (
             self._layerwise_prefill_transfer_state()
@@ -2211,11 +2211,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             device_wait_start = torch.npu.Event(enable_timing=True)
             device_wait_end = torch.npu.Event(enable_timing=True)
             device_wait_start.record(current_stream)
-        if save_record is not None and save_record[0] == generation:
-            current_stream.wait_event(save_record[1])
         load_record = load_done.pop((kv_group, int(layer_id)), None)
         if load_record is not None and load_record[0] == generation:
+            # The load stream already waits on this bank's save event before
+            # submitting H2D, and load_done is recorded after that H2D. Do
+            # not join save_record on the compute stream as well: when the
+            # store stream has a backlog, that duplicate dependency exposes
+            # the full D2H queue immediately before SFA/Lightning Indexer.
             current_stream.wait_event(load_record[1])
+        elif save_record is not None and save_record[0] == generation:
+            # Cache miss: there is no load_done fence to cover this bank. Keep
+            # the bank-lifetime guard so a later D2H cannot reuse it while the
+            # old save is live.
+            current_stream.wait_event(save_record[1])
         if diagnose_first_bank:
             device_wait_end.record(current_stream)
             fields = dict(

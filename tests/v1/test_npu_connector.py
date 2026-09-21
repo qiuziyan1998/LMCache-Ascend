@@ -4551,10 +4551,10 @@ def test_wait_for_layerwise_prefill_load_waits_load_completion(monkeypatch) -> N
 
     connector.wait_for_layerwise_prefill_load(layer_id=3, kv_group=0)
 
-    assert compute_stream.events == [
-        ("wait_event", "save-bank-1"),
-        ("wait_event", "load-layer-3"),
-    ]
+    # The load stream already waited on save-bank-1 before recording
+    # load-layer-3. Joining save-bank-1 again on compute would expose the
+    # entire D2H backlog before SFA.
+    assert compute_stream.events == [("wait_event", "load-layer-3")]
     assert connector._layerwise_prefill_load_done_events == {}
 
 
