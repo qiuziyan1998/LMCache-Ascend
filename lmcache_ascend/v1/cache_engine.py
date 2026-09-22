@@ -6535,10 +6535,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             request_id=str(kwargs.get("req_id", "unspecified")),
             kv_group=int(kwargs.get("kv_group", 0) or 0),
         )
+        result_key = kwargs.get("layerwise_store_key")
+        if result_key is not None:
+            if not hasattr(self, "_layerwise_store_results"):
+                self._layerwise_store_results = {}
+            self._layerwise_store_results[result_key] = store_result
         kv_group = store_result.kv_group
         num_layers = self._num_layers_for_kv_group(kv_group)
         deferred_layerwise_put = bool(
             kwargs.get("deferred_layerwise_put", False)
+        )
+        defer_layerwise_publish = bool(
+            kwargs.get("defer_layerwise_publish", False)
         )
 
         # Health check: block operation if LMCache is unhealthy
@@ -7021,6 +7029,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                 cached_tensors=cached_tensors,
                 cache_chunk_indices=cache_chunk_indices,
             )
+            index_chunks = getattr(
+                self, "_index_layerwise_store_result_chunks", None
+            )
+            if callable(index_chunks):
+                index_chunks(store_result)
 
             try:
                 store_perf_enabled = serving_perf_enabled()
@@ -7132,6 +7145,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                             kv_group=kv_group,
                         )
                         if page_first_store:
+                            return
+                        if defer_layerwise_publish:
                             return
                         required_futures = self.storage_manager.batched_put(
                             keys[layer_id],
