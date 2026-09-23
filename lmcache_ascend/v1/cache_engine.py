@@ -7239,6 +7239,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             next(mem_obj_generator)
                             publish_completed_layer(layer_id)
 
+                # One tail event per physical bank fences every save DMA for
+                # this compute chunk.  The events are consumed by the
+                # background Mooncake writer; do not synchronize them here.
                 layerwise_store_fences: tuple[Any, ...] = ()
                 if async_layerwise_store and page_first_store:
                     fences_fn = getattr(

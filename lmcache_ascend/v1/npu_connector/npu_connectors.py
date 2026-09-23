@@ -2077,11 +2077,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return watchdog
 
     def layerwise_prefill_store_fences(self, kv_group: int) -> tuple[Any, ...]:
-        """Borrow the current generation's actual per-layer D2H events.
+        """Borrow the current generation's two bank-tail D2H events.
 
-        Call only after draining batched_from_gpu for the entire KV group.
-        Events were already recorded on the per-bank DMA streams; this creates
-        no new event and performs no device synchronization. Empty means
+        Call only after draining ``batched_from_gpu`` for the entire KV group.
+        Each returned event is recorded after the last save DMA submitted on
+        one physical bank stream.  Because operations on each bank stream are
+        ordered, the two tail events fence every earlier save DMA for this
+        chunk while avoiding a host-side synchronization.  Empty means
         unavailable.
         """
         generations = getattr(self, "_layerwise_prefill_transfer_generations", {})
@@ -2089,13 +2091,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if generation is None:
             return ()
         save_done = getattr(self, "_layerwise_prefill_save_done_events", {})
-        current = [
-            (layer, event)
-            for (group, _bank, layer), (epoch, event) in save_done.items()
-            if group == kv_group and epoch == generation
-        ]
-        current.sort(key=lambda item: item[0])
-        return tuple(event for _, event in current)
+        latest_by_bank: dict[int, tuple[int, Any]] = {}
+        for (group, bank, layer), (epoch, event) in save_done.items():
+            if group != kv_group or epoch != generation:
+                continue
+            previous = latest_by_bank.get(bank)
+            if previous is None or layer >= previous[0]:
+                latest_by_bank[bank] = (layer, event)
+        return tuple(
+            latest_by_bank[bank][1] for bank in sorted(latest_by_bank)
+        )
 
     def _layerwise_prefill_transfer_state(
         self,
