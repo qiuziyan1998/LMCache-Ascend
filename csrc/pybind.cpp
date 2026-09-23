@@ -5,6 +5,7 @@
 #include "managed_mem.h"
 #include "mem_alloc.h"
 #include "mem_kernels.h"
+#include "indexer_c8.h"
 #include "pos_kernels.h"
 #include <iostream>
 #include <pybind11/pybind11.h>
@@ -236,6 +237,22 @@ py::tuple dense_mla_dsa_group_direct_kv_transfer_fast_wrapper(
 }
 
 PYBIND11_MODULE(c_ops, m) {
+  py::class_<lmc::IndexerC8State>(m, "IndexerC8State")
+      .def(py::init<torch::Tensor, torch::Tensor>());
+  py::class_<lmc::IndexerC8GroupState>(m, "IndexerC8GroupState")
+      .def(py::init<std::vector<lmc::IndexerC8State>>());
+  m.def("indexer_c8_group_transfer_prepared", &lmc::indexer_c8_group_transfer_prepared,
+        py::arg("state"), py::arg("packet_ptrs"), py::arg("chunk_offsets"),
+        py::arg("chunk_counts"), py::arg("slot_mapping"),
+        py::arg("chunk_capacity"), py::arg("from_npu"),
+        py::arg("fixed_chunks") = false,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("indexer_c8_transfer_prepared", &lmc::indexer_c8_transfer_prepared,
+        py::arg("state"), py::arg("packet_ptrs"), py::arg("chunk_offsets"),
+        py::arg("chunk_counts"), py::arg("slot_mapping"),
+        py::arg("chunk_capacity"), py::arg("from_npu"),
+        py::arg("fixed_chunks") = false,
+        py::call_guard<py::gil_scoped_release>());
   m.def("dense_mla_dsa_group_direct_kv_transfer_prepared",
         [](const py::sequence &objects, torch::Tensor &slots,
            torch::Tensor &pointers, torch::Tensor &offsets,

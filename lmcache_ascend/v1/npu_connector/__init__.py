@@ -46,6 +46,18 @@ def CreateNPUConnector(
     Replaces upstream CreateGPUConnector to return Ascend NPU-specific
     connector implementations.
     """
+    if getattr(metadata, "indexer_c8_layout", None) is not None and not (
+        _build_info.__framework_name__ == "pytorch"
+        and engine == EngineType.VLLM
+        and metadata.use_mla
+        and config.use_layerwise
+        and config.dsa_two_groups
+        and not config.enable_blending
+    ):
+        raise ValueError(
+            "Indexer C8 requires the PyTorch vLLM two-group layerwise "
+            "connector without blending"
+        )
     use_gpu = need_gpu_interm_buffer(config)
     configure_npu_content_diagnostics(
         bool(getattr(config, "enable_npu_content_diagnostics", False))

@@ -97,6 +97,7 @@ def fixture():
         ns,
     )
     layout = NS(
+        indexer_c8=False,
         kv_format=NS(value=1),
         vllm_two_major=False,
         k_hidden_dims=2,

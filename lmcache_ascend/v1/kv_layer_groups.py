@@ -5,6 +5,7 @@ from collections import defaultdict
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 import torch
 
 logger = init_logger(__name__)
@@ -39,6 +40,22 @@ def _get_kv_cache_group_key_and_info(
     """Build a stable grouping key plus the LMCache storage shape/dtype."""
     if isinstance(kv_cache, tuple):
         dtypes = tuple(tensor.dtype for tensor in kv_cache)
+        if dtypes == (torch.int8, torch.float16):
+            key, scale = kv_cache
+            if (
+                key.ndim != 4 or key.shape[1:3] != (128, 1)
+                or scale.shape != (*key.shape[:3], 1)
+            ):
+                raise ValueError(
+                    "Indexer C8 requires matching PA_BSND key/scale planes"
+                )
+            layout = IndexerC8Layout(key.shape[-1])
+            shapes = tuple(tensor.shape for tensor in kv_cache)
+            return (
+                (shapes, dtypes),
+                torch.Size([key.shape[0], key.shape[1], layout.token_bytes]),
+                torch.uint8,
+            )
         if len(set(dtypes)) != 1:
             raise ValueError(
                 "Tuple-based KV caches with mixed dtypes are not supported by "

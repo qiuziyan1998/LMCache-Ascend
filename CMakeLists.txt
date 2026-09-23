@@ -71,6 +71,7 @@ if(DEFINED ENV{USE_MINDSPORE})
   )
 
 else()
+  add_subdirectory(csrc/indexer_c8)
   add_subdirectory(csrc)
   set(TORCH_LIBS_DIR "${TORCH_PATH}/lib")
 
@@ -93,6 +94,7 @@ else()
     PUBLIC
     ${TORCH_LIBRARIES}
     libtorch_npu.so
+    indexer_c8_kernels
     cache_kernels
     ascendcl
     platform

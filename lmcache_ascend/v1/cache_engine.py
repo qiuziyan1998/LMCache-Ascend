@@ -4748,7 +4748,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 raise MemoryError("Live split shared-CPU page pin failed")
             pages = allocated
-        compact_destination = 1 in handled_groups
+        # Compact v1 destinations describe one plane per physical layer.
+        # C8 uses the existing byte-vector format for the key/scale pair.
+        compact_destination = (
+            1 in handled_groups
+            and getattr(self.gpu_connector, "indexer_c8_layout", None) is None
+        )
         destination_planner = getattr(
             self.gpu_connector,
             "plan_compact_page_layout" if compact_destination
@@ -9028,7 +9033,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             release_unowned_cached_publication_objs()
             release_pending_pre_resolved()
             append.rollback()
-
 
     @torch.inference_mode()
     def store(
