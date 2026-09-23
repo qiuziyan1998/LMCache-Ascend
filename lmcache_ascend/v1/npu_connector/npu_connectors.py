@@ -6068,10 +6068,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         self, "_layerwise_prefill_bank_tail_events", {}
                     )
                     previous_tail = bank_tails.get((kv_group, bank))
-                    previous_tail_pending = bool(
-                        previous_tail is not None
-                        and not previous_tail[1].query()
-                    )
+                    previous_tail_pending = None
+                    if layer_id == 0 and prefill_start_timing_enabled():
+                        previous_tail_pending = bool(
+                            previous_tail is not None
+                            and not previous_tail[1].query()
+                        )
                     bound = bind_incremental_copy_addresses(
                         dma_plans[bank], source_objs, starts, ends,
                         [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
