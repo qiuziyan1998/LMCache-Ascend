@@ -1959,7 +1959,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             tuple[int, int, int], tuple[int, Any]
         ] = {}
         self._layerwise_prefill_load_done_events: dict[
-            tuple[int, int], tuple[int, Any]
+            tuple, tuple[int, Any]
         ] = {}
         self._prefill_dma_bound_loads: dict[
             str, dict[tuple[int, int], BoundCopyPrefix]
@@ -1967,6 +1967,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._prefill_dma_slot_snapshots: dict[
             str, dict[tuple[int, int], torch.Tensor]
         ] = {}
+        # The logical layer ordinal is stable across requests, while the
+        # physical bank phase rotates at every local prefill chunk.  Track the
+        # phase used to build a request's bound DMA rows so a later chunk never
+        # reuses addresses bound for the opposite bank.
+        self._prefill_dma_bank_offsets: dict[str, dict[int, int]] = {}
         # Async P-node stores can publish the CPU object before the D2H event
         # completes.  Keep the latest event per request/group so request
         # teardown fences the source KV cache exactly once.
@@ -2017,6 +2022,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     owner.ref_count_down()
         self._prefill_dma_bound_loads.pop(req_id, None)
         self._prefill_dma_slot_snapshots.pop(req_id, None)
+        self._prefill_dma_bank_offsets.pop(req_id, None)
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
@@ -2108,14 +2114,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dict[int, int],
         dict[int, int],
         dict[tuple[int, int, int], tuple[int, Any]],
-        dict[tuple[int, int], tuple[int, Any]],
+        dict[tuple, tuple[int, Any]],
     ]:
         """Return lazily initialized state used by P-node bank hand-offs.
 
         ``save_done`` is keyed by ``(kv_group, bank, layer_id)`` for
-        publication and teardown.  Raw layerwise-prefill DMA uses the
-        per-bank FIFO streams above, so a bank's save/load ordering is carried
-        by stream order; consumers wait only for their layer's load event.
+        publication and teardown.  Raw layerwise-prefill DMA keys loads by
+        ``(kv_group, layer_id, bank)`` because chunk phases can rotate one
+        logical layer between the two physical banks.  The per-bank FIFO
+        streams carry save/load ordering; consumers wait only for the load
+        events for banks used by the current batch.
         """
         bank_counts = getattr(self, "_layerwise_prefill_bank_counts", None)
         if bank_counts is None:
@@ -2177,6 +2185,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # pages or block mappings. Never carry bound addresses across reset.
         getattr(self, "_prefill_dma_bound_loads", {}).clear()
         getattr(self, "_prefill_dma_slot_snapshots", {}).clear()
+        getattr(self, "_prefill_dma_bank_offsets", {}).clear()
 
         bank_counts, generations, save_done, load_done = (
             self._layerwise_prefill_transfer_state()
@@ -2184,7 +2193,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if kv_group is None:
             groups = set(bank_counts) | set(generations)
             groups.update(group for group, *_ in save_done)
-            groups.update(group for group, _ in load_done)
+            groups.update(key[0] for key in load_done)
         else:
             groups = {int(kv_group)}
 
@@ -2210,7 +2219,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         previous = bank_counts.get(kv_group)
         if previous is not None and previous != bank_count:
             if any(group == kv_group for group, *_ in save_done) or any(
-                group == kv_group for group, _ in load_done
+                key[0] == kv_group for key in load_done
             ):
                 raise RuntimeError(
                     "Cannot change layerwise-prefill bank count while transfer "
@@ -2219,10 +2228,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
         bank_counts[kv_group] = bank_count
 
-    def _layerwise_prefill_bank(self, layer_id: int, kv_group: int) -> int:
+    def _layerwise_prefill_bank(
+        self,
+        layer_id: int,
+        kv_group: int,
+        bank_offset: int = 0,
+    ) -> int:
         bank_counts, _, _, _ = self._layerwise_prefill_transfer_state()
         bank_count = bank_counts.get(kv_group, 2)
-        return int(layer_id) % bank_count
+        return (int(layer_id) + int(bank_offset)) % bank_count
 
     def _layerwise_prefill_dma_stream(
         self,
@@ -2289,6 +2303,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         layer_id: int,
         kv_group: int,
+        bank_offset: Optional[int] = None,
     ) -> None:
         """Order a layer consumer after its asynchronous P-node bank hand-off.
 
@@ -2298,51 +2313,79 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         retains its save fence because it has no bank FIFO stream; the raw DMA
         path never joins a store event here.
         """
-        _, generations, save_done, load_done = (
+        _, generations, _, load_done = (
             self._layerwise_prefill_transfer_state()
         )
         generation = generations.setdefault(int(kv_group), 0)
         current_stream = torch.npu.current_stream()
-        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        selected_banks = (
+            (
+                self._layerwise_prefill_bank(
+                    layer_id, kv_group, int(bank_offset)
+                ),
+            )
+            if bank_offset is not None
+            else tuple(
+                range(
+                    self._layerwise_prefill_transfer_state()[0].get(
+                        int(kv_group), 2
+                    )
+                )
+            )
+        )
+        bank = selected_banks[0] if len(selected_banks) == 1 else None
         bank_streams = getattr(self, "_layerwise_prefill_dma_streams", {})
-        bank_fifo_active = (int(kv_group), bank) in bank_streams
-        save_record = save_done.get((kv_group, bank, int(layer_id)))
-        diagnose_first_bank = prefill_start_timing_enabled() and layer_id == 0
+        bank_fifo_active = any(
+            (int(kv_group), selected_bank) in bank_streams
+            for selected_bank in selected_banks
+        )
+        # Profile mode records every layer's device-side dependency.  The
+        # first actual lightning-indexer ordinal is model-dependent (GLM52 is
+        # ordinal 3), so restricting this to layer 0 hides the real boundary.
+        diagnose_first_bank = prefill_start_timing_enabled()
         if diagnose_first_bank:
             wait_started = time.perf_counter()
             device_wait_start = torch.npu.Event(enable_timing=True)
             device_wait_end = torch.npu.Event(enable_timing=True)
             device_wait_start.record(current_stream)
-        load_record = load_done.pop((kv_group, int(layer_id)), None)
-        if load_record is not None and load_record[0] == generation:
-            # The bank FIFO stream already orders this H2D after the preceding
-            # same-bank D2H. The compute stream only needs this layer's H2D
-            # completion event.
-            current_stream.wait_event(load_record[1])
-        elif (
-            not bank_fifo_active
-            and save_record is not None
-            and save_record[0] == generation
-        ):
-            # Preserve the legacy dense-direct fallback when the raw DMA bank
-            # FIFO is not active. The raw DMA path never takes this branch.
-            current_stream.wait_event(save_record[1])
+        load_records: list[tuple[int, Any]] = []
+        # Raw DMA records are keyed by physical bank.  Waiting on every bank
+        # used by the current batch is required when requests are at different
+        # chunk phases; the final event on each bank FIFO fences all loads for
+        # that bank without a host-side query or synchronization.
+        for selected_bank in selected_banks:
+            load_record = load_done.pop(
+                (kv_group, int(layer_id), selected_bank), None
+            )
+            if load_record is None:
+                # Legacy dense-direct records retain the old two-field key.
+                load_record = load_done.pop((kv_group, int(layer_id)), None)
+            if load_record is not None and load_record[0] == generation:
+                load_records.append((selected_bank, load_record[1]))
+                current_stream.wait_event(load_record[1])
+
+        if not load_records:
+            # A cache miss or a non-deferred layer has no load_done record. If
+            # the selected bank was used by the previous chunk, join its tail
+            # event before the layer can overwrite that bank. This is a device
+            # dependency only; no host synchronize is introduced.
+            bank_tails = getattr(
+                self, "_layerwise_prefill_bank_tail_events", {}
+            )
+            for selected_bank in selected_banks:
+                previous_tail = bank_tails.get((kv_group, selected_bank))
+                if previous_tail is None or previous_tail[0] != generation:
+                    continue
+                current_stream.wait_event(previous_tail[1])
         if diagnose_first_bank:
             device_wait_end.record(current_stream)
             fields = dict(
                 kv_group=kv_group, layer_id=layer_id, bank=bank,
-                load_event_pending=(
-                    load_record is not None
-                    and load_record[0] == generation
-                    and not load_record[1].query()
-                ),
+                load_event_pending=any(not event.query() for _, event in load_records),
                 save_event=(
-                    not bank_fifo_active
-                    and save_record is not None
-                    and save_record[0] == generation
+                    not load_records and not bank_fifo_active
                 ),
-                load_event=load_record is not None
-                and load_record[0] == generation,
+                load_event=bool(load_records),
             )
             pending = getattr(self, "_prefill_first_bank_timing_events", None)
             if pending is None:
@@ -5810,6 +5853,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layerwise_prefill_bank_count = int(
             kwargs.get("layerwise_prefill_bank_count", 2) or 2
         )
+        layerwise_prefill_bank_offset = int(
+            kwargs.get("layerwise_prefill_bank_offset", 0) or 0
+        ) & 1
         if deferred_dense_direct_get:
             self._set_layerwise_prefill_bank_count(
                 kv_group,
@@ -5890,6 +5936,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 bound_loads = self._prefill_dma_bound_loads.setdefault(
                     dma_req_id, {}
                 )
+                bank_offsets = self._prefill_dma_bank_offsets.setdefault(
+                    dma_req_id, {}
+                )
+                previous_offset = bank_offsets.get(int(kv_group))
+                if previous_offset is not None and previous_offset != (
+                    layerwise_prefill_bank_offset
+                ):
+                    # Layer IDs are logical ordinals.  Their physical bank
+                    # changes with the chunk phase, so old bound rows cannot
+                    # be reused after the phase flips.
+                    for cache_key in tuple(bound_loads):
+                        if cache_key[0] == kv_group:
+                            bound_loads.pop(cache_key)
+                bank_offsets[int(kv_group)] = layerwise_prefill_bank_offset
                 slot_snapshots = self._prefill_dma_slot_snapshots.setdefault(
                     dma_req_id, {}
                 )
@@ -5903,8 +5963,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         or block_ids[:len(old_block_ids)] != old_block_ids
                     ):
                         for cache_key in tuple(bound_loads):
-                            if (cache_key[0] == kv_group
-                                    and cache_key[1] % 2 == bank):
+                            if (
+                                cache_key[0] == kv_group
+                                and self._layerwise_prefill_bank(
+                                    cache_key[1],
+                                    kv_group,
+                                    layerwise_prefill_bank_offset,
+                                )
+                                == bank
+                            ):
                                 bound_loads.pop(cache_key)
                     slot_snapshots[(kv_group, bank)] = block_ids
         if dense_direct and not prefill_dma:
@@ -6060,7 +6127,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # memobj -> gpu_buffer -> kvcaches
                 if prefill_dma:
                     assert dma_plans is not None
-                    bank = self._layerwise_prefill_bank(layer_id, kv_group)
+                    bank = self._layerwise_prefill_bank(
+                        layer_id, kv_group, layerwise_prefill_bank_offset
+                    )
                     bank_stream = self._layerwise_prefill_dma_stream(
                         kv_group, bank
                     )
@@ -6069,7 +6138,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                     previous_tail = bank_tails.get((kv_group, bank))
                     previous_tail_pending = None
-                    if layer_id == 0 and prefill_start_timing_enabled():
+                    if prefill_start_timing_enabled():
                         previous_tail_pending = bool(
                             previous_tail is not None
                             and not previous_tail[1].query()
@@ -6110,7 +6179,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             str(req_id), []
                         ).append(load_done_event)
                     _, _, _, load_done = self._layerwise_prefill_transfer_state()
-                    load_done[(kv_group, layer_id)] = (
+                    load_done[(kv_group, layer_id, bank)] = (
                         layerwise_prefill_generation, load_done_event,
                     )
                     if layer_id == 0 and prefill_start_timing_enabled():
@@ -6121,6 +6190,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             kv_group=kv_group,
                             layer_id=layer_id,
                             bank=bank,
+                            bank_offset=layerwise_prefill_bank_offset,
                             previous_tail_pending=previous_tail_pending,
                             previous_tail_layer=(
                                 previous_tail[2]
@@ -6129,7 +6199,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                 elif dense_direct:
                     if deferred_dense_direct_get:
-                        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+                        bank = self._layerwise_prefill_bank(
+                            layer_id, kv_group, layerwise_prefill_bank_offset
+                        )
                         _, _, save_done, _ = (
                             self._layerwise_prefill_transfer_state()
                         )
@@ -7416,6 +7488,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             layerwise_prefill_bank_count = int(
                 kwargs.get("layerwise_prefill_bank_count", 2) or 2
             )
+            layerwise_prefill_bank_offset = int(
+                kwargs.get("layerwise_prefill_bank_offset", 0) or 0
+            ) & 1
             if layerwise_prefill_bank_count <= 0:
                 raise ValueError(
                     "layerwise_prefill_bank_count must be positive"
@@ -7482,7 +7557,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 f"ranges={len(starts)}"
                             )
                         deferred_dma_copies.append(bind_copy_addresses(
-                            dma_plans[layer_id % 2],
+                            dma_plans[
+                                (layer_id + layerwise_prefill_bank_offset) % 2
+                            ],
                             host_ptrs,
                             [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
                             chunk_sizes, widths,
@@ -7593,7 +7670,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # or runtime stream changes do not attach dependencies to a
                 # stale stream from the first layer.
                 current_stream = torch.npu.current_stream()
-                bank = layer_id % source_bank_count
+                bank = (
+                    layer_id + layerwise_prefill_bank_offset
+                ) % source_bank_count
 
                 if prefill_dma:
                     # The raw-address plan already selects the physical bank.
