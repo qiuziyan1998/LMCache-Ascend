@@ -2380,7 +2380,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if diagnose_first_bank:
             device_wait_end.record(current_stream)
             fields = dict(
-                kv_group=kv_group, layer_id=layer_id, bank=bank,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                bank=bank,
+                bank_offset=bank_offset,
                 load_event_pending=any(not event.query() for _, event in load_records),
                 save_event=(
                     not load_records and not bank_fifo_active
