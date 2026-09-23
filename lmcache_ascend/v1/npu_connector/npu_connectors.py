@@ -6237,6 +6237,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # memobj -> gpu_buffer -> kvcaches
                 if prefill_dma:
                     assert dma_plans is not None
+                    diagnose_bank_load = (
+                        layer_id < 2 and prefill_start_timing_enabled()
+                    )
+                    if diagnose_bank_load:
+                        bank_load_started = time.perf_counter()
                     bank = self._layerwise_prefill_bank(
                         layer_id, kv_group, layerwise_prefill_bank_offset
                     )
@@ -6248,11 +6253,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                     previous_tail = bank_tails.get((kv_group, bank))
                     previous_tail_pending = None
-                    if prefill_start_timing_enabled():
+                    if diagnose_bank_load:
                         previous_tail_pending = bool(
                             previous_tail is not None
                             and not previous_tail[1].query()
                         )
+                        bind_started = time.perf_counter()
                     bound = bind_incremental_copy_addresses(
                         dma_plans[bank], source_objs, starts, ends,
                         [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
@@ -6275,15 +6281,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     if bound_loads is not None:
                         bound_loads[(kv_group, layer_id)] = bound
                     copies = bound.rows
+                    if diagnose_bank_load:
+                        bind_ms = (time.perf_counter() - bind_started) * 1000
                     # Save and load for one physical bank share one FIFO
                     # stream.  The preceding save is therefore ordered
                     # before this H2D without a separate event wait; no
                     # unrelated layer's D2H can leak into the compute wait.
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
+                        if diagnose_bank_load:
+                            native_enqueue_started = time.perf_counter()
                         lmc_ops.layerwise_prefill_dma_copy(copies, False)
+                        if diagnose_bank_load:
+                            native_enqueue_ms = (
+                                time.perf_counter() - native_enqueue_started
+                            ) * 1000
+                    if diagnose_bank_load:
+                        event_record_started = time.perf_counter()
                     load_done_event = torch.npu.Event()
                     load_done_event.record(bank_stream)
+                    if diagnose_bank_load:
+                        event_record_ms = (
+                            time.perf_counter() - event_record_started
+                        ) * 1000
                     if req_id is not None:
                         self._layerwise_prefill_load_request_events.setdefault(
                             str(req_id), []
@@ -6292,15 +6312,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     load_done[(kv_group, layer_id, bank)] = (
                         layerwise_prefill_generation, load_done_event,
                     )
-                    if layer_id == 0 and prefill_start_timing_enabled():
+                    if diagnose_bank_load:
                         prefill_start_timing_log(
                             logger,
                             "first_bank_load_submit",
-                            time.perf_counter(),
+                            bank_load_started,
                             kv_group=kv_group,
                             layer_id=layer_id,
                             bank=bank,
                             bank_offset=layerwise_prefill_bank_offset,
+                            bind_ms=round(bind_ms, 3),
+                            native_enqueue_ms=round(native_enqueue_ms, 3),
+                            event_record_ms=round(event_record_ms, 3),
                             previous_tail_pending=previous_tail_pending,
                             previous_tail_layer=(
                                 previous_tail[2]
