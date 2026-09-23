@@ -5462,6 +5462,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         *,
         kv_group: int,
         num_tokens: int,
+        layer_id: int = 0,
     ):
         """Use Ascend's group-aware connector shape for shared view checks.
 
@@ -5475,6 +5476,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         Generic LMCache metadata can still describe only the latent group in
         older startup/passive paths, so retain the connector fallback.
         """
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
+            return (
+                torch.Size([policy.layer_bytes(num_tokens, layer_id)]),
+                torch.uint8,
+                self._memory_format_for_kv_group(kv_group),
+            )
         layer_groups = getattr(
             self.metadata.kv_layer_groups_manager,
             "kv_layer_groups",
@@ -6115,6 +6123,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             if page_store
             else None
         )
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        mixed_indexer = kv_group == 1 and policy is not None and policy.mixed
+        page_shapes = (
+            self.metadata.indexer_layer_shapes(int(self.config.chunk_size))
+            if mixed_indexer
+            else [page_shape]
+        )
+        page_dtypes = [kv_dtype] * len(page_shapes)
         local = self._shared_local_cpu_backend() if page_store else None
         memory_format = self._memory_format_for_kv_group(kv_group)
         force_store_wait = self.config.get_extra_config_value(
@@ -6157,8 +6173,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         if pending_chunks and page_store:
             assert local is not None and page_shape is not None
             page_batch = local.batched_allocate_layer_pages(
-                [page_shape],
-                [kv_dtype],
+                page_shapes,
+                page_dtypes,
                 len(pending_chunks),
                 self._num_layers_for_kv_group(kv_group),
                 memory_format,
@@ -6190,8 +6206,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             if memory_objs_multi_layer is None and page_store and not legacy_suffix:
                 assert local is not None and page_shape is not None
                 page = local.batched_allocate_layer_pages(
-                    [page_shape],
-                    [kv_dtype],
+                    page_shapes,
+                    page_dtypes,
                     1,
                     self._num_layers_for_kv_group(kv_group),
                     memory_format,
@@ -6224,13 +6240,33 @@ class AscendLMCacheEngine(LMCacheEngine):
             ):
                 continue
             if memory_objs_multi_layer is None:
-                memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                    kv_shape_single_layer,
-                    kv_dtype,
-                    batch_size=self._num_layers_for_kv_group(kv_group),
-                    fmt=memory_format,
-                    busy_loop=force_store_wait,
-                )
+                if mixed_indexer:
+                    memory_objs_multi_layer = []
+                    try:
+                        for shape in self.metadata.indexer_layer_shapes(num_tokens):
+                            allocated = self.storage_manager.batched_allocate(
+                                shape,
+                                kv_dtype,
+                                batch_size=1,
+                                fmt=memory_format,
+                                busy_loop=force_store_wait,
+                            )
+                            if allocated is None:
+                                break
+                            memory_objs_multi_layer.extend(allocated)
+                    finally:
+                        if len(memory_objs_multi_layer) != num_layers:
+                            for obj in memory_objs_multi_layer:
+                                obj.ref_count_down()
+                            memory_objs_multi_layer = None
+                else:
+                    memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                        kv_shape_single_layer,
+                        kv_dtype,
+                        batch_size=self._num_layers_for_kv_group(kv_group),
+                        fmt=memory_format,
+                        busy_loop=force_store_wait,
+                    )
                 if memory_objs_multi_layer is not None:
                     # Legacy flat chunks (including page-allocation fallback)
                     # need the logical count just like LayerPageMemoryObj does.
@@ -7029,6 +7065,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             expected_shape, expected_dtype, expected_fmt = (
                                 self._expected_shared_cpu_chunk_metadata(
                                     kv_group=kv_group,
+                                    layer_id=layer_id,
                                     num_tokens=int(
                                         ends[chunk_index] - starts[chunk_index]
                                     ),
@@ -9156,7 +9193,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         if (
             dtype != group.dtype
             or fmt != group.fmt
-            or int(shape.numel()) != group.raw_token_dim
+            or int(shape.numel())
+            != (
+                group.layer_token_dims[0]
+                if group.layer_token_dims
+                else group.raw_token_dim
+            )
         ):
             raise ValueError(
                 "remote-fill Group-1 shared-page metadata disagrees with "
@@ -9228,7 +9270,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             if (
                 dtype != group.dtype
                 or fmt != group.fmt
-                or int(shape.numel()) != group.raw_token_dim
+                or int(shape.numel())
+                != (
+                    group.layer_token_dims[0]
+                    if group.layer_token_dims
+                    else group.raw_token_dim
+                )
             ):
                 raise ValueError(
                     "remote-fill negotiated group layout disagrees with "
@@ -9275,8 +9322,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 local_backend = self._shared_local_cpu_backend()
                 group = layout.group(1)
                 pages = local_backend.batched_allocate_layer_pages(
-                    [group.full_shape(layout.chunk_size)],
-                    [group.dtype],
+                    group.page_shapes(layout.chunk_size),
+                    [group.dtype] * len(group.page_shapes(layout.chunk_size)),
                     1,
                     layout.num_layers_for_group(1),
                     group.fmt,
@@ -9398,9 +9445,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     if (
                         batch.num_layers != layout.num_layers_for_group(1)
                         or batch.num_chunks != 1
-                        or batch.page_offsets
-                        != [int(rank0_page.metadata.address)]
-                        or batch.physical_sizes != [int(rank0_page.layer_size)]
+                        or batch.page_offsets != [int(rank0_page.metadata.address)]
+                        or batch.physical_sizes != [rank0_page.layer_size_bytes(0)]
                         or batch.page_physical_sizes
                         != [int(rank0_page.metadata.phy_size)]
                     ):
@@ -10051,6 +10097,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 * self._shared_cpu_dtype_for_kv_group(group).itemsize
                 * self._num_layers_for_kv_group(group)
             )
+            policy = getattr(self.metadata, "indexer_c8_layout", None)
+            if group == 1 and policy is not None and policy.mixed:
+                raw_size = sum(
+                    policy.layer_bytes(tokens, i)
+                    for i in range(self._num_layers_for_kv_group(group))
+                )
             if round_size is not None:
                 required_bytes += round_size(raw_size)
             else:
@@ -10079,9 +10131,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise ValueError("Checkpoint registered group capture is unavailable")
         shape = self.gpu_connector.get_shape(tokens, kv_group=group)
         widths = self.gpu_connector.checkpoint_plane_widths(group)
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        shapes = (
+            self.metadata.indexer_layer_shapes(tokens)
+            if group == 1 and policy is not None and policy.mixed
+            else [shape]
+        )
         pages = local.batched_allocate_layer_pages(
-            [shape],
-            [self._shared_cpu_dtype_for_kv_group(group)],
+            shapes,
+            [self._shared_cpu_dtype_for_kv_group(group)] * len(shapes),
             1,
             self._num_layers_for_kv_group(group),
             self._memory_format_for_kv_group(group),

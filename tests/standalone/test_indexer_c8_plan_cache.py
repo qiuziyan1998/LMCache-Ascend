@@ -49,6 +49,7 @@ def test_plan_reuses_rewrapped_buffers_but_not_rebound_scales(validation):
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), ns)
     connector = ns["Connector"]()
     connector.indexer_c8_layout = object()
+    connector._group_layouts = {1: SimpleNamespace(layer_slot_factors=(1, 1))}
     connector.enable_npu_transfer_validation = validation
     connector._expected_group_layers = lambda _: 2
     keys = [torch.empty(2, 128, 1, 128, dtype=torch.int8) for _ in range(2)]

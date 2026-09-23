@@ -269,7 +269,9 @@ class LocalCheckpointStore:
         for layer in range(destination.num_layers):
             target = destination.layer_tensor(layer).reshape(-1)
             preceding = 0
-            for width in widths:
+            for width in (
+                widths[layer] if widths and isinstance(widths[0], tuple) else widths
+            ):
                 for source, page in sources:
                     left, right = max(start, source.start), min(end, source.end)
                     src = page.layer_tensor(layer).reshape(-1)

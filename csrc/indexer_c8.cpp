@@ -19,13 +19,13 @@ IndexerC8State::IndexerC8State(torch::Tensor key, c10::optional<torch::Tensor> s
   TORCH_CHECK(quantized ? scales.defined() && scales.scalar_type() == at::kHalf
                        : !scales.defined() && (keys.scalar_type() == at::kHalf || keys.scalar_type() == at::kBFloat16),
               "Indexer requires floating keys alone, or int8 keys and float16 scales");
-  TORCH_CHECK((factor == 1 || (factor == 2 && quantized)) && keys.size(0) % factor == 0,
-              "Invalid physical indexer block factor");
   TORCH_CHECK(keys.dim() == 4 &&
                   keys.size(0) > 0 && keys.size(1) == 128 &&
                   keys.size(2) == 1 && keys.size(3) == 128 &&
                   keys.is_contiguous(),
               "Indexer destinations require contiguous PA_BSND storage");
+  TORCH_CHECK((factor == 1 || (factor == 2 && quantized)) && keys.size(0) % factor == 0,
+              "Invalid physical indexer block factor");
   TORCH_CHECK(!quantized || (scales.dim() == 4 &&
                   scales.size(0) == keys.size(0) && scales.size(1) == 128 &&
                   scales.size(2) == 1 && scales.size(3) == 1 && scales.is_contiguous()),

@@ -1913,13 +1913,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         layer_tensors: List[torch.Tensor],
         kv_group: Optional[int] = None,
+        layer_id: int = 0,
     ) -> int:
         num_chunks = len(layer_tensors)
         if num_chunks == 0:
             return 0
         if num_chunks == 1:
-            return self._lmc_plane_num_tokens(layer_tensors[0], kv_group)
-        last_tokens = self._lmc_plane_num_tokens(layer_tensors[-1], kv_group)
+            return self._lmc_plane_num_tokens(layer_tensors[0], kv_group, layer_id)
+        last_tokens = self._lmc_plane_num_tokens(layer_tensors[-1], kv_group, layer_id)
         return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
 
     def append_sparse_chunk_ptr_cache_for_layer(
@@ -2197,35 +2198,40 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return None
         compatible_layout = None
         for page in pages:
-            prefixes = tuple(page.group_prefix_sum)
-            metadata = page.metadata
-            shapes = tuple(metadata.shapes or ())
-            dtypes = tuple(metadata.dtypes or ())
-            page_layout = (
-                metadata.fmt,
-                dtypes[0] if dtypes else None,
-                (
-                    page.layer_size // page.valid_tokens
-                    if page.valid_tokens > 0
-                    and page.layer_size % page.valid_tokens == 0
-                    else None
-                ),
-            )
             if (
                 not page.valid
                 or page.num_layers != page_layers
-                or page.layer_size <= 0
-                or prefixes
-                != tuple(i * page.layer_size for i in range(page_layers + 1))
-                or len(shapes) != page_layers
-                or len(set(shapes)) != 1
+                or page.valid_tokens <= 0
+            ):
+                return None
+            metadata = page.metadata
+            shapes = tuple(metadata.shapes or ())
+            dtypes = tuple(metadata.dtypes or ())
+            layer_size = page.layer_size
+            if layer_size is None:
+                if not page.layer_layout_is_valid():
+                    return None
+                sizes = tuple(page.layer_size_bytes(i) for i in range(page_layers))
+                if any(size <= 0 or size % page.valid_tokens for size in sizes):
+                    return None
+                token_widths = tuple(size // page.valid_tokens for size in sizes)
+            else:
+                # Preserve the homogeneous Group-0 path's scalar sizing.
+                if (
+                    layer_size <= 0
+                    or layer_size % page.valid_tokens
+                    or tuple(page.group_prefix_sum)
+                    != tuple(i * layer_size for i in range(page_layers + 1))
+                    or len(set(shapes)) != 1
+                ):
+                    return None
+                token_widths = layer_size // page.valid_tokens
+            page_layout = (metadata.fmt, dtypes[0] if dtypes else None, token_widths)
+            if (
+                len(shapes) != page_layers
                 or len(dtypes) != page_layers
                 or len(set(dtypes)) != 1
-                or page_layout[2] is None
-                or (
-                    compatible_layout is not None
-                    and page_layout != compatible_layout
-                )
+                or (compatible_layout is not None and page_layout != compatible_layout)
             ):
                 return None
             compatible_layout = page_layout
@@ -2292,7 +2298,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 required_bytes = (
                     int(source_obj.numel() * source_obj.element_size())
                     if isinstance(source_obj, torch.Tensor)
-                    else int(source_obj.layer_size)
+                    else source_obj.layer_size_bytes(layer_id)
                     if isinstance(source_obj, LayerPageMemoryObj)
                     else int(source_obj.get_size())
                 )
@@ -2640,7 +2646,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return None
         if total_tokens <= 0:
             total_tokens = self._sparse_total_tokens_from_layer_chunks(
-                layer_tensors, kv_group
+                layer_tensors, kv_group, layer_id
             )
         if source_signature is None:
             source_signature = self._sparse_direct_source_signature(
@@ -2694,7 +2700,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         if total_tokens <= 0:
             total_tokens = self._sparse_total_tokens_from_layer_chunks(
-                layer_tensors, kv_group
+                layer_tensors, kv_group, layer_id
             )
 
         state_key = self._sparse_direct_state_key(
@@ -3051,7 +3057,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         chunk_sizes: list[int] = []
         covered_tokens = 0
         for tensor in layer_tensors:
-            chunk_tokens = self._lmc_plane_num_tokens(tensor, kv_group)
+            chunk_tokens = self._lmc_plane_num_tokens(tensor, kv_group, layer_id)
             chunk_offsets.append(covered_tokens)
             chunk_sizes.append(chunk_tokens)
             covered_tokens += chunk_tokens
@@ -3832,7 +3838,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             planes = 2 if kv_group == 0 or c8 else 1
             layers = kvcaches[: self._expected_group_layers(kv_group)]
             if len(layers) != self._expected_group_layers(kv_group) or any(
-                len(layer) != planes for layer in layers
+                len(layer) != (2 if layer[0].dtype == torch.int8 else 1)
+                if c8
+                else len(layer) != planes
+                for layer in layers
             ):
                 return self._reject_direct_page_plan(
                     kv_group, "owner_layout_mismatch"
@@ -3855,12 +3864,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kv_group, "owner_dtype_or_device_mismatch"
                 )
             if c8 and any(
-                key.dtype != torch.int8
-                or scale.dtype != torch.float16
-                or key.ndim != 4
-                or key.shape[1:] != (128, 1, 128)
-                or scale.shape != (*key.shape[:3], 1)
-                for key, scale in layers
+                layer[0].ndim != 4
+                or layer[0].shape[1:] != (128, 1, 128)
+                or (
+                    layer[0].dtype == torch.int8
+                    and (
+                        layer[1].dtype != torch.float16
+                        or layer[1].shape != (*layer[0].shape[:3], 1)
+                    )
+                )
+                or (layer[0].dtype != torch.int8 and layer[0].dtype != self.dtype)
+                for layer in layers
             ):
                 return self._reject_direct_page_plan(
                     kv_group, "c8_key_scale_layout_mismatch"
@@ -3906,7 +3920,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         (tuple(tensor.shape[2:]), tuple(tensor.stride()[2:]))
                     )
                 reference = plane_layouts[:planes]
-                if any(
+                if not c8 and any(
                     plane_layouts[offset : offset + planes] != reference
                     for offset in range(planes, len(plane_layouts), planes)
                 ):
@@ -3915,9 +3929,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 cache[kv_group] = (signature, tensor_meta)
             expected_token_bytes = (
-                self.get_shape(1, kv_group).numel()
-                * owners[0].element_size()
-                * self._expected_group_layers(kv_group)
+                sum(layout.layer_token_bytes)
+                if c8
+                else (
+                    self.get_shape(1, kv_group).numel()
+                    * owners[0].element_size()
+                    * self._expected_group_layers(kv_group)
+                )
             )
             if (
                 sum(token_bytes for _, token_bytes in tensor_meta)
@@ -3926,8 +3944,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 return self._reject_direct_page_plan(
                     kv_group, "page_byte_layout_mismatch"
                 )
-            slot_capacity = min(
-                int(tensor.shape[0] * tensor.shape[1]) for tensor in owners
+            slot_capacity = (
+                min(
+                    int(layer[0].shape[0] * layer[0].shape[1])
+                    // layout.layer_slot_factors[i]
+                    for i, layer in enumerate(layers)
+                )
+                if c8
+                else min(int(tensor.shape[0] * tensor.shape[1]) for tensor in owners)
             )
             getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
             return tensor_meta, owners, slot_capacity
@@ -4144,7 +4168,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 return None
             tensor_meta, owners, slot_capacity = direct_layout
             group_layers = self._expected_group_layers(kv_group)
+            layout = self._group_layouts[kv_group]
+            c8 = getattr(layout, "indexer_c8", False)
             planes = len(tensor_meta) // group_layers
+            if c8:
+                plane_offsets, plane_factors = [0], []
+                for i, layer in enumerate(kvcaches[:group_layers]):
+                    plane_offsets.append(plane_offsets[-1] + len(layer))
+                    plane_factors.extend([layout.layer_slot_factors[i]] * len(layer))
+            remap_slots = c8 and 2 in layout.layer_slot_factors
             if not starts or len(starts) != len(ends):
                 return self._reject_direct_page_plan(kv_group, "invalid_ranges")
             slot_base, slot_end = min(starts), max(ends)
@@ -4187,28 +4219,57 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for left, right in pairwise(boundaries)
                 ]
 
+                physical_runs = runs
+                if remap_slots:
+                    physical_slots = page_slots + (page_slots // 128) * 128
+                    breaks = (
+                        torch.where(physical_slots[1:] != physical_slots[:-1] + 1)[0]
+                        + 1
+                    )
+                    boundaries = [0, *breaks.tolist(), physical_slots.numel()]
+                    physical_runs = [
+                        (int(physical_slots[left]), right - left)
+                        for left, right in pairwise(boundaries)
+                    ]
                 page_ptrs, page_sizes = [], []
                 for layer in range(group_layers if layerwise else 1):
                     ptrs: List[int] = []
                     sizes: List[int] = []
-                    metadata = (
-                        tensor_meta[layer * planes : (layer + 1) * planes]
-                        if layerwise
-                        else tensor_meta
-                    )
-                    for base, token_bytes in metadata:
-                        for slot, count in runs:
-                            ptrs.append(base + slot * token_bytes)
-                            sizes.append(count * token_bytes)
+                    if c8:
+                        first = plane_offsets[layer] if layerwise else 0
+                        last = (
+                            plane_offsets[layer + 1] if layerwise else len(tensor_meta)
+                        )
+                        for plane in range(first, last):
+                            base, token_bytes = tensor_meta[plane]
+                            for slot, count in (
+                                physical_runs if plane_factors[plane] == 2 else runs
+                            ):
+                                ptrs.append(base + slot * token_bytes)
+                                sizes.append(count * token_bytes)
+                    else:
+                        metadata = (
+                            tensor_meta[layer * planes : (layer + 1) * planes]
+                            if layerwise
+                            else tensor_meta
+                        )
+                        for base, token_bytes in metadata:
+                            for slot, count in runs:
+                                ptrs.append(base + slot * token_bytes)
+                                sizes.append(count * token_bytes)
                     page_ptrs.append(ptrs)
                     page_sizes.append(sizes)
                 expected = sum(token_bytes for _, token_bytes in tensor_meta) * (
                     end - start
                 )
                 metadata_bytes = (
-                    self.get_shape(end - start, kv_group).numel()
-                    * owners[0].element_size()
-                    * group_layers
+                    sum(layout.layer_token_bytes) * (end - start)
+                    if c8
+                    else (
+                        self.get_shape(end - start, kv_group).numel()
+                        * owners[0].element_size()
+                        * group_layers
+                    )
                 )
                 if sum(map(sum, page_sizes)) != expected or expected != metadata_bytes:
                     return self._reject_direct_page_plan(
@@ -4460,6 +4521,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Return the registered CPU format's per-token plane widths."""
         layout = self._group_layouts[kv_group]
         if layout.indexer_c8:
+            if any(width != 130 for width in layout.layer_token_bytes):
+                return tuple(
+                    (128, 2) if width == 130 else (256,)
+                    for width in layout.layer_token_bytes
+                )
             return (128, 2)
         widths = ((layout.dsa_hidden_dims,) if kv_group == 1
                   else tuple(x for x in (layout.k_hidden_dims, layout.v_hidden_dims) if x))
@@ -4534,7 +4600,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if layout.indexer_c8 and any(
                 tensor.dtype != torch.uint8
                 or not tensor.is_contiguous()
-                or tensor.numel() < (end - start) * 130
+                or tensor.numel() < (end - start) * layout.layer_token_bytes[layer]
                 for tensor, start, end in zip(tensors[-1], starts, ends, strict=True)
             ):
                 raise ValueError(
@@ -4644,10 +4710,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return event
 
     def _lmc_plane_num_tokens(
-        self, lmc_tensor: torch.Tensor, kv_group: Optional[int] = None
+        self,
+        lmc_tensor: torch.Tensor,
+        kv_group: Optional[int] = None,
+        layer_id: int = 0,
     ) -> int:
         fmt = self._fmt_for(kv_group)
         layout = self._layout_for(kv_group)
+        if layout is not None and layout.indexer_c8:
+            width = layout.layer_token_bytes[layer_id]
+            if lmc_tensor.numel() % width:
+                raise ValueError("Indexer packet does not contain complete tokens")
+            return lmc_tensor.numel() // width
         k_hidden = layout.k_hidden_dims if layout else self.k_hidden_dims
         v_hidden = layout.v_hidden_dims if layout else self.v_hidden_dims
         dsa_hidden = layout.dsa_hidden_dims if layout else self.dsa_hidden_dims
@@ -4939,13 +5013,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sizes: List[int],
         stream: Any,
         from_npu: bool,
+        token_bytes: int = 130,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
         """Keep compact planar packets intact through the optional GPU staging pool."""
         views = []
         offset = 0
         with self._stream_context_or_null(stream):
             for tensor, tokens in zip(tensors, sizes, strict=True):
-                size = tokens * 130
+                size = tokens * token_bytes
                 if (
                     tensor.dtype != torch.uint8
                     or not tensor.is_contiguous()
@@ -5123,6 +5198,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 if layout.indexer_c8:
                     policy = self.indexer_c8_layout
+                    if policy.c8_layers and len(policy.c8_layers) != len(kv_caches):
+                        raise ValueError(
+                            "Indexer cache owners disagree with precision policy"
+                        )
                     bf16_blocks = {
                         layer[0].shape[0] for i, layer in enumerate(kv_caches)
                         if not policy.is_c8(i)
@@ -5130,6 +5209,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     if len(bf16_blocks) > 1:
                         raise ValueError("Mixed indexer layers disagree on logical block capacity")
                     logical_blocks = next(iter(bf16_blocks)) if bf16_blocks else first_layer_cache[0].shape[0]
+                    if logical_blocks <= 0:
+                        raise ValueError("Indexer cache must contain physical blocks")
                     factors = []
                     for i, layer in enumerate(kv_caches):
                         key = layer[0]
@@ -5222,6 +5303,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         * layout.num_layers
                     ),
                 }
+                if layout.indexer_c8:
+                    payload["layer_token_bytes"] = layout.layer_token_bytes
+                    payload["layer_slot_factors"] = layout.layer_slot_factors
+                    payload["page_bytes"] = (
+                        sum(layout.layer_token_bytes) * self.lmcache_chunk_size
+                    )
                 encoded = json.dumps(
                     payload, sort_keys=True, separators=(",", ":")
                 )
@@ -5546,6 +5633,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             chunk_sizes,
                             self.load_stream,
                             False,
+                            layout.layer_token_bytes[layer_id],
                         )
                     elif pointer_first:
                         chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
@@ -6199,7 +6287,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             total_tokens = (
                 lmcache_cached_tokens
                 if lmcache_cached_tokens > 0
-                else self._sparse_total_tokens_from_layer_chunks(cpu_tensors, kv_group)
+                else self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group, layer_id
+                )
             )
             if layout.indexer_c8:
                 self._run_c8_indexer_bootstrap(
@@ -6373,7 +6463,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
             if _mtp_dw_diag_enabled() and layer_id == 0:
                 actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group
+                    cpu_tensors, kv_group, layer_id
                 )
                 diag_selected = selected_token_idx.detach().cpu().reshape(-1)
                 selected_count = int(diag_selected.numel())
@@ -6451,7 +6541,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 slot_values = deep_diag["slot_values"]
                 conflicts = deep_diag["conflicts"]
                 actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group
+                    cpu_tensors, kv_group, layer_id
                 )
                 raw_window = os.environ.get(
                     "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
@@ -6733,6 +6823,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             chunk_sizes,
                             self.store_stream,
                             True,
+                            layout.layer_token_bytes[layer_id],
                         )
                     else:
                         chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(

@@ -54,6 +54,8 @@ def connector():
     layout = SimpleNamespace(
         kv_format=formats.DSA_INDEX,
         indexer_c8=True,
+        layer_token_bytes=(130, 130),
+        layer_slot_factors=(1, 1),
         k_hidden_dims=130,
         v_hidden_dims=0,
         dsa_hidden_dims=130,
@@ -229,3 +231,92 @@ def test_disabled_byte_plan_matches_baseline(connector, group, layerwise):
     assert expected is not None
     assert actual[:2] == expected[:2]
     assert all(a is b for a, b in zip(actual[2], expected[2], strict=True))
+
+
+@pytest.mark.parametrize("factor", [1, 2])
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_mixed_plan_preserves_bytes_and_logical_block_ownership(
+    connector, factor, layerwise
+):
+    layout = connector._group_layouts[1]
+    layout.layer_token_bytes = (256, 130)
+    layout.layer_slot_factors = (1, factor)
+    layout.dsa_hidden_dims = 256
+    caches = [
+        (torch.arange(4 * 128 * 128).to(torch.bfloat16).reshape(4, 128, 1, 128),),
+        (
+            torch.arange(4 * factor * 128 * 128)
+            .to(torch.int8)
+            .reshape(4 * factor, 128, 1, 128),
+            torch.arange(4 * factor * 128)
+            .to(torch.float16)
+            .reshape(4 * factor, 128, 1, 1),
+        ),
+    ]
+    slots = torch.tensor([126, 127, 128, 129, 300, 301, 511])
+    pointers, sizes, owners = connector.plan_direct_page_sources(
+        caches, slots, [0], [len(slots)], 1, layerwise
+    )
+    packets = [
+        b"".join(ctypes.string_at(p, n) for p, n in zip(ps, ns, strict=True))
+        for ps, ns in zip(pointers, sizes, strict=True)
+    ]
+    expected = []
+    for i, layer in enumerate(caches):
+        selected = slots + slots // 128 * 128 * (layout.layer_slot_factors[i] - 1)
+        expected.append(
+            b"".join(
+                t.flatten(0, 1)[selected]
+                .contiguous()
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+                for t in layer
+            )
+        )
+    assert packets == (expected if layerwise else [b"".join(expected)])
+    destination = [tuple(torch.full_like(t, 42) for t in layer) for layer in caches]
+    pointers, sizes, _ = connector.plan_direct_page_destinations(
+        destination, slots, [0], [len(slots)], 1, layerwise
+    )
+    for packet, ps, ns in zip(packets, pointers, sizes, strict=True):
+        offset = 0
+        for ptr, size in zip(ps, ns, strict=True):
+            ctypes.memmove(ptr, packet[offset : offset + size], size)
+            offset += size
+        assert offset == len(packet)
+    for i, layer in enumerate(destination):
+        selected = slots + slots // 128 * 128 * (layout.layer_slot_factors[i] - 1)
+        untouched = torch.ones(layer[0].shape[0] * 128, dtype=torch.bool)
+        untouched[selected] = False
+        for original, actual in zip(caches[i], layer, strict=True):
+            assert torch.equal(
+                original.flatten(0, 1)[selected], actual.flatten(0, 1)[selected]
+            )
+            assert torch.all(actual.flatten(0, 1)[untouched] == 42)
+
+
+def test_latent_plan_bounds_every_plane_not_only_keys(connector):
+    layout = SimpleNamespace(
+        kv_format=1,
+        indexer_c8=False,
+        k_hidden_dims=512,
+        v_hidden_dims=64,
+        dsa_hidden_dims=128,
+    )
+    connector._group_layouts = {0: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *args, **kwargs: layout
+    caches = [
+        (
+            torch.empty(4, 128, 1, 512, dtype=torch.bfloat16),
+            torch.empty(3, 128, 1, 64, dtype=torch.bfloat16),
+        )
+        for _ in range(2)
+    ]
+    # Token 384 is inside the key plane but beyond the last value-plane block.
+    assert (
+        connector.plan_direct_page_destinations(
+            caches, torch.tensor([384]), [0], [1], 0
+        )
+        is None
+    )
