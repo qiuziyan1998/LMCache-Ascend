@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <c10/core/DeviceGuard.h>
 #include <limits>
+#include <type_traits>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 
@@ -92,6 +93,29 @@ static uint32_t validate_transfer(
   return cores;
 }
 
+namespace {
+// Task-queue slot replacement can destroy a handler under the enqueue mutex.
+// It must never release Tensor storage there (allocator events re-enter it).
+// Prepared states/request owners and stream records retain the actual buffers.
+struct IndexerC8Launch {
+  uint32_t cores;
+  void *stream, *keys, *scales, *packets, *offsets, *counts, *slots;
+  int64_t chunks, capacity, slot_count, cache_slots;
+  bool from_npu, metadata_int64, slots_int64, fixed_chunks;
+  int64_t layers, key_bytes, slot_factor;
+
+  int operator()() const {
+    launch_indexer_c8_transfer(
+        cores, stream, keys, scales, packets, offsets, counts, slots,
+        chunks, capacity, slot_count, cache_slots, from_npu, metadata_int64,
+        slots_int64, fixed_chunks, layers, key_bytes, slot_factor);
+    return 0;
+  }
+};
+static_assert(std::is_trivially_copyable<IndexerC8Launch>::value,
+              "Queued C8 launch must not own tensor storage");
+} // namespace
+
 void indexer_c8_transfer_prepared(
     const IndexerC8State &state, const torch::Tensor &packet_ptrs,
     const torch::Tensor &chunk_offsets, const torch::Tensor &chunk_counts,
@@ -105,19 +129,14 @@ void indexer_c8_transfer_prepared(
   const auto stream = c10_npu::getCurrentNPUStream().stream();
   at_npu::native::OpCommand cmd;
   cmd.Name("indexer_c8_transfer_prepared");
-  // OpCommand may defer host submission. Retain all tensor handles until the
-  // launch; the connector retains packets/metadata until its completion event.
-  cmd.SetCustomHandler([state, packet_ptrs, chunk_offsets, chunk_counts,
-                        slot_mapping, chunk_capacity, from_npu, chunks,
-                        cores, stream, fixed_chunks]() -> int {
-    launch_indexer_c8_transfer(
-        cores, stream, state.keys.data_ptr(), state.scales.defined() ? state.scales.data_ptr() : nullptr,
-        packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
-        slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
-        state.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
-        slot_mapping.scalar_type() == at::kLong, fixed_chunks, 1, state.key_bytes, state.slot_factor);
-    return 0;
-  });
+  cmd.SetCustomHandler(IndexerC8Launch{
+      cores, stream, state.keys.data_ptr(),
+      state.scales.defined() ? state.scales.data_ptr() : nullptr,
+      packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
+      slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
+      state.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
+      slot_mapping.scalar_type() == at::kLong, fixed_chunks, 1,
+      state.key_bytes, state.slot_factor});
   cmd.Run();
 }
 
@@ -143,21 +162,15 @@ void indexer_c8_group_transfer_prepared(
   const auto stream = c10_npu::getCurrentNPUStream().stream();
   at_npu::native::OpCommand cmd;
   cmd.Name("indexer_c8_group_transfer_prepared");
-  cmd.SetCustomHandler([state, packet_ptrs, chunk_offsets, chunk_counts,
-                        slot_mapping, chunk_capacity, from_npu, fixed_chunks,
-                        layers, chunks, group_cores, stream]() -> int {
-    const auto &first = state.layers[0];
-    launch_indexer_c8_transfer(
-        group_cores, stream,
-        layers > 1 ? state.planes.data_ptr() : first.keys.data_ptr(),
-        first.scales.defined() ? first.scales.data_ptr() : nullptr,
-        packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
-        slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
-        first.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
-        slot_mapping.scalar_type() == at::kLong, fixed_chunks, layers,
-        state.max_key_bytes, first.slot_factor);
-    return 0;
-  });
+  cmd.SetCustomHandler(IndexerC8Launch{
+      group_cores, stream,
+      layers > 1 ? state.planes.data_ptr() : first.keys.data_ptr(),
+      first.scales.defined() ? first.scales.data_ptr() : nullptr,
+      packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
+      slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
+      first.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
+      slot_mapping.scalar_type() == at::kLong, fixed_chunks, layers,
+      state.max_key_bytes, first.slot_factor});
   cmd.Run();
 }
 } // namespace lmc

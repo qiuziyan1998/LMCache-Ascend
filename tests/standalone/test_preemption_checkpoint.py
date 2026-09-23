@@ -664,3 +664,143 @@ def test_restore_sources_wait_for_all_worker_ack_even_on_cancel_and_failed_local
     assert page.refs == 0 and not store.restore_owners
     store.release_restore("r", 1, 7)  # Duplicate ack is harmless.
     store.close()
+
+
+@pytest.mark.parametrize("failure", [None, "submission", "event"])
+def test_c8_capture_owners_outlive_nonowning_deferred_submission(
+    api, monkeypatch, failure
+):
+    """A raw-pointer native callback must not be the plan's lifetime owner."""
+    import weakref
+
+    class Owner:
+        pass
+
+    engine = fake_engine()
+    refs, events = [], []
+
+    def prepare(*args, **kwargs):
+        plan = NS(
+            c8_group=Owner(),
+            pointers=Owner(),
+            offsets=Owner(),
+            sizes=Owner(),
+            slots=Owner(),
+            states=[Owner()],
+        )
+        refs.extend(
+            weakref.ref(value)
+            for value in (
+                plan.c8_group,
+                plan.pointers,
+                plan.offsets,
+                plan.sizes,
+                plan.slots,
+                plan.states[0],
+            )
+        )
+        return plan
+
+    def check_owners():
+        assert len(refs) == 12  # Both groups have been prepared.
+        assert all(ref() is not None for ref in refs)
+
+    def fence():
+        check_owners()
+        events.append("completion")
+        if failure == "event":
+            raise RuntimeError("completion failed")
+
+    def enqueue(plan):
+        # Deliberately retain NO plan or operands here, unlike Mock.call_args.
+        check_owners()
+        events.append("enqueue")
+        if failure == "submission" and events.count("enqueue") == 2:
+            raise RuntimeError("submission failed")
+        return NS(synchronize=fence)
+
+    def failure_fence():
+        check_owners()
+        events.append("failure-fence")
+
+    engine.gpu_connector.prepare_group_capture = prepare
+    engine.gpu_connector.enqueue_group_capture = enqueue
+    engine.gpu_connector.finish_checkpoint_capture = failure_fence
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        store, _, _ = start_capture(api, monkeypatch, engine)
+        try:
+            result = store.poll()
+            assert result[0].status == ("failed" if failure else "captured")
+            expected = ["enqueue", "enqueue"]
+            if failure != "submission":
+                expected.append("completion")
+            if failure:
+                expected.append("failure-fence")
+            assert events == expected
+            assert all(ref() is None for ref in refs)
+        finally:
+            store.close()
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_c8_capture_quarantine_keeps_nonowning_launch_operands(api, monkeypatch):
+    import weakref
+
+    class Owner:
+        pass
+
+    control, module = api
+    engine = fake_engine()
+    refs = []
+
+    def prepare(*args, **kwargs):
+        plan = NS(
+            c8_group=Owner(),
+            pointers=Owner(),
+            offsets=Owner(),
+            sizes=Owner(),
+            slots=Owner(),
+        )
+        refs.extend(weakref.ref(value) for value in vars(plan).values())
+        return plan
+
+    def fail_fence():
+        assert len(refs) == 10 and all(ref() is not None for ref in refs)
+        raise RuntimeError("completion unknown")
+
+    engine.gpu_connector.prepare_group_capture = prepare
+    engine.gpu_connector.enqueue_group_capture = lambda plan: NS(synchronize=fail_fence)
+    engine.gpu_connector.finish_checkpoint_capture = fail_fence
+    monkeypatch.setattr(
+        module,
+        "torch",
+        NS(
+            tensor=lambda values, **kw: torch.tensor(values, dtype=kw["dtype"]),
+            long=torch.long,
+        ),
+    )
+    store = module.CheckpointWorker(engine)
+    spec = control.CaptureSpec("r", 1, 0, 4, 0, ((1,), (1,)), prefix_end=0)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with pytest.raises(RuntimeError, match="owners retained"):
+            store.capture(spec, {0: [1], 1: [2]}, 4)
+        assert store.jobs["r", 1].quarantined
+        store.cancel("r")
+        with pytest.raises(RuntimeError, match="unresolved native transfer"):
+            store.close()
+        assert all(ref() is not None for ref in refs)
+        assert all(page.refs == 1 for page in engine.allocated)
+    finally:
+        # Test-only teardown: there is no real DMA in this host test.
+        if (job := store.jobs.get(("r", 1))) is not None:
+            job.quarantined = False
+            store.cancel("r")
+        store.close()
+        if enabled:
+            gc.enable()
