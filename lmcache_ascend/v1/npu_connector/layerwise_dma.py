@@ -220,6 +220,7 @@ class BoundCopyPrefix:
     element_bytes: int
     segment_chunks: torch.Tensor
     rows: list[list[int]]
+    reused_chunks: int = 0
 
 
 def bind_incremental_copy_addresses(
@@ -314,6 +315,7 @@ def bind_incremental_copy_addresses(
         element_bytes=element_bytes,
         segment_chunks=plan.chunk,
         rows=rows,
+        reused_chunks=begin_chunk,
     )
 
 
