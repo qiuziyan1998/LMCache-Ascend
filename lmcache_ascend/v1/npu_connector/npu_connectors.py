@@ -2331,6 +2331,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             device_wait_end.record(current_stream)
             fields = dict(
                 kv_group=kv_group, layer_id=layer_id, bank=bank,
+                load_event_pending=(
+                    load_record is not None
+                    and load_record[0] == generation
+                    and not load_record[1].query()
+                ),
                 save_event=(
                     not bank_fifo_active
                     and save_record is not None
@@ -6059,6 +6064,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     bank_stream = self._layerwise_prefill_dma_stream(
                         kv_group, bank
                     )
+                    bank_tails = getattr(
+                        self, "_layerwise_prefill_bank_tail_events", {}
+                    )
+                    previous_tail = bank_tails.get((kv_group, bank))
+                    previous_tail_pending = bool(
+                        previous_tail is not None
+                        and not previous_tail[1].query()
+                    )
                     bound = bind_incremental_copy_addresses(
                         dma_plans[bank], source_objs, starts, ends,
                         [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
@@ -6098,6 +6111,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     load_done[(kv_group, layer_id)] = (
                         layerwise_prefill_generation, load_done_event,
                     )
+                    if layer_id == 0 and prefill_start_timing_enabled():
+                        prefill_start_timing_log(
+                            logger,
+                            "first_bank_load_submit",
+                            time.perf_counter(),
+                            kv_group=kv_group,
+                            layer_id=layer_id,
+                            bank=bank,
+                            previous_tail_pending=previous_tail_pending,
+                            previous_tail_layer=(
+                                previous_tail[2]
+                                if previous_tail is not None else None
+                            ),
+                        )
                 elif dense_direct:
                     if deferred_dense_direct_get:
                         bank = self._layerwise_prefill_bank(layer_id, kv_group)
@@ -7753,6 +7780,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         save_done[(kv_group, bank, layer_id)] = (
                             layerwise_prefill_generation,
                             bank_done_event,
+                        )
+                        bank_tails = getattr(
+                            self, "_layerwise_prefill_bank_tail_events", None
+                        )
+                        if bank_tails is None:
+                            bank_tails = {}
+                            self._layerwise_prefill_bank_tail_events = (
+                                bank_tails
+                            )
+                        bank_tails[(kv_group, bank)] = (
+                            layerwise_prefill_generation,
+                            bank_done_event,
+                            layer_id,
+                            kwargs.get("req_id"),
                         )
                     else:
                         # The fallback path owns only one reusable staging
