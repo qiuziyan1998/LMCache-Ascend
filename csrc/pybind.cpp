@@ -238,7 +238,8 @@ py::tuple dense_mla_dsa_group_direct_kv_transfer_fast_wrapper(
 
 PYBIND11_MODULE(c_ops, m) {
   py::class_<lmc::IndexerC8State>(m, "IndexerC8State")
-      .def(py::init<torch::Tensor, torch::Tensor>());
+      .def(py::init<torch::Tensor, c10::optional<torch::Tensor>, int64_t>(),
+           py::arg("keys"), py::arg("scales") = c10::nullopt, py::arg("slot_factor") = 1);
   py::class_<lmc::IndexerC8GroupState>(m, "IndexerC8GroupState")
       .def(py::init<std::vector<lmc::IndexerC8State>>());
   m.def("indexer_c8_group_transfer_prepared", &lmc::indexer_c8_group_transfer_prepared,

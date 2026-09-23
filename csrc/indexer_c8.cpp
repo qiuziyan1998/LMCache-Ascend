@@ -9,22 +9,29 @@
 #include <torch_npu/csrc/framework/OpCommand.h>
 
 namespace lmc {
-IndexerC8State::IndexerC8State(torch::Tensor key, torch::Tensor scale)
-    : keys(std::move(key)), scales(std::move(scale)) {
+IndexerC8State::IndexerC8State(torch::Tensor key, c10::optional<torch::Tensor> scale,
+                             int64_t factor)
+    : keys(std::move(key)), scales(scale.value_or(torch::Tensor())), slot_factor(factor) {
   TORCH_CHECK(keys.device().type() == c10::DeviceType::PrivateUse1 &&
-                  scales.device() == keys.device(),
+                  (!scales.defined() || scales.device() == keys.device()),
               "C8 destinations must share one NPU device");
-  TORCH_CHECK(keys.scalar_type() == at::kChar &&
-                  scales.scalar_type() == at::kHalf,
-              "C8 destinations require int8 keys and float16 scales");
-  TORCH_CHECK(keys.dim() == 4 && scales.dim() == 4 &&
+  const bool quantized = keys.scalar_type() == at::kChar;
+  TORCH_CHECK(quantized ? scales.defined() && scales.scalar_type() == at::kHalf
+                       : !scales.defined() && (keys.scalar_type() == at::kHalf || keys.scalar_type() == at::kBFloat16),
+              "Indexer requires floating keys alone, or int8 keys and float16 scales");
+  TORCH_CHECK((factor == 1 || (factor == 2 && quantized)) && keys.size(0) % factor == 0,
+              "Invalid physical indexer block factor");
+  TORCH_CHECK(keys.dim() == 4 &&
                   keys.size(0) > 0 && keys.size(1) == 128 &&
                   keys.size(2) == 1 && keys.size(3) == 128 &&
+                  keys.is_contiguous(),
+              "Indexer destinations require contiguous PA_BSND storage");
+  TORCH_CHECK(!quantized || (scales.dim() == 4 &&
                   scales.size(0) == keys.size(0) && scales.size(1) == 128 &&
-                  scales.size(2) == 1 && scales.size(3) == 1 &&
-                  keys.is_contiguous() && scales.is_contiguous(),
+                  scales.size(2) == 1 && scales.size(3) == 1 && scales.is_contiguous()),
               "C8 destinations require paired contiguous PA_BSND storage");
-  cache_slots = keys.numel() / 128;
+  cache_slots = keys.numel() / 128 / factor;
+  key_bytes = 128 * keys.element_size();
   const c10::OptionalDeviceGuard guard(keys.device());
   auto platform =
       platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
@@ -34,18 +41,22 @@ IndexerC8State::IndexerC8State(torch::Tensor key, torch::Tensor scale)
 IndexerC8GroupState::IndexerC8GroupState(std::vector<IndexerC8State> states)
     : layers(std::move(states)) {
   TORCH_CHECK(!layers.empty(), "C8 group must contain at least one layer");
-  std::vector<int64_t> keys, scales;
+  std::vector<int64_t> table(4 * layers.size());
+  size_t i = 0;
   for (const auto &state : layers) {
     TORCH_CHECK(state.keys.device() == layers[0].keys.device() &&
                     state.cache_slots == layers[0].cache_slots,
                 "C8 group layers must share device and slot capacity");
-    keys.push_back(reinterpret_cast<int64_t>(state.keys.data_ptr()));
-    scales.push_back(reinterpret_cast<int64_t>(state.scales.data_ptr()));
+    table[i] = reinterpret_cast<int64_t>(state.keys.data_ptr());
+    table[layers.size() + i] = state.scales.defined() ? reinterpret_cast<int64_t>(state.scales.data_ptr()) : 0;
+    table[2 * layers.size() + i] = state.key_bytes;
+    table[3 * layers.size() + i] = state.slot_factor;
+    max_key_bytes = std::max(max_key_bytes, state.key_bytes);
+    ++i;
   }
   if (layers.size() > 1) {
     const c10::OptionalDeviceGuard guard(layers[0].keys.device());
-    key_ptrs = torch::tensor(keys, at::kLong).to(layers[0].keys.device());
-    scale_ptrs = torch::tensor(scales, at::kLong).to(layers[0].keys.device());
+    planes = torch::tensor(table, at::kLong).to(layers[0].keys.device());
   }
 }
 
@@ -100,11 +111,11 @@ void indexer_c8_transfer_prepared(
                         slot_mapping, chunk_capacity, from_npu, chunks,
                         cores, stream, fixed_chunks]() -> int {
     launch_indexer_c8_transfer(
-        cores, stream, state.keys.data_ptr(), state.scales.data_ptr(),
+        cores, stream, state.keys.data_ptr(), state.scales.defined() ? state.scales.data_ptr() : nullptr,
         packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
         slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
         state.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
-        slot_mapping.scalar_type() == at::kLong, fixed_chunks);
+        slot_mapping.scalar_type() == at::kLong, fixed_chunks, 1, state.key_bytes, state.slot_factor);
     return 0;
   });
   cmd.Run();
@@ -138,12 +149,13 @@ void indexer_c8_group_transfer_prepared(
     const auto &first = state.layers[0];
     launch_indexer_c8_transfer(
         group_cores, stream,
-        layers > 1 ? state.key_ptrs.data_ptr() : first.keys.data_ptr(),
-        layers > 1 ? state.scale_ptrs.data_ptr() : first.scales.data_ptr(),
+        layers > 1 ? state.planes.data_ptr() : first.keys.data_ptr(),
+        first.scales.defined() ? first.scales.data_ptr() : nullptr,
         packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
         slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
         first.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
-        slot_mapping.scalar_type() == at::kLong, fixed_chunks, layers);
+        slot_mapping.scalar_type() == at::kLong, fixed_chunks, layers,
+        state.max_key_bytes, first.slot_factor);
     return 0;
   });
   cmd.Run();

@@ -225,3 +225,33 @@ def test_native_c8_repeated_copy_on_two_streams_keeps_disjoint_slots():
         assert torch.equal(scale_result[indices], expected_scales)
     assert torch.all(keys.cpu().view(-1, 128)[tokens * 2 :] == -7)
     assert torch.all(scales.cpu().view(-1)[tokens * 2 :] == -1)
+
+
+@pytest.mark.parametrize("slot_factor", [1, 2])
+def test_native_mixed_group_preserves_bf16_bits_and_c8_physical_mapping(slot_factor):
+    tokens = 259
+    bf16_cpu = torch.arange(4 * 128 * 128).to(torch.int16).view(torch.bfloat16).reshape(4, 128, 1, 128)
+    c8_cpu = torch.arange(4 * slot_factor * 128 * 128).to(torch.int8).reshape(4 * slot_factor, 128, 1, 128)
+    scale_cpu = (torch.arange(4 * slot_factor * 128) * 97).to(torch.int16).view(torch.float16).reshape(4 * slot_factor, 128, 1, 1)
+    bf16, c8, scale = bf16_cpu.npu(), c8_cpu.npu(), scale_cpu.npu()
+    state = c_ops.IndexerC8GroupState([
+        c_ops.IndexerC8State(bf16), c_ops.IndexerC8State(c8, scale, slot_factor)])
+    packets = [torch.empty(tokens * width, dtype=torch.uint8, device="npu") for width in (256, 130)]
+    pointers = torch.tensor([[p.data_ptr()] for p in packets], dtype=torch.int64, device="npu")
+    offsets = torch.tensor([0], dtype=torch.int32, device="npu")
+    sizes = torch.tensor([tokens], dtype=torch.int32, device="npu")
+    slots = torch.arange(tokens, dtype=torch.int64, device="npu")
+    physical = torch.arange(tokens) + (torch.arange(tokens) // 128) * (slot_factor - 1) * 128
+    c_ops.indexer_c8_group_transfer_prepared(state, pointers, offsets, sizes, slots, tokens, True)
+    expected_bf16 = bf16_cpu.view(-1, 128)[:tokens].contiguous().view(torch.uint8).flatten()
+    expected_c8 = torch.cat((c8_cpu.view(-1, 128)[physical].contiguous().view(torch.uint8).flatten(),
+                             scale_cpu.view(-1, 1)[physical].contiguous().view(torch.uint8).flatten()))
+    assert torch.equal(packets[0].cpu(), expected_bf16)
+    assert torch.equal(packets[1].cpu(), expected_c8)
+    bf16.zero_()
+    c8.zero_()
+    scale.zero_()
+    c_ops.indexer_c8_group_transfer_prepared(state, pointers, offsets, sizes, slots, tokens, False)
+    assert torch.equal(bf16.cpu().view(-1, 128)[:tokens].contiguous().view(torch.uint8).flatten(), expected_bf16)
+    assert torch.equal(c8.cpu().view(-1, 128)[physical], c8_cpu.view(-1, 128)[physical])
+    assert torch.equal(scale.cpu().view(torch.int16).view(-1)[physical], scale_cpu.view(torch.int16).view(-1)[physical])

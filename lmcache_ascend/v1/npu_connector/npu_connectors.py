@@ -1505,6 +1505,8 @@ class _GroupLayout:
         "layout_signature",
         "storage_dtype",
         "indexer_c8",
+        "layer_slot_factors",
+        "layer_token_bytes",
     )
 
     def __init__(self) -> None:
@@ -1524,6 +1526,8 @@ class _GroupLayout:
         self.layout_signature: Optional[str] = None
         self.storage_dtype: Optional[torch.dtype] = None
         self.indexer_c8: bool = False
+        self.layer_slot_factors: tuple[int, ...] = ()
+        self.layer_token_bytes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -2577,7 +2581,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return plan
 
         states = (
-            tuple(lmc_ops.IndexerC8State(*layer) for layer in kvcaches_ref)
+            tuple(
+                lmc_ops.IndexerC8State(
+                    layer[0], layer[1] if len(layer) == 2 else None,
+                    self._group_layouts[kv_group].layer_slot_factors[i],
+                )
+                for i, layer in enumerate(kvcaches_ref)
+            )
             if c8
             else tuple(
                 prepare_sparse_direct_destination_state(
@@ -5112,20 +5122,40 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     indexer_tensor.shape[-2] * indexer_tensor.shape[-1]
                 )
                 if layout.indexer_c8:
-                    for key, scale in kv_caches:
+                    policy = self.indexer_c8_layout
+                    bf16_blocks = {
+                        layer[0].shape[0] for i, layer in enumerate(kv_caches)
+                        if not policy.is_c8(i)
+                    }
+                    if len(bf16_blocks) > 1:
+                        raise ValueError("Mixed indexer layers disagree on logical block capacity")
+                    logical_blocks = next(iter(bf16_blocks)) if bf16_blocks else first_layer_cache[0].shape[0]
+                    factors = []
+                    for i, layer in enumerate(kv_caches):
+                        key = layer[0]
+                        quantized = policy.is_c8(i)
+                        factor = key.shape[0] // logical_blocks
                         if (
-                            key.dtype != torch.int8
-                            or scale.dtype != torch.float16
+                            len(layer) != (2 if quantized else 1)
+                            or key.dtype != (torch.int8 if quantized else self.dtype)
                             or key.ndim != 4
                             or key.shape[1:] != (128, 1, 128)
-                            or scale.shape != (*key.shape[:3], 1)
-                            or key.device != scale.device
+                            or factor not in ((1, 2) if quantized else (1,))
+                            or key.shape[0] != logical_blocks * factor
                         ):
-                            raise ValueError(
-                                "C8 indexer requires paired int8 keys and "
-                                "FP16 scales in PA_BSND"
-                            )
-                    layout.dsa_hidden_dims = self.indexer_c8_layout.token_bytes
+                            raise ValueError("Indexer cache disagrees with its per-layer precision policy")
+                        if quantized and (
+                            layer[1].dtype != torch.float16
+                            or layer[1].shape != (*key.shape[:3], 1)
+                            or layer[1].device != key.device
+                        ):
+                            raise ValueError("C8 indexer requires paired FP16 scales in PA_BSND")
+                        factors.append(factor)
+                    layout.layer_slot_factors = tuple(factors)
+                    layout.layer_token_bytes = tuple(policy.token_bytes_for(i) for i in range(len(kv_caches)))
+                    # Capacity of the reusable staging pool; packet lengths
+                    # remain per-layer and do not acquire this padding.
+                    layout.dsa_hidden_dims = max(layout.layer_token_bytes)
                 # Map onto MLA_KV kernel: k=dsa, v=0
                 layout.k_hidden_dims = layout.dsa_hidden_dims
                 layout.v_hidden_dims = 0

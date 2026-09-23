@@ -6,7 +6,6 @@ namespace {
 // One tile copies at most 128 tokens. Contiguous slots share one DMA per
 // plane; short scale tails use DataCopyPad so adjacent slots are untouched.
 constexpr int64_t kTileTokens = 128;
-constexpr uint32_t kKeyBytes = 128;
 constexpr uint32_t kScaleBytes = 2;
 
 class IntVector {
@@ -31,26 +30,28 @@ class IndexerC8Copy {
       GM_ADDR keys, GM_ADDR scales, GM_ADDR packets, GM_ADDR offsets,
       GM_ADDR counts, GM_ADDR slots, int64_t chunks, int64_t capacity,
       int64_t slot_count, int64_t cache_slots, bool from_npu,
-      bool metadata_int64, bool slots_int64, bool fixed_chunks, int64_t layers) {
+      bool metadata_int64, bool slots_int64, bool fixed_chunks, int64_t layers,
+      int64_t max_key_bytes, int64_t single_slot_factor) {
     AscendC::GlobalTensor<uint64_t> pointers;
-    AscendC::GlobalTensor<uint64_t> key_planes, scale_planes;
+    AscendC::GlobalTensor<uint64_t> key_planes;
     if (layers > 1) {
       key_planes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(keys));
-      scale_planes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(scales));
     }
     IntVector starts, lengths, mapping;
     pointers.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(packets));
     starts.Init(offsets, metadata_int64);
     lengths.Init(counts, metadata_int64);
     mapping.Init(slots, slots_int64);
-    pipe_.InitBuffer(queue_, 2, kTileTokens * kKeyBytes);
+    pipe_.InitBuffer(queue_, 2, kTileTokens * max_key_bytes);
     const int64_t tiles = (capacity + kTileTokens - 1) / kTileTokens;
     for (int64_t work = AscendC::GetBlockIdx(); work < layers * chunks * tiles;
          work += AscendC::GetBlockNum()) {
       const int64_t layer = work / (chunks * tiles);
       const int64_t chunk = (work / tiles) % chunks;
       GM_ADDR key_base = layers > 1 ? reinterpret_cast<GM_ADDR>(key_planes.GetValue(layer)) : keys;
-      GM_ADDR scale_base = layers > 1 ? reinterpret_cast<GM_ADDR>(scale_planes.GetValue(layer)) : scales;
+      GM_ADDR scale_base = layers > 1 ? reinterpret_cast<GM_ADDR>(key_planes.GetValue(layers + layer)) : scales;
+      const int64_t key_bytes = layers > 1 ? key_planes.GetValue(2 * layers + layer) : max_key_bytes;
+      const int64_t slot_factor = layers > 1 ? key_planes.GetValue(3 * layers + layer) : single_slot_factor;
       const int64_t start = fixed_chunks ? chunk * capacity : starts.GetValue(chunk);
       const int64_t remaining = slot_count - start;
       const int64_t count = fixed_chunks ? (remaining < capacity ? remaining : capacity)
@@ -72,13 +73,17 @@ class IndexerC8Copy {
         }
         int64_t run = 1;
         while (token + run < end && slot + run < cache_slots &&
+               (slot_factor == 1 || slot % 128 + run < 128) &&
                mapping.GetValue(start + token + run) == slot + run) {
           ++run;
         }
-        Copy(reinterpret_cast<GM_ADDR>(packet) + token * kKeyBytes,
-             key_base + slot * kKeyBytes, run * kKeyBytes, from_npu);
-        Copy(reinterpret_cast<GM_ADDR>(packet) + count * kKeyBytes + token * kScaleBytes,
-             scale_base + slot * kScaleBytes, run * kScaleBytes, from_npu);
+        const int64_t physical_slot = slot + (slot / 128) * (slot_factor - 1) * 128;
+        Copy(reinterpret_cast<GM_ADDR>(packet) + token * key_bytes,
+             key_base + physical_slot * key_bytes, run * key_bytes, from_npu);
+        if (scale_base != nullptr) {
+          Copy(reinterpret_cast<GM_ADDR>(packet) + count * key_bytes + token * kScaleBytes,
+               scale_base + physical_slot * kScaleBytes, run * kScaleBytes, from_npu);
+        }
         token += run;
       }
     }
@@ -111,10 +116,12 @@ extern "C" __global__ __aicore__ void indexer_c8_copy_kernel(
     GM_ADDR keys, GM_ADDR scales, GM_ADDR packets, GM_ADDR offsets,
     GM_ADDR counts, GM_ADDR slots, int64_t chunks, int64_t capacity,
     int64_t slot_count, int64_t cache_slots, bool from_npu,
-    bool metadata_int64, bool slots_int64, bool fixed_chunks, int64_t layers) {
+    bool metadata_int64, bool slots_int64, bool fixed_chunks, int64_t layers,
+    int64_t max_key_bytes, int64_t slot_factor) {
   IndexerC8Copy op;
   op.Run(keys, scales, packets, offsets, counts, slots, chunks, capacity,
-         slot_count, cache_slots, from_npu, metadata_int64, slots_int64, fixed_chunks, layers);
+         slot_count, cache_slots, from_npu, metadata_int64, slots_int64, fixed_chunks,
+         layers, max_key_bytes, slot_factor);
 }
 
 namespace lmc {
@@ -122,11 +129,13 @@ void launch_indexer_c8_transfer(
     uint32_t cores, void *stream, void *keys, void *scales, void *packets,
     void *offsets, void *counts, void *slots, int64_t chunks,
     int64_t capacity, int64_t slot_count, int64_t cache_slots, bool from_npu,
-    bool metadata_int64, bool slots_int64, bool fixed_chunks, int64_t layers) {
+    bool metadata_int64, bool slots_int64, bool fixed_chunks, int64_t layers,
+    int64_t max_key_bytes, int64_t slot_factor) {
   indexer_c8_copy_kernel<<<cores, nullptr, stream>>>(
       static_cast<GM_ADDR>(keys), static_cast<GM_ADDR>(scales),
       static_cast<GM_ADDR>(packets), static_cast<GM_ADDR>(offsets),
       static_cast<GM_ADDR>(counts), static_cast<GM_ADDR>(slots), chunks,
-      capacity, slot_count, cache_slots, from_npu, metadata_int64, slots_int64, fixed_chunks, layers);
+      capacity, slot_count, cache_slots, from_npu, metadata_int64, slots_int64,
+      fixed_chunks, layers, max_key_bytes, slot_factor);
 }
 } // namespace lmc
