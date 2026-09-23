@@ -33,9 +33,8 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
-add_subdirectory(third_party/kvcache-ops)
-
 if(DEFINED ENV{USE_MINDSPORE})
+  add_subdirectory(third_party/kvcache-ops)
   find_package(Threads REQUIRED)
   add_subdirectory(csrc/mindspore)
   target_link_options(c_ops PRIVATE
@@ -94,7 +93,6 @@ else()
     PUBLIC
     ${TORCH_LIBRARIES}
     libtorch_npu.so
-    indexer_c8_kernels
     cache_kernels
     ascendcl
     platform

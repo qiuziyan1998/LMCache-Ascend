@@ -370,8 +370,6 @@ class CustomAscendCmakeBuildExt(build_ext):
 
         # Expected file patterns (using glob patterns for flexibility)
         expected_patterns = ["c_ops*.so", "libcache_kernels.so"]
-        if not USE_MINDSPORE:
-            expected_patterns.append("libindexer_c8_kernels.so")
         if self._cann_version_no_hccl:
             expected_patterns.append("hixl_npu_comms*.so")
             expected_patterns.append("hcomm_onesided*.so")

@@ -1,10 +1,20 @@
-# Separate local kernel library; leave the vendored BF16 kernels unchanged.
-include("${PROJECT_SOURCE_DIR}/third_party/kvcache-ops/ascendc_with_def.cmake")
+# Initialize Ascend C once and extend the existing library without editing
+# vendored kernels. Its toolkit setup defines process-wide CMake targets.
+set(KVCACHE_OPS_ROOT "${PROJECT_SOURCE_DIR}/third_party/kvcache-ops")
+file(GLOB KERNEL_FILES
+  "${KVCACHE_OPS_ROOT}/kernels/*.cpp"
+  "${KVCACHE_OPS_ROOT}/kernels/cachegen/*.cpp"
+  "${KVCACHE_OPS_ROOT}/kernels/fused_rope/*.cpp"
+  "${KVCACHE_OPS_ROOT}/kernels/single_layer/*.cpp"
+  "${KVCACHE_OPS_ROOT}/kernels/multi_layer/*.cpp"
+)
+list(APPEND KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cpp")
+include("${KVCACHE_OPS_ROOT}/ascendc_with_def.cmake")
 if(DEFINED ASCEND_AICORE_ARCH)
-  ascendc_library_with_def(indexer_c8_kernels SHARED kernel.cpp)
-  ascendc_compile_definitions(indexer_c8_kernels PRIVATE
+  ascendc_library_with_def(cache_kernels SHARED ${KERNEL_FILES})
+  ascendc_compile_definitions(cache_kernels PRIVATE
     -DASCEND_AICORE_ARCH=${ASCEND_AICORE_ARCH})
 else()
-  ascendc_library(indexer_c8_kernels SHARED kernel.cpp)
+  ascendc_library(cache_kernels SHARED ${KERNEL_FILES})
 endif()
-install(TARGETS indexer_c8_kernels DESTINATION ${LMC_INSTALL_PATH})
+target_include_directories(cache_kernels PUBLIC "${KVCACHE_OPS_ROOT}")
