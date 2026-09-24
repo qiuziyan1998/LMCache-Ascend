@@ -796,7 +796,11 @@ void sparse_graph_kv_transfer(
                   limits.device() == selected.device(),
               "Graph transfer inputs must be on the same NPU");
   const c10::OptionalDeviceGuard guard(device_of(selected));
-  const uint32_t cores = direct_aiv_num(static_cast<int32_t>(selected.numel()));
+  // Full-graph H2D saturates at 12 AIVs per rank; leave capacity for compute.
+  // GetBlockNum() partitions all active tokens across this bounded launch grid.
+  constexpr uint32_t kSparseGraphMaxAivCores = 12;
+  const uint32_t cores = std::min(
+      direct_aiv_num(static_cast<int32_t>(selected.numel())), kSparseGraphMaxAivCores);
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   auto *slot_ptr = static_cast<uint8_t *>(slots.data_ptr());
   auto *selected_ptr = static_cast<uint8_t *>(selected.data_ptr());
