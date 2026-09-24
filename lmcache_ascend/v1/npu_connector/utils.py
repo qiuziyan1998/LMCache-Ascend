@@ -336,8 +336,15 @@ def sparse_graph_kv_transfer(
     ptrs: torch.Tensor,
     limits: torch.Tensor,
     chunk_size: int,
+    *,
+    max_aiv_cores: int = 0,
 ) -> None:
     """Capture one two-plane copy; all request-dependent data stays on device."""
+    if max_aiv_cores:
+        lmc_ops.sparse_graph_kv_transfer(
+            destination_state, slots, selected, counts, ptrs, limits, chunk_size, max_aiv_cores
+        )
+        return
     lmc_ops.sparse_graph_kv_transfer(
         destination_state, slots, selected, counts, ptrs, limits, chunk_size
     )

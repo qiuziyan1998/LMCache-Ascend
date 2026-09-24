@@ -754,7 +754,7 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 void sparse_graph_kv_transfer(
     const SparseDirectDestinationState &state,
     torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
-    torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size) {
+    torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size, int64_t max_aiv_cores) {
   // Host metadata checks run at eager warmup/capture only, never on replay.
   TORCH_CHECK(selected.dim() == 2 && selected.is_contiguous(),
               "Graph selected tokens must be a contiguous matrix");
@@ -796,11 +796,13 @@ void sparse_graph_kv_transfer(
                   limits.device() == selected.device(),
               "Graph transfer inputs must be on the same NPU");
   const c10::OptionalDeviceGuard guard(device_of(selected));
-  // Full-graph H2D saturates at 12 AIVs per rank; leave capacity for compute.
-  // GetBlockNum() partitions all active tokens across this bounded launch grid.
-  constexpr uint32_t kSparseGraphMaxAivCores = 12;
-  const uint32_t cores = std::min(
-      direct_aiv_num(static_cast<int32_t>(selected.numel())), kSparseGraphMaxAivCores);
+  TORCH_CHECK(max_aiv_cores >= 0 && max_aiv_cores <= std::numeric_limits<uint32_t>::max(),
+              "max_aiv_cores must be zero (automatic) or a positive uint32 value");
+  uint32_t cores = direct_aiv_num(static_cast<int32_t>(selected.numel()));
+  // Serial retrieval is critical-path work. Only a prefetch caller caps AIVs.
+  if (max_aiv_cores > 0) {
+    cores = std::min(cores, static_cast<uint32_t>(max_aiv_cores));
+  }
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   auto *slot_ptr = static_cast<uint8_t *>(slots.data_ptr());
   auto *selected_ptr = static_cast<uint8_t *>(selected.data_ptr());

@@ -59,6 +59,31 @@ def make_transfer(module, capacity=1):
     )
 
 
+def test_aiv_limit_is_per_launch_and_serial_default_is_uncapped(transfer_module, monkeypatch):
+    module, _ = transfer_module
+    native = Mock()
+    monkeypatch.setattr(module, "sparse_graph_kv_transfer", native)
+    transfer = make_transfer(module)
+    selected, counts, slots = torch.zeros((1, 4), dtype=torch.int32), torch.ones(1, dtype=torch.int32), torch.zeros((1, 4), dtype=torch.int64)
+    transfer.load(selected, counts, slots)
+    transfer.load(selected, counts, slots, max_aiv_cores=12)
+    transfer.load(selected, counts, slots)
+    assert [call.kwargs for call in native.call_args_list] == [{}, {"max_aiv_cores": 12}, {}]
+
+
+def test_graph_transfer_wrapper_preserves_default_native_signature():
+    path = Path(__file__).resolve().parents[2] / "lmcache_ascend/v1/npu_connector/utils.py"
+    fn = next(n for n in ast.parse(path.read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "sparse_graph_kv_transfer")
+    native = Mock()
+    ns = {"torch": torch, "lmc_ops": SimpleNamespace(sparse_graph_kv_transfer=native)}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    arguments = (object(),) * 6 + (1024,)
+    ns[fn.name](*arguments)
+    ns[fn.name](*arguments, max_aiv_cores=12)
+    assert native.call_args_list == [mock_call(*arguments), mock_call(*arguments, 12)]
+
+
 def test_tail_growth_and_request_replacement_keep_addresses(transfer_module):
     module, _ = transfer_module
     transfer = make_transfer(module)
