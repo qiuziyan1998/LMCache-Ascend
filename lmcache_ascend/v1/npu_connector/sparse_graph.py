@@ -182,6 +182,8 @@ class SparseGraphTransfer:
         selected: torch.Tensor,
         counts: torch.Tensor,
         slots: torch.Tensor,
+        *,
+        max_aiv_cores: int = 0,
     ) -> None:
         """Capture device top-k -> one K/PE copy, without payload preprocessing."""
         if (
@@ -198,6 +200,7 @@ class SparseGraphTransfer:
             self.ptrs,
             self.valid_tokens,
             self.chunk_size,
+            **({"max_aiv_cores": max_aiv_cores} if max_aiv_cores else {}),
         )
 
     def clear_source(self) -> None:
