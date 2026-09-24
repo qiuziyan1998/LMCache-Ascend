@@ -115,3 +115,94 @@ def test_direct_prefix_repair_source_uses_exact_full_mapping(
     assert {id(owner) for owner in plan.owners} == {
         id(owner) for planes in caches for owner in planes
     }
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("bad", [None, "negative", "bytes", "fence"])
+def test_c8_prefix_repair_preserves_partial_page_planes(monkeypatch, mixed, bad):
+    engine = object.__new__(AscendLMCacheEngine)
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 2
+    connector.dsa_two_groups = True
+    connector.dtype = torch.bfloat16
+    factors = (2, 1) if mixed else (1, 1)
+    layout = SimpleNamespace(
+        num_layers=2,
+        kv_format=KVCacheFormat.DSA_INDEX,
+        indexer_c8=True,
+        layer_slot_factors=factors,
+        layer_token_bytes=(130, 256) if mixed else (130, 130),
+    )
+    connector._group_layouts = {1: layout}
+    connector._lazy_initialize_buffer_with_staging = lambda *a, **k: layout
+    caches = []
+    for layer, factor in enumerate(factors):
+        c8 = not mixed or layer == 0
+        key = torch.empty(
+            6 * factor, 128, 1, 128, dtype=torch.int8 if c8 else torch.bfloat16
+        )
+        planes = (
+            (key, torch.empty(6 * factor, 128, 1, 1, dtype=torch.float16))
+            if c8
+            else (key,)
+        )
+        for plane, owner in enumerate(planes):
+            raw = (
+                ctypes.c_ubyte * (owner.numel() * owner.element_size())
+            ).from_address(owner.data_ptr())
+            raw[:] = bytes((i + 17 * layer + 83 * plane) % 256 for i in range(len(raw)))
+        caches.append(planes)
+    # Holes straddle a physical block; the cached gap must not be dereferenced.
+    slots = torch.tensor([126, 127, 128, -1, -1, 255, 256, 257])
+    pages = tuple(
+        ControlPage(
+            canonical_key=f"c8-hole-{i}",
+            kv_group=1,
+            chunk_index=i,
+            chunk_start=start,
+            chunk_end=end,
+            valid_tokens=end - start,
+            destination_tp_rank=0,
+            expected_bytes=(end - start) * sum(layout.layer_token_bytes),
+            layer_count=2,
+            layout_tag="mixed-c8" if mixed else "c8",
+        )
+        for i, (start, end) in enumerate(((0, 3), (5, 8)))
+    )
+    events = (object(),)
+    if bad == "negative":
+        slots[0] = -1
+    elif bad == "bytes":
+        import msgspec
+
+        pages = (msgspec.structs.replace(pages[0], expected_bytes=1), pages[1])
+    elif bad == "fence":
+        events = ()
+    engine.gpu_connector = connector
+    if bad:
+        with pytest.raises(ValueError):
+            engine._remote_fill_prefix_source_plan(
+                pages, ({1: caches}, {1: slots}), events
+            )
+        return
+    plan = engine._remote_fill_prefix_source_plan(
+        pages, ({1: caches}, {1: slots}), events
+    )
+    assert plan.producer_events is events
+    assert {id(x) for x in plan.owners} == {id(x) for planes in caches for x in planes}
+    for page, source in zip(pages, plan.pages, strict=True):
+        actual = b"".join(
+            ctypes.string_at(p, n)
+            for p, n in zip(source.source_ptrs, source.source_lengths, strict=True)
+        )
+        expected = bytearray()
+        for planes, factor in zip(caches, factors, strict=True):
+            for owner in planes:
+                width = owner[0, 0].numel() * owner.element_size()
+                for token in range(page.chunk_start, page.chunk_end):
+                    slot = int(slots[token])
+                    physical = (slot // 128) * 128 * factor + slot % 128
+                    expected.extend(
+                        ctypes.string_at(owner.data_ptr() + physical * width, width)
+                    )
+        assert actual == expected
