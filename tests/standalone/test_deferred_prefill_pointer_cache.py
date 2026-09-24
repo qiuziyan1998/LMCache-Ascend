@@ -29,7 +29,7 @@ class TorchProbe:
         return call
 
 
-def connector():
+def connector(*, prefill=True):
     path = (
         Path(__file__).resolve().parents[2]
         / "lmcache_ascend/v1/npu_connector/npu_connectors.py"
@@ -40,8 +40,10 @@ def connector():
         "prepare_layerwise_prefill_source_pointers",
         "materialize_sparse_chunk_ptr_cache",
         "append_sparse_chunk_ptr_cache_for_layer",
+        "_append_sparse_chunk_ptr_cache_for_layer_legacy",
         "append_sparse_chunk_ptr_cache_for_layers",
         "_append_sparse_chunk_ptr_rows",
+        "_append_sparse_chunk_ptr_rows_legacy",
         "release_sparse_chunk_ptr_cache",
         "_resolve_sparse_chunk_ptrs_npu",
     }
@@ -79,6 +81,7 @@ def connector():
         return source_obj
 
     obj = SimpleNamespace(
+        _layerwise_prefill_dma=prefill,
         kv_device=torch.device("cpu"),
         _expected_group_layers=lambda group: 2,
         _layer_page_pointer_rows=lambda sources: None,
@@ -228,3 +231,59 @@ def test_deferred_groups_materialize_and_release_independently():
     obj.materialize_sparse_chunk_ptr_cache(host0, device0, kv_group=0)
     assert [row.tolist() for row in device0] == host0
     assert probe.allocations == ["tensor", "tensor"]
+
+
+def test_decoder_group_append_rebuilds_complete_rows_and_preserves_old_storage():
+    obj, probe, _ = connector(prefill=False)
+    host, device = [], []
+    obj.append_sparse_chunk_ptr_cache_for_layers([[11, 12], [21, 22]], host, device)
+    old = tuple(device)
+    obj.append_sparse_chunk_ptr_cache_for_layers([[13], [23]], host, device)
+    assert [row.tolist() for row in device] == [[11, 12, 13], [21, 22, 23]]
+    assert [row.tolist() for row in old] == [[11, 12], [21, 22]]
+    assert old[0].untyped_storage().data_ptr() != device[0].untyped_storage().data_ptr()
+    assert probe.allocations == ["tensor", "tensor"]
+    assert not hasattr(obj, "_layerwise_pointer_tables")
+
+
+def test_decoder_layer_append_and_metadata_kwargs_cannot_enable_prefill_tables():
+    obj, probe, _ = connector(prefill=False)
+    host, device = [], []
+    obj.prepare_layerwise_prefill_source_pointers(
+        [[11], [21]], host, device, prefill_dma=True,
+    )
+    old = tuple(device)
+    obj.append_sparse_chunk_ptr_cache_for_layer(0, [12], host, device)
+    obj.append_sparse_chunk_ptr_cache_for_layer(1, [22], host, device)
+    assert [row.tolist() for row in device] == [[11, 12], [21, 22]]
+    assert [row.tolist() for row in old] == [[11], [21]]
+    assert not obj._is_deferred_sparse_pointer_cache(device)
+    assert not hasattr(obj, "_layerwise_pointer_tables")
+    assert probe.allocations == ["tensor", "tensor", "tensor"]
+
+
+def test_decoder_deferred_copy_uploads_full_table_once_on_the_load_stream():
+    obj, probe, _ = connector(prefill=False)
+    staged = []
+
+    def stage(value, **kwargs):
+        staged.append(value.tolist())
+        return value.clone()
+
+    obj.stage_dense_load_tensor = stage
+    host, device = [], []
+    obj._append_sparse_chunk_ptr_rows([[11], [21]], host, device, defer_copy=True)
+    obj._append_sparse_chunk_ptr_rows([[12], [22]], host, device, defer_copy=True)
+    assert staged == [[[11], [21]], [[11, 12], [21, 22]]]
+    assert [row.tolist() for row in device] == host
+    assert probe.allocations == ["tensor", "tensor"]
+
+
+def test_prefill_group_append_still_reuses_its_capacity_table():
+    obj, _, _ = connector(prefill=True)
+    host, device = [], []
+    obj.append_sparse_chunk_ptr_cache_for_layers([[11], [21]], host, device)
+    old_address = device[0].untyped_storage().data_ptr()
+    obj.append_sparse_chunk_ptr_cache_for_layers([[12], [22]], host, device)
+    assert device[0].untyped_storage().data_ptr() == old_address
+    assert [row.tolist() for row in device] == [[11, 12], [21, 22]]

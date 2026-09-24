@@ -520,7 +520,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             for key in list(self._completed_layerwise_stores):
                 if key[0] in req_ids:
                     self._completed_layerwise_stores.pop(key, None)
-            self._forget_layerwise_store_results(req_ids)
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                self._forget_layerwise_store_results(req_ids)
             if self.lmcache_engine is not None:
                 try:
                     self.lmcache_engine.wait_for_direct_stores(req_ids)
@@ -1392,6 +1393,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
 
     def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
+        if not getattr(self, "_force_layerwise_prefill_store", False):
+            return super()._release_finished_worker_requests(req_ids)
         req_ids = tuple(req_ids)
         if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
             # Cancellation may happen before the normal final-prefill fence.

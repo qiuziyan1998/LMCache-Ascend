@@ -221,6 +221,53 @@ def test_failed_public_store_does_not_commit_prepared_suffix():
     assert engine._layerwise_prefill_store_frontiers["req"] == {}
 
 
+def test_decoder_ignores_prefill_metadata_and_deferred_generator_flags():
+    engine, Cache = _engine()
+    engine._force_layerwise_prefill_store = False
+    cache = Cache()
+    result = list(_store(engine, cache, list(range(6)), skip=4))
+    # The baseline generator has one yield per layer, followed by its result.
+    assert len(result) == 3
+    assert result[-1].committed_end == 6
+    assert [(row[1]["start"], row[1]["end"]) for row in engine.checked] == [
+        (0, 4), (4, 6),
+    ]
+    assert not cache.hashes
+    assert engine._layerwise_prefill_store_frontiers == {}
+
+
+def test_decoder_flat_partial_store_restores_logical_valid_tokens():
+    engine, Cache = _engine()
+    engine._force_layerwise_prefill_store = False
+    engine._layerwise_chunk_fully_stored = lambda *args, **kwargs: False
+    engine.kv_events_enabled = False
+    allocated = []
+
+    def allocate(*args, **kwargs):
+        objects = [NS(metadata=NS(valid_tokens=None), get_size=lambda: 4)
+                   for _ in range(kwargs["batch_size"])]
+        allocated.append(objects)
+        return objects
+
+    class ReachedTransfer(Exception):
+        pass
+
+    def before_transfer(*args, **kwargs):
+        raise ReachedTransfer
+
+    engine.gpu_connector = NS(get_shape=lambda *args, **kwargs: (4,))
+    engine.storage_manager = NS(batched_allocate=allocate)
+    engine._append_layerwise_store_cache_chunks = before_transfer
+    engine.store_layer.__func__.__globals__["assert_layerwise_gpu_connector"] = (
+        lambda connector: None
+    )
+    with pytest.raises(ReachedTransfer):
+        next(_store(engine, Cache(), list(range(6))))
+    assert [[obj.metadata.valid_tokens for obj in chunk] for chunk in allocated] == [
+        [4, 4], [2, 2],
+    ]
+
+
 def test_default_store_planner_keeps_legacy_iterable_and_frontier_contract():
     engine, _ = _engine()
     first, base, prior = engine._layerwise_prefill_store_plan(

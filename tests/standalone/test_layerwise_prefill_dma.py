@@ -192,6 +192,7 @@ def _reuse_debug_connector(enabled):
         ),
         _is_mla_dsa_format=lambda group: True,
         _set_layerwise_prefill_bank_count=lambda *args: None,
+        _layerwise_prefill_dma=True,
         _layerwise_prefill_transfer_generation=lambda group: 0,
         _check_layerwise_transfer_generation=lambda *args: None,
         _check_layerwise_prefill_transfer_generation=lambda *args: None,

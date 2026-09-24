@@ -240,3 +240,38 @@ def test_ordinary_store_rejects_invalid_storage(store_implementation, merged):
     with pytest.raises((RuntimeError, ValueError), match="no longer valid|no tensor"):
         next(gen)
     assert not calls
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_store_stream_snapshot_and_early_close_follow_selected_mode(
+    store_implementation, monkeypatch, prefill,
+):
+    connector, fmt, width, calls, syncs = connector_for_store(
+        store_implementation, 1, 3,
+    )
+    connector._layerwise_prefill_dma = prefill
+    snapshots = []
+
+    def current_stream():
+        stream = object()
+        snapshots.append(stream)
+        return stream
+
+    monkeypatch.setattr(
+        store_implementation.__globals__["torch"].npu,
+        "current_stream", current_stream,
+    )
+    pages = [memory_obj(fmt, 4, width, 3)]
+    gen = connector.batched_from_gpu(
+        [pages] * 3, [0], [4],
+        slot_mapping=torch.arange(4), sync=False, kv_group=1,
+    )
+    next(gen)
+    next(gen)
+    assert len(snapshots) == (2 if prefill else 1)
+    assert [call["current_stream"] for call in calls] == (
+        snapshots if prefill else snapshots * 2
+    )
+    gen.close()
+    # Dense D stores retain baseline close semantics; P may have a pending DMA.
+    assert len(syncs) == (2 if prefill else 1)

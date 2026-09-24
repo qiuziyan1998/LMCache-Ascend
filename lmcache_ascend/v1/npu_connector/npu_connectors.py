@@ -1891,6 +1891,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
         self._prefill_worker_id = int(kwargs.get("worker_id", -1))
+        # This connector is shared by P and D.  Only the explicitly enabled
+        # P process may use mutable pointer tables or bank-transfer metadata.
+        self._layerwise_prefill_dma = (
+            os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip().lower() == "true"
+        )
         self.load_stream_num = 4
         self.load_stream_list = [
             torch.cuda.Stream() for __ in range(self.load_stream_num)
@@ -2465,7 +2471,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def synchronize_shared_cpu_store_publication(self) -> None:
         """Complete this rank's store work before publishing shared handles."""
         self.store_stream.synchronize()
-        self._synchronize_layerwise_prefill_dma_streams()
+        if getattr(self, "_layerwise_prefill_dma", False):
+            self._synchronize_layerwise_prefill_dma_streams()
 
     def _mirror_layout(self, layout: _GroupLayout) -> None:
         """Mirror a group's layout into the instance attributes."""
@@ -2509,7 +2516,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _is_deferred_sparse_pointer_cache(
         self, cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]]
     ) -> bool:
-        if cached_chunk_ptrs_npu is None:
+        if (not getattr(self, "_layerwise_prefill_dma", False)
+                or cached_chunk_ptrs_npu is None):
             return False
         deferred = getattr(self, "_deferred_sparse_pointer_caches", {})
         return deferred.get(id(cached_chunk_ptrs_npu)) is cached_chunk_ptrs_npu
@@ -2532,6 +2540,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse consumer needs an NPU pointer table. Keep the mutable cache
         identity to distinguish this state from an invalid ordinary cache.
         """
+        prefill_dma = prefill_dma and getattr(self, "_layerwise_prefill_dma", False)
         if not prefill_dma:
             self.materialize_sparse_chunk_ptr_cache(
                 cached_chunk_dev_ptrs, cached_chunk_ptrs_npu, kv_group=kv_group
@@ -2609,6 +2618,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: int = 0,
     ) -> None:
         """Resolve and append NPU device ptrs for newly retrieved chunks only."""
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            return self._append_sparse_chunk_ptr_cache_for_layer_legacy(
+                layer_id, new_sources, cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu, kv_group=kv_group,
+            )
         if not new_sources:
             return
 
@@ -2690,6 +2704,68 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         state["table"][old_count:required].copy_(new_ptrs_npu.to(device=state["table"].device))
         state["length"] = required
         cached_chunk_ptrs_npu[layer_id] = state["table"][:required]
+
+    def _append_sparse_chunk_ptr_cache_for_layer_legacy(
+        self,
+        layer_id: int,
+        new_sources: List[Union[torch.Tensor, MemoryObj]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        kv_group: int,
+    ) -> None:
+        """Resolve and append NPU device ptrs for newly retrieved chunks only."""
+        if not new_sources:
+            return
+
+        new_dev_ptrs = [
+            self._resolve_registered_cpu_source_device_ptr(
+                source_obj,
+                layer_id=layer_id,
+                chunk_index=chunk_index,
+                source="append_sparse_chunk_ptr_cache_for_layer",
+            )
+            for chunk_index, source_obj in enumerate(new_sources)
+        ]
+
+        updated_ptrs_npu = None
+        if cached_chunk_ptrs_npu is not None:
+            new_ptrs_npu = torch.tensor(
+                new_dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
+            existing = (
+                cached_chunk_ptrs_npu[layer_id]
+                if layer_id < len(cached_chunk_ptrs_npu)
+                else None
+            )
+            updated_ptrs_npu = (
+                new_ptrs_npu
+                if existing is None
+                else torch.cat((existing, new_ptrs_npu), dim=0)
+            )
+
+        # Use the call's group rather than mutable connector state because
+        # interleaved group generators can leave that state stale.
+        num_layers = self._expected_group_layers(kv_group)
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) <= layer_id:
+            cached_chunk_dev_ptrs.append([])
+
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+        while (
+            cached_chunk_ptrs_npu is not None and len(cached_chunk_ptrs_npu) <= layer_id
+        ):
+            cached_chunk_ptrs_npu.append(None)
+
+        cached_chunk_dev_ptrs[layer_id].extend(new_dev_ptrs)
+
+        if cached_chunk_ptrs_npu is None:
+            return
+
+        cached_chunk_ptrs_npu[layer_id] = updated_ptrs_npu
+
 
     def append_sparse_chunk_ptr_cache_for_layers(
         self,
@@ -2810,6 +2886,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         Keep an amortized-capacity table per request and write only the
         suffix.  The public cache remains a list of exact-length row views.
         """
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            return self._append_sparse_chunk_ptr_rows_legacy(
+                staged_rows, cached_chunk_dev_ptrs, cached_chunk_ptrs_npu,
+                defer_copy=defer_copy,
+            )
         num_layers = len(staged_rows)
         diagnose = serving_perf_enabled()
         started = time.perf_counter() if diagnose else 0.0
@@ -2936,6 +3017,84 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 table_h2d_submit_ms=round(table_ms, 3),
                 unbind_ms=round(unbind_ms, 3),
             )
+
+    def _append_sparse_chunk_ptr_rows_legacy(
+        self,
+        staged_rows: list[list[int]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
+    ) -> None:
+        """Append complete host rows and refresh their shared NPU table."""
+        num_layers = len(staged_rows)
+        diagnose = serving_perf_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
+        prefix_counts = {
+            len(cached_chunk_dev_ptrs[layer_id])
+            if layer_id < len(cached_chunk_dev_ptrs)
+            else 0
+            for layer_id in range(num_layers)
+        }
+        if len(prefix_counts) != 1:
+            raise ValueError(
+                "Sparse group pointer append has ragged existing prefix: "
+                f"prefix_counts={sorted(prefix_counts)}"
+            )
+        complete_rows = [
+            list(cached_chunk_dev_ptrs[layer_id]) + staged_rows[layer_id]
+            if layer_id < len(cached_chunk_dev_ptrs)
+            else staged_rows[layer_id]
+            for layer_id in range(num_layers)
+        ]
+        row_views = None
+        table_started = time.perf_counter() if diagnose else 0.0
+        if cached_chunk_ptrs_npu is not None:
+            if defer_copy:
+                pointer_table = self.stage_dense_load_tensor(
+                    torch.tensor(complete_rows, dtype=torch.long),
+                    dtype=torch.long,
+                )
+            else:
+                pointer_table = torch.tensor(
+                    complete_rows, dtype=torch.long, device=self.kv_device
+                )
+            table_ms = (time.perf_counter() - table_started) * 1000 if diagnose else 0.0
+            unbind_started = time.perf_counter() if diagnose else 0.0
+            # The row views retain the table storage after this function returns.
+            row_views = list(pointer_table.unbind(0))
+            unbind_ms = (
+                (time.perf_counter() - unbind_started) * 1000 if diagnose else 0.0
+            )
+        else:
+            table_ms = unbind_ms = 0.0
+
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) < num_layers:
+            cached_chunk_dev_ptrs.append([])
+        if cached_chunk_ptrs_npu is not None:
+            if not cached_chunk_ptrs_npu:
+                cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+            while len(cached_chunk_ptrs_npu) < num_layers:
+                cached_chunk_ptrs_npu.append(None)
+        for layer_id in range(num_layers):
+            cached_chunk_dev_ptrs[layer_id].extend(staged_rows[layer_id])
+            if cached_chunk_ptrs_npu is not None:
+                assert row_views is not None
+                cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_pointer_table_publish_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                chunks=len(complete_rows[0]),
+                table_h2d_submit_ms=round(table_ms, 3),
+                unbind_ms=round(unbind_ms, 3),
+            )
+
 
     def release_sparse_chunk_ptr_cache(
         self,
@@ -4399,6 +4558,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         prepared_layer_state: Any = None,
         prepared_validation_key: Optional[tuple] = None,
     ) -> None:
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            defer_consumer_wait = False
+            require_prepared_state = False
+            prepared_layer_state = None
+            prepared_validation_key = None
         num_tokens = int(slot_mapping_full.numel())
         if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return
@@ -5963,10 +6127,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ):
             raise ValueError("Invalid deferred dense-load readiness request.")
         deferred_layerwise_get = bool(
-            kwargs.get("deferred_layerwise_get", False)
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("deferred_layerwise_get", False)
         )
         deferred_dense_direct_get = deferred_layerwise_get and dense_direct
-        if kwargs.get("prefill_dma_block_ids_by_bank") is not None and not dense_direct:
+        if (
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+            and not dense_direct
+        ):
             raise RuntimeError("Layerwise prefill DMA requires dense direct load")
         prefill_dma = bool(
             deferred_dense_direct_get
@@ -5980,12 +6149,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             KVCacheFormat.MLA_LATENT, KVCacheFormat.DSA_INDEX
         ):
             raise ValueError("Layerwise prefill DMA requires two-group DSA KV")
-        layerwise_prefill_bank_count = int(
-            kwargs.get("layerwise_prefill_bank_count", 2) or 2
-        )
-        layerwise_prefill_bank_offset = int(
-            kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-        ) & 1
+        layerwise_prefill_bank_count = 2
+        layerwise_prefill_bank_offset = 0
+        if getattr(self, "_layerwise_prefill_dma", False):
+            layerwise_prefill_bank_count = int(
+                kwargs.get("layerwise_prefill_bank_count", 2) or 2
+            )
+            layerwise_prefill_bank_offset = int(
+                kwargs.get("layerwise_prefill_bank_offset", 0) or 0
+            ) & 1
         if deferred_dense_direct_get:
             self._set_layerwise_prefill_bank_count(
                 kv_group,
@@ -6023,12 +6195,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if prefill_dma:
             slot_mapping_chunks = ()
             slot_mapping_full = torch.empty(0, dtype=torch.long)
+        elif not getattr(self, "_layerwise_prefill_dma", False):
+            slot_mapping_chunks = [
+                slot_mapping[start:end]
+                for start, end in zip(starts, ends, strict=False)
+            ]
+            slot_mapping_full = (
+                slot_mapping_chunks[0]
+                if len(slot_mapping_chunks) == 1
+                else torch.cat(slot_mapping_chunks, dim=0)
+            )
         else:
             slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
                 slot_mappings, slot_mapping, starts, ends
             )
 
-        num_tokens = sum(chunk_sizes)
+        num_tokens = (
+            sum(chunk_sizes) if prefill_dma else len(slot_mapping_full)
+        )
         self._check_layerwise_transfer_invariants(
             operation="retrieve",
             kv_group=kv_group,
@@ -6148,7 +6332,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         layerwise_prefill_generation,
                     )
                 layer_request = None
-                if isinstance(layer_payload, dict) and "memory_objs" in layer_payload:
+                if (
+                    deferred_layerwise_get
+                    and isinstance(layer_payload, dict)
+                    and "memory_objs" in layer_payload
+                ):
                     memory_objs_layer = layer_payload["memory_objs"]
                     layer_request = layer_payload.get("layer_request")
                 else:
@@ -7501,7 +7689,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        deferred_layerwise_put = bool(kwargs.get("deferred_layerwise_put", False))
+        deferred_layerwise_put = bool(
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("deferred_layerwise_put", False)
+        )
         # P-node prefill DMA records one completion event per physical bank.
         # The caller can publish the CPU objects before the host observes the
         # final event; same-process H2D and remote page puts consume those
@@ -7516,7 +7707,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             and kwargs.get("prefill_dma_block_ids_by_bank") is not None
         )
         async_layerwise_store = async_layerwise_store and prefill_dma
-        if kwargs.get("prefill_dma_block_ids_by_bank") is not None and not dense_direct:
+        if (
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+            and not dense_direct
+        ):
             raise RuntimeError("Layerwise prefill DMA requires dense direct store")
         if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
             raise RuntimeError(
@@ -7530,12 +7725,39 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if prefill_dma:
             slot_mapping_chunks = ()
             slot_mapping_full = torch.empty(0, dtype=torch.long)
+        elif not getattr(self, "_layerwise_prefill_dma", False):
+            slot_mapping_chunks = []
+            for start, end in zip(starts, ends, strict=False):
+                local_start = start - slot_mapping_base
+                local_end = end - slot_mapping_base
+                if (
+                    local_start < 0
+                    or local_end < local_start
+                    or local_end > len(slot_mapping)
+                ):
+                    raise ValueError(
+                        "Layerwise store chunk is outside the provided slot-mapping "
+                        "window: "
+                        f"chunk=[{start}, {end}), base={slot_mapping_base}, "
+                        f"mapping_tokens={len(slot_mapping)}, "
+                        f"local_chunk=[{local_start}, {local_end})"
+                    )
+                slot_mapping_chunks.append(slot_mapping[local_start:local_end])
+
+            slot_mapping_full = (
+                slot_mapping_chunks[0]
+                if len(slot_mapping_chunks) == 1
+                else torch.cat(slot_mapping_chunks, dim=0)
+            )
+
         else:
             slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
                 slot_mappings, slot_mapping, starts, ends, slot_mapping_base
             )
 
-        num_tokens = sum(chunk_sizes)
+        num_tokens = (
+            sum(chunk_sizes) if prefill_dma else len(slot_mapping_full)
+        )
         self._check_layerwise_transfer_invariants(
             operation="store",
             kv_group=kv_group,
@@ -7626,6 +7848,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             )
 
+        ordinary_store = not getattr(self, "_layerwise_prefill_dma", False)
+        if ordinary_store:
+            # Keep D's original stream snapshot for the whole store generator.
+            current_stream = torch.npu.current_stream()
+
         def log_completed_store_layer(layer_id: int) -> None:
             if not (_mtp_dw_deep_diag_enabled() and layer_id == 0):
                 return
@@ -7668,12 +7895,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         store_transfer_pending = False
         try:
-            layerwise_prefill_bank_count = int(
-                kwargs.get("layerwise_prefill_bank_count", 2) or 2
-            )
-            layerwise_prefill_bank_offset = int(
-                kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-            ) & 1
+            layerwise_prefill_bank_count = 2
+            layerwise_prefill_bank_offset = 0
+            if not ordinary_store:
+                layerwise_prefill_bank_count = int(
+                    kwargs.get("layerwise_prefill_bank_count", 2) or 2
+                )
+                layerwise_prefill_bank_offset = int(
+                    kwargs.get("layerwise_prefill_bank_offset", 0) or 0
+                ) & 1
             if layerwise_prefill_bank_count <= 0:
                 raise ValueError(
                     "layerwise_prefill_bank_count must be positive"
@@ -7852,7 +8082,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # attention callback.  Capture that stream per layer so graph
                 # or runtime stream changes do not attach dependencies to a
                 # stale stream from the first layer.
-                current_stream = torch.npu.current_stream()
+                if not ordinary_store:
+                    current_stream = torch.npu.current_stream()
                 bank = (
                     layer_id + layerwise_prefill_bank_offset
                 ) % source_bank_count
@@ -7925,6 +8156,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 "not completely prepared before the transfer "
                                 f"window at layer {layer_id}."
                             )
+                    elif ordinary_store:
+                        cpu_tensors = [
+                            _layer_memory_tensor(memory_obj, layer_id)
+                            for memory_obj in memory_objs_layer
+                        ]
+                        for memory_obj in memory_objs_layer:
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id, cpu_tensors,
+                        )
                     else:
                         cpu_tensors = []
                         for memory_obj in memory_objs_layer:
@@ -8009,10 +8254,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 dsa_hidden_dims,
                             )
                         else:
+                            mappings = (
+                                (slot_mapping[start:end] for start, end in
+                                 zip(starts, ends, strict=False))
+                                if ordinary_store else layer_slot_mapping_chunks
+                            )
                             for mapping_chunk, memory_obj in zip(
-                                layer_slot_mapping_chunks,
-                                memory_objs_layer,
-                                strict=False,
+                                mappings, memory_objs_layer, strict=False,
                             ):
                                 lmc_ops.single_layer_kv_transfer(
                                     _layer_memory_tensor(memory_obj, layer_id),
@@ -8134,7 +8382,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if not deferred_layerwise_put:
                 yield None
         finally:
-            if store_transfer_pending:
+            if store_transfer_pending and not ordinary_store:
                 if prefill_dma:
                     self._synchronize_layerwise_prefill_dma_streams(kv_group)
                 else:
@@ -8144,6 +8392,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 and tmp_gpu_buffer_obj is not None
                 and tmp_gpu_buffer_obj.is_valid()
             ):
+                if ordinary_store:
+                    self.store_stream.synchronize()
                 tmp_gpu_buffer_obj.ref_count_down()
 
 

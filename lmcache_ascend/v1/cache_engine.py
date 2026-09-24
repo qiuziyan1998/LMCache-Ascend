@@ -528,9 +528,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         # readback cannot hide whether that event was initially incomplete.
         self._pending_live_source_diagnostics: dict[str, dict[str, Any]] = {}
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
+        # Synchronous engines also close through the shared worker teardown.
+        self._store_queue: Optional[queue.Queue] = None
+        self._store_worker_thread: Optional[threading.Thread] = None
         if self.is_store_async:
-            self._store_queue: Optional[queue.Queue] = None
-            self._store_worker_thread: Optional[threading.Thread] = None
             self._store_lock = threading.Lock()
             self._store_cv = threading.Condition(self._store_lock)
 
@@ -952,7 +953,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
     def close_remote_fill_producer(self) -> None:
-        self.poll_layerwise_prefill_puts(final=True)
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            self.poll_layerwise_prefill_puts(final=True)
         coordinator = getattr(self, "_remote_fill_coordinator", None)
         if coordinator is not None:
             coordinator.close(
@@ -960,11 +962,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for state in getattr(self, "_direct_store_states", {}).values()
                 if state.remote_fill is not None
             )
-        sources = getattr(self, "_layerwise_cpu_fill_sources", {})
-        for groups in sources.values():
-            for _, lease in groups.values():
-                lease.release()
-        sources.clear()
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            sources = getattr(self, "_layerwise_cpu_fill_sources", {})
+            for groups in sources.values():
+                for _, lease in groups.values():
+                    lease.release()
+            sources.clear()
 
     def remote_fill_producer_metrics_snapshot(self) -> dict[str, Any]:
         coordinator = getattr(self, "_remote_fill_coordinator", None)
@@ -3771,9 +3774,10 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def wait_for_direct_stores(self, req_ids: Iterable[str]) -> set[str]:
         """Fence request-owned direct puts before vLLM may release KV blocks."""
-        req_ids = tuple(req_ids)
-        if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
-            self.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            req_ids = tuple(req_ids)
+            if req_ids:
+                self.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
         waited: set[str] = set()
         for req_id in req_ids:
             state = self._direct_store_states.get(req_id)
@@ -3963,9 +3967,10 @@ class AscendLMCacheEngine(LMCacheEngine):
     def drop_direct_store_states(self, req_ids: Iterable[str]) -> None:
         """Forget completed request bookkeeping after vLLM releases ownership."""
         for req_id in req_ids:
-            sources = getattr(self, "_layerwise_cpu_fill_sources", {})
-            for _, lease in sources.pop(req_id, {}).values():
-                lease.release()
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                sources = getattr(self, "_layerwise_cpu_fill_sources", {})
+                for _, lease in sources.pop(req_id, {}).values():
+                    lease.release()
             state = self._direct_store_states.get(req_id)
             if state is not None:
                 releasable = not state.futures and not state.pending_keys
@@ -3977,10 +3982,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self._direct_store_states.pop(req_id, None)
             self._live_source_builders.pop(req_id, None)
             self._completed_live_sources.pop(req_id, None)
-            self._layerwise_prefill_store_frontiers.pop(req_id, None)
-            getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(
-                req_id, None
-            )
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                self._layerwise_prefill_store_frontiers.pop(req_id, None)
+                getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(
+                    req_id, None
+                )
             pending_diagnostics = getattr(self, "_pending_live_source_diagnostics", None)
             if pending_diagnostics is not None:
                 pending_diagnostics.pop(req_id, None)
@@ -4117,6 +4123,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     break
 
+                if not getattr(self, "_force_layerwise_prefill_store", False):
+                    # Preserve the decoder's logical length for flat MLA/DSA.
+                    memory_obj.metadata.valid_tokens = num_tokens
                 starts.append(start)
                 ends.append(end)
                 keys.append(key)
@@ -4683,6 +4692,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         kv_group: int = 0,
     ) -> None:
         """Publish one native group store's packed pointer metadata."""
+        if not getattr(self, "_force_layerwise_prefill_store", False):
+            return self._append_group_store_tensors_legacy(
+                memory_objs, cached_tensors,
+                cached_chunk_dev_ptrs, cached_chunk_ptrs_npu,
+                host_pointer_rows, layer_chunk_ptrs_npu,
+            )
         num_layers = len(memory_objs)
         if len(host_pointer_rows) != num_layers:
             raise ValueError("Dense group store pointer rows do not match layers.")
@@ -4755,6 +4770,65 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 "incremental pointer-table API"
                             )
                         cached_chunk_ptrs_npu[layer_id] = new_row
+
+    def _append_group_store_tensors_legacy(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        host_pointer_rows: List[List[int]],
+        layer_chunk_ptrs_npu: torch.Tensor,
+    ) -> None:
+        """Publish one native group store's packed pointer metadata."""
+        num_layers = len(memory_objs)
+        if len(host_pointer_rows) != num_layers:
+            raise ValueError("Dense group store pointer rows do not match layers.")
+        if (
+            layer_chunk_ptrs_npu.dim() != 2
+            or layer_chunk_ptrs_npu.size(0) != num_layers
+        ):
+            raise ValueError(
+                "Dense group store NPU pointer table must be [layers, chunks]."
+            )
+        has_pages = any(
+            isinstance(memory_obj, LayerPageMemoryObj)
+            for memory_obj in memory_objs[0]
+        )
+        cache_tensors = cached_tensors is not None and (
+            any(cached_tensors) or not has_pages
+        )
+        if cache_tensors and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
+        if cached_chunk_dev_ptrs is not None and not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+
+        for layer_id, layer_memory_objs in enumerate(memory_objs):
+            host_row = host_pointer_rows[layer_id]
+            if len(host_row) != len(layer_memory_objs):
+                raise ValueError("Dense group store pointer count mismatch.")
+            if cache_tensors:
+                tensors = [
+                    AscendLMCacheEngine._layer_memory_tensor(
+                        memory_obj, layer_id
+                    )
+                    for memory_obj in layer_memory_objs
+                ]
+                assert cached_tensors is not None
+                cached_tensors[layer_id].extend(tensors)
+            if cached_chunk_dev_ptrs is not None:
+                cached_chunk_dev_ptrs[layer_id].extend(host_row)
+            if cached_chunk_ptrs_npu is not None:
+                existing = cached_chunk_ptrs_npu[layer_id]
+                new_row = layer_chunk_ptrs_npu[layer_id]
+                cached_chunk_ptrs_npu[layer_id] = (
+                    new_row
+                    if existing is None
+                    else torch.cat((existing, new_row), dim=0)
+                )
+
 
     def _resolve_shared_rank0_layer_pages(
         self,
@@ -6232,7 +6306,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                         int(cached_ends[index]),
                         cached_keys[0][index].chunk_hash,
                     )
-                    for index in range(len(cached_starts))
+                    for index in range(
+                        len(cached_starts)
+                        if self._force_layerwise_prefill_store
+                        else chunk_index_base
+                    )
                 ]
                 if sampled_worker_retrieve
                 and kv_group == 0
@@ -6639,7 +6717,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         kv_group = store_result.kv_group
         num_layers = self._num_layers_for_kv_group(kv_group)
         deferred_layerwise_put = bool(
-            kwargs.get("deferred_layerwise_put", False)
+            self._force_layerwise_prefill_store
+            and kwargs.get("deferred_layerwise_put", False)
         )
 
         # Health check: block operation if LMCache is unhealthy
@@ -6827,7 +6906,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         for candidate_index, (start, end, key) in enumerate(candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
-            if end - start == chunk_size and end % chunk_size == 0:
+            if (
+                incremental_prefill
+                and end - start == chunk_size
+                and end % chunk_size == 0
+            ):
                 latest_full_frontier = (end, key.chunk_hash)
 
             keys_multi_layer = (
@@ -6944,6 +7027,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         force_store_wait and not self._force_layerwise_prefill_store
                     ),
                 )
+                if (
+                    memory_objs_multi_layer is not None
+                    and not self._force_layerwise_prefill_store
+                ):
+                    # Baseline D saves expose the logical partial-chunk length.
+                    for memory_obj in memory_objs_multi_layer:
+                        memory_obj.metadata.valid_tokens = num_tokens
 
             if memory_objs_multi_layer is None:
                 if self._force_layerwise_prefill_store:
@@ -7401,8 +7491,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     layer_pages,
                                     location=self.store_location,
                                     req_id=req_id,
-                                    publish_local_early=async_pages,
-                                    producer_events=layerwise_store_fences,
+                                    **({
+                                        "publish_local_early": async_pages,
+                                        "producer_events": layerwise_store_fences,
+                                    } if self._force_layerwise_prefill_store else {}),
                                 )
                             except Exception as error:
                                 if async_pages:
@@ -11064,6 +11156,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
 
-        for req_id in tuple(self._layerwise_prefill_page_owners):
-            self.release_layerwise_prefill_pages(req_id)
+        if self._force_layerwise_prefill_store:
+            for req_id in tuple(self._layerwise_prefill_page_owners):
+                self.release_layerwise_prefill_pages(req_id)
         super().close()
