@@ -56,8 +56,12 @@ from lmcache_ascend.v1.content_diagnostics import (
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.layerwise_dma import (
     BoundCopyPrefix,
+    IncrementalDmaPlan,
+    SourceAddressCache,
     bind_copy_addresses,
     bind_incremental_copy_addresses,
+    plan_block_id_ranges_incremental,
+    prepare_source_addresses,
 )
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
@@ -277,6 +281,7 @@ def _prefill_dma_plans(
     kvcaches: Sequence,
     direction: str,
     cycle,
+    plan_cache: Optional[dict[tuple[int, int], IncrementalDmaPlan]] = None,
 ) -> tuple:
     """Plan both P-node banks once, before entering the model forward.
 
@@ -289,20 +294,33 @@ def _prefill_dma_plans(
     if (not kvcaches[0][0].is_contiguous()
             or not kvcaches[0][-1].is_contiguous()):
         raise ValueError("Layerwise prefill DMA requires contiguous NPU planes")
-    plans = (
-        cycle.plan_block_id_ranges(
-            block_ids_by_bank[0], block_size,
-            starts, ends, slot_mapping_base,
-        ),
-        cycle.plan_block_id_ranges(
-            block_ids_by_bank[1], block_size,
-            starts, ends, slot_mapping_base,
-        ),
-    )
     capacity = int(kvcaches[0][0].shape[0]) * int(kvcaches[0][0].shape[1])
-    if (bool((plans[0].slot + plans[0].tokens > capacity).any())
-            or bool((plans[1].slot + plans[1].tokens > capacity).any())):
-        raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
+    plans = []
+    pending_states = {}
+    for bank in range(2):
+        if plan_cache is None:
+            plan = cycle.plan_block_id_ranges(
+                block_ids_by_bank[bank], block_size, starts, ends, slot_mapping_base
+            )
+            exceeds_capacity = bool((plan.slot + plan.tokens > capacity).any())
+        else:
+            key = (kv_group, bank)
+            state = plan_block_id_ranges_incremental(
+                cycle, block_ids_by_bank[bank], block_size, starts, ends,
+                plan_cache.get(key), slot_mapping_base,
+                slot_capacity=capacity,
+            )
+            exceeds_capacity = state.max_slot_end > capacity
+            if not exceeds_capacity:
+                pending_states[key] = state
+            plan = state.plan
+        if exceeds_capacity:
+            raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
+        plans.append(plan)
+    if plan_cache is not None:
+        # Commit both maps together so a failed second bank cannot hide the
+        # first bank's mapping change from bound-address invalidation on retry.
+        plan_cache.update(pending_states)
     if started:
         prefill_start_timing_log(
             logger, "dma_plan", started, direction=direction,
@@ -1965,16 +1983,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             tuple, tuple[int, Any]
         ] = {}
         self._prefill_dma_bound_loads: dict[
-            str, dict[tuple[int, int], BoundCopyPrefix]
+            str, dict[tuple[int, int, int], BoundCopyPrefix]
         ] = {}
-        self._prefill_dma_slot_snapshots: dict[
-            str, dict[tuple[int, int], torch.Tensor]
+        self._prefill_dma_plan_cache: dict[
+            str, dict[tuple[int, int], IncrementalDmaPlan]
         ] = {}
-        # The logical layer ordinal is stable across requests, while the
-        # physical bank phase rotates at every local prefill chunk.  Track the
-        # phase used to build a request's bound DMA rows so a later chunk never
-        # reuses addresses bound for the opposite bank.
-        self._prefill_dma_bank_offsets: dict[str, dict[int, int]] = {}
+        self._prefill_dma_source_cache: dict[
+            str, dict[tuple[int, int], SourceAddressCache]
+        ] = {}
         # Async P-node stores can publish the CPU object before the D2H event
         # completes.  Keep the latest event per request/group so request
         # teardown fences the source KV cache exactly once.
@@ -2024,8 +2040,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if owner.is_valid():
                     owner.ref_count_down()
         self._prefill_dma_bound_loads.pop(req_id, None)
-        self._prefill_dma_slot_snapshots.pop(req_id, None)
-        self._prefill_dma_bank_offsets.pop(req_id, None)
+        getattr(self, "_prefill_dma_plan_cache", {}).pop(req_id, None)
+        getattr(self, "_prefill_dma_source_cache", {}).pop(req_id, None)
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
@@ -2187,8 +2203,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # An aborted/restarted transfer can reuse the request ID with new
         # pages or block mappings. Never carry bound addresses across reset.
         getattr(self, "_prefill_dma_bound_loads", {}).clear()
-        getattr(self, "_prefill_dma_slot_snapshots", {}).clear()
-        getattr(self, "_prefill_dma_bank_offsets", {}).clear()
+        getattr(self, "_prefill_dma_plan_cache", {}).clear()
+        getattr(self, "_prefill_dma_source_cache", {}).clear()
 
         bank_counts, generations, save_done, load_done = (
             self._layerwise_prefill_transfer_state()
@@ -6039,6 +6055,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dma_plans = None
         dma_req_id = kwargs.get("req_id") if prefill_dma else None
         bound_loads = None
+        plan_cache = source_cache = None
+        plan_mode = "full"
         reuse_debug = prefill_dma and prefill_reuse_debug_enabled(
             getattr(self, "_prefill_worker_id", -1)
         )
@@ -6048,58 +6066,32 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             debug_submit_ms = 0.0
             debug_layer_count = min(2, self._expected_group_layers(kv_group))
         if prefill_dma:
+            if isinstance(dma_req_id, str) and dma_req_id:
+                bound_loads = self._prefill_dma_bound_loads.setdefault(dma_req_id, {})
+                if not hasattr(self, "_prefill_dma_plan_cache"):
+                    self._prefill_dma_plan_cache = {}
+                    self._prefill_dma_source_cache = {}
+                plan_cache = self._prefill_dma_plan_cache.setdefault(dma_req_id, {})
+                source_cache = self._prefill_dma_source_cache.setdefault(dma_req_id, {})
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_block_ids_by_bank"],
                 int(kwargs["prefill_dma_block_size"]),
                 starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "load",
                 self.prefill_dma_cycles[kv_group],
+                plan_cache=plan_cache,
             )
-            if isinstance(dma_req_id, str) and dma_req_id:
-                bound_loads = self._prefill_dma_bound_loads.setdefault(
-                    dma_req_id, {}
+            if plan_cache is not None:
+                reused_plans = sum(
+                    plan_cache[(kv_group, bank)].reused_chunks > 0 for bank in range(2)
                 )
-                bank_offsets = self._prefill_dma_bank_offsets.setdefault(
-                    dma_req_id, {}
-                )
-                previous_offset = bank_offsets.get(int(kv_group))
-                if previous_offset is not None and previous_offset != (
-                    layerwise_prefill_bank_offset
-                ):
-                    # Layer IDs are logical ordinals.  Their physical bank
-                    # changes with the chunk phase, so old bound rows cannot
-                    # be reused after the phase flips.
-                    for cache_key in tuple(bound_loads):
-                        if cache_key[0] == kv_group:
-                            bound_loads.pop(cache_key)
-                            if reuse_debug:
-                                debug_phase_drops += 1
-                bank_offsets[int(kv_group)] = layerwise_prefill_bank_offset
-                slot_snapshots = self._prefill_dma_slot_snapshots.setdefault(
-                    dma_req_id, {}
-                )
-                for bank, bank_block_ids in enumerate(
-                    kwargs["prefill_dma_block_ids_by_bank"]
-                ):
-                    block_ids = tuple(bank_block_ids)
-                    old_block_ids = slot_snapshots.get((kv_group, bank))
-                    if old_block_ids is None or (
-                        len(block_ids) < len(old_block_ids)
-                        or block_ids[:len(old_block_ids)] != old_block_ids
-                    ):
+                plan_mode = ("full", "mix", "reuse")[reused_plans]
+                for bank in range(2):
+                    if plan_cache[(kv_group, bank)].mapping_changed:
                         for cache_key in tuple(bound_loads):
-                            if (
-                                cache_key[0] == kv_group
-                                and self._layerwise_prefill_bank(
-                                    cache_key[1],
-                                    kv_group,
-                                    layerwise_prefill_bank_offset,
-                                )
-                                == bank
-                            ):
+                            if cache_key[0] == kv_group and cache_key[2] == bank:
                                 bound_loads.pop(cache_key)
                                 if reuse_debug:
                                     debug_map_drops += 1
-                    slot_snapshots[(kv_group, bank)] = block_ids
         if dense_direct and not prefill_dma:
             (
                 dense_fixed_chunk_size,
@@ -6277,6 +6269,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         bind_started = time.perf_counter()
                     if reuse_debug and layer_id < debug_layer_count:
                         debug_submit_started = time.perf_counter()
+                    source_metadata = None
+                    if source_cache is not None:
+                        source_key = (kv_group, layer_id)
+                        source_metadata = prepare_source_addresses(
+                            source_objs, starts, ends,
+                            lambda obj, layer_id=layer_id: (
+                                int(obj.layer_data_ptr(layer_id))
+                                if isinstance(obj, LayerPageMemoryObj)
+                                else int(obj.data_ptr)
+                            ),
+                            lambda obj, layer_id=layer_id: self._lmc_plane_num_tokens(
+                                _layer_memory_tensor(obj, layer_id), kv_group
+                            ),
+                            source_cache.get(source_key),
+                        )
+                        source_cache[source_key] = source_metadata
                     bound = bind_incremental_copy_addresses(
                         dma_plans[bank], source_objs, starts, ends,
                         [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
@@ -6291,13 +6299,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             _layer_memory_tensor(obj, layer_id), kv_group
                         ),
                         (
-                            bound_loads.get((kv_group, layer_id))
+                            bound_loads.get((kv_group, layer_id, bank))
                             if bound_loads is not None else None
                         ),
                         slot_prefix_unchanged=bound_loads is not None,
+                        source_metadata=source_metadata,
+                        reuse_rows_in_place=bound_loads is not None,
                     )
                     if bound_loads is not None:
-                        bound_loads[(kv_group, layer_id)] = bound
+                        bound_loads[(kv_group, layer_id, bank)] = bound
                     copies = bound.rows
                     if diagnose_bank_load:
                         bind_ms = (time.perf_counter() - bind_started) * 1000
@@ -6367,7 +6377,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             l=debug_layers,
                             x=f"{debug_reused}/{debug_rebuilt}",
                             drop=f"{debug_phase_drops}/{debug_map_drops}",
-                            plan="full",
+                            plan=plan_mode,
                             ms=debug_submit_ms,
                         )
                 elif dense_direct:

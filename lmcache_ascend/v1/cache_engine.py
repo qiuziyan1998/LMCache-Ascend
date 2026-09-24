@@ -15,6 +15,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 from urllib.parse import urlsplit
@@ -63,6 +64,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_page_layout_enabled,
     mooncake_payload_layout,
 )
+from lmcache.v1.prefill_metadata import PrefillMetadataPlan
 from lmcache.v1.remote_fill import (
     ControlPage,
     log_remote_fill_diagnostic,
@@ -502,6 +504,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._layerwise_prefill_store_frontiers: dict[
             str, dict[int, tuple[int, Union[int, bytes]]]
         ] = {}
+        self._layerwise_prefill_store_metadata_scopes: dict[str, tuple] = {}
         self._layerwise_cpu_fill_sources: dict[
             str, dict[int, tuple[_DirectPageBatch, LayerwiseCPUFillLease]]
         ] = {}
@@ -1634,6 +1637,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if release_dma is not None:
             release_dma(req_id)
         self._layerwise_prefill_store_frontiers.pop(req_id, None)
+        getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(req_id, None)
         with self._engine_state_lock:
             owned = self._layerwise_prefill_page_owners.pop(req_id, None)
         if owned is not None:
@@ -1674,6 +1678,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                 yield start, end, key
 
         return track_prefix()
+
+    def track_prefill_retrieve_keys(
+        self, req_id: str, keys: Iterable[CacheEngineKey]
+    ) -> None:
+        """Keep remote-put dependencies when cached plans bypass tokenization."""
+        queue = getattr(self, "_layerwise_put_queue", None)
+        if queue is not None:
+            queue.track_keys(req_id, keys)
 
     def _queue_layerwise_cpu_fill(
         self,
@@ -3966,6 +3978,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._live_source_builders.pop(req_id, None)
             self._completed_live_sources.pop(req_id, None)
             self._layerwise_prefill_store_frontiers.pop(req_id, None)
+            getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(
+                req_id, None
+            )
             pending_diagnostics = getattr(self, "_pending_live_source_diagnostics", None)
             if pending_diagnostics is not None:
                 pending_diagnostics.pop(req_id, None)
@@ -6456,8 +6471,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         request_configs: Optional[dict],
         kv_group: int,
         incremental: bool,
+        metadata_cache: Optional[Any] = None,
+        num_layers: Optional[int] = None,
+        skip_tokens: Optional[int] = None,
     ) -> tuple[
-        Iterable[tuple[int, int, CacheEngineKey]],
+        Union[Iterable[tuple[int, int, CacheEngineKey]], PrefillMetadataPlan],
         int,
         Optional[tuple[int, Union[int, bytes]]],
     ]:
@@ -6469,6 +6487,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         hash frontier per request/group and start the next plan from it.  The
         caller publishes the returned frontier only after the store completes,
         so a failed transfer never makes an unsaved suffix look committed.
+        With a metadata cache, the first result is its prepared plan so the
+        caller can also reuse split layer keys; other callers keep an iterable.
         """
         full_tokens = len(tokens)
         if not incremental:
@@ -6482,6 +6502,32 @@ class AscendLMCacheEngine(LMCacheEngine):
                 0,
                 None,
             )
+
+        if metadata_cache is not None:
+            scopes = getattr(self, "_layerwise_prefill_store_metadata_scopes", None)
+            if scopes is None:
+                scopes = self._layerwise_prefill_store_metadata_scopes = {}
+            signature = (
+                int(self.config.chunk_size),
+                bool(getattr(self.token_database.config, "save_unfull_chunk", True)),
+                request_configs or {},
+            )
+            scope = scopes.get(req_id)
+            if (
+                scope is None
+                or scope[0] is not metadata_cache
+                or scope[1] is not self.token_database
+                or scope[2] != signature
+            ):
+                # Prepared metadata is not proof that the current request
+                # scope was stored. Same-length config/MM replacements must
+                # not inherit another scope's committed frontier.
+                self._layerwise_prefill_store_frontiers.pop(req_id, None)
+                scopes[req_id] = (
+                    metadata_cache,
+                    self.token_database,
+                    deepcopy(signature),
+                )
 
         frontiers = self._layerwise_prefill_store_frontiers.setdefault(
             req_id, {}
@@ -6500,6 +6546,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # once; subsequent chunks are incremental again.
                 frontiers.pop(kv_group, None)
                 previous = None
+
+        if metadata_cache is not None:
+            if num_layers is None:
+                raise ValueError("Cached prefill store needs a layer count")
+            if skip_tokens is None:
+                skip_tokens = (
+                    int(mask.numel() - mask.long().sum().item())
+                    if mask is not None
+                    else 0
+                )
+            if (
+                not 0 <= skip_tokens <= full_tokens
+                or skip_tokens % int(self.config.chunk_size)
+            ):
+                raise ValueError("Cached prefill store needs an aligned masked prefix")
+            previous_end = previous[0] if previous is not None else 0
+            return (
+                metadata_cache.prepare(
+                    self.token_database,
+                    tokens,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                    num_layers=num_layers,
+                    skip_tokens=max(skip_tokens, previous_end),
+                ),
+                previous_end,
+                previous,
+            )
 
         if previous is None:
             return (
@@ -6615,7 +6689,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         req_id = self._get_req_id(kwargs)
         store_result.request_id = req_id
 
-        if mask is not None:
+        metadata_skip = (
+            kwargs.get("_prefill_skip_tokens")
+            if deferred_layerwise_put and kwargs.get("_prefill_metadata_cache")
+            else None
+        )
+        if metadata_skip is not None:
+            num_to_store_tokens = len(tokens) - int(metadata_skip)
+        elif mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
         else:
             num_to_store_tokens = len(tokens)
@@ -6721,6 +6802,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 request_configs=request_configs,
                 kv_group=kv_group,
                 incremental=incremental_prefill,
+                metadata_cache=(
+                    kwargs.get("_prefill_metadata_cache")
+                    if incremental_prefill
+                    else None
+                ),
+                num_layers=num_layers,
+                skip_tokens=metadata_skip,
             )
         )
         if incremental_prefill:
@@ -6730,13 +6818,23 @@ class AscendLMCacheEngine(LMCacheEngine):
             requested_end = planned_base
         latest_full_frontier = prior_frontier
         chunk_size = int(self.config.chunk_size)
-        for start, end, key in token_plan:
+        metadata_plan = (
+            token_plan if isinstance(token_plan, PrefillMetadataPlan) else None
+        )
+        candidates = (
+            metadata_plan.candidates if metadata_plan is not None else token_plan
+        )
+        for candidate_index, (start, end, key) in enumerate(candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
             if end - start == chunk_size and end % chunk_size == 0:
                 latest_full_frontier = (end, key.chunk_hash)
 
-            keys_multi_layer = key.split_layers(num_layers)
+            keys_multi_layer = (
+                metadata_plan.keys_chunk_major[candidate_index]
+                if metadata_plan is not None
+                else key.split_layers(num_layers)
+            )
             if self._layerwise_put_queue is not None:
                 # A local hit can precede its producer's remote persistence.
                 self._layerwise_put_queue.track_keys(req_id, (key,))

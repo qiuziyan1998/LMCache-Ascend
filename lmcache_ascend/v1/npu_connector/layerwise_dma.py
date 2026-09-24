@@ -145,7 +145,8 @@ class DmaCycle:
         )
 
     def plan_block_id_ranges(
-        self, block_ids, block_size: int, starts, ends, slot_mapping_base=0
+        self, block_ids, block_size: int, starts, ends, slot_mapping_base=0,
+        *, first_block=0,
     ):
         """Plan ranges from block IDs without materializing per-token slots."""
         if block_size <= 0:
@@ -163,7 +164,8 @@ class DmaCycle:
         if bool((starts < slot_mapping_base).any()) or bool((ends <= starts).any()):
             raise ValueError("DMA block-id ranges are invalid")
         logical_end = int(ends[-1]) - slot_mapping_base
-        if logical_end > block_ids.numel() * block_size:
+        if (int(starts[0]) - slot_mapping_base < first_block * block_size
+                or logical_end > (first_block + block_ids.numel()) * block_size):
             raise ValueError("DMA block IDs do not cover the requested range")
         periods = torch.arange(
             int(starts[0] - slot_mapping_base) // self.period,
@@ -171,7 +173,9 @@ class DmaCycle:
         )
         periodic = periods[:, None] * self.period + self.boundaries[None, :]
         block_starts = torch.arange(
-            0, block_ids.numel() * block_size, block_size, dtype=torch.long
+            first_block * block_size,
+            (first_block + block_ids.numel()) * block_size,
+            block_size, dtype=torch.long,
         )
         block_gaps = torch.cat(
             (
@@ -197,7 +201,7 @@ class DmaCycle:
         active = (begin >= starts[chunk]) & (stop <= ends[chunk])
         begin, stop, chunk = begin[active], stop[active], chunk[active]
         relative = begin - slot_mapping_base
-        block_index = relative // block_size
+        block_index = relative // block_size - first_block
         slots = block_ids[block_index] * block_size + relative % block_size
         return DmaPlan(
             chunk,
@@ -205,6 +209,182 @@ class DmaCycle:
             begin - starts[chunk],
             stop - begin,
         )
+
+
+def _reusable_range_chunks(starts, ends, old_starts, old_ends):
+    """Keep an unchanged prefix, allowing only its final chunk to grow."""
+    count = len(old_starts)
+    if not count or count > len(starts):
+        return 0
+    if (starts[:count - 1] != old_starts[:-1]
+            or ends[:count - 1] != old_ends[:-1]
+            or starts[count - 1] != old_starts[-1]):
+        return 0
+    if ends[count - 1] == old_ends[-1]:
+        return count
+    return count - 1 if ends[count - 1] > old_ends[-1] else 0
+
+
+def _append_cpu_columns(previous, keep, suffix):
+    """Write a suffix with amortized growth; never copy the prefix per append."""
+    required = keep + suffix.shape[1]
+    copied = 0
+    if previous is None or required > previous.shape[1]:
+        capacity = 4 if previous is None else previous.shape[1]
+        while capacity < required:
+            capacity *= 2
+        table = torch.empty((suffix.shape[0], capacity), dtype=torch.long)
+        if keep:
+            table[:, :keep].copy_(previous[:, :keep])
+            copied = keep
+    else:
+        table = previous
+    if suffix.shape[1]:
+        table[:, keep:required].copy_(suffix)
+    return table, copied
+
+
+@dataclass(frozen=True)
+class IncrementalDmaPlan:
+    cycle: DmaCycle
+    block_size: int
+    slot_mapping_base: int
+    block_ids: tuple[int, ...]
+    starts: tuple[int, ...]
+    ends: tuple[int, ...]
+    table: torch.Tensor
+    segment_count: int
+    tail_segment_start: int
+    reused_chunks: int
+    planned_chunks: int
+    planned_blocks: int
+    copied_segments: int
+    mapping_changed: bool
+    max_slot_end: int
+
+    @property
+    def plan(self):
+        return DmaPlan(*(self.table[row, :self.segment_count] for row in range(4)))
+
+
+def plan_block_id_ranges_incremental(
+    cycle, block_ids, block_size, starts, ends, previous=None, slot_mapping_base=0,
+    *, slot_capacity=None,
+):
+    """Plan only new ranges or a grown tail for one physical bank."""
+    starts, ends = tuple(starts), tuple(ends)
+    if len(starts) != len(ends) or block_size <= 0:
+        raise ValueError("Invalid incremental DMA ranges or block size")
+    used_blocks = (
+        (ends[-1] - slot_mapping_base + block_size - 1) // block_size
+        if ends else 0
+    )
+    blocks = tuple(block_ids[:used_blocks])
+    if used_blocks > len(blocks):
+        raise ValueError("DMA block IDs do not cover the requested range")
+    same_layout = bool(
+        previous is not None and previous.cycle is cycle
+        and previous.block_size == block_size
+        and previous.slot_mapping_base == slot_mapping_base
+    )
+    same_map = bool(
+        same_layout and len(blocks) >= len(previous.block_ids)
+        and blocks[:len(previous.block_ids)] == previous.block_ids
+    )
+    keep_chunks = (
+        _reusable_range_chunks(starts, ends, previous.starts, previous.ends)
+        if same_map else 0
+    )
+    keep_segments = (
+        previous.segment_count if keep_chunks == len(previous.starts)
+        else previous.tail_segment_start
+    ) if keep_chunks else 0
+    if keep_chunks == len(starts) and previous is not None and same_map:
+        if slot_capacity is not None and previous.max_slot_end > slot_capacity:
+            raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
+        return IncrementalDmaPlan(
+            cycle, block_size, slot_mapping_base, blocks, starts, ends,
+            previous.table, previous.segment_count, previous.tail_segment_start,
+            keep_chunks, 0, 0, 0, False, previous.max_slot_end,
+        )
+    first_block = (
+        (starts[keep_chunks] - slot_mapping_base) // block_size if starts else 0
+    )
+    suffix = cycle.plan_block_id_ranges(
+        blocks[first_block:], block_size, starts[keep_chunks:], ends[keep_chunks:],
+        slot_mapping_base, first_block=first_block,
+    )
+    columns = torch.stack((
+        suffix.chunk + keep_chunks, suffix.slot, suffix.chunk_token, suffix.tokens
+    ))
+    max_slot_end = max(
+        previous.max_slot_end if keep_chunks else 0,
+        int((suffix.slot + suffix.tokens).max()) if len(suffix) else 0,
+    )
+    # Validate before replacing a cached tail in the shared CPU backing table.
+    if slot_capacity is not None and max_slot_end > slot_capacity:
+        raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
+    table, copied = _append_cpu_columns(
+        previous.table if keep_chunks else None, keep_segments, columns
+    )
+    tail = (
+        keep_segments + int(torch.searchsorted(
+            suffix.chunk, len(starts) - keep_chunks - 1
+        )) if starts else 0
+    )
+    return IncrementalDmaPlan(
+        cycle, block_size, slot_mapping_base, blocks, starts, ends, table,
+        keep_segments + len(suffix), tail, keep_chunks, len(starts) - keep_chunks,
+        len(blocks) - first_block, copied, previous is not None and not same_map,
+        max_slot_end,
+    )
+
+
+@dataclass(frozen=True)
+class SourceAddressCache:
+    owners: tuple[object, ...]
+    owner_ids: tuple[int, ...]
+    starts: tuple[int, ...]
+    ends: tuple[int, ...]
+    table: torch.Tensor
+    reused_chunks: int
+    rebuilt_chunks: int
+    copied_chunks: int
+
+
+def prepare_source_addresses(
+    source_objs, starts, ends, host_ptr, host_tokens, previous=None
+):
+    """Resolve new source metadata independently of physical destination banks."""
+    starts, ends = tuple(starts), tuple(ends)
+    owners = tuple(source_objs)
+    if len(owners) != len(starts) or len(starts) != len(ends):
+        raise ValueError("DMA source metadata differs from ranges")
+    identities = tuple(map(id, owners))
+    keep = (
+        _reusable_range_chunks(starts, ends, previous.starts, previous.ends)
+        if previous is not None else 0
+    )
+    if keep and identities[:keep] != previous.owner_ids[:keep]:
+        # A replaced final object can keep every earlier chunk.
+        keep = keep - 1 if (
+            identities[:keep - 1] == previous.owner_ids[:keep - 1]
+        ) else 0
+    if keep == len(owners) and previous is not None:
+        return SourceAddressCache(
+            owners, identities, starts, ends, previous.table, keep, 0, 0
+        )
+    suffix = owners[keep:]
+    columns = torch.tensor(
+        [list(map(host_ptr, suffix)), list(map(host_tokens, suffix))],
+        dtype=torch.long,
+    )
+    table, copied = _append_cpu_columns(
+        previous.table if keep else None, keep, columns
+    )
+    return SourceAddressCache(
+        owners, identities, starts, ends, table, keep, len(suffix), copied
+    )
 
 
 @dataclass(frozen=True)
@@ -221,6 +401,7 @@ class BoundCopyPrefix:
     segment_chunks: torch.Tensor
     rows: list[list[int]]
     reused_chunks: int = 0
+    tail_segment_start: int | None = None
 
 
 def bind_incremental_copy_addresses(
@@ -236,6 +417,8 @@ def bind_incremental_copy_addresses(
     previous: BoundCopyPrefix | None,
     *,
     slot_prefix_unchanged: bool,
+    source_metadata: SourceAddressCache | None = None,
+    reuse_rows_in_place: bool = False,
 ) -> BoundCopyPrefix:
     """Keep stable rows; replace a grown tail and bind newly appended chunks."""
     npu_ptrs = tuple(npu_ptrs)
@@ -249,7 +432,12 @@ def bind_incremental_copy_addresses(
         and plane_widths == previous.plane_widths
         and element_bytes == previous.element_bytes
     )
-    current_ids = tuple(map(id, source_objs))
+    current_ids = (
+        source_metadata.owner_ids if source_metadata is not None
+        else tuple(map(id, source_objs))
+    )
+    if source_metadata is not None:
+        starts, ends = source_metadata.starts, source_metadata.ends
     stable_before_tail = bool(
         compatible
         and old_count > 0
@@ -271,11 +459,17 @@ def bind_incremental_copy_addresses(
         old_count if tail_unchanged else old_count - 1 if stable_before_tail else 0
     )
     first_segment = int(torch.searchsorted(plan.chunk, begin_chunk))
-    previous_segments = (
-        int(torch.searchsorted(previous.segment_chunks, begin_chunk))
-        if begin_chunk and previous is not None
-        else 0
-    )
+    if begin_chunk and previous is not None:
+        if begin_chunk == old_count:
+            previous_segments = len(previous.rows) // len(plane_widths)
+        elif previous.tail_segment_start is not None:
+            previous_segments = previous.tail_segment_start
+        else:
+            previous_segments = int(torch.searchsorted(
+                previous.segment_chunks, begin_chunk
+            ))
+    else:
+        previous_segments = 0
     suffix_plan = DmaPlan(
         plan.chunk[first_segment:] - begin_chunk,
         plan.slot[first_segment:],
@@ -286,7 +480,8 @@ def bind_incremental_copy_addresses(
     suffix_rows = (
         bind_copy_addresses(
             suffix_plan,
-            list(map(host_ptr, suffix_objs)),
+            (source_metadata.table[0, begin_chunk:len(source_objs)]
+             if source_metadata is not None else list(map(host_ptr, suffix_objs))),
             npu_ptrs,
             (
                 torch.as_tensor(ends[begin_chunk:])
@@ -295,18 +490,30 @@ def bind_incremental_copy_addresses(
             plane_widths,
             element_bytes,
             device_to_host=False,
-            host_chunk_tokens=list(map(host_tokens, suffix_objs)),
+            host_chunk_tokens=(
+                source_metadata.table[1, begin_chunk:len(source_objs)]
+                if source_metadata is not None else list(map(host_tokens, suffix_objs))
+            ),
         )
         if suffix_objs
         else []
     )
-    rows = (
-        previous.rows[: previous_segments * len(plane_widths)] + suffix_rows
-        if begin_chunk and previous is not None
-        else suffix_rows
-    )
+    if begin_chunk and previous is not None and reuse_rows_in_place:
+        # The native entry point consumes the Python rows into a C++ vector
+        # before returning. Only this request's next submission mutates them.
+        rows = previous.rows
+        del rows[previous_segments * len(plane_widths):]
+        rows.extend(suffix_rows)
+    else:
+        rows = (
+            previous.rows[: previous_segments * len(plane_widths)] + suffix_rows
+            if begin_chunk and previous is not None else suffix_rows
+        )
     return BoundCopyPrefix(
-        owners=tuple(source_objs),
+        owners=(
+            source_metadata.owners
+            if source_metadata is not None else tuple(source_objs)
+        ),
         owner_ids=current_ids,
         starts=tuple(starts),
         ends=tuple(ends),
@@ -316,6 +523,10 @@ def bind_incremental_copy_addresses(
         segment_chunks=plan.chunk,
         rows=rows,
         reused_chunks=begin_chunk,
+        tail_segment_start=(
+            int(torch.searchsorted(plan.chunk, len(source_objs) - 1))
+            if source_objs else 0
+        ),
     )
 
 
