@@ -1507,6 +1507,8 @@ class _GroupLayout:
         "indexer_c8",
         "layer_slot_factors",
         "layer_token_bytes",
+        "block_map_cpu",
+        "block_map_device",
     )
 
     def __init__(self) -> None:
@@ -1528,6 +1530,8 @@ class _GroupLayout:
         self.indexer_c8: bool = False
         self.layer_slot_factors: tuple[int, ...] = ()
         self.layer_token_bytes: tuple[int, ...] = ()
+        self.block_map_cpu = None
+        self.block_map_device = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -1707,6 +1711,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         **kwargs,
     ):
         self.indexer_c8_layout = kwargs.pop("indexer_c8_layout", None)
+        self.indexer_hbm_block_map = kwargs.pop("indexer_hbm_block_map", None)
+        mapping = self.indexer_hbm_block_map
+        if mapping is not None and (
+            self.indexer_c8_layout is None
+            or not self.indexer_c8_layout.mixed
+            or not isinstance(mapping, tuple)
+            or not mapping
+            or len(mapping) % 18
+            or any(type(b) is not int for b in mapping)
+            or mapping[0] != 0
+            or set(mapping) != set(range(len(mapping)))
+        ):
+            raise ValueError(
+                "Paired-bank HBM layout requires a complete mixed-C8 block permutation"
+            )
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
         self.load_stream_num = 4
@@ -2589,8 +2608,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         states = (
             tuple(
                 lmc_ops.IndexerC8State(
-                    layer[0], layer[1] if len(layer) == 2 else None,
+                    layer[0],
+                    layer[1] if len(layer) == 2 else None,
                     self._group_layouts[kv_group].layer_slot_factors[i],
+                    **(
+                        {"block_map": self._group_layouts[kv_group].block_map_device}
+                        if getattr(
+                            self._group_layouts[kv_group], "block_map_device", None
+                        )
+                        is not None
+                        and layer[0].dtype == torch.int8
+                        else {}
+                    ),
                 )
                 for i, layer in enumerate(kvcaches_ref)
             )
@@ -4172,11 +4201,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             c8 = getattr(layout, "indexer_c8", False)
             planes = len(tensor_meta) // group_layers
             if c8:
-                plane_offsets, plane_factors = [0], []
+                plane_offsets, plane_factors, plane_mapped = [0], [], []
                 for i, layer in enumerate(kvcaches[:group_layers]):
                     plane_offsets.append(plane_offsets[-1] + len(layer))
                     plane_factors.extend([layout.layer_slot_factors[i]] * len(layer))
-            remap_slots = c8 and 2 in layout.layer_slot_factors
+                    plane_mapped.extend(
+                        [
+                            getattr(layout, "block_map_cpu", None) is not None
+                            and layer[0].dtype == torch.int8
+                        ]
+                        * len(layer)
+                    )
+            remap_slots = c8 and (2 in layout.layer_slot_factors or any(plane_mapped))
             if not starts or len(starts) != len(ends):
                 return self._reject_direct_page_plan(kv_group, "invalid_ranges")
             slot_base, slot_end = min(starts), max(ends)
@@ -4221,7 +4257,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
                 physical_runs = runs
                 if remap_slots:
-                    physical_slots = page_slots + (page_slots // 128) * 128
+                    block_map = getattr(layout, "block_map_cpu", None)
+                    physical_slots = (
+                        block_map[page_slots // 128] * 128 + page_slots % 128
+                        if block_map is not None
+                        else page_slots + (page_slots // 128) * 128
+                    )
                     breaks = (
                         torch.where(physical_slots[1:] != physical_slots[:-1] + 1)[0]
                         + 1
@@ -4243,7 +4284,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         for plane in range(first, last):
                             base, token_bytes = tensor_meta[plane]
                             for slot, count in (
-                                physical_runs if plane_factors[plane] == 2 else runs
+                                physical_runs
+                                if plane_factors[plane] == 2 or plane_mapped[plane]
+                                else runs
                             ):
                                 ptrs.append(base + slot * token_bytes)
                                 sizes.append(count * token_bytes)
@@ -5062,6 +5105,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise RuntimeError(
                 "Indexer C8 requires rebuilding the LMCache-Ascend native extension"
             )
+        if (
+            getattr(metadata, "indexer_hbm_block_map", None) is not None
+            and getattr(lmc_ops, "INDEXER_C8_BLOCK_MAP_ABI", 0) < 1
+        ):
+            raise RuntimeError(
+                "Paired-bank C8 requires rebuilding the LMCache-Ascend native extension"
+            )
         num_layers = metadata.kv_shape[0]
         chunk_size = metadata.kv_shape[2]
         num_kv_head = metadata.kv_shape[3]
@@ -5079,6 +5129,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             layout_hints=layout_hints,
             max_staging_tokens=max_staging_tokens,
             indexer_c8_layout=getattr(metadata, "indexer_c8_layout", None),
+            indexer_hbm_block_map=getattr(metadata, "indexer_hbm_block_map", None),
         )
 
     def _assign_group_gpu_allocator(
@@ -5232,6 +5283,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         ):
                             raise ValueError("C8 indexer requires paired FP16 scales in PA_BSND")
                         factors.append(factor)
+                    mapping = getattr(self, "indexer_hbm_block_map", None)
+                    if mapping is not None:
+                        if len(mapping) != logical_blocks or any(
+                            factor != 1 for factor in factors
+                        ):
+                            raise ValueError(
+                                "Paired-bank map disagrees with registered HBM capacity"
+                            )
+                        layout.block_map_cpu = torch.tensor(mapping, dtype=torch.int64)
+                        layout.block_map_device = layout.block_map_cpu.to(
+                            device=layout.kv_device, dtype=torch.int32
+                        )
                     layout.layer_slot_factors = tuple(factors)
                     layout.layer_token_bytes = tuple(policy.token_bytes_for(i) for i in range(len(kv_caches)))
                     # Capacity of the reusable staging pool; packet lengths
@@ -5306,6 +5369,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if layout.indexer_c8:
                     payload["layer_token_bytes"] = layout.layer_token_bytes
                     payload["layer_slot_factors"] = layout.layer_slot_factors
+                    if layout.block_map_cpu is not None:
+                        payload["hbm_addressing"] = "paired_bank_v1"
                     payload["page_bytes"] = (
                         sum(layout.layer_token_bytes) * self.lmcache_chunk_size
                     )

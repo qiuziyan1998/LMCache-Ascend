@@ -320,3 +320,91 @@ def test_latent_plan_bounds_every_plane_not_only_keys(connector):
         )
         is None
     )
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_legacy_source_to_paired_bank_destination_preserves_wire_bytes(
+    connector, layerwise
+):
+    t = 3
+    blocks = 18 * t
+    mapping = torch.empty(blocks, dtype=torch.int64)
+    for u in range(t):
+        ids = [
+            *range(8 * u, 8 * u + 8),
+            *range(8 * (t + u), 8 * (t + u) + 8),
+            16 * t + u,
+            17 * t + u,
+        ]
+        mapping[ids] = torch.tensor(
+            [*range(16 * u, 16 * u + 16), 16 * t + 2 * u, 16 * t + 2 * u + 1]
+        )
+    layout = connector._group_layouts[1]
+    layout.layer_token_bytes = (256, 130)
+    layout.layer_slot_factors = (1, 2)
+    caches = [
+        (
+            torch.arange(blocks * 128 * 128)
+            .to(torch.bfloat16)
+            .reshape(blocks, 128, 1, 128),
+        ),
+        (
+            torch.arange(2 * blocks * 128 * 128)
+            .to(torch.int8)
+            .reshape(2 * blocks, 128, 1, 128),
+            torch.arange(2 * blocks * 128)
+            .to(torch.float16)
+            .reshape(2 * blocks, 128, 1, 1),
+        ),
+    ]
+    source_slots = torch.tensor([126, 127, 128, 255, 256, 500, 511, 512, 513])
+
+    def read(pages):
+        ptrs, sizes, _ = pages
+        return [
+            b"".join(ctypes.string_at(p, n) for p, n in zip(ps, ns, strict=True))
+            for ps, ns in zip(ptrs, sizes, strict=True)
+        ]
+
+    # Different P/D HBM layouts and block IDs; canonical token packet is unchanged.
+    packets = read(
+        connector.plan_direct_page_sources(
+            caches, source_slots, [0, 5], [5, 9], 1, layerwise
+        )
+    )
+    dst = [
+        (torch.full((blocks, 128, 1, 128), 42, dtype=torch.bfloat16),),
+        (
+            torch.full((blocks, 128, 1, 128), 42, dtype=torch.int8),
+            torch.full((blocks, 128, 1, 1), 42, dtype=torch.float16),
+        ),
+    ]
+    slots = torch.cat(
+        [torch.arange(b * 128 + 126, b * 128 + 129) for b in (23, 47, 50)]
+    )
+    layout.layer_slot_factors = (1, 1)
+    layout.block_map_cpu = mapping
+    dest = connector.plan_direct_page_destinations(
+        dst, slots, [0, 5], [5, 9], 1, layerwise
+    )
+    assert dest is not None
+    ptrs, sizes, owners = dest
+    assert {id(x) for x in owners} == {id(x) for planes in dst for x in planes}
+    for packet, ps, ns in zip(packets, ptrs, sizes, strict=True):
+        offset = 0
+        for ptr, size in zip(ps, ns, strict=True):
+            ctypes.memmove(ptr, packet[offset : offset + size], size)
+            offset += size
+        assert offset == len(packet)
+    assert (
+        read(
+            connector.plan_direct_page_sources(dst, slots, [0, 5], [5, 9], 1, layerwise)
+        )
+        == packets
+    )
+    for quantized, planes in enumerate(dst):
+        selected = mapping[slots // 128] * 128 + slots % 128 if quantized else slots
+        unused = torch.ones(blocks * 128, dtype=torch.bool)
+        unused[selected] = False
+        for plane in planes:
+            assert plane.flatten(0, 1)[unused].eq(42).all()

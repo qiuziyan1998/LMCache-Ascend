@@ -11,8 +11,9 @@
 
 namespace lmc {
 IndexerC8State::IndexerC8State(torch::Tensor key, c10::optional<torch::Tensor> scale,
-                             int64_t factor)
-    : keys(std::move(key)), scales(scale.value_or(torch::Tensor())), slot_factor(factor) {
+                             int64_t factor, c10::optional<torch::Tensor> mapping)
+    : keys(std::move(key)), scales(scale.value_or(torch::Tensor())),
+      block_map(mapping.value_or(torch::Tensor())), slot_factor(factor) {
   TORCH_CHECK(keys.device().type() == c10::DeviceType::PrivateUse1 &&
                   (!scales.defined() || scales.device() == keys.device()),
               "C8 destinations must share one NPU device");
@@ -31,6 +32,10 @@ IndexerC8State::IndexerC8State(torch::Tensor key, c10::optional<torch::Tensor> s
                   scales.size(0) == keys.size(0) && scales.size(1) == 128 &&
                   scales.size(2) == 1 && scales.size(3) == 1 && scales.is_contiguous()),
               "C8 destinations require paired contiguous PA_BSND storage");
+  TORCH_CHECK(!block_map.defined() || (quantized && factor == 1 &&
+                  block_map.device() == keys.device() && block_map.scalar_type() == at::kInt &&
+                  block_map.dim() == 1 && block_map.numel() == keys.size(0) && block_map.is_contiguous()),
+              "C8 block permutation must be a complete contiguous int32 vector on the cache device");
   cache_slots = keys.numel() / 128 / factor;
   key_bytes = 128 * keys.element_size();
   const c10::OptionalDeviceGuard guard(keys.device());
@@ -42,7 +47,7 @@ IndexerC8State::IndexerC8State(torch::Tensor key, c10::optional<torch::Tensor> s
 IndexerC8GroupState::IndexerC8GroupState(std::vector<IndexerC8State> states)
     : layers(std::move(states)) {
   TORCH_CHECK(!layers.empty(), "C8 group must contain at least one layer");
-  std::vector<int64_t> table(4 * layers.size());
+  std::vector<int64_t> table(5 * layers.size());
   size_t i = 0;
   for (const auto &state : layers) {
     TORCH_CHECK(state.keys.device() == layers[0].keys.device() &&
@@ -52,6 +57,7 @@ IndexerC8GroupState::IndexerC8GroupState(std::vector<IndexerC8State> states)
     table[layers.size() + i] = state.scales.defined() ? reinterpret_cast<int64_t>(state.scales.data_ptr()) : 0;
     table[2 * layers.size() + i] = state.key_bytes;
     table[3 * layers.size() + i] = state.slot_factor;
+    table[4 * layers.size() + i] = state.block_map.defined() ? reinterpret_cast<int64_t>(state.block_map.data_ptr()) : 0;
     max_key_bytes = std::max(max_key_bytes, state.key_bytes);
     ++i;
   }
@@ -100,6 +106,7 @@ namespace {
 struct IndexerC8Launch {
   uint32_t cores;
   void *stream, *keys, *scales, *packets, *offsets, *counts, *slots;
+  void *block_map;
   int64_t chunks, capacity, slot_count, cache_slots;
   bool from_npu, metadata_int64, slots_int64, fixed_chunks;
   int64_t layers, key_bytes, slot_factor;
@@ -108,7 +115,7 @@ struct IndexerC8Launch {
     launch_indexer_c8_transfer(
         cores, stream, keys, scales, packets, offsets, counts, slots,
         chunks, capacity, slot_count, cache_slots, from_npu, metadata_int64,
-        slots_int64, fixed_chunks, layers, key_bytes, slot_factor);
+        slots_int64, fixed_chunks, layers, key_bytes, slot_factor, block_map);
     return 0;
   }
 };
@@ -133,7 +140,8 @@ void indexer_c8_transfer_prepared(
       cores, stream, state.keys.data_ptr(),
       state.scales.defined() ? state.scales.data_ptr() : nullptr,
       packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
-      slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
+      slot_mapping.data_ptr(), state.block_map.defined() ? state.block_map.data_ptr() : nullptr,
+      chunks, chunk_capacity, slot_mapping.numel(),
       state.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
       slot_mapping.scalar_type() == at::kLong, fixed_chunks, 1,
       state.key_bytes, state.slot_factor});
@@ -167,7 +175,8 @@ void indexer_c8_group_transfer_prepared(
       layers > 1 ? state.planes.data_ptr() : first.keys.data_ptr(),
       first.scales.defined() ? first.scales.data_ptr() : nullptr,
       packet_ptrs.data_ptr(), chunk_offsets.data_ptr(), chunk_counts.data_ptr(),
-      slot_mapping.data_ptr(), chunks, chunk_capacity, slot_mapping.numel(),
+      slot_mapping.data_ptr(), first.block_map.defined() ? first.block_map.data_ptr() : nullptr,
+      chunks, chunk_capacity, slot_mapping.numel(),
       first.cache_slots, from_npu, chunk_offsets.scalar_type() == at::kLong,
       slot_mapping.scalar_type() == at::kLong, fixed_chunks, layers,
       state.max_key_bytes, first.slot_factor});

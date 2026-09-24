@@ -5,12 +5,12 @@
 namespace lmc {
 // Retain both stable destinations for the same lifetime as the prepared state.
 struct IndexerC8State {
-  torch::Tensor keys, scales;
+  torch::Tensor keys, scales, block_map;
   int64_t cache_slots;
   int64_t key_bytes, slot_factor;
   uint32_t cores;
   IndexerC8State(torch::Tensor keys, c10::optional<torch::Tensor> scales,
-                 int64_t slot_factor = 1);
+                 int64_t slot_factor = 1, c10::optional<torch::Tensor> block_map = c10::nullopt);
 };
 
 struct IndexerC8GroupState {

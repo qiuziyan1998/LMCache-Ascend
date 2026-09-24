@@ -166,7 +166,7 @@ def test_mixed_remote_fill_reservation_and_checkpoint_tail():
     assert allocator.total_allocated_size == 0
 
 
-@pytest.mark.parametrize("factor", [1, 2])
+@pytest.mark.parametrize("factor", [1, 2, "paired"])
 def test_derived_connector_initializes_mixed_layout_without_staging(factor):
     from lmcache_ascend.v1.npu_connector.npu_connectors import (
         VLLMPagedMemLayerwiseNPUConnector,
@@ -182,16 +182,23 @@ def test_derived_connector_initializes_mixed_layout_without_staging(factor):
     conn.indexer_c8_layout = IndexerC8Layout(c8_layers=(False, True))
     conn._reset_sparse_direct_layer_states = lambda: None
     conn._mirror_layout = lambda _: None
+    paired = factor == "paired"
+    blocks = 36 if paired else 9
+    factor = 1 if paired else factor
+    conn.indexer_hbm_block_map = tuple(range(36)) if paired else None
     caches = [
-        (torch.empty(9, 128, 1, 128, dtype=torch.bfloat16),),
+        (torch.empty(blocks, 128, 1, 128, dtype=torch.bfloat16),),
         (
-            torch.empty(9 * factor, 128, 1, 128, dtype=torch.int8),
-            torch.empty(9 * factor, 128, 1, 1, dtype=torch.float16),
+            torch.empty(blocks * factor, 128, 1, 128, dtype=torch.int8),
+            torch.empty(blocks * factor, 128, 1, 1, dtype=torch.float16),
         ),
     ]
     layout = conn._lazy_initialize_buffer(caches, kv_group=1, init_staging=False)
     assert layout.layer_token_bytes == (256, 130)
     assert layout.layer_slot_factors == (1, factor)
+    if paired:
+        assert layout.block_map_cpu.tolist() == list(conn.indexer_hbm_block_map)
+        assert layout.block_map_device.dtype == torch.int32
     assert layout.gpu_buffer_allocator is None
     assert layout.storage_dtype == torch.uint8
     assert (

@@ -255,3 +255,84 @@ def test_native_mixed_group_preserves_bf16_bits_and_c8_physical_mapping(slot_fac
     assert torch.equal(bf16.cpu().view(-1, 128)[:tokens].contiguous().view(torch.uint8).flatten(), expected_bf16)
     assert torch.equal(c8.cpu().view(-1, 128)[physical], c8_cpu.view(-1, 128)[physical])
     assert torch.equal(scale.cpu().view(torch.int16).view(-1)[physical], scale_cpu.view(torch.int16).view(-1)[physical])
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_paired_bank_copy_roundtrip_and_unused_rows(grouped):
+    assert getattr(c_ops, "INDEXER_C8_BLOCK_MAP_ABI", 0) >= 1
+    t = 3
+    mapping = torch.empty(18 * t, dtype=torch.int32)
+    for u in range(t):
+        ids = [
+            *range(8 * u, 8 * u + 8),
+            *range(8 * (t + u), 8 * (t + u) + 8),
+            16 * t + u,
+            17 * t + u,
+        ]
+        mapping[ids] = torch.tensor(
+            [*range(16 * u, 16 * u + 16), 16 * t + 2 * u, 16 * t + 2 * u + 1],
+            dtype=torch.int32,
+        )
+    keys = (
+        torch.arange(18 * t * 128 * 128)
+        .to(torch.int8)
+        .reshape(18 * t, 128, 1, 128)
+        .npu()
+    )
+    scales = (
+        (torch.arange(18 * t * 128) * 97)
+        .to(torch.int16)
+        .view(torch.float16)
+        .reshape(18 * t, 128, 1, 1)
+        .npu()
+    )
+    device_map = mapping.npu()
+    state = c_ops.IndexerC8State(keys, scales, 1, device_map)
+    # Cross main/extra NOPE and both PE banks, including a short scale tail.
+    host_slots = torch.cat(
+        [torch.arange(b * 128 + 126, b * 128 + 129) for b in (23, 47, 50)]
+    )
+    physical = mapping[host_slots // 128].long() * 128 + host_slots % 128
+    expected = torch.cat(
+        [
+            keys.cpu().view(-1, 128)[physical].contiguous().view(torch.uint8).flatten(),
+            scales.cpu().view(-1)[physical].contiguous().view(torch.uint8).flatten(),
+        ]
+    )
+    packet = torch.zeros_like(expected, device="npu")
+    ptr = torch.tensor([packet.data_ptr()], dtype=torch.int64, device="npu")
+    offsets = torch.tensor([0], dtype=torch.int32, device="npu")
+    counts = torch.tensor([len(host_slots)], dtype=torch.int32, device="npu")
+    slots = host_slots.npu()
+    if grouped:
+        bf = torch.full_like(keys, 5, dtype=torch.bfloat16)
+        bf_packet = torch.empty(len(host_slots) * 256, dtype=torch.uint8, device="npu")
+        state = c_ops.IndexerC8GroupState([c_ops.IndexerC8State(bf), state])
+        ptr = torch.tensor(
+            [[bf_packet.data_ptr()], [packet.data_ptr()]],
+            dtype=torch.int64,
+            device="npu",
+        )
+    fn = (
+        c_ops.indexer_c8_group_transfer_prepared
+        if grouped
+        else c_ops.indexer_c8_transfer_prepared
+    )
+    fn(state, ptr, offsets, counts, slots, len(host_slots), True)
+    torch.npu.synchronize()
+    assert torch.equal(packet.cpu(), expected)
+    keys.zero_()
+    scales.zero_()
+    fn(state, ptr, offsets, counts, slots, len(host_slots), False)
+    torch.npu.synchronize()
+    actual = torch.cat(
+        [
+            keys.cpu().view(-1, 128)[physical].contiguous().view(torch.uint8).flatten(),
+            scales.cpu().view(-1)[physical].contiguous().view(torch.uint8).flatten(),
+        ]
+    )
+    assert torch.equal(actual, expected)
+    unused = torch.ones(18 * t * 128, dtype=torch.bool)
+    unused[physical] = False
+    assert keys.cpu().view(-1, 128)[unused].eq(0).all()
+    assert scales.cpu().view(-1)[unused].eq(0).all()

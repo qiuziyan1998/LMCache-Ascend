@@ -104,3 +104,18 @@ def test_incompatible_c8_connector_rejected_before_device_setup(invalid):
         create(config, metadata, "vllm")
     probe.assert_not_called()
     assert not calls
+
+
+@pytest.mark.parametrize("abi", [0, 1])
+def test_paired_map_reaches_derived_factory_only_with_native_capability(abi):
+    create, config, metadata, derived, calls, _ = factory_api()
+    metadata.indexer_hbm_block_map = tuple(range(36))
+    ops = derived.from_metadata.__func__.__globals__["lmc_ops"]
+    ops.INDEXER_C8_BLOCK_MAP_ABI = abi
+    if not abi:
+        with pytest.raises(RuntimeError, match="Paired-bank"):
+            create(config, metadata, "vllm")
+        assert not calls
+    else:
+        create(config, metadata, "vllm")
+        assert calls[0]["indexer_hbm_block_map"] is metadata.indexer_hbm_block_map

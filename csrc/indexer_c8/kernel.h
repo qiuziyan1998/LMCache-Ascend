@@ -8,5 +8,5 @@ void launch_indexer_c8_transfer(
     void *offsets, void *counts, void *slots, int64_t chunks,
     int64_t chunk_capacity, int64_t slot_count, int64_t cache_slots,
     bool from_npu, bool metadata_int64, bool slots_int64, bool fixed_chunks,
-    int64_t layers = 1, int64_t key_bytes = 128, int64_t slot_factor = 1);
+    int64_t layers = 1, int64_t key_bytes = 128, int64_t slot_factor = 1, void *block_map = nullptr);
 } // namespace lmc
