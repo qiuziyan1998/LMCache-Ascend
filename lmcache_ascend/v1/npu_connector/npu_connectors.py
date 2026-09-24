@@ -7928,13 +7928,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     else:
                         cpu_tensors = []
                         for memory_obj in memory_objs_layer:
-                            assert memory_obj.tensor is not None
                             if memory_obj.metadata.fmt != expected_fmt:
                                 raise ValueError(
                                     f"Expected memory format {expected_fmt}, "
                                     f"got {memory_obj.metadata.fmt}."
                                 )
-                            cpu_tensors.append(_layer_memory_tensor(memory_obj, layer_id))
+                            # Merged pages only expose a tensor for a specific
+                            # layer; this accessor also rejects invalid storage.
+                            cpu_tensors.append(
+                                _layer_memory_tensor(memory_obj, layer_id)
+                            )
                         chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                             layer_id,
                             cpu_tensors,
