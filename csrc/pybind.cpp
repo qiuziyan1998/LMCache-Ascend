@@ -383,7 +383,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("diagnostic_layer_id") = -1);
   m.def("sparse_graph_kv_transfer", &sparse_graph_kv_transfer,
         py::arg("destination_state"), py::arg("slots"), py::arg("selected"),
-        py::arg("counts"), py::arg("ptrs"), py::arg("limits"), py::arg("chunk_size"));
+        py::arg("counts"), py::arg("ptrs"), py::arg("limits"), py::arg("chunk_size"),
+        py::arg("max_aiv_cores") = 0);
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),
