@@ -3388,6 +3388,7 @@ def test_coordinator_ascend_preemption_preserves_real_engine_drop_ownership(fata
     engine.wait_for_pending_stores = lambda _ids: (order.append("persistent") or set())
     _coordinator(engine)
     adapter = object.__new__(LMCacheAscendConnectorV1Impl)
+    adapter._parent = SimpleNamespace(has_connector_metadata=lambda: False)
     adapter.lmcache_engine = engine
     adapter._parent = SimpleNamespace(has_connector_metadata=lambda: False)
     adapter.store_async = True

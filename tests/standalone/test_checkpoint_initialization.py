@@ -92,8 +92,15 @@ def init_api(config):
             "_validate_preemption_checkpoint_setup": ns[validate.name],
         },
     )
-    kv = NS(kv_cache_groups=[NS(layer_names=["model.layers.0.self_attn.attn"]),
-                            NS(layer_names=["model.layers.0.self_attn.indexer.k_cache"])])
+    kv = NS(
+        kv_cache_groups=[
+            NS(layer_names=["model.layers.0.self_attn.attn"]),
+            NS(
+                layer_names=["model.layers.0.self_attn.indexer.k_cache"],
+                kv_cache_spec=NS(cache_sparse_c8=False),
+            ),
+        ]
+    )
     return partial(cls, kv_cache_config=kv), calls, ResourcesStarted
 
 

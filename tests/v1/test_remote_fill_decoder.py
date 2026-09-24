@@ -524,6 +524,13 @@ class _FakeCapabilityPage:
     def is_valid(self) -> bool:
         return self.refs > 0
 
+    def layer_size_bytes(self, layer_id: int) -> int:
+        assert 0 <= layer_id < self.num_layers
+        return self.layer_size
+
+    def layer_layout_is_valid(self) -> bool:
+        return self.size == self.layer_size * self.num_layers
+
     def get_size(self) -> int:
         return self.size
 

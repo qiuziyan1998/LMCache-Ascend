@@ -5,6 +5,7 @@ from collections import defaultdict
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 import torch
 
 logger = init_logger(__name__)
@@ -39,6 +40,22 @@ def _get_kv_cache_group_key_and_info(
     """Build a stable grouping key plus the LMCache storage shape/dtype."""
     if isinstance(kv_cache, tuple):
         dtypes = tuple(tensor.dtype for tensor in kv_cache)
+        if dtypes == (torch.int8, torch.float16):
+            key, scale = kv_cache
+            if (
+                key.ndim != 4 or key.shape[1:3] != (128, 1)
+                or scale.shape != (*key.shape[:3], 1)
+            ):
+                raise ValueError(
+                    "Indexer C8 requires matching PA_BSND key/scale planes"
+                )
+            layout = IndexerC8Layout(key.shape[-1])
+            shapes = tuple(tensor.shape for tensor in kv_cache)
+            return (
+                (shapes, dtypes),
+                torch.Size([key.shape[0], key.shape[1], layout.token_bytes]),
+                torch.uint8,
+            )
         if len(set(dtypes)) != 1:
             raise ValueError(
                 "Tuple-based KV caches with mixed dtypes are not supported by "
@@ -76,7 +93,12 @@ def patched_hidden_dim_size(self) -> int:
         raise ValueError(f"Invalid shape: {self.shape}")
 
 
-def build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor]) -> None:
+def build_kv_layer_groups(
+    self,
+    kv_caches: dict[str, torch.Tensor],
+    *,
+    indexer_c8_layout: IndexerC8Layout | None = None,
+) -> None:
     """Build KV layer groups structure by analyzing each layer's shape and dtype.
 
     Layers with the same shape and dtype are grouped together. This is useful
@@ -101,10 +123,29 @@ def build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor]) -> None:
     groups_dict: dict[tuple[object, ...], list[tuple[str, int]]] = defaultdict(list)
     group_infos: dict[tuple[object, ...], tuple[torch.Size, torch.dtype]] = {}
 
+    indexer_layer = 0
     for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
         key, shape, dtype = _get_kv_cache_group_key_and_info(kv_cache)
+        if (
+            indexer_c8_layout is not None
+            and indexer_c8_layout.mixed
+            and "indexer" in layer_name
+        ):
+            quantized = indexer_c8_layout.is_c8(indexer_layer)
+            planes = kv_cache if isinstance(kv_cache, tuple) else (kv_cache,)
+            if (planes[0].dtype == torch.int8) != quantized:
+                raise ValueError("Registered indexer dtype disagrees with model policy")
+            key = ("mixed_indexer",)
+            # Per-layer byte extents live in metadata; this width is a staging bound.
+            shape = torch.Size([planes[0].shape[0], planes[0].shape[1], 256])
+            dtype = torch.uint8
+            indexer_layer += 1
         groups_dict[key].append((layer_name, idx))
         group_infos[key] = (shape, dtype)
+
+    if indexer_c8_layout is not None and indexer_c8_layout.mixed:
+        if indexer_layer != len(indexer_c8_layout.c8_layers):
+            raise ValueError("Registered indexer layers disagree with precision policy")
 
     # Build KVLayerGroupInfo list
     # Sort groups by the first layer index to maintain order

@@ -33,11 +33,8 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
-# Build upstream kernels and our graph-specific kernel in the same library.
-# The submodule itself remains unmodified.
-add_subdirectory(csrc/graph)
-
 if(DEFINED ENV{USE_MINDSPORE})
+  add_subdirectory(third_party/kvcache-ops)
   find_package(Threads REQUIRED)
   add_subdirectory(csrc/mindspore)
   target_link_options(c_ops PRIVATE
@@ -73,6 +70,7 @@ if(DEFINED ENV{USE_MINDSPORE})
   )
 
 else()
+  add_subdirectory(csrc/graph)
   add_subdirectory(csrc)
   set(TORCH_LIBS_DIR "${TORCH_PATH}/lib")
 
