@@ -187,6 +187,7 @@ class RemoteFillNegotiationCache:
             handoff.destination_engine_epoch,
             handoff.shared_cache_generation,
             handoff.destination_dp_rank,
+            handoff.destination_tp_size,
             spec,
         )
 

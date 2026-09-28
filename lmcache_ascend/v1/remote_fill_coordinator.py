@@ -117,11 +117,13 @@ class RemoteFillCoordinator:
         tp_size: int,
         storage_manager: StorageManager,
         fatal_reporter: Callable[[tuple[str, ...]], None],
+        tp_independent: bool = False,
     ) -> None:
         # Borrow the validated worker configuration. Production treats it as
         # immutable after startup; do not shadow values or change cast timing.
         self.config = config
         self.tp_size = tp_size
+        self.tp_independent = tp_independent
         self.storage_manager = storage_manager
         self._fatal_reporter = WeakMethod(fatal_reporter)
         self._session_lock = threading.RLock()
@@ -355,7 +357,7 @@ class RemoteFillCoordinator:
                 severity="warning",
             )
             return False
-        if handoff.destination_tp_size != self.tp_size:
+        if handoff.destination_tp_size != self.tp_size and not self.tp_independent:
             state.disabled_reason = "incompatible_tp_mapping"
             log_remote_fill_diagnostic(
                 logger,
