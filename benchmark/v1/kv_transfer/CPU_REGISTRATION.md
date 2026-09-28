@@ -83,6 +83,15 @@ start and completion. The last started phase without completion localizes a
 hang. ACL/HAL error codes remain in stderr. Private/NUMA timings are combined
 allocation+registration; the benchmark does not falsely separate them.
 
+Before spawning workers, the probe reports `/dev/shm` total and available bytes.
+If the page-rounded total exceeds available space, it exits with
+`failure_stage=shm_capacity_preflight` and `registration_attempted=false`.
+Chunking does not bypass this check: all chunks remain allocated together.
+This is a snapshot, not a reservation; concurrent allocations can still cause
+a later native reserve failure. A 200 GiB tmpfs cannot test a 240 GiB shared slab;
+increase the container's shm capacity first. Passing this check does not prove
+that the container has enough RAM.
+
 - `reserve` failure: examine `/dev/shm` free space/quota.
 - `populate` failure/kill: inspect available RAM, NUMA policy and cgroup OOM
   counters (also ancestor cgroups if the current cgroup has no explicit limit).
@@ -95,8 +104,13 @@ allocation+registration; the benchmark does not falsely separate them.
 
 Record `npu-smi info`, `ulimit -l`, `df -h /dev/shm`, and kernel OOM/driver logs
 around failures. `/proc` snapshots include memlock limits, RSS/locked memory,
-host memory and best-effort cgroup-v2 counters; VmLck alone does not measure all
-driver-pinned pages. No system limits are changed by the benchmark.
+host memory and best-effort cgroup v1/v2 counters. Controller paths are resolved
+against `/proc/self/mountinfo`, including container bind-mount roots. The
+`memory_cgroups` field records each readable group and visible ancestor, since
+an ancestor can impose a lower limit. An empty field means the limits could not
+be read, not that memory is unlimited; ancestors outside the container's visible
+mount remain unknown. VmLck alone does not measure all driver-pinned pages.
+No system limits are changed by the benchmark.
 
 Workers are started in order to isolate the first failing device, not to
 measure parallel startup throughput. All earlier registrations remain live.

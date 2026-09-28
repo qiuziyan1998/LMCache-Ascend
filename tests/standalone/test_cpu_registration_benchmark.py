@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import tempfile
 from unittest.mock import Mock, call, patch
 
 SOURCE = Path(__file__).resolve().parents[2] / "benchmark/v1/kv_transfer/benchmark_cpu_registration.py"
@@ -12,6 +13,46 @@ spec.loader.exec_module(bench)
 
 
 class RegistrationBenchmarkTests(unittest.TestCase):
+    def test_cgroup_v1_bind_mount_root(self):
+        mounts = "31 20 0:27 /docker/abc /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory"
+        rows = list(bench.memory_cgroups("9:memory:/docker/abc/child", mounts))
+        self.assertEqual(rows, [(1, Path("/sys/fs/cgroup/memory"),
+                                Path("/sys/fs/cgroup/memory/child"))])
+
+    def test_cgroup_v2_namespace_root_and_escaped_mount(self):
+        mounts = r"31 20 0:27 / /sys/fs/cgroup\040test rw - cgroup2 cgroup rw"
+        rows = list(bench.memory_cgroups("0::/", mounts))
+        self.assertEqual(rows, [(2, Path("/sys/fs/cgroup test"), Path("/sys/fs/cgroup test"))])
+
+    def test_cgroup_unrelated_mount_does_not_read_wrong_limits(self):
+        mounts = "31 20 0:27 /docker/other /cg rw - cgroup cgroup rw,memory"
+        self.assertEqual(list(bench.memory_cgroups("9:memory:/docker/abc", mounts)), [])
+
+    def test_cgroup_reads_visible_ancestor_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = root / "child"
+            child.mkdir()
+            (root / "memory.limit_in_bytes").write_text("200")
+            (child / "memory.limit_in_bytes").write_text("999")
+            (child / "memory.failcnt").write_text("3")
+            with patch.object(bench, "memory_cgroups", return_value=[(1, root, child)]):
+                data = bench.cgroup_snapshot("", "")
+            self.assertEqual(data[str(root)]["memory.limit_in_bytes"], "200")
+            self.assertEqual(data[str(child)]["memory.failcnt"], "3")
+
+    def test_shm_limit_stops_before_worker_creation_even_with_chunks(self):
+        args = self.args()
+        args.chunk_bytes = 40
+        with patch.object(bench, "snapshot", return_value={"shm_available_bytes": 200}), \
+                patch.object(bench.os, "sysconf", create=True, return_value=1), \
+                patch.object(bench.mp, "get_context") as spawn, \
+                patch.object(bench, "emit") as emit:
+            self.assertFalse(bench.trial(args, 240))
+        spawn.assert_not_called()
+        self.assertEqual(emit.call_args.kwargs["failure_stage"], "shm_capacity_preflight")
+        self.assertFalse(emit.call_args.kwargs["registration_attempted"])
+
     def args(self, mode="shared", attach="auto"):
         return SimpleNamespace(mode=mode, attach=attach, numa_node=1, interleave_nodes=[0, 1])
 

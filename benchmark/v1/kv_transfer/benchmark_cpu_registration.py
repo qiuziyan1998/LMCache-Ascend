@@ -7,6 +7,7 @@ import math
 import multiprocessing as mp
 import os
 from pathlib import Path
+import re
 import sys
 import time
 import uuid
@@ -16,28 +17,79 @@ def emit(event, **fields):
     print(json.dumps(dict(event=event, pid=os.getpid(), **fields)), flush=True)
 
 
+def mount_path(value):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
+
+
+def memory_cgroups(cgroup, mountinfo):
+    """Resolve memory-controller paths against visible mounts, including bind roots."""
+    for line in cgroup.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, group = parts
+        version = 2 if controllers == "" else 1
+        if version == 1 and "memory" not in controllers.split(","):
+            continue
+        for mount in mountinfo.splitlines():
+            left, sep, right = mount.partition(" - ")
+            fields, fs = left.split(), right.split()
+            if not sep or len(fields) < 6 or len(fs) < 3:
+                continue
+            if fs[0] != ("cgroup2" if version == 2 else "cgroup"):
+                continue
+            if version == 1 and "memory" not in fs[2].split(","):
+                continue
+            root, target = mount_path(fields[3]), mount_path(fields[4])
+            if group == root:
+                relative = ""
+            elif root == "/":
+                relative = group.lstrip("/")
+            elif group.startswith(root.rstrip("/") + "/"):
+                relative = group[len(root):].lstrip("/")
+            else:
+                continue
+            if ".." not in Path(relative).parts:
+                yield version, Path(target), Path(target) / relative
+
+
+def cgroup_snapshot(cgroup, mountinfo):
+    result = {}
+    for version, mount, current in memory_cgroups(cgroup, mountinfo):
+        names = (("memory.max", "memory.current", "memory.events") if version == 2 else
+                 ("memory.limit_in_bytes", "memory.usage_in_bytes", "memory.failcnt",
+                  "memory.oom_control", "memory.stat"))
+        while True:
+            values = {}
+            for name in names:
+                try:
+                    values[name] = (current / name).read_text().strip()
+                except OSError:
+                    pass
+            if values:
+                result[str(current)] = dict(version=version, **values)
+            if current == mount:
+                break
+            current = current.parent
+    return result
+
+
 def snapshot():
     result = {}
     for name in ("/proc/meminfo", "/proc/self/status", "/proc/self/limits",
-                 "/proc/self/cgroup"):
+                 "/proc/self/cgroup", "/proc/self/mountinfo"):
         try:
             result[name] = Path(name).read_text()
         except OSError:
             pass
     try:
         stat = os.statvfs("/dev/shm")
+        result["shm_total_bytes"] = stat.f_blocks * stat.f_frsize
         result["shm_available_bytes"] = stat.f_bavail * stat.f_frsize
     except (OSError, AttributeError):
         pass
-    # Resolve the process's cgroup v2 rather than assuming it is at the root.
-    for line in result.get("/proc/self/cgroup", "").splitlines():
-        if line.startswith("0::"):
-            root = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-            for name in ("memory.max", "memory.current", "memory.events"):
-                try:
-                    result[name] = (root / name).read_text().strip()
-                except OSError:
-                    pass
+    result["memory_cgroups"] = cgroup_snapshot(
+        result.get("/proc/self/cgroup", ""), result.pop("/proc/self/mountinfo", ""))
     return result
 
 
@@ -125,6 +177,17 @@ def worker(args, device, sizes, names, owner, conn):
 
 def trial(args, total):
     sizes = regions(total, args.chunk_bytes)
+    before = snapshot()
+    emit("preflight", mode=args.mode, total_bytes=total, memory=before)
+    available = before.get("shm_available_bytes")
+    # Every region remains live. Splitting cannot evade tmpfs capacity.
+    page = os.sysconf("SC_PAGE_SIZE") if args.mode == "shared" else 1
+    required = sum((size + page - 1) // page * page for size in sizes)
+    if args.mode == "shared" and available is not None and required > available:
+        emit("trial_result", total_bytes=total, success=False,
+             failure_stage="shm_capacity_preflight", required_bytes=required,
+             available_bytes=available, registration_attempted=False)
+        return False
     prefix = "lmcache_regbench_" + uuid.uuid4().hex
     names = [f"/{prefix}_{i}" for i in range(len(sizes))]
     ctx = mp.get_context("spawn")
