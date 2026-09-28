@@ -22,6 +22,7 @@ from lmcache.v1.serving_perf import (
     serving_perf_log,
 )
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
     MemoryFormat,
@@ -30,6 +31,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.mooncake_layout import (
     MOONCAKE_VALID_TOKENS_TAG,
+    mooncake_layer_pages_enabled,
     mooncake_valid_tokens,
     resolve_mooncake_dsa_raw_token_dims,
     resolve_remote_fill_identity,
@@ -61,6 +63,45 @@ logger = init_logger(__name__)
 
 REMOTE_FILL_MODEL_LAYOUT = "mla-dsa-layer-page-v3"
 _DESCRIPTOR_VERIFICATION_CAPABILITY_BYTES = 32
+
+
+def remote_fill_tp_independent(
+    config: LMCacheEngineConfig, metadata: LMCacheMetadata
+) -> bool:
+    """Qualify TP-independent split-group pages from local startup metadata.
+
+    Native topology establishes replicated MLA vectors; the existing source and
+    destination tensor preflights still validate their physical planes/strides.
+    Only G0 is pushed to shared TP0 CPU memory. G1 keeps its persistent HBM path.
+    """
+    if not (
+        getattr(metadata, "mla_cache_tp_replicated", False)
+        and metadata.use_mla
+        and config.dsa_two_groups
+        and config.enable_sparse_attention
+        and config.dsa_group1_load_mode == "persistent_direct_hbm"
+        and mooncake_layer_pages_enabled(config)
+    ):
+        return False
+    dtypes = metadata.get_dtypes()
+    c8 = getattr(metadata, "indexer_c8_layout", None)
+    if c8 is not None:
+        # G1 is loaded through its existing persistent key/scale path. Its
+        # precision policy and physical layer names remain in the layout tag;
+        # worker-local HBM block IDs are never part of the wire payload.
+        counts = getattr(metadata, "runtime_kv_group_layer_counts", None)
+        return (
+            isinstance(c8, IndexerC8Layout)
+            and len(dtypes) == 2
+            and dtypes[0] in (torch.float16, torch.bfloat16)
+            and dtypes[1] == torch.uint8
+            and counts is not None and len(counts) == 2
+            and all(type(count) is int and count > 0 for count in counts)
+            and (not c8.c8_layers or len(c8.c8_layers) == counts[1])
+        )
+    return len(dtypes) in (1, 2) and all(
+        dtype in (torch.float16, torch.bfloat16) for dtype in dtypes
+    )
 
 
 def build_remote_fill_protocol_limits(config: LMCacheEngineConfig) -> ProtocolLimits:
@@ -1600,6 +1641,10 @@ def create_decoder_remote_fill_runtime(
         shared_cache_generation=shared_cache_generation,
         descriptor_verification_key=verification_capability,
         negotiation=negotiation,
+        tp_independent=(
+            not negotiation.shared_group1
+            and remote_fill_tp_independent(config, metadata)
+        ),
         page_lifecycle=lifecycle,
         limits=limits,
         reservation_ttl_sec=float(config.remote_fill_reservation_ttl_sec),
