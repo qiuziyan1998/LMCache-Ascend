@@ -127,8 +127,35 @@ def release(ops, args, ptr, size, name, owner):
         ops.detach_shm_pinned_ptr(ptr, size)
 
 
+def npu_snapshot(torch, device):
+    try:
+        free, total = torch.npu.mem_get_info(device)
+        return dict(free_bytes=int(free), total_bytes=int(total),
+                    allocated_bytes=int(torch.npu.memory_allocated(device)),
+                    reserved_bytes=int(torch.npu.memory_reserved(device)))
+    except Exception as exc:
+        return dict(error=repr(exc))
+
+
+def preload_npu(torch, device, target_free, chunk, tensors):
+    """Retain ordinary allocations; target is approximate due to allocator rounding."""
+    free, _ = torch.npu.mem_get_info(device)
+    if free < target_free:
+        raise RuntimeError("NPU already has less free memory than the requested target")
+    amount = int(free) - target_free
+    for size in regions(amount, chunk) if amount else []:
+        tensor = torch.empty(size, dtype=torch.uint8, device=f"npu:{device}")
+        tensors.append(tensor)  # Keep even a partially completed preload alive.
+        tensor.zero_()
+    torch.npu.synchronize()
+    return amount
+
+
 def worker(args, device, sizes, names, owner, conn):
     allocations = []
+    npu_tensors = []
+    stage = "initialize"
+    torch_module = None
     ok = True
     try:
         # Set before importing the extension; native shared-slab phase logs
@@ -138,6 +165,7 @@ def worker(args, device, sizes, names, owner, conn):
         import torch_npu
         from lmcache_ascend import c_ops
 
+        torch_module = torch
         torch.npu.set_device(device)
         torch.npu.synchronize()
         emit("worker_start", device=device, owner=owner, torch=torch.__version__,
@@ -145,7 +173,17 @@ def worker(args, device, sizes, names, owner, conn):
              environment={k: os.environ.get(k) for k in
                           ("ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES")},
              memory=snapshot())
+        emit("npu_memory", device=device, phase="before_preload",
+             memory=npu_snapshot(torch, device))
+        if args.npu_free_gib is not None:
+            stage = "npu_preload"
+            emit("npu_preload_start", device=device, target_free_gib=args.npu_free_gib)
+            amount = preload_npu(torch, device, int(args.npu_free_gib * 2**30),
+                                 int(args.npu_preload_chunk_gib * 2**30), npu_tensors)
+            emit("npu_preload_complete", device=device, requested_bytes=amount,
+                 tensor_count=len(npu_tensors), memory=npu_snapshot(torch, device))
         for size, name in zip(sizes, names):
+            stage = "cpu_allocate_register"
             emit("allocate_start", device=device, bytes=size, name=name)
             start = time.perf_counter()
             ptr = allocate(c_ops, args, size, name, owner)
@@ -155,11 +193,16 @@ def worker(args, device, sizes, names, owner, conn):
                 raise RuntimeError("allocation returned without a complete device mapping")
             emit("allocate_complete", device=device, bytes=size,
                  elapsed_s=time.perf_counter() - start, memory=snapshot())
+            emit("npu_memory", device=device, phase="after_registration",
+                 memory=npu_snapshot(torch, device))
+        stage = "hold"
         conn.send("ready")
         conn.recv()  # Keep all registrations live until parent releases us.
     except BaseException as exc:
         ok = False
-        emit("worker_failed", device=device, error=repr(exc), memory=snapshot())
+        emit("worker_failed", device=device, failure_stage=stage,
+             error=repr(exc), memory=snapshot(),
+             npu_memory=npu_snapshot(torch_module, device) if torch_module else None)
     finally:
         for ptr, size, name in reversed(allocations):
             try:
@@ -170,6 +213,17 @@ def worker(args, device, sizes, names, owner, conn):
             except Exception as exc:
                 ok = False
                 emit("release_failed", device=device, error=repr(exc))
+        # Preserve HBM pressure through CPU unregister/free, including failures.
+        if npu_tensors:
+            try:
+                torch_module.npu.synchronize()
+                npu_tensors.clear()
+                torch_module.npu.empty_cache()
+                emit("npu_preload_released", device=device,
+                     memory=npu_snapshot(torch_module, device))
+            except Exception as exc:
+                ok = False
+                emit("npu_preload_release_failed", device=device, error=repr(exc))
         conn.close()
     if not ok:
         raise SystemExit(1)
@@ -246,11 +300,19 @@ def main():
     parser.add_argument("--attach", choices=["auto", "readonly", "writable"], default="auto")
     parser.add_argument("--timeout", type=float, default=600, help="per-worker startup AND cleanup deadline in seconds")
     parser.add_argument("--hold-seconds", type=float, default=2)
+    parser.add_argument("--npu-free-gib", type=float, default=None,
+                        help="preload NPU tensors to leave approximately this much free HBM")
+    parser.add_argument("--npu-preload-chunk-gib", type=float, default=1,
+                        help="size of each retained NPU allocation (default 1 GiB)")
     args = parser.parse_args()
     if (any(not math.isfinite(s) or s <= 0 for s in args.sizes_gib)
             or not math.isfinite(args.chunk_gib) or args.chunk_gib < 0
             or not math.isfinite(args.timeout) or args.timeout <= 0
             or not math.isfinite(args.hold_seconds) or args.hold_seconds < 0
+            or (args.npu_free_gib is not None and
+                (not math.isfinite(args.npu_free_gib) or args.npu_free_gib <= 0))
+            or not math.isfinite(args.npu_preload_chunk_gib)
+            or args.npu_preload_chunk_gib * 2**30 < 1
             or any(d < 0 for d in args.devices) or not 0 <= args.numa_node < 64
             or any(n < 0 for n in args.interleave_nodes)):
         parser.error("invalid size, time, device or NUMA node")

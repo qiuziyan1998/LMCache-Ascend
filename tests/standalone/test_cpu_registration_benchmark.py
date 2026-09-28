@@ -54,7 +54,34 @@ class RegistrationBenchmarkTests(unittest.TestCase):
         self.assertFalse(emit.call_args.kwargs["registration_attempted"])
 
     def args(self, mode="shared", attach="auto"):
-        return SimpleNamespace(mode=mode, attach=attach, numa_node=1, interleave_nodes=[0, 1])
+        return SimpleNamespace(mode=mode, attach=attach, numa_node=1, interleave_nodes=[0, 1],
+                               npu_free_gib=None, npu_preload_chunk_gib=1)
+
+    def test_preload_retains_chunked_tensors_and_synchronizes(self):
+        torch = Mock()
+        torch.npu.mem_get_info.return_value = (11, 20)
+        tensors = []
+        self.assertEqual(bench.preload_npu(torch, 0, 4, 3, tensors), 7)
+        self.assertEqual([c.args[0] for c in torch.empty.call_args_list], [3, 3, 1])
+        self.assertEqual(len(tensors), 3)
+        torch.npu.synchronize.assert_called_once()
+
+    def test_preload_reports_insufficient_initial_headroom(self):
+        torch = Mock()
+        torch.npu.mem_get_info.return_value = (3, 20)
+        with self.assertRaises(RuntimeError):
+            bench.preload_npu(torch, 0, 4, 3, [])
+        torch.empty.assert_not_called()
+
+    def test_partial_preload_failure_preserves_existing_tensor(self):
+        torch = Mock()
+        torch.npu.mem_get_info.return_value = (11, 20)
+        tensor = Mock()
+        torch.empty.side_effect = [tensor, RuntimeError("OOM")]
+        tensors = []
+        with self.assertRaises(RuntimeError):
+            bench.preload_npu(torch, 0, 4, 3, tensors)
+        self.assertEqual(tensors, [tensor])
 
     def test_partial_last_region_and_single_slab(self):
         self.assertEqual(bench.regions(11, 4), [4, 4, 3])

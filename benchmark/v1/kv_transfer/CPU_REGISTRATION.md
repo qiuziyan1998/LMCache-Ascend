@@ -76,6 +76,32 @@ groups likewise need separate shared-slab runs; their physical allocations add.
 
 ## Interpret results
 
+### Isolate HBM pressure before registration
+
+On an idle device, compare the existing 240 GiB interleaved test against:
+
+```bash
+python benchmark/v1/kv_transfer/benchmark_cpu_registration.py --sizes-gib 240 --devices 0 --interleave-nodes 0 1 2 3 4 5 6 7 --npu-free-gib 6 --timeout 1200 2>&1 | tee registration-240-hbm6.log
+```
+
+`--npu-free-gib 6` first reads available NPU memory, allocates the difference
+as uint8 NPU tensors in 1 GiB chunks, zeroes them, and synchronizes before any
+CPU slab allocation. The tensors remain alive through host registration and
+unregistration. Afterwards their references and PyTorch cached blocks are
+released. No model is loaded. Omit the option for the original control test.
+The target is approximate: use the actual `free_bytes` in
+`npu_preload_complete`, alongside `allocated_bytes` and `reserved_bytes`.
+`--npu-preload-chunk-gib` changes allocation granularity, not CPU slab size.
+
+An OOM during `npu_preload` is NOT a CPU registration failure. If registration
+fails under preload but passes without it, ordinary NPU allocation pressure
+is sufficient to reproduce the issue; this does not identify the driver's
+internal exhausted resource. If registration succeeds even under preload,
+free HBM alone does not reproduce serving startup: model allocation layout,
+other registrations and runtime state remain differences. This probe does not
+simulate fragmentation or vLLM initialization exactly. Run it without a live
+server, and only on the selected devices.
+
 Capture stdout AND stderr. JSON records report each region's duration, memory
 snapshot, process/device, native extension path, Torch versions and exit status.
 Native shared-slab logs expose reserve/populate/owner_register/attach_register
