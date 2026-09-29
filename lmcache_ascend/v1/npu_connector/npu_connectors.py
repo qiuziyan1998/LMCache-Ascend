@@ -6420,7 +6420,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         memory_objs_layer, layer_id, expected_fmt
                     )
                 # Ordinary paths need the active compute stream per layer.
-                # Deferred DMA uses bank events and never queries that stream.
+                # Deferred DMA fences bank reuse separately at H2D submission.
                 current_stream = (
                     self.load_stream
                     if defer_dense_waits or prefill_dma
@@ -6503,10 +6503,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         debug_reused += bound.reused_chunks
                         debug_rebuilt += len(source_objs) - bound.reused_chunks
                         debug_layers += 1
-                    # Save and load for one physical bank share one FIFO
-                    # stream.  The preceding save is therefore ordered
-                    # before this H2D without a separate event wait; no
-                    # unrelated layer's D2H can leak into the compute wait.
+                    # Submit at N+1 entry, before its compute-bank wait. Every
+                    # rank must finish reading N's bank before H2D overwrites
+                    # it with N+2. Passive TP ranks skip save(N), so FIFO with
+                    # that save alone cannot provide this dependency. Snapshot
+                    # the compute stream here (outside the bank context): this
+                    # only enqueues a device wait, and does not wait for N+1's
+                    # subsequently submitted compute or block the host.
+                    bank_stream.wait_stream(torch.npu.current_stream())
+                    # The same bank FIFO still orders save(N) before load(N+2).
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
                         if diagnose_bank_load:

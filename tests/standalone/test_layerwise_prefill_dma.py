@@ -2,7 +2,7 @@
 """CPU-only checks for the layerwise prefill DMA planner."""
 
 import ast
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import importlib.util
 from pathlib import Path
 from types import MethodType, SimpleNamespace as NS
@@ -106,7 +106,7 @@ def test_reused_chunks_counts_stable_prefix_and_replaced_tail():
     assert rebound.reused_chunks == 0 and resolved == owners
 
 
-def _reuse_debug_connector(enabled):
+def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
     dma = _load_dma_module()
     path = (
         Path(__file__).resolve().parents[2]
@@ -122,6 +122,11 @@ def _reuse_debug_connector(enabled):
         node for node in cls.body
         if isinstance(node, ast.FunctionDef) and node.name == "batched_to_gpu"
     )
+    wait = next(
+        node for node in cls.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "wait_for_layerwise_prefill_load"
+    )
     planner = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "_prefill_dma_plans"
@@ -135,17 +140,27 @@ def _reuse_debug_connector(enabled):
         assert enabled, "Disabled reuse debugging must not read the clock"
         return next(ticks) / 1000
 
-    class TorchWithoutNPU:
+    if npu is None:
         npu = NS(
             stream=lambda stream: nullcontext(),
+            current_stream=lambda: None,
             Event=lambda: NS(record=lambda stream: None),
         )
 
+    class TorchWithoutNPU:
         def __getattr__(self, name):
             return getattr(torch, name)
 
+    torch_runtime = TorchWithoutNPU()
+    torch_runtime.npu = npu
+
+    def copy(rows, direction):
+        copies.append([list(row) for row in rows])
+        if copy_hook is not None:
+            copy_hook(rows, direction)
+
     ns = dict(
-        torch=TorchWithoutNPU(),
+        torch=torch_runtime,
         time=NS(perf_counter=debug_clock),
         _DENSE_DIRECT_LOAD_DISABLE=False,
         KVCacheFormat=fmt,
@@ -162,11 +177,7 @@ def _reuse_debug_connector(enabled):
             (rank, stage, fields)
         ),
         logger=NS(isEnabledFor=lambda level: False),
-        lmc_ops=NS(
-            layerwise_prefill_dma_copy=lambda rows, direction: copies.append(
-                [list(row) for row in rows]
-            )
-        ),
+        lmc_ops=NS(layerwise_prefill_dma_copy=copy),
     )
     future = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
@@ -174,13 +185,13 @@ def _reuse_debug_connector(enabled):
     exec(
         compile(
             ast.fix_missing_locations(
-                ast.Module(body=[future, planner, run], type_ignores=[])
+                ast.Module(body=[future, planner, run, wait], type_ignores=[])
             ),
             str(path), "exec",
         ),
         ns,
     )
-    caches = [(torch.zeros((8, 4, 2)),) for _ in range(2)]
+    caches = [(torch.zeros((8, 4, 2)),) for _ in range(layers)]
     state = ({}, {}, {}, {})
     obj = NS(
         _prefill_worker_id=1,
@@ -200,13 +211,18 @@ def _reuse_debug_connector(enabled):
         _layerwise_token_major=lambda group: True,
         _expected_memory_format=lambda group: "fmt",
         _sparse_lmc_host_interleaved=lambda group: True,
-        _expected_group_layers=lambda group: 2,
-        prefill_dma_cycles={0: dma.DmaCycle.build(bundle_tokens=8, chunk_tokens=4)},
+        _expected_group_layers=lambda group: layers,
+        prefill_dma_cycles={
+            group: dma.DmaCycle.build(bundle_tokens=8, chunk_tokens=4)
+            for group in (0, 1)
+        },
         _prefill_dma_bound_loads={},
         _layerwise_prefill_load_owners={},
         _layerwise_prefill_load_request_events={},
         _layerwise_prefill_bank=lambda layer, group, offset: (layer + offset) % 2,
-        _layerwise_prefill_dma_stream=lambda group, bank: bank,
+        _layerwise_prefill_dma_stream=lambda group, bank: NS(
+            wait_stream=lambda stream: None,
+        ),
         _layerwise_prefill_transfer_state=lambda: state,
         checkpoint_plane_widths=lambda group: [2],
         _lmc_plane_num_tokens=lambda tensor, group: 4,
@@ -214,6 +230,9 @@ def _reuse_debug_connector(enabled):
         use_gpu=False,
     )
     obj.run = MethodType(ns["batched_to_gpu"], obj)
+    obj.wait_for_layerwise_prefill_load = MethodType(
+        ns["wait_for_layerwise_prefill_load"], obj,
+    )
     owners = [
         NS(
             data_ptr=100 + index * 100, tensor=torch.empty(4),
@@ -241,6 +260,7 @@ def _reuse_debug_connector(enabled):
         generator.close()
 
     submit.connector = obj
+    submit.owners = owners
     return submit, logs, copies
 
 
@@ -598,3 +618,175 @@ def test_request_release_and_generation_reset_clear_incremental_metadata():
     for name in ("_prefill_dma_bound_loads", "_prefill_dma_plan_cache",
                  "_prefill_dma_source_cache"):
         assert getattr(obj, name) == {}
+
+
+class _AsyncOp:
+    def __init__(self, dependencies, action):
+        self.dependencies = tuple(dep for dep in dependencies if dep is not None)
+        self.action = action
+        self.done = self.running = False
+
+    def run(self):
+        if self.done:
+            return
+        assert not self.running, "Cyclic compute/DMA dependency"
+        self.running = True
+        for dependency in self.dependencies:
+            dependency.run()
+        self.action()
+        self.done = True
+        self.running = False
+
+
+class _AsyncStream:
+    """Enqueue only; device execution is explicitly driven by the test."""
+
+    def __init__(self):
+        self.tail = None
+
+    def enqueue(self, action=lambda: None, dependencies=()):
+        self.tail = _AsyncOp((self.tail, *dependencies), action)
+        return self.tail
+
+    def wait_stream(self, stream):
+        # Snapshot submitted work, excluding future work on the other stream.
+        self.enqueue(dependencies=(stream.tail,))
+
+    def wait_event(self, event):
+        self.enqueue(dependencies=(event.tail,))
+
+    def synchronize(self):
+        pytest.fail("Bank handoff must not synchronize the host")
+
+
+class _AsyncNPU:
+    class Event:
+        def record(self, stream):
+            self.tail = stream.tail
+
+        def synchronize(self):
+            pytest.fail("Bank handoff must not synchronize the host")
+
+    def __init__(self):
+        self.compute = _AsyncStream()
+        self.current = self.compute
+
+    def current_stream(self):
+        return self.current
+
+    @contextmanager
+    def stream(self, stream):
+        previous = self.current
+        self.current = stream
+        try:
+            yield
+        finally:
+            self.current = previous
+
+
+def _async_bank_connector(group, offset):
+    npu = _AsyncNPU()
+    banks = [_AsyncStream(), _AsyncStream()]
+    contents = {}
+    pending = []
+    observed = []
+
+    def copy(_rows, to_cpu):
+        assert not to_cpu
+        bank = npu.current_stream()
+        assert bank in banks
+        value = pending.pop()
+        bank.enqueue(lambda: contents.__setitem__(bank, value))
+
+    submit, _, _ = _reuse_debug_connector(
+        False, npu=npu, copy_hook=copy, layers=4,
+    )
+    obj = submit.connector
+    obj._layerwise_prefill_dma_stream = lambda group, bank: banks[bank]
+
+    def start(chunk):
+        starts = [4 * index for index in range(chunk + 1)]
+        generator = obj.run(
+            starts, [start + 4 for start in starts],
+            slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
+            kv_group=group, req_id="request", deferred_layerwise_get=True,
+            prefill_dma_block_ids_by_bank=((0, 1, 2, 3), (4, 5, 6, 7)),
+            prefill_dma_block_size=4, layerwise_prefill_bank_offset=offset,
+        )
+        next(generator)
+
+        def load(layer):
+            pending.append((chunk, layer))
+            generator.send(submit.owners[:chunk + 1])
+
+        return generator, load
+
+    def read(chunk, layer):
+        bank = banks[(layer + offset) % 2]
+
+        def verify():
+            assert contents[bank] == (chunk, layer), "KV bank overwritten early"
+            observed.append((chunk, layer))
+
+        obj.wait_for_layerwise_prefill_load(layer, group, offset)
+        npu.compute.enqueue(verify)
+
+    return npu, banks, contents, observed, start, read
+
+
+@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("has_save", [False, True])
+def test_dma_bank_reuse_protects_pending_reads_across_chunks(group, offset, has_save):
+    """Drive DMA ahead of compute, including passive TP ranks without D2H."""
+    npu, banks, contents, observed, start, read = _async_bank_connector(group, offset)
+    saved = []
+    for chunk in range(3):
+        generator, load = start(chunk)
+        load(0)
+        load(1)
+        for layer in range(4):
+            read(chunk, layer)
+            if has_save:
+                bank = banks[(layer + offset) % 2]
+                # Active rank's existing save waits for the compute producer.
+                bank.wait_stream(npu.compute)
+                bank.enqueue(lambda bank=bank: saved.append(contents[bank]))
+            if layer + 2 < 4:
+                load(layer + 2)
+        next(generator)
+        generator.close()
+
+    assert observed == saved == []  # Submission never waits on the host.
+    # Adversarial order: eagerly execute DMA, then let compute catch up.
+    for bank in banks:
+        bank.tail.run()
+    npu.compute.tail.run()
+    expected = [(chunk, layer) for chunk in range(3) for layer in range(4)]
+    assert observed == expected
+    if has_save:
+        assert sorted(saved) == expected
+
+
+@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_dma_handoff_does_not_wait_for_next_layer_compute(group, offset):
+    npu, banks, contents, observed, start, read = _async_bank_connector(group, offset)
+    generator, load = start(0)
+    load(0)
+    load(1)
+    read(0, 0)
+    load(2)  # N+1 entry, before its bank wait and compute are submitted.
+    read(0, 1)
+    assert observed == []
+    banks[offset].tail.run()
+    assert observed == [(0, 0)]
+    assert contents[banks[offset]] == (0, 2)
+    # The other bank's layer can remain in flight while this H2D completes.
+    load(3)
+    read(0, 2)
+    read(0, 3)
+    next(generator)
+    generator.close()
+    npu.compute.tail.run()
+    assert observed == [(0, layer) for layer in range(4)]
