@@ -2,6 +2,7 @@
 # Standard
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+import os
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -240,6 +241,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
         )
         self.store_async = self.config.store_async
+        self._force_layerwise_prefill_store = bool(
+            self.use_layerwise
+            and os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip()
+            .lower() == "true"
+        )
         get_extra = getattr(self.config, "get_extra_config_value", None)
         _validate_remote_fill_sleep_mode(self.config, vllm_config)
         self._remote_store_requested = bool(
@@ -276,7 +283,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._live_source_ready_fences: dict[str, _LiveSourceReadyFence] = {}
         self._finalized_live_source_submissions: set[str] = set()
 
-        if self._direct_store_requested:
+        if self._direct_store_requested and self._force_layerwise_prefill_store:
+            logger.warning(
+                "[PREFILL_STORE_FALLBACK] Layerwise prefill reuses two KV banks; "
+                "ignoring all-layer NPU direct-store/RemoteFill source reads. "
+                "Using per-layer NPU-to-CPU saves before bank reuse and "
+                "persistent remote publication. RemoteFill can send the "
+                "completed CPU pages concurrently with Mooncake persistence."
+            )
+        if self._direct_store_requested and not self._force_layerwise_prefill_store:
             extra = self.config.extra_config or {}
             valid = (
                 self.store_async
@@ -306,6 +321,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             and self.use_layerwise
             and self.store_async
             and not self._direct_store_requested
+            and not self._force_layerwise_prefill_store
         ):
             raise ValueError(
                 "Layerwise storing is not supported with async store"
@@ -352,6 +368,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     ) -> None:
         """Start loads and arm a real producer-event handoff when required."""
 
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            self.lmcache_engine.poll_layerwise_prefill_puts()
+        if (
+            getattr(self, "_force_layerwise_prefill_store", False)
+            and self._remote_store_requested
+            and forward_context.attn_metadata is not None
+        ):
+            # Do this before super() primes the storers and creates cache keys.
+            # The direct callback is bypassed for banked P nodes, but the
+            # Group-1 decoder-local Mooncake placement must not be bypassed.
+            for request in self._parent._get_connector_metadata().requests:
+                _prepare_remote_fill_persistent_placement(
+                    request.request_configs,
+                    group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
+                )
         super().start_load_kv(forward_context, **kwargs)
         if forward_context.attn_metadata is None or not self.config.dsa_two_groups:
             return
@@ -414,7 +445,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
         if (
-            not getattr(self, "_direct_store_requested", False)
+            getattr(self, "_force_layerwise_prefill_store", False)
+            or not getattr(self, "_direct_store_requested", False)
             or self.kv_role == "kv_consumer"
             or self.lmcache_engine is None
             or self._parent._connector_metadata is None
@@ -458,7 +490,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             request, kv_group, completed, result
         )
         if (
-            self._direct_store_requested
+            (self._direct_store_requested or self._force_layerwise_prefill_store)
             and completed
             and result is not None
             and result.committed_end > 0
@@ -488,6 +520,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             for key in list(self._completed_layerwise_stores):
                 if key[0] in req_ids:
                     self._completed_layerwise_stores.pop(key, None)
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                self._forget_layerwise_store_results(req_ids)
             if self.lmcache_engine is not None:
                 try:
                     self.lmcache_engine.wait_for_direct_stores(req_ids)
@@ -761,6 +795,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         source_ready_events: tuple[Any, ...] = (),
     ) -> None:
         """Submit direct pages; also used by the wait-for-save fallback."""
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            # Neither a late callback nor finalization may expose banked NPU
+            # addresses after subsequent layers have overwritten their data.
+            return
         assert self.lmcache_engine is not None
         live_source_ready_fences = getattr(
             self, "_live_source_ready_fences", {}
@@ -1138,7 +1176,58 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             "slot_mapping_npu": slot_mapping_npu,
         }
 
+    def _finish_layerwise_prefill_batch(self) -> None:
+        """Fence persistent saves without revisiting the reused NPU banks."""
+        if self.kv_role == "kv_consumer" or self.lmcache_engine is None:
+            return
+        metadata = self._parent._get_connector_metadata()
+        final_requests = tuple(
+            request
+            for request in metadata.requests
+            if request.is_last_prefill and not request.is_sparse_decode
+        )
+        try:
+            # Both groups' CPU pages now exist. Start the independent D-cache
+            # fill BEFORE waiting for Mooncake puts, not after that barrier.
+            self.lmcache_engine.submit_layerwise_prefill_fills(
+                request.req_id for request in metadata.requests
+            )
+            self.lmcache_engine.poll_layerwise_prefill_puts(
+                final=bool(final_requests),
+                req_ids=tuple(request.req_id for request in final_requests),
+            )
+            # Only legacy/non-page fallback puts land in this set. Normal
+            # Mooncake CPU-page puts use the bounded asynchronous queue above.
+            self.lmcache_engine.wait_for_pending_sync_stores()
+        finally:
+            completed = self._completed_layerwise_stores
+            self._completed_layerwise_stores = {}
+        pending = getattr(self, "_layerwise_local_store_results", None)
+        if pending is None:
+            pending = self._layerwise_local_store_results = {}
+        pending.update(completed)
+        if not final_requests:
+            return
+        # Local completion is deliberately NOT adopted as persistent progress
+        # until its remote barrier (including reused-prefix dependencies)
+        # succeeds. Other requests may still have remote puts in flight.
+        for request in final_requests:
+            for group in (0, 1):
+                result = pending.pop((request.req_id, group), None)
+                if result is not None:
+                    self.lmcache_engine.adopt_completed_layerwise_store(result)
+            self.lmcache_engine.finish_layerwise_prefill_store(
+                request.req_id,
+                request.request_configs,
+                required_store_end=len(request.token_ids),
+                persistence_fenced=True,
+                tokens=request.token_ids,
+            )
+
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            self._finish_layerwise_prefill_batch()
+            return
         # Preserve the final attention producer dependency before resetting
         # per-step bookkeeping.  Prefix-hit/cold-resume steps can reach this
         # deferred path when not every registered cache callback fires.  The
@@ -1319,6 +1408,22 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             self._finalize_worker_requests_after_store({req_id})
         )
 
+    def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
+        if not getattr(self, "_force_layerwise_prefill_store", False):
+            return super()._release_finished_worker_requests(req_ids)
+        req_ids = tuple(req_ids)
+        if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
+            # Cancellation may happen before the normal final-prefill fence.
+            self.lmcache_engine.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
+            self._forget_layerwise_store_results(req_ids)
+        super()._release_finished_worker_requests(req_ids)
+
+    def _forget_layerwise_store_results(self, req_ids: Iterable[str]) -> None:
+        pending = getattr(self, "_layerwise_local_store_results", {})
+        for req_id in req_ids:
+            for group in (0, 1):
+                pending.pop((req_id, group), None)
+
     def _finalize_worker_requests_after_store(
         self, finished_req_ids: set[str]
     ) -> set[str]:
@@ -1406,6 +1511,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
         if self.lmcache_engine is None:
             return
+        if preempted_req_ids and getattr(self, "_force_layerwise_prefill_store", False):
+            self.lmcache_engine.poll_layerwise_prefill_puts(
+                final=True, req_ids=preempted_req_ids
+            )
+            self._forget_layerwise_store_results(preempted_req_ids)
         worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
         metadata = (
             self._parent._get_connector_metadata()
