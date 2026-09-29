@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from copy import deepcopy
+import os
 from typing import Any, TYPE_CHECKING, Optional
 
 # Third Party
@@ -32,6 +34,60 @@ logger = init_logger(__name__)
 
 class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
     supports_dsa_index_lmcache = True
+
+    @classmethod
+    def get_dsa_compact_startup_policy(cls, vllm_config: VllmConfig) -> Optional[tuple[int, int]]:
+        # This module imports lmcache_ascend before LMCache's config singleton,
+        # so the same extended config class is used by probing and construction.
+        from lmcache.integration.vllm.utils import lmcache_get_or_create_config
+        from lmcache.v1.config_base import validate_and_set_config_value
+
+        config = deepcopy(lmcache_get_or_create_config())
+        transfer = vllm_config.kv_transfer_config
+        for key, value in (getattr(transfer, "kv_connector_extra_config", None) or {}).items():
+            if key.startswith("lmcache."):
+                validate_and_set_config_value(config, key[8:], value)
+        return cls._compact_policy_from_config(vllm_config, config)
+
+    @staticmethod
+    def _compact_policy_from_config(vllm_config: VllmConfig, config: Any) -> Optional[tuple[int, int]]:
+        transfer = vllm_config.kv_transfer_config
+        extra = getattr(config, "extra_config", None)
+        shared_cpu = (
+            extra.get("enable_shared_cpu_cache", config.enable_shared_cpu_cache)
+            if isinstance(extra, dict) else config.enable_shared_cpu_cache
+        )
+        if (
+            transfer is None or transfer.kv_role not in ("kv_consumer", "kv_both")
+            or getattr(transfer, "kv_load_failure_policy", None) != "fail"
+            or getattr(config, "pd_role", None) != "receiver"
+            or getattr(config, "dsa_group1_load_mode", None) not in ("persistent_direct_hbm", "p2p_preferred")
+            or not getattr(config, "enable_dsa_cold_compact_load", False)
+            or vllm_config.cache_config.enable_prefix_caching
+            or not config.enable_sparse_attention or not config.dsa_two_groups
+            or not shared_cpu or not config.use_layerwise
+        ):
+            return None
+        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        if hf_config is None:
+            hf_config = vllm_config.model_config.hf_config
+        topk = int(getattr(hf_config, "index_topk", 0) or 0)
+        if topk <= 0:
+            return None
+        scratch = (1 + max(int(getattr(vllm_config, "num_speculative_tokens", 0)), 0)) * topk
+        try:
+            threshold = max(int(os.environ.get("LMCACHE_DSA_KV_POLICY_THRESHOLD", "0")), 0)
+        except (TypeError, ValueError):
+            threshold = 0
+        return scratch, threshold
+
+    def get_dsa_compact_runtime_policy(self, vllm_config: VllmConfig) -> Optional[tuple[int, int]]:
+        engine = self._lmcache_engine
+        policy = self._compact_policy_from_config(vllm_config, engine.config)
+        if policy != (getattr(engine, "_dsa_scratch_capacity", None),
+                      getattr(engine, "_dsa_kv_policy_threshold", None)):
+            return None
+        return policy
 
     def register_kv_caches(self, kv_caches):
         super().register_kv_caches(kv_caches)
