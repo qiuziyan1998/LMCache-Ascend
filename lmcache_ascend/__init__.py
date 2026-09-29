@@ -381,12 +381,19 @@ def _patch_storage_backend_init():
 
 def _patch_torch_capability():
     # Third Party
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+    from torch_npu.contrib import transfer_to_npu
     import torch
+    from torch._dynamo.device_interface import CudaInterface
 
     # Note: torch_npu do not support get_device_capability
     capability_mock = lambda *args: (0, 0)
     torch.npu.get_device_capability = capability_mock
+    # transfer_to_npu already bound the original NPU callable under CUDA.
+    # Repair that alias too before an early connector import reaches Dynamo.
+    torch.cuda.get_device_capability = capability_mock
+    # Compiler CUDA detection must use genuine CUDA availability, not the
+    # remapped NPU flag: NPU properties have no CUDA compute-capability major.
+    CudaInterface.is_available = staticmethod(transfer_to_npu.is_available)
 
 
 def _patch_transfer_channel():
