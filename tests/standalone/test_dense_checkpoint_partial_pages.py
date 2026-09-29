@@ -47,6 +47,7 @@ def test_dense_loader_plans_full_and_partial_local_pages(
         object,
         _lmcache_nvtx_annotate=lambda fn: fn,
         serving_perf_enabled=lambda: False,
+        prefill_start_timing_enabled=lambda: False,
         mooncake_page_layout_enabled=lambda config: True,
         mooncake_layer_pages_enabled=lambda config: True,
         CacheEngineKey=base_key,
@@ -55,6 +56,7 @@ def test_dense_loader_plans_full_and_partial_local_pages(
         _RemoteFillMaterializationError=type("RemoteFillError", (RuntimeError,), {}),
     )
     obj = cls()
+    obj.metadata = NS(worker_id=0)
     obj.num_layers, obj.config = 2, engine.config
     obj._num_transfer_layers_for_call = engine._num_transfer_layers_for_call
     obj.num_layers_for_group = engine.num_layers_for_group

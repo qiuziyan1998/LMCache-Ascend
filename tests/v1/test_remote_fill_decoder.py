@@ -1813,6 +1813,7 @@ def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = object.__new__(AscendLMCacheEngine)
+    engine._force_layerwise_prefill_store = False
     base_close_calls = 0
 
     class _SafeRuntime:

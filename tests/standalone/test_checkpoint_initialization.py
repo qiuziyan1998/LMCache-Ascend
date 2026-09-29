@@ -3,7 +3,7 @@
 
 import ast
 from functools import partial
-import runpy
+import os
 from enum import Enum
 from pathlib import Path
 import sys
@@ -61,15 +61,19 @@ def init_api(config):
         calls.append("factory")
         raise ResourcesStarted()
 
+    group_source = ROOT.parent / "LMCache-NPU/lmcache/v1/kv_layer_groups.py"
+    group_validator = next(
+        node for node in ast.parse(group_source.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef) and node.name == "validate_two_group_layer_counts"
+    )
     ns = dict(
+        os=os,
+        _layerwise_prefill_p_node_enabled=lambda: False,
         lmcache_get_or_create_config=lambda: config,
         LMCacheEngineConfig=Config,
         VllmServiceFactory=factory,
         KVConnectorRole=Role,
         logger=NS(info=lambda *a, **kw: None),
-        validate_two_group_layer_counts=runpy.run_path(
-            str(ROOT.parent / "LMCache-NPU/lmcache/v1/kv_layer_groups.py")
-        )["validate_two_group_layer_counts"],
     )
     prefix = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
@@ -77,7 +81,7 @@ def init_api(config):
     exec(
         compile(
             ast.fix_missing_locations(
-                ast.Module(body=[prefix, init, validate], type_ignores=[])
+                ast.Module(body=[prefix, group_validator, init, validate], type_ignores=[])
             ),
             str(base_path),
             "exec",
