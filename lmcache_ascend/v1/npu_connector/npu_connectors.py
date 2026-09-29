@@ -1979,6 +1979,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # This is the ordering that protects bank reuse without making the
         # compute stream wait for unrelated layers.
         self._layerwise_prefill_dma_streams: dict[tuple[int, int], Any] = {}
+        # Latest final-access event per physical bank. Its device wait is
+        # queued at the attention callback, before any following save/load.
+        self._layerwise_prefill_bank_use_events: dict[
+            tuple[int, int], tuple[int, int, Any]
+        ] = {}
         # Keep one D2H completion fence per group/bank/layer for publication
         # and teardown.  The bank FIFO streams above, not these bookkeeping
         # events, enforce save/load ordering on the hot compute path.
@@ -2230,6 +2235,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             del save_done[key]
         for key in load_done_keys:
             del load_done[key]
+        bank_uses = getattr(self, "_layerwise_prefill_bank_use_events", {})
+        for key in tuple(bank_uses):
+            if key[0] in groups:
+                del bank_uses[key]
 
     def _set_layerwise_prefill_bank_count(
         self,
@@ -2286,6 +2295,50 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         stream = stream_factory() if callable(stream_factory) else self.load_stream
         streams[key] = stream
         return stream
+
+    def record_layerwise_prefill_bank_use(
+        self,
+        layer_id: int,
+        kv_group: int,
+        bank_offsets: tuple[int, ...],
+        event: Any,
+    ) -> None:
+        """Queue final-compute-access waits before a P bank's next DMA.
+
+        Attention records ``event`` immediately after its last KV access.
+        Every participating rank calls this, even when it skips D2H. The
+        bank FIFO then orders event -> save (if any) -> load, without taking
+        another compute-stream snapshot at the later transfer callback.
+        """
+        if event is None:
+            raise ValueError("Layerwise prefill bank use requires a device event")
+        generation = self._layerwise_prefill_transfer_generation(kv_group)
+        uses = getattr(self, "_layerwise_prefill_bank_use_events", None)
+        if uses is None:
+            uses = self._layerwise_prefill_bank_use_events = {}
+        banks = {
+            self._layerwise_prefill_bank(layer_id, kv_group, offset)
+            for offset in bank_offsets
+        }
+        for bank in banks:
+            self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
+            uses[(kv_group, bank)] = (generation, layer_id, event)
+
+    def _require_layerwise_prefill_bank_use(
+        self, layer_id: int, kv_group: int, bank: int,
+    ) -> None:
+        """Reject a transfer if the source layer never handed off its bank."""
+        use = getattr(self, "_layerwise_prefill_bank_use_events", {}).get(
+            (kv_group, bank)
+        )
+        if use is None or use[:2] != (
+            self._layerwise_prefill_transfer_generation(kv_group), layer_id,
+        ):
+            raise RuntimeError(
+                "Missing final-access event for layerwise prefill bank: "
+                f"group={kv_group}, bank={bank}, source_layer={layer_id}. "
+                "Update vllm-ascend, LMCache and LMCache-Ascend together."
+            )
 
     def _synchronize_layerwise_prefill_dma_streams(
         self,
@@ -6503,15 +6556,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         debug_reused += bound.reused_chunks
                         debug_rebuilt += len(source_objs) - bound.reused_chunks
                         debug_layers += 1
-                    # Submit at N+1 entry, before its compute-bank wait. Every
-                    # rank must finish reading N's bank before H2D overwrites
-                    # it with N+2. Passive TP ranks skip save(N), so FIFO with
-                    # that save alone cannot provide this dependency. Snapshot
-                    # the compute stream here (outside the bank context): this
-                    # only enqueues a device wait, and does not wait for N+1's
-                    # subsequently submitted compute or block the host.
-                    bank_stream.wait_stream(torch.npu.current_stream())
-                    # The same bank FIFO still orders save(N) before load(N+2).
+                    # Attention already queued the exact last-use event on
+                    # this bank FIFO, on every TP rank. Do not snapshot the
+                    # current compute stream here: it can include N's FFN or
+                    # N+1's normalization. Initial L0/L1 loads also inherit the
+                    # previous chunk's tail handoff from the same bank FIFO.
+                    if layer_id >= layerwise_prefill_bank_count:
+                        self._require_layerwise_prefill_bank_use(
+                            layer_id - layerwise_prefill_bank_count, kv_group, bank,
+                        )
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
                         if diagnose_bank_load:
@@ -8083,11 +8136,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         kv_group,
                         layerwise_prefill_generation,
                     )
-                # save_kv_layer resumes this generator from the active layer's
-                # attention callback.  Capture that stream per layer so graph
-                # or runtime stream changes do not attach dependencies to a
-                # stale stream from the first layer.
-                if not ordinary_store:
+                # Non-DMA layerwise stores still capture the callback stream
+                # per layer to avoid a stale first-layer stream. Prefill DMA
+                # already has the earlier final-access event on its bank FIFO.
+                if not ordinary_store and not prefill_dma:
                     current_stream = torch.npu.current_stream()
                 bank = (
                     layer_id + layerwise_prefill_bank_offset
@@ -8142,8 +8194,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     bank_stream = self._layerwise_prefill_dma_stream(
                         kv_group, bank
                     )
+                    self._require_layerwise_prefill_bank_use(
+                        layer_id, kv_group, bank,
+                    )
                     with torch.npu.stream(bank_stream):
-                        bank_stream.wait_stream(current_stream)
+                        # The final-access event is already ahead of us on
+                        # the bank FIFO; do not wait for later compute here.
                         lmc_ops.layerwise_prefill_dma_copy(
                             deferred_dma_copies[layer_id], True
                         )

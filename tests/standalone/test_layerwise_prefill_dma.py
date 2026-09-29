@@ -127,6 +127,24 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         if isinstance(node, ast.FunctionDef)
         and node.name == "wait_for_layerwise_prefill_load"
     )
+    handoff = [
+        node for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in (
+            "record_layerwise_prefill_bank_use", "_require_layerwise_prefill_bank_use",
+        )
+    ]
+    store = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "batched_from_gpu")
+    dma_store = next(
+        n for n in ast.walk(store) if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Name) and n.test.id == "prefill_dma"
+        and any(isinstance(part, ast.With) for part in n.body)
+    )
+    save = ast.parse(
+        "def save(self, layer_id, kv_group, bank, current_stream):\n"
+        "    deferred_dma_copies = [[]] * 4\n"
+    ).body[0]
+    save.body.extend(dma_store.body)
     planner = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "_prefill_dma_plans"
@@ -185,7 +203,9 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
     exec(
         compile(
             ast.fix_missing_locations(
-                ast.Module(body=[future, planner, run, wait], type_ignores=[])
+                ast.Module(
+                    body=[future, planner, run, wait, save, *handoff], type_ignores=[],
+                )
             ),
             str(path), "exec",
         ),
@@ -222,6 +242,7 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         _layerwise_prefill_bank=lambda layer, group, offset: (layer + offset) % 2,
         _layerwise_prefill_dma_stream=lambda group, bank: NS(
             wait_stream=lambda stream: None,
+            wait_event=lambda event: None,
         ),
         _layerwise_prefill_transfer_state=lambda: state,
         checkpoint_plane_widths=lambda group: [2],
@@ -230,9 +251,12 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         use_gpu=False,
     )
     obj.run = MethodType(ns["batched_to_gpu"], obj)
+    obj.save = MethodType(ns["save"], obj)
     obj.wait_for_layerwise_prefill_load = MethodType(
         ns["wait_for_layerwise_prefill_load"], obj,
     )
+    for method in handoff:
+        setattr(obj, method.name, MethodType(ns[method.name], obj))
     owners = [
         NS(
             data_ptr=100 + index * 100, tensor=torch.empty(4),
@@ -255,7 +279,9 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         )
         next(generator)
         generator.send(owners[:count])
+        obj.record_layerwise_prefill_bank_use(0, 0, (offset,), npu.Event())
         generator.send(owners[:count])
+        obj.record_layerwise_prefill_bank_use(1, 0, (offset,), npu.Event())
         next(generator)
         generator.close()
 
@@ -615,6 +641,7 @@ def test_request_release_and_generation_reset_clear_incremental_metadata():
     state[0][0] = 2
     reset(0, synchronize=False)
     assert state[1][0] == 1
+    assert obj._layerwise_prefill_bank_use_events == {}
     for name in ("_prefill_dma_bound_loads", "_prefill_dma_plan_cache",
                  "_prefill_dma_source_cache"):
         assert getattr(obj, name) == {}
@@ -690,11 +717,14 @@ def _async_bank_connector(group, offset):
     contents = {}
     pending = []
     observed = []
+    saved = []
 
     def copy(_rows, to_cpu):
-        assert not to_cpu
         bank = npu.current_stream()
         assert bank in banks
+        if to_cpu:
+            bank.enqueue(lambda: saved.append(contents[bank]))
+            return
         value = pending.pop()
         bank.enqueue(lambda: contents.__setitem__(bank, value))
 
@@ -730,8 +760,17 @@ def _async_bank_connector(group, offset):
 
         obj.wait_for_layerwise_prefill_load(layer, group, offset)
         npu.compute.enqueue(verify)
+        event = npu.Event()
+        event.record(npu.compute)
+        obj.record_layerwise_prefill_bank_use(layer, group, (offset,), event)
 
-    return npu, banks, contents, observed, start, read
+    def save(layer):
+        obj.save(layer, group, (layer + offset) % 2, npu.compute)
+
+    return NS(
+        npu=npu, banks=banks, contents=contents, observed=observed,
+        start=start, read=read, save=save, saved=saved, connector=obj,
+    )
 
 
 @pytest.mark.parametrize("group", [0, 1])
@@ -739,54 +778,86 @@ def _async_bank_connector(group, offset):
 @pytest.mark.parametrize("has_save", [False, True])
 def test_dma_bank_reuse_protects_pending_reads_across_chunks(group, offset, has_save):
     """Drive DMA ahead of compute, including passive TP ranks without D2H."""
-    npu, banks, contents, observed, start, read = _async_bank_connector(group, offset)
-    saved = []
+    api = _async_bank_connector(group, offset)
     for chunk in range(3):
-        generator, load = start(chunk)
+        generator, load = api.start(chunk)
         load(0)
         load(1)
         for layer in range(4):
-            read(chunk, layer)
+            api.read(chunk, layer)
             if has_save:
-                bank = banks[(layer + offset) % 2]
-                # Active rank's existing save waits for the compute producer.
-                bank.wait_stream(npu.compute)
-                bank.enqueue(lambda bank=bank: saved.append(contents[bank]))
+                api.save(layer)
             if layer + 2 < 4:
                 load(layer + 2)
         next(generator)
         generator.close()
 
-    assert observed == saved == []  # Submission never waits on the host.
+    assert api.observed == api.saved == []  # Submission never waits on the host.
     # Adversarial order: eagerly execute DMA, then let compute catch up.
-    for bank in banks:
+    for bank in api.banks:
         bank.tail.run()
-    npu.compute.tail.run()
+    api.npu.compute.tail.run()
     expected = [(chunk, layer) for chunk in range(3) for layer in range(4)]
-    assert observed == expected
+    assert api.observed == expected
     if has_save:
-        assert sorted(saved) == expected
+        assert sorted(api.saved) == expected
 
 
 @pytest.mark.parametrize("group", [0, 1])
 @pytest.mark.parametrize("offset", [0, 1])
-def test_dma_handoff_does_not_wait_for_next_layer_compute(group, offset):
-    npu, banks, contents, observed, start, read = _async_bank_connector(group, offset)
-    generator, load = start(0)
+@pytest.mark.parametrize("has_save", [False, True])
+def test_dma_handoff_does_not_wait_for_next_layer_compute(group, offset, has_save):
+    api = _async_bank_connector(group, offset)
+    generator, load = api.start(0)
     load(0)
     load(1)
-    read(0, 0)
+    api.read(0, 0)
+    later_compute = []
+    api.npu.compute.enqueue(lambda: later_compute.append("N FFN / N+1 norm"))
+    if has_save:
+        api.save(0)
     load(2)  # N+1 entry, before its bank wait and compute are submitted.
-    read(0, 1)
-    assert observed == []
-    banks[offset].tail.run()
-    assert observed == [(0, 0)]
-    assert contents[banks[offset]] == (0, 2)
+    api.read(0, 1)
+    assert api.observed == []
+    api.banks[offset].tail.run()
+    assert api.observed == [(0, 0)]
+    assert api.contents[api.banks[offset]] == (0, 2)
+    assert api.saved == ([(0, 0)] if has_save else [])
+    assert later_compute == []  # Neither save nor load resnapshots compute.
     # The other bank's layer can remain in flight while this H2D completes.
     load(3)
-    read(0, 2)
-    read(0, 3)
+    api.read(0, 2)
+    api.read(0, 3)
     next(generator)
     generator.close()
-    npu.compute.tail.run()
-    assert observed == [(0, layer) for layer in range(4)]
+    api.npu.compute.tail.run()
+    assert api.observed == [(0, layer) for layer in range(4)]
+
+
+def test_missing_or_stale_bank_handoff_rejects_save_and_load():
+    api = _async_bank_connector(0, 0)
+    generator, load = api.start(0)
+    load(0)
+    load(1)
+    with pytest.raises(RuntimeError, match="Missing final-access event"):
+        api.save(0)
+    with pytest.raises(RuntimeError, match="Missing final-access event"):
+        load(2)
+    generator.close()
+    api.read(0, 0)
+    with pytest.raises(RuntimeError, match="Missing final-access event"):
+        api.save(2)
+
+
+def test_mixed_phase_handoff_fences_both_banks_without_host_wait():
+    api = _async_bank_connector(0, 0)
+    completed = []
+    api.npu.compute.enqueue(lambda: completed.append("KV access"))
+    event = api.npu.Event()
+    event.record(api.npu.compute)
+    api.connector.record_layerwise_prefill_bank_use(0, 0, (0, 1, 1), event)
+    api.npu.compute.enqueue(lambda: completed.append("later compute"))
+    assert completed == []
+    for bank in api.banks:
+        bank.tail.run()
+    assert completed == ["KV access"]
