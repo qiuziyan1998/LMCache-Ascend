@@ -22,9 +22,10 @@ def methods():
 
 
 @pytest.mark.parametrize('different_capacity', [False, True])
+@pytest.mark.parametrize('pages', [False, True])
 @pytest.mark.parametrize('bank', [0, 1])
 @pytest.mark.parametrize('direction', [False, True])
-def test_mixed_packets_preserve_physical_tail_scale_offset_and_bank(bank, direction, different_capacity, monkeypatch):
+def test_mixed_packets_preserve_physical_tail_scale_offset_and_bank(bank, direction, different_capacity, pages, monkeypatch):
     events = []
     class Stream:
         def __init__(self, name): self.name = name
@@ -46,13 +47,20 @@ def test_mixed_packets_preserve_physical_tail_scale_offset_and_bank(bank, direct
     layer_capacities = [(4, 3), (5 if different_capacity else 4, 3)]
     packets = [[torch.zeros(capacity * width, dtype=torch.uint8) for capacity in capacities]
                for width, capacities in zip(layout.layer_token_bytes, layer_capacities)]
-    objects = [[NS(tensor=tensor) for tensor in row] for row in packets]
+    class Page:
+        def __init__(self, tensor): self.tensor = tensor
+        def layer_size_bytes(self, layer): return self.tensor.numel()
+    objects = [[Page(tensor) if pages else NS(tensor=tensor)
+                for tensor in row] for row in packets]
     calls = []
     ops = NS(IndexerC8State=lambda *args: args,
              indexer_c8_transfer_prepared=lambda *args, **kwargs: calls.append((args, kwargs)))
-    scope = dict(torch=torch, lmc_ops=ops,
+    def layer_tensor(obj, layer):
+        assert not isinstance(obj, Page), 'Page size must not construct a tensor view'
+        return obj.tensor
+    scope = dict(torch=torch, lmc_ops=ops, LayerPageMemoryObj=Page,
         _layer_source_memory_objs=lambda objs, layer: objs,
-        _layer_memory_tensor=lambda obj, layer: obj.tensor)
+        _layer_memory_tensor=layer_tensor)
     exec(compile(ast.fix_missing_locations(methods()), '<actual connector methods>', 'exec'), scope)
     obj = scope['Connector']()
     obj.indexer_c8_layout = policy

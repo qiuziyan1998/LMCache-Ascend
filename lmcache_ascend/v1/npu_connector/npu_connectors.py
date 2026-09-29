@@ -2408,6 +2408,49 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         self._prefill_first_bank_timing_events = remaining
 
+    def wait_for_layerwise_prefill_source_publication(self, kv_group: int) -> None:
+        """Make prior CPU writes visible before rank0 shares handles with TP peers.
+
+        Peer processes cannot wait on this rank's NPU events. Only the P-node
+        shared-source publication boundary may wait on pending prior D2H tails;
+        completed tails incur queries only. Never snapshot later compute work.
+        """
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            return
+        generation = self._layerwise_prefill_transfer_generation(kv_group)
+        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
+        events = tuple(
+            record[1] for bank in range(2)
+            if (record := tails.get((kv_group, bank))) is not None
+            and record[0] == generation
+        )
+        for event in events:
+            if not event.query():
+                event.synchronize()
+
+    def _prepare_layerwise_prefill_source_readiness(self, kv_group: int) -> None:
+        """Fence prior CPU producers before a new banked load is submitted.
+
+        Early LocalCPU publication can expose pages whose D2H is still on the
+        opposite FIFO after a request's phase changes. Snapshot prior save tails
+        for the active generation before enqueueing new loads; immutable
+        event dependencies cannot include these new waits and form a cycle.
+        Same-bank readiness is already guaranteed by FIFO order. Passive ranks
+        without saves have no tails and incur no additional stream work.
+        """
+        generation = self._layerwise_prefill_transfer_generation(kv_group)
+        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
+        producers = tuple(
+            (bank, record[1])
+            for bank in range(2)
+            if (record := tails.get((kv_group, bank))) is not None
+            and record[0] == generation
+        )
+        for bank in range(2):
+            for source_bank, event in producers:
+                if source_bank != bank:
+                    self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
+
     def wait_for_layerwise_prefill_load(
         self,
         layer_id: int,
@@ -4743,8 +4786,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     raise ValueError("Banked C8 packet count disagrees with chunk ranges")
                 capacities, pointers = [], []
                 for chunk_id, (obj, start, end) in enumerate(zip(objects, starts, ends, strict=True)):
-                    tensor = _layer_memory_tensor(obj, layer_id)
-                    packet_bytes = tensor.numel() * tensor.element_size()
+                    if isinstance(obj, LayerPageMemoryObj):
+                        packet_bytes = obj.layer_size_bytes(layer_id)
+                    else:
+                        tensor = _layer_memory_tensor(obj, layer_id)
+                        packet_bytes = tensor.numel() * tensor.element_size()
                     width = layout.layer_token_bytes[layer_id]
                     capacity, remainder = divmod(packet_bytes, width)
                     if remainder or not 0 < end - start <= capacity:
@@ -6931,6 +6977,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 block_size=int(kwargs["prefill_dma_block_size"]), starts=starts, ends=ends,
                 transfer_stream=self.load_stream,
             )
+        if prefill_dma:
+            self._prepare_layerwise_prefill_source_readiness(kv_group)
         deferred_load_submitted = False
         deferred_load_completed = False
         try:
@@ -8517,6 +8565,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             store_req_id = kwargs.get("req_id")
             if store_req_id is None:
                 return
+            if async_layerwise_store:
+                # Async publication protects device/remote consumers with this
+                # bank event. A host fingerprint must explicitly observe it too.
+                diagnostic_bank = (
+                    layer_id + layerwise_prefill_bank_offset
+                ) % source_bank_count
+                last_store_events[diagnostic_bank].synchronize()
             store_tensors = [
                 _layer_memory_tensor(memory_obj, layer_id)
                 for memory_obj in memory_objs[layer_id]

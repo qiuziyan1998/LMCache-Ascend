@@ -131,6 +131,8 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         node for node in cls.body
         if isinstance(node, ast.FunctionDef) and node.name in (
             "record_layerwise_prefill_bank_use", "_require_layerwise_prefill_bank_use",
+            "_prepare_layerwise_prefill_source_readiness",
+            "wait_for_layerwise_prefill_source_publication",
         )
     ]
     store = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -878,3 +880,195 @@ def test_mixed_phase_handoff_fences_both_banks_without_host_wait():
     for bank in api.banks:
         bank.tail.run()
     assert completed == ["KV access"]
+
+
+@pytest.mark.parametrize("phase_flip", [False, True])
+@pytest.mark.parametrize("completed_bank", [None, 0, 1])
+@pytest.mark.parametrize("packet", [False, True])
+def test_early_cpu_page_read_waits_previous_producer_on_either_bank(
+    phase_flip, completed_bank, packet,
+):
+    """Prior D2H can lag compute; phase-flipped H2D must not read that page."""
+    npu = _AsyncNPU()
+    banks = [_AsyncStream(), _AsyncStream()]
+    contents = {}
+    cpu = {layer: "unwritten" for layer in range(4)}
+    context = {}
+
+    def copy(_rows, to_cpu):
+        bank = npu.current_stream()
+        layer, step = context["layer"], context["step"]
+        if to_cpu:
+            bank.enqueue(lambda: cpu.__setitem__(layer, contents[bank]))
+        else:
+            bank.enqueue(lambda: contents.__setitem__(
+                bank, (step, layer) if step == 0 else cpu[layer],
+            ))
+
+    submit, _, _ = _reuse_debug_connector(False, npu=npu, copy_hook=copy, layers=4)
+    obj = submit.connector
+    obj._layerwise_prefill_dma_stream = lambda group, bank: banks[bank]
+    obj._layerwise_prefill_bank_tail_events = {}
+    obj.test_prefill_packet = packet
+    if packet:
+        original_layout = obj._lazy_initialize_buffer_with_staging
+        def packet_layout(*args, **kwargs):
+            layout = original_layout(*args, **kwargs)
+            layout.indexer_c8 = True
+            return layout
+        obj._lazy_initialize_buffer_with_staging = packet_layout
+        obj._prepare_prefill_c8_packets = lambda **kwargs: []
+        obj._submit_prefill_c8_packet = lambda prepared, layer, bank, stream, direction: copy(None, direction)
+
+    def start(step, offset):
+        generator = obj.run(
+            [0], [4], slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
+            kv_group=1, req_id="request", deferred_layerwise_get=True,
+            prefill_dma_block_ids_by_bank=((0, 1, 2, 3), (4, 5, 6, 7)),
+            prefill_dma_block_size=4, layerwise_prefill_bank_offset=offset,
+            prefill_c8_memory_objs=[submit.owners[:1]] * 4,
+        )
+        next(generator)
+        def load(layer):
+            context.update(step=step, layer=layer)
+            generator.send(submit.owners[:1])
+        def read(layer):
+            obj.wait_for_layerwise_prefill_load(layer, 1, offset)
+            event = npu.Event()
+            event.record(npu.compute)
+            obj.record_layerwise_prefill_bank_use(layer, 1, (offset,), event)
+        return generator, load, read
+
+    previous, load, read = start(0, 0)
+    load(0)
+    load(1)
+    for layer in range(4):
+        read(layer)
+        context.update(step=0, layer=layer)
+        obj.save(layer, 1, layer % 2, npu.compute)
+        # The full store generator records this completion after the actual
+        # native submission branch extracted by the fixture.
+        event = npu.Event()
+        event.record(banks[layer % 2])
+        obj._layerwise_prefill_bank_tail_events[(1, layer % 2)] = (0, event, layer, "request")
+        if layer + 2 < 4:
+            load(layer + 2)
+    next(previous)
+    previous.close()
+    if completed_bank is not None:
+        banks[completed_bank].tail.run()
+
+    offset = int(phase_flip)
+    current, load, read = start(1, offset)
+    load(0)
+    load(1)
+    read(0)
+    load(2)
+    banks[offset].tail.run()
+    assert cpu[2] == contents[banks[offset]] == (0, 2)
+    current.close()
+
+
+def test_source_readiness_without_saves_adds_no_bank_work():
+    submit, _, _ = _reuse_debug_connector(False)
+    obj = submit.connector
+    obj._layerwise_prefill_dma_stream = lambda *args: pytest.fail("no producer to fence")
+    obj._prepare_layerwise_prefill_source_readiness(1)
+    # An earlier reset generation is already drained and must not be rejoined.
+    obj._layerwise_prefill_bank_tail_events = {(1, 0): (-1, object(), 0, "old")}
+    obj._prepare_layerwise_prefill_source_readiness(1)
+
+
+def _rank0_publication_boundary(connector, messages):
+    """Execute the real inherited handle try/error-envelope/publication block."""
+    path = Path(__file__).parents[3] / "LMCache-NPU/lmcache/v1/cache_engine.py"
+    cls = next(node for node in ast.parse(path.read_text()).body
+               if isinstance(node, ast.ClassDef) and node.name == "LMCacheEngine")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "_retrieve_layer_shared_rank0")
+    boundary = next(node for node in ast.walk(method) if isinstance(node, ast.Try)
+                    and any(isinstance(statement, ast.Assign)
+                            and any(isinstance(target, ast.Name) and target.id == "handles"
+                                    for target in statement.targets)
+                            for statement in node.body))
+    parent = next(node for node in ast.walk(method)
+                  if isinstance(getattr(node, "body", None), list) and boundary in node.body)
+    index = parent.body.index(boundary)
+    function = ast.parse("def publish(self): pass").body[0]
+    function.body = parent.body[index:index + 3]
+    scope = dict(
+        deferred_layerwise_get=True, envelope_required=True, layer_id=0,
+        kv_group=1, compact_batch=object(), mem_objs_layer=[], handles_by_layer=[],
+        req_id="request", phase="prefill", request_ordinal=0, location="LocalCPUBackend",
+        remote_fill_plan=None, remote_fill_load=False,
+        _RemoteFillMaterializationError=RuntimeError,
+        SharedHandleEnvelope=lambda **kwargs: NS(**kwargs),
+    )
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                 str(path), "exec"), scope)
+    engine = NS(gpu_connector=connector, shared_cpu_cache_generation=0,
+                _shared_layerwise_error_envelope=lambda **kwargs: NS(status="error", **kwargs),
+                _broadcast_shared_envelope=lambda envelope: messages.append(envelope))
+    return lambda: scope["publish"](engine)
+
+
+@pytest.mark.parametrize("already_complete", [False, True])
+def test_passive_cpu_load_observes_rank0_producer_before_handle_publication(already_complete):
+    producer, _, _ = _reuse_debug_connector(False)
+    writer = _AsyncStream()
+    cpu = {"value": "unwritten"}
+    writer.enqueue(lambda: cpu.__setitem__("value", "ready"))
+    event = _AsyncNPU.Event()
+    event.record(writer)
+    waits = []
+    event.query = lambda: event.tail.done
+    event.synchronize = lambda: (waits.append("producer"), event.tail.run())
+    producer.connector._layerwise_prefill_bank_tail_events = {(1, 1): (0, event, 3, "producer")}
+    if already_complete:
+        writer.tail.run()
+    envelopes = []
+    publish = _rank0_publication_boundary(producer.connector, envelopes)
+    publish()
+    assert envelopes[0].status == "ok" and cpu["value"] == "ready"
+    assert waits == ([] if already_complete else ["producer"])
+
+    # Another TP connector has no producer event registry of its own.
+    npu = _AsyncNPU()
+    banks = [_AsyncStream(), _AsyncStream()]
+    loaded = []
+    def copy(_rows, to_cpu):
+        assert not to_cpu
+        npu.current_stream().enqueue(lambda: loaded.append(cpu["value"]))
+    passive, _, _ = _reuse_debug_connector(False, npu=npu, copy_hook=copy, layers=4)
+    passive.connector._layerwise_prefill_dma_stream = lambda group, bank: banks[bank]
+    generator = passive.connector.run(
+        [0], [4], slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
+        kv_group=1, req_id="passive", deferred_layerwise_get=True,
+        prefill_dma_block_ids_by_bank=((0, 1, 2, 3), (4, 5, 6, 7)),
+        prefill_dma_block_size=4, layerwise_prefill_bank_offset=0,
+    )
+    next(generator)
+    generator.send(passive.owners[:1])
+    banks[0].tail.run()
+    assert loaded == ["ready"]
+    generator.close()
+
+
+def test_rank0_publication_fence_failure_broadcasts_error_before_reraising():
+    submit, _, _ = _reuse_debug_connector(False)
+    def fail():
+        raise RuntimeError("unknown producer completion")
+    event = NS(query=lambda: False, synchronize=fail)
+    submit.connector._layerwise_prefill_bank_tail_events = {(1, 0): (0, event, 2, "producer")}
+    messages = []
+    with pytest.raises(RuntimeError, match="unknown producer completion"):
+        _rank0_publication_boundary(submit.connector, messages)()
+    assert [envelope.status for envelope in messages] == ["error"]
+    assert "unknown producer completion" in messages[0].details["error"]
+
+
+def test_decoder_source_publication_never_reads_prefill_events():
+    submit, _, _ = _reuse_debug_connector(False)
+    submit.connector._layerwise_prefill_dma = False
+    submit.connector._layerwise_prefill_transfer_generation = lambda group: pytest.fail("D event work")
+    submit.connector.wait_for_layerwise_prefill_source_publication(1)
