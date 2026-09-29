@@ -32,6 +32,34 @@ logger = init_logger(__name__)
 class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
     supports_dsa_index_lmcache = True
 
+    def register_kv_caches(self, kv_caches):
+        super().register_kv_caches(kv_caches)
+        impl = self._lmcache_engine
+        if impl._layerwise_prefill_dma:
+            from vllm.v1.core.dsa_shared_pool import (
+                DSASharedBlockLayout, layerwise_prefill_bundle_multiplier,
+            )
+            from lmcache_ascend.v1.npu_connector.layerwise_dma import (
+                build_group_cycles,
+                cache_page_size_bytes,
+            )
+
+            latent = impl._kvcaches_for_group(0)[0]
+            indexer = impl._kvcaches_for_group(1)[0]
+            # Match the scheduler's layout construction, including its slab split.
+            layout = DSASharedBlockLayout(
+                latent_page_size_bytes=cache_page_size_bytes(latent),
+                indexer_page_size_bytes=cache_page_size_bytes(indexer),
+                capacity_bundles=1,
+                bundle_multiplier=layerwise_prefill_bundle_multiplier(),
+            )
+            impl.lmcache_engine.gpu_connector.prefill_dma_cycles = build_group_cycles(
+                latent, indexer,
+                impl._lmcache_chunk_size,
+                layout.bundle_multiplier,
+                (layout.k_nope_dim, layout.k_pe_dim),
+            )
+
     @property
     def uses_layerwise_model_callbacks(self) -> bool:
         """Whether model-layer Python callbacks are part of this execution."""
