@@ -133,6 +133,7 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
             "record_layerwise_prefill_bank_use", "_require_layerwise_prefill_bank_use",
             "_prepare_layerwise_prefill_source_readiness",
             "wait_for_layerwise_prefill_source_publication",
+            "_retain_unfenced_layerwise_prefill_load",
         )
     ]
     store = next(n for n in cls.body if isinstance(n, ast.FunctionDef)

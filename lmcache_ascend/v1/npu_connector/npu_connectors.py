@@ -2049,8 +2049,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ] = {}
         self._layerwise_prefill_load_request_events: dict[str, list[Any]] = {}
 
+    def _retain_unfenced_layerwise_prefill_load(
+        self, req_id: str, kv_group: int, bank: Optional[int], stream: Any,
+    ) -> None:
+        """Remember a submission whose completion event could not be installed.
+
+        This error-only registry retains the exact stream even if later reset
+        code replaces its bank mapping. Successful transfers need no latch.
+        """
+        failed = getattr(self, "_layerwise_prefill_unfenced_loads", None)
+        if failed is None:
+            failed = self._layerwise_prefill_unfenced_loads = {}
+        failed.setdefault(str(req_id), {})[(kv_group, bank, id(stream))] = stream
+
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
+        unfenced = getattr(self, "_layerwise_prefill_unfenced_loads", None)
+        failed_streams = unfenced.get(req_id) if unfenced else None
+        if failed_streams:
+            # A native call or Event.record may fail after enqueuing reads.
+            # Earlier events cannot fence those reads. Keep both this latch
+            # and every request owner if any fallback fence is unsuccessful.
+            for stream in failed_streams.values():
+                stream.synchronize()
+            unfenced.pop(req_id, None)
         pending_store_events_by_request = getattr(
             self, "_layerwise_prefill_async_store_events", {}
         )
@@ -7418,6 +7440,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 tmp_gpu_buffer_obj = None
             deferred_load_completed = True
             yield
+        except GeneratorExit:
+            # Closing a suspended generator with installed completion events
+            # needs only the normal request teardown, not a fallback fence.
+            raise
+        except BaseException:
+            if (
+                deferred_dense_direct_get
+                and deferred_load_submitted
+                and not deferred_load_completed
+                and req_id is not None
+            ):
+                self._retain_unfenced_layerwise_prefill_load(
+                    str(req_id), kv_group, bank if prefill_dma else None,
+                    bank_stream if prefill_dma else self.load_stream,
+                )
+            raise
         finally:
             if (
                 deferred_dense_direct_get
