@@ -17,7 +17,48 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("tail", [13, 1024])
+def test_prepared_pairs_multilayer_strided_bind(tail):
+    """Real NPU table arithmetic/copies at 1M capacity, without reading KV payload."""
+    from types import SimpleNamespace as NS
+    from lmcache_ascend.v1.npu_connector.sparse_graph import (
+        SparseGraphTransfer, prepare_source_pointer_pairs,
+    )
+
+    torch.npu.set_device(0)
+    device = torch.device("npu:0")
+    rows = torch.arange(79 * 1024, dtype=torch.int64, device=device).reshape(79, 1024) + 2**50
+    source = NS(
+        layers=tuple(NS(chunk_ptrs_npu=row) for row in rows.unbind(0)),
+        chunk_token_counts=(1024,) * 1023 + (tail,),
+        total_tokens=1023 * 1024 + tail, pointer_device=device,
+        validated_chunk_size=1024, graph_pointer_pairs=None,
+    )
+    producer = torch.npu.Stream()
+    producer.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(producer):
+        prepare_source_pointer_pairs(source, 1024, 1024)
+        ready = torch.npu.Event()
+        ready.record()
+    torch.npu.current_stream().wait_event(ready)
+    transfer = SparseGraphTransfer(
+        (torch.empty((2, 128, 1, 512), dtype=torch.bfloat16, device=device),
+         torch.empty((2, 128, 1, 64), dtype=torch.bfloat16, device=device)),
+        torch.zeros((2, 4), dtype=torch.int64, device=device), 1024, 1048576, 2,
+    )
+    for layer in (0, 77, 78):
+        transfer.bind_batch((None, source), layer)
+        expected = rows[layer].cpu()
+        actual = transfer.ptrs[:, 1024:].cpu()
+        torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
+        offsets = torch.full((1024,), 1024 * 1024, dtype=torch.int64)
+        offsets[-1] = tail * 1024
+        torch.testing.assert_close(actual[1], expected + offsets, rtol=0, atol=0)
+        assert transfer.valid_tokens[1].item() == source.total_tokens
+
+
 @pytest.mark.parametrize("incremental", [False, True])
+@pytest.mark.parametrize("prepared_pairs", [False, True])
 @pytest.mark.parametrize("request_capacity", [1, 4, 16])
 @pytest.mark.parametrize(
     "payload",
@@ -29,14 +70,14 @@ pytestmark = pytest.mark.skipif(
     ],
 )
 def test_one_capture_replays_live_topk_and_growing_cpu_history(
-    request_capacity, payload, incremental
+    request_capacity, payload, incremental, prepared_pairs
 ):
     from lmcache.v1.gpu_connector.sparse import (
         PreparedSparseSource,
         PreparedSparseSourceLayer,
     )
     from lmcache.v1.memory_management import PinMemoryAllocator
-    from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
+    from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer, prepare_source_pointer_pairs
 
     helpers = Path(__file__).resolve().parents[2] / "benchmark/v1/kv_transfer"
     sys.path.insert(0, str(helpers))
@@ -72,7 +113,7 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
                     offset + token + 100
                 )
             chunks.append(chunk)
-        return PreparedSparseSource(
+        source = PreparedSparseSource(
             layers=(
                 PreparedSparseSourceLayer(
                     tuple(chunks), build_chunk_ptrs_npu(chunks, device)
@@ -82,6 +123,16 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
             chunk_token_counts=tuple(counts),
             pointer_device=device,
         )
+        if prepared_pairs:
+            object.__setattr__(source, "validated_chunk_size", chunk_size)
+            load_stream = torch.npu.Stream()
+            load_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(load_stream):
+                prepare_source_pointer_pairs(source, chunk_size, k_width * chunks[0].element_size())
+                ready = torch.npu.Event()
+                ready.record()
+            torch.npu.current_stream().wait_event(ready)
+        return source
 
     try:
         cases = [

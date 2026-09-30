@@ -16,6 +16,36 @@ from lmcache_ascend.v1.npu_connector.utils import (
 )
 
 
+def prepare_source_pointer_pairs(
+    source: PreparedSparseSource, chunk_size: int, k_bytes: int
+) -> None:
+    """Prepare all layers on the producer stream; caller must fence publication."""
+    if (
+        source.graph_pointer_pairs is not None
+        or source.validated_chunk_size != chunk_size
+    ):
+        return
+    counts = source.chunk_token_counts
+    if not counts:
+        return
+    try:
+        pairs = torch.empty(
+            (2, len(source.layers), len(counts)),
+            dtype=torch.int64, device=source.pointer_device,
+        )
+    except torch.OutOfMemoryError:
+        # Optional metadata only; no work was submitted and the existing
+        # per-layer binding can use the original pointer rows without it.
+        return
+    # Attach before submission so a failed launch retains the allocation with
+    # the source until the existing cold-load cleanup fences its stream.
+    object.__setattr__(source, "graph_pointer_pairs", (k_bytes, pairs))
+    torch.stack(tuple(layer.chunk_ptrs_npu for layer in source.layers), out=pairs[0])
+    torch.add(pairs[0], chunk_size * k_bytes, out=pairs[1])
+    if counts[-1] != chunk_size:
+        pairs[1, :, -1].add_((counts[-1] - chunk_size) * k_bytes)
+
+
 class SparseGraphTransfer:
     """One layer's stable source tables and process-owned destinations.
 
@@ -116,7 +146,11 @@ class SparseGraphTransfer:
             counts = source.chunk_token_counts
             if not counts:
                 return None  # Let normal validation report malformed geometry.
-            writes = 3 + int(counts[-1] != self.chunk_size)
+            pairs = getattr(source, "graph_pointer_pairs", None)
+            writes = (
+                2 if pairs is not None and pairs[0] == self.k_bytes
+                else 3 + int(counts[-1] != self.chunk_size)
+            )
             full_cost += writes
             lane_costs.append(writes + int(len(counts) < self.capacity))
         cost = sum(lane_costs[i] if i < len(lane_costs) else 2 for i in changed_lanes)
@@ -164,6 +198,11 @@ class SparseGraphTransfer:
             end = start + len(counts)
             if lanes is not None and len(counts) < self.capacity:
                 self.ptrs[:, end : start + self.capacity].zero_()
+            pairs = getattr(source, "graph_pointer_pairs", None)
+            if pairs is not None and pairs[0] == self.k_bytes:
+                self.ptrs[:, start:end].copy_(pairs[1][:, layer_id, :])
+                self.valid_tokens[lane].fill_(source.total_tokens)
+                continue
             self.ptrs[0, start:end].copy_(layer.chunk_ptrs_npu)
             # Validation guarantees full physical chunks except possibly the tail.
             torch.add(

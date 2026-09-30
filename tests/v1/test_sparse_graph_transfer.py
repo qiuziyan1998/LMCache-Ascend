@@ -59,6 +59,113 @@ def make_transfer(module, capacity=1):
     )
 
 
+@pytest.mark.parametrize("counts", [(1,), (256,), (256, 13), (256, 256)])
+@pytest.mark.parametrize("k_bytes", [1024, 2048])
+def test_prepared_pairs_match_legacy_and_reduce_admission_ops(transfer_module, counts, k_bytes):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    module, _ = transfer_module
+    source = make_source([2**55 + i * 1234567 for i in range(len(counts))], counts)
+    source.layers += (SimpleNamespace(chunk_ptrs_npu=source.layers[0].chunk_ptrs_npu + 8192),)
+    source.pointer_device = torch.device("cpu")
+    source.validated_chunk_size = 256
+    source.graph_pointer_pairs = None
+    transfer = make_transfer(module, 4)
+    transfer.k_bytes = k_bytes
+    expected = []
+    for layer in range(2):
+        transfer.bind_batch((None, source), layer)
+        expected.append(transfer.ptrs.clone())
+    module.prepare_source_pointer_pairs(source, 256, k_bytes)
+    table = source.graph_pointer_pairs[1]
+    module.prepare_source_pointer_pairs(source, 256, k_bytes)
+    assert source.graph_pointer_pairs[1] is table
+
+    class CopiesOnly(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert func not in (torch.ops.aten.add.out, torch.ops.aten.add_.Tensor)
+            return func(*args, **(kwargs or {}))
+
+    for layer in range(2):
+        transfer.ptrs.fill_(-1)
+        with CopiesOnly():
+            transfer.bind_batch((None, source), layer)
+        torch.testing.assert_close(transfer.ptrs, expected[layer], rtol=0, atol=0)
+        transfer.bind_batch((None,), layer, lanes=(1,))
+        assert transfer.ptrs[:, 4:8].eq(0).all()
+        assert transfer.valid_tokens[1].item() == 0
+    # Another destination precision must use its own offsets, never cached bytes.
+    transfer.k_bytes *= 2
+    transfer.bind_batch((source,), 0)
+    torch.testing.assert_close(
+        transfer.ptrs[1, :len(counts)],
+        source.layers[0].chunk_ptrs_npu + torch.tensor(counts) * transfer.k_bytes,
+        rtol=0, atol=0,
+    )
+
+
+def test_pointer_preparation_retains_output_on_submit_failure(transfer_module, monkeypatch):
+    module, _ = transfer_module
+    source = make_source([1000], [13])
+    source.pointer_device = torch.device("cpu")
+    source.validated_chunk_size = 256
+    source.graph_pointer_pairs = None
+    monkeypatch.setattr(module.torch, "add", Mock(side_effect=RuntimeError("submit")))
+    with pytest.raises(RuntimeError, match="submit"):
+        module.prepare_source_pointer_pairs(source, 256, 1024)
+    assert source.graph_pointer_pairs[1].shape == (2, 1, 1)
+
+
+def test_optional_pointer_allocation_oom_keeps_legacy_binding(transfer_module, monkeypatch):
+    module, _ = transfer_module
+    source = make_source([1000, 9000], [256, 13])
+    source.pointer_device = torch.device("cpu")
+    source.validated_chunk_size = 256
+    source.graph_pointer_pairs = None
+    transfer = make_transfer(module)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(module.torch, "empty", Mock(side_effect=torch.OutOfMemoryError("HBM full")))
+        module.prepare_source_pointer_pairs(source, 256, transfer.k_bytes)
+    assert source.graph_pointer_pairs is None
+    transfer.bind(source, 0)
+    torch.testing.assert_close(
+        transfer.ptrs[1, :2], torch.tensor([1000 + 256 * 2048, 9000 + 13 * 2048]),
+        rtol=0, atol=0,
+    )
+
+
+def test_78_layer_admission_writes_drop_from_390_to_234(transfer_module):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    module, _ = transfer_module
+    source = make_source([1000, 9000], [256, 13])
+    source.layers *= 79  # 78 target layers plus the MTP layer.
+    source.pointer_device = torch.device("cpu")
+    source.validated_chunk_size = 256
+    source.graph_pointer_pairs = None
+    transfers = [make_transfer(module, 16) for _ in range(78)]
+
+    class Writes(TorchDispatchMode):
+        count = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if str(func) in {
+                "aten.zero_.default", "aten.copy_.default", "aten.add.out",
+                "aten.add_.Tensor", "aten.fill_.Scalar",
+            }:
+                self.count += 1
+            return func(*args, **(kwargs or {}))
+
+    with Writes() as before:
+        for layer, transfer in enumerate(transfers):
+            transfer.bind_batch((source,), layer, lanes=(0,))
+    module.prepare_source_pointer_pairs(source, 256, transfers[0].k_bytes)
+    with Writes() as after:
+        for layer, transfer in enumerate(transfers):
+            transfer.bind_batch((source,), layer, lanes=(0,))
+    assert (before.count, after.count) == (390, 234)
+
+
 def test_aiv_limit_is_per_launch_and_serial_default_is_uncapped(transfer_module, monkeypatch):
     module, _ = transfer_module
     native = Mock()

@@ -210,6 +210,34 @@ class _LiveSourceReadyFence:
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     supports_preemption_checkpoint = True
+
+    def _record_dsa_cold_dense_load_readiness(
+        self, state, readiness=None, additional_owners=()
+    ):
+        if (
+            self._prepare_cold_graph_pointers
+            and readiness is None
+            and not state.dense_prefix_resident_tokens
+        ):
+            source = state.prepared_sparse_sources.get(0)
+            caches = self._kvcaches_for_group(0)
+            if (
+                source is not None and caches
+                and isinstance(caches[0], (tuple, list))
+                and len(caches[0]) == 2 and caches[0][0].ndim == 4
+            ):
+                from lmcache_ascend.v1.npu_connector.sparse_graph import prepare_source_pointer_pairs
+
+                key = caches[0][0]
+                with torch.npu.stream(self.lmcache_engine.gpu_connector.load_stream):
+                    prepare_source_pointer_pairs(
+                        source, self._lmcache_chunk_size,
+                        key.shape[-2] * key.shape[-1] * key.element_size(),
+                    )
+        return super()._record_dsa_cold_dense_load_readiness(
+            state, readiness, additional_owners
+        )
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -218,6 +246,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
+        self._prepare_cold_graph_pointers = bool(
+            int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))
+        )
         # Cache the existing dense-load compatibility switches on scheduler and
         # worker alike. Legacy staged copies cannot export async readiness.
         self._resident_cold_load_enabled = not any(
