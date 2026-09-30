@@ -218,6 +218,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
+        # Cache the existing dense-load compatibility switches on scheduler and
+        # worker alike. Legacy staged copies cannot export async readiness.
+        self._resident_cold_load_enabled = not any(
+            os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+            for name in (
+                "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE",
+                "LMCACHE_ASCEND_DENSE_DIRECT_LOAD_DISABLE",
+            )
+        )
         super().__init__(
             vllm_config,
             role,
