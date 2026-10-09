@@ -124,6 +124,44 @@ def test_plan_encodes_partial_keys_then_scales_and_restores(
             assert torch.all(b.flatten(0, 1)[untouched] == 42)
 
 
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_multi_page_plan_sums_invariant_widths_once(connector, layerwise):
+    class Widths(list):
+        scans = 0
+
+        def __iter__(self):
+            self.scans += 1
+            return super().__iter__()
+
+    caches = [
+        (torch.empty(8, 128, 1, 128, dtype=torch.int8),
+         torch.empty(8, 128, 1, 1, dtype=torch.float16))
+        for _ in range(2)
+    ]
+    meta, owners, capacity = connector._direct_page_tensor_layout(caches, 1)
+    meta = Widths(meta)
+    widths = Widths(connector._group_layouts[1].layer_token_bytes)
+    connector._group_layouts[1].layer_token_bytes = widths
+    connector._direct_page_tensor_layout = lambda *a: (meta, owners, capacity)
+    # Discontiguous slots and a shorter final page retain per-page validation.
+    slots = torch.arange(581)
+    slots[300:] += 128
+    starts = list(range(0, 581, 8))
+    ends = [min(start + 8, 581) for start in starts]
+    result = connector.plan_direct_page_destinations(
+        caches, slots, starts, ends, 1, layerwise
+    )
+    assert result is not None
+    assert meta.scans == widths.scans == 1
+    assert sum(map(sum, result[1])) == 581 * 260
+    # Hoisting must not bypass bounds checks in later pages.
+    slots[-1] = capacity
+    assert connector.plan_direct_page_destinations(
+        caches, slots, starts, ends, 1, layerwise
+    ) is None
+    assert connector._direct_page_plan_rejections[1] == "slot_value_out_of_bounds"
+
+
 def test_reject_mismatched_scale_capacity(connector):
     caches = [
         (
