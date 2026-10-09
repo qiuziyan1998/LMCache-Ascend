@@ -4962,24 +4962,26 @@ class AscendLMCacheEngine(LMCacheEngine):
         owned: list[MemoryObj] = list(pages)
         pinned: list[MemoryObj] = []
         try:
-            phase_started = serving_perf_now() if perf_enabled else 0.0
-            legacy_suffix = local_count < page_chunks and local.contains_all_exact(
-                page_keys[local_count].split_layers(self._num_layers_for_kv_group(kv_group))
-            )
-            if perf_enabled:
-                legacy_probe_ms = (serving_perf_now() - phase_started) * 1000
             tail_start = local_count
-            if local_count < page_chunks and not legacy_suffix:
+            while tail_start < page_chunks:
+                phase_started = serving_perf_now() if perf_enabled else 0.0
+                legacy_suffix = local.contains_all_exact(
+                    page_keys[tail_start].split_layers(self._num_layers_for_kv_group(kv_group))
+                )
+                if perf_enabled:
+                    legacy_probe_ms += (serving_perf_now() - phase_started) * 1000
+                if legacy_suffix:
+                    break
                 remote = self.storage_manager.storage_backends.get("RemoteBackend")
                 contains = getattr(remote, "batched_contains_layer_pages", None)
                 retrieve = getattr(remote, "batched_get_layer_pages", None)
                 if not callable(contains) or not callable(retrieve):
                     raise RuntimeError("RemoteBackend does not support layer pages")
-                remote_keys = page_keys[local_count:page_chunks]
+                remote_keys = page_keys[tail_start:page_chunks]
                 phase_started = serving_perf_now() if perf_enabled else 0.0
                 remote_count = contains(remote_keys)
                 if perf_enabled:
-                    remote_probe_ms = (
+                    remote_probe_ms += (
                         serving_perf_now() - phase_started
                     ) * 1000
                 if not 0 <= remote_count <= len(remote_keys):
@@ -4987,7 +4989,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 phase_started = serving_perf_now() if perf_enabled else 0.0
                 fetched = retrieve(remote_keys[:remote_count]) if remote_count else []
                 if perf_enabled:
-                    remote_get_ms = (
+                    remote_get_ms += (
                         serving_perf_now() - phase_started
                     ) * 1000
                 if len(fetched) != remote_count:
@@ -4996,14 +4998,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 owned.extend(fetched)
                 tail_start += remote_count
                 if tail_start < page_chunks:
-                    # A checkpoint tail exists only in LocalCPU, even when
-                    # its original prompt prefix had to come from Mooncake.
+                    # Eviction can leave arbitrarily alternating tier runs.
+                    phase_started = serving_perf_now() if perf_enabled else 0.0
                     fetched, count = local.batched_get_layer_page_prefix(
                         page_keys[tail_start:page_chunks]
                     )
+                    if perf_enabled:
+                        local_get_ms += (serving_perf_now() - phase_started) * 1000
                     pages.extend(fetched)
                     owned.extend(fetched)
                     tail_start += count
+                    local_count += count
+                    if not count:
+                        # Neither tier has a merged page at this boundary.
+                        break
 
             legacy_page_layers = (
                 [
