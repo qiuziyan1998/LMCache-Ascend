@@ -59,6 +59,29 @@ def make_transfer(module, capacity=1):
     )
 
 
+def test_sealed_geometry_skips_repeated_scans_but_keeps_layer_validation(transfer_module):
+    module, _ = transfer_module
+    class Counts(tuple):
+        def __iter__(self):
+            raise AssertionError("sealed geometry was rescanned")
+    source = make_source([1000, 2000], [256, 17])
+    source.chunk_token_counts = Counts(source.chunk_token_counts)
+    source.validated_chunk_size = 256
+    transfer = make_transfer(module)
+    transfer.bind_batch((source,), 0)
+    source.layers[0].chunk_ptrs_npu = torch.zeros(3, dtype=torch.int64)
+    with pytest.raises(ValueError, match="physical chunk lengths"):
+        transfer.bind_batch((source,), 0)
+
+
+def test_different_sealed_chunk_size_still_checks_geometry(transfer_module):
+    module, _ = transfer_module
+    source = make_source([1000, 2000], [128, 17])
+    source.validated_chunk_size = 128
+    with pytest.raises(ValueError, match="bounded chunk prefix"):
+        make_transfer(module).bind_batch((source,), 0)
+
+
 @pytest.mark.parametrize("counts", [(1,), (256,), (256, 13), (256, 256)])
 @pytest.mark.parametrize("k_bytes", [1024, 2048])
 def test_prepared_pairs_match_legacy_and_reduce_admission_ops(transfer_module, counts, k_bytes):

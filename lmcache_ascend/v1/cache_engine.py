@@ -81,6 +81,7 @@ from lmcache.v1.shared_cpu_cache import (
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.storage_backend.remote_backend import RemoteExternalPageReader
 from lmcache.v1.token_database import (
+    ChunkedTokenDatabase,
     DSA_INDEX_CACHE_SCHEMA,
     DSA_INDEX_CACHE_SCHEMA_TAG,
     TokenDatabase,
@@ -773,6 +774,26 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ) from rollback_error
             raise failure
 
+    def prepare_cold_chunk_plan(
+        self, tokens: list[int]
+    ) -> Optional[Callable[[], tuple[tuple[int, int, Any], ...]]]:
+        """Hash once in either loader, without waiting for its sibling's I/O."""
+        if not isinstance(self.token_database, ChunkedTokenDatabase):
+            return None  # Segment plans can contain separator gaps.
+        lock = threading.Lock()
+        chunks = None
+
+        def get_chunks() -> tuple[tuple[int, int, Any], ...]:
+            nonlocal chunks
+            with lock:
+                if chunks is None:
+                    chunks = tuple(
+                        self.token_database.process_tokens(tokens=tokens, make_key=False)
+                    )
+                return chunks
+
+        return get_chunks
+
     def load_group1_pages_direct(
         self,
         tokens: list[int],
@@ -780,6 +801,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         kvcaches: list,
         request_configs: Optional[dict],
         req_id: str,
+        *,
+        chunk_plan: Optional[Callable[[], tuple[tuple[int, int, Any], ...]]] = None,
     ) -> None:
         """Load exact persistent Group-1 pages into final vLLM HBM blocks."""
         perf_enabled = serving_perf_enabled()
@@ -788,9 +811,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         if not self._persistent_direct_hbm_split_group_enabled():
             raise RuntimeError("Group-1 direct-HBM mode is disabled")
         phase_started = serving_perf_now() if perf_enabled else 0.0
+        token_args = {"tokens": tokens}
+        if chunk_plan is not None:
+            chunks = chunk_plan()
+            token_args = {
+                "hashes": [entry[2] for entry in chunks],
+                "offsets": [end - start for start, end, _ in chunks],
+            }
         plans = list(
             self.token_database.process_tokens(
-                tokens=tokens,
+                **token_args,
                 request_configs=request_configs,
                 kv_group=1,
             )
@@ -6355,6 +6385,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                         remote_fill_locations
                     )
             key_plan = remote_fill_chunk_plan or chunk_plan
+            if (
+                key_plan is None
+                and (retrieve_kwargs or {}).get("_cold_chunk_plan") is not None
+            ):
+                key_plan = retrieve_kwargs["_cold_chunk_plan"]()
             metadata_extension = (
                 self._build_retrieve_metadata_extension(
                     tokens=tokens,
@@ -7816,9 +7851,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ]
             else:
                 starts, ends, keys = [], [], []
+                token_args = {"tokens": tokens, "mask": mask}
+                if kwargs.get("_cold_chunk_plan") is not None:
+                    chunks = kwargs["_cold_chunk_plan"]()
+                    token_args = {
+                        "hashes": [entry[2] for entry in chunks],
+                        "offsets": [end - start for start, end, _ in chunks],
+                    }
                 for start, end, key in self.token_database.process_tokens(
-                    tokens=tokens,
-                    mask=mask,
+                    **token_args,
                     request_configs=request_configs,
                     kv_group=kv_group,
                 ):
@@ -8930,13 +8971,27 @@ class AscendLMCacheEngine(LMCacheEngine):
             elif sampled_worker_retrieve:
                 local_cpu_backend = self._shared_local_cpu_backend()
                 try:
+                    local_pages = 0
+                    if mooncake_layer_pages_enabled(self.config):
+                        local_pages, _ = (
+                            self.storage_manager.batched_contains_layer_pages(
+                                missing_keys[0], [LOCAL_CPU_BACKEND_NAME]
+                            )
+                        )
+                    # Whole pages already prove all layer locations. Probe
+                    # legacy keys only beyond that prefix; the resolver still
+                    # acquires and validates the actual source objects.
+                    probe_keys = (
+                        [keys[local_pages:] for keys in missing_keys]
+                        if local_pages else missing_keys
+                    )
                     batched_prefix_get = getattr(
                         local_cpu_backend,
                         "batched_get_prefixes_with_misses",
                         None,
                     )
                     if callable(batched_prefix_get):
-                        local_prefix_layers.extend(batched_prefix_get(missing_keys))
+                        local_prefix_layers.extend(batched_prefix_get(probe_keys))
                         if len(local_prefix_layers) != len(missing_keys):
                             raise ValueError(
                                 "Shared CPU batched local-prefix lookup returned "
@@ -8951,40 +9006,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                             local_cpu_backend.batched_get_prefix_with_misses(
                                 layer_keys
                             )
-                            for layer_keys in missing_keys
+                            for layer_keys in probe_keys
                         )
                     for local_prefix in local_prefix_layers:
-                        layer_locations = [LOCAL_CPU_BACKEND_NAME] * len(
-                            local_prefix.local_memory_objs
+                        layer_locations = [LOCAL_CPU_BACKEND_NAME] * (
+                            local_pages + len(local_prefix.local_memory_objs)
                         ) + ["RemoteBackend"] * len(local_prefix.remote_positions)
                         shared_chunk_locations_layer_major.append(layer_locations)
-                    if mooncake_layer_pages_enabled(self.config):
-                        page_chunks = len(missing_keys[0])
-                        local_pages, _ = (
-                            self.storage_manager.batched_contains_layer_pages(
-                                missing_keys[0][:page_chunks],
-                                [LOCAL_CPU_BACKEND_NAME],
-                            )
-                        )
-                        for locations in shared_chunk_locations_layer_major:
-                            locations[:local_pages] = [
-                                LOCAL_CPU_BACKEND_NAME
-                            ] * local_pages
-                        if page_chunks < len(missing_keys[0]):
-                            tail_keys = [
-                                layer_keys[page_chunks]
-                                for layer_keys in missing_keys
-                            ]
-                            local_tail, _ = self.storage_manager.batched_contains(
-                                tail_keys, [LOCAL_CPU_BACKEND_NAME]
-                            )
-                            if local_tail == len(tail_keys):
-                                for locations in (
-                                    shared_chunk_locations_layer_major
-                                ):
-                                    locations[page_chunks] = (
-                                        LOCAL_CPU_BACKEND_NAME
-                                    )
                 except Exception:
                     release_local_prefix_layers()
                     raise

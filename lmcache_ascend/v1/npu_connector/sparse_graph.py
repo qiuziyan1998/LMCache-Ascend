@@ -110,9 +110,14 @@ class SparseGraphTransfer:
             not counts
             or len(counts) > self.capacity
             or not 0 < source.total_tokens <= self.max_tokens
-            or any(n != self.chunk_size for n in counts[:-1])
-            or not 0 < counts[-1] <= self.chunk_size
-            or sum(counts) < source.total_tokens
+            or (
+                getattr(source, "validated_chunk_size", None) != self.chunk_size
+                and (
+                    any(n != self.chunk_size for n in counts[:-1])
+                    or not 0 < counts[-1] <= self.chunk_size
+                    or sum(counts) < source.total_tokens
+                )
+            )
         ):
             raise ValueError(
                 "Full graph source is not a contiguous bounded chunk prefix"
