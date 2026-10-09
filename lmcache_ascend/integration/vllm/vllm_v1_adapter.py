@@ -249,6 +249,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._prepare_cold_graph_pointers = bool(
             int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))
         )
+        self._defer_prepared_sparse_setup = self._prepare_cold_graph_pointers
         # Cache the existing dense-load compatibility switches on scheduler and
         # worker alike. Legacy staged copies cannot export async readiness.
         self._resident_cold_load_enabled = not any(

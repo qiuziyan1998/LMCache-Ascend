@@ -2,6 +2,7 @@
 """Execute the derived cold-load hook with explicit stream/fence collaborators."""
 
 import ast
+import os
 from contextlib import contextmanager
 from pathlib import Path
 import sys
@@ -9,6 +10,36 @@ from types import ModuleType, SimpleNamespace as NS
 
 import pytest
 import torch
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_warm_deferral_uses_existing_full_graph_setting(monkeypatch, enabled):
+    path = Path(__file__).resolve().parents[2] / (
+        "lmcache_ascend/integration/vllm/vllm_v1_adapter.py"
+    )
+    cls = next(
+        n for n in ast.parse(path.read_text(encoding="utf8")).body
+        if isinstance(n, ast.ClassDef) and n.name == "LMCacheAscendConnectorV1Impl"
+    )
+    cls.body = [n for n in cls.body if getattr(n, "name", None) == "__init__"]
+
+    class BeforeBaseInitialization(Exception):
+        pass
+
+    class Base:
+        def __init__(self, *args, **kwargs):
+            assert self._defer_prepared_sparse_setup is enabled
+            raise BeforeBaseInitialization
+
+    monkeypatch.setenv("VLLM_ASCEND_SFA_FULL_GRAPH", str(int(enabled)))
+    namespace = dict(
+        LMCacheConnectorV1Impl=Base, os=os, logger=NS(debug=lambda *a: None)
+    )
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(cls)
+    exec(compile(module, str(path), "exec"), namespace)
+    with pytest.raises(BeforeBaseInitialization):
+        namespace[cls.name](None, None, None)
 
 
 @pytest.mark.parametrize(
