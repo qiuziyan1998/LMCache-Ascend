@@ -1708,6 +1708,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         else "request_not_eligible"
                     ),
                 )
+        if (
+            isinstance(return_params, dict)
+            and isinstance(params, dict)
+            and params.get("do_remote_decode")
+            and isinstance(getattr(request, "num_cached_tokens", None), int)
+            and request.num_cached_tokens >= 0
+        ):
+            # LMCache-Ascend keeps the P-side public handoff in the
+            # do_remote_decode form. Preserve the existing sanitized handoff
+            # and add the P-side prefix-cache hit count for the D worker.
+            return_params["remote_prefill_cached_tokens"] = (
+                request.num_cached_tokens
+            )
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params
 

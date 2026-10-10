@@ -3241,6 +3241,7 @@ def test_remote_fill_terminal_is_returned_without_private_capabilities(
     )
     request = SimpleNamespace(
         request_id="request",
+        num_cached_tokens=123,
         kv_transfer_params={
             "do_remote_decode": True,
             "remote_engine_id": "decoder",
@@ -3271,6 +3272,7 @@ def test_remote_fill_terminal_is_returned_without_private_capabilities(
     assert delay_free is True
     assert returned["first_tok"] == 7
     assert returned["do_remote_decode"] is True
+    assert returned["remote_prefill_cached_tokens"] == 123
     assert returned["remote_engine_id"] == "decoder"
     public = returned["lmcache.remote_fill"]
     assert public["terminal"] == terminal
