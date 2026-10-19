@@ -2,6 +2,7 @@
 """Exercise the installed LMCache-Ascend allocators, without loading a model."""
 
 import argparse
+import ctypes
 import json
 import math
 import multiprocessing as mp
@@ -76,7 +77,7 @@ def cgroup_snapshot(cgroup, mountinfo):
 
 def snapshot():
     result = {}
-    for name in ("/proc/meminfo", "/proc/self/status", "/proc/self/limits",
+    for name in ("/proc/meminfo", "/proc/self/status", "/proc/self/smaps_rollup", "/proc/self/limits",
                  "/proc/self/cgroup", "/proc/self/mountinfo"):
         try:
             result[name] = Path(name).read_text()
@@ -151,12 +152,67 @@ def preload_npu(torch, device, target_free, chunk, tensors):
     return amount
 
 
+class NativeProbeUnknown(RuntimeError):
+    """A submitted native probe could not be fenced; retain its operands."""
+
+
+def process_roles(devices, separate_owner=False):
+    """Keep the storage owner distinct from every TP reader when requested."""
+    if separate_owner:
+        return [(devices[0], True)] + [(device, False) for device in devices]
+    return [(device, rank == 0) for rank, device in enumerate(devices)]
+
+
+def probe_payload(torch):
+    """Seven planar C8 records with distinct key bytes and FP16 scale bits."""
+    keys = ((torch.arange(7 * 128) * 17) % 251).to(torch.uint8)
+    scales = (torch.arange(7, dtype=torch.int16) * 97 + 1234).view(torch.uint8)
+    return torch.cat((keys, scales))
+
+
+def verify_registered_read(torch, ops, ptr, size, device, operands):
+    """Read M's partial packet through this process's actual native mapping."""
+    payload = probe_payload(torch)
+    if size < payload.numel() + 64:
+        raise ValueError("Native read probe requires at least 974 bytes per region")
+    keys = torch.full((1, 128, 1, 128), -7, dtype=torch.int8, device=f"npu:{device}")
+    scales = torch.full((1, 128, 1, 1), -1, dtype=torch.float16, device=f"npu:{device}")
+    state = ops.IndexerC8State(keys, scales)
+    mapped = int(ops.get_device_ptr(ptr + 32, payload.numel()))
+    if not mapped:
+        raise RuntimeError("Native probe packet has no registered device pointer")
+    signed_pointer = mapped if mapped < 2**63 else mapped - 2**64
+    pointers = torch.tensor([signed_pointer], dtype=torch.int64, device=keys.device)
+    offsets = torch.zeros(1, dtype=torch.int32, device=keys.device)
+    counts = torch.tensor([7], dtype=torch.int32, device=keys.device)
+    slots = torch.arange(1, 8, dtype=torch.int64, device=keys.device)
+    operands.extend((keys, scales, state, pointers, offsets, counts, slots))
+    try:
+        ops.indexer_c8_transfer_prepared(state, pointers, offsets, counts, slots, 7, False)
+    finally:
+        try:
+            torch.npu.synchronize()
+        except BaseException as error:
+            raise NativeProbeUnknown("Native packet completion is unknown") from error
+    actual_keys, actual_scales = keys.cpu(), scales.cpu()
+    if not (
+        torch.equal(actual_keys.view(torch.uint8).reshape(128, 128)[1:8].flatten(), payload[:7 * 128])
+        and torch.equal(actual_scales.view(torch.uint8).reshape(128, 2)[1:8].flatten(), payload[7 * 128:])
+        and bool(torch.all(actual_keys[0, 0] == -7))
+        and bool(torch.all(actual_scales[0, 0] == -1))
+        and ctypes.string_at(ptr, 32) == bytes([173]) * 32
+        and ctypes.string_at(ptr + 32 + payload.numel(), 32) == bytes([173]) * 32
+    ):
+        raise RuntimeError("Registered native read changed payload, scale or null bytes")
+
+
 def worker(args, device, sizes, names, owner, conn):
     allocations = []
     npu_tensors = []
     stage = "initialize"
     torch_module = None
     ok = True
+    quarantine = False
     try:
         # Set before importing the extension; native shared-slab phase logs
         # distinguish reserve/populate/owner_register/attach_register stalls.
@@ -175,7 +231,7 @@ def worker(args, device, sizes, names, owner, conn):
              memory=snapshot())
         emit("npu_memory", device=device, phase="before_preload",
              memory=npu_snapshot(torch, device))
-        if args.npu_free_gib is not None:
+        if args.npu_free_gib is not None and not (getattr(args, "separate_owner", False) and owner):
             stage = "npu_preload"
             emit("npu_preload_start", device=device, target_free_gib=args.npu_free_gib)
             amount = preload_npu(torch, device, int(args.npu_free_gib * 2**30),
@@ -195,16 +251,36 @@ def worker(args, device, sizes, names, owner, conn):
                  elapsed_s=time.perf_counter() - start, memory=snapshot())
             emit("npu_memory", device=device, phase="after_registration",
                  memory=npu_snapshot(torch, device))
+        if getattr(args, "verify_c8", False):
+            stage = "native_registered_read"
+            ptr, size, _ = allocations[0]
+            if owner:
+                payload = probe_payload(torch).numpy().tobytes()
+                if size < len(payload) + 64:
+                    raise ValueError("Native packet does not fit the first region")
+                ctypes.memset(ptr, 173, len(payload) + 64)
+                ctypes.memmove(ptr + 32, payload, len(payload))
+            else:
+                verify_registered_read(torch, c_ops, ptr, size, device, npu_tensors)
+                emit("native_read_verified", device=device, tokens=7,
+                     memory=npu_snapshot(torch, device))
         stage = "hold"
         conn.send("ready")
-        conn.recv()  # Keep all registrations live until parent releases us.
+        command = conn.recv()  # Keep all registrations live until parent releases us.
+        if command == "quarantine":
+            quarantine, ok = True, False
     except BaseException as exc:
         ok = False
+        quarantine = isinstance(exc, NativeProbeUnknown) or (
+            bool(getattr(args, "verify_c8", False)) and stage == "hold"
+        )
+        if quarantine:
+            conn.send("quarantined")
         emit("worker_failed", device=device, failure_stage=stage,
              error=repr(exc), memory=snapshot(),
-             npu_memory=npu_snapshot(torch_module, device) if torch_module else None)
+             npu_memory=npu_snapshot(torch_module, device) if torch_module and not quarantine else None)
     finally:
-        for ptr, size, name in reversed(allocations):
+        for ptr, size, name in reversed(allocations) if not quarantine else ():
             try:
                 start = time.perf_counter()
                 release(c_ops, args, ptr, size, name, owner)
@@ -214,7 +290,7 @@ def worker(args, device, sizes, names, owner, conn):
                 ok = False
                 emit("release_failed", device=device, error=repr(exc))
         # Preserve HBM pressure through CPU unregister/free, including failures.
-        if npu_tensors:
+        if npu_tensors and not quarantine:
             try:
                 torch_module.npu.synchronize()
                 npu_tensors.clear()
@@ -225,6 +301,10 @@ def worker(args, device, sizes, names, owner, conn):
                 ok = False
                 emit("npu_preload_release_failed", device=device, error=repr(exc))
         conn.close()
+        if quarantine:
+            emit("native_operands_quarantined", device=device,
+                 allocations=len(allocations), operands=len(npu_tensors))
+            os._exit(2)  # No Python finalizers; parent preserves the named CPU slab.
     if not ok:
         raise SystemExit(1)
 
@@ -247,29 +327,35 @@ def trial(args, total):
     ctx = mp.get_context("spawn")
     workers = []
     ok = True
+    quarantined = False
     emit("trial_start", mode=args.mode, total_bytes=total, region_bytes=sizes,
          devices=args.devices, physical_bytes=total * (1 if args.mode == "shared" else len(args.devices)))
     try:
-        for rank, device in enumerate(args.devices):
+        for device, owner in process_roles(args.devices, getattr(args, "separate_owner", False)):
             parent, child = ctx.Pipe()
-            proc = ctx.Process(target=worker, args=(args, device, sizes, names, rank == 0, child))
+            proc = ctx.Process(target=worker, args=(args, device, sizes, names, owner, child))
             proc.start()
             child.close()
             workers.append((proc, parent))
             if not parent.poll(args.timeout):
                 raise TimeoutError(f"device {device}: no ready message within {args.timeout}s")
-            if parent.recv() != "ready":
+            response = parent.recv()
+            if response == "quarantined":
+                quarantined = True
+            if response != "ready":
                 raise RuntimeError(f"device {device}: unexpected worker response")
         emit("all_registered", total_bytes=total, devices=args.devices)
         time.sleep(args.hold_seconds)
     except (Exception, KeyboardInterrupt) as exc:
         ok = False
+        # A missing receipt can include a native launch whose fence never returned.
+        quarantined |= bool(getattr(args, "verify_c8", False))
         emit("trial_failed", error=repr(exc))
     finally:
         # Detach passive mappings before freeing/unlinking the owner's slab.
         for proc, conn in reversed(workers):
             try:
-                conn.send("release")
+                conn.send("quarantine" if quarantined else "release")
             except (BrokenPipeError, EOFError, OSError):
                 pass
             proc.join(args.timeout)
@@ -280,11 +366,15 @@ def trial(args, total):
                 proc.join(10)
             if proc.exitcode != 0:
                 ok = False
+            quarantined |= proc.exitcode == 2
             conn.close()
         # Recover only this trial's uniquely named slabs after crashes/timeouts.
-        if args.mode == "shared":
+        if args.mode == "shared" and not quarantined:
             for name in names:
                 Path("/dev/shm", name.lstrip("/")).unlink(missing_ok=True)
+        if quarantined:
+            emit("native_slab_quarantined", names=names,
+                 recovery="retain named slabs until coordinated NPU recovery proves no DMA")
     emit("trial_result", total_bytes=total, success=ok)
     return ok
 
@@ -295,6 +385,8 @@ def main():
     parser.add_argument("--chunk-gib", type=float, default=0, help="0: one allocation; otherwise retain multiple chunks")
     parser.add_argument("--devices", type=int, nargs="+", default=[0], help="logical NPU IDs; shared mode maps ONE slab into every worker")
     parser.add_argument("--mode", choices=["shared", "private", "numa"], default="shared")
+    parser.add_argument("--separate-owner", action="store_true", help="shared mode: one extra M process on the first device, plus every TP reader")
+    parser.add_argument("--verify-c8", action="store_true", help="requires separate owner: verify native partial-packet reads and untouched null slots")
     parser.add_argument("--numa-node", type=int, default=0)
     parser.add_argument("--interleave-nodes", type=int, nargs="*", default=[])
     parser.add_argument("--attach", choices=["auto", "readonly", "writable"], default="auto")
@@ -305,6 +397,8 @@ def main():
     parser.add_argument("--npu-preload-chunk-gib", type=float, default=1,
                         help="size of each retained NPU allocation (default 1 GiB)")
     args = parser.parse_args()
+    if (args.separate_owner and args.mode != "shared") or (args.verify_c8 and not args.separate_owner):
+        parser.error("separate owner requires shared mode; verify-c8 requires separate owner")
     if (any(not math.isfinite(s) or s <= 0 for s in args.sizes_gib)
             or not math.isfinite(args.chunk_gib) or args.chunk_gib < 0
             or not math.isfinite(args.timeout) or args.timeout <= 0

@@ -1747,7 +1747,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         previous_latent_future: Any = None,
         live_state: Any = None,
     ) -> Any:
-        if not hasattr(plan["request"].load_spec, "checkpoint_generation"):
+        if (getattr(self.lmcache_engine, "storage_process", None) is not None
+                or not hasattr(plan["request"].load_spec, "checkpoint_generation")):
             return super()._run_dsa_cold_compact_load(
                 plan,
                 npu_device_id,
@@ -1792,7 +1793,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     def _run_dsa_cold_indexer_load(self, plan: Any, npu_device_id: Any) -> Any:
         request = plan["request"]
-        if not hasattr(request.load_spec, "checkpoint_generation"):
+        if (getattr(self.lmcache_engine, "storage_process", None) is not None
+                or not hasattr(request.load_spec, "checkpoint_generation")):
             return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
         error = None
         try:

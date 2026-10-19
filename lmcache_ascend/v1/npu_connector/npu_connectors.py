@@ -4430,6 +4430,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self, plan: _SparseDestinationPlan, pointers: torch.Tensor, layer_id: int,
         slots: torch.Tensor, total_tokens: int, chunk_size: int,
         explicit_selection: bool,
+        physical_chunk_token_counts: Optional[tuple[int, ...]] = None,
+        metadata_cache: Optional[dict] = None,
     ) -> None:
         """Group 1 uses the full prefix through the sparse generator protocol."""
         if explicit_selection:
@@ -4447,21 +4449,61 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         current = torch.npu.current_stream()
         join = getattr(self, "_active_sparse_load_join", None)
+        if join is not None and join.compute_stream != current:
+            join = None
         stream = self.load_stream_list[0] if join is not None else current
         if join is not None:
             # Register before launch so the existing failure path fences it too.
             join.used_stream_indices.add(0)
         slots = slots[:total_tokens]
         dummy = self._dense_direct_dummy_metadata_tensor()
+        offsets = counts = dummy
+        fixed_chunks = True
+        capacity = chunk_size
+        physical = physical_chunk_token_counts
+        if physical and (len(physical) - 1) * chunk_size + physical[-1] != total_tokens:
+            if len(physical) != pointers.numel() or any(
+                not 0 < count <= chunk_size
+                or index < len(physical) - 1 and count != chunk_size
+                for index, count in enumerate(physical)
+            ):
+                raise ValueError("C8 source physical capacities disagree with chunks")
+            metadata = (
+                metadata_cache.get(physical) if metadata_cache is not None else None
+            )
+            if metadata is None:
+                physical_total = (len(physical) - 1) * chunk_size + physical[-1]
+                if physical_total < total_tokens:
+                    raise ValueError(
+                        "C8 source physical capacity is shorter than coverage"
+                    )
+                # Native scales follow complete packet capacity. Excluded slots
+                # retain that offset without restoring unconsumed source rows.
+                padded = torch.full(
+                    (physical_total,), -1, dtype=slots.dtype, device=slots.device
+                )
+                padded[:total_tokens].copy_(slots)
+                offsets = torch.arange(
+                    len(physical), dtype=torch.long, device=slots.device
+                ) * chunk_size
+                counts = torch.tensor(physical, dtype=torch.long, device=slots.device)
+                metadata = (offsets, counts, padded, max(physical))
+                if metadata_cache is not None:
+                    metadata_cache[physical] = metadata
+            offsets, counts, slots, capacity = metadata
+            fixed_chunks = False
         slots.record_stream(stream)
         pointers.record_stream(stream)
         dummy.record_stream(stream)
+        if not fixed_chunks:
+            offsets.record_stream(stream)
+            counts.record_stream(stream)
         with self._stream_context_or_null(stream):
             if stream is not current:
                 stream.wait_stream(current)
             lmc_ops.indexer_c8_transfer_prepared(
-                plan.states[layer_id], pointers, dummy, dummy, slots,
-                chunk_size, False, fixed_chunks=True,
+                plan.states[layer_id], pointers, offsets, counts, slots,
+                capacity, False, fixed_chunks=fixed_chunks,
             )
 
     def _run_prepared_sparse_direct_kv_transfer_layer(
@@ -4476,6 +4518,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         total_tokens: int,
         sparse_host_interleaved: bool,
         selected_token_counts: Optional[torch.Tensor] = None,
+        compact_source: Optional[PreparedSparseSource] = None,
+        source_k_bytes: int = 0,
     ) -> None:
         """Launch one prepared layer directly on the current compute stream."""
         if selected_token_idx.numel() == 0:
@@ -4485,6 +4529,60 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._validate_sparse_fixed_chunk_coverage(
             int(chunk_ptrs_npu.numel()), int(chunk_size), int(total_tokens)
         )
+        if compact_source is not None:
+            from lmcache_ascend.v1.npu_connector.sparse_graph import (
+                prepare_source_pointer_pairs,
+            )
+
+            # The existing graph kernel accepts physical per-plane pointers and
+            # an independent logical source bound, including eager recovery.
+            # Cache immutable launch operands on the source so uncertain queued
+            # native launches retain them even if their generator is closed.
+            metadata = compact_source.compact_transfer_metadata
+            prepare_source_pointer_pairs(compact_source, chunk_size, source_k_bytes)
+            pairs = compact_source.graph_pointer_pairs
+            if pairs is None or pairs[0] != source_k_bytes:
+                raise MemoryError(
+                    "Compact source physical pointer metadata is unavailable"
+                )
+            selected = (
+                selected_token_idx.view(1, -1)
+                if selected_token_idx.ndim == 1 else selected_token_idx
+            )
+            slots = slot_mapping_packed.view_as(selected)
+            requests = selected.shape[0]
+            pointer_key = ("pointers", layer_id, requests)
+            pointers = metadata.get(pointer_key)
+            if pointers is None:
+                pointers = pairs[1][:, layer_id, :].repeat(1, requests)
+                metadata[pointer_key] = pointers
+            limit_key = ("limits", requests)
+            limits = metadata.get(limit_key)
+            if limits is None:
+                limits = torch.full(
+                    (requests,), total_tokens, dtype=torch.int32, device=selected.device
+                )
+                metadata[limit_key] = limits
+            counts = selected_token_counts
+            if counts is None:
+                count_key = ("counts", requests)
+                counts = metadata.get(count_key)
+                if counts is None:
+                    # The existing kernel clips each count to this payload's
+                    # row width; one immutable value covers every width.
+                    counts = torch.full(
+                        (requests,), 2**31 - 1,
+                        dtype=torch.int32, device=selected.device,
+                    )
+                    metadata[count_key] = counts
+            current = torch.npu.current_stream()
+            for operand in (slots, selected, counts, pointers, limits):
+                operand.record_stream(current)
+            lmc_ops.sparse_graph_kv_transfer(
+                plan.states[layer_id], slots, selected, counts, pointers, limits,
+                chunk_size,
+            )
+            return
         sparse_mla_dsa_batched_direct_kv_transfer_prepared(
             plan.states[layer_id],
             slot_mapping_packed,
@@ -7553,6 +7651,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         start_layer = int(transfer_kwargs.get("prepared_start_layer", 0))
         if not 0 <= start_layer < len(source.layers):
             raise ValueError("prepared_start_layer is outside the source")
+        physical_counts = getattr(source, "physical_chunk_token_counts", ())
+        c8_physical_metadata = (
+            source.compact_transfer_metadata
+            if layout.indexer_c8 and physical_counts else None
+        )
         for layer_id in range(start_layer, len(source.layers)):
             source_layer = source.layers[layer_id]
             sparse_request = yield
@@ -7622,6 +7725,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             if content_diag_enabled and layer_id in (0, self.num_layers // 2):
                 diagnostic_source_tensors = list(source_layer.tensors)
+                if source.owner_lease is not None:
+                    diagnostic_source_tensors = list(
+                        self.compact_source_importer.source_layer_tensors(
+                            source, layer_id
+                        )
+                    )
                 for memory_obj in (
                     source_layer.memory_objs
                     if not diagnostic_source_tensors
@@ -7641,13 +7750,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     total_tokens=source.total_tokens,
                     token_major=self._layerwise_token_major(kv_group),
                     layer_cache=kvcaches_snapshot[layer_id],
+                    source_owner=source.owner_lease,
                 )
             diagnostic_done = time.perf_counter() if perf_enabled else 0.0
+            if source.owner_lease is not None:
+                self.native_source_lifetime.note(source, torch.npu.current_stream())
             if layout.indexer_c8:
                 self._run_c8_indexer_bootstrap(
                     destination_plan, source_layer.chunk_ptrs_npu, layer_id,
                     slot_mapping_packed, source.total_tokens, chunk_size,
                     has_explicit_sparse_selection,
+                    **(
+                        {
+                            "physical_chunk_token_counts": physical_counts[layer_id],
+                            "metadata_cache": c8_physical_metadata,
+                        }
+                        if physical_counts else {}
+                    ),
                 )
             else:
                 self._run_prepared_sparse_direct_kv_transfer_layer(
@@ -7660,6 +7779,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     total_tokens=source.total_tokens,
                     sparse_host_interleaved=sparse_host_interleaved,
                     selected_token_counts=selected_token_counts,
+                    **(
+                        {
+                            "compact_source": source,
+                            "source_k_bytes": (
+                                self.compact_source_importer.layout.groups[kv_group]
+                                .plane_token_bytes[layer_id][0]
+                            ),
+                        }
+                        if kv_group == 0 and physical_counts
+                        and physical_counts[layer_id][-1] != chunk_token_counts[-1]
+                        else {}
+                    ),
                 )
             if perf_enabled:
                 native_done = time.perf_counter()
@@ -7691,6 +7822,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
             if capture_content and layer_id == 0:
                 source_tensors = list(source_layer.tensors)
+                if source.owner_lease is not None:
+                    source_tensors = list(
+                        self.compact_source_importer.source_layer_tensors(
+                            source, layer_id
+                        )
+                    )
                 for memory_obj in (
                     source_layer.memory_objs if not source_tensors else ()
                 ):

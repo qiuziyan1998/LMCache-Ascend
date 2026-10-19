@@ -22,8 +22,18 @@ def implementation(path, class_name, names, base, **namespace):
     cls = next(
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name
     )
+    selected = {n.name: n for n in cls.body if getattr(n, "name", None) in names}
+    # CPU methods now live in the production mixin; retain local engine
+    # overrides when the selected methods intentionally span both classes.
+    if names - selected.keys():
+        mixin_path = (ROOT / path).with_name("cpu_cache_operations.py")
+        mixin_tree = ast.parse(mixin_path.read_text(encoding="utf-8"))
+        for mixin in (n for n in mixin_tree.body if isinstance(n, ast.ClassDef)):
+            for node in mixin.body:
+                if getattr(node, "name", None) in names - selected.keys():
+                    selected[node.name] = node
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
-    cls.body = [n for n in cls.body if getattr(n, "name", None) in names]
+    cls.body = list(selected.values())
     prefix = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
     )

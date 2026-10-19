@@ -18,7 +18,6 @@ from concurrent.futures import (
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
-from urllib.parse import urlsplit
 from weakref import WeakSet, proxy
 import json
 import logging
@@ -30,7 +29,7 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.integration.vllm.preemption_checkpoint import LOCAL_CHECKPOINT_CONFIG, CheckpointRestoreMiss
+from lmcache.integration.vllm.preemption_checkpoint import CheckpointRestoreMiss
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
@@ -104,6 +103,11 @@ from lmcache_ascend.v1.direct_store_plan import (
     merge_deferred_remote_fill_batches,
     select_remote_fill_batch_pages,
 )
+from lmcache_ascend.v1.cpu_cache_operations import (
+    AscendCPUCacheOperations,
+    _remote_fill_advertise_host_from_session as _remote_fill_advertise_host_from_session,
+    _validate_remote_fill_control_port as _validate_remote_fill_control_port,
+)
 from lmcache_ascend.v1.preemption_checkpoint import CheckpointWorker
 from lmcache_ascend.v1.layerwise_cpu_fill import (
     LayerwiseCPUFillLease,
@@ -159,47 +163,8 @@ def _log_remote_fill_producer_fence_state(
     )
 
 
-def _remote_fill_advertise_host_from_session(remote_session: str) -> str:
-    """Extract the decoder host already advertised by its GlobalTE session."""
-
-    value = str(remote_session).strip()
-    if not value:
-        raise ValueError("remote-fill GlobalTE session is empty")
-    parsed = urlsplit(value if "://" in value else f"//{value}")
-    if not parsed.hostname:
-        raise ValueError(
-            "remote-fill cannot infer a routable control host from GlobalTE session"
-        )
-    return parsed.hostname
 
 
-def _validate_remote_fill_control_port(
-    base_port: int,
-    dp_rank: int,
-    dp_size: int,
-    *,
-    internal_api_enabled: bool,
-    internal_api_port_start: int,
-) -> int:
-    """Validate the complete DP port range and return this rank's port."""
-
-    control_port = int(base_port) + dp_rank
-    last_control_port = int(base_port) + dp_size - 1
-    if dp_size <= 0 or not 0 <= dp_rank < dp_size:
-        raise ValueError("remote-fill decoder DP topology is invalid")
-    if not 0 < int(base_port) < 65536 or last_control_port >= 65536:
-        raise ValueError("remote-fill decoder DP control port is invalid")
-    if internal_api_enabled:
-        internal_start = int(internal_api_port_start)
-        internal_end = internal_start + dp_size - 1
-        if max(int(base_port), internal_start) <= min(
-            last_control_port, internal_end
-        ):
-            raise ValueError(
-                "remote-fill decoder control ports overlap the internal API "
-                "port range"
-            )
-    return control_port
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 REMOTE_BACKEND_NAME = "RemoteBackend"
@@ -443,7 +408,7 @@ class _SparseCacheAppend:
             values[:] = snapshot
 
 
-class AscendLMCacheEngine(LMCacheEngine):
+class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
     """Ascend NPU variant of ``LMCacheEngine`` with an async store path."""
 
     def __init__(
@@ -467,12 +432,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self.is_store_async = self.config.store_async
         self._pending_sync_store_futures: set[Future] = set()
-        self.checkpoint_worker = (
-            CheckpointWorker(self)
-            if getattr(self.config, "decode_preemption_checkpoint", False)
-            and self.metadata.is_first_rank()
-            else None
-        )
+        self.checkpoint_worker = None
+        if getattr(self.config, "decode_preemption_checkpoint", False):
+            if self.storage_process is not None:
+                from lmcache_ascend.v1.process_checkpoint import ProcessCheckpointWorker
+
+                self.checkpoint_worker = ProcessCheckpointWorker(self)
+            elif self.metadata.is_first_rank():
+                self.checkpoint_worker = CheckpointWorker(self)
         self._require_store_completion = False
         self._force_layerwise_prefill_store = bool(
             self.config.use_layerwise
@@ -568,6 +535,25 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self._store_worker_thread.start()
 
+    def prepare_storage_layout(self, group_caches: dict[int, list]) -> None:
+        """Freeze CPU plane geometry from the registered worker destinations.
+
+        Format detection reuses the existing layout path without staging buffers.
+        Widths describe CPU storage planes, including the indexer scale sidecar.
+        """
+        planes = {}
+        for group, caches in group_caches.items():
+            self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
+            widths = self.gpu_connector.checkpoint_plane_widths(group)
+            itemsize = self._shared_cpu_dtype_for_kv_group(group).itemsize
+            if widths and isinstance(widths[0], tuple):
+                planes[group] = tuple(
+                    tuple(width * itemsize for width in row) for row in widths
+                )
+            else:
+                planes[group] = tuple(width * itemsize for width in widths)
+        self.storage_plane_token_bytes = planes
+
     def post_init(self, **kwargs) -> None:
         if getattr(self, "checkpoint_worker", None) is not None and not (
             callable(getattr(self.gpu_connector, "supports_preemption_capture", None))
@@ -583,6 +569,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                 rank=self.metadata.worker_id,
             )
         super().post_init(**kwargs)
+        if self.storage_process is not None:
+            self._group1_external_page_reader = self.storage_process.reader
+            self._remote_fill_process_placement = self.storage_process.call("remote_fill_placement", {})
+            self._remote_fill_decoder_initialized = True
+            if self.is_store_async:
+                self._device_id = torch.npu.current_device()
+                self._ensure_store_worker()
+            return
         if perf_enabled:
             serving_perf_log(
                 logger,
@@ -676,6 +670,8 @@ class AscendLMCacheEngine(LMCacheEngine):
     def get_remote_fill_placement_info(self) -> dict[str, int | str | bool] | None:
         """Return pointer-free decoder placement or ``None`` when unavailable."""
 
+        if self.storage_process is not None:
+            return self._remote_fill_process_placement if self.is_healthy() else None
         runtime = self._remote_fill_runtime
         if runtime is None or not runtime.available or not self.is_healthy():
             return None
@@ -684,6 +680,8 @@ class AscendLMCacheEngine(LMCacheEngine):
     def get_remote_fill_metrics(self) -> dict[str, int] | None:
         """Return fixed-cardinality decoder metrics when remote fill is active."""
 
+        if self.storage_process is not None:
+            return self.storage_process.call("remote_fill_metrics", {})
         runtime = self._remote_fill_runtime
         return None if runtime is None else runtime.metrics_snapshot()
 
@@ -702,7 +700,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def _group1_external_page_load(self) -> Callable[..., None]:
         loader = (
             self._group1_external_page_reader
-            if self._is_passive()
+            if self.storage_process is not None or self._is_passive()
             else self.storage_manager
         )
         if loader is None:
@@ -4163,6 +4161,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Shared implementation for sync and async store.
         From upstream store function.
         """
+        if self.storage_process is not None:
+            from lmcache_ascend.v1.process_store import run_store
+
+            run_store(
+                self, req_id, tokens, hashes, offsets, mask, kwargs,
+                num_to_store_tokens=num_to_store_tokens,
+            )
+            return
         assert tokens is not None or hashes is not None, (
             "Either 'tokens' or 'hashes' must be provided."
         )
@@ -4942,206 +4948,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
 
 
-    def _resolve_shared_rank0_layer_pages(
-        self,
-        *,
-        req_id: str,
-        phase: str,
-        kv_group: int,
-        keys_layer_major: list[list[CacheEngineKey]],
-        page_chunks: int,
-        base_page_keys: Optional[list[CacheEngineKey]] = None,
-        exact_chunk_locations: Optional[list[str]] = None,
-    ) -> tuple[list[list[MemoryObj]], int]:
-        """Resolve exact-size full or partial layer pages with legacy fallback."""
-        perf_enabled = serving_perf_enabled()
-        resolve_started = serving_perf_now() if perf_enabled else 0.0
-        resolve_thread_started = time.thread_time_ns() if perf_enabled else 0
-        local_get_ms = legacy_probe_ms = remote_probe_ms = remote_get_ms = 0.0
-        tail_resolve_ms = validate_pin_ms = 0.0
-        if not 0 < page_chunks <= len(keys_layer_major[0]):
-            raise ValueError("Layer-page retrieval requires at least one chunk")
-        page_keys = (
-            list(base_page_keys[:page_chunks])
-            if base_page_keys is not None
-            else [
-                key.without_layer()
-                for key in keys_layer_major[0][:page_chunks]
-                if isinstance(key, LayerCacheEngineKey)
-            ]
-        )
-        if len(page_keys) != page_chunks:
-            raise ValueError("Layer-page retrieval requires one base key per page")
-        if exact_chunk_locations is not None:
-            return self._resolve_shared_rank0_exact_layer_pages(
-                req_id=req_id,
-                phase=phase,
-                kv_group=kv_group,
-                keys_layer_major=keys_layer_major,
-                page_chunks=page_chunks,
-                base_page_keys=page_keys,
-                chunk_locations=exact_chunk_locations,
-            )
-
-        local = self._shared_local_cpu_backend()
-        assert self.storage_manager is not None
-        phase_started = serving_perf_now() if perf_enabled else 0.0
-        pages, local_count = local.batched_get_layer_page_prefix(page_keys)
-        if perf_enabled:
-            local_get_ms = (serving_perf_now() - phase_started) * 1000
-        owned: list[MemoryObj] = list(pages)
-        pinned: list[MemoryObj] = []
-        try:
-            tail_start = local_count
-            while tail_start < page_chunks:
-                phase_started = serving_perf_now() if perf_enabled else 0.0
-                legacy_suffix = local.contains_all_exact(
-                    page_keys[tail_start].split_layers(self._num_layers_for_kv_group(kv_group))
-                )
-                if perf_enabled:
-                    legacy_probe_ms += (serving_perf_now() - phase_started) * 1000
-                if legacy_suffix:
-                    break
-                remote = self.storage_manager.storage_backends.get("RemoteBackend")
-                contains = getattr(remote, "batched_contains_layer_pages", None)
-                retrieve = getattr(remote, "batched_get_layer_pages", None)
-                if not callable(contains) or not callable(retrieve):
-                    raise RuntimeError("RemoteBackend does not support layer pages")
-                remote_keys = page_keys[tail_start:page_chunks]
-                phase_started = serving_perf_now() if perf_enabled else 0.0
-                remote_count = contains(remote_keys)
-                if perf_enabled:
-                    remote_probe_ms += (
-                        serving_perf_now() - phase_started
-                    ) * 1000
-                if not 0 <= remote_count <= len(remote_keys):
-                    raise ValueError("Remote layer-page lookup returned invalid count")
-                phase_started = serving_perf_now() if perf_enabled else 0.0
-                fetched = retrieve(remote_keys[:remote_count]) if remote_count else []
-                if perf_enabled:
-                    remote_get_ms += (
-                        serving_perf_now() - phase_started
-                    ) * 1000
-                if len(fetched) != remote_count:
-                    raise ValueError("Remote layer-page result count is inconsistent")
-                pages.extend(fetched)
-                owned.extend(fetched)
-                tail_start += remote_count
-                if tail_start < page_chunks:
-                    # Eviction can leave arbitrarily alternating tier runs.
-                    phase_started = serving_perf_now() if perf_enabled else 0.0
-                    fetched, count = local.batched_get_layer_page_prefix(
-                        page_keys[tail_start:page_chunks]
-                    )
-                    if perf_enabled:
-                        local_get_ms += (serving_perf_now() - phase_started) * 1000
-                    pages.extend(fetched)
-                    owned.extend(fetched)
-                    tail_start += count
-                    local_count += count
-                    if not count:
-                        # Neither tier has a merged page at this boundary.
-                        break
-
-            legacy_page_layers = (
-                [
-                    list(layer)
-                    for layer in zip(
-                        *(
-                            key.split_layers(self._num_layers_for_kv_group(kv_group))
-                            for key in page_keys[tail_start:page_chunks]
-                        ),
-                        strict=True,
-                    )
-                ]
-                if tail_start < page_chunks
-                else [[] for _ in range(self._num_layers_for_kv_group(kv_group))]
-            )
-            tail_keys_layer_major = [
-                legacy_page_layers[layer_id]
-                + list(keys_layer_major[layer_id][page_chunks:])
-                for layer_id in range(self._num_layers_for_kv_group(kv_group))
-            ]
-            phase_started = serving_perf_now() if perf_enabled else 0.0
-            tail = (
-                # This retains the legacy layerwise fallback, but measures it
-                # separately from merged-page retrieval.
-                self._resolve_shared_rank0_page_first_layers(
-                    req_id=req_id,
-                    phase=phase,
-                    kv_group=kv_group,
-                    keys_layer_major=tail_keys_layer_major,
-                )
-                if tail_keys_layer_major[0]
-                else [[] for _ in keys_layer_major]
-            )
-            if perf_enabled:
-                tail_resolve_ms = (
-                    serving_perf_now() - phase_started
-                ) * 1000
-            tail_objects = [obj for layer in tail for obj in layer]
-            owned.extend(tail_objects)
-            pinned.extend(tail_objects)
-            if len(pages) != tail_start:
-                raise ValueError(
-                    f"Layer-page result count {len(pages)} != {tail_start}"
-                )
-            phase_started = serving_perf_now() if perf_enabled else 0.0
-            invalid_page = False
-            for chunk_index, page in enumerate(pages):
-                token_count = int(getattr(page, "valid_tokens", 0))
-                expected_shape, _, _ = self._expected_shared_cpu_chunk_metadata(
-                    kv_group=kv_group,
-                    num_tokens=token_count,
-                )
-                invalid_page |= (
-                    page.num_layers != self._num_layers_for_kv_group(kv_group)
-                    or page.get_shape() != expected_shape
-                )
-            if invalid_page or not LayerPageMemoryObj.pin_many(pages):
-                raise ValueError("Invalid or unpinnable layer-page object")
-            pinned.extend(pages)
-            for chunk_index, page in enumerate(pages):
-                self._validate_rank0_shared_mem_obj(
-                    page,
-                    req_id=req_id,
-                    phase=phase,
-                    layer_id=0,
-                    kv_group=kv_group,
-                    chunk_index=chunk_index,
-                )
-            if perf_enabled:
-                validate_pin_ms = (
-                    serving_perf_now() - phase_started
-                ) * 1000
-                elapsed_ms = (serving_perf_now() - resolve_started) * 1000
-                if elapsed_ms >= 100.0:
-                    serving_perf_log(
-                        logger,
-                        "rank0_page_resolve_slow",
-                        started=resolve_started,
-                        req_id=req_id,
-                        phase=phase,
-                        kv_group=kv_group,
-                        pages=page_chunks,
-                        local_pages=local_count,
-                        local_get_ms=round(local_get_ms, 3),
-                        legacy_probe_ms=round(legacy_probe_ms, 3),
-                        remote_probe_ms=round(remote_probe_ms, 3),
-                        remote_get_ms=round(remote_get_ms, 3),
-                        tail_resolve_ms=round(tail_resolve_ms, 3),
-                        validate_pin_ms=round(validate_pin_ms, 3),
-                        thread_cpu_ms=round(
-                            (time.thread_time_ns() - resolve_thread_started) / 1e6,
-                            3,
-                        ),
-                    )
-            return [list(pages) + layer for layer in tail], tail_start
-        except Exception:
-            for obj in reversed(pinned):
-                obj.unpin()
-            self._release_shared_retrieve_objs(owned, unpin=False)
-            raise
 
     def prefetch_shared_layer_pages(
         self,
@@ -6848,6 +6654,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             of the last layer to the storage backends and yields the completed
             store output.
         """
+        if self.storage_process is not None:
+            from lmcache_ascend.v1.process_store import store_layer
+
+            yield from store_layer(self, tokens, mask, kwargs)
+            return
         store_result = LayerwiseStoreResult(
             request_id=str(kwargs.get("req_id", "unspecified")),
             kv_group=int(kwargs.get("kv_group", 0) or 0),
@@ -10208,7 +10019,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger.debug("rank=%s ignore store", self.metadata.worker_id)
             return
 
-        assert self.storage_manager is not None
+        assert self.storage_process is not None or self.storage_manager is not None
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
@@ -10324,66 +10135,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             "shared_cache_generation": int(self.shared_cpu_cache_generation),
         }
 
-    def _validate_remote_fill_decoder_layout(
-        self,
-        layout: RemoteFillDecoderLayout,
-    ) -> None:
-        """Match both negotiated groups to the model-visible cache layout."""
-
-        layer_groups = tuple(
-            getattr(
-                getattr(self.metadata, "kv_layer_groups_manager", None),
-                "kv_layer_groups",
-                (),
-            )
-        )
-        if layer_groups and len(layer_groups) != 2:
-            raise ValueError(
-                "remote-fill requires exactly two registered decoder cache "
-                f"groups, found {len(layer_groups)}"
-            )
-
-        for kv_group in (0, 1):
-            shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
-                kv_group=kv_group,
-                num_tokens=1,
-            )
-            group = layout.group(kv_group)
-            registered_layers = (
-                layer_groups[kv_group].num_layers if layer_groups else None
-            )
-            if (
-                registered_layers is not None
-                and registered_layers != layout.num_layers_for_group(kv_group)
-            ):
-                raise ValueError(
-                    "remote-fill requires registered cache-bearing layer "
-                    "coverage for both groups: "
-                    f"kv_group={kv_group}, "
-                    f"registered_layers={registered_layers}, "
-                    f"negotiated_layers={layout.num_layers_for_group(kv_group)}"
-                )
-            if (
-                dtype != group.dtype
-                or fmt != group.fmt
-                or int(shape.numel())
-                != (
-                    group.layer_token_dims[0]
-                    if group.layer_token_dims
-                    else group.raw_token_dim
-                )
-            ):
-                raise ValueError(
-                    "remote-fill negotiated group layout disagrees with "
-                    "decoder cache metadata: "
-                    f"kv_group={kv_group}, "
-                    f"decoder_shape={tuple(shape)}, "
-                    f"decoder_elements_per_token={int(shape.numel())}, "
-                    f"decoder_dtype={dtype}, decoder_format={fmt.name}, "
-                    f"negotiated_elements_per_token={group.raw_token_dim}, "
-                    f"negotiated_dtype={group.dtype}, "
-                    f"negotiated_format={group.fmt.name}"
-                )
 
     def _preflight_remote_fill_shared_group1(
         self,
@@ -10772,41 +10523,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             runtime.placement.python_hash_seed,
         )
 
-    def _remote_fill_capacity_available(self, requested_bytes: int) -> bool:
-        if requested_bytes < 0:
-            return False
-        try:
-            free_bytes, heap_bytes = (
-                self._shared_local_cpu_backend().get_allocator_capacity_bytes()
-            )
-        except (NotImplementedError, RuntimeError):
-            return False
-        reserve = max(
-            int(self.config.remote_fill_min_free_bytes),
-            int(heap_bytes * float(self.config.remote_fill_min_free_ratio)),
-        )
-        return free_bytes - requested_bytes >= reserve
 
-    def _remote_fill_reclaim_capacity(self, requested_bytes: int) -> bool:
-        if requested_bytes < 0:
-            return False
-        reclaim = getattr(
-            self._shared_local_cpu_backend(),
-            "reclaim_evictable_capacity",
-            None,
-        )
-        if not callable(reclaim):
-            return False
-        return bool(
-            reclaim(
-                requested_bytes,
-                min_free_bytes=int(self.config.remote_fill_min_free_bytes),
-                min_free_ratio=float(self.config.remote_fill_min_free_ratio),
-                num_layers=getattr(self.metadata, "runtime_kv_group_layer_counts", None)
-                or self.num_layers,
-                cause="remote_fill_capacity_reclaim",
-            )
-        )
 
     def _remote_fill_require_paired_restart(
         self,
@@ -10976,141 +10693,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         if self.checkpoint_worker is not None:
             self.checkpoint_worker.local.forget(req_id)
 
-    def checkpoint_backend(self) -> Any:
-        """Return the existing registered LocalCPU heap for checkpoint pages."""
-        local = self._shared_local_cpu_backend()
-        if local is None or not local.use_hot:
-            raise RuntimeError("Local checkpoint storage is unavailable")
-        return local
 
-    def checkpoint_page_key(
-        self, spec: Any, group: int, start: int, end: int
-    ) -> CacheEngineKey:
-        """Make an isolated local-only key; unsealed bytes cannot be prefix hits."""
-        return CacheEngineKey(
-            self.metadata.model_name,
-            self.metadata.world_size,
-            self.metadata.worker_id,
-            secrets.token_bytes(16),
-            self._shared_cpu_dtype_for_kv_group(group),
-            {
-                "lmcache.tag.checkpoint": f"{spec.req_id}:{spec.generation}:{start}:{end}"
-            },
-            kv_group=group,
-        )
 
-    @staticmethod
-    def is_checkpoint_page_key(key: CacheEngineKey) -> bool:
-        """Identify private staging keys without touching canonical prefix keys."""
-        return "lmcache.tag.checkpoint" in (key.request_configs or {})
 
-    def validate_checkpoint_page(self, group: int, page: LayerPageMemoryObj) -> None:
-        """Reject incompatible local layouts before constructing transfer operands."""
-        if (
-            page.num_layers != self._num_layers_for_kv_group(group)
-            or page.get_dtype() != self._shared_cpu_dtype_for_kv_group(group)
-            or page.metadata.fmt != self._memory_format_for_kv_group(group)
-        ):
-            raise ValueError("Local checkpoint page layout mismatch")
 
-    def load_checkpoint_prefix(
-        self, tokens: tuple[int, ...], group: int, configs: Any
-    ) -> Any:
-        """Retain the exact original boundary page, fetching only that page on miss."""
-        start, end, key = list(
-            self.token_database.process_tokens(
-                tokens=list(tokens),
-                request_configs=configs,
-                kv_group=group,
-            )
-        )[-1]
-        cached = self.get_checkpoint_prefix(key, group, end - start)
-        if cached is not None:
-            return cached[0]
-        page, _ = self.allocate_checkpoint_fragment(group, end - start)
-        try:
-            self.storage_manager.batched_get_external_pages(
-                [key],
-                [
-                    [
-                        page.layer_data_ptr(i)
-                        for i in range(self._num_layers_for_kv_group(group))
-                    ]
-                ],
-                [
-                    [
-                        page.layer_tensor(i).numel() * page.get_dtype().itemsize
-                        for i in range(self._num_layers_for_kv_group(group))
-                    ]
-                ],
-                (page.raw_data,),
-                "checkpoint-prefix",
-            )
-            return page
-        except NativeExternalPageTransferUnknownError:
-            self._checkpoint_quarantined_owners = getattr(
-                self, "_checkpoint_quarantined_owners", []
-            )
-            self._checkpoint_quarantined_owners.append(page)
-            raise
-        except BaseException:
-            page.ref_count_down()
-            raise
 
-    def _lookup_remote_fill_two_group_prefix(
-        self,
-        chunks: list,
-        *,
-        search_range: list,
-        lookup_id: str | None,
-        pin: bool,
-        request_configs: Any = None,
-        diagnostics: Any = None,
-    ) -> int:
-        generation = (request_configs or {}).get(LOCAL_CHECKPOINT_CONFIG)
-        if generation is None:
-            return super()._lookup_remote_fill_two_group_prefix(
-                chunks,
-                search_range=search_range,
-                lookup_id=lookup_id,
-                pin=pin,
-                request_configs=request_configs,
-                diagnostics=diagnostics,
-            )
-        worker = self.checkpoint_worker
-        manifest = worker.local.manifest(lookup_id, int(generation)) if worker else None
-        if manifest is None or not chunks:
-            return 0
-        configs = dict(request_configs)
-        configs.pop(LOCAL_CHECKPOINT_CONFIG)
-        prefix = list(
-            self.token_database.process_tokens(
-                tokens=list(manifest.tokens[: manifest.prefix_end]),
-                request_configs=configs,
-            )
-        )
-        hit = (
-            super()._lookup_remote_fill_two_group_prefix(
-                prefix,
-                search_range=search_range,
-                lookup_id=None,
-                pin=False,
-                request_configs=configs,
-            )
-            if prefix
-            else 0
-        )
-        if hit != manifest.prefix_end:
-            return hit
-        expected = list(
-            self.token_database.process_tokens(
-                tokens=list(manifest.tokens[: chunks[-1][1]]),
-                request_configs=configs,
-            )
-        )
-        if chunks != expected:
-            return 0
-        return worker.local.available(lookup_id, int(generation), chunks[-1][1])
 
     def prepare_checkpoint_restore(self, request: Any) -> tuple[int, list[Any]]:
         """Normalize on TP0 and broadcast terminal admission before ordinary loads."""
@@ -11296,7 +10883,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             # Runtime shutdown can itself discover a still-armed transfer.
             raise RuntimeError(fatal_message)
         self._remote_fill_runtime = None
-        if self._group1_external_page_reader is not None:
+        if self._group1_external_page_reader is not None and self.storage_process is None:
             self._group1_external_page_reader.close()
             self._group1_external_page_reader = None
         self.close_remote_fill_producer()
@@ -11343,4 +10930,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         if self._force_layerwise_prefill_store:
             for req_id in tuple(self._layerwise_prefill_page_owners):
                 self.release_layerwise_prefill_pages(req_id)
+        if self.storage_process is not None:
+            from lmcache_ascend.v1.content_diagnostics import begin_deferred_diagnostic_step
+
+            begin_deferred_diagnostic_step()
         super().close()

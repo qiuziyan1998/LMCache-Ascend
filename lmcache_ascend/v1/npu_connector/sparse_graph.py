@@ -31,7 +31,8 @@ def prepare_source_pointer_pairs(
     try:
         pairs = torch.empty(
             (2, len(source.layers), len(counts)),
-            dtype=torch.int64, device=source.pointer_device,
+            dtype=torch.int64,
+            device=source.pointer_device,
         )
     except torch.OutOfMemoryError:
         # Optional metadata only; no work was submitted and the existing
@@ -42,7 +43,20 @@ def prepare_source_pointer_pairs(
     object.__setattr__(source, "graph_pointer_pairs", (k_bytes, pairs))
     torch.stack(tuple(layer.chunk_ptrs_npu for layer in source.layers), out=pairs[0])
     torch.add(pairs[0], chunk_size * k_bytes, out=pairs[1])
-    if counts[-1] != chunk_size:
+    physical = getattr(source, "physical_chunk_token_counts", ())
+    if physical:
+        tails = tuple(row[-1] for row in physical)
+        if len(set(tails)) == 1:
+            if tails[0] != chunk_size:
+                pairs[1, :, -1].add_((tails[0] - chunk_size) * k_bytes)
+        else:
+            offsets = torch.tensor(
+                [(tail - chunk_size) * k_bytes for tail in tails],
+                dtype=torch.int64,
+                device=source.pointer_device,
+            )
+            pairs[1, :, -1].add_(offsets)
+    elif counts[-1] != chunk_size:
         pairs[1, :, -1].add_((counts[-1] - chunk_size) * k_bytes)
 
 
@@ -153,7 +167,8 @@ class SparseGraphTransfer:
                 return None  # Let normal validation report malformed geometry.
             pairs = getattr(source, "graph_pointer_pairs", None)
             writes = (
-                2 if pairs is not None and pairs[0] == self.k_bytes
+                2
+                if pairs is not None and pairs[0] == self.k_bytes
                 else 3 + int(counts[-1] != self.chunk_size)
             )
             full_cost += writes
@@ -215,9 +230,11 @@ class SparseGraphTransfer:
                 self.chunk_size * self.k_bytes,
                 out=self.ptrs[1, start:end],
             )
-            if counts[-1] != self.chunk_size:
+            physical = getattr(source, "physical_chunk_token_counts", ())
+            tail_capacity = physical[layer_id][-1] if physical else counts[-1]
+            if tail_capacity != self.chunk_size:
                 self.ptrs[1, end - 1 : end].add_(
-                    (counts[-1] - self.chunk_size) * self.k_bytes
+                    (tail_capacity - self.chunk_size) * self.k_bytes
                 )
             self.valid_tokens[lane].fill_(source.total_tokens)
 

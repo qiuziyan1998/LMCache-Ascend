@@ -62,7 +62,7 @@ class CaptureJob:
 class CheckpointWorker:
     """Capture synchronously at HBM reuse; publish accepted CPU-owned spans locally."""
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, *, local_store: Any = None) -> None:
         self.engine = engine
         self.jobs: dict[tuple[str, int], CaptureJob] = {}
         self.results: list[CheckpointResult] = []
@@ -73,7 +73,7 @@ class CheckpointWorker:
         self.max_jobs = max(1, int(engine.config.store_async_max_queue_size or 2))
         self.timeout = float(engine.config.blocking_timeout_secs)
         self.chunk_size = int(engine.config.chunk_size)
-        self.local = LocalCheckpointStore(engine)
+        self.local = LocalCheckpointStore(engine) if local_store is None else local_store
 
     def begin_restore(self, req_id: str, generation: int, load_generation: int) -> None:
         """Keep release controls active until the scheduler acknowledges every TP."""
@@ -152,62 +152,7 @@ class CheckpointWorker:
                     blocks[i // block_size] <= 0 for i in range(start, spec.end)
                 ):
                     raise ValueError("Checkpoint source includes released/null blocks")
-            cursor, reclaimed = spec.base, False
-            while cursor < spec.end:
-                desired_end = min(
-                    spec.end, (cursor // self.chunk_size + 1) * self.chunk_size
-                )
-                end = desired_end
-                while end > cursor:
-                    candidate = {}
-                    try:
-                        for group in (0, 1):
-                            start = (
-                                max(cursor, spec.resident_start)
-                                if group == 0
-                                else cursor
-                            )
-                            if start >= end:
-                                continue
-                            try:
-                                page, widths = self._allocate_fragment(
-                                    group, end - start, caches[group]
-                                )
-                            except MemoryError:
-                                if reclaimed:
-                                    raise
-                                reclaimed = True
-                                missing = {
-                                    g: caches[g]
-                                    for g in (group, 1)
-                                    if g not in candidate
-                                }
-                                if not self.engine.reclaim_checkpoint_capacity(
-                                    end - cursor, missing
-                                ):
-                                    raise
-                                page, widths = self._allocate_fragment(
-                                    group, end - start, caches[group]
-                                )
-                            candidate[group] = (start, end, page, widths)
-                    except MemoryError:
-                        for _, _, page, _ in candidate.values():
-                            page.ref_count_down()
-                        end = cursor + (end - cursor) // 2
-                        continue
-                    except BaseException:
-                        for _, _, page, _ in candidate.values():
-                            page.ref_count_down()
-                        raise
-                    for group, fragment in candidate.items():
-                        job.fragments.setdefault(group, []).append(fragment)
-                    cursor = end
-                    break
-                if end != desired_end:
-                    break  # Keep one smaller tail; bound failed-allocation work.
-            if cursor <= spec.prefix_end:
-                raise MemoryError("Checkpoint CPU staging allocation refused")
-            job.captured_end = cursor
+            job.captured_end = self._reserve_fragments(job, caches)
             # Admit the entire selected paired prefix before device preparation.
             for group, fragments in job.fragments.items():
                 starts = [a for a, _, _, _ in fragments]
@@ -223,6 +168,7 @@ class CheckpointWorker:
                     pin_memory=True,
                 )
                 device_work_started = True
+                self._begin_capture(job)
                 plan = self.engine.gpu_connector.prepare_group_capture(
                     [
                         [
@@ -249,6 +195,7 @@ class CheckpointWorker:
             # capture. No layer/group payload is read by the host before this.
             events[-1].synchronize()
             captured_at = time.monotonic()
+            self._capture_completed(job)
             job.plans.clear()
             self.jobs[key] = job
             self.results.append(
@@ -416,6 +363,72 @@ class CheckpointWorker:
             self.cancel(req_id, generation)
         self.executor.shutdown(wait=True)
         self.poll()
+
+    def _reserve_fragments(self, job: CaptureJob, caches: dict[int, list]) -> int:
+        """Reserve the existing paired prefix before preparing any device work."""
+        spec = job.spec
+        cursor, reclaimed = spec.base, False
+        while cursor < spec.end:
+            desired_end = min(
+                spec.end, (cursor // self.chunk_size + 1) * self.chunk_size
+            )
+            end = desired_end
+            while end > cursor:
+                candidate = {}
+                try:
+                    for group in (0, 1):
+                        start = (
+                            max(cursor, spec.resident_start)
+                            if group == 0
+                            else cursor
+                        )
+                        if start >= end:
+                            continue
+                        try:
+                            page, widths = self._allocate_fragment(
+                                group, end - start, caches[group]
+                            )
+                        except MemoryError:
+                            if reclaimed:
+                                raise
+                            reclaimed = True
+                            missing = {
+                                g: caches[g]
+                                for g in (group, 1)
+                                if g not in candidate
+                            }
+                            if not self.engine.reclaim_checkpoint_capacity(
+                                end - cursor, missing
+                            ):
+                                raise
+                            page, widths = self._allocate_fragment(
+                                group, end - start, caches[group]
+                            )
+                        candidate[group] = (start, end, page, widths)
+                except MemoryError:
+                    for _, _, page, _ in candidate.values():
+                        page.ref_count_down()
+                    end = cursor + (end - cursor) // 2
+                    continue
+                except BaseException:
+                    for _, _, page, _ in candidate.values():
+                        page.ref_count_down()
+                    raise
+                for group, fragment in candidate.items():
+                    job.fragments.setdefault(group, []).append(fragment)
+                cursor = end
+                break
+            if end != desired_end:
+                break  # Keep one smaller tail; bound failed-allocation work.
+        if cursor <= spec.prefix_end:
+            raise MemoryError("Checkpoint CPU staging allocation refused")
+        return cursor
+
+    def _begin_capture(self, job: CaptureJob) -> None:
+        """Acquire optional external consumer ownership before device preparation."""
+
+    def _capture_completed(self, job: CaptureJob) -> None:
+        """Publish optional external readiness after the final native fence."""
 
     @staticmethod
     def _release(job: CaptureJob) -> None:

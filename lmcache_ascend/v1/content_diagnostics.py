@@ -63,6 +63,15 @@ class _Group0SourceProbe:
     token_major: bool
     plane_widths: tuple[int, ...]
     destination_stride: int
+    source_lease: Any = None
+
+
+def _release_source_probes(probes: Sequence[_Group0SourceProbe] | None) -> None:
+    """Release CPU-only observations explicitly, including with cyclic GC off."""
+    for probe in probes or ():
+        if probe.source_lease is not None:
+            probe.source_lease.release("never_imported")
+            probe.source_lease = None
 
 
 @dataclass(slots=True)
@@ -112,14 +121,19 @@ def configure_npu_content_diagnostics(enabled: bool) -> None:
         before inference begins.
     """
     global _ENABLED
+    released = []
     with _STATE_LOCK:
         _ENABLED = bool(enabled)
         if not _ENABLED:
+            released.extend(_GROUP0_SOURCE_PROBES.values())
+            for snapshot in _PENDING:
+                released.extend(snapshot.group0_source_probes or ())
             _PENDING.clear()
             _SEEN.clear()
             _REQUEST_SPECS.clear()
             _GROUP0_SOURCE_PROBES.clear()
             _PENDING_STORE_PROBES.clear()
+    _release_source_probes(released)
     _configure_vllm_diagnostic_bridge(_ENABLED)
     if _ENABLED:
         _content_log(
@@ -1152,6 +1166,7 @@ def register_group0_source_probe(
     total_tokens: int,
     token_major: bool,
     layer_cache: Any,
+    source_owner: Any = None,
 ) -> None:
     """Retain a bounded Group-0 source observation for post-join comparison.
 
@@ -1256,13 +1271,19 @@ def register_group0_source_probe(
             if selected_tokens.ndim
             else int(selected_tokens.numel()),
         ),
+        source_lease=source_owner.retain() if source_owner is not None else None,
     )
     key = (probe.req_id, probe.layer_id)
+    released = []
     with _STATE_LOCK:
+        previous = _GROUP0_SOURCE_PROBES.get(key)
+        if previous is not None:
+            released.append(previous)
         _GROUP0_SOURCE_PROBES[key] = probe
         _GROUP0_SOURCE_PROBES.move_to_end(key)
         while len(_GROUP0_SOURCE_PROBES) > MAX_TRACKED_REQUEST_LAYERS:
-            _GROUP0_SOURCE_PROBES.popitem(last=False)
+            released.append(_GROUP0_SOURCE_PROBES.popitem(last=False)[1])
+    _release_source_probes(released)
     _content_log(
         "group0_source_probe_registered",
         req_id=probe.req_id,
@@ -1285,6 +1306,7 @@ def _take_group0_source_probes(
                 )
             )
     if not probes or any(probe is None for probe in probes):
+        _release_source_probes(tuple(probe for probe in probes if probe is not None))
         return None
     return tuple(probe for probe in probes if probe is not None)
 
@@ -2090,6 +2112,7 @@ def _queue_snapshot(snapshot: _DeferredSnapshot) -> None:
             dropped = _PENDING.pop(0)
         _PENDING.append(snapshot)
     if dropped is not None:
+        _release_source_probes(dropped.group0_source_probes)
         _content_log(
             "content_diagnostic_snapshot_dropped",
             dropped_event=dropped.event,
@@ -2103,10 +2126,14 @@ def begin_deferred_diagnostic_step() -> None:
         return
     with _STATE_LOCK:
         stale = len(_PENDING)
+        released = list(_GROUP0_SOURCE_PROBES.values())
+        for snapshot in _PENDING:
+            released.extend(snapshot.group0_source_probes or ())
         _PENDING.clear()
         _GROUP0_SOURCE_PROBES.clear()
         stale_probes = len(_PENDING_STORE_PROBES)
         _PENDING_STORE_PROBES.clear()
+    _release_source_probes(released)
     if stale or stale_probes:
         _content_log(
             "content_diagnostic_snapshot_dropped",
@@ -2504,3 +2531,5 @@ def flush_deferred_diagnostics() -> None:
                 ),
                 readback_may_synchronize=True,
             )
+        finally:
+            _release_source_probes(snapshot.group0_source_probes)
