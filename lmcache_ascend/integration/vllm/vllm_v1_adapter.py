@@ -1895,7 +1895,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 metadata = CheckpointWorkerMetadata(
                     metadata.descriptors, metadata.remote_fill_results, results
                 )
-        if not worker.jobs and not worker.restore_owners:
+        sources_drained = getattr(worker, "sources_drained", None)
+        if (
+            not worker.jobs and not worker.restore_owners
+            and (sources_drained is None or sources_drained())
+        ):
             # Reveal the original class methods, rather than retaining bound
             # instance methods/cycles when cyclic GC is disabled.
             del self.start_load_kv, self.build_connector_worker_meta

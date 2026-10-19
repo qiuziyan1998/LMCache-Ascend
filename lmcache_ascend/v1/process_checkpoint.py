@@ -2,6 +2,7 @@
 """Worker checkpoint capture using M-owned pages and explicit participant leases."""
 
 # Standard
+from concurrent.futures import TimeoutError
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any
@@ -18,11 +19,16 @@ from lmcache.integration.vllm.preemption_checkpoint import (
     CheckpointResult,
     SealSpec,
 )
+from lmcache.integration.vllm.storage_process import cancel_unadmitted_operation
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.rpc.storage_protocol import SourceGeometry, unpack_uints
 from lmcache.v1.shared_cpu_cache import LocalLeaseHandle, SharedHandleBatch
-from lmcache_ascend.v1.preemption_checkpoint import CaptureJob, CheckpointWorker
+from lmcache_ascend.v1.preemption_checkpoint import (
+    CaptureJob,
+    CheckpointWorker,
+    clear_failure_tracebacks,
+)
 
 
 @dataclass
@@ -35,10 +41,13 @@ class _Reservation:
     fenced: bool = False
     sealed: bool = False
     releasing: bool = False
-    reconcile_queued: bool = False
     released: bool = False
     acknowledging: bool = False
     retired: set[str] = field(default_factory=set)
+    cancel_future: Any = None
+    cleanup_future: Any = None
+    resume_on: Any = None
+    cancel_deadline: float = 0.0
 
 
 class _CheckpointControls:
@@ -112,11 +121,17 @@ class ProcessCheckpointWorker(CheckpointWorker):
             return
         with self._lock:
             reconciling = key in self.reservations
+            occupied = len(set(self.jobs) | self.reservations.keys())
         if reconciling:
             self.results.append(
                 CheckpointResult(
                     *key, "failed", reason="checkpoint generation is still reconciling"
                 )
+            )
+            return
+        if occupied >= self.max_jobs:
+            self.results.append(
+                CheckpointResult(*key, "failed", reason="checkpoint staging is busy")
             )
             return
         source = getattr(prefix_state, "prepared_sparse_sources", {}).get(0)
@@ -139,6 +154,19 @@ class ProcessCheckpointWorker(CheckpointWorker):
         """Relay accepted/computed tokens once through the existing seal executor."""
         if self.writer:
             super().seal(seal)
+
+    def cancel(self, req_id: str, generation: int | None = None) -> None:
+        """Queue cleanup without waiting for service replies, including during seal."""
+        super().cancel(req_id, generation)
+        with self._lock:
+            states = tuple(self.reservations.values())
+        for state in states:
+            spec = state.job.spec
+            if spec.req_id == req_id and (
+                generation is None or spec.generation == generation
+            ):
+                state.job.cancelled = True
+                self._release(state.job)
 
     def release_restore(
         self, req_id: str, generation: int, load_generation: int
@@ -212,13 +240,28 @@ class ProcessCheckpointWorker(CheckpointWorker):
 
     def close(self) -> None:
         """Drain source views and refuse teardown while service ownership is unknown."""
-        super().close()
+        if self.restore_owners:
+            raise RuntimeError(
+                "Checkpoint restores still await all-worker acknowledgement"
+            )
+        for req_id, generation in tuple(self.jobs):
+            self.cancel(req_id, generation)
+        with self._lock:
+            states = tuple(self.reservations.values())
+        for state in states:
+            state.job.cancelled = True
+            self._release(state.job)
         deadline = time.monotonic() + self.timeout
-        while not self.sources_drained() and time.monotonic() < deadline:
+        while True:
+            # Poll may enqueue the final forget for a completed cancelled seal.
+            # Include that control in the drain before stopping this executor.
             self.poll()
+            if self.sources_drained():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Process checkpoint ownership has not drained")
             time.sleep(0.005)
-        if not self.sources_drained():
-            raise RuntimeError("Process checkpoint ownership has not drained")
+        self.executor.shutdown(wait=True)
 
     def _reserve_fragments(self, job: CaptureJob, caches: dict[int, list]) -> int:
         spec = job.spec
@@ -391,16 +434,10 @@ class ProcessCheckpointWorker(CheckpointWorker):
 
     def _capture_completed(self, job: CaptureJob) -> None:
         state = self.reservations[job.spec.req_id, job.spec.generation]
+        # The reservation retains its producer holds until seal or cancellation.
+        # Both controls already accept this final-access proof, so reporting local
+        # capture completion needs no separate service acknowledgement.
         state.fenced = True
-        self._call(
-            job,
-            "commit_write",
-            {
-                "reservation_id": state.reply["reservation_id"],
-                "phase": "captured",
-                "proof": "fenced",
-            },
-        )
 
     def _publish_local(self, job: CaptureJob, seal: SealSpec) -> int:
         job.publish_started = time.monotonic()
@@ -503,24 +540,114 @@ class ProcessCheckpointWorker(CheckpointWorker):
             CheckpointWorker._release(job)
             return
         if job.quarantined:
-            self.jobs[key] = job
             return
         if state.released:
             self._ack_released(state.future.identity)
             return
+        with self._lock:
+            if state.releasing or (
+                state.resume_on is not None and not state.resume_on.done()
+            ):
+                return
+            state.releasing = True
+            # The base capture calls release only after its final-access fence,
+            # including the recovery fence following partially prepared work.
+            if state.imported:
+                state.fenced = True
+            try:
+                state.cleanup_future = self.executor.submit(
+                    self._release_reserved, state
+                )
+            except RuntimeError:
+                state.releasing = False
+                job.quarantined = True
+
+    def _resume_release(self, state: _Reservation, future: Any) -> None:
+        """Continue after the original reply, even with no foreground decode poll."""
+        if state.resume_on is future:
+            return
+        state.resume_on = future
+        key = (state.job.spec.req_id, state.job.spec.generation)
+        operation = state.future.identity.key
+        receiver = proxy(self)
+
+        def completed(_: Any) -> None:
+            # Queue behind the current cleanup/seal on the existing executor.
+            # Capturing only the key avoids Future -> reservation ownership cycles.
+            try:
+                receiver.executor.submit(receiver._continue_release, key, operation)
+            except RuntimeError:
+                with receiver._lock:
+                    retained = receiver.reservations.get(key)
+                    if (
+                        retained is not None
+                        and retained.future.identity.key == operation
+                    ):
+                        retained.job.quarantined = True
+
+        future.add_done_callback(completed)
+
+    def _continue_release(self, key: tuple[str, int], operation: tuple) -> None:
+        with self._lock:
+            state = self.reservations.get(key)
+            if state is None or state.future.identity.key != operation:
+                return
+            state.resume_on = None
+        self._release(state.job)
+
+    def _release_reserved(self, state: _Reservation) -> None:
+        """Run bounded CPU control waits on the existing checkpoint executor."""
+        try:
+            self._finish_release(state)
+        except BaseException as error:
+            state.job.quarantined = True
+            clear_failure_tracebacks(error)
+        finally:
+            with self._lock:
+                state.releasing = False
+
+    def _finish_release(self, state: _Reservation) -> None:
+        job = state.job
+        # A cancellation queued during sealing follows it in this same executor.
+        published = job.future
+        if published is not None and job.cancelled:
+            try:
+                published.result()
+            except NativeExternalPageTransferUnknownError:
+                job.quarantined = True
+                return
+            except BaseException as error:
+                clear_failure_tracebacks(error)
         if state.reply is None:
             try:
                 result = state.future.result() if state.future.done() else None
             except BaseException:
                 job.quarantined = True
-                self.jobs[key] = job
                 return
+            if result is not None and result.status == "BUSY":
+                deadline = time.monotonic() + self.timeout
+                while result.status == "BUSY":
+                    remaining = max(0.0, deadline - time.monotonic())
+                    result = cancel_unadmitted_operation(
+                        self.client, state.future, remaining
+                    )
+                    if result.status == "BUSY":
+                        if not remaining:
+                            raise TimeoutError(
+                                "CPU reservation cancellation deadline expired"
+                            )
+                        time.sleep(min(0.005, remaining))
             if result is not None and result.status == "COMPLETED":
                 state.reply = result.value
                 if result.value.get("status") == "SKIPPED":
                     self._ack_released(state.future.identity, no_leases=True)
                     return
-                self._import_fragments(job, state)
+                try:
+                    self._import_fragments(job, state)
+                except Exception as error:
+                    # Rejected exported geometry still owns every lease adopted
+                    # before validation; cancellation needs no device operands.
+                    clear_failure_tracebacks(error)
             elif result is not None and result.status in (
                 "FAILED_SAFE",
                 "CANCELLED_NOT_STARTED",
@@ -529,43 +656,86 @@ class ProcessCheckpointWorker(CheckpointWorker):
                 return
             elif result is not None and result.status == "FAILED_UNKNOWN":
                 job.quarantined = True
-                self.jobs[key] = job
                 return
             else:
                 self.client.cancel(state.future.identity)
                 self.client.replay(state.future.identity)
-                if not state.reconcile_queued:
-                    state.reconcile_queued = True
-
-                    def resolved(_: Any) -> None:
-                        # Cancellation never starts a new operation or imports
-                        # device operands. The model poll retries after a late
-                        # response, including after executor shutdown.
-                        job.cancelled = True
-
-                    state.future.add_done_callback(resolved)
+                self._resume_release(state, state.future)
                 return
         if not state.sealed:
-            try:
-                result = self._call(
-                    job,
-                    "cancel_write",
-                    {
-                        "reservation_id": state.reply["reservation_id"],
-                        "proof": "fenced" if state.imported else "never_imported",
-                    },
-                )
-            except Exception:
-                job.cancelled = True
-                self.jobs[key] = job
+            if not self._cancel_reserved(state):
                 return
-            if result.get("status") == "PENDING":
-                job.cancelled = True
-                self.jobs[key] = job
-                return
-        state.releasing = True
+        if job.cancelled:
+            # Also covers a seal whose response timed out before M completed it.
+            # Forget only after cancellation proves publication is no longer live.
+            self.local.forget(job.spec.req_id, job.spec.generation)
         CheckpointWorker._release(job)
         for hold in state.holds:
             hold.release("fenced" if state.imported else "never_imported")
         state.released = True
         self._ack_released(state.future.identity)
+
+    def _cancel_reserved(self, state: _Reservation) -> bool:
+        job = state.job
+        if not state.cancel_deadline:
+            state.cancel_deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = max(0.0, state.cancel_deadline - time.monotonic())
+            if state.cancel_future is None:
+                try:
+                    state.cancel_future = self.submit_control(
+                        "cancel_write",
+                        {
+                            "reservation_id": state.reply["reservation_id"],
+                            "proof": "fenced" if state.imported else "never_imported",
+                        },
+                        job.spec.req_id,
+                        job.spec.generation,
+                        state.future.identity.request_attempt,
+                    )
+                except BufferError:
+                    if not remaining:
+                        raise
+                    time.sleep(min(0.005, remaining))
+                    continue
+            future = state.cancel_future
+            if not future.done():
+                self._resume_release(state, future)
+                return False
+            result = future.result()
+            if result.status == "BUSY":
+                result = cancel_unadmitted_operation(self.client, future, remaining)
+                if result.status == "CANCELLED_NOT_STARTED":
+                    with self._lock:
+                        self.pending_controls.pop(future.identity.key, None)
+                elif result.status == "BUSY":
+                    # A full service registry can refuse the lifecycle cancel as
+                    # well as the work submission. Retain and reconcile this same
+                    # original operation until its non-admission is proven.
+                    if time.monotonic() >= state.cancel_deadline:
+                        raise TimeoutError(
+                            "CPU checkpoint cancellation admission deadline expired"
+                        )
+                    time.sleep(min(0.005, remaining))
+                    continue
+            if result.status == "FAILED_UNKNOWN":
+                job.quarantined = True
+                return False
+            retry = result.status == "CANCELLED_NOT_STARTED" or (
+                result.status == "COMPLETED"
+                and isinstance(result.value, dict)
+                and result.value.get("status") == "PENDING"
+            )
+            if retry:
+                if time.monotonic() >= state.cancel_deadline:
+                    raise TimeoutError("CPU checkpoint cancellation deadline expired")
+                state.cancel_future = None
+                time.sleep(min(0.005, remaining))
+                continue
+            if (
+                result.status != "COMPLETED"
+                or result.error
+                or result.value.get("status") != "CANCELLED"
+            ):
+                raise RuntimeError("CPU checkpoint cancellation is unresolved")
+            return True

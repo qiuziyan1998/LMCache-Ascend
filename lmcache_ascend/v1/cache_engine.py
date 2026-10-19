@@ -10594,7 +10594,13 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
 
     def _receive_checkpoint_envelope(self, reader: Callable) -> Any:
         envelope = reader(self)
-        if envelope.phase not in ("checkpoint_index_prefix", "checkpoint_remote_fill"):
+        if envelope.phase not in (
+            "checkpoint_index_prefix",
+            "checkpoint_remote_fill",
+            "storage_dense_import",
+            "storage_source_import",
+            "storage_store_import",
+        ):
             return envelope
         identity = dict(
             req_id=envelope.request_id,

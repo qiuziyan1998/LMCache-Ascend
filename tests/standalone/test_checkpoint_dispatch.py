@@ -243,3 +243,19 @@ def test_release_only_control_frame_retires_restore_owners_and_restores_idle_met
     assert calls[-2:] == [("release", key), "ordinary-load"]
     impl.build_connector_worker_meta()
     assert "start_load_kv" not in impl.__dict__
+
+
+def test_empty_jobs_keeps_hooks_until_process_retirement_is_acknowledged():
+    impl, _, _, _, _, _, _ = fixture()
+    worker = impl.lmcache_engine.checkpoint_worker
+    state = NS(drained=False)
+    worker.sources_drained = lambda: state.drained
+    impl._activate_checkpoint_io()
+    assert not worker.jobs and not worker.restore_owners
+    impl.build_connector_worker_meta()
+    assert "start_load_kv" in impl.__dict__
+    assert "get_finished_stores" in impl.lmcache_engine.__dict__
+    state.drained = True
+    impl.build_connector_worker_meta()
+    assert "start_load_kv" not in impl.__dict__
+    assert "get_finished_stores" not in impl.lmcache_engine.__dict__
