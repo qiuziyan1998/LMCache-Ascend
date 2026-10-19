@@ -29,8 +29,10 @@ from lmcache.v1.rpc.storage_protocol import (
     LookupReply,
     OperationIdentity,
     PrepareSpec,
+    checked_uint,
     pack_uints,
     restore_hash,
+    unpack_uints,
 )
 from lmcache.v1.rpc.storage_layout import freeze_storage_layout
 from lmcache.v1.token_database import ChunkedTokenDatabase
@@ -85,6 +87,10 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             and self.metadata.use_mla
         )
         self.save_indexer_only_first_rank = self.save_only_first_rank
+
+    def bootstrap_descriptor(self) -> dict[str, Any]:
+        """Advertise packed checkpoint support through the existing bootstrap."""
+        return dict(super().bootstrap_descriptor(), checkpoint_tokens_u32_le_v1=True)
 
     def on_layout_bound(self) -> None:
         """Finalize hashing and advertise RemoteFill after every worker is ready."""
@@ -482,6 +488,15 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 raise StorageFailedSafe("CPU write publication is already running")
             reservation.committing = True
         try:
+            tokens: tuple[int, ...] = ()
+            if reservation.purpose == "checkpoint" and phase != "captured":
+                if phase != "seal":
+                    raise StorageFailedSafe(
+                        "Checkpoint publication requires accepted-token sealing"
+                    )
+                # Decode only after count/extent/frontier checks and before any
+                # producer hold is released or checkpoint pages are published.
+                tokens = self._checkpoint_seal_tokens(reservation, value)
             if not reservation.captured:
                 if (
                     value.get("proof") != "fenced"
@@ -496,11 +511,7 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             if phase == "captured":
                 return {"status": "CAPTURED", "captured_end": reservation.captured_end}
             if reservation.purpose == "checkpoint":
-                if phase != "seal":
-                    raise StorageFailedSafe(
-                        "Checkpoint publication requires accepted-token sealing"
-                    )
-                self._seal_checkpoint(reservation, tuple(value["tokens"]))
+                self._seal_checkpoint(reservation, tokens)
             else:
                 self._commit_store(reservation)
             for lease in reservation.leases:
@@ -878,6 +889,34 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 reservation.captured_end = max(reservation.captured_end, end)
         if not reservation.fragments:
             raise MemoryError("Local CPU store allocation refused")
+
+    def _checkpoint_seal_tokens(
+        self, reservation: _WriteReservation, value: dict[str, Any]
+    ) -> tuple[int, ...]:
+        packed = "tokens_u32_le" in value or "token_count" in value
+        if packed and "tokens" in value:
+            raise StorageFailedSafe("Ambiguous checkpoint token representation")
+        if packed:
+            count = value.get("token_count")
+            frame = value.get("tokens_u32_le")
+            try:
+                checked_uint(count)
+            except ValueError as error:
+                raise StorageFailedSafe("Invalid checkpoint token count") from error
+            if not isinstance(frame, bytes) or len(frame) != 4 * count:
+                raise StorageFailedSafe("Checkpoint tokens have the wrong byte length")
+        else:
+            if "tokens" not in value:
+                raise StorageFailedSafe("Checkpoint token representation is missing")
+            tokens = tuple(value["tokens"])
+            count = len(tokens)
+        if (
+            not max(reservation.options["base"], reservation.prefix_end)
+            < count
+            <= (reservation.captured_end)
+        ):
+            raise StorageFailedSafe("Invalid checkpoint seal frontier")
+        return unpack_uints(frame, count, 32) if packed else tokens
 
     def _seal_checkpoint(
         self, reservation: _WriteReservation, tokens: tuple[int, ...]

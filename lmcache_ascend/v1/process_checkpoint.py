@@ -5,7 +5,7 @@
 from concurrent.futures import TimeoutError
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import Any
+from typing import Annotated, Any
 from weakref import proxy
 import time
 
@@ -22,7 +22,11 @@ from lmcache.integration.vllm.preemption_checkpoint import (
 from lmcache.integration.vllm.storage_process import cancel_unadmitted_operation
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
-from lmcache.v1.rpc.storage_protocol import SourceGeometry, unpack_uints
+from lmcache.v1.rpc.storage_protocol import (
+    SourceGeometry,
+    pack_checkpoint_tokens_u32,
+    unpack_uints,
+)
 from lmcache.v1.shared_cpu_cache import LocalLeaseHandle, SharedHandleBatch
 from lmcache_ascend.v1.preemption_checkpoint import (
     CaptureJob,
@@ -444,15 +448,31 @@ class ProcessCheckpointWorker(CheckpointWorker):
         if job.cancelled:
             return 0
         state = self.reservations[job.spec.req_id, job.spec.generation]
+        payload: dict[str, Any] = {
+            "reservation_id": state.reply["reservation_id"],
+            "phase": "seal",
+            "proof": "fenced",
+        }
+        descriptor = getattr(self.context, "descriptor", {})
+        if descriptor.get("checkpoint_tokens_u32_le_v1") is True:
+            try:
+                frame = pack_checkpoint_tokens_u32(seal.tokens)
+            except msgspec.ValidationError:
+                # Wider supported integers retain their exact legacy encoding.
+                # Strict conversion still rejects bools, strings and negatives.
+                payload["tokens"] = msgspec.convert(
+                    seal.tokens,
+                    type=tuple[Annotated[int, msgspec.Meta(ge=0)], ...],
+                    strict=True,
+                )
+            else:
+                payload.update(token_count=len(frame) // 4, tokens_u32_le=frame)
+        else:
+            payload["tokens"] = seal.tokens
         self._call(
             job,
             "commit_write",
-            {
-                "reservation_id": state.reply["reservation_id"],
-                "phase": "seal",
-                "proof": "fenced",
-                "tokens": seal.tokens,
-            },
+            payload,
         )
         state.sealed = True
         job.publish_finished = time.monotonic()
