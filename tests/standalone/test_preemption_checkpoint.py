@@ -570,6 +570,106 @@ def test_invalid_block_table_refuses_before_allocation_or_device_work(api, monke
     store.close()
 
 
+@pytest.mark.parametrize("resident", [3, 100003])
+def test_capture_validates_each_covered_block_once(api, monkeypatch, resident):
+    control, module = api
+
+    class CountedBlocks(tuple):
+        def __getitem__(self, index):
+            if isinstance(index, int):
+                self.reads.append(index)
+            return super().__getitem__(index)
+
+    end, block_size = 100003, 128
+    groups = tuple(CountedBlocks(range(1, (end + 127) // 128 + 1)) for _ in range(2))
+    for blocks in groups:
+        blocks.reads = []
+    engine = fake_engine()
+    worker = module.CheckpointWorker(engine)
+
+    def refuse(*args):
+        raise MemoryError("stop after validation")
+
+    monkeypatch.setattr(worker, "_reserve_fragments", refuse)
+    try:
+        worker.capture(
+            control.CaptureSpec("r", 1, 0, end, resident, groups),
+            {0: [1], 1: [2]},
+            block_size,
+        )
+        assert worker.poll()[0].reason == "stop after validation"
+        assert groups[0].reads == (
+            list(range(resident // block_size, len(groups[0])))
+            if resident < end
+            else []
+        )
+        assert groups[1].reads == list(range(len(groups[1])))
+        assert not engine.allocated and not engine.calls
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        ([], []),
+        ([3], [3]),
+        ([1], [13]),
+        ([3, 4, 8], [4, 8, 11]),
+        ([1, 9], [3, 13]),
+        ([3, 128, 256], [128, 256, 513]),
+        ([1, 257], [129, 513]),
+    ],
+)
+def test_bulk_checkpoint_slots_match_exact_fragment_order(api, monkeypatch, ranges):
+    _, module = api
+    starts, ends = ranges
+    blocks, block_size = (9, 2, 17, 4) * 80, 4
+    requested = []
+
+    def tensor(values, **kwargs):
+        requested.append(kwargs.pop("pin_memory"))
+        return torch.tensor(values, **kwargs)
+
+    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
+    result = module._checkpoint_slot_mapping(blocks, starts, ends, block_size)
+    assert result.tolist() == [
+        blocks[i // block_size] * block_size + i % block_size
+        for a, b in zip(starts, ends, strict=True)
+        for i in range(a, b)
+    ]
+    assert result.dtype == torch.long and result.is_contiguous()
+    assert requested == [True]
+
+
+def test_bulk_checkpoint_slots_do_not_wrap_int64(api, monkeypatch):
+    _, module = api
+    monkeypatch.setattr(
+        module,
+        "torch",
+        NS(
+            long=torch.long,
+            tensor=lambda values, **kw: torch.tensor(values, dtype=kw["dtype"]),
+        ),
+    )
+    limit = (1 << 63) - 1
+    # The final block's valid partial range fits even though its full extent does not.
+    blocks = (limit // 3,)
+    assert module._checkpoint_slot_mapping(blocks, [0], [2], 3).tolist() == [
+        limit - 1,
+        limit,
+    ]
+    with pytest.raises((OverflowError, RuntimeError, ValueError)):
+        module._checkpoint_slot_mapping(blocks, [0], [3], 3)
+    blocks = (1,) * 100 + blocks
+    assert module._checkpoint_slot_mapping(blocks, [0], [302], 3).tolist()[-2:] == [
+        limit - 1,
+        limit,
+    ]
+    with pytest.raises((OverflowError, RuntimeError, ValueError)):
+        module._checkpoint_slot_mapping(blocks, [0], [303], 3)
+
+
 def test_boundary_assembly_reclaims_once_and_keeps_acquired_sources_protected(
     api, monkeypatch
 ):

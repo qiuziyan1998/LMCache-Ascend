@@ -23,6 +23,7 @@ from lmcache.integration.vllm.preemption_checkpoint import (
     SealSpec,
 )
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
+import numpy as np
 import torch
 
 
@@ -39,6 +40,49 @@ def clear_failure_tracebacks(error: BaseException) -> None:
         )
         pending.extend(getattr(current, "exceptions", ()))
         current.__traceback__ = None
+
+
+def _checkpoint_slot_mapping(
+    blocks: tuple[int, ...], starts: list[int], ends: list[int], block_size: int
+) -> torch.Tensor:
+    """Expand validated block IDs in bulk, preserving fragment order and pinning."""
+    count = sum(b - a for a, b in zip(starts, ends, strict=True))
+    if count < 64:
+        # For tiny tails, retain the cheaper existing construction.
+        return torch.tensor(
+            [
+                blocks[i // block_size] * block_size + i % block_size
+                for a, b in zip(starts, ends, strict=True)
+                for i in range(a, b)
+            ],
+            dtype=torch.long,
+            pin_memory=True,
+        )
+    slots = np.empty(count, dtype=np.int64)
+    offsets = np.arange(block_size, dtype=np.int64)
+    cursor = 0
+    for start, end in zip(starts, ends, strict=True):
+        count = end - start
+        if not count:
+            continue
+        first, stop = start // block_size, (end + block_size - 1) // block_size
+        ids = np.asarray(blocks[first:stop], dtype=np.int64)
+        if int(ids.max()) * block_size + block_size - 1 > np.iinfo(np.int64).max:
+            # Preserve exact partial-block behavior at the int64 boundary;
+            # NumPy arithmetic must not silently wrap an invalid slot address.
+            values = np.asarray(
+                [
+                    blocks[i // block_size] * block_size + i % block_size
+                    for i in range(start, end)
+                ],
+                dtype=np.int64,
+            )
+        else:
+            values = (ids[:, None] * block_size + offsets).reshape(-1)
+            values = values[start % block_size : start % block_size + count]
+        slots[cursor : cursor + count] = values
+        cursor += count
+    return torch.tensor(slots, dtype=torch.long, pin_memory=True)
 
 
 @dataclass
@@ -148,8 +192,14 @@ class CheckpointWorker:
             for group in (0, 1):
                 start = spec.resident_start if group == 0 else spec.base
                 blocks = spec.blocks[group]
-                if (spec.end + block_size - 1) // block_size > len(blocks) or any(
-                    blocks[i // block_size] <= 0 for i in range(start, spec.end)
+                if (spec.end + block_size - 1) // block_size > len(blocks) or (
+                    start < spec.end and any(
+                        blocks[i] <= 0
+                        for i in range(
+                            start // block_size,
+                            (spec.end + block_size - 1) // block_size,
+                        )
+                    )
                 ):
                     raise ValueError("Checkpoint source includes released/null blocks")
             job.captured_end = self._reserve_fragments(job, caches)
@@ -158,15 +208,7 @@ class CheckpointWorker:
                 starts = [a for a, _, _, _ in fragments]
                 ends = [b for _, b, _, _ in fragments]
                 blocks = spec.blocks[group]
-                slots = torch.tensor(
-                    [
-                        blocks[i // block_size] * block_size + i % block_size
-                        for a, b in zip(starts, ends, strict=True)
-                        for i in range(a, b)
-                    ],
-                    dtype=torch.long,
-                    pin_memory=True,
-                )
+                slots = _checkpoint_slot_mapping(blocks, starts, ends, block_size)
                 device_work_started = True
                 self._begin_capture(job)
                 plan = self.engine.gpu_connector.prepare_group_capture(
