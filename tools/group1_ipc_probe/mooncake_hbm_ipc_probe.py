@@ -93,6 +93,28 @@ def child_runtime():
     return torch
 
 
+def pointer_diagnostic(tensor, stage: str) -> dict:
+    """Record raw ACL results without assuming a particular binding schema."""
+    storage = tensor.untyped_storage()
+    record = {
+        "stage": stage, "device": tensor.device.index,
+        "storage_pointer": int(storage.data_ptr()),
+        "view_pointer": int(tensor.data_ptr()),
+        "storage_bytes": int(storage.nbytes()),
+    }
+    for name in ("storage", "view"):
+        try:
+            import acl
+
+            record[name + "_attributes"] = repr(
+                acl.rt.pointer_get_attributes(record[name + "_pointer"])
+            )
+        except Exception as exc:
+            record[name + "_attributes"] = f"{type(exc).__name__}: {exc}"
+    log("pointer_attributes", **record)
+    return record
+
+
 def hold_resources(conn, reason: str) -> None:
     """Keep the child's stack/owners alive when safe retirement is unproven."""
     log("QUARANTINED", reason=reason)
@@ -128,6 +150,7 @@ def owner_main(conn, device: int) -> None:
             "exporter_pointer": int(view.data_ptr()),
             "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
             "torch": torch.__version__, "device_name": torch.npu.get_device_name(device),
+            "pointer_attributes": pointer_diagnostic(view, "exporter"),
         }
         conn.send({"event": "owner_ready", "descriptor": descriptor})
         # The root and exported view remain explicitly owned until M retires.
@@ -301,6 +324,7 @@ class Reader:
 
 def storage_main(conn, options, descriptors) -> None:
     readers, views, imported_storages = [], {}, []
+    diagnostics = []
     safe = False
     failure = None
     try:
@@ -322,18 +346,33 @@ def storage_main(conn, options, descriptors) -> None:
             views[device] = view
             log("imported", device=device, imported_pointer=int(view.data_ptr()),
                 exporter_pointer=descriptor["exporter_pointer"], view_offset=descriptor["storage_offset"])
+            diagnostics.append(pointer_diagnostic(view, "importer_before_transport"))
             if options["engine_mode"] == "per-device" or not readers:
                 # Retain an object even when its constructor partially fails.
                 reader = Reader.__new__(Reader)
                 readers.append(reader)
                 reader.__init__(torch, options, device)
             reader = readers[-1] if options["engine_mode"] == "per-device" else readers[0]
-            reader.register_device(view)
+            diagnostics.append(pointer_diagnostic(view, "importer_after_transport"))
+            try:
+                reader.register_device(view)
+            except Exception:
+                # A failed registration has submitted no GET. Compare an
+                # ordinary M-owned allocation, without registering or copying it.
+                try:
+                    control = torch.empty(GUARD, dtype=torch.uint8, device=f"npu:{device}")
+                    diagnostics.append(pointer_diagnostic(control, "importer_owned_control"))
+                    diagnostics.append(pointer_diagnostic(view, "importer_after_control"))
+                    del control
+                except Exception as exc:
+                    diagnostics.append({"stage": "control_failed", "error": repr(exc)})
+                raise
         device_readers = {
             descriptor["device"]: readers[index] if options["engine_mode"] == "per-device" else readers[0]
             for index, descriptor in enumerate(descriptors)
         }
-        conn.send({"event": "storage_ready", "module": module.__file__})
+        conn.send({"event": "storage_ready", "module": module.__file__,
+                   "pointer_diagnostics": diagnostics})
         with ThreadPoolExecutor(max_workers=len(descriptors)) as pool:
             while True:
                 command = conn.recv()
@@ -373,12 +412,14 @@ def storage_main(conn, options, descriptors) -> None:
         if "storage" in locals():
             del storage
         safe = True
-        conn.send({"event": "storage_closed", "safe": True, "error": failure, "warnings": warnings})
+        conn.send({"event": "storage_closed", "safe": True, "error": failure,
+                   "warnings": warnings, "pointer_diagnostics": diagnostics})
     except BaseException:
         detail = traceback.format_exc()
         safe = False
         try:
-            conn.send({"event": "storage_failed", "safe": False, "error": failure, "cleanup_error": detail})
+            conn.send({"event": "storage_failed", "safe": False, "error": failure,
+                       "cleanup_error": detail, "pointer_diagnostics": diagnostics})
         except (EOFError, OSError):
             log("lost_supervisor", error=detail)
     if not safe:

@@ -1,9 +1,10 @@
 Local validation: 2026-10-19
 
 python -m unittest -v test_probe_cpu.py
-  14 tests passed; no skips.
+  16 tests passed; no skips.
   Includes real CPU subprocess protocol tests and a real CPU Torch/mmap fixture
   alignment, content and explicit-retirement test. Mooncake calls are mocked.
+  Includes raw ACL pointer-query recording and diagnostic-error containment.
 
 ruff check --isolated --select E9,F,B mooncake_hbm_ipc_probe.py test_probe_cpu.py
   Passed.

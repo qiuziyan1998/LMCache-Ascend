@@ -100,6 +100,11 @@ transfer, and is not a throughput benchmark.
 owner_error: device initialization or IPC export failed.
 imported: M reconstructed the exported view; registration may still fail later.
 reader_ready: engine and Store setup succeeded; no HBM data transfer proven yet.
+pointer_attributes: raw acl.rt.pointer_get_attributes results for storage base
+and view address in W, and M before/after transport setup. If registration fails,
+the probe also queries a fresh 4 KiB M-owned allocation and rechecks the imported
+view. These records are included in the JSON report as well as the log. No memory
+type is guessed and diagnostic failure does not override the registration result.
 storage_ready: all imported HBM registrations succeeded.
 phase_result with ok=true: byte counts, actual data and guards passed that case.
 Fixture PUT failed: inspect source allocation/master/storage setup first; this

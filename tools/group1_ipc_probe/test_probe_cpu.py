@@ -2,7 +2,9 @@
 """CPU-only helper/protocol tests. These do not qualify NPU IPC or Mooncake."""
 
 import json
+import contextlib
 import ctypes
+import io
 import mmap
 import multiprocessing as mp
 from pathlib import Path
@@ -11,6 +13,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import mooncake_hbm_ipc_probe as probe
 
@@ -51,6 +54,38 @@ def fake_storage(conn, options, descriptors):
 
 
 class Helpers(unittest.TestCase):
+    def test_pointer_diagnostics_query_base_and_offset_view(self):
+        calls = []
+
+        def query(ptr):
+            calls.append(ptr)
+            return ({"location": {"type": 7, "id": 0}}, 0)
+
+        tensor = SimpleNamespace(
+            device=SimpleNamespace(index=0), data_ptr=lambda: 8192,
+            untyped_storage=lambda: SimpleNamespace(data_ptr=lambda: 4096, nbytes=lambda: 16384),
+        )
+        with patch.dict("sys.modules", {"acl": SimpleNamespace(rt=SimpleNamespace(pointer_get_attributes=query))}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                record = probe.pointer_diagnostic(tensor, "importer")
+        self.assertEqual(calls, [4096, 8192])
+        self.assertEqual(record["storage_attributes"], repr(({"location": {"type": 7, "id": 0}}, 0)))
+        self.assertEqual(record["view_pointer"], 8192)
+
+    def test_pointer_query_error_is_diagnostic_not_a_registration_override(self):
+        def query(ptr):
+            raise RuntimeError("query unsupported")
+
+        tensor = SimpleNamespace(
+            device=SimpleNamespace(index=0), data_ptr=lambda: 8192,
+            untyped_storage=lambda: SimpleNamespace(data_ptr=lambda: 4096, nbytes=lambda: 16384),
+        )
+        with patch.dict("sys.modules", {"acl": SimpleNamespace(rt=SimpleNamespace(pointer_get_attributes=query))}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                record = probe.pointer_diagnostic(tensor, "importer")
+        self.assertEqual(record["storage_attributes"], "RuntimeError: query unsupported")
+        self.assertEqual(record["view_attributes"], "RuntimeError: query unsupported")
+
     def test_layout_and_guards(self):
         for case, rows in probe.CASES.items():
             probe.validate_runs(rows, probe.VIEW_BYTES)
