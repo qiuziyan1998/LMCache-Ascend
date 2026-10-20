@@ -2,6 +2,7 @@
 # Standard
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 import os
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -24,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.forward_context import is_forward_context_available
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
@@ -33,6 +35,11 @@ import torch
 from lmcache_ascend.v1.content_diagnostics import (
     log_npu_content_diagnostic_event,
     npu_content_diagnostics_enabled,
+)
+from lmcache_ascend.v1.npu_connector.prefill_overlap import (
+    AclEventTimer,
+    PrefillOverlapRecorder,
+    single_request_span,
 )
 from lmcache_ascend.v1.remote_fill_producer import parse_remote_fill_handoff
 
@@ -288,6 +295,26 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             .strip()
             .lower() == "true"
         )
+        self._prefill_overlap_enabled = bool(
+            self._force_layerwise_prefill_store
+            and ascend_envs.VLLM_ASCEND_PREFILL_OVERLAP_STATS
+        )
+        self._prefill_overlap_recorder = None
+        if self._prefill_overlap_enabled and role == KVConnectorRole.WORKER:
+            device = torch.npu.current_device()
+            self._prefill_overlap_recorder = PrefillOverlapRecorder(
+                partial(torch.npu.Event, enable_timing=True),
+                logger.info,
+                elapsed_time=AclEventTimer(),
+                worker=dict(
+                    tp_rank=get_tensor_model_parallel_rank(),
+                    dp_rank=int(vllm_config.parallel_config.data_parallel_index),
+                ),
+                initialize_thread=partial(torch.npu.set_device, device),
+            )
+            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
+                self._prefill_overlap_recorder
+            )
         get_extra = getattr(self.config, "get_extra_config_value", None)
         _validate_remote_fill_sleep_mode(self.config, vllm_config)
         self._remote_store_requested = bool(
@@ -402,6 +429,25 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             })
         )
 
+    def _build_request_meta(
+        self, tracker: Any, load_spec: Any, *, is_sparse_decode: bool = False,
+    ) -> Optional[ReqMeta]:
+        metadata = super()._build_request_meta(
+            tracker, load_spec, is_sparse_decode=is_sparse_decode,
+        )
+        if (
+            metadata is not None
+            and getattr(self, "_prefill_overlap_enabled", False)
+            and not is_sparse_decode
+        ):
+            request = self._unfinished_requests.get(tracker.req_id)
+            if request is not None:
+                start = int(request.num_computed_tokens)
+                end = min(len(tracker.token_ids), int(tracker.prompt_len))
+                if start < end:
+                    metadata.prefill_overlap_span = (start, end)
+        return metadata
+
     def start_load_kv(
         self,
         forward_context: ForwardContext,
@@ -409,6 +455,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     ) -> None:
         """Start loads and arm a real producer-event handoff when required."""
 
+        recorder = getattr(self, "_prefill_overlap_recorder", None)
+        if recorder is not None:
+            requests = self._parent._get_connector_metadata().requests
+            recorder.begin_step(single_request_span(
+                requests, forward_context.attn_metadata,
+            ))
+            self._prefill_overlap_step_active = recorder.active is not None
+            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
+                recorder if self._prefill_overlap_step_active else None
+            )
         if getattr(self, "_force_layerwise_prefill_store", False):
             self.lmcache_engine.poll_layerwise_prefill_puts()
         if (
@@ -424,7 +480,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request.request_configs,
                     group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
                 )
-        super().start_load_kv(forward_context, **kwargs)
+        try:
+            super().start_load_kv(forward_context, **kwargs)
+        except BaseException:
+            if recorder is not None:
+                recorder.finish_step("incomplete")
+            raise
         if forward_context.attn_metadata is None or not self.config.dsa_two_groups:
             return
         requests = self._direct_prefill_requests() or []
@@ -441,6 +502,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             logger.warning(
                 "Conflicting live-source event handoff; using persistent fallback"
             )
+
+    def wait_for_save(self) -> None:
+        """Seal timing events after all ordinary bank submissions, without a fence."""
+        recorder = getattr(self, "_prefill_overlap_recorder", None)
+        try:
+            super().wait_for_save()
+        except BaseException:
+            if recorder is not None:
+                recorder.finish_step("incomplete")
+            raise
+        else:
+            if recorder is not None:
+                recorder.finish_step()
 
     def capture_live_source_event_handoff(
         self,

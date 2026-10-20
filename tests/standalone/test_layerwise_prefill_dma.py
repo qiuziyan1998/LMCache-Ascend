@@ -983,6 +983,8 @@ def test_source_readiness_without_saves_adds_no_bank_work():
 def _rank0_publication_boundary(connector, messages):
     """Execute the real inherited handle try/error-envelope/publication block."""
     path = Path(__file__).parents[3] / "LMCache-NPU/lmcache/v1/cache_engine.py"
+    if not path.exists():
+        path = Path(__file__).parents[3] / "LMCache/lmcache/v1/cache_engine.py"
     cls = next(node for node in ast.parse(path.read_text()).body
                if isinstance(node, ast.ClassDef) and node.name == "LMCacheEngine")
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
