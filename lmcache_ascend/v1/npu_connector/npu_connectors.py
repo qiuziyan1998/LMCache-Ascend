@@ -285,21 +285,21 @@ def _prefill_dma_plans(
     cycle,
     plan_cache: Optional[dict[tuple[int, int], IncrementalDmaPlan]] = None,
 ) -> tuple:
-    """Plan both P-node banks once, before entering the model forward.
+    """Plan all P-node banks once, before entering the model forward.
 
     Cycle tables were built from the registered allocator layout at startup.
     Only segment boundaries are indexed; no token scan or D2H sync is needed.
     """
     started = time.perf_counter() if prefill_start_timing_enabled() else 0.0
-    if len(block_ids_by_bank) != 2:
-        raise ValueError("Layerwise prefill DMA requires two bank block maps")
+    if not block_ids_by_bank:
+        raise ValueError("Layerwise prefill DMA requires bank block maps")
     if (not kvcaches[0][0].is_contiguous()
             or not kvcaches[0][-1].is_contiguous()):
         raise ValueError("Layerwise prefill DMA requires contiguous NPU planes")
     capacity = int(kvcaches[0][0].shape[0]) * int(kvcaches[0][0].shape[1])
     plans = []
     pending_states = {}
-    for bank in range(2):
+    for bank in range(len(block_ids_by_bank)):
         if plan_cache is None:
             plan = cycle.plan_block_id_ranges(
                 block_ids_by_bank[bank], block_size, starts, ends, slot_mapping_base
@@ -327,7 +327,7 @@ def _prefill_dma_plans(
         prefill_start_timing_log(
             logger, "dma_plan", started, direction=direction,
             kv_group=kv_group, tokens=sum(chunk_sizes),
-            segments_by_bank=[len(plans[0]), len(plans[1])],
+            segments_by_bank=[len(plan) for plan in plans],
         )
     return tuple(plans)
 
@@ -1928,6 +1928,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip().lower() == "true"
         )
+        configured_bank_count = 2
+        if self._layerwise_prefill_dma:
+            from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
+            configured_bank_count = layerwise_prefill_bank_count()
         self.load_stream_num = 4
         self.load_stream_list = [
             torch.cuda.Stream() for __ in range(self.load_stream_num)
@@ -2002,7 +2007,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # (when there is no load for the layer that is about to use it).
         # Keep the state per KV group: latent and indexer own independent
         # physical banks even though they share the connector streams.
-        self._layerwise_prefill_bank_counts: dict[int, int] = {}
+        self._layerwise_prefill_bank_counts: dict[int, int] = (
+            dict.fromkeys((0, 1), configured_bank_count)
+            if self._layerwise_prefill_dma else {}
+        )
         self._layerwise_prefill_transfer_generations: dict[int, int] = {}
         # Raw layerwise-prefill DMA uses one FIFO stream per physical bank and
         # KV group.  Save/load operations for a bank must share this stream:
@@ -2166,12 +2174,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         return watchdog
 
     def layerwise_prefill_store_fences(self, kv_group: int) -> tuple[Any, ...]:
-        """Borrow the current generation's two bank-tail D2H events.
+        """Borrow the current generation's bank-tail D2H events.
 
         Call only after draining ``batched_from_gpu`` for the entire KV group.
         Each returned event is recorded after the last save DMA submitted on
         one physical bank stream.  Because operations on each bank stream are
-        ordered, the two tail events fence every earlier save DMA for this
+        ordered, the tail events fence every earlier save DMA for this
         chunk while avoiding a host-side synchronization.  Empty means
         unavailable.
         """
@@ -2442,7 +2450,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         generation = self._layerwise_prefill_transfer_generation(kv_group)
         tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
         events = tuple(
-            record[1] for bank in range(2)
+            record[1] for bank in range(
+                self._layerwise_prefill_transfer_state()[0].get(kv_group, 2)
+            )
             if (record := tails.get((kv_group, bank))) is not None
             and record[0] == generation
         )
@@ -2464,11 +2474,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
         producers = tuple(
             (bank, record[1])
-            for bank in range(2)
+            for bank in range(
+                self._layerwise_prefill_transfer_state()[0].get(kv_group, 2)
+            )
             if (record := tails.get((kv_group, bank))) is not None
             and record[0] == generation
         )
-        for bank in range(2):
+        for bank in range(
+            self._layerwise_prefill_transfer_state()[0].get(kv_group, 2)
+        ):
             for source_bank, event in producers:
                 if source_bank != bank:
                     self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
@@ -4775,8 +4789,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("Uniform-C8 banked prefill needs an explicit logical capacity")
         if getattr(self, "indexer_hbm_block_map", None) is not None:
             raise ValueError("Banked prefill requires BF16 logical IDs, not a paired map")
-        if len(block_ids_by_bank) != 2 or block_size != 128:
-            raise ValueError("Banked C8 requires two logical bank maps with 128-token blocks")
+        if not block_ids_by_bank or block_size != 128:
+            raise ValueError(
+                "Banked C8 requires logical bank maps with 128-token blocks"
+            )
         if any(factor != (2 if self.indexer_c8_layout.is_c8(i) else 1)
                for i, factor in enumerate(layout.layer_slot_factors)):
             raise ValueError("Banked mixed-C8 requires factor-2 INT8 and factor-1 BF16 views")
@@ -4859,7 +4875,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     *metadata))
             ready = torch.npu.Event()
             ready.record(transfer_stream)
-        for bank in range(2):
+        for bank in range(len(block_ids_by_bank)):
             self._layerwise_prefill_dma_stream(1, bank).wait_event(ready)
         return prepared
 
@@ -6829,7 +6845,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             layerwise_prefill_bank_offset = int(
                 kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-            ) & 1
+            ) % layerwise_prefill_bank_count
+        if prefill_dma and (
+            len(kwargs["prefill_dma_block_ids_by_bank"]) != layerwise_prefill_bank_count
+        ):
+            raise ValueError("Prefill DMA bank maps disagree with the rotation depth")
         if deferred_dense_direct_get:
             self._set_layerwise_prefill_bank_count(
                 kv_group,
@@ -6939,10 +6959,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
             if plan_cache is not None:
                 reused_plans = sum(
-                    plan_cache[(kv_group, bank)].reused_chunks > 0 for bank in range(2)
+                    plan_cache[(kv_group, bank)].reused_chunks > 0
+                    for bank in range(len(dma_plans))
                 )
-                plan_mode = ("full", "mix", "reuse")[reused_plans]
-                for bank in range(2):
+                plan_mode = (
+                    "full" if reused_plans == 0 else
+                    "reuse" if reused_plans == len(dma_plans) else "mix"
+                )
+                for bank in range(len(dma_plans)):
                     if plan_cache[(kv_group, bank)].mapping_changed:
                         for cache_key in tuple(bound_loads):
                             if cache_key[0] == kv_group and cache_key[2] == bank:
@@ -8671,10 +8695,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 layerwise_prefill_bank_offset = int(
                     kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-                ) & 1
+                ) % layerwise_prefill_bank_count
             if layerwise_prefill_bank_count <= 0:
                 raise ValueError(
                     "layerwise_prefill_bank_count must be positive"
+                )
+            if prefill_dma and (
+                len(kwargs["prefill_dma_block_ids_by_bank"])
+                != layerwise_prefill_bank_count
+            ):
+                raise ValueError(
+                    "Prefill DMA bank maps disagree with the rotation depth"
                 )
             # The fallback path reuses one staging tensor for every layer, so
             # it cannot safely pipeline multiple source banks. Keep its
@@ -8747,7 +8778,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             )
                         deferred_dma_copies.append(bind_copy_addresses(
                             dma_plans[
-                                (layer_id + layerwise_prefill_bank_offset) % 2
+                                (layer_id + layerwise_prefill_bank_offset)
+                                % source_bank_count
                             ],
                             host_ptrs,
                             [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],

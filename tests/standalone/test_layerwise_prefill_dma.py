@@ -145,7 +145,7 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
     )
     save = ast.parse(
         "def save(self, layer_id, kv_group, bank, current_stream):\n"
-        "    deferred_dma_copies = [[]] * 4\n"
+        "    deferred_dma_copies = [[]] * self._expected_group_layers(kv_group)\n"
         "    prefill_packet = getattr(self, 'test_prefill_packet', False)\n"
         "    prefill_packets = None\n"
     ).body[0]
@@ -717,11 +717,11 @@ class _AsyncNPU:
             self.current = previous
 
 
-def _async_bank_connector(group, offset):
+def _async_bank_connector(group, offset, bank_count=2, layers=4):
     packet = group == "c8"
     group = 1 if packet else group
     npu = _AsyncNPU()
-    banks = [_AsyncStream(), _AsyncStream()]
+    banks = [_AsyncStream() for _ in range(bank_count)]
     contents = {}
     pending = []
     observed = []
@@ -737,9 +737,14 @@ def _async_bank_connector(group, offset):
         bank.enqueue(lambda: contents.__setitem__(bank, value))
 
     submit, _, _ = _reuse_debug_connector(
-        False, npu=npu, copy_hook=copy, layers=4,
+        False, npu=npu, copy_hook=copy, layers=layers,
     )
     obj = submit.connector
+    obj.kvcaches = [(torch.zeros((bank_count * 4, 4, 2)),) for _ in range(layers)]
+    obj._layerwise_prefill_transfer_state()[0][group] = bank_count
+    obj._layerwise_prefill_bank = (
+        lambda layer, group, phase: (layer + phase) % bank_count
+    )
     obj._layerwise_prefill_dma_stream = lambda group, bank: banks[bank]
     obj.test_prefill_packet = packet
     if packet:
@@ -758,9 +763,12 @@ def _async_bank_connector(group, offset):
             starts, [start + 4 for start in starts],
             slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
             kv_group=group, req_id="request", deferred_layerwise_get=True,
-            prefill_dma_block_ids_by_bank=((0, 1, 2, 3), (4, 5, 6, 7)),
+            prefill_dma_block_ids_by_bank=tuple(
+                tuple(range(bank * 4, bank * 4 + 4)) for bank in range(bank_count)
+            ),
             prefill_dma_block_size=4, layerwise_prefill_bank_offset=offset,
-            prefill_c8_memory_objs=[submit.owners[:chunk + 1]] * 4,
+            layerwise_prefill_bank_count=bank_count,
+            prefill_c8_memory_objs=[submit.owners[:chunk + 1]] * layers,
         )
         next(generator)
 
@@ -771,7 +779,7 @@ def _async_bank_connector(group, offset):
         return generator, load
 
     def read(chunk, layer):
-        bank = banks[(layer + offset) % 2]
+        bank = banks[(layer + offset) % bank_count]
 
         def verify():
             assert contents[bank] == (chunk, layer), "KV bank overwritten early"
@@ -784,12 +792,60 @@ def _async_bank_connector(group, offset):
         obj.record_layerwise_prefill_bank_use(layer, group, (offset,), event)
 
     def save(layer):
-        obj.save(layer, group, (layer + offset) % 2, npu.compute)
+        obj.save(layer, group, (layer + offset) % bank_count, npu.compute)
 
     return NS(
         npu=npu, banks=banks, contents=contents, observed=observed,
         start=start, read=read, save=save, saved=saved, connector=obj,
     )
+
+
+@pytest.mark.parametrize("bank_count", [1, 3, 8])
+@pytest.mark.parametrize("group", [0, 1, "c8"])
+@pytest.mark.parametrize("has_save", [False, True])
+def test_configurable_bank_dma_rotation_never_overwrites_pending_compute(
+    bank_count, group, has_save,
+):
+    layers = 19
+    api = _async_bank_connector(group, bank_count - 1, bank_count, layers)
+    for chunk in range(3):
+        generator, load = api.start(chunk)
+        for layer in range(min(bank_count, layers)):
+            load(layer)
+        for layer in range(layers):
+            api.read(chunk, layer)
+            if has_save:
+                api.save(layer)
+            if layer + bank_count < layers:
+                load(layer + bank_count)
+        next(generator)
+        generator.close()
+    assert api.observed == api.saved == []
+    for bank in reversed(api.banks):
+        bank.tail.run()
+    api.npu.compute.tail.run()
+    expected = [(chunk, layer) for chunk in range(3) for layer in range(layers)]
+    assert api.observed == expected
+    if has_save:
+        assert sorted(api.saved) == expected
+
+
+def test_eight_bank_source_readiness_includes_the_last_bank_producer():
+    api = _async_bank_connector(0, 7, bank_count=8)
+    published = []
+    tails = {}
+    for bank_id, stream in enumerate(api.banks):
+        stream.enqueue(lambda bank_id=bank_id: published.append(bank_id))
+        event = api.npu.Event()
+        event.record(stream)
+        tails[(0, bank_id)] = (0, event, bank_id, "previous chunk")
+    api.connector._layerwise_prefill_bank_tail_events = tails
+    api.connector._prepare_layerwise_prefill_source_readiness(0)
+    seen = []
+    api.banks[5].enqueue(lambda: seen.extend(sorted(published)))
+    assert published == seen == []
+    api.banks[5].tail.run()
+    assert seen == list(range(8))
 
 
 @pytest.mark.parametrize("group", [0, 1, "c8"])
