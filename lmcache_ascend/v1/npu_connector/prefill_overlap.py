@@ -19,6 +19,7 @@ import socket
 
 
 LOG_MARKER = "[PREFILL_OVERLAP]"
+COVERAGE_DEFINITION = "same_bank_reuse_v1"
 MAX_PENDING_STEPS = 32
 MAX_POOLED_EVENTS = 4096
 POLL_SECONDS = 0.02
@@ -118,26 +119,28 @@ def summarize_step(
     batch: StepTimings,
     elapsed_time: Callable[[Any, Any], float],
 ) -> dict[str, Any]:
-    """Read a completed batch and average per-layer coverage, excluding L0.
+    """Compare consecutive consumers of the SAME physical bank in a KV group.
 
     A model-layer start is its LAST bank consumer gate's END event, so both
     latent and indexer waits precede that start. Indexer waits carry the actual
     model-layer number, not the sparse group ordinal.
-    For each consecutive pair, coverage = 1 - wait(next) / (start(next)-start).
-    The final statistic is the arithmetic mean, NOT a ratio of summed times.
+    The denominator spans the previous and current model-layer ready events
+    for that bank, not adjacent model layers. Each gate contributes its own
+    bank wait. Average valid bank ratios within each model layer, then average
+    model layers so layers with an indexer do not receive extra weight.
     Negative measurements are preserved for diagnosis instead of clamped.
     """
     starts: dict[int, Any] = {}
-    latent_layers: set[int] = set()
     waits: dict[int, float] = {}
+    consumers: dict[tuple[int, Optional[int], int], float] = {}
     banks: dict[tuple[int, Optional[int]], dict[str, Any]] = {}
     for item in batch.intervals:
         duration = elapsed_time(item.start, item.end)
         if item.kind == "wait":
             waits[item.model_layer] = waits.get(item.model_layer, 0.0) + duration
             starts[item.model_layer] = item.end
-            if item.group == 0:
-                latent_layers.add(item.model_layer)
+            key = (item.group, item.bank, item.model_layer)
+            consumers[key] = consumers.get(key, 0.0) + duration
         else:
             entry = banks.setdefault(
                 (item.group, item.bank),
@@ -145,22 +148,48 @@ def summarize_step(
             )
             entry[item.kind + "_ms"] += duration
 
-    ratios, wait_ms, interval_ms = [], 0.0, 0.0
-    layers = sorted(latent_layers)
-    for previous, current in zip(layers, layers[1:], strict=False):
-        if current != previous + 1:
+    layer_ratios: dict[int, list[float]] = {}
+    previous_layers: dict[tuple[int, int], int] = {}
+    bank_ratios: dict[tuple[int, int], list[float]] = {}
+    wait_ms, interval_ms, initial_bank_wait_ms = 0.0, 0.0, 0.0
+    unknown_bank_waits, invalid_intervals = 0, 0
+    for (group, bank, current), waited in consumers.items():
+        if bank is None:
+            unknown_bank_waits += 1
+            continue
+        identity = (group, bank)
+        entry = banks.setdefault(
+            identity,
+            dict(group=group, bank=bank, load_ms=0.0, save_ms=0.0),
+        )
+        previous = previous_layers.get(identity)
+        previous_layers[identity] = current
+        if previous is None:
+            initial_bank_wait_ms += waited
+            entry["initial_wait_ms"] = waited
             continue
         period = elapsed_time(starts[previous], starts[current])
         if period <= 0:
+            invalid_intervals += 1
             continue
-        waited = waits.get(current, 0.0)
-        ratios.append(1.0 - waited / period)
+        ratio = 1.0 - waited / period
+        layer_ratios.setdefault(current, []).append(ratio)
+        bank_ratios.setdefault(identity, []).append(ratio)
+        entry["wait_ms"] = entry.get("wait_ms", 0.0) + waited
+        entry["interval_ms"] = entry.get("interval_ms", 0.0) + period
         wait_ms += waited
         interval_ms += period
+    ratios = [sum(values) / len(values) for values in layer_ratios.values()]
+    for identity, entry in banks.items():
+        values = bank_ratios.get(identity, [])
+        entry["reuse_samples"] = len(values)
+        entry["coverage"] = sum(values) / len(values) if values else None
     load_ms = sum(row["load_ms"] for row in banks.values())
     save_ms = sum(row["save_ms"] for row in banks.values())
     return dict(
-        schema_version=1,
+        schema_version=2,
+        coverage_definition=COVERAGE_DEFINITION,
+        coverage_aggregation="mean_layer_mean_bank_ratios",
         status=batch.status,
         scope="single_request_step",
         start_definition="last_bank_ready",
@@ -171,14 +200,21 @@ def summarize_step(
         ],
         coverage=(sum(ratios) / len(ratios) if ratios else None),
         layer_samples=len(ratios),
+        bank_reuse_samples=sum(len(values) for values in bank_ratios.values()),
         wait_ms=wait_ms,
         interval_ms=interval_ms,
-        first_layer_wait_ms=waits.get(layers[0], 0.0) if layers else 0.0,
+        first_layer_wait_ms=waits[min(waits)] if waits else 0.0,
+        initial_bank_wait_ms=initial_bank_wait_ms,
         all_wait_ms=sum(waits.values()),
+        unknown_bank_waits=unknown_bank_waits,
+        invalid_reuse_intervals=invalid_intervals,
         load_ms=load_ms,
         save_ms=save_ms,
         dma_ms=load_ms + save_ms,
-        out_of_range_layers=sum(not 0.0 <= ratio <= 1.0 for ratio in ratios),
+        out_of_range_layers=sum(
+            any(not 0.0 <= ratio <= 1.0 for ratio in values)
+            for values in layer_ratios.values()
+        ),
         banks=list(banks.values()),
     )
 
@@ -334,7 +370,8 @@ class PrefillOverlapRecorder:
                 + " "
                 + json.dumps(
                     dict(
-                        schema_version=1,
+                        schema_version=2,
+                        coverage_definition=COVERAGE_DEFINITION,
                         status="collector_error",
                         error=str(error),
                         **self.worker,

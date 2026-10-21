@@ -85,11 +85,11 @@ def test_acl_timer_reports_runtime_error_instead_of_inventing_zero_time():
         timer(NS(npu_event=1), NS(npu_event=2))
 
 
-def interval(kind, group, layer, start, end, model_layer=None):
+def interval(kind, group, layer, start, end, model_layer=None, bank=...):
     return overlap.TimingInterval(
         kind,
         group,
-        layer % 2,
+        layer % 2 if bank is ... else bank,
         layer,
         layer if model_layer is None else model_layer,
         DeviceEvent(start),
@@ -97,47 +97,121 @@ def interval(kind, group, layer, start, end, model_layer=None):
     )
 
 
-def test_mean_of_layer_ratios_not_ratio_of_sums_and_excludes_first():
+def test_same_bank_mean_of_layer_ratios_and_all_ready_layer_starts():
     batch = overlap.StepTimings(1, (("r", 4096, 8192),))
     batch.intervals = [
-        interval("wait", 0, 0, 0, 1),
-        interval("wait", 0, 1, 9, 11),
-        interval("wait", 0, 2, 21, 25),
+        interval("wait", 0, 0, 0, 1, bank=0),
+        interval("wait", 0, 1, 9, 11, bank=0),
+        interval("wait", 0, 2, 21, 29, bank=0),
         # Sparse indexer row 1 belongs to MODEL layer 2, not model layer 1.
-        interval("wait", 1, 1, 25, 31, model_layer=2),
+        interval("wait", 1, 1, 29, 31, model_layer=2),
         interval("load", 0, 0, 0, 3),
         interval("save", 0, 1, 10, 15),
         interval("load", 1, 1, 16, 20),
     ]
     result = overlap.summarize_step(batch, event_elapsed)
     assert result["layer_samples"] == 2
-    assert result["coverage"] == pytest.approx((0.8 + 0.5) / 2)
-    assert result["coverage"] != pytest.approx(1 - 12 / 30)
+    assert result["schema_version"] == 2
+    assert result["coverage_definition"] == "same_bank_reuse_v1"
+    assert result["coverage"] == pytest.approx((0.8 + 0.6) / 2)
+    assert result["coverage"] != pytest.approx(1 - 10 / 30)
     assert result["first_layer_wait_ms"] == 1
-    assert result["wait_ms"] == 12
+    assert result["wait_ms"] == 10
+    assert result["initial_bank_wait_ms"] == 3
+    assert result["all_wait_ms"] == 13
     assert result["load_ms"] == 7
     assert result["save_ms"] == 5
     assert result["dma_ms"] == 12
     assert result["requests"][0]["token_end"] == 8192
 
 
-def test_missing_layer_and_single_layer_have_no_invented_sample():
+def test_different_banks_and_unknown_bank_have_no_invented_reuse_sample():
     batch = overlap.StepTimings(1, (("r", 0, 17),))
     batch.intervals = [interval("wait", 0, 0, 0, 1)]
     assert overlap.summarize_step(batch, event_elapsed)["coverage"] is None
-    batch.intervals.append(interval("wait", 0, 2, 10, 11))
+    batch.intervals.append(interval("wait", 0, 2, 10, 11, bank=1))
     assert overlap.summarize_step(batch, event_elapsed)["layer_samples"] == 0
+    batch.intervals.append(interval("wait", 0, 3, 20, 21, bank=None))
+    result = overlap.summarize_step(batch, event_elapsed)
+    assert result["layer_samples"] == 0 and result["unknown_bank_waits"] == 1
+    assert result["all_wait_ms"] == 3
+
+
+@pytest.mark.parametrize("bank_count", [2, 4, 8])
+def test_real_same_bank_predecessor_tracks_rotation_and_chunk_phase(bank_count):
+    batch = overlap.StepTimings(1, (("r", 4096, 8192),))
+    expected = []
+    for layer in range(bank_count * 2):
+        waited = 1 if layer < bank_count else layer - bank_count + 2
+        end = layer * 10 + waited
+        batch.intervals.append(
+            interval(
+                "wait",
+                0,
+                layer,
+                layer * 10,
+                end,
+                bank=(layer + 1) % bank_count,
+            )
+        )
+        if layer >= bank_count:
+            previous_start = (layer - bank_count) * 10 + 1
+            expected.append(1 - waited / (end - previous_start))
+    result = overlap.summarize_step(batch, event_elapsed)
+    assert result["layer_samples"] == bank_count
+    assert result["bank_reuse_samples"] == bank_count
+    assert result["coverage"] == pytest.approx(sum(expected) / bank_count)
+    assert result["initial_bank_wait_ms"] == bank_count
+    assert all(bank["reuse_samples"] == 1 for bank in result["banks"])
+
+
+def test_sparse_indexer_pairs_its_own_bank_across_nonadjacent_model_layers():
+    batch = overlap.StepTimings(1, (("r", 4096, 8192),))
+    for ordinal, model_layer in enumerate([3, 7, 11, 15, 19]):
+        batch.intervals.append(
+            interval(
+                "wait",
+                1,
+                ordinal,
+                ordinal * 10,
+                ordinal * 10 + 1,
+                model_layer=model_layer,
+                bank=(ordinal + 2) % 4,
+            )
+        )
+    result = overlap.summarize_step(batch, event_elapsed)
+    assert result["bank_reuse_samples"] == result["layer_samples"] == 1
+    assert result["coverage"] == pytest.approx(1 - 1 / 40)
+
+
+def test_kv_groups_have_independent_banks_and_model_layers_have_equal_weight():
+    batch = overlap.StepTimings(1, (("r", 4096, 8192),))
+    batch.intervals = [
+        interval("wait", 0, 0, 0, 1),
+        interval("wait", 1, 0, 1, 2),
+        interval("wait", 0, 1, 10, 11),
+        interval("wait", 1, 1, 11, 12),
+        interval("wait", 0, 2, 20, 24),
+        interval("wait", 1, 2, 24, 26),
+        interval("wait", 0, 3, 30, 31),
+    ]
+    result = overlap.summarize_step(batch, event_elapsed)
+    layer2 = ((1 - 4 / 24) + (1 - 2 / 24)) / 2
+    layer3 = 1 - 1 / 19
+    assert result["coverage"] == pytest.approx((layer2 + layer3) / 2)
+    assert result["layer_samples"] == 2 and result["bank_reuse_samples"] == 3
+    assert result["initial_bank_wait_ms"] == 4
+    assert result["wait_ms"] == 7 and result["all_wait_ms"] == 11
 
 
 def test_out_of_range_ratios_are_not_silently_clamped():
     batch = overlap.StepTimings(1, (("r", 0, 4096),))
     batch.intervals = [
         interval("wait", 0, 0, 0, 8),
-        interval("wait", 0, 1, 2, 3),
-        interval("wait", 1, 0, 4, 9, model_layer=1),
+        interval("wait", 0, 1, 2, 9, bank=0),
     ]
     result = overlap.summarize_step(batch, event_elapsed)
-    assert result["coverage"] == -5
+    assert result["coverage"] == -6
     assert result["out_of_range_layers"] == 1
 
 
@@ -246,7 +320,7 @@ def test_real_collector_thread_owns_queries_elapsed_time_and_logging():
         recorder.begin_step((("r", 0, 4096),))
         for layer in range(2):
             stream.time = layer * 10
-            ticket = recorder.start_interval("wait", stream, 0, layer, layer)
+            ticket = recorder.start_interval("wait", stream, 0, 0, layer)
             stream.time += 1
             recorder.end_interval(ticket, stream)
         recorder.finish_step()
