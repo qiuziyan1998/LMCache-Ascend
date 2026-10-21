@@ -568,6 +568,24 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self._store_worker_thread.start()
 
+    def _post_init_shared_cpu_cache(self) -> None:
+        worker = getattr(self, "checkpoint_worker", None)
+        if worker is not None and getattr(
+            self.config, "decode_checkpoint_writeback", False
+        ):
+            try:
+                worker.local.validate_capacity()
+            except Exception as error:
+                # Peers are waiting for the existing shared-cache envelope.
+                # Validate before the base preflight can publish success.
+                if self.enable_shared_cpu_cache and self.metadata.world_size > 1:
+                    self.broadcast_object_fn(
+                        self._shared_cpu_cache_startup_envelope("error", str(error)),
+                        self.metadata.first_rank,
+                    )
+                raise
+        super()._post_init_shared_cpu_cache()
+
     def post_init(self, **kwargs) -> None:
         if getattr(self, "checkpoint_worker", None) is not None and not (
             callable(getattr(self.gpu_connector, "supports_preemption_capture", None))
@@ -10982,6 +11000,63 @@ class AscendLMCacheEngine(LMCacheEngine):
         if local is None or not local.use_hot:
             raise RuntimeError("Local checkpoint storage is unavailable")
         return local
+
+    def checkpoint_resume_admitted(
+        self, req_id: str, generation: int, load_generation: int
+    ) -> None:
+        """Join resumed dispatch with the existing TP release acknowledgement."""
+        if self.checkpoint_worker is not None:
+            self.checkpoint_worker.restore_event(
+                req_id, generation, load_generation, "admitted"
+            )
+
+    def probe_checkpoint_pages(self, keys: list) -> list[bool]:
+        """Distinguish confirmed missing remote pages from transport errors."""
+        return self.storage_manager.batched_external_pages_exist(keys, strict=True)
+
+    def persist_checkpoint_page(
+        self, key: CacheEngineKey, page: Any, req_id: str
+    ) -> Future:
+        """Submit a sealed page; the caller retains its owner until completion."""
+        return self.storage_manager.batched_put_external_pages(
+            [key],
+            [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+            [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+            (page.raw_data,),
+            None,
+            req_id,
+        )
+
+    def load_checkpoint_page(
+        self, key: CacheEngineKey, group: int, tokens: int, req_id: str
+    ) -> Any:
+        """Load a canonical checkpoint page, retaining unknown native destinations."""
+        try:
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        except MemoryError:
+            if not self.reclaim_checkpoint_capacity(tokens, {group: None}):
+                raise
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        try:
+            self.storage_manager.batched_get_external_pages(
+                [key],
+                [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+                [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+                (page.raw_data,),
+                req_id,
+            )
+            self.validate_checkpoint_page(group, page)
+            return page
+        except NativeExternalPageTransferUnknownError:
+            self.__dict__.setdefault("_checkpoint_quarantined_owners", []).append(page)
+            raise
+        except BaseException as error:
+            page.ref_count_down()
+            failed = getattr(error, "failed_pages", ())
+            if failed and all(status <= 0 for _, status, _ in failed):
+                if not self.probe_checkpoint_pages([key])[0]:
+                    return None
+            raise
 
     def checkpoint_page_key(
         self, spec: Any, group: int, start: int, end: int

@@ -20,6 +20,9 @@ class LocalCheckpoint:
     tokens: tuple[int, ...]
     prefix_end: int
     groups: tuple[tuple[CheckpointPage, ...], tuple[CheckpointPage, ...]]
+    request_configs: Any = None
+    identity: tuple[str, int] | None = None
+    retention_id: object | None = None
 
 
 class LocalCheckpointStore:
@@ -54,7 +57,6 @@ class LocalCheckpointStore:
         This is a short ownership lease, never a reservation while waiting for
         HBM. Missing/evicted pages shorten coverage instead of causing a spin.
         """
-        backend = self.engine.checkpoint_backend()
         groups: list[list[tuple[CheckpointPage, Any]]] = [[], []]
         ends = []
         try:
@@ -65,17 +67,10 @@ class LocalCheckpointStore:
                         continue
                     if source.start > cursor or cursor >= end:
                         break
-                    pages, count = backend.batched_get_layer_page_prefix([source.key])
-                    if not count:
+                    page = self.get_page(manifest, group, source)
+                    if page is None:
                         break
-                    page = pages[0]
                     groups[group].append((source, page))
-                    if (
-                        not page.is_valid()
-                        or page.valid_tokens < source.end - source.start
-                    ):
-                        raise ValueError("Invalid local checkpoint page")
-                    self.engine.validate_checkpoint_page(group, page)
                     cursor = min(source.end, end)
                 ends.append(cursor)
             common = min(ends)
@@ -86,6 +81,89 @@ class LocalCheckpointStore:
         except BaseException:
             self.release(groups)
             raise
+
+    def get_page(
+        self, manifest: LocalCheckpoint, group: int, source: CheckpointPage
+    ) -> Any:
+        """Acquire and validate an actual cache owner, or report a local miss."""
+        pages, count = self.engine.checkpoint_backend().batched_get_layer_page_prefix(
+            [source.key]
+        )
+        if not count:
+            return None
+        page = pages[0]
+        try:
+            if not page.is_valid() or page.valid_tokens < source.end - source.start:
+                raise ValueError("Invalid local checkpoint page")
+            self.engine.validate_checkpoint_page(group, page)
+            return page
+        except BaseException:
+            page.ref_count_down()
+            raise
+
+    def build_page(
+        self,
+        manifest: LocalCheckpoint,
+        sources: list,
+        group: int,
+        start: int,
+        end: int,
+        key: Any,
+        configs: Any,
+        reserve: Any,
+    ) -> Any:
+        """Return one owned canonical page without changing aliases or manifests."""
+        selected = [(s, p) for s, p in sources if s.start < end and s.end > start]
+        if (
+            len(selected) == 1
+            and selected[0][0].start == start
+            and selected[0][0].end == end
+            and selected[0][1].valid_tokens == end - start
+        ):
+            page = selected[0][1]
+            page.ref_count_up()
+            return page
+        cached = self.engine.get_checkpoint_prefix(key, group, end - start)
+        if cached is not None:
+            return cached[0]
+        prefix = page = None
+        try:
+            base = (
+                manifest.prefix_end
+                // int(self.engine.config.chunk_size)
+                * int(self.engine.config.chunk_size)
+            )
+            if start == base and selected and selected[0][0].start > base:
+                prefix = reserve(
+                    lambda: self.engine.load_checkpoint_prefix(
+                        manifest.tokens[: manifest.prefix_end], group, configs
+                    ),
+                    group,
+                    manifest.prefix_end - base,
+                )
+                selected.insert(
+                    0,
+                    (
+                        CheckpointPage(
+                            base, min(manifest.prefix_end, selected[0][0].start), None
+                        ),
+                        prefix,
+                    ),
+                )
+            page, widths = reserve(
+                lambda: self.engine.allocate_checkpoint_fragment(group, end - start),
+                group,
+                end - start,
+            )
+            self._assemble(page, widths, selected, start, end)
+            return page
+        except BaseException:
+            if page is not None:
+                page.ref_count_down()
+            raise
+        finally:
+            if prefix is not None:
+                prefix.ref_count_down()
 
     @staticmethod
     def release(groups: list[list[tuple[CheckpointPage, Any]]]) -> None:
@@ -153,56 +231,16 @@ class LocalCheckpointStore:
                         raise ValueError(
                             "Normalized checkpoint coverage has a gap or overlap"
                         )
-                    selected = [
-                        (source, page)
-                        for source, page in sources
-                        if source.start < end and source.end > start
-                    ]
-                    if (
-                        len(selected) == 1
-                        and selected[0][0].start == start
-                        and selected[0][0].end == end
-                        and selected[0][1].valid_tokens == end - start
-                    ):
-                        page = selected[0][1]
-                        page.ref_count_up()
-                    else:
-                        cached = self.engine.get_checkpoint_prefix(
-                            key, group, end - start
-                        )
-                        if cached is not None:
-                            page, _ = cached
-                        else:
-                            if start == base and sources[0][0].start > base:
-                                # Fetch the exact original partial page only
-                                # when assembling a boundary that is not cached.
-                                prefix = reserve(
-                                    lambda: self.engine.load_checkpoint_prefix(
-                                        manifest.tokens[: manifest.prefix_end],
-                                        group,
-                                        request_configs,
-                                    ),
-                                    group,
-                                    manifest.prefix_end - base,
-                                )
-                                owners.append(prefix)
-                                prefix_stop = min(
-                                    manifest.prefix_end, sources[0][0].start
-                                )
-                                selected.insert(
-                                    0,
-                                    (CheckpointPage(base, prefix_stop, None), prefix),
-                                )
-                            page, widths = reserve(
-                                lambda: self.engine.allocate_checkpoint_fragment(
-                                    group, end - start
-                                ),
-                                group,
-                                end - start,
-                            )
-                            owners.append(page)
-                            self._assemble(page, widths, selected, start, end)
-                            page = owners.pop()
+                    page = self.build_page(
+                        manifest,
+                        sources,
+                        group,
+                        start,
+                        end,
+                        key,
+                        request_configs,
+                        reserve,
+                    )
                     owners.append(page)
                     keys.append(key)
                     pages.append(page)
@@ -218,8 +256,9 @@ class LocalCheckpointStore:
                 updated = list(manifest.groups)
                 updated[group] = tuple(normalized)
                 with self.lock:
+                    previous = manifest
                     manifest = replace(manifest, groups=tuple(updated))
-                    if (req_id, generation) in self.manifests:
+                    if self.manifests.get((req_id, generation)) is previous:
                         self.manifests[req_id, generation] = manifest
                 for source, _ in groups[group]:
                     if self.engine.is_checkpoint_page_key(source.key):

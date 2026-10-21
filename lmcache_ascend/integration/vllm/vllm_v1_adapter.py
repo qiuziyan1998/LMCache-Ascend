@@ -1834,6 +1834,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return False
         worker = self.lmcache_engine.checkpoint_worker
         if worker is not None:
+            notify = getattr(worker, "restore_event", None)
+            if notify is not None:
+                notify(
+                    request.req_id, request.load_spec.checkpoint_generation,
+                    generation, "failed",
+                )
             worker.results.append(
                 CheckpointResult(
                     request.req_id,
@@ -1906,6 +1912,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         parallel = vllm_config.parallel_config
         spec = vllm_config.speculative_config
         shared_cpu = config.get_extra_config_value("enable_shared_cpu_cache", config.enable_shared_cpu_cache)
+        if getattr(config, "decode_checkpoint_writeback", False):
+            from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
+            from lmcache.v1.storage_backend.connector.base_connector import (
+                resolve_save_chunk_meta,
+            )
+            if (
+                not str(config.remote_url).startswith("mooncakestore://")
+                or not mooncake_page_layout_enabled(config)
+                or resolve_save_chunk_meta(config)
+            ):
+                raise ValueError(
+                    "Checkpoint write-back requires the Mooncake page-first backend"
+                )
         if not (
             self.kv_role == "kv_both" and config.pd_role == "receiver"
             and config.store_async and config.use_layerwise and shared_cpu

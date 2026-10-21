@@ -50,6 +50,7 @@ class CaptureJob:
     )
     plans: list[Any] = field(default_factory=list)
     prefix_sources: tuple[CheckpointPage, ...] = ()
+    prefix_owners: list[Any] = field(default_factory=list)
     captured_end: int = 0
     future: Future | None = None
     cancelled: bool = False
@@ -74,10 +75,23 @@ class CheckpointWorker:
         self.timeout = float(engine.config.blocking_timeout_secs)
         self.chunk_size = int(engine.config.chunk_size)
         self.local = LocalCheckpointStore(engine)
+        if getattr(engine.config, "decode_checkpoint_writeback", False):
+            from lmcache_ascend.v1.checkpoint_writeback import CheckpointWritebackStore
+
+            self.local = CheckpointWritebackStore(engine, self.executor)
 
     def begin_restore(self, req_id: str, generation: int, load_generation: int) -> None:
         """Keep release controls active until the scheduler acknowledges every TP."""
         self.restore_owners.setdefault((req_id, generation, load_generation), [])
+        self.restore_event(req_id, generation, load_generation, "begin")
+
+    def restore_event(
+        self, req_id: str, generation: int, load_generation: int, event: str
+    ) -> None:
+        """Notify optional waiting retention without changing restore ownership."""
+        notify = getattr(self.local, "restore_event", None)
+        if notify is not None:
+            notify((req_id, generation), load_generation, event)
 
     def hold_restore(
         self, req_id: str, generation: int, load_generation: int, owners: list[Any]
@@ -91,6 +105,7 @@ class CheckpointWorker:
         """Retire one attempt only after its all-worker receive acknowledgement."""
         for page in self.restore_owners.pop((req_id, generation, load_generation), ()):
             page.ref_count_down()
+        self.restore_event(req_id, generation, load_generation, "ack")
 
     def _allocate_fragment(
         self, group: int, tokens: int, caches: Any = None
@@ -145,6 +160,16 @@ class CheckpointWorker:
                     )
                     if b > spec.prefix_end and a < spec.resident_start
                 )
+                if getattr(self.engine.config, "decode_checkpoint_writeback", False):
+                    for source in job.prefix_sources:
+                        pages, count = (
+                            self.engine.checkpoint_backend().batched_get_layer_page_prefix(
+                                [source.key]
+                            )
+                        )
+                        job.prefix_owners.extend(pages)
+                        if count:
+                            self.engine.validate_checkpoint_page(0, pages[0])
             for group in (0, 1):
                 start = spec.resident_start if group == 0 else spec.base
                 blocks = spec.blocks[group]
@@ -332,6 +357,7 @@ class CheckpointWorker:
                 seal.tokens,
                 spec.prefix_end,
                 tuple(tuple(sorted(g, key=lambda p: p.start)) for g in groups),
+                spec.request_configs,
             ),
         )
         job.publish_finished = time.monotonic()
@@ -339,6 +365,9 @@ class CheckpointWorker:
 
     def poll(self) -> tuple[CheckpointResult, ...]:
         """Advance control-only requests and retire completed buffer owners."""
+        fatal = getattr(self.local, "fatal", None)
+        if fatal is not None:
+            raise RuntimeError("Checkpoint write-back requires restart") from fatal
         if not self.jobs and not self.results:
             return ()
         for key, job in tuple(self.jobs.items()):
@@ -414,6 +443,9 @@ class CheckpointWorker:
             )
         for req_id, generation in tuple(self.jobs):
             self.cancel(req_id, generation)
+        close = getattr(self.local, "close", None)
+        if close is not None:
+            close()
         self.executor.shutdown(wait=True)
         self.poll()
 
@@ -426,3 +458,6 @@ class CheckpointWorker:
                 page.ref_count_down()
         job.fragments.clear()
         job.plans.clear()
+        for page in job.prefix_owners:
+            page.ref_count_down()
+        job.prefix_owners.clear()
