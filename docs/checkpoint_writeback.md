@@ -7,10 +7,24 @@ require a separate storage process or a Mooncake/native extension rebuild.
 
 ## Configuration
 
-Keep the existing supported decoder checkpoint configuration, including the
-shared-CPU two-group layout, asynchronous stores, cold compact loading,
-`persistent_direct_hbm`, and the ordinary/one-token-MTP checkpoint restrictions.
-Mooncake must use the existing metadata-free page-first format.
+Keep the shared-CPU two-group layout, asynchronous stores, cold compact loading,
+and the ordinary/one-token-MTP checkpoint restrictions. Mooncake must use the
+existing metadata-free page-first format. A disaggregated receiver continues to
+use `pd_role: receiver` and `dsa_group1_load_mode: persistent_direct_hbm`.
+
+A standalone `kv_both` server leaves `pd_role` unset (or `null`) and can retain
+the default `dsa_group1_load_mode: p2p_preferred`. The CPU-loading alternatives
+`persistent_serial` and `persistent_parallel_prefetch` are also supported.
+Standalone restore requires `extra_config.mooncake_layer_merged_page_objects:
+true` and `extra_config.save_chunk_meta: false`, in addition to the shared-CPU
+page-first settings. It does not require `enable_remote_lmcache_store` or a
+RemoteFill service. Keep the existing standalone prefill store configuration.
+
+Standalone checkpoint restore prepares both groups through the existing
+shared-CPU loader, after checkpoint normalization. The receiver's direct-HBM
+prompt-index load is unchanged. Standalone startup still budgets HBM for normal
+prefill; checkpoint support does not enable the receiver-only compact startup
+memory budget or establish standalone 1M-context capacity.
 
 The feature is off by default. Example initial budgets for a **200 GiB CPU heap**:
 
