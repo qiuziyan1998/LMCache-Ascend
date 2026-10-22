@@ -16,6 +16,7 @@ from ctypes.util import find_library
 import json
 import os
 import socket
+import time
 
 
 LOG_MARKER = "[PREFILL_OVERLAP]"
@@ -119,6 +120,8 @@ class StepTimings:
     intervals: list[TimingInterval] = field(default_factory=list)
     tails: dict[int, Any] = field(default_factory=dict)
     status: str = "complete"
+    # Submission time only anchors offline plots; durations use device events.
+    start_time_ns: int = field(default_factory=time.time_ns)
 
 
 def summarize_step(
@@ -219,6 +222,8 @@ def summarize_step(
         scope="batch_step" if len(batch.requests) > 1 else "single_request_step",
         start_definition="last_bank_ready",
         step=batch.step,
+        batch_start_time_ns=batch.start_time_ns,
+        time_basis="host_batch_submission",
         requests=[
             dict(req_id=req, token_start=start, token_end=end)
             for req, start, end in batch.requests

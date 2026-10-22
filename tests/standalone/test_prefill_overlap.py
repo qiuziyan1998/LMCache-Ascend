@@ -45,6 +45,31 @@ def event_elapsed(start, end):
     return start.elapsed_time(end)
 
 
+def test_batch_timestamp_is_captured_at_submission_not_collector_emission():
+    emitted = []
+    recorder = overlap.PrefillOverlapRecorder(
+        DeviceEvent,
+        emitted.append,
+        worker={},
+        elapsed_time=event_elapsed,
+        start_worker=False,
+    )
+    recorder.begin_step((("r", 0, 4096),))
+    timestamp = recorder.active.start_time_ns
+    assert timestamp > 0
+    stream = NS(time=0.0, ready=True)
+    ticket = recorder.start_interval("load", stream, 0, 0, 0)
+    stream.time = 3.0
+    recorder.end_interval(ticket, stream)
+    recorder.finish_step()
+    assert not emitted
+    assert recorder.poll()
+    result = json.loads(emitted[0].split(overlap.LOG_MARKER)[1])
+    assert result["batch_start_time_ns"] == timestamp
+    assert result["time_basis"] == "host_batch_submission"
+    assert result["load_ms"] == 3.0
+
+
 def test_acl_timer_uses_raw_handles_and_never_torch_elapsed_or_sync():
     calls = []
 
