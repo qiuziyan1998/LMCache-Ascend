@@ -4,6 +4,7 @@
 import ast
 from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace as NS, MethodType
 from typing import Any, List, Union
@@ -34,6 +35,7 @@ def fixture():
         int32=torch.int32,
         int64=torch.int64,
         long=torch.long,
+        uint8=torch.uint8,
         npu=NS(
             current_stream=lambda: stream,
             Event=lambda: NS(record=lambda s: events.append("event")),
@@ -53,6 +55,7 @@ def fixture():
         MemoryObj=Any,
         PreparedGroupCapture=None,
         dataclass=dataclass,
+        pairwise=pairwise,
         LayerPageMemoryObj=Page,
         prepare_sparse_direct_layer_state=lambda *a: object(),
         dense_mla_dsa_group_direct_kv_transfer_fast=native,
@@ -80,12 +83,10 @@ def fixture():
         "enqueue_group_capture",
         "batched_from_gpu_group",
     }
-    nodes.append(
-        next(
-            n
-            for n in source.body
-            if isinstance(n, ast.FunctionDef) and n.name == "_layer_memory_tensor"
-        )
+    nodes.extend(
+        n for n in source.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in {"_layer_memory_tensor", "_checkpoint_page_rows"}
     )
     nodes += [
         n

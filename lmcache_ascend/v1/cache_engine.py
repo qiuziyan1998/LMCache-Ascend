@@ -11011,12 +11011,40 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
     def checkpoint_token_results(
-        self, tokens: list[int], request_configs: Any, kv_group: int, state: dict
+        self,
+        tokens: list[int],
+        request_configs: Any,
+        kv_group: int,
+        state: dict,
+        *,
+        start: int = 0,
     ) -> Iterable[tuple[int, int, CacheEngineKey]]:
-        """Reuse paired prefix hashes within one checkpoint operation."""
-        return super()._dense_retrieve_token_results(
-            tokens, None, request_configs, kv_group,
-            {"shared_cpu_request_preflight_state": state},
+        """Hash once per operation; only build keys for its checkpoint windows.
+
+        State is private to one immutable token/configuration snapshot and start.
+        The complete prefix hash chain is computed even when its keys are unused.
+        """
+        plan = state.get("checkpoint_chunks")
+        if plan is None:
+            plan = tuple(
+                (a, b, digest)
+                for a, b, digest in self.token_database.process_tokens(
+                    tokens=tokens,
+                    make_key=False,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+                if a >= start
+            )
+            state["checkpoint_chunks"] = plan
+        generated = self.token_database.process_tokens(
+            hashes=[entry[2] for entry in plan],
+            offsets=[entry[1] - entry[0] for entry in plan],
+            request_configs=request_configs,
+            kv_group=kv_group,
+        )
+        return (
+            (a, b, key) for (a, b, _), (_, _, key) in zip(plan, generated, strict=True)
         )
 
     def probe_checkpoint_pages(self, keys: list) -> list[bool]:
@@ -11101,14 +11129,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         self, tokens: tuple[int, ...], group: int, configs: Any
     ) -> Any:
         """Retain the exact original boundary page, fetching only that page on miss."""
-        start, end, key = list(
+        start, end, key = deque(
             self.token_database.process_tokens(
                 tokens=list(tokens),
                 request_configs=configs,
                 kv_group=group,
-            )
-        )[-1]
-        cached = self.get_checkpoint_prefix(key, group, end - start)
+            ),
+            maxlen=1,
+        ).pop()
+        cached = self.get_checkpoint_prefix(key, group, end - start, with_widths=False)
         if cached is not None:
             return cached[0]
         page, _ = self.allocate_checkpoint_fragment(group, end - start)
@@ -11347,8 +11376,10 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         return allocate
 
-    def get_checkpoint_prefix(self, key: CacheEngineKey, group: int, tokens: int) -> Any:
-        """Retain an exact CPU page, or let checkpoint persistence fetch it."""
+    def get_checkpoint_prefix(
+        self, key: CacheEngineKey, group: int, tokens: int, *, with_widths: bool = True
+    ) -> Any:
+        """Retain an exact CPU page, optionally computing assembly plane widths."""
         local = self._shared_local_cpu_backend()
         pages, count = local.batched_get_layer_page_prefix([key])
         if not count:
@@ -11361,7 +11392,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             and page.get_dtype() == self._shared_cpu_dtype_for_kv_group(group)
             and page.metadata.fmt == self._memory_format_for_kv_group(group)
         ):
-            return page, self.gpu_connector.checkpoint_plane_widths(group)
+            return page, (
+                self.gpu_connector.checkpoint_plane_widths(group) if with_widths else ()
+            )
         page.ref_count_down()
         return None
 

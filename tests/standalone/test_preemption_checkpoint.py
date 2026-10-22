@@ -69,6 +69,13 @@ class Page:
         self.refs = 1
         self.metadata = NS(fmt="test")
         self.valid_tokens, self.num_layers = tokens, layers
+        self.group_prefix_sum = tuple(i * self.stride for i in range(layers + 1))
+
+    def layer_layout_is_valid(self):
+        return self.group_prefix_sum[-1] == self.raw_data.numel()
+
+    def get_dtypes(self):
+        return [torch.uint8] * self.num_layers
 
     def is_valid(self):
         return self.refs > 0
@@ -197,7 +204,7 @@ def fake_engine(group_layers=(2, 2)):
         fill(page, len(tokens) - length, group)
         return page
 
-    def cached_prefix(key, group, length):
+    def cached_prefix(key, group, length, *, with_widths=True):
         pages, count = backend.batched_get_layer_page_prefix([key])
         if count:
             if pages[0].valid_tokens == length:
@@ -245,8 +252,10 @@ def fake_engine(group_layers=(2, 2)):
         ),
         token_database=database,
         checkpoint_token_results=(
-            lambda tokens, configs, group, state: database.process_tokens(
-                tokens=tokens, request_configs=configs, kv_group=group
+            lambda tokens, configs, group, state, start=0: (
+                entry for entry in database.process_tokens(
+                    tokens=tokens, request_configs=configs, kv_group=group
+                ) if entry[0] >= start
             )
         ),
         num_layers=group_layers[0],

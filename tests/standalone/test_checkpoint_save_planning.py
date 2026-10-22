@@ -173,8 +173,11 @@ def test_page_building_receives_only_overlapping_sources(
 
 
 @pytest.mark.parametrize("byte_hash", [False, True])
-@pytest.mark.parametrize("length", [1, 4, 5, 11])
-def test_checkpoint_hash_reuse_preserves_exact_group_keys(key_types, byte_hash, length):
+@pytest.mark.parametrize("length", [1, 4, 5, 11, 67])
+@pytest.mark.parametrize("start", [0, 4, 64])
+def test_checkpoint_hash_reuse_preserves_exact_group_keys(
+    key_types, byte_hash, length, start
+):
     key_cls = key_types[0]
     key_cls.__post_init__.__globals__["TORCH_DTYPE_TO_STR_DTYPE"][torch.bfloat16] = (
         "bf16"
@@ -233,6 +236,12 @@ def test_checkpoint_hash_reuse_preserves_exact_group_keys(key_types, byte_hash, 
         base,
     )()
     engine.token_database = database
+    made_keys = []
+    make_key = database._make_key_by_hash
+    database._make_key_by_hash = lambda *args, **kwargs: (
+        made_keys.append((args, kwargs)),
+        make_key(*args, **kwargs),
+    )[1]
     # New operation/history must not consume the previous operation's hashes.
     for offset in (0, 100):
         tokens = list(range(offset, offset + length))
@@ -248,13 +257,66 @@ def test_checkpoint_hash_reuse_preserves_exact_group_keys(key_types, byte_hash, 
         ]
         assert len(hashed) == 2 * ((length + 3) // 4)
         hashed.clear()
+        made_keys.clear()
         state = {}
         actual = [
-            list(engine.checkpoint_token_results(tokens, configs, g, state))
+            list(
+                engine.checkpoint_token_results(tokens, configs, g, state, start=start)
+            )
             for g in (0, 1)
         ]
-        assert actual == expected
+        assert actual == [
+            [entry for entry in group if entry[0] >= start] for group in expected
+        ]
         assert len(hashed) == (length + 3) // 4
-        assert actual[0][-1][2].dtype == torch.bfloat16
-        assert actual[1][-1][2].dtype == torch.uint8
-        assert dict(actual[1][-1][2].tags)["dsa_idx"] == "v2"
+        assert len(made_keys) == sum(map(len, actual))
+        if actual[0]:
+            assert actual[0][-1][2].dtype == torch.bfloat16
+            assert actual[1][-1][2].dtype == torch.uint8
+            assert dict(actual[1][-1][2].tags)["dsa_idx"] == "v2"
+
+
+@pytest.mark.parametrize("widths", [(512, 64), ((4, 2), (3, 1))])
+def test_boundary_assembly_reuses_one_source_view_per_layer(api, monkeypatch, widths):
+    mixed = isinstance(widths[0], tuple)
+    # Unequal physical layer widths exercise the same implementation as C8 scales.
+    planes = widths if mixed else (widths,) * 3
+
+    def page(tokens):
+        p = Page(len(planes), tokens, (1,))
+        offsets = [0]
+        for layer in planes:
+            offsets.append(offsets[-1] + tokens * sum(layer))
+        p.raw_data = torch.arange(offsets[-1]).to(torch.uint8)
+        p.layer_tensor = lambda layer: p.raw_data[offsets[layer] : offsets[layer + 1]]
+        return p
+
+    first, second, output = page(4), page(3), page(4)
+    sources = [(NS(start=1, end=5), first), (NS(start=5, end=8), second)]
+    expected = []
+    reads = []
+    for layer, layer_widths in enumerate(planes):
+        reference, preceding = [], 0
+        for width in layer_widths:
+            reference.extend(
+                first.layer_tensor(layer)[
+                    4 * preceding + width : 4 * (preceding + width)
+                ].tolist()
+            )
+            reference.extend(
+                second.layer_tensor(layer)[
+                    3 * preceding : 3 * preceding + width
+                ].tolist()
+            )
+            preceding += width
+        expected.append(reference)
+    for p in (first, second):
+        original = p.layer_tensor
+        monkeypatch.setattr(
+            p,
+            "layer_tensor",
+            lambda layer, original=original: (reads.append(layer), original(layer))[1],
+        )
+    api[1].LocalCheckpointStore._assemble(output, widths, sources, 2, 6)
+    assert [output.layer_tensor(i).tolist() for i in range(len(planes))] == expected
+    assert len(reads) == 2 * len(planes)

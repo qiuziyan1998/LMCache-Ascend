@@ -1565,14 +1565,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         if metadata is not None and metadata.preemption_captures:
             self.lmcache_engine.enable_checkpoint_prefix_agreement()
+        waited_req_ids = None
         if worker is not None and metadata is not None:
             for req_id, generation in metadata.preemption_cancels:
                 worker.cancel(req_id, generation)
             captures = metadata.preemption_captures
             if captures:
                 self._activate_checkpoint_io()
-                self.lmcache_engine.wait_for_pending_stores(preempted_req_ids)
-                self.lmcache_engine.wait_for_direct_stores(preempted_req_ids)
+                # This also drains direct stores before capture/HBM reuse.
+                waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+                    preempted_req_ids
+                )
                 caches = self._direct_group_caches()
                 for capture in captures:
                     if capture.req_id in preempted_req_ids:
@@ -1590,10 +1593,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if not self.store_async or self.kv_role == "kv_consumer":
             return
 
-        waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
-            preempted_req_ids
-        )
-        self.lmcache_engine.wait_for_direct_stores(preempted_req_ids)
+        if waited_req_ids is None:
+            waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+                preempted_req_ids
+            )
         for req_id in preempted_req_ids:
             getattr(self, "_scheduler_remote_fill_results", {}).pop(
                 req_id, None

@@ -139,7 +139,9 @@ class LocalCheckpointStore:
             page = selected[0][1]
             page.ref_count_up()
             return page
-        cached = self.engine.get_checkpoint_prefix(key, group, end - start)
+        cached = self.engine.get_checkpoint_prefix(
+            key, group, end - start, with_widths=False
+        )
         if cached is not None:
             return cached[0]
         prefix = page = None
@@ -228,10 +230,8 @@ class LocalCheckpointStore:
                 keys, pages, normalized = [], [], []
                 covered = base
                 for start, end, key in self.engine.checkpoint_token_results(
-                    tokens, request_configs, group, chunk_plan
+                    tokens, request_configs, group, chunk_plan, start=base
                 ):
-                    if start < base:
-                        continue
                     if start != covered or not start < end <= len(tokens):
                         raise ValueError(
                             "Normalized checkpoint coverage has a gap or overlap"
@@ -337,25 +337,25 @@ class LocalCheckpointStore:
     ) -> None:
         """Copy CPU spans in layer/plane/token order with explicit coverage."""
         cursor = start
-        for source, _ in sources:
+        spans = []
+        for source, page in sources:
             left, right = max(start, source.start), min(end, source.end)
             if left != cursor:
                 raise ValueError("Local checkpoint boundary has a hole or overlap")
+            spans.append((page, left - source.start, left - start, right - left))
             cursor = right
         if cursor != end:
             raise ValueError("Local checkpoint boundary is incomplete")
         for layer in range(destination.num_layers):
             target = destination.layer_tensor(layer).reshape(-1)
-            preceding = 0
-            for width in (
+            layer_widths = (
                 widths[layer] if widths and isinstance(widths[0], tuple) else widths
-            ):
-                for source, page in sources:
-                    left, right = max(start, source.start), min(end, source.end)
-                    src = page.layer_tensor(layer).reshape(-1)
-                    a = page.valid_tokens * preceding + (left - source.start) * width
-                    b = (end - start) * preceding + (left - start) * width
-                    target[b : b + (right - left) * width].copy_(
-                        src[a : a + (right - left) * width]
-                    )
-                preceding += width
+            )
+            for page, source_offset, target_offset, count in spans:
+                src = page.layer_tensor(layer).reshape(-1)
+                preceding = 0
+                for width in layer_widths:
+                    a = page.valid_tokens * preceding + source_offset * width
+                    b = (end - start) * preceding + target_offset * width
+                    target[b : b + count * width].copy_(src[a : a + count * width])
+                    preceding += width

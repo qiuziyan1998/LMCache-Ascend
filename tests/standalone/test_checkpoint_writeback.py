@@ -446,6 +446,73 @@ def test_cancel_during_boundary_preparation_does_not_start_put(deployment):
     assert not engine.puts
 
 
+@pytest.mark.parametrize("stopped", ["cancelled", "restoring", "closed", "frozen"])
+def test_stopped_spill_skips_history_copy_and_hash_planning(deployment, stopped):
+    from dataclasses import replace
+
+    engine, create, _ = deployment
+    store = create()
+    record = store.local.records["r", 1]
+    calls = []
+
+    class History(tuple):
+        def __iter__(self):
+            calls.append("copy-history")
+            return super().__iter__()
+
+    record.manifest = replace(record.manifest, tokens=History(record.manifest.tokens))
+    original = engine.checkpoint_token_results
+
+    def plan(*args, **kwargs):
+        calls.append("plan-hashes")
+        return original(*args, **kwargs)
+
+    engine.checkpoint_token_results = plan
+    if stopped == "cancelled":
+        record.cancelled = True
+    elif stopped == "restoring":
+        record.attempts[1] = {"begin"}
+    elif stopped == "closed":
+        store.local.closed = True
+    else:
+        engine.is_frozen = lambda: True
+    assert store.local._spill(record, record.groups) == ()
+    assert not calls
+    assert not engine.puts
+
+
+def test_spill_cancelled_after_selection_retires_without_preparing(deployment):
+    engine, create, _ = deployment
+    store = create()
+    selected, resume = Event(), Event()
+    original = store.local._spill
+    calls = []
+    plan = engine.checkpoint_token_results
+
+    def prepare(*args, **kwargs):
+        calls.append("plan-hashes")
+        return plan(*args, **kwargs)
+
+    def gated(record, groups):
+        selected.set()
+        assert resume.wait(5)
+        return original(record, groups)
+
+    engine.checkpoint_token_results = prepare
+    store.local._spill = gated
+    engine.free = 0
+    store.local.wake.set()
+    try:
+        assert selected.wait(5)
+        store.cancel("r", 1)
+    finally:
+        resume.set()
+    wait(lambda: store.local.used == 0)
+    assert not calls and not engine.puts and not store.local.records
+    assert store.local.fatal is None
+    assert all(page.refs == 1 for page in engine.backend.pages.values())
+
+
 def test_gc_disabled_finish_releases_retention(deployment):
     engine, create, _ = deployment
     enabled = gc.isenabled()
@@ -552,7 +619,7 @@ def test_spill_and_normalize_have_independent_single_reclaim_budgets(
 
     engine.allocate_checkpoint_fragment = pressured_allocate
     engine.reclaim_checkpoint_capacity = lambda *args: (reclaims.append(args), True)[1]
-    engine.get_checkpoint_prefix = lambda *args: None
+    engine.get_checkpoint_prefix = lambda *args, **kwargs: None
     miss = sys.modules[
         "lmcache.integration.vllm.preemption_checkpoint"
     ].CheckpointRestoreMiss

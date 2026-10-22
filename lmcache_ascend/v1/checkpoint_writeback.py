@@ -217,8 +217,9 @@ class CheckpointWritebackStore(LocalCheckpointStore):
         for i, page in owners.items():
             _, count = self.charges[i]
             if count == 1:
-                self.used -= page.get_physical_size()
-                released += page.get_physical_size()
+                size = page.get_physical_size()
+                self.used -= size
+                released += size
                 del self.charges[i]
             else:
                 self.charges[i] = (page, count - 1)
@@ -313,6 +314,15 @@ class CheckpointWritebackStore(LocalCheckpointStore):
 
     def _spill(self, record: Retention, groups: list) -> tuple:
         """One canonical page per native PUT bounds workspace and lock occupancy."""
+        # The monitor drops its lock before calling us. Stop before copying the
+        # history or eagerly planning hashes if the selected work was withdrawn.
+        if (
+            record.cancelled
+            or record.attempts
+            or self.closed
+            or self.engine.is_frozen()
+        ):
+            return ()
         manifest = record.manifest
         remote = [[], []]
         chunk = int(self.engine.config.chunk_size)
@@ -325,10 +335,8 @@ class CheckpointWritebackStore(LocalCheckpointStore):
             covered = base
             select_sources = self._source_selector(groups[group])
             for start, end, key in self.engine.checkpoint_token_results(
-                tokens, manifest.request_configs, group, chunk_plan
+                tokens, manifest.request_configs, group, chunk_plan, start=base
             ):
-                if start < base:
-                    continue
                 if (
                     record.cancelled
                     or record.attempts
