@@ -285,13 +285,13 @@ def start_capture(
 ):
     control, module = api
     engine = engine or fake_engine()
-    original_tensor = torch.tensor
+    original_empty = torch.empty
 
-    def tensor(values, **kw):
+    def empty(shape, **kw):
         kw.pop("pin_memory", None)
-        return original_tensor(values, **kw)
+        return original_empty(shape, **kw)
 
-    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
+    monkeypatch.setattr(module, "torch", NS(empty=empty, long=torch.long))
     store = module.CheckpointWorker(engine)
     blocks = tuple(range(1, (end + 3) // 4 + 1))
     spec = control.CaptureSpec(
@@ -794,7 +794,7 @@ def test_c8_capture_quarantine_keeps_nonowning_launch_operands(api, monkeypatch)
         module,
         "torch",
         NS(
-            tensor=lambda values, **kw: torch.tensor(values, dtype=kw["dtype"]),
+            empty=lambda shape, **kw: torch.empty(shape, dtype=kw["dtype"]),
             long=torch.long,
         ),
     )

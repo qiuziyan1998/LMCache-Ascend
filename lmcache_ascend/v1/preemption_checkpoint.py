@@ -24,6 +24,32 @@ from lmcache.integration.vllm.preemption_checkpoint import (
 )
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 import torch
+import numpy as np
+
+
+def _checkpoint_slots(blocks, start: int, end: int, block_size: int) -> torch.Tensor:
+    """Build pinned slots for a validated, nonempty contiguous capture range."""
+    ids = np.asarray(
+        blocks[start // block_size : (end + block_size - 1) // block_size],
+        dtype=np.int64,
+    )
+    # NumPy arithmetic wraps; preserve the old tensor constructor's rejection
+    # of unrepresentable slots, including a partial final block.
+    limit = np.iinfo(np.int64).max
+    if (
+        len(ids) > 1 and int(ids[:-1].max()) * block_size + block_size - 1 > limit
+    ) or int(ids[-1]) * block_size + (end - 1) % block_size > limit:
+        raise OverflowError("Checkpoint slot exceeds int64")
+    storage = torch.empty((len(ids), block_size), dtype=torch.long, pin_memory=True)
+    np.add(
+        (ids * block_size)[:, None],
+        np.arange(block_size, dtype=np.int64),
+        out=storage.numpy(),
+    )
+    # A contiguous pinned view retains its backing allocation through the plan's
+    # host_metadata, including nonblocking upload and unknown-completion cleanup.
+    offset = start % block_size
+    return storage.view(-1)[offset : offset + end - start]
 
 
 @dataclass
@@ -229,15 +255,7 @@ class CheckpointWorker:
                 ends = [b for _, b, _ in fragments]
                 pages = [page for _, _, page in fragments]
                 blocks = spec.blocks[group]
-                slots = torch.tensor(
-                    [
-                        blocks[i // block_size] * block_size + i % block_size
-                        for a, b in zip(starts, ends, strict=True)
-                        for i in range(a, b)
-                    ],
-                    dtype=torch.long,
-                    pin_memory=True,
-                )
+                slots = _checkpoint_slots(blocks, starts[0], ends[-1], block_size)
                 device_work_started = True
                 plan = self.engine.gpu_connector.prepare_group_capture(
                     [pages] * self.engine.num_layers_for_group(group),
