@@ -65,32 +65,37 @@ class AclEventTimer:
         return float(elapsed.value)
 
 
-def single_request_span(
+def request_spans(
     requests: list[Any],
     attn_metadata: Any,
 ) -> tuple[tuple[str, int, int], ...]:
-    """Use CPU metadata to reject multi-request and dummy model batches.
+    """Identify all prefill requests in a model batch using CPU metadata.
 
     Connector metadata may omit requests that perform no cache operations.
     Check the actual attention batch as well, without device tensor readback.
     """
-    if len(requests) != 1 or not isinstance(attn_metadata, Mapping):
+    if not requests or not isinstance(attn_metadata, Mapping):
         return ()
-    request = requests[0]
-    span = getattr(request, "prefill_overlap_span", None)
-    if span is None or span[0] >= span[1]:
+    spans = []
+    for request in requests:
+        span = getattr(request, "prefill_overlap_span", None)
+        if span is None or span[0] >= span[1]:
+            return ()
+        spans.append((request.req_id, int(span[0]), int(span[1])))
+    expected_ids = {row[0] for row in spans}
+    if len(expected_ids) != len(spans):
         return ()
     metadata = next(iter(attn_metadata.values()), None)
     ids = getattr(metadata, "req_ids", None)
     if ids is not None:
-        if not isinstance(ids, (list, tuple)) or set(ids) != {request.req_id}:
+        if not isinstance(ids, (list, tuple)) or set(ids) != expected_ids:
             return ()
     else:
         # CPU shape only: query_start_loc has one more entry than requests.
         offsets = getattr(metadata, "query_start_loc_cpu", None)
-        if offsets is None or len(offsets) != 2:
+        if offsets is None or len(offsets) != len(spans) + 1:
             return ()
-    return ((request.req_id, int(span[0]), int(span[1])),)
+    return tuple(spans)
 
 
 @dataclass
@@ -104,6 +109,7 @@ class TimingInterval:
     model_layer: int
     start: Any
     end: Any
+    rotation_slot: Optional[int] = None
 
 
 @dataclass
@@ -129,17 +135,23 @@ def summarize_step(
     bank wait. Average valid bank ratios within each model layer, then average
     model layers so layers with an indexer do not receive extra weight.
     Negative measurements are preserved for diagnosis instead of clamped.
+
+    With mixed request phases, one consumer gate joins multiple banks. Its
+    rotation_slot identifies the group-layer ordinal modulo bank count: the
+    same per-request physical-bank assignment returns after a full rotation.
+    These batch gates are reported separately from physical-bank DMA totals.
     """
     starts: dict[int, Any] = {}
     waits: dict[int, float] = {}
-    consumers: dict[tuple[int, Optional[int], int], float] = {}
+    consumers: dict[tuple[int, Optional[int], Optional[int], int], float] = {}
     banks: dict[tuple[int, Optional[int]], dict[str, Any]] = {}
+    batch_slots: dict[tuple[int, int], dict[str, Any]] = {}
     for item in batch.intervals:
         duration = elapsed_time(item.start, item.end)
         if item.kind == "wait":
             waits[item.model_layer] = waits.get(item.model_layer, 0.0) + duration
             starts[item.model_layer] = item.end
-            key = (item.group, item.bank, item.model_layer)
+            key = (item.group, item.bank, item.rotation_slot, item.model_layer)
             consumers[key] = consumers.get(key, 0.0) + duration
         else:
             entry = banks.setdefault(
@@ -149,19 +161,26 @@ def summarize_step(
             entry[item.kind + "_ms"] += duration
 
     layer_ratios: dict[int, list[float]] = {}
-    previous_layers: dict[tuple[int, int], int] = {}
-    bank_ratios: dict[tuple[int, int], list[float]] = {}
+    previous_layers: dict[tuple[int, str, int], int] = {}
+    bank_ratios: dict[tuple[int, str, int], list[float]] = {}
     wait_ms, interval_ms, initial_bank_wait_ms = 0.0, 0.0, 0.0
     unknown_bank_waits, invalid_intervals = 0, 0
-    for (group, bank, current), waited in consumers.items():
-        if bank is None:
+    for (group, bank, rotation_slot, current), waited in consumers.items():
+        if bank is None and rotation_slot is None:
             unknown_bank_waits += 1
             continue
-        identity = (group, bank)
-        entry = banks.setdefault(
-            identity,
-            dict(group=group, bank=bank, load_ms=0.0, save_ms=0.0),
-        )
+        if bank is None:
+            identity = (group, "batch_rotation", rotation_slot)
+            entry = batch_slots.setdefault(
+                (group, rotation_slot),
+                dict(group=group, rotation_slot=rotation_slot),
+            )
+        else:
+            identity = (group, "physical", bank)
+            entry = banks.setdefault(
+                (group, bank),
+                dict(group=group, bank=bank, load_ms=0.0, save_ms=0.0),
+            )
         previous = previous_layers.get(identity)
         previous_layers[identity] = current
         if previous is None:
@@ -180,7 +199,13 @@ def summarize_step(
         wait_ms += waited
         interval_ms += period
     ratios = [sum(values) / len(values) for values in layer_ratios.values()]
-    for identity, entry in banks.items():
+    entries = [
+        ((group, "physical", bank), entry) for (group, bank), entry in banks.items()
+    ] + [
+        ((group, "batch_rotation", slot), entry)
+        for (group, slot), entry in batch_slots.items()
+    ]
+    for identity, entry in entries:
         values = bank_ratios.get(identity, [])
         entry["reuse_samples"] = len(values)
         entry["coverage"] = sum(values) / len(values) if values else None
@@ -191,7 +216,7 @@ def summarize_step(
         coverage_definition=COVERAGE_DEFINITION,
         coverage_aggregation="mean_layer_mean_bank_ratios",
         status=batch.status,
-        scope="single_request_step",
+        scope="batch_step" if len(batch.requests) > 1 else "single_request_step",
         start_definition="last_bank_ready",
         step=batch.step,
         requests=[
@@ -216,6 +241,7 @@ def summarize_step(
             for values in layer_ratios.values()
         ),
         banks=list(banks.values()),
+        batch_rotation_slots=list(batch_slots.values()),
     )
 
 
@@ -257,11 +283,11 @@ class PrefillOverlapRecorder:
             atexit.register(self.close)
 
     def begin_step(self, requests: tuple[tuple[str, int, int], ...]) -> None:
-        """Begin a single-request step; empty/dummy/multi-request steps are free."""
+        """Begin one batch measurement; empty/dummy steps are free."""
         if self.active is not None:
             self.finish_step("incomplete")
         self.sequence += 1
-        if len(requests) != 1 or self.failed:
+        if not requests or self.failed:
             return
         if self.pending.full():
             self.dropped_steps += 1
@@ -276,6 +302,7 @@ class PrefillOverlapRecorder:
         bank: Optional[int],
         layer: int,
         model_layer: Optional[int] = None,
+        rotation_slot: Optional[int] = None,
     ) -> Optional[TimingInterval]:
         """Record a start, after existing producer waits on the SAME stream."""
         if self.active is None or self.failed:
@@ -288,6 +315,7 @@ class PrefillOverlapRecorder:
             layer if model_layer is None else model_layer,
             self._event(),
             self._event(),
+            rotation_slot,
         )
         ticket.start.record(stream)
         return ticket

@@ -39,7 +39,7 @@ from lmcache_ascend.v1.content_diagnostics import (
 from lmcache_ascend.v1.npu_connector.prefill_overlap import (
     AclEventTimer,
     PrefillOverlapRecorder,
-    single_request_span,
+    request_spans,
 )
 from lmcache_ascend.v1.remote_fill_producer import parse_remote_fill_handoff
 
@@ -458,7 +458,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         recorder = getattr(self, "_prefill_overlap_recorder", None)
         if recorder is not None:
             requests = self._parent._get_connector_metadata().requests
-            recorder.begin_step(single_request_span(
+            recorder.begin_step(request_spans(
                 requests, forward_context.attn_metadata,
             ))
             self._prefill_overlap_step_active = recorder.active is not None

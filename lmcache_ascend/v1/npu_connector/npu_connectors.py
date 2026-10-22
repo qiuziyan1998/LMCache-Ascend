@@ -2502,7 +2502,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         retains its save fence because it has no bank FIFO stream; the raw DMA
         path never joins a store event here.
         """
-        _, generations, _, load_done = (
+        bank_counts, generations, _, load_done = (
             self._layerwise_prefill_transfer_state()
         )
         generation = generations.setdefault(int(kv_group), 0)
@@ -2541,6 +2541,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         overlap_wait = (
             overlap.start_interval(
                 "wait", current_stream, kv_group, bank, layer_id, model_layer_id,
+                # Different requests may use different physical-bank phases.
+                # The whole batch revisits the same bank assignment only after
+                # B group layers, not at the next overlapping physical bank.
+                rotation_slot=(
+                    int(layer_id) % bank_counts.get(int(kv_group), 2)
+                    if bank is None else None
+                ),
             ) if overlap is not None else None
         )
         load_records: list[tuple[int, Any]] = []

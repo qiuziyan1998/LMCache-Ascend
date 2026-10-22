@@ -253,7 +253,7 @@ def test_no_submission_queries_and_pending_events_are_not_recycled():
     assert not recorder.pool.empty()
 
 
-@pytest.mark.parametrize("requests", [(), (("a", 0, 4), ("b", 0, 4))])
+@pytest.mark.parametrize("requests", [()])
 def test_skipped_batch_records_no_events(requests):
     recorder = overlap.PrefillOverlapRecorder(
         lambda: pytest.fail("created event for skipped batch"),
@@ -363,29 +363,62 @@ def test_collector_initialization_failure_disables_measurement():
 def test_single_actual_request_uses_exact_partial_or_cached_span(actual_ids):
     request = NS(req_id="r", prefill_overlap_span=(1234, 1777))
     metadata = {"layer": NS(req_ids=actual_ids)}
-    assert overlap.single_request_span([request], metadata) == (("r", 1234, 1777),)
+    assert overlap.request_spans([request], metadata) == (("r", 1234, 1777),)
 
 
 @pytest.mark.parametrize("actual_ids", [["r", "other"], [], ["other"]])
 def test_attention_batch_can_reject_request_omitted_by_connector(actual_ids):
     request = NS(req_id="r", prefill_overlap_span=(0, 4096))
-    assert (
-        overlap.single_request_span([request], {"layer": NS(req_ids=actual_ids)}) == ()
-    )
+    assert overlap.request_spans([request], {"layer": NS(req_ids=actual_ids)}) == ()
 
 
 def test_missing_ids_require_cpu_proof_of_one_query():
     request = NS(req_id="r", prefill_overlap_span=(0, 4096))
-    assert overlap.single_request_span([request], {"layer": NS()}) == ()
-    assert overlap.single_request_span(
+    assert overlap.request_spans([request], {"layer": NS()}) == ()
+    assert overlap.request_spans(
         [request], {"layer": NS(query_start_loc_cpu=[0, 4096])}
     )
     assert (
-        overlap.single_request_span(
+        overlap.request_spans(
             [request], {"layer": NS(query_start_loc_cpu=[0, 1, 4096])}
         )
         == ()
     )
+
+
+def test_multi_request_batch_keeps_unequal_spans_and_counts_timing_once():
+    requests = [
+        NS(req_id="a", prefill_overlap_span=(0, 1024)),
+        NS(req_id="b", prefill_overlap_span=(8192, 11264)),
+    ]
+    spans = overlap.request_spans(requests, {"layer": NS(req_ids=["a", "b"])})
+    assert spans == (("a", 0, 1024), ("b", 8192, 11264))
+    emitted = []
+    recorder = overlap.PrefillOverlapRecorder(
+        DeviceEvent,
+        emitted.append,
+        worker={},
+        elapsed_time=event_elapsed,
+        start_worker=False,
+    )
+    recorder.begin_step(spans)
+    stream = NS(time=0, ready=True)
+    for layer in range(8):
+        stream.time = layer * 10
+        ticket = recorder.start_interval(
+            "wait", stream, 0, None, layer, rotation_slot=layer % 4
+        )
+        stream.time += 2
+        recorder.end_interval(ticket, stream)
+    recorder.finish_step()
+    assert recorder.poll()
+    result = json.loads(emitted[0].split(overlap.LOG_MARKER)[1])
+    assert result["scope"] == "batch_step" and len(result["requests"]) == 2
+    assert result["coverage"] == pytest.approx(0.95)  # 1 - 2 / 40, NOT 1 - 2 / 10.
+    assert result["layer_samples"] == 4 and result["bank_reuse_samples"] == 4
+    assert result["all_wait_ms"] == 16 and result["wait_ms"] == 8
+    assert result["unknown_bank_waits"] == 0
+    assert len(result["batch_rotation_slots"]) == 4
 
 
 @pytest.mark.parametrize("group", [0, 1, "c8"])
