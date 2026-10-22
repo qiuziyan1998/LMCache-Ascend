@@ -173,6 +173,10 @@ def fill(page, start, group):
 
 
 def fake_engine(group_layers=(2, 2)):
+    class Engine(NS):
+        def prepare_checkpoint_allocator(self, group, caches=None):
+            return lambda n: self.allocate_checkpoint_fragment(group, n, caches)
+
     backend = LocalCPU()
     allocated, calls = [], []
 
@@ -203,6 +207,11 @@ def fake_engine(group_layers=(2, 2)):
 
     def prepare(rows, starts, ends, **kw):
         calls.append(("prepare", kw["kv_group"], len(starts)))
+        rows = [
+            [NS(tensor=obj.layer_tensor(layer), metadata=obj.metadata)
+             if isinstance(obj, Page) else obj for obj in row]
+            for layer, row in enumerate(rows)
+        ]
         return rows, starts, ends, kw["kv_group"]
 
     def enqueue(plan):
@@ -220,7 +229,8 @@ def fake_engine(group_layers=(2, 2)):
                     offset += (end - start) * width
         return NS(synchronize=lambda: calls.append(("fence",)))
 
-    return NS(
+    database = NS(process_tokens=tokens)
+    return Engine(
         config=NS(store_async_max_queue_size=2, blocking_timeout_secs=10, chunk_size=4),
         checkpoint_backend=lambda: backend,
         validate_checkpoint_page=lambda group, page: None,
@@ -233,7 +243,12 @@ def fake_engine(group_layers=(2, 2)):
             start,
             end,
         ),
-        token_database=NS(process_tokens=tokens),
+        token_database=database,
+        checkpoint_token_results=(
+            lambda tokens, configs, group, state: database.process_tokens(
+                tokens=tokens, request_configs=configs, kv_group=group
+            )
+        ),
         num_layers=group_layers[0],
         num_layers_for_group=lambda group: group_layers[group],
         _num_layers_for_kv_group=lambda group: group_layers[group],

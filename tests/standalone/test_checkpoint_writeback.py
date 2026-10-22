@@ -77,11 +77,11 @@ def deployment(api, monkeypatch):
     engine.load_checkpoint_page = get
     stores = []
 
-    def create(**kwargs):
+    def create(accepted=11, **kwargs):
         store, capture, _ = start_capture(api, monkeypatch, engine, **kwargs)
         stores.append(store)
         assert store.poll()[0].status == "captured"
-        publish(api, store, 11)
+        publish(api, store, accepted)
         return store
 
     yield engine, create, module
@@ -509,6 +509,71 @@ def test_shared_generations_are_charged_once(deployment):
     assert store.local.available("r", 2, 11) == 11
     store.local.forget("r", 2)
     wait(lambda: store.local.used == 0)
+
+
+def test_publication_reuses_its_unique_owner_set(deployment, monkeypatch):
+    _, create, module = deployment
+    store = create()
+    before = store.local.used
+    acquire = module.LocalCheckpointStore.acquire
+    traversals = []
+
+    class CountedGroups(list):
+        def __iter__(self):
+            traversals.append(1)
+            return super().__iter__()
+
+    def counted_acquire(self, *args):
+        end, groups = acquire(self, *args)
+        return end, CountedGroups(groups)
+
+    monkeypatch.setattr(module.LocalCheckpointStore, "acquire", counted_acquire)
+    store.local.publish("r", 2, store.local.manifest("r", 1))
+    # One owner-set traversal and one range index; charging reuses the set.
+    assert len(traversals) == 2
+    assert store.local.used == before  # Shared physical owners are charged once.
+
+
+@pytest.mark.parametrize("failures", [{1}, {1, 3}])
+def test_spill_and_normalize_have_independent_single_reclaim_budgets(
+    deployment, failures
+):
+    engine, create, _ = deployment
+    store = create()
+    record = store.local.records["r", 1]
+    allocate = engine.allocate_checkpoint_fragment
+    calls, reclaims = [], []
+
+    def pressured_allocate(*args):
+        calls.append(args)
+        if len(calls) in failures:
+            raise MemoryError("injected pressure")
+        return allocate(*args)
+
+    engine.allocate_checkpoint_fragment = pressured_allocate
+    engine.reclaim_checkpoint_capacity = lambda *args: (reclaims.append(args), True)[1]
+    engine.get_checkpoint_prefix = lambda *args: None
+    miss = sys.modules[
+        "lmcache.integration.vllm.preemption_checkpoint"
+    ].CheckpointRestoreMiss
+    for restore in (False, True):
+        calls.clear()
+        reclaims.clear()
+
+        def run(restore):
+            if restore:
+                _, owners = store.local.normalize("r", 1, list(range(11)), None)
+                for page in owners:
+                    page.ref_count_down()
+            else:
+                assert store.local._spill(record, record.groups)
+
+        if len(failures) > 1:
+            with pytest.raises(miss if restore else MemoryError):
+                run(restore)
+        else:
+            run(restore)
+        assert len(reclaims) == 1
 
 
 def test_repreemption_holds_nonresident_latent_until_new_retention(deployment, api):

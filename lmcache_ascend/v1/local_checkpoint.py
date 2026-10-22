@@ -1,11 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Evictable local checkpoint offers; only an acquired restore owns pages."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Any
 
 from lmcache.integration.vllm.preemption_checkpoint import CheckpointRestoreMiss
+
+
+def clear_failure_tracebacks(error: BaseException) -> None:
+    """Drop terminal I/O frames without relying on cyclic garbage collection."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending.extend(
+            e for e in (current.__cause__, current.__context__) if e is not None
+        )
+        pending.extend(getattr(current, "exceptions", ()))
+        current.__traceback__ = None
 
 
 @dataclass(frozen=True)
@@ -196,20 +212,8 @@ class LocalCheckpointStore:
             raise ValueError("Local checkpoint generation/history is unavailable")
         common, groups = self.acquire(manifest, len(tokens))
         owners: list[Any] = []
-        reclaimed = False
+        reserve = self._allocation_retry()
         covered = manifest.prefix_end
-
-        def reserve(factory: Any, group: int, count: int) -> Any:
-            nonlocal reclaimed
-            try:
-                return factory()
-            except MemoryError:
-                if reclaimed:
-                    raise
-                reclaimed = True
-                if not self.engine.reclaim_checkpoint_capacity(count, {group: None}):
-                    raise
-                return factory()
 
         try:
             if common != len(tokens):
@@ -218,12 +222,13 @@ class LocalCheckpointStore:
                 )
             chunk = int(self.engine.config.chunk_size)
             base = manifest.prefix_end // chunk * chunk
+            chunk_plan = {}
             for group in (0, 1):
-                sources = list(groups[group])
+                select_sources = self._source_selector(groups[group])
                 keys, pages, normalized = [], [], []
                 covered = base
-                for start, end, key in self.engine.token_database.process_tokens(
-                    tokens=tokens, request_configs=request_configs, kv_group=group
+                for start, end, key in self.engine.checkpoint_token_results(
+                    tokens, request_configs, group, chunk_plan
                 ):
                     if start < base:
                         continue
@@ -233,7 +238,7 @@ class LocalCheckpointStore:
                         )
                     page = self.build_page(
                         manifest,
-                        sources,
+                        select_sources(start, end),
                         group,
                         start,
                         end,
@@ -291,6 +296,40 @@ class LocalCheckpointStore:
             raise
         finally:
             self.release(groups)
+
+    @staticmethod
+    def _source_selector(sources: list) -> Callable[[int, int], list]:
+        """Select overlaps for increasing windows from retained ordered sources."""
+        index = 0
+
+        def select(start: int, end: int) -> list:
+            nonlocal index
+            while index < len(sources) and sources[index][0].end <= start:
+                index += 1
+            stop = index
+            while stop < len(sources) and sources[stop][0].start < end:
+                stop += 1
+            return sources[index:stop]
+
+        return select
+
+    def _allocation_retry(self) -> Callable[[Callable[[], Any], int, int], Any]:
+        """Give one operation a private, single-reclaim allocation budget."""
+        reclaimed = False
+
+        def reserve(factory: Callable[[], Any], group: int, count: int) -> Any:
+            nonlocal reclaimed
+            try:
+                return factory()
+            except MemoryError:
+                if reclaimed:
+                    raise
+                reclaimed = True
+                if not self.engine.reclaim_checkpoint_capacity(count, {group: None}):
+                    raise
+                return factory()
+
+        return reserve
 
     @staticmethod
     def _assemble(

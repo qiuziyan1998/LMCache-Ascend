@@ -12,8 +12,8 @@ from lmcache_ascend.v1.local_checkpoint import (
     CheckpointPage,
     LocalCheckpoint,
     LocalCheckpointStore,
+    clear_failure_tracebacks,
 )
-from lmcache_ascend.v1.preemption_checkpoint import clear_failure_tracebacks
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ class CheckpointWritebackStore(LocalCheckpointStore):
                     if i not in self.charges
                 )
                 if end == len(manifest.tokens) and self.used + added <= self.limit:
-                    self._charge_locked(groups)
+                    self._charge_locked(owners)
                     self.records[manifest.identity] = Retention(manifest, groups)
                     accepted = True
                     if self.thread is None:
@@ -199,8 +199,8 @@ class CheckpointWritebackStore(LocalCheckpointStore):
                 "Checkpoint write-back has quarantined native owners"
             ) from self.fatal
 
-    def _charge_locked(self, groups: list) -> None:
-        for i, page in {id(p): p for g in groups for _, p in g}.items():
+    def _charge_locked(self, owners: dict[int, Any]) -> None:
+        for i, page in owners.items():
             previous = self.charges.get(i)
             if previous is None:
                 self.used += page.get_physical_size()
@@ -280,7 +280,7 @@ class CheckpointWritebackStore(LocalCheckpointStore):
                 for g in groups:
                     for _, page in g:
                         page.ref_count_up()
-                self._charge_locked(groups)
+                self._charge_locked({id(p): p for g in groups for _, p in g})
             try:
                 remote = self._spill(record, groups)
                 retired = [[], []]
@@ -317,25 +317,15 @@ class CheckpointWritebackStore(LocalCheckpointStore):
         remote = [[], []]
         chunk = int(self.engine.config.chunk_size)
         base = manifest.prefix_end // chunk * chunk
-        reclaimed = False
+        reserve = self._allocation_retry()
         tokens = list(manifest.tokens)  # TokenDatabase accepts lists, not tuples.
-
-        def reserve(factory: Any, group: int, count: int) -> Any:
-            nonlocal reclaimed
-            try:
-                return factory()
-            except MemoryError:
-                if reclaimed:
-                    raise
-                reclaimed = True
-                if not self.engine.reclaim_checkpoint_capacity(count, {group: None}):
-                    raise
-                return factory()
+        chunk_plan = {}
 
         for group in (0, 1):
             covered = base
-            for start, end, key in self.engine.token_database.process_tokens(
-                tokens=tokens, request_configs=manifest.request_configs, kv_group=group
+            select_sources = self._source_selector(groups[group])
+            for start, end, key in self.engine.checkpoint_token_results(
+                tokens, manifest.request_configs, group, chunk_plan
             ):
                 if start < base:
                     continue
@@ -350,7 +340,7 @@ class CheckpointWritebackStore(LocalCheckpointStore):
                     raise ValueError("Checkpoint persistence has a range gap")
                 page = self.build_page(
                     manifest,
-                    groups[group],
+                    select_sources(start, end),
                     group,
                     start,
                     end,

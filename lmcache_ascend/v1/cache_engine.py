@@ -11010,6 +11010,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 req_id, generation, load_generation, "admitted"
             )
 
+    def checkpoint_token_results(
+        self, tokens: list[int], request_configs: Any, kv_group: int, state: dict
+    ) -> Iterable[tuple[int, int, CacheEngineKey]]:
+        """Reuse paired prefix hashes within one checkpoint operation."""
+        return super()._dense_retrieve_token_results(
+            tokens, None, request_configs, kv_group,
+            {"shared_cpu_request_preflight_state": state},
+        )
+
     def probe_checkpoint_pages(self, keys: list) -> list[bool]:
         """Distinguish confirmed missing remote pages from transport errors."""
         return self.storage_manager.batched_external_pages_exist(keys, strict=True)
@@ -11263,16 +11272,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         for group, caches in group_caches.items():
             if caches is not None:
                 self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
-            raw_size = (
-                self.gpu_connector.get_shape(tokens, kv_group=group).numel()
-                * self._shared_cpu_dtype_for_kv_group(group).itemsize
-                * self._num_layers_for_kv_group(group)
-            )
             policy = getattr(self.metadata, "indexer_c8_layout", None)
             if group == 1 and policy is not None and policy.mixed:
                 raw_size = sum(
                     policy.layer_bytes(tokens, i)
                     for i in range(self._num_layers_for_kv_group(group))
+                )
+            else:
+                raw_size = (
+                    self.gpu_connector.get_shape(tokens, kv_group=group).numel()
+                    * self._shared_cpu_dtype_for_kv_group(group).itemsize
+                    * self._num_layers_for_kv_group(group)
                 )
             if round_size is not None:
                 required_bytes += round_size(raw_size)
@@ -11293,35 +11303,49 @@ class AscendLMCacheEngine(LMCacheEngine):
         self, group: int, tokens: int, caches: Optional[list] = None
     ) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
         """Allocate registered capture storage without eviction or busy retry."""
+        return self.prepare_checkpoint_allocator(group, caches)(tokens)
+
+    def prepare_checkpoint_allocator(
+        self, group: int, caches: Optional[list] = None
+    ) -> Callable[[int], tuple[LayerPageMemoryObj, tuple[int, ...]]]:
+        """Prepare group invariants for one capture; allocate exact sizes on demand.
+
+        The caller keeps this allocator within one capture, never across cache
+        reconfiguration. Allocation failure does not reclaim, spin or wait.
+        """
         if not self.save_only_first_rank or not self.save_indexer_only_first_rank:
             raise ValueError("Checkpoint requires replicated MLA group writer ownership")
         if caches is not None:
             self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
         local = self._shared_local_cpu_backend()
-        if local is None or tokens <= 0 or not self.gpu_connector.supports_batched_from_gpu_group(group):
+        if local is None or not self.gpu_connector.supports_batched_from_gpu_group(
+            group
+        ):
             raise ValueError("Checkpoint registered group capture is unavailable")
-        shape = self.gpu_connector.get_shape(tokens, kv_group=group)
         widths = self.gpu_connector.checkpoint_plane_widths(group)
+        dtype = self._shared_cpu_dtype_for_kv_group(group)
+        layers = self._num_layers_for_kv_group(group)
+        fmt = self._memory_format_for_kv_group(group)
         policy = getattr(self.metadata, "indexer_c8_layout", None)
-        shapes = (
-            self.metadata.indexer_layer_shapes(tokens)
-            if group == 1 and policy is not None and policy.mixed
-            else [shape]
-        )
-        pages = local.batched_allocate_layer_pages(
-            shapes,
-            [self._shared_cpu_dtype_for_kv_group(group)] * len(shapes),
-            1,
-            self._num_layers_for_kv_group(group),
-            self._memory_format_for_kv_group(group),
-            busy_loop=False,
-            eviction=False,
-            valid_tokens=tokens,
-            full_tokens=tokens,
-        )
-        if not pages:
-            raise MemoryError("Checkpoint CPU staging allocation refused")
-        return pages[0], widths
+        mixed = group == 1 and policy is not None and policy.mixed
+
+        def allocate(tokens: int) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
+            if tokens <= 0:
+                raise ValueError("Checkpoint registered group capture is unavailable")
+            shapes = (
+                self.metadata.indexer_layer_shapes(tokens)
+                if mixed else [self.gpu_connector.get_shape(tokens, kv_group=group)]
+            )
+            pages = local.batched_allocate_layer_pages(
+                shapes, [dtype] * len(shapes), 1, layers, fmt,
+                busy_loop=False, eviction=False,
+                valid_tokens=tokens, full_tokens=tokens,
+            )
+            if not pages:
+                raise MemoryError("Checkpoint CPU staging allocation refused")
+            return pages[0], widths
+
+        return allocate
 
     def get_checkpoint_prefix(self, key: CacheEngineKey, group: int, tokens: int) -> Any:
         """Retain an exact CPU page, or let checkpoint persistence fetch it."""

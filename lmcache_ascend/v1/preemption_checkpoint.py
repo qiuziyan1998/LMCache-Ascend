@@ -7,13 +7,13 @@ fragments are private until accepted token IDs arrive from EngineCore.
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from lmcache_ascend.v1.local_checkpoint import (
     CheckpointPage,
     LocalCheckpoint,
     LocalCheckpointStore,
+    clear_failure_tracebacks,
 )
 import time
 
@@ -26,28 +26,11 @@ from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 import torch
 
 
-def clear_failure_tracebacks(error: BaseException) -> None:
-    """Drop terminal I/O frames without relying on cyclic garbage collection."""
-    pending, seen = [error], set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        pending.extend(
-            e for e in (current.__cause__, current.__context__) if e is not None
-        )
-        pending.extend(getattr(current, "exceptions", ()))
-        current.__traceback__ = None
-
-
 @dataclass
 class CaptureJob:
     spec: CaptureSpec
-    # group -> (start, end, page, per-plane widths)
-    fragments: dict[int, list[tuple[int, int, Any, tuple[int, ...]]]] = field(
-        default_factory=dict
-    )
+    # group -> (start, end, page)
+    fragments: dict[int, list[tuple[int, int, Any]]] = field(default_factory=dict)
     plans: list[Any] = field(default_factory=list)
     prefix_sources: tuple[CheckpointPage, ...] = ()
     prefix_owners: list[Any] = field(default_factory=list)
@@ -108,11 +91,11 @@ class CheckpointWorker:
         self.restore_event(req_id, generation, load_generation, "ack")
 
     def _allocate_fragment(
-        self, group: int, tokens: int, caches: Any = None
+        self, allocate: Callable, tokens: int
     ) -> tuple[Any, tuple[int, ...]]:
         if not 0 < tokens <= self.chunk_size:
             raise MemoryError("Checkpoint fragment exceeds one chunk")
-        return self.engine.allocate_checkpoint_fragment(group, tokens, caches)
+        return allocate(tokens)
 
     def capture(
         self,
@@ -173,10 +156,17 @@ class CheckpointWorker:
             for group in (0, 1):
                 start = spec.resident_start if group == 0 else spec.base
                 blocks = spec.blocks[group]
-                if (spec.end + block_size - 1) // block_size > len(blocks) or any(
-                    blocks[i // block_size] <= 0 for i in range(start, spec.end)
+                stop = (spec.end + block_size - 1) // block_size
+                if stop > len(blocks) or (
+                    start < spec.end
+                    and any(blocks[i] <= 0 for i in range(start // block_size, stop))
                 ):
                     raise ValueError("Checkpoint source includes released/null blocks")
+            allocators = {
+                group: self.engine.prepare_checkpoint_allocator(group, caches[group])
+                for group in (0, 1)
+                if (spec.resident_start if group == 0 else spec.base) < spec.end
+            }
             cursor, reclaimed = spec.base, False
             while cursor < spec.end:
                 desired_end = min(
@@ -195,15 +185,15 @@ class CheckpointWorker:
                             if start >= end:
                                 continue
                             try:
-                                page, widths = self._allocate_fragment(
-                                    group, end - start, caches[group]
+                                page, _ = self._allocate_fragment(
+                                    allocators[group], end - start
                                 )
                             except MemoryError:
                                 if reclaimed:
                                     raise
                                 reclaimed = True
                                 missing = {
-                                    g: caches[g]
+                                    g: None  # Both group layouts are already prepared.
                                     for g in (group, 1)
                                     if g not in candidate
                                 }
@@ -211,17 +201,17 @@ class CheckpointWorker:
                                     end - cursor, missing
                                 ):
                                     raise
-                                page, widths = self._allocate_fragment(
-                                    group, end - start, caches[group]
+                                page, _ = self._allocate_fragment(
+                                    allocators[group], end - start
                                 )
-                            candidate[group] = (start, end, page, widths)
+                            candidate[group] = (start, end, page)
                     except MemoryError:
-                        for _, _, page, _ in candidate.values():
+                        for _, _, page in candidate.values():
                             page.ref_count_down()
                         end = cursor + (end - cursor) // 2
                         continue
                     except BaseException:
-                        for _, _, page, _ in candidate.values():
+                        for _, _, page in candidate.values():
                             page.ref_count_down()
                         raise
                     for group, fragment in candidate.items():
@@ -235,8 +225,9 @@ class CheckpointWorker:
             job.captured_end = cursor
             # Admit the entire selected paired prefix before device preparation.
             for group, fragments in job.fragments.items():
-                starts = [a for a, _, _, _ in fragments]
-                ends = [b for _, b, _, _ in fragments]
+                starts = [a for a, _, _ in fragments]
+                ends = [b for _, b, _ in fragments]
+                pages = [page for _, _, page in fragments]
                 blocks = spec.blocks[group]
                 slots = torch.tensor(
                     [
@@ -249,15 +240,7 @@ class CheckpointWorker:
                 )
                 device_work_started = True
                 plan = self.engine.gpu_connector.prepare_group_capture(
-                    [
-                        [
-                            SimpleNamespace(
-                                tensor=page.layer_tensor(layer), metadata=page.metadata
-                            )
-                            for _, _, page, _ in fragments
-                        ]
-                        for layer in range(self.engine.num_layers_for_group(group))
-                    ],
+                    [pages] * self.engine.num_layers_for_group(group),
                     starts,
                     ends,
                     slot_mapping=slots,
@@ -337,7 +320,7 @@ class CheckpointWorker:
         groups: list[list[CheckpointPage]] = [list(job.prefix_sources), []]
         keys, pages = [], []
         for group, fragments in job.fragments.items():
-            for start, stop, page, _ in fragments:
+            for start, stop, page in fragments:
                 if start >= end:
                     continue
                 key = self.engine.checkpoint_page_key(spec, group, start, stop)
@@ -454,7 +437,7 @@ class CheckpointWorker:
         if job.quarantined:
             return
         for fragments in job.fragments.values():
-            for _, _, page, _ in fragments:
+            for _, _, page in fragments:
                 page.ref_count_down()
         job.fragments.clear()
         job.plans.clear()
