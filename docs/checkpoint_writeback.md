@@ -1,6 +1,6 @@
 # Decoder checkpoint write-back
 
-This optional policy protects waiting checkpoints in the existing registered
+This policy protects waiting checkpoints in the existing registered
 LocalCPU heap, then copies them to Mooncake when retention or allocator pressure
 rises. It extends the existing decoder preemption checkpoint path. It does not
 require a separate storage process or a Mooncake/native extension rebuild.
@@ -26,7 +26,10 @@ prompt-index load is unchanged. Standalone startup still budgets HBM for normal
 prefill; checkpoint support does not enable the receiver-only compact startup
 memory budget or establish standalone 1M-context capacity.
 
-The feature is off by default. Example initial budgets for a **200 GiB CPU heap**:
+Checkpoint capture remains opt-in. When `decode_preemption_checkpoint: true`,
+writeback defaults to enabled with the following budgets; the last three settings
+can be omitted. Set `decode_checkpoint_writeback: false` to keep local-only
+checkpoint storage.
 
 ```yaml
 decode_preemption_checkpoint: true
@@ -36,8 +39,10 @@ decode_checkpoint_free_reserve_bytes: 8589934592   # 8 GiB
 ```
 
 Budgets are per TP instance/storage-owning rank, not per TP worker. Both byte
-values must be positive and smaller than the actual heap. They are tuning
-examples, not measured optimal values. Actual heap validation runs after storage
+values must be positive and smaller than the actual heap. These limits use the
+existing CPU heap, not an additional 12 GiB allocation. They are initial defaults,
+not measured optimal values; small heaps need smaller explicit budgets.
+Actual heap validation runs after storage
 initialization and before shared-cache startup success is broadcast; invalid
 budgets reach passive TP ranks through the existing failure envelope.
 Update both LMCache Python repositories
