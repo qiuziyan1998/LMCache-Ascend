@@ -939,6 +939,65 @@ def test_mixed_phase_handoff_fences_both_banks_without_host_wait():
     assert completed == ["KV access"]
 
 
+@pytest.mark.parametrize("bank_count", [2, 4, 8])
+@pytest.mark.parametrize("group", [0, 1])
+def test_partial_bank_load_still_fences_cache_miss_d2h(bank_count, group):
+    """A hit on one bank must not let another request overwrite a pending save."""
+    api = _async_bank_connector(group, 0, bank_count=bank_count, layers=bank_count + 1)
+    obj = api.connector
+    old_layer, next_layer = 0, bank_count
+    contents = {bank: old_layer for bank in range(bank_count)}
+    saved = []
+    tails = {}
+    # Only bank 0 loads a prefix. Other phases have cache-miss requests whose
+    # N-layer D2H can still be executing when N+B wants to write their slots.
+    api.banks[0].enqueue()
+    loaded = api.npu.Event()
+    loaded.record(api.banks[0])
+    obj._layerwise_prefill_transfer_state()[3][(group, next_layer, 0)] = (0, loaded)
+    for bank in range(1, bank_count):
+        api.banks[bank].enqueue(
+            lambda bank=bank: saved.append((bank, contents[bank]))
+        )
+        done = api.npu.Event()
+        done.record(api.banks[bank])
+        tails[(group, bank)] = (0, done, old_layer, f"miss-{bank}")
+    obj._layerwise_prefill_bank_tail_events = tails
+    obj.wait_for_layerwise_prefill_load(next_layer, group, None)
+    api.npu.compute.enqueue(
+        lambda: contents.update(dict.fromkeys(contents, next_layer))
+    )
+    assert saved == [] and set(contents.values()) == {old_layer}
+    # Execute the consumer as early as possible; no host wait or convenient
+    # completion of the save streams may mask a missing device dependency.
+    api.npu.compute.tail.run()
+    for stream in api.banks:
+        stream.tail.run()
+    assert sorted(saved) == [(bank, old_layer) for bank in range(1, bank_count)]
+    assert set(contents.values()) == {next_layer}
+
+
+@pytest.mark.parametrize("bank_count", [4, 8])
+@pytest.mark.parametrize("group", [0, 1])
+def test_mixed_phase_wait_leaves_unused_bank_saves_asynchronous(bank_count, group):
+    api = _async_bank_connector(group, 0, bank_count=bank_count, layers=bank_count + 1)
+    obj = api.connector
+    saved = []
+    tails = {}
+    for bank, stream in enumerate(api.banks):
+        stream.enqueue(lambda bank=bank: saved.append(bank))
+        done = api.npu.Event()
+        done.record(stream)
+        tails[(group, bank)] = (0, done, 0, f"request-{bank}")
+    obj._layerwise_prefill_bank_tail_events = tails
+    obj.wait_for_layerwise_prefill_load(bank_count, group, bank_offsets=(0, 1, 1))
+    observed = []
+    api.npu.compute.enqueue(lambda: observed.extend(saved))
+    api.npu.compute.tail.run()
+    assert observed == [0, 1]
+    assert all(not stream.tail.done for stream in api.banks[2:])
+
+
 @pytest.mark.parametrize("phase_flip", [False, True])
 @pytest.mark.parametrize("completed_bank", [None, 0, 1])
 @pytest.mark.parametrize("packet", [False, True])
