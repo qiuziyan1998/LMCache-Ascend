@@ -119,6 +119,7 @@ def _engine():
         LayerwiseStoreResult=StoreResult, Base=Base,
         mooncake_layer_pages_enabled=lambda config: False,
         _mtp_dw_diag_enabled=lambda: False,
+        prefill_store_debug_enabled=lambda: False,
     )
     future = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0

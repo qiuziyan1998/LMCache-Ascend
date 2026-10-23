@@ -65,6 +65,11 @@ from lmcache.v1.mooncake_layout import (
     mooncake_payload_layout,
 )
 from lmcache.v1.prefill_metadata import PrefillMetadataPlan
+from lmcache.v1.prefill_store_debug import (
+    prefill_store_allocator_snapshot,
+    prefill_store_debug_enabled,
+    prefill_store_debug_log,
+)
 from lmcache.v1.remote_fill import (
     ControlPage,
     log_remote_fill_diagnostic,
@@ -6908,6 +6913,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
         store_result.request_id = req_id
+        store_debug = (
+            self._force_layerwise_prefill_store and prefill_store_debug_enabled()
+        )
 
         metadata_skip = (
             kwargs.get("_prefill_skip_tokens")
@@ -7112,6 +7120,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for page in page_batch:
                     page.ref_count_down()
                 raise RuntimeError("Layer-page allocation returned wrong page count")
+            if page_batch is None and store_debug:
+                prefill_store_debug_log(
+                    "bulk_retry",
+                    req_id,
+                    kv_group,
+                    start=pending_chunks[0][0],
+                    end=pending_chunks[-1][1],
+                    chunks=len(pending_chunks),
+                )
 
         legacy_suffix = False
         for chunk_index, (start, end, key, keys_multi_layer) in enumerate(
@@ -7154,6 +7171,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                 else:
                     legacy_suffix = True
+                    if store_debug:
+                        prefill_store_debug_log(
+                            "page_single_none",
+                            req_id,
+                            kv_group,
+                            start=start,
+                            end=end,
+                            **prefill_store_allocator_snapshot(local),
+                        )
             if (
                 memory_objs_multi_layer is None
                 and legacy_suffix
@@ -7207,6 +7233,15 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             if memory_objs_multi_layer is None:
                 if self._force_layerwise_prefill_store:
+                    if store_debug:
+                        prefill_store_debug_log(
+                            "alloc_failed",
+                            req_id,
+                            kv_group,
+                            error=True,
+                            start=start,
+                            end=end,
+                        )
                     for obj in {
                         id(item): item
                         for layer_objs in memory_objs
@@ -7673,6 +7708,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                             layer_pages = [
                                 memory_objs[0][index] for index in page_indices
                             ]
+                            if store_debug:
+                                prefill_store_debug_log(
+                                    "page_put",
+                                    req_id,
+                                    kv_group,
+                                    start=starts[page_indices[0]],
+                                    end=ends[page_indices[-1]],
+                                    chunks=len(page_indices),
+                                    async_d2h=async_layerwise_store,
+                                    events=len(layerwise_store_fences),
+                                )
                             try:
                                 page_futures = self.storage_manager.batched_put_layer_pages(
                                     [
@@ -7692,6 +7738,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     ),
                                 )
                             except Exception as error:
+                                if store_debug:
+                                    prefill_store_debug_log(
+                                        "page_error",
+                                        req_id,
+                                        kv_group,
+                                        error=True,
+                                        status=type(error).__name__,
+                                    )
                                 if async_pages:
                                     self._layerwise_put_queue.fail(error)
                                 raise
@@ -7700,6 +7754,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                             for page in layer_pages:
                                 pending_store_release.pop(id(page), None)
                         if legacy_indices:
+                            if store_debug:
+                                prefill_store_debug_log(
+                                    "flat_put",
+                                    req_id,
+                                    kv_group,
+                                    start=starts[legacy_indices[0]],
+                                    end=ends[legacy_indices[-1]],
+                                    chunks=len(legacy_indices),
+                                    async_d2h=async_layerwise_store,
+                                    events=len(layerwise_store_fences),
+                                )
                             legacy_keys = [
                                 layer_keys[index]
                                 for layer_keys in keys
@@ -7733,6 +7798,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                                         )
                                     )
                                 except Exception as error:
+                                    if store_debug:
+                                        prefill_store_debug_log(
+                                            "flat_error",
+                                            req_id,
+                                            kv_group,
+                                            error=True,
+                                            status=type(error).__name__,
+                                        )
                                     if async_pages:
                                         self._layerwise_put_queue.fail(error)
                                     raise
