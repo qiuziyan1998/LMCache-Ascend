@@ -4445,9 +4445,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         The dense prefill DMA path already records per-layer D2H events.  A
         local CPU backend only installs the MemoryObj pointer, so subsequent
         same-process H2D is protected by those layer events.  Page-first
-        storage additionally forwards the events to the external-page
-        backend.  Legacy tensor puts to a remote backend have no readiness
-        argument and must keep the synchronous drain.
+        storage forwards the events to the external-page backend, including
+        flat-object fallbacks when merged-page allocation fails. Outside page
+        mode, ordinary remote puts still require the synchronous drain.
         """
         cache = getattr(self, "_layerwise_prefill_async_store_support", None)
         if cache is None:
@@ -4473,6 +4473,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             supported = bool(
                 callable(supports_pages)
                 and supports_pages(location=self.store_location)
+                and callable(
+                    getattr(storage_manager, "batched_put_layerwise_objects", None)
+                )
             )
             cache[cache_key] = supported
             return supported
@@ -7611,14 +7614,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                     async_pages = bool(
                         self._force_layerwise_prefill_store
                         and page_store
-                        and str(self.config.remote_url or "").startswith("mooncakestore://")
-                        and all(isinstance(obj, LayerPageMemoryObj) for obj in memory_objs[0])
+                        and str(self.config.remote_url or "").startswith(
+                            "mooncakestore://"
+                        )
+                        and (
+                            async_layerwise_store
+                            or all(
+                                isinstance(obj, LayerPageMemoryObj)
+                                for obj in memory_objs[0]
+                            )
+                        )
                     )
-                    batch_bytes = sum(obj.get_size() for obj in memory_objs[0]) if async_pages else 0
+                    # Flat fallbacks own one object per layer; merged pages
+                    # appear in every row. Charge each physical object once.
+                    batch_bytes = (
+                        sum(obj.get_size() for obj in pending_store_release.values())
+                        if async_pages
+                        else 0
+                    )
                     if async_pages:
                         if self._layerwise_put_queue is None:
                             self._layerwise_put_queue = LayerwisePutQueue(
-                                max_bytes=int(self.config.remote_fill_max_inflight_bytes),
+                                max_bytes=int(
+                                    self.config.remote_fill_max_inflight_bytes
+                                ),
                                 # A compute batch produces one put per DSA group.
                                 max_batches=2 * (self._store_queue_maxsize or 2),
                                 timeout=float(self.config.blocking_timeout_secs),
@@ -7629,8 +7648,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         and self.config.enable_remote_lmcache_store
                     ):
                         self._queue_layerwise_cpu_fill(
-                            req_id, request_configs, kv_group,
-                            keys[0], memory_objs[0], starts, ends,
+                            req_id,
+                            request_configs,
+                            kv_group,
+                            keys[0],
+                            memory_objs[0],
+                            starts,
+                            ends,
                         )
                     if page_store:
                         page_indices = [
@@ -7658,10 +7682,14 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     layer_pages,
                                     location=self.store_location,
                                     req_id=req_id,
-                                    **({
-                                        "publish_local_early": async_pages,
-                                        "producer_events": layerwise_store_fences,
-                                    } if self._force_layerwise_prefill_store else {}),
+                                    **(
+                                        {
+                                            "publish_local_early": async_pages,
+                                            "producer_events": layerwise_store_fences,
+                                        }
+                                        if self._force_layerwise_prefill_store
+                                        else {}
+                                    ),
                                 )
                             except Exception as error:
                                 if async_pages:
@@ -7682,13 +7710,39 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 for layer_objs in memory_objs
                                 for index in legacy_indices
                             ]
-                            required_futures.extend(
-                                self.storage_manager.batched_put(
+                            if async_layerwise_store:
+                                # Plain batched_put has no producer fence and
+                                # may let Mooncake read unfinished D2H bytes.
+                                # Keep flat CPU objects, but hand their layer
+                                # buffers and bank events to the page writer.
+                                try:
+                                    storage = self.storage_manager
+                                    legacy_futures = (
+                                        storage.batched_put_layerwise_objects(
+                                            [
+                                                [row[index] for index in legacy_indices]
+                                                for row in keys
+                                            ],
+                                            [
+                                                [row[index] for index in legacy_indices]
+                                                for row in memory_objs
+                                            ],
+                                            producer_events=layerwise_store_fences,
+                                            location=self.store_location,
+                                            req_id=req_id,
+                                        )
+                                    )
+                                except Exception as error:
+                                    if async_pages:
+                                        self._layerwise_put_queue.fail(error)
+                                    raise
+                            else:
+                                legacy_futures = self.storage_manager.batched_put(
                                     legacy_keys,
                                     legacy_objs,
                                     location=self.store_location,
                                 )
-                            )
+                            required_futures.extend(legacy_futures)
                             submitted_objs.extend(legacy_objs)
                     else:
                         flattened_keys = [
@@ -7704,7 +7758,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     if async_pages:
                         self._layerwise_put_queue.add(
-                            batch_bytes, required_futures, req_id=req_id,
+                            batch_bytes,
+                            required_futures,
+                            req_id=req_id,
                             keys=(key.without_layer() for key in keys[0]),
                         )
                     else:
