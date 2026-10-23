@@ -568,6 +568,24 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self._store_worker_thread.start()
 
+    def _post_init_shared_cpu_cache(self) -> None:
+        worker = getattr(self, "checkpoint_worker", None)
+        if worker is not None and getattr(
+            self.config, "decode_checkpoint_writeback", False
+        ):
+            try:
+                worker.local.validate_capacity()
+            except Exception as error:
+                # Peers are waiting for the existing shared-cache envelope.
+                # Validate before the base preflight can publish success.
+                if self.enable_shared_cpu_cache and self.metadata.world_size > 1:
+                    self.broadcast_object_fn(
+                        self._shared_cpu_cache_startup_envelope("error", str(error)),
+                        self.metadata.first_rank,
+                    )
+                raise
+        super()._post_init_shared_cpu_cache()
+
     def post_init(self, **kwargs) -> None:
         if getattr(self, "checkpoint_worker", None) is not None and not (
             callable(getattr(self.gpu_connector, "supports_preemption_capture", None))
@@ -10983,6 +11001,100 @@ class AscendLMCacheEngine(LMCacheEngine):
             raise RuntimeError("Local checkpoint storage is unavailable")
         return local
 
+    def checkpoint_resume_admitted(
+        self, req_id: str, generation: int, load_generation: int
+    ) -> None:
+        """Join resumed dispatch with the existing TP release acknowledgement."""
+        if self.checkpoint_worker is not None:
+            self.checkpoint_worker.restore_event(
+                req_id, generation, load_generation, "admitted"
+            )
+
+    def checkpoint_token_results(
+        self,
+        tokens: list[int],
+        request_configs: Any,
+        kv_group: int,
+        state: dict,
+        *,
+        start: int = 0,
+    ) -> Iterable[tuple[int, int, CacheEngineKey]]:
+        """Hash once per operation; only build keys for its checkpoint windows.
+
+        State is private to one immutable token/configuration snapshot and start.
+        The complete prefix hash chain is computed even when its keys are unused.
+        """
+        plan = state.get("checkpoint_chunks")
+        if plan is None:
+            plan = tuple(
+                (a, b, digest)
+                for a, b, digest in self.token_database.process_tokens(
+                    tokens=tokens,
+                    make_key=False,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+                if a >= start
+            )
+            state["checkpoint_chunks"] = plan
+        generated = self.token_database.process_tokens(
+            hashes=[entry[2] for entry in plan],
+            offsets=[entry[1] - entry[0] for entry in plan],
+            request_configs=request_configs,
+            kv_group=kv_group,
+        )
+        return (
+            (a, b, key) for (a, b, _), (_, _, key) in zip(plan, generated, strict=True)
+        )
+
+    def probe_checkpoint_pages(self, keys: list) -> list[bool]:
+        """Distinguish confirmed missing remote pages from transport errors."""
+        return self.storage_manager.batched_external_pages_exist(keys, strict=True)
+
+    def persist_checkpoint_page(
+        self, key: CacheEngineKey, page: Any, req_id: str
+    ) -> Future:
+        """Submit a sealed page; the caller retains its owner until completion."""
+        return self.storage_manager.batched_put_external_pages(
+            [key],
+            [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+            [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+            (page.raw_data,),
+            None,
+            req_id,
+        )
+
+    def load_checkpoint_page(
+        self, key: CacheEngineKey, group: int, tokens: int, req_id: str
+    ) -> Any:
+        """Load a canonical checkpoint page, retaining unknown native destinations."""
+        try:
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        except MemoryError:
+            if not self.reclaim_checkpoint_capacity(tokens, {group: None}):
+                raise
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        try:
+            self.storage_manager.batched_get_external_pages(
+                [key],
+                [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+                [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+                (page.raw_data,),
+                req_id,
+            )
+            self.validate_checkpoint_page(group, page)
+            return page
+        except NativeExternalPageTransferUnknownError:
+            self.__dict__.setdefault("_checkpoint_quarantined_owners", []).append(page)
+            raise
+        except BaseException as error:
+            page.ref_count_down()
+            failed = getattr(error, "failed_pages", ())
+            if failed and all(status <= 0 for _, status, _ in failed):
+                if not self.probe_checkpoint_pages([key])[0]:
+                    return None
+            raise
+
     def checkpoint_page_key(
         self, spec: Any, group: int, start: int, end: int
     ) -> CacheEngineKey:
@@ -11017,14 +11129,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         self, tokens: tuple[int, ...], group: int, configs: Any
     ) -> Any:
         """Retain the exact original boundary page, fetching only that page on miss."""
-        start, end, key = list(
+        start, end, key = deque(
             self.token_database.process_tokens(
                 tokens=list(tokens),
                 request_configs=configs,
                 kv_group=group,
-            )
-        )[-1]
-        cached = self.get_checkpoint_prefix(key, group, end - start)
+            ),
+            maxlen=1,
+        ).pop()
+        cached = self.get_checkpoint_prefix(key, group, end - start, with_widths=False)
         if cached is not None:
             return cached[0]
         page, _ = self.allocate_checkpoint_fragment(group, end - start)
@@ -11188,16 +11301,17 @@ class AscendLMCacheEngine(LMCacheEngine):
         for group, caches in group_caches.items():
             if caches is not None:
                 self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
-            raw_size = (
-                self.gpu_connector.get_shape(tokens, kv_group=group).numel()
-                * self._shared_cpu_dtype_for_kv_group(group).itemsize
-                * self._num_layers_for_kv_group(group)
-            )
             policy = getattr(self.metadata, "indexer_c8_layout", None)
             if group == 1 and policy is not None and policy.mixed:
                 raw_size = sum(
                     policy.layer_bytes(tokens, i)
                     for i in range(self._num_layers_for_kv_group(group))
+                )
+            else:
+                raw_size = (
+                    self.gpu_connector.get_shape(tokens, kv_group=group).numel()
+                    * self._shared_cpu_dtype_for_kv_group(group).itemsize
+                    * self._num_layers_for_kv_group(group)
                 )
             if round_size is not None:
                 required_bytes += round_size(raw_size)
@@ -11218,38 +11332,54 @@ class AscendLMCacheEngine(LMCacheEngine):
         self, group: int, tokens: int, caches: Optional[list] = None
     ) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
         """Allocate registered capture storage without eviction or busy retry."""
+        return self.prepare_checkpoint_allocator(group, caches)(tokens)
+
+    def prepare_checkpoint_allocator(
+        self, group: int, caches: Optional[list] = None
+    ) -> Callable[[int], tuple[LayerPageMemoryObj, tuple[int, ...]]]:
+        """Prepare group invariants for one capture; allocate exact sizes on demand.
+
+        The caller keeps this allocator within one capture, never across cache
+        reconfiguration. Allocation failure does not reclaim, spin or wait.
+        """
         if not self.save_only_first_rank or not self.save_indexer_only_first_rank:
             raise ValueError("Checkpoint requires replicated MLA group writer ownership")
         if caches is not None:
             self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
         local = self._shared_local_cpu_backend()
-        if local is None or tokens <= 0 or not self.gpu_connector.supports_batched_from_gpu_group(group):
+        if local is None or not self.gpu_connector.supports_batched_from_gpu_group(
+            group
+        ):
             raise ValueError("Checkpoint registered group capture is unavailable")
-        shape = self.gpu_connector.get_shape(tokens, kv_group=group)
         widths = self.gpu_connector.checkpoint_plane_widths(group)
+        dtype = self._shared_cpu_dtype_for_kv_group(group)
+        layers = self._num_layers_for_kv_group(group)
+        fmt = self._memory_format_for_kv_group(group)
         policy = getattr(self.metadata, "indexer_c8_layout", None)
-        shapes = (
-            self.metadata.indexer_layer_shapes(tokens)
-            if group == 1 and policy is not None and policy.mixed
-            else [shape]
-        )
-        pages = local.batched_allocate_layer_pages(
-            shapes,
-            [self._shared_cpu_dtype_for_kv_group(group)] * len(shapes),
-            1,
-            self._num_layers_for_kv_group(group),
-            self._memory_format_for_kv_group(group),
-            busy_loop=False,
-            eviction=False,
-            valid_tokens=tokens,
-            full_tokens=tokens,
-        )
-        if not pages:
-            raise MemoryError("Checkpoint CPU staging allocation refused")
-        return pages[0], widths
+        mixed = group == 1 and policy is not None and policy.mixed
 
-    def get_checkpoint_prefix(self, key: CacheEngineKey, group: int, tokens: int) -> Any:
-        """Retain an exact CPU page, or let checkpoint persistence fetch it."""
+        def allocate(tokens: int) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
+            if tokens <= 0:
+                raise ValueError("Checkpoint registered group capture is unavailable")
+            shapes = (
+                self.metadata.indexer_layer_shapes(tokens)
+                if mixed else [self.gpu_connector.get_shape(tokens, kv_group=group)]
+            )
+            pages = local.batched_allocate_layer_pages(
+                shapes, [dtype] * len(shapes), 1, layers, fmt,
+                busy_loop=False, eviction=False,
+                valid_tokens=tokens, full_tokens=tokens,
+            )
+            if not pages:
+                raise MemoryError("Checkpoint CPU staging allocation refused")
+            return pages[0], widths
+
+        return allocate
+
+    def get_checkpoint_prefix(
+        self, key: CacheEngineKey, group: int, tokens: int, *, with_widths: bool = True
+    ) -> Any:
+        """Retain an exact CPU page, optionally computing assembly plane widths."""
         local = self._shared_local_cpu_backend()
         pages, count = local.batched_get_layer_page_prefix([key])
         if not count:
@@ -11262,7 +11392,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             and page.get_dtype() == self._shared_cpu_dtype_for_kv_group(group)
             and page.metadata.fmt == self._memory_format_for_kv_group(group)
         ):
-            return page, self.gpu_connector.checkpoint_plane_widths(group)
+            return page, (
+                self.gpu_connector.checkpoint_plane_widths(group) if with_widths else ()
+            )
         page.ref_count_down()
         return None
 
