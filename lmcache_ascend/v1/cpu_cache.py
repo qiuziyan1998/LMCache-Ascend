@@ -22,6 +22,7 @@ class CPUBackendFactory:
         *,
         local_backend: Any = None,
         defer_layout: bool = False,
+        native_io: Any = None,
     ) -> None:
         if memory_allocator is None:
             raise ValueError("CPU storage requires a precreated allocator")
@@ -33,6 +34,7 @@ class CPUBackendFactory:
             raise ValueError("Bootstrap backend does not own the supplied allocator")
         self._bootstrap_backend = local_backend
         self.defer_layout = defer_layout
+        self.native_io = native_io
         self._local_backend: Any = None
         self._remote_backend: Any = None
         self._layout_metadata: Any = None
@@ -124,6 +126,8 @@ class CPUBackendFactory:
             and "RemoteBackend" not in existing
         ):
             options = {"defer_layout": True} if self.defer_layout else {}
+            if self.native_io is not None:
+                options["native_io"] = self.native_io
             remote = RemoteBackend(
                 config,
                 self._layout_metadata or metadata,
@@ -249,6 +253,7 @@ def create_storage_runtime(runtime_config: dict[str, Any]) -> Any:
     PrometheusLogger.GetOrCreate(metadata, config=config)
     local = LocalCPUBackend(config, metadata, dst_device="cpu")
     manager = None
+    native_io = None
     try:
         allocator = local.memory_allocator
         root_allocator = getattr(allocator, "_allocator", allocator)
@@ -257,7 +262,27 @@ def create_storage_runtime(runtime_config: dict[str, Any]) -> Any:
                 "Decoder CPU allocator did not create its named shared slab"
             )
         slab_size = int(root_allocator.buffer.numel())
-        factory = CPUBackendFactory(allocator, local_backend=local, defer_layout=True)
+        if runtime_config.get("transport") is not None:
+            from lmcache.v1.rpc.mooncake_transport import RemoteMooncakeStore
+
+            native_io = RemoteMooncakeStore(
+                runtime_config["transport"],
+                instance=runtime_config["cache_instance_id"],
+                epoch=runtime_config["service_epoch"],
+                base=int(root_allocator.buffer.data_ptr()),
+                size=slab_size,
+                generation=int(runtime_config.get("slab_generation", 1)),
+                timeout=max(
+                    float(config.blocking_timeout_secs),
+                    float(config.get_extra_config_value("transfer_timeout", 30)),
+                    float(config.remote_fill_native_hard_timeout_ms) / 1000.0,
+                ),
+                max_bytes=config.remote_fill_max_inflight_bytes,
+                max_operations=config.remote_fill_max_native_operations,
+            )
+        factory = CPUBackendFactory(
+            allocator, local_backend=local, defer_layout=True, native_io=native_io
+        )
         manager = StorageManager(
             config,
             metadata,
@@ -282,10 +307,13 @@ def create_storage_runtime(runtime_config: dict[str, Any]) -> Any:
             slab_generation=int(runtime_config.get("slab_generation", 1)),
             sessions=sessions,
             bootstrap_config=runtime_config,
+            native_io=native_io,
         )
     except BaseException:
         if manager is not None:
             manager.close()
         else:
             local.close()
+        if native_io is not None:
+            native_io.shutdown()
         raise

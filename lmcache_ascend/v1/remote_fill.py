@@ -614,6 +614,7 @@ class AscendRemoteFillPageLifecycle:
         chunk_hash_bytes: int | None,
         direct_groups: tuple[int, ...] = (0, 1),
         capacity_reclaimer: Callable[[int], bool] | None = None,
+        export_address: Callable[[int, int], int] | None = None,
         pin_pages: Callable[[Sequence[LayerPageMemoryObj]], bool] = (
             LayerPageMemoryObj.pin_many
         ),
@@ -651,6 +652,7 @@ class AscendRemoteFillPageLifecycle:
             raise ValueError(
                 "remote-fill direct groups must be exactly (0,) or (0, 1)"
             )
+        self._export_address = export_address
         self._local = local_backend
         self._layout = layout
         self._direct_groups = direct_groups
@@ -852,12 +854,15 @@ class AscendRemoteFillPageLifecycle:
                 control = pages[index]
                 if page.get_size() != control.expected_bytes:
                     raise ValueError("remote-fill allocation byte count mismatch")
+                address = page.data_ptr
+                if self._export_address is not None:
+                    address = self._export_address(address, page.get_size())
                 handle = _HiddenPage(keys[index], page)
                 results[index] = PreparedPage(
                     handle=handle,
-                    destination_ptr=page.data_ptr,
+                    destination_ptr=address,
                     destination_length=page.get_size(),
-                    reservation_base=page.data_ptr,
+                    reservation_base=address,
                     reservation_length=page.get_size(),
                     disposition=PageDisposition.ALLOCATED,
                 )
@@ -1536,6 +1541,7 @@ def create_decoder_remote_fill_runtime(
     chunk_hash_bytes: int | None,
     shared_group1: bool = True,
     capacity_reclaimer: Callable[[int], bool] | None = None,
+    export_address: Callable[[int, int], int] | None = None,
     descriptor_verification_capability: bytes | None = None,
     server_factory: Callable[[RemoteFillService], RemoteFillServer] | None = None,
 ) -> DecoderRemoteFillRuntime:
@@ -1628,6 +1634,7 @@ def create_decoder_remote_fill_runtime(
         layout=layout,
         capacity_available=capacity_available,
         capacity_reclaimer=capacity_reclaimer,
+        export_address=export_address,
         chunk_hash_type=chunk_hash_type,
         chunk_hash_bytes=chunk_hash_bytes,
         direct_groups=direct_groups,

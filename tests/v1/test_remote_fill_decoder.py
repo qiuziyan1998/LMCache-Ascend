@@ -999,6 +999,7 @@ def _lifecycle(
     chunk_hash_bytes: int | None = None,
     direct_groups: tuple[int, ...] = (0, 1),
     layout: RemoteFillDecoderLayout | None = None,
+    export_address=None,
 ) -> AscendRemoteFillPageLifecycle:
     def pin_pages(pages: list[_FakePage]) -> bool:
         for page in pages:
@@ -1008,6 +1009,7 @@ def _lifecycle(
     return AscendRemoteFillPageLifecycle(
         local_backend=local,
         layout=layout or _layout(),
+        export_address=export_address,
         capacity_available=(
             capacity
             if callable(capacity)
@@ -2310,3 +2312,45 @@ def test_unequal_group_pages_allocate_and_publish_exact_bytes():
     for call in local.allocations:
         for page in call["pages"]:
             assert page.refs == 1 and page.pins == 0
+
+
+def test_remote_fill_exports_worker_mapping_and_keeps_owner_page():
+    local = _FakeLocalBackend()
+    translated = []
+
+    def export(ptr, size):
+        translated.append((ptr, size))
+        return ptr + 65536
+
+    lifecycle = _lifecycle(local, export_address=export)
+    controls = (_control_page(0, 0), _control_page(0, 1))
+    prepared = lifecycle.prepare_pages("transport", 0, controls, True)
+    for page, (ptr, size) in zip(prepared, translated, strict=True):
+        assert page.destination_ptr == page.reservation_base == ptr + 65536
+        assert page.destination_length == page.reservation_length == size
+    assert lifecycle.commit_pages(
+        "transport", controls, _views(controls, prepared), _finish(4)
+    )
+    assert all(
+        page.refs == 1 and page.pins == 0
+        for call in local.allocations
+        for page in call["pages"]
+    )
+
+
+def test_remote_fill_translation_failure_releases_unexported_destinations():
+    local = _FakeLocalBackend()
+
+    def fail(ptr, size):
+        raise ValueError("mapping changed")
+
+    lifecycle = _lifecycle(local, export_address=fail)
+    with pytest.raises(ValueError, match="mapping changed"):
+        lifecycle.prepare_pages(
+            "transport", 0, (_control_page(0, 0), _control_page(0, 1)), True
+        )
+    assert all(
+        page.refs == 0 and page.pins == 0
+        for call in local.allocations
+        for page in call["pages"]
+    )

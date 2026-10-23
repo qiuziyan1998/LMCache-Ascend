@@ -1075,6 +1075,9 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             shared_cache_generation=self.shared_cpu_cache_generation,
             capacity_available=self._remote_fill_capacity_available,
             capacity_reclaimer=self._remote_fill_reclaim_capacity,
+            export_address=(
+                self.native_io.export_address if self.native_io is not None else None
+            ),
             fatal_restart=self._remote_fill_require_paired_restart,
             global_te_push=True,
             save_only_first_rank=self.save_only_first_rank,
