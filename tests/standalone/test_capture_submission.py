@@ -4,12 +4,15 @@
 import ast
 from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace as NS, MethodType
 from typing import Any, List, Union
 
 import pytest
 import torch
+
+from test_preemption_checkpoint import Page
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -32,6 +35,7 @@ def fixture():
         int32=torch.int32,
         int64=torch.int64,
         long=torch.long,
+        uint8=torch.uint8,
         npu=NS(
             current_stream=lambda: stream,
             Event=lambda: NS(record=lambda s: events.append("event")),
@@ -51,7 +55,8 @@ def fixture():
         MemoryObj=Any,
         PreparedGroupCapture=None,
         dataclass=dataclass,
-        _layer_memory_tensor=lambda obj, layer: obj.tensor,
+        pairwise=pairwise,
+        LayerPageMemoryObj=Page,
         prepare_sparse_direct_layer_state=lambda *a: object(),
         dense_mla_dsa_group_direct_kv_transfer_fast=native,
         lmc_ops=NS(
@@ -78,6 +83,11 @@ def fixture():
         "enqueue_group_capture",
         "batched_from_gpu_group",
     }
+    nodes.extend(
+        n for n in source.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in {"_layer_memory_tensor", "_checkpoint_page_rows"}
+    )
     nodes += [
         n
         for n in ast.walk(source)
@@ -178,5 +188,28 @@ def test_fragmented_group_capture_builds_one_pointer_matrix_without_extra_fences
     assert plan.offsets.tolist() == [0, 4, 8]
     assert plan.sizes.tolist() == [4, 4, 2]
     assert len(plan.states) == 2 and events == []
+    obj.enqueue_group_capture(plan)
+    assert events == ["dependency", "native", "event"]
+
+
+def test_group_capture_accepts_shared_physical_page_rows():
+    obj, _, events, _ = fixture()
+    pages = [Page(2, count, (2,)) for count in (4, 2)]
+    for page in pages:
+        page.metadata.fmt = "fmt"
+    rows = [pages] * 2
+    plan = obj.prepare_group_capture(
+        rows,
+        [8, 12],
+        [12, 14],
+        slot_mapping=torch.arange(6),
+        slot_mapping_base=8,
+        kv_group=0,
+    )
+    assert rows == [pages, pages]
+    assert plan.host_rows == [
+        [p.layer_data_ptr(layer) for p in pages] for layer in range(2)
+    ]
+    assert plan.sizes.tolist() == [4, 2]
     obj.enqueue_group_capture(plan)
     assert events == ["dependency", "native", "event"]

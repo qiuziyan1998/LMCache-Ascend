@@ -2,6 +2,7 @@
 """Use production key identities at the checkpoint/page-loader boundary."""
 
 import ast
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace as NS
@@ -123,6 +124,7 @@ def test_cached_original_boundary_needs_no_allocation(key_types, group):
         "AscendLMCacheEngine",
         {"get_checkpoint_prefix", "load_checkpoint_prefix"},
         object,
+        deque=deque,
     )
     obj = cls()
     obj.num_layers = engine.num_layers
@@ -131,8 +133,9 @@ def test_cached_original_boundary_needs_no_allocation(key_types, group):
     obj._shared_local_cpu_backend = lambda: engine.backend
     obj._shared_cpu_dtype_for_kv_group = lambda group: torch.uint8
     obj._memory_format_for_kv_group = lambda group: "test"
+    widths = []
     obj.gpu_connector = NS(
-        checkpoint_plane_widths=lambda group: (2, 1) if group == 0 else (1,)
+        checkpoint_plane_widths=lambda group: widths.append(group) or (2, 1)
     )
     obj.allocate_checkpoint_fragment = lambda *a: pytest.fail(
         "unnecessary staging allocation"
@@ -144,7 +147,11 @@ def test_cached_original_boundary_needs_no_allocation(key_types, group):
     engine.backend.pages[key] = page
     result = obj.load_checkpoint_prefix((0, 1, 2), group, None)
     assert result is page and page.refs == 2
+    assert not widths  # Both page-only callers avoid unused plane preparation.
     result.ref_count_down()
+    cached, planes = obj.get_checkpoint_prefix(key, group, 3)
+    assert cached is page and planes == (2, 1) and widths == [group]
+    cached.ref_count_down()
     assert page.refs == 1
 
 

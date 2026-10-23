@@ -2,7 +2,9 @@
 """Ascend CPU source and checkpoint operations, with no device-engine dependency."""
 
 # Standard
-from typing import Any, Optional
+from typing import Any, Optional, Iterable
+from concurrent.futures import Future
+from collections import deque
 from urllib.parse import urlsplit
 import secrets
 import time
@@ -406,14 +408,15 @@ class AscendCPUCacheOperations(CPUCacheOperations):
         self, tokens: tuple[int, ...], group: int, configs: Any
     ) -> Any:
         """Retain the exact original boundary page, fetching only that page on miss."""
-        start, end, key = list(
+        start, end, key = deque(
             self.token_database.process_tokens(
                 tokens=list(tokens),
                 request_configs=configs,
                 kv_group=group,
-            )
-        )[-1]
-        cached = self.get_checkpoint_prefix(key, group, end - start)
+            ),
+            maxlen=1,
+        ).pop()
+        cached = self.get_checkpoint_prefix(key, group, end - start, with_widths=False)
         if cached is not None:
             return cached[0]
         page, _ = self.allocate_checkpoint_fragment(group, end - start)
@@ -428,7 +431,7 @@ class AscendCPUCacheOperations(CPUCacheOperations):
                 ],
                 [
                     [
-                        page.layer_tensor(i).numel() * page.get_dtype().itemsize
+                        page.layer_size_bytes(i)
                         for i in range(self._num_layers_for_kv_group(group))
                     ]
                 ],
@@ -504,3 +507,88 @@ class AscendCPUCacheOperations(CPUCacheOperations):
         if chunks != expected:
             return 0
         return local.available(request_id, int(generation), chunks[-1][1])
+
+    def checkpoint_token_results(
+        self,
+        tokens: list[int],
+        request_configs: Any,
+        kv_group: int,
+        state: dict,
+        *,
+        start: int = 0,
+    ) -> Iterable[tuple[int, int, CacheEngineKey]]:
+        """Hash once per operation; only build keys for its checkpoint windows.
+
+        State is private to one immutable token/configuration snapshot and start.
+        The complete prefix hash chain is computed even when its keys are unused.
+        """
+        plan = state.get("checkpoint_chunks")
+        if plan is None:
+            plan = tuple(
+                (a, b, digest)
+                for a, b, digest in self.token_database.process_tokens(
+                    tokens=tokens,
+                    make_key=False,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+                if a >= start
+            )
+            state["checkpoint_chunks"] = plan
+        generated = self.token_database.process_tokens(
+            hashes=[entry[2] for entry in plan],
+            offsets=[entry[1] - entry[0] for entry in plan],
+            request_configs=request_configs,
+            kv_group=kv_group,
+        )
+        return (
+            (a, b, key) for (a, b, _), (_, _, key) in zip(plan, generated, strict=True)
+        )
+
+    def probe_checkpoint_pages(self, keys: list) -> list[bool]:
+        """Distinguish confirmed missing remote pages from transport errors."""
+        return self.storage_manager.batched_external_pages_exist(keys, strict=True)
+
+    def persist_checkpoint_page(
+        self, key: CacheEngineKey, page: Any, req_id: str
+    ) -> Future:
+        """Submit a sealed page; the caller retains its owner until completion."""
+        return self.storage_manager.batched_put_external_pages(
+            [key],
+            [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+            [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+            (page.raw_data,),
+            None,
+            req_id,
+        )
+
+    def load_checkpoint_page(
+        self, key: CacheEngineKey, group: int, tokens: int, req_id: str
+    ) -> Any:
+        """Load a canonical checkpoint page, retaining unknown native destinations."""
+        try:
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        except MemoryError:
+            if not self.reclaim_checkpoint_capacity(tokens, {group: None}):
+                raise
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        try:
+            self.storage_manager.batched_get_external_pages(
+                [key],
+                [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+                [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+                (page.raw_data,),
+                req_id,
+            )
+            self.validate_checkpoint_page(group, page)
+            return page
+        except NativeExternalPageTransferUnknownError:
+            self.__dict__.setdefault("_checkpoint_quarantined_owners", []).append(page)
+            raise
+        except BaseException as error:
+            page.ref_count_down()
+            failed = getattr(error, "failed_pages", ())
+            if failed and all(status <= 0 for _, status, _ in failed):
+                if not self.probe_checkpoint_pages([key])[0]:
+                    return None
+            raise

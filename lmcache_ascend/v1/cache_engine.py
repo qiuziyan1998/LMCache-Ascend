@@ -554,6 +554,24 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                 planes[group] = tuple(width * itemsize for width in widths)
         self.storage_plane_token_bytes = planes
 
+    def _post_init_shared_cpu_cache(self) -> None:
+        worker = getattr(self, "checkpoint_worker", None)
+        if worker is not None and getattr(
+            self.config, "decode_checkpoint_writeback", False
+        ):
+            try:
+                worker.local.validate_capacity()
+            except Exception as error:
+                # Peers are waiting for the existing shared-cache envelope.
+                # Validate before the base preflight can publish success.
+                if self.enable_shared_cpu_cache and self.metadata.world_size > 1:
+                    self.broadcast_object_fn(
+                        self._shared_cpu_cache_startup_envelope("error", str(error)),
+                        self.metadata.first_rank,
+                    )
+                raise
+        super()._post_init_shared_cpu_cache()
+
     def post_init(self, **kwargs) -> None:
         if getattr(self, "checkpoint_worker", None) is not None and not (
             callable(getattr(self.gpu_connector, "supports_preemption_capture", None))
@@ -10700,10 +10718,14 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             self.checkpoint_worker.local.forget(req_id)
 
 
-
-
-
-
+    def checkpoint_resume_admitted(
+        self, req_id: str, generation: int, load_generation: int
+    ) -> None:
+        """Join resumed dispatch with the existing TP release acknowledgement."""
+        if self.checkpoint_worker is not None:
+            self.checkpoint_worker.restore_event(
+                req_id, generation, load_generation, "admitted"
+            )
 
     def prepare_checkpoint_restore(self, request: Any) -> tuple[int, list[Any]]:
         """Normalize on TP0 and broadcast terminal admission before ordinary loads."""
@@ -10781,16 +10803,17 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         for group, caches in group_caches.items():
             if caches is not None:
                 self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
-            raw_size = (
-                self.gpu_connector.get_shape(tokens, kv_group=group).numel()
-                * self._shared_cpu_dtype_for_kv_group(group).itemsize
-                * self._num_layers_for_kv_group(group)
-            )
             policy = getattr(self.metadata, "indexer_c8_layout", None)
             if group == 1 and policy is not None and policy.mixed:
                 raw_size = sum(
                     policy.layer_bytes(tokens, i)
                     for i in range(self._num_layers_for_kv_group(group))
+                )
+            else:
+                raw_size = (
+                    self.gpu_connector.get_shape(tokens, kv_group=group).numel()
+                    * self._shared_cpu_dtype_for_kv_group(group).itemsize
+                    * self._num_layers_for_kv_group(group)
                 )
             if round_size is not None:
                 required_bytes += round_size(raw_size)
@@ -10811,38 +10834,54 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         self, group: int, tokens: int, caches: Optional[list] = None
     ) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
         """Allocate registered capture storage without eviction or busy retry."""
+        return self.prepare_checkpoint_allocator(group, caches)(tokens)
+
+    def prepare_checkpoint_allocator(
+        self, group: int, caches: Optional[list] = None
+    ) -> Callable[[int], tuple[LayerPageMemoryObj, tuple[int, ...]]]:
+        """Prepare group invariants for one capture; allocate exact sizes on demand.
+
+        The caller keeps this allocator within one capture, never across cache
+        reconfiguration. Allocation failure does not reclaim, spin or wait.
+        """
         if not self.save_only_first_rank or not self.save_indexer_only_first_rank:
             raise ValueError("Checkpoint requires replicated MLA group writer ownership")
         if caches is not None:
             self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
         local = self._shared_local_cpu_backend()
-        if local is None or tokens <= 0 or not self.gpu_connector.supports_batched_from_gpu_group(group):
+        if local is None or not self.gpu_connector.supports_batched_from_gpu_group(
+            group
+        ):
             raise ValueError("Checkpoint registered group capture is unavailable")
-        shape = self.gpu_connector.get_shape(tokens, kv_group=group)
         widths = self.gpu_connector.checkpoint_plane_widths(group)
+        dtype = self._shared_cpu_dtype_for_kv_group(group)
+        layers = self._num_layers_for_kv_group(group)
+        fmt = self._memory_format_for_kv_group(group)
         policy = getattr(self.metadata, "indexer_c8_layout", None)
-        shapes = (
-            self.metadata.indexer_layer_shapes(tokens)
-            if group == 1 and policy is not None and policy.mixed
-            else [shape]
-        )
-        pages = local.batched_allocate_layer_pages(
-            shapes,
-            [self._shared_cpu_dtype_for_kv_group(group)] * len(shapes),
-            1,
-            self._num_layers_for_kv_group(group),
-            self._memory_format_for_kv_group(group),
-            busy_loop=False,
-            eviction=False,
-            valid_tokens=tokens,
-            full_tokens=tokens,
-        )
-        if not pages:
-            raise MemoryError("Checkpoint CPU staging allocation refused")
-        return pages[0], widths
+        mixed = group == 1 and policy is not None and policy.mixed
 
-    def get_checkpoint_prefix(self, key: CacheEngineKey, group: int, tokens: int) -> Any:
-        """Retain an exact CPU page, or let checkpoint persistence fetch it."""
+        def allocate(tokens: int) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
+            if tokens <= 0:
+                raise ValueError("Checkpoint registered group capture is unavailable")
+            shapes = (
+                self.metadata.indexer_layer_shapes(tokens)
+                if mixed else [self.gpu_connector.get_shape(tokens, kv_group=group)]
+            )
+            pages = local.batched_allocate_layer_pages(
+                shapes, [dtype] * len(shapes), 1, layers, fmt,
+                busy_loop=False, eviction=False,
+                valid_tokens=tokens, full_tokens=tokens,
+            )
+            if not pages:
+                raise MemoryError("Checkpoint CPU staging allocation refused")
+            return pages[0], widths
+
+        return allocate
+
+    def get_checkpoint_prefix(
+        self, key: CacheEngineKey, group: int, tokens: int, *, with_widths: bool = True
+    ) -> Any:
+        """Retain an exact CPU page, optionally computing assembly plane widths."""
         local = self._shared_local_cpu_backend()
         pages, count = local.batched_get_layer_page_prefix([key])
         if not count:
@@ -10855,7 +10894,9 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             and page.get_dtype() == self._shared_cpu_dtype_for_kv_group(group)
             and page.metadata.fmt == self._memory_format_for_kv_group(group)
         ):
-            return page, self.gpu_connector.checkpoint_plane_widths(group)
+            return page, (
+                self.gpu_connector.checkpoint_plane_widths(group) if with_widths else ()
+            )
         page.ref_count_down()
         return None
 

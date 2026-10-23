@@ -177,6 +177,7 @@ def adapter(calls):
     )
     obj = cls()
     obj._lmcache_chunk_size = 4
+    obj.config = NS(pd_role="receiver")
     obj.lmcache_engine = NS(
         load_group1_pages_direct=lambda *a: calls.append(
             ("persistent_prefix", len(a[0]))

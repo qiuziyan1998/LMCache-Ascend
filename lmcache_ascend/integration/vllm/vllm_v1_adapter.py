@@ -1565,14 +1565,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         if metadata is not None and metadata.preemption_captures:
             self.lmcache_engine.enable_checkpoint_prefix_agreement()
+        waited_req_ids = None
         if worker is not None and metadata is not None:
             for req_id, generation in metadata.preemption_cancels:
                 worker.cancel(req_id, generation)
             captures = metadata.preemption_captures
             if captures:
                 self._activate_checkpoint_io()
-                self.lmcache_engine.wait_for_pending_stores(preempted_req_ids)
-                self.lmcache_engine.wait_for_direct_stores(preempted_req_ids)
+                # This also drains direct stores before capture/HBM reuse.
+                waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+                    preempted_req_ids
+                )
                 caches = self._direct_group_caches()
                 for capture in captures:
                     if capture.req_id in preempted_req_ids:
@@ -1590,10 +1593,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if not self.store_async or self.kv_role == "kv_consumer":
             return
 
-        waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
-            preempted_req_ids
-        )
-        self.lmcache_engine.wait_for_direct_stores(preempted_req_ids)
+        if waited_req_ids is None:
+            waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+                preempted_req_ids
+            )
         for req_id in preempted_req_ids:
             getattr(self, "_scheduler_remote_fill_results", {}).pop(
                 req_id, None
@@ -1796,6 +1799,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if (getattr(self.lmcache_engine, "storage_process", None) is not None
                 or not hasattr(request.load_spec, "checkpoint_generation")):
             return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
+        if self.config.pd_role is None:
+            # Standalone keeps both groups in the ordinary shared-CPU path.
+            # Normalize the checkpoint before even speculative CPU prefetch can
+            # observe its tail; no per-rank direct-HBM reader is initialized here.
+            plan["latent_shared_ready"].result()
+            return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
         error = None
         try:
             plan["latent_shared_ready"].result()
@@ -1836,6 +1845,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             return False
         worker = self.lmcache_engine.checkpoint_worker
         if worker is not None:
+            notify = getattr(worker, "restore_event", None)
+            if notify is not None:
+                notify(
+                    request.req_id, request.load_spec.checkpoint_generation,
+                    generation, "failed",
+                )
             worker.results.append(
                 CheckpointResult(
                     request.req_id,
@@ -1912,14 +1927,38 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         parallel = vllm_config.parallel_config
         spec = vllm_config.speculative_config
         shared_cpu = config.get_extra_config_value("enable_shared_cpu_cache", config.enable_shared_cpu_cache)
+        standalone = config.pd_role is None
+        if standalone or getattr(config, "decode_checkpoint_writeback", False):
+            from lmcache.v1.mooncake_layout import (
+                mooncake_layer_pages_enabled, mooncake_page_layout_enabled,
+            )
+            from lmcache.v1.storage_backend.connector.base_connector import (
+                resolve_save_chunk_meta,
+            )
+            if (
+                not str(config.remote_url).startswith("mooncakestore://")
+                or not mooncake_page_layout_enabled(config)
+                or resolve_save_chunk_meta(config)
+                or (standalone and not mooncake_layer_pages_enabled(config))
+            ):
+                raise ValueError(
+                    "Checkpoint write-back/standalone restore requires the Mooncake "
+                    "page-first backend; standalone also requires shared merged pages"
+                )
+        load_mode_supported = (
+            config.dsa_group1_load_mode in (
+                "p2p_preferred", "persistent_serial", "persistent_parallel_prefetch"
+            )
+            if standalone else config.dsa_group1_load_mode == "persistent_direct_hbm"
+        )
         if not (
-            self.kv_role == "kv_both" and config.pd_role == "receiver"
+            self.kv_role == "kv_both" and config.pd_role in (None, "receiver")
             and config.store_async and config.use_layerwise and shared_cpu
             and config.enable_sparse_attention and config.dsa_two_groups
             and config.enable_dsa_cold_compact_load
             and config.get_extra_config_value("save_only_first_rank", True)
             and not vllm_config.cache_config.enable_prefix_caching
-            and config.dsa_group1_load_mode == "persistent_direct_hbm"
+            and load_mode_supported
             and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size
             == parallel.decode_context_parallel_size == 1
             and (spec is None or (
@@ -1927,9 +1966,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 and not spec.parallel_drafting and not spec.disable_padded_drafter_batch
             ))
         ):
-            raise ValueError("decode_preemption_checkpoint requires the two-group shared-CPU "
-                             "kv_both decoder with async stores, cold-compact persistent_direct_hbm "
-                             "loading, PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding")
+            raise ValueError(
+                "decode_preemption_checkpoint requires the two-group shared-CPU "
+                "kv_both server with async stores, cold-compact loading, "
+                "persistent_direct_hbm on a receiver or CPU loading standalone, "
+                "PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding"
+            )
         if not callable(getattr(type(self._parent), "handle_preemptions_with_metadata", None)):
             raise ValueError("decode_preemption_checkpoint requires the dynamic LMCache checkpoint connector")
         scheduler = vllm_config.scheduler_config.get_scheduler_cls()

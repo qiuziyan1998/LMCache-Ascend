@@ -69,6 +69,13 @@ class Page:
         self.refs = 1
         self.metadata = NS(fmt="test")
         self.valid_tokens, self.num_layers = tokens, layers
+        self.group_prefix_sum = tuple(i * self.stride for i in range(layers + 1))
+
+    def layer_layout_is_valid(self):
+        return self.group_prefix_sum[-1] == self.raw_data.numel()
+
+    def get_dtypes(self):
+        return [torch.uint8] * self.num_layers
 
     def is_valid(self):
         return self.refs > 0
@@ -173,6 +180,10 @@ def fill(page, start, group):
 
 
 def fake_engine(group_layers=(2, 2)):
+    class Engine(NS):
+        def prepare_checkpoint_allocator(self, group, caches=None):
+            return lambda n: self.allocate_checkpoint_fragment(group, n, caches)
+
     backend = LocalCPU()
     allocated, calls = [], []
 
@@ -193,7 +204,7 @@ def fake_engine(group_layers=(2, 2)):
         fill(page, len(tokens) - length, group)
         return page
 
-    def cached_prefix(key, group, length):
+    def cached_prefix(key, group, length, *, with_widths=True):
         pages, count = backend.batched_get_layer_page_prefix([key])
         if count:
             if pages[0].valid_tokens == length:
@@ -203,6 +214,11 @@ def fake_engine(group_layers=(2, 2)):
 
     def prepare(rows, starts, ends, **kw):
         calls.append(("prepare", kw["kv_group"], len(starts)))
+        rows = [
+            [NS(tensor=obj.layer_tensor(layer), metadata=obj.metadata)
+             if isinstance(obj, Page) else obj for obj in row]
+            for layer, row in enumerate(rows)
+        ]
         return rows, starts, ends, kw["kv_group"]
 
     def enqueue(plan):
@@ -220,7 +236,8 @@ def fake_engine(group_layers=(2, 2)):
                     offset += (end - start) * width
         return NS(synchronize=lambda: calls.append(("fence",)))
 
-    return NS(
+    database = NS(process_tokens=tokens)
+    return Engine(
         config=NS(store_async_max_queue_size=2, blocking_timeout_secs=10, chunk_size=4),
         checkpoint_backend=lambda: backend,
         validate_checkpoint_page=lambda group, page: None,
@@ -233,7 +250,14 @@ def fake_engine(group_layers=(2, 2)):
             start,
             end,
         ),
-        token_database=NS(process_tokens=tokens),
+        token_database=database,
+        checkpoint_token_results=(
+            lambda tokens, configs, group, state, start=0: (
+                entry for entry in database.process_tokens(
+                    tokens=tokens, request_configs=configs, kv_group=group
+                ) if entry[0] >= start
+            )
+        ),
         num_layers=group_layers[0],
         num_layers_for_group=lambda group: group_layers[group],
         _num_layers_for_kv_group=lambda group: group_layers[group],
@@ -270,13 +294,13 @@ def start_capture(
 ):
     control, module = api
     engine = engine or fake_engine()
-    original_tensor = torch.tensor
+    original_empty = torch.empty
 
-    def tensor(values, **kw):
+    def empty(shape, **kw):
         kw.pop("pin_memory", None)
-        return original_tensor(values, **kw)
+        return original_empty(shape, **kw)
 
-    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
+    monkeypatch.setattr(module, "torch", NS(empty=empty, long=torch.long))
     store = module.CheckpointWorker(engine)
     blocks = tuple(range(1, (end + 3) // 4 + 1))
     spec = control.CaptureSpec(
@@ -879,7 +903,7 @@ def test_c8_capture_quarantine_keeps_nonowning_launch_operands(api, monkeypatch)
         module,
         "torch",
         NS(
-            tensor=lambda values, **kw: torch.tensor(values, dtype=kw["dtype"]),
+            empty=lambda shape, **kw: torch.empty(shape, dtype=kw["dtype"]),
             long=torch.long,
         ),
     )

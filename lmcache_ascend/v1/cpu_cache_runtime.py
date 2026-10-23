@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
 from types import SimpleNamespace
 from typing import Any
@@ -61,6 +62,7 @@ class _WriteReservation:
     fragments: dict[int, list[tuple[int, int, Any]]] = field(default_factory=dict)
     leases: list[str] = field(default_factory=list)
     prefix_sources: tuple[CheckpointPage, ...] = ()
+    prefix_owners: list[Any] = field(default_factory=list)
     captured_end: int = 0
     captured: bool = False
     committing: bool = False
@@ -80,6 +82,21 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
         self._write_reservations: dict[str, _WriteReservation] = {}
         super().__init__(*args, **kwargs)
         self.checkpoint_store = LocalCheckpointStore(self)
+        self.checkpoint_retire_executor = None
+        if self.config.decode_preemption_checkpoint and getattr(
+            self.config, "decode_checkpoint_writeback", False
+        ):
+            from lmcache_ascend.v1.checkpoint_writeback import CheckpointWritebackStore
+
+            executor = ThreadPoolExecutor(1, thread_name_prefix="checkpoint-retire")
+            store = CheckpointWritebackStore(self, executor)
+            try:
+                store.validate_capacity()
+            except BaseException:
+                executor.shutdown(wait=True)
+                raise
+            self.checkpoint_store = store
+            self.checkpoint_retire_executor = executor
         self.save_only_first_rank = bool(
             self.config.get_extra_config_value(
                 "save_only_first_rank", self.metadata.use_mla
@@ -121,6 +138,12 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
 
     def checkpoint_plane_widths(self, group: int) -> tuple[Any, ...]:
         """Return element widths for the existing CPU checkpoint assembler."""
+        cached_layout, cached = getattr(self, "_checkpoint_width_cache", (None, {}))
+        if cached_layout is not self.layout:
+            cached = {}
+            self._checkpoint_width_cache = (self.layout, cached)
+        if group in cached:
+            return cached[group]
         widths = []
         for layer, planes in enumerate(self.layout.groups[group].plane_token_bytes):
             _, dtype, _ = self._expected_shared_cpu_chunk_metadata(
@@ -131,7 +154,10 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             if any(width % dtype.itemsize for width in planes):
                 raise ValueError("Checkpoint plane is not dtype aligned")
             widths.append(tuple(width // dtype.itemsize for width in planes))
-        return widths[0] if all(row == widths[0] for row in widths) else tuple(widths)
+        cached[group] = (
+            widths[0] if all(row == widths[0] for row in widths) else tuple(widths)
+        )
+        return cached[group]
 
     def allocate_checkpoint_fragment(
         self,
@@ -143,14 +169,21 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
         if caches is not None or tokens <= 0:
             raise ValueError("CPU capture reservations contain layout values only")
         local = self.checkpoint_backend()
-        geometry = [
-            self._expected_shared_cpu_chunk_metadata(
-                kv_group=group,
-                num_tokens=tokens,
-                layer_id=layer,
+        layout, prepared = getattr(self, "_checkpoint_allocation_cache", (None, {}))
+        if layout is not self.layout:
+            prepared = {}
+            self._checkpoint_allocation_cache = (self.layout, prepared)
+        previous_tokens, geometry = prepared.get(group, (None, None))
+        if previous_tokens != tokens:
+            geometry = tuple(
+                self._expected_shared_cpu_chunk_metadata(
+                    kv_group=group, num_tokens=tokens, layer_id=layer
+                )
+                for layer in range(self.num_layers_for_group(group))
             )
-            for layer in range(self.num_layers_for_group(group))
-        ]
+            # Keep only the latest exact token size per group under the frozen
+            # layout. Tail sizes cannot accumulate an unbounded metadata cache.
+            prepared[group] = (tokens, geometry)
         pages = local.batched_allocate_layer_pages(
             [shape for shape, _, _ in geometry],
             [dtype for _, dtype, _ in geometry],
@@ -205,7 +238,9 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             max_scan_entries=4096,
         )
 
-    def get_checkpoint_prefix(self, key: Any, group: int, tokens: int) -> Any:
+    def get_checkpoint_prefix(
+        self, key: Any, group: int, tokens: int, *, with_widths: bool = True
+    ) -> Any:
         """Retain an exact registered local page before checkpoint normalization."""
         pages, count = self.checkpoint_backend().batched_get_layer_page_prefix([key])
         if not count:
@@ -216,9 +251,27 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             if not page.is_valid() or page.valid_tokens != tokens:
                 page.ref_count_down()
                 return None
-            return page, self.checkpoint_plane_widths(group)
+            return page, self.checkpoint_plane_widths(group) if with_widths else ()
         except BaseException:
             page.ref_count_down()
+            raise
+
+    def prepare(
+        self,
+        spec: PrepareSpec,
+        identity: OperationIdentity,
+        *,
+        payload_digest: bytes | None = None,
+    ) -> Any:
+        """Retire a failed restore attempt even if later source export fails."""
+        try:
+            return super().prepare(spec, identity, payload_digest=payload_digest)
+        except BaseException:
+            notify = getattr(self.checkpoint_store, "restore_event", None)
+            if spec.mode == "checkpoint_restore" and notify is not None:
+                key = (identity.request_id, spec.checkpoint_generation)
+                notify(key, identity.load_generation, "failed")
+                notify(key, identity.load_generation, "ack")
             raise
 
     def prepare_checkpoint_restore_sources(
@@ -239,6 +292,9 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 "Local checkpoint offer is unavailable",
                 details={"checkpoint_miss_end": 0},
             )
+        notify = getattr(self.checkpoint_store, "restore_event", None)
+        if notify is not None:
+            notify((identity.request_id, generation), identity.load_generation, "begin")
         configs = dict(reply.request_configs)
         configs.pop(LOCAL_CHECKPOINT_CONFIG)
         owners = []
@@ -378,12 +434,15 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 reservation.leases.append(lease)
                 if isinstance(objects[0], LayerPageMemoryObj):
                     geometries, geometry_ids = [], []
+                    previous = None
                     for page in objects:
                         geometry = self.source_geometry(group, page)
-                        geometry.validate(
-                            self.num_layers_for_group(group),
-                            int(page.metadata.phy_size),
-                        )
+                        proof = (geometry, int(page.metadata.phy_size))
+                        if proof != previous:
+                            geometry.validate(
+                                self.num_layers_for_group(group), proof[1]
+                            )
+                            previous = proof
                         if geometry not in geometries:
                             geometries.append(geometry)
                         geometry_ids.append(geometries.index(geometry))
@@ -451,6 +510,7 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             self.registry.publish_leases(identity, reservation.leases)
             return reply
         except BaseException as error:
+            self._release_checkpoint_prefix(reservation)
             for lease in reservation.leases:
                 self.registry.producer_done(lease, known_complete=True)
                 self.registry.producer_done(lease, known_complete=True)
@@ -518,6 +578,7 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 self.registry.producer_done(lease, known_complete=True)
             with self._write_lock:
                 self._write_reservations.pop(value["reservation_id"], None)
+            self._release_checkpoint_prefix(reservation)
             return {"status": "COMMITTED", "committed_end": reservation.captured_end}
         finally:
             with self._write_lock:
@@ -555,11 +616,24 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 self.registry.producer_done(lease, known_complete=True)
         with self._write_lock:
             self._write_reservations.pop(value["reservation_id"], None)
+        self._release_checkpoint_prefix(reservation)
         return {"status": "CANCELLED"}
+
+    def is_frozen(self) -> bool:
+        """Read owner freeze state without an IPC roundtrip."""
+        return self.storage_manager.is_frozen()
+
+    def _release_checkpoint_prefix(self, reservation: _WriteReservation) -> None:
+        owners, reservation.prefix_owners = reservation.prefix_owners, []
+        self._release_shared_retrieve_objs(owners, unpin=False)
 
     def is_healthy(self) -> bool:
         """Include the native receiver's latched unknown-completion state."""
-        return not self._remote_fill_fatal_transfers and super().is_healthy()
+        return (
+            not self._remote_fill_fatal_transfers
+            and getattr(self.checkpoint_store, "fatal", None) is None
+            and super().is_healthy()
+        )
 
     def close(self) -> None:
         """Close RemoteFill before its registered CPU storage, after lease drain."""
@@ -582,12 +656,35 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                         "RemoteFill shutdown found unresolved native transfers"
                     )
                 self._remote_fill_runtime = None
+            close = getattr(self.checkpoint_store, "close", None)
+            if close is not None:
+                close()
+            if self.checkpoint_retire_executor is not None:
+                self.checkpoint_retire_executor.shutdown(wait=True)
             super().close()
         finally:
             with self._lock:
                 self._closing = False
 
     def _dispatch(self, request: Any) -> Any:
+        if request.method == "checkpoint_restore_event":
+            value = request.payload
+            if (
+                request.identity.client_session != "worker-0"
+                or value.get("generation") != request.identity.load_generation
+                or type(value.get("attempt")) is not int
+                or value["attempt"] < 0
+                or value.get("event") not in ("admitted", "failed", "ack")
+            ):
+                raise StorageFailedSafe("Invalid checkpoint restore notification")
+            notify = getattr(self.checkpoint_store, "restore_event", None)
+            if notify is not None:
+                notify(
+                    (request.identity.request_id, value["generation"]),
+                    value["attempt"],
+                    value["event"],
+                )
+            return None
         if request.method == "reserve_write":
             return self.reserve_write(request.payload, request.identity)
         if request.method == "commit_write":
@@ -687,23 +784,32 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 "Checkpoint prefix has no live source ownership proof"
             )
         records = []
-        for entry in prefix_sources:
-            count = entry["object_end"] - entry["start"]
-            raw_hash = restore_hash(
-                entry["hash"], self.layout.hash_width, self.layout.hash_kind
-            )
-            _, _, key = next(
-                iter(
-                    self.token_database.process_tokens(
-                        hashes=[raw_hash],
-                        offsets=[count],
-                        request_configs=value.get("request_configs") or {},
-                        kv_group=0,
+        if prefix_sources:
+            keys = self.token_database.process_tokens(
+                hashes=[
+                    restore_hash(
+                        e["hash"], self.layout.hash_width, self.layout.hash_kind
                     )
-                )
+                    for e in prefix_sources
+                ],
+                offsets=[e["object_end"] - e["start"] for e in prefix_sources],
+                request_configs=value.get("request_configs") or {},
+                kv_group=0,
             )
-            records.append(CheckpointPage(entry["start"], entry["end"], key))
+            records = [
+                CheckpointPage(e["start"], e["end"], key)
+                for e, (_, _, key) in zip(prefix_sources, keys, strict=True)
+            ]
         reservation.prefix_sources = tuple(records)
+        if records and getattr(self.config, "decode_checkpoint_writeback", False):
+            pages, count = self.checkpoint_backend().batched_get_layer_page_prefix(
+                [record.key for record in records]
+            )
+            reservation.prefix_owners.extend(pages)
+            if count != len(records):
+                raise StorageFailedSafe("Checkpoint older latent source is unavailable")
+            for page in pages:
+                self.validate_checkpoint_page(0, page)
         cursor, reclaimed = base, False
         while cursor < end:
             desired_end = min(
@@ -952,6 +1058,7 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 tokens,
                 reservation.prefix_end,
                 tuple(tuple(sorted(group, key=lambda p: p.start)) for group in groups),
+                reservation.options.get("request_configs"),
             ),
         )
 

@@ -181,3 +181,90 @@ def test_scheduler_without_retry_support_is_rejected_before_services_start():
     with pytest.raises(ValueError, match="safe restore retries"):
         cls(vllm, Role.SCHEDULER, parent)
     assert calls == []
+
+
+@pytest.fixture
+def page_backend_helpers(monkeypatch):
+    """Load actual pure config helpers without importing a device connector."""
+    for name in (
+        "lmcache",
+        "lmcache.v1",
+        "lmcache.v1.storage_backend",
+        "lmcache.v1.storage_backend.connector",
+    ):
+        if name not in sys.modules:
+            monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    for name, path, names in (
+        (
+            "lmcache.v1.mooncake_layout",
+            "lmcache/v1/mooncake_layout.py",
+            {"mooncake_layer_pages_enabled", "mooncake_page_layout_enabled"},
+        ),
+        (
+            "lmcache.v1.storage_backend.connector.base_connector",
+            "lmcache/v1/storage_backend/connector/base_connector.py",
+            {"resolve_save_chunk_meta"},
+        ),
+    ):
+        source = ROOT.parent / "LMCache-NPU" / path
+        nodes = [
+            n
+            for n in ast.parse(source.read_text(encoding="utf-8")).body
+            if isinstance(n, ast.FunctionDef) and n.name in names
+        ]
+        module = ModuleType(name)
+        prefix = ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[prefix, *nodes], type_ignores=[])
+                ),
+                str(source),
+                "exec",
+            ),
+            vars(module),
+        )
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize(
+    "mode", ["p2p_preferred", "persistent_serial", "persistent_parallel_prefetch"]
+)
+def test_standalone_checkpoint_reaches_factory_without_remote_fill(
+    mode, page_backend_helpers
+):
+    config, vllm, parent = configs()
+    config.pd_role = None
+    config.dsa_group1_load_mode = mode
+    config.remote_url = "mooncakestore://localhost:50088/"
+    config.enable_remote_lmcache_store = False
+    config.extra_config = {
+        "save_only_first_rank": True,
+        "save_chunk_meta": False,
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+    }
+    cls, calls, started = init_api(config)
+    with pytest.raises(started):
+        cls(vllm, Role.SCHEDULER, parent)
+    assert calls == ["factory"]
+    assert config.pd_role is None and not config.enable_remote_lmcache_store
+
+
+def test_standalone_without_paired_page_sources_fails_before_factory(
+    page_backend_helpers,
+):
+    config, vllm, parent = configs()
+    config.pd_role = None
+    config.dsa_group1_load_mode = "p2p_preferred"
+    config.remote_url = "mooncakestore://localhost:50088/"
+    config.extra_config = {
+        "save_chunk_meta": False,
+        "mooncake_page_first_multi_buffer": True,
+    }
+    cls, calls, _ = init_api(config)
+    with pytest.raises(ValueError, match="shared merged pages"):
+        cls(vllm, Role.SCHEDULER, parent)
+    assert not calls

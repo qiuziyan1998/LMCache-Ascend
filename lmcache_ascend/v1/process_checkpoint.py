@@ -70,6 +70,22 @@ class _CheckpointControls:
                 f"forget-{generation}",
             )
 
+    def restore_event(self, identity: tuple, attempt: int, event: str) -> None:
+        """Forward bounded lifecycle notifications without waiting in W."""
+        worker = self.worker
+        if (
+            worker.writer
+            and event != "begin"
+            and getattr(worker.engine.config, "decode_checkpoint_writeback", False)
+        ):
+            worker.submit_control(
+                "checkpoint_restore_event",
+                {"generation": identity[1], "attempt": attempt, "event": event},
+                identity[0],
+                identity[1],
+                f"restore-{attempt}",
+            )
+
     def normalize(self, *args: Any, **kwargs: Any) -> None:
         """Restore normalization belongs to the coarse M prepare operation."""
         raise RuntimeError(
@@ -121,7 +137,7 @@ class ProcessCheckpointWorker(CheckpointWorker):
         if key in self.jobs:
             # EngineCore may repeat a control until its result arrives. The
             # existing captured generation no longer needs its old prefix lease.
-            super().capture(spec, caches, block_size, prefix_state)
+            super().capture(spec, caches, block_size)
             return
         with self._lock:
             reconciling = key in self.reservations
@@ -144,7 +160,9 @@ class ProcessCheckpointWorker(CheckpointWorker):
                 self._sources[key] = (
                     self.engine.compact_source_importer.source_descriptor(source)
                 )
-            super().capture(spec, caches, block_size, prefix_state)
+            # M validates and retains the source descriptor during reservation.
+            # W has no owner cache and must not run local-mode prefix acquisition.
+            super().capture(spec, caches, block_size)
         except Exception as error:
             # Descriptor validation happens before the base capture owns a job.
             if key not in self.reservations:
@@ -177,6 +195,7 @@ class ProcessCheckpointWorker(CheckpointWorker):
     ) -> None:
         """Retire normalization ownership at the existing all-TP receive ACK."""
         self.engine.compact_source_importer.release_restore(req_id, load_generation)
+        self.restore_event(req_id, generation, load_generation, "ack")
         for owner in self.restore_owners.pop((req_id, generation, load_generation), ()):
             if isinstance(owner, LocalLeaseHandle):
                 owner.release("fenced")
@@ -184,7 +203,14 @@ class ProcessCheckpointWorker(CheckpointWorker):
                 owner.ref_count_down()
 
     def submit_control(
-        self, method: str, payload: dict, req_id: str, generation: int, attempt: str
+        self,
+        method: str,
+        payload: dict,
+        req_id: str,
+        generation: int,
+        attempt: str,
+        *,
+        retry_deadline: float | None = None,
     ) -> Any:
         """Queue one CPU-only metadata operation and retain its terminal ACK."""
         future = self.client.request(
@@ -198,10 +224,18 @@ class ProcessCheckpointWorker(CheckpointWorker):
         with self._lock:
             self.pending_controls[future.identity.key] = future
         receiver = proxy(self)
+        deadline = retry_deadline
+        if method == "checkpoint_restore_event" and deadline is None:
+            deadline = time.monotonic() + self.timeout
 
         def completed(done: Any) -> None:
             try:
                 result = done.result()
+                if result.status == "BUSY" and method == "checkpoint_restore_event":
+                    receiver.executor.submit(
+                        receiver._retry_restore_control, done, payload, deadline
+                    )
+                    return
                 if result.status not in (
                     "COMPLETED",
                     "FAILED_SAFE",
@@ -223,6 +257,45 @@ class ProcessCheckpointWorker(CheckpointWorker):
 
         future.add_done_callback(completed)
         return future
+
+    def _retry_restore_control(
+        self, future: Any, payload: dict, deadline: float, cancelled: bool = False
+    ) -> None:
+        """Reconcile refused notifications off-thread using existing cancel proof."""
+        try:
+            if time.monotonic() >= deadline:
+                return
+            if not cancelled:
+                result = cancel_unadmitted_operation(
+                    self.client, future, max(0.001, deadline - time.monotonic())
+                )
+                if result.status not in ("BUSY", "CANCELLED_NOT_STARTED"):
+                    return  # Keep ambiguous operation evidence and drain guard.
+                cancelled = result.status == "CANCELLED_NOT_STARTED"
+            if cancelled:
+                identity = future.identity
+                self.submit_control(
+                    "checkpoint_restore_event",
+                    payload,
+                    identity.request_id,
+                    identity.load_generation,
+                    identity.request_attempt,
+                    retry_deadline=deadline,
+                )
+                with self._lock:
+                    self.pending_controls.pop(identity.key, None)
+                return
+        except BufferError:
+            pass  # Cancellation/ACK credit can recover just like submission credit.
+        except BaseException as error:
+            clear_failure_tracebacks(error)
+            return  # No timeout or failed IPC establishes notification completion.
+        # Retirement queued on this executor can be what frees capacity.
+        # Yield after one refusal instead of occupying its sole worker.
+        time.sleep(0.005)
+        self.executor.submit(
+            self._retry_restore_control, future, payload, deadline, cancelled
+        )
 
     def poll(self) -> tuple[CheckpointResult, ...]:
         """Preserve normal control results and retry a short refused CPU cancel."""
@@ -377,32 +450,38 @@ class ProcessCheckpointWorker(CheckpointWorker):
                 if group_id == 0
                 else job.spec.base
             )
-            widths = tuple(
-                tuple(value) if isinstance(value, list) else value
-                for value in group["plane_widths"]
-            )
+            prepared_geometry = {}
             for index, (start, end) in enumerate(zip(starts, ends, strict=True)):
                 if start != cursor or not start < end <= reply["captured_end"]:
                     raise ValueError(
                         "Checkpoint reservation coverage has a hole or overlap"
                     )
-                geometry = geometries[indices[index]]
-                geometry.validate(layers, extents[index])
+                geometry_id = indices[index]
+                if geometry_id >= len(geometries):
+                    raise ValueError("Checkpoint geometry index is out of bounds")
+                geometry = geometries[geometry_id]
                 if (
                     geometry.token_capacity != end - start
                     or offsets[index] + extents[index] > mapping.size
-                    or geometry.layer_starts
-                    != tuple(
-                        sum(geometry.layer_sizes[:layer]) for layer in range(layers)
-                    )
-                    or len(set(geometry.layer_dtypes)) != 1
                 ):
-                    raise ValueError(
-                        "Checkpoint reservation physical geometry disagrees "
-                        "with its page"
+                    raise ValueError("Checkpoint page exceeds its destination bounds")
+                key = (geometry_id, extents[index])
+                if key not in prepared_geometry:
+                    geometry.validate(layers, extents[index])
+                    position, layer_starts = 0, []
+                    for size in geometry.layer_sizes:
+                        layer_starts.append(position)
+                        position += size
+                    if (
+                        geometry.layer_starts != tuple(layer_starts)
+                        or len(set(geometry.layer_dtypes)) != 1
+                    ):
+                        raise ValueError("Checkpoint physical layer geometry disagrees")
+                    prepared_geometry[key] = (
+                        [torch.Size(shape) for shape in geometry.layer_shapes],
+                        getattr(torch, geometry.layer_dtypes[0].removeprefix("torch.")),
                     )
-                shapes = [torch.Size(shape) for shape in geometry.layer_shapes]
-                dtype = getattr(torch, geometry.layer_dtypes[0].removeprefix("torch."))
+                shapes, dtype = prepared_geometry[key]
                 batch = SharedHandleBatch(
                     mapping.shm_name,
                     0,
@@ -423,9 +502,7 @@ class ProcessCheckpointWorker(CheckpointWorker):
                     cached_positions=range(start, end),
                     layer_shapes=shapes,
                 )
-                job.fragments.setdefault(group_id, []).append(
-                    (start, end, page, widths)
-                )
+                job.fragments.setdefault(group_id, []).append((start, end, page))
                 cursor = end
             if cursor != reply["captured_end"]:
                 raise ValueError("Checkpoint reservation omits its captured tail")
