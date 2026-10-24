@@ -20,6 +20,7 @@ from lmcache.v1.prefill_store_debug import (
     prefill_store_debug_finish,
     prefill_store_debug_log,
 )
+from lmcache.v1.prefill_kv_hash import finish_kv_hash, kv_hash_enabled
 from lmcache.v1.cache_engine import LayerwiseStoreResult
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -1363,6 +1364,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
             if store_debug:
                 prefill_store_debug_finish(request.req_id)
+            if kv_hash_enabled() and get_tensor_model_parallel_rank() == 0:
+                finish_kv_hash(request.req_id)
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
         if getattr(self, "_force_layerwise_prefill_store", False):

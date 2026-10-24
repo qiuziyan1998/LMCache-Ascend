@@ -45,7 +45,7 @@ class Queue:
         raise error
 
 
-def publish(*, mixed=False, asynchronous=True, trace=None):
+def publish(*, mixed=False, asynchronous=True, trace=None, hash_enabled=False):
     """Execute the actual page-mode branch, including its flat-object fallback."""
     path = Path(__file__).resolve().parents[2] / "lmcache_ascend/v1/cache_engine.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -62,6 +62,13 @@ def publish(*, mixed=False, asynchronous=True, trace=None):
         and node.test.id == "page_first_store"
         and isinstance(node.body[0], ast.Assign)
         and node.body[0].targets[0].id == "async_pages"
+    )
+    hash_block = next(
+        node
+        for node in ast.walk(store)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test)
+        == "self._force_layerwise_prefill_store and kv_hash_enabled()"
     )
     flat = [[Object() for _ in range(2)] for _ in range(3)]
     if mixed:
@@ -100,7 +107,15 @@ def publish(*, mixed=False, asynchronous=True, trace=None):
             batched_put_layerwise_objects=fenced_put,
         ),
         _track_sync_store_futures=lambda futures, **kw: required.extend(futures),
+        hash_calls=[],
     )
+    engine.config.chunk_size = 256
+    hash_ready = NS(cpu_hash_fence=True)
+
+    def hash_submit(*args, **kwargs):
+        engine.hash_calls.append((args, kwargs))
+        return hash_ready
+
     namespace = dict(
         self=engine,
         memory_objs=flat,
@@ -119,11 +134,27 @@ def publish(*, mixed=False, asynchronous=True, trace=None):
         ends=[256, 512],
         store_debug=trace is not None,
         prefill_store_debug_log=lambda *args, **kwargs: trace.append((args, kwargs)),
+        kv_hash_enabled=lambda: hash_enabled,
+        submit_kv_hash=hash_submit,
     )
     exec(
-        compile(ast.Module(body=[block], type_ignores=[]), str(path), "exec"), namespace
+        compile(
+            ast.Module(body=[hash_block, block], type_ignores=[]), str(path), "exec"
+        ),
+        namespace,
     )
     return engine, flat, fences, unfenced_reads, fenced_puts, required
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_real_store_passes_hash_ready_to_background_writer(mixed):
+    engine, _, fences, _, puts, _ = publish(mixed=mixed, hash_enabled=True)
+    assert len(engine.hash_calls) == 1
+    assert engine.hash_calls[0][1]["producer_events"] == fences
+    for _, _, options in puts:
+        events = options["producer_events"]
+        assert events[:-1] == fences
+        assert events[-1].cpu_hash_fence is True
 
 
 @pytest.mark.parametrize("mixed", [False, True])
@@ -263,6 +294,7 @@ def test_terminal_marker_follows_existing_persistence_barriers(enabled, failed):
 
     runtime = dict(
         prefill_store_debug_enabled=lambda: enabled,
+        kv_hash_enabled=lambda: False,
         get_tensor_model_parallel_rank=lambda: 0,
         prefill_store_debug_log=lambda stage, *args, **kwargs: trace.append(stage),
         prefill_store_debug_finish=lambda req: trace.append("persist_done"),

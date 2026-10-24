@@ -65,6 +65,11 @@ from lmcache.v1.mooncake_layout import (
     mooncake_payload_layout,
 )
 from lmcache.v1.prefill_metadata import PrefillMetadataPlan
+from lmcache.v1.prefill_kv_hash import (
+    kv_hash_enabled,
+    skip_kv_hash,
+    submit_kv_hash,
+)
 from lmcache.v1.prefill_store_debug import (
     prefill_store_allocator_snapshot,
     prefill_store_debug_enabled,
@@ -5338,6 +5343,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             if not retrieve_kwargs.get("_defer_direct_load_readiness", False):
                 consume(record())
+            if (
+                kv_hash_enabled()
+                and self.metadata.is_first_rank()
+                and not self._force_layerwise_prefill_store
+            ):
+                skip_kv_hash("D", req_id, 1, "direct_npu_not_observed")
             return True
         except Exception as exc:
             if isinstance(exc, NativeExternalPageTransferUnknownError):
@@ -7645,6 +7656,30 @@ class AscendLMCacheEngine(LMCacheEngine):
                     if callable(fences_fn):
                         layerwise_store_fences = tuple(fences_fn(kv_group))
 
+                if self._force_layerwise_prefill_store and kv_hash_enabled():
+                    hash_fences = layerwise_store_fences
+                    if async_layerwise_store and not hash_fences:
+                        hash_fences = tuple(
+                            self.gpu_connector.layerwise_prefill_store_fences(kv_group)
+                        )
+                    if async_layerwise_store and not hash_fences:
+                        skip_kv_hash("S", req_id, kv_group, "missing_producer_fence")
+                    else:
+                        hash_ready = submit_kv_hash(
+                            "S",
+                            req_id,
+                            kv_group,
+                            starts,
+                            ends,
+                            memory_objs,
+                            int(self.config.chunk_size),
+                            producer_events=hash_fences,
+                        )
+                        if hash_ready is not None:
+                            # The existing Mooncake background worker waits
+                            # for the pre-store CPU hash, after the bank DMAs.
+                            layerwise_store_fences += (hash_ready,)
+
                 if page_first_store:
                     async_pages = bool(
                         self._force_layerwise_prefill_store
@@ -7717,7 +7752,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     end=ends[page_indices[-1]],
                                     chunks=len(page_indices),
                                     async_d2h=async_layerwise_store,
-                                    events=len(layerwise_store_fences),
+                                    events=sum(
+                                        not getattr(event, "cpu_hash_fence", False)
+                                        for event in layerwise_store_fences
+                                    ),
                                     layers=len(memory_objs),
                                     bytes=layer_pages[0].get_size(),
                                 )
@@ -7765,7 +7803,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     end=ends[legacy_indices[-1]],
                                     chunks=len(legacy_indices),
                                     async_d2h=async_layerwise_store,
-                                    events=len(layerwise_store_fences),
+                                    events=sum(
+                                        not getattr(event, "cpu_hash_fence", False)
+                                        for event in layerwise_store_fences
+                                    ),
                                 )
                             legacy_keys = [
                                 layer_keys[index]
@@ -9969,6 +10010,33 @@ class AscendLMCacheEngine(LMCacheEngine):
         defer_finish = False
         dispatch_count = 0
         dispatch_sum_s = dispatch_max_s = 0.0
+        if (
+            kv_hash_enabled()
+            and self.metadata.is_first_rank()
+            and not direct_group1_load
+            and not self._force_layerwise_prefill_store
+        ):
+            hash_rows = (
+                cached_memory_objs
+                if self._retrieve_data_cache_covers(
+                    cached_memory_objs, num_layers, len(starts)
+                )
+                else pre_resolved_shared_mem_layers
+            )
+            if hash_rows is not None:
+                submit_kv_hash(
+                    "D",
+                    kwargs.get("req_id", "unspecified"),
+                    kv_group,
+                    starts,
+                    ends,
+                    hash_rows,
+                    int(self.config.chunk_size),
+                )
+            else:
+                skip_kv_hash(
+                    "D", kwargs.get("req_id", "unspecified"), kv_group, "no_cpu_sources"
+                )
         try:
             for layer_id in range(num_layers):
                 sparse_request = yield ret_mask
