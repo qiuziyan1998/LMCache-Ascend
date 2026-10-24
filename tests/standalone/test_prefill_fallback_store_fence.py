@@ -108,6 +108,10 @@ def publish(*, mixed=False, asynchronous=True, trace=None, hash_enabled=False):
         ),
         _track_sync_store_futures=lambda futures, **kw: required.extend(futures),
         hash_calls=[],
+        trace_calls=[],
+    )
+    engine.gpu_connector = NS(
+        enqueue_store_kv_trace=lambda *args: engine.trace_calls.append(args)
     )
     engine.config.chunk_size = 256
     hash_ready = NS(cpu_hash_fence=True)
@@ -151,6 +155,7 @@ def test_real_store_passes_hash_ready_to_background_writer(mixed):
     engine, _, fences, _, puts, _ = publish(mixed=mixed, hash_enabled=True)
     assert len(engine.hash_calls) == 1
     assert engine.hash_calls[0][1]["producer_events"] == fences
+    assert engine.trace_calls[0][-1] == fences
     for _, _, options in puts:
         events = options["producer_events"]
         assert events[:-1] == fences

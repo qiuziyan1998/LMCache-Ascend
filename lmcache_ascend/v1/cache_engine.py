@@ -5341,6 +5341,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             self.storage_manager.batched_get_external_pages(
                 pages, ptrs, sizes, owners, req_id
             )
+            if kv_hash_enabled():
+                trace = getattr(self.gpu_connector, "trace_direct_kv", None)
+                if callable(trace):
+                    trace(req_id, 1, kvcaches, slot_mapping, starts, ends)
             if not retrieve_kwargs.get("_defer_direct_load_readiness", False):
                 consume(record())
             if (
@@ -7665,6 +7669,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                     if async_layerwise_store and not hash_fences:
                         skip_kv_hash("S", req_id, kv_group, "missing_producer_fence")
                     else:
+                        trace = getattr(
+                            self.gpu_connector, "enqueue_store_kv_trace", None
+                        )
+                        if callable(trace):
+                            trace(
+                                req_id, kv_group, starts, ends, memory_objs, hash_fences
+                            )
                         hash_ready = submit_kv_hash(
                             "S",
                             req_id,
@@ -10024,6 +10035,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 else pre_resolved_shared_mem_layers
             )
             if hash_rows is not None:
+                trace = getattr(self.gpu_connector, "trace_cpu_kv", None)
+                if callable(trace):
+                    trace("D_CPU", kwargs.get("req_id", "unspecified"), kv_group,
+                          starts, ends, hash_rows, mirror=True)
                 submit_kv_hash(
                     "D",
                     kwargs.get("req_id", "unspecified"),

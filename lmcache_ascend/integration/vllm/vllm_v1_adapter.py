@@ -1366,6 +1366,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 prefill_store_debug_finish(request.req_id)
             if kv_hash_enabled() and get_tensor_model_parallel_rank() == 0:
                 finish_kv_hash(request.req_id)
+            if kv_hash_enabled():
+                trace = getattr(
+                    self.lmcache_engine.gpu_connector, "finish_kv_trace", None
+                )
+                if callable(trace):
+                    trace(request.req_id)
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
         if getattr(self, "_force_layerwise_prefill_store", False):
