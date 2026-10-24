@@ -7718,6 +7718,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     chunks=len(page_indices),
                                     async_d2h=async_layerwise_store,
                                     events=len(layerwise_store_fences),
+                                    layers=len(memory_objs),
+                                    bytes=layer_pages[0].get_size(),
                                 )
                             try:
                                 page_futures = self.storage_manager.batched_put_layer_pages(
