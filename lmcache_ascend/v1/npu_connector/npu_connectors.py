@@ -2485,6 +2485,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             return
         for row, req_id in enumerate(ids):
+            if not trace.accepts(req_id):
+                continue
             spec = getattr(self, "kv_trace_requests", {}).get(req_id)
             if spec is None:
                 trace.error(

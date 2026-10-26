@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import threading
+import weakref
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -111,14 +112,119 @@ def test_bad_table_is_reported_without_submitting_an_out_of_bounds_gather(
     assert trace.failed
 
 
-def test_queue_full_does_not_launch_producer_or_lose_async_buffers(features, tmp_path):
+def test_buffer_budget_limits_one_request_without_disabling_the_worker(
+    features, tmp_path
+):
     logs, calls = [], []
     trace = features.KVTrace(0, "P", root=tmp_path, emit=logs.append)
-    trace.slots = threading.BoundedSemaphore(1)
-    trace.slots.acquire()
-    trace.capture(dict(req="req", stage="P_LOAD"), lambda: calls.append(True))
+    trace.max_pending_bytes = features.TASK_BYTES
+    trace.capture(
+        dict(req="req", stage="P_LOAD", start=0, end=1), lambda: calls.append(True)
+    )
     assert calls == []
-    assert logs[0]["error"] == "feature_queue_full"
+    assert logs[0]["error"] == "feature_buffer_budget_exceeded"
+    assert not trace.failed
+    assert not trace.accepts("req") and trace.accepts("next")
+    trace.finish("req")
+    assert trace.drain(5)
+    assert logs[-1]["failed"] and logs[-1]["cause"]["error"] == logs[0]["error"]
+    trace.max_pending_bytes += 100
+    trace.tensor("next", "P_LOAD", 0, 0, 4, 0, 4, 0, torch.arange(4, dtype=torch.uint8))
+    trace.finish("next")
+    assert trace.drain(5)
+    assert logs[-1]["failed"] is False and trace.pending_bytes == 0
+    path, records = rows(tmp_path)
+    assert read(path, next(r for r in records if "pieces" in r)) == bytes(range(4))
+
+
+def test_slow_writer_keeps_more_than_512_observations_and_ordered_end(
+    features, tmp_path
+):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    entered, release = threading.Event(), threading.Event()
+    trace.cpu_work("req", lambda: (entered.set(), release.wait(15)), (), ())
+    assert entered.wait(5)
+    try:
+        for layer in range(2048):
+            trace.tensor(
+                "req",
+                "P_COMPUTE",
+                0,
+                layer,
+                4,
+                0,
+                4,
+                0,
+                torch.arange(4, dtype=torch.uint8),
+            )
+        trace.finish("req")
+        assert trace.accepts("req") and not trace.failed
+    finally:
+        release.set()
+    assert trace.drain(15)
+    path, records = rows(tmp_path)
+    observations = [r for r in records if "pieces" in r]
+    assert [r["layer"] for r in observations] == list(range(2048))
+    assert all(read(path, r) == bytes(range(4)) for r in observations)
+    assert records[-1]["stage"] == "END" and not records[-1]["failed"]
+    assert trace.pending_bytes == 0
+
+
+def test_completed_device_readback_is_released_while_writer_is_blocked(
+    features, tmp_path, monkeypatch
+):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    entered, release = threading.Event(), threading.Event()
+    trace.cpu_work("req", lambda: (entered.set(), release.wait(15)), (), ())
+    assert entered.wait(5)
+
+    class DeviceValue:
+        shape = (4,)
+        dtype = torch.uint8
+        device = SimpleNamespace(type="npu")
+
+    value = DeviceValue()
+    observed = weakref.ref(value)
+    completed = threading.Event()
+    event = SimpleNamespace(record=lambda stream: None, synchronize=completed.set)
+    host = SimpleNamespace(
+        copy_=lambda *args, **kwargs: None,
+        contiguous=lambda: torch.arange(4, dtype=torch.uint8),
+    )
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                features,
+                "torch",
+                SimpleNamespace(
+                    empty=lambda *args, **kwargs: host,
+                    npu=SimpleNamespace(
+                        Event=lambda: event, current_stream=lambda device: None
+                    ),
+                ),
+            )
+            trace.capture(
+                dict(
+                    req="req",
+                    stage="P_LOAD",
+                    group=0,
+                    layer=0,
+                    component=0,
+                    start=0,
+                    end=4,
+                ),
+                lambda value=value: value,
+            )
+        del value
+        assert completed.wait(5)
+        trace.queue.join()
+        assert observed() is None
+        assert trace.ready.qsize() == 1
+        trace.finish("req")
+    finally:
+        release.set()
+    assert trace.drain(5)
+    assert not trace.failed and trace.pending_bytes == 0
 
 
 def test_failed_event_record_keeps_pending_host_storage_alive(
@@ -167,6 +273,31 @@ def test_cpu_reader_waits_real_event_and_releases_only_after_capture(
     gate.set()
     assert trace.drain(5)
     assert obj.refs == 1 and calls == [trace.thread.ident]
+
+
+def test_retirement_failure_retains_owners_and_records_cause_on_end(features, tmp_path):
+    logs, calls = [], []
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=logs.append)
+    owner = SimpleNamespace(refs=1)
+    owner.ref_count_up = lambda: setattr(owner, "refs", owner.refs + 1)
+    owner.ref_count_down = lambda: setattr(owner, "refs", owner.refs - 1)
+
+    def fail_wait():
+        raise RuntimeError("DMA completion failed")
+
+    trace.cpu_work(
+        "first",
+        lambda: calls.append(True),
+        [owner],
+        [SimpleNamespace(synchronize=fail_wait)],
+    )
+    trace.finish("later")
+    assert not trace.drain(5)
+    assert calls == [] and owner.refs == 2
+    assert trace.quarantine
+    assert logs[-1]["req"] == "later" and logs[-1]["failed"]
+    assert logs[-1]["cause"]["req"] == "first"
+    assert logs[-1]["cause"]["detail"] == "DMA completion failed"
 
 
 def bind_connector(obj, features):
@@ -296,12 +427,15 @@ def test_nested_cpu_save_captures_before_END_and_keeps_sources_leased(
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
-def test_actual_sparse_features_align_by_logical_position(features, tmp_path, corrupt):
+@pytest.mark.parametrize("layer", [0, 78])
+def test_actual_sparse_features_align_by_logical_position(
+    features, tmp_path, corrupt, layer
+):
     trace = features.KVTrace(0, "D", root=tmp_path, emit=lambda r: None)
     obj = SimpleNamespace(
         kv_trace=trace,
         _layerwise_prefill_dma=False,
-        kv_trace_sources={("req", 0, 0): ((0,), (8,), (), (2,), False)},
+        kv_trace_sources={("req", 0, layer): ((0,), (8,), (), (2,), False)},
     )
     bind_connector(obj, features)
     plane = torch.zeros(2, 4, 1, 2, dtype=torch.uint8)
@@ -310,7 +444,7 @@ def test_actual_sparse_features_align_by_logical_position(features, tmp_path, co
     obj.trace_selected_kv(
         "req",
         0,
-        0,
+        layer,
         [plane],
         torch.tensor([[2, 3, -1]]),
         torch.tensor([[5, 1, -1]]),

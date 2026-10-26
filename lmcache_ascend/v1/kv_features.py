@@ -2,9 +2,11 @@
 """Opt-in one-byte-per-token KV observations, without content hashes.
 
 Only the first raw byte of each token/component is exported. File writes,
-prefix reuse and CPU source reads run on one background worker. Observations
-use the existing bank stream and completion fences; serving never waits for
-the file writer. Sampling cannot prove equality of the unsampled bytes.
+prefix reuse and CPU source reads run on a background writer. A separate
+worker retires completed device readbacks, so disk writes cannot retain NPU
+buffers. Observations use existing bank streams and completion fences;
+serving never waits for the file writer. Sampling cannot prove equality of
+the unsampled bytes.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 from queue import Queue
-from threading import BoundedSemaphore, Event, Thread, get_ident
+from threading import Event, Lock, Thread, get_ident
 from typing import Any
 import json
 import os
@@ -35,7 +37,10 @@ from lmcache_ascend.v1.kv_trace import (
 
 FORMAT = "token-byte0-v1"
 BLOCK_TOKENS = 4096
-MAX_PENDING = 512
+# Bound outstanding feature snapshots, not the number of layer observations.
+# A single 79+22-layer forward can already enqueue more than 512 small tasks.
+MAX_PENDING_BYTES = 2 * 1024**3
+TASK_BYTES = 4096
 REFERENCE_SEGMENT_TOKENS = BLOCK_TOKENS
 
 
@@ -140,24 +145,61 @@ class KVTrace:
         self.segment_tokens = segment_tokens
         self.root = Path(root) if root is not None else Path.cwd() / "kv-feature-dump"
         self.queue: Queue = Queue()
-        self.slots = BoundedSemaphore(MAX_PENDING)
+        self.ready: Queue = Queue()
+        self.budget_lock = Lock()
+        self.pending_bytes = 0
+        self.max_pending_bytes = MAX_PENDING_BYTES
+        self.request_failures: dict[str, dict[str, Any]] = {}
+        self.first_failure: dict[str, Any] | None = None
         self.files: dict[str, FeatureFile] = {}
         self.seen: OrderedDict[tuple, None] = OrderedDict()
         self.failed = False
         self.quarantine: list[Any] = []
         self.thread = Thread(target=self._run, daemon=True, name="kv-feature-writer")
+        self.completion_thread = Thread(
+            target=self._retire, daemon=True, name="kv-feature-completion"
+        )
         self.thread.start()
+        self.completion_thread.start()
 
     def error(self, req: str, stage: str, reason: str, **fields: Any) -> None:
         """Stop further device probes after the first failure; report it once."""
         if self.failed:
             return
         self.failed = True
-        self.emit(dict(self.base, req=req, stage=stage, error=reason, **fields))
+        self.first_failure = dict(req=req, stage=stage, error=reason, **fields)
+        self.emit(dict(self.base, **self.first_failure))
+
+    def accepts(self, req: str) -> bool:
+        """A resource-limited request must not disable unrelated requests."""
+        return not self.failed and req not in self.request_failures
+
+    def _reserve(self, record: dict[str, Any], size: int) -> bool:
+        if not self.accepts(record["req"]):
+            return False
+        with self.budget_lock:
+            if self.pending_bytes + size <= self.max_pending_bytes:
+                self.pending_bytes += size
+                return True
+            failure = dict(
+                req=record["req"],
+                stage=record["stage"],
+                error="feature_buffer_budget_exceeded",
+                pending_bytes=self.pending_bytes,
+                requested_bytes=size,
+                limit_bytes=self.max_pending_bytes,
+            )
+            self.request_failures[record["req"]] = failure
+        self.emit(dict(self.base, **failure))
+        return False
+
+    def _unreserve(self, size: int) -> None:
+        with self.budget_lock:
+            self.pending_bytes -= size
 
     def claim(self, req: str, stage: str, group: int, layer: int) -> bool:
         """Limit D observations to the first real decode transfer per layer."""
-        if self.failed:
+        if not self.accepts(req):
             return False
         key = req, stage, group, layer
         if key in self.seen:
@@ -170,12 +212,16 @@ class KVTrace:
         return dict(req=req, stage=stage, **fields)
 
     def capture(self, record: dict[str, Any], producer: Any) -> None:
-        """Reserve capacity before enqueueing NPU sampling or async readback."""
-        if self.failed:
+        """Bound snapshot bytes before submitting any device sampling work."""
+        if not self.accepts(record["req"]):
             return
         inline = get_ident() == self.thread.ident
-        if not inline and not self.slots.acquire(blocking=False):
-            self.error(record["req"], record["stage"], "feature_queue_full")
+        # Conservatively charge both device output and host readback until
+        # persistence finishes, plus task metadata. No KV payload is copied.
+        size = TASK_BYTES + 2 * max(
+            0, int(record.get("end", 0)) - int(record.get("start", 0))
+        ) * int(record.get("byte_width", 1))
+        if not inline and not self._reserve(record, size):
             return
         host = value = event = None
         try:
@@ -192,13 +238,13 @@ class KVTrace:
                     event.synchronize()  # Background worker only.
                 self._file(record["req"]).write(record, host)
             else:
-                self.queue.put(("sample", record, host, value, event))
+                self.queue.put(("sample", record, host, value, event, size))
         except Exception as error:
             # A failed event record does not prove an async host write ended.
             if host is not None and value is not None and value.device.type != "cpu":
                 self.quarantine.append((host, value, event))
             if not inline:
-                self.slots.release()
+                self._unreserve(size)
             self.error(
                 record["req"],
                 record["stage"],
@@ -262,7 +308,7 @@ class KVTrace:
         Device indices are clamped before every gather. Original P mappings
         are archived separately for offline bounds/expected-map checks.
         """
-        if self.failed or end <= start:
+        if not self.accepts(req) or end <= start:
             return
         if table.ndim != 1 or (end - 1) // block_size >= table.numel():
             self.error(req, stage, "feature_table_range", group=group, layer=layer)
@@ -321,7 +367,7 @@ class KVTrace:
         **fields: Any,
     ) -> None:
         """Sample completed CPU packets; no independent full-payload D mirror."""
-        if self.failed:
+        if not self.accepts(req):
             return
         planes = packet_planes(tensor, capacity, byte_widths, interleaved)
         for component, plane in enumerate(planes):
@@ -373,16 +419,16 @@ class KVTrace:
         **fields: Any,
     ) -> None:
         """Lease source objects until real producer completion and CPU sampling."""
-        if self.failed:
+        if not self.accepts(req):
             return
         inline = get_ident() == self.thread.ident
-        if not inline and not self.slots.acquire(blocking=False):
-            self.error(req, stage, "feature_queue_full")
+        owners = tuple({id(obj): obj for obj in owners}.values())
+        size = TASK_BYTES + 16 * len(owners)
+        if not inline and not self._reserve(self.record(req, stage), size):
             return
         held = []
-        released_slot = inline
         try:
-            for obj in {id(obj): obj for obj in owners}.values():
+            for obj in owners:
                 obj.ref_count_up()
                 held.append(obj)
             if inline:
@@ -406,22 +452,23 @@ class KVTrace:
                         callback,
                         held,
                         tuple(events),
+                        size,
                     )
                 )
         except Exception as error:
             self._release(held, self.record(req, stage))
-            if not released_slot:
-                self.slots.release()
+            if not inline:
+                self._unreserve(size)
             self.error(req, stage, type(error).__name__, detail=str(error)[:500])
 
     def finish(self, req: str, **fields: Any) -> None:
         """Queue a completion marker after earlier observations, without waiting."""
-        self.queue.put(("end", self.record(req, "END", **fields), None, None, None))
+        self.queue.put(("end", self.record(req, "END", **fields), None, None, None, 0))
 
     def drain(self, timeout: float = 60.0) -> bool:
         """Shutdown-only wait; unsafe pending device writes prevent slab release."""
         done = Event()
-        self.queue.put(("drain", {}, done, None, None))
+        self.queue.put(("drain", {}, done, None, None, 0))
         return done.wait(timeout) and not self.quarantine
 
     def _file(self, req: str) -> FeatureFile:
@@ -446,38 +493,60 @@ class KVTrace:
                     detail=str(error)[:500],
                 )
 
+    def _retire(self) -> None:
+        """Retire device events independently of slow CPU scans and file I/O."""
+        while True:
+            kind, record, host, device, event, size = self.queue.get()
+            try:
+                if kind == "sample":
+                    if event is not None:
+                        event.synchronize()  # Background readback completion only.
+                    device = None  # Release NPU storage before waiting for disk.
+                elif kind == "work":
+                    for producer in event:
+                        producer.synchronize()  # Existing DMA producer fences.
+                self.ready.put((kind, record, host, device, size))
+            except Exception as error:
+                self.quarantine.append((host, device, event))
+                self.error(
+                    record.get("req", "unknown"),
+                    record.get("stage", kind),
+                    type(error).__name__,
+                    detail=str(error)[:500],
+                    stack=traceback.format_exc()[-1500:],
+                )
+                self._unreserve(size)
+            finally:
+                self.queue.task_done()
+                del host, device, event
+
     def _run(self) -> None:
         while True:
-            kind, record, host, device, event = self.queue.get()
-            completed = event is None or kind not in ("sample", "work")
+            kind, record, host, device, size = self.ready.get()
             try:
                 if kind == "drain":
                     host.set()
                 elif kind == "end":
+                    failure = self.request_failures.get(record["req"])
+                    failure = failure or self.first_failure
+                    end = dict(record, failed=failure is not None)
+                    if failure is not None:
+                        end["cause"] = failure
                     if record["req"] in self.files:
                         file = self.files.pop(record["req"])
-                        file.write_event(dict(record, failed=self.failed))
+                        file.write_event(end)
                         file.close()
                     self.seen = OrderedDict(
                         (k, v) for k, v in self.seen.items() if k[0] != record["req"]
                     )
-                    self.emit(dict(self.base, **record, failed=self.failed))
+                    self.emit(dict(self.base, **end))
                 elif kind == "work":
-                    for producer in event:
-                        # Background only, borrowing existing real DMA fences.
-                        producer.synchronize()
-                    completed = True
                     if not self.failed:
                         host()
                 else:
-                    if event is not None:
-                        event.synchronize()  # Background feature readback only.
-                    completed = True
                     if not self.failed:
                         self._file(record["req"]).write(record, host)
             except Exception as error:
-                if not completed:
-                    self.quarantine.append((host, device, event))
                 self.error(
                     record.get("req", "unknown"),
                     record.get("stage", kind),
@@ -486,9 +555,9 @@ class KVTrace:
                     stack=traceback.format_exc()[-1500:],
                 )
             finally:
-                if kind == "work" and completed:
+                if kind == "work":
                     self._release(device, record)
                 if kind in ("sample", "work"):
-                    self.slots.release()
-                self.queue.task_done()
-                del host, device, event
+                    self._unreserve(size)
+                self.ready.task_done()
+                del host, device
