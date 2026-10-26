@@ -2892,7 +2892,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 value = value * valid.reshape(-1, 1).to(torch.uint8)
                 digest = content_checksum(value)
-                host = torch.empty(4, dtype=torch.int32, pin_memory=True)
+                host = torch.empty(digest.shape, dtype=torch.int32, pin_memory=True)
                 host.copy_(digest, non_blocking=True)
                 actual.append((host, digest))
             ready = torch.npu.Event()

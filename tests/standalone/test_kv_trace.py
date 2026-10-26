@@ -114,19 +114,14 @@ def test_disabled_switch(trace_module, monkeypatch):
 
 def test_checksum_matches_unsigned_scalar_reference(trace_module):
     raw = bytes(range(61))
-    padded = raw + bytes((-len(raw)) % 4)
-    expected = []
-    for seed in (0, 668265263, -2048144789, -1028477387):
-        total = 0
-        for index in range(len(padded) // 4):
-            word = int.from_bytes(padded[index * 4 : index * 4 + 4], "little")
-            word ^= index * 0x9E3779B9 & 0xFFFFFFFF
-            word ^= seed & 0xFFFFFFFF
-            word = (word ^ (word >> 16)) * 0x85EBCA6B & 0xFFFFFFFF
-            word = (word ^ (word >> 13)) * 0xC2B2AE35 & 0xFFFFFFFF
-            word ^= word >> 16
-            total = total + word & 0xFFFFFFFF
-        expected.append(total ^ len(raw))
+    padded = raw + bytes(len(raw) % 2)
+    words = [
+        int.from_bytes(padded[i : i + 2], "little") for i in range(0, len(padded), 2)
+    ]
+    expected = [
+        (sum(words) & 0xFFFFFFFF) ^ len(raw),
+        sum((i + 1) * word for i, word in enumerate(words)) & 0xFFFFFFFF,
+    ]
     value = torch.tensor(list(raw), dtype=torch.uint8)
     assert [
         int(x) & 0xFFFFFFFF for x in trace_module.content_checksum(value)
@@ -141,7 +136,9 @@ def test_batched_checksums_equal_each_independent_segment(trace_module):
 
 
 @pytest.mark.parametrize("width", [1, 2, 3, 4, 31, 61, 1024])
-def test_parallel_device_seeds_preserve_existing_byte_hash(trace_module, width):
+def test_simple_checksum_matches_scalar_for_batched_odd_and_even_rows(
+    trace_module, width
+):
     raw = torch.randint(
         0,
         256,
@@ -149,14 +146,39 @@ def test_parallel_device_seeds_preserve_existing_byte_hash(trace_module, width):
         dtype=torch.int32,
         generator=torch.Generator().manual_seed(width),
     ).to(torch.uint8)
-    expected = trace_module.content_checksums(raw)
-    padded = torch.cat((raw, torch.zeros((3, (-width) % 4), dtype=torch.uint8)), dim=1)
-    words = padded.view(torch.int32)
-    positions = torch.arange(words.shape[1], dtype=torch.int32)
-    actual = trace_module.parallel_word_checksums(
-        words ^ (positions * -1640531527), width
+    actual = trace_module.content_checksums(raw)
+    for row, checksums in zip(raw.tolist(), actual.tolist(), strict=True):
+        data = bytes(row) + bytes(width % 2)
+        words = [
+            int.from_bytes(data[i : i + 2], "little") for i in range(0, len(data), 2)
+        ]
+        assert [int(x) & 0xFFFFFFFF for x in checksums] == [
+            (sum(words) & 0xFFFFFFFF) ^ width,
+            sum((i + 1) * word for i, word in enumerate(words)) & 0xFFFFFFFF,
+        ]
+
+
+def test_position_weight_catches_reordering_with_same_plain_sum(trace_module):
+    values = torch.tensor([1, 2, 3, 4], dtype=torch.int16)
+    before = trace_module.content_checksum(values)
+    after = trace_module.content_checksum(values[[1, 0, 2, 3]])
+    assert before[0] == after[0] and before[1] != after[1]
+    assert before.shape == (2,)
+
+
+def test_checksum_wraps_int32_and_supports_odd_storage_offset(trace_module):
+    words = 200000
+    values = torch.full((words * 2,), 255, dtype=torch.uint8)
+    actual = trace_module.content_checksum(values)
+    assert [int(x) & 0xFFFFFFFF for x in actual] == [
+        ((65535 * words) & 0xFFFFFFFF) ^ (words * 2),
+        (65535 * words * (words + 1) // 2) & 0xFFFFFFFF,
+    ]
+    odd = values[1:9]
+    assert odd.storage_offset() == 1
+    assert torch.equal(
+        trace_module.content_checksum(odd), trace_module.content_checksum(odd.clone())
     )
-    assert torch.equal(actual, expected)
 
 
 def test_unaligned_half_scale_slice_checksums_without_host_readback(trace_module):

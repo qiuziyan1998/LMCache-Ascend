@@ -2,9 +2,9 @@
 """Full-content segmented KV diagnostics; logs contain hashes, never tensors.
 
 The existing LMCACHE_PREFILL_STORE_DEBUG switch owns this diagnostic. Device
-payloads are reduced on their consuming stream; only four int32 checksums per
-segment leave the device. ``mix32x4-v1`` is a deterministic corruption checksum,
-not a cryptographic hash. CPU and device use the identical byte algorithm.
+payloads are reduced on their consuming stream; only two int32 checksums per
+segment leave the device. ``sum16x2-v1`` contains a plain sum and a position-
+weighted sum of unsigned 16-bit words. CPU and device use the same algorithm.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import traceback
 # Third Party
 import torch
 
-ALGORITHM = "mix32x4-v1"
+ALGORITHM = "sum16x2-v1"
 SEGMENT_TOKENS = 1024
 REFERENCE_SEGMENT_TOKENS = 128
 MAX_PENDING = 8192
@@ -86,10 +86,10 @@ def diagnostic(function: Any) -> Any:
 
 
 def content_checksum(value: torch.Tensor) -> torch.Tensor:
-    """Reduce every payload byte to four int32 words on value's device.
+    """Reduce every payload byte to two int32 words on value's device.
 
-    Integer overflow is intentional modulo 2**32. Masks implement logical
-    shifts on signed int32. Byte count makes zero padding unambiguous.
+    Integer overflow is intentional modulo 2**32. The first sum includes the
+    valid byte count; the second weights words by their one-based positions.
     No scalar extraction or device-to-host payload copy occurs here.
     """
     return content_checksums(
@@ -98,10 +98,15 @@ def content_checksum(value: torch.Tensor) -> torch.Tensor:
 
 
 def content_checksums(values: torch.Tensor) -> torch.Tensor:
-    """Vectorize independent segment checksums; return [segments, 4] int32."""
+    """Compute two integer sums per segment; return [segments, 2] int32.
+
+    All bytes participate. There are no seed loops or avalanche rounds. The
+    weighted sum detects ordinary reordering that a plain sum would miss.
+    This is an inexpensive diagnostic checksum, not a cryptographic hash.
+    """
     raw = values.detach().contiguous().view(torch.uint8).reshape(values.shape[0], -1)
     valid_bytes = raw.shape[1]
-    padding = (-valid_bytes) % 4
+    padding = valid_bytes % 2
     if padding:
         raw = torch.cat(
             (
@@ -112,87 +117,59 @@ def content_checksums(values: torch.Tensor) -> torch.Tensor:
             ),
             dim=1,
         )
-    elif raw.storage_offset() % 4:
-        # A sliced FP16 scale row may start two bytes into its allocation.
+    elif raw.storage_offset() % 2:
         raw = raw.clone()
-    words = raw.view(torch.int32)
-    positions = torch.arange(words.shape[1], dtype=torch.int32, device=raw.device)
-    indexed = words ^ (positions * -1640531527)
-    if raw.device.type != "cpu":
-        return parallel_word_checksums(indexed, valid_bytes)
-    result = []
-    for seed in (0, 668265263, -2048144789, -1028477387):
-        mixed = indexed ^ seed
-        mixed = (mixed ^ ((mixed >> 16) & 0xFFFF)) * -2048144789
-        mixed = (mixed ^ ((mixed >> 13) & 0x7FFFF)) * -1028477387
-        mixed = mixed ^ ((mixed >> 16) & 0xFFFF)
-        result.append(mixed.sum(dim=1, dtype=torch.int32) ^ valid_bytes)
-    return torch.stack(result, dim=1)
-
-
-def parallel_word_checksums(indexed: torch.Tensor, valid_bytes: int) -> torch.Tensor:
-    """Evaluate the same four seeds together, reducing eager NPU dispatches.
-
-    Broadcasting the avalanche across the seed axis keeps mix32x4-v1 byte
-    identical to the CPU reference. No tensor constants are copied from the
-    host on this path. The existing raw-payload bound limits temporary storage.
-    """
-    mixed = torch.stack(
-        (indexed, indexed ^ 668265263, indexed ^ -2048144789, indexed ^ -1028477387),
-        dim=0,
+    words = raw.view(torch.int16).to(torch.int32) & 0xFFFF
+    positions = torch.arange(
+        1, words.shape[1] + 1, dtype=torch.int32, device=raw.device
     )
-    mixed = (mixed ^ ((mixed >> 16) & 0xFFFF)) * -2048144789
-    mixed = (mixed ^ ((mixed >> 13) & 0x7FFFF)) * -1028477387
-    mixed = mixed ^ ((mixed >> 16) & 0xFFFF)
-    return (mixed.sum(dim=-1, dtype=torch.int32) ^ valid_bytes).transpose(0, 1)
+    plain = words.sum(dim=1, dtype=torch.int32) ^ valid_bytes
+    weighted = (words * positions).sum(dim=1, dtype=torch.int32)
+    return torch.stack((plain, weighted), dim=1)
 
 
 def prefix_checksums(value: torch.Tensor) -> torch.Tensor:
     """Hash every token prefix of one short boundary segment on its device.
 
-    Handles arbitrary D truncation, including a half-word FP16 scale, without
+    Handles arbitrary D truncation, including an odd final byte, without
     comparing different ranges or copying the KV payload to the host.
     """
     raw = value.detach().contiguous().view(torch.uint8).reshape(value.shape[0], -1)
     row_bytes = raw.shape[1]
     flat = raw.reshape(-1)
-    padding = (-flat.numel()) % 4
+    padding = flat.numel() % 2
     if padding:
         flat = torch.cat(
             (flat, torch.zeros(padding, dtype=torch.uint8, device=flat.device))
         )
-    elif flat.storage_offset() % 4:
+    elif flat.storage_offset() % 2:
         flat = flat.clone()
-    words = flat.view(torch.int32)
-    positions = torch.arange(words.numel(), dtype=torch.int32, device=words.device)
+    words = flat.view(torch.int16).to(torch.int32) & 0xFFFF
+    positions = torch.arange(
+        1, words.numel() + 1, dtype=torch.int32, device=words.device
+    )
     lengths = (
         torch.arange(1, raw.shape[0] + 1, dtype=torch.int32, device=words.device)
         * row_bytes
     )
-    complete, remainder = lengths // 4, lengths % 4
-    result = []
-    for seed in (0, 668265263, -2048144789, -1028477387):
-        mixed = words ^ (positions * -1640531527) ^ seed
-        mixed = (mixed ^ ((mixed >> 16) & 0xFFFF)) * -2048144789
-        mixed = (mixed ^ ((mixed >> 13) & 0x7FFFF)) * -1028477387
-        mixed ^= (mixed >> 16) & 0xFFFF
-        cumulative = mixed.cumsum(dim=0, dtype=torch.int32)
-        total = cumulative.index_select(0, (complete - 1).clamp_min(0).long())
-        total = torch.where(complete > 0, total, 0)
-        if row_bytes % 4:
-            mask = (torch.ones_like(remainder) << (remainder * 8)) - 1
-            last = (
-                words.index_select(0, complete.clamp_max(words.numel() - 1).long())
-                & mask
-            )
-            last ^= complete * -1640531527
-            last ^= seed
-            last = (last ^ ((last >> 16) & 0xFFFF)) * -2048144789
-            last = (last ^ ((last >> 13) & 0x7FFFF)) * -1028477387
-            last ^= (last >> 16) & 0xFFFF
-            total += torch.where(remainder > 0, last, 0)
-        result.append(total ^ lengths)
-    return torch.stack(result, dim=1)
+    complete, remainder = lengths // 2, lengths % 2
+    last_complete = (complete - 1).clamp_min(0).long()
+    plain = words.cumsum(dim=0, dtype=torch.int32).index_select(0, last_complete)
+    weighted = (
+        (words * positions)
+        .cumsum(dim=0, dtype=torch.int32)
+        .index_select(0, last_complete)
+    )
+    plain = torch.where(complete > 0, plain, 0)
+    weighted = torch.where(complete > 0, weighted, 0)
+    if row_bytes % 2:
+        last = (
+            words.index_select(0, complete.clamp_max(words.numel() - 1).long()) & 0xFF
+        )
+        last = torch.where(remainder > 0, last, 0)
+        plain += last
+        weighted += last * (complete + 1)
+    return torch.stack((plain ^ lengths, weighted), dim=1)
 
 
 def _emit(record: dict[str, Any]) -> None:
@@ -370,8 +347,8 @@ class KVTrace:
             if value.device.type == "cpu":
                 self._result(record, digest)
                 return
-            # Pinned memory allows asynchronous readback of 16 bytes only.
-            host = torch.empty(4, dtype=torch.int32, pin_memory=True)
+            # Only the two checksum words leave the device.
+            host = torch.empty(digest.shape, dtype=torch.int32, pin_memory=True)
             host.copy_(digest, non_blocking=True)
             event = torch.npu.Event()
             event.record(torch.npu.current_stream(digest.device))
@@ -779,7 +756,7 @@ class KVTrace:
                             if key[0] == record["req"]:
                                 self.cpu_baselines.pop(key, None)
                 else:
-                    event.synchronize()  # Background thread; 16-byte readback only.
+                    event.synchronize()  # Background checksum readback only.
                     self._result(record, host)
             except Exception as error:
                 if callable(record):
