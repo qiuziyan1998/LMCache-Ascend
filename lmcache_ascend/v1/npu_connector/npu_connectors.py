@@ -2457,9 +2457,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         metadata: Any,
         produced: Any = None,
     ) -> None:
-        """Trace model-visible bank rows using attention's actual block table."""
+        """Trace P bank rows; D is sampled at its actual sparse load boundary."""
         trace = getattr(self, "kv_trace", None)
-        if trace is None:
+        if trace is None or not self._layerwise_prefill_dma:
             return
         ids = getattr(metadata, "req_ids", None)
         lengths = getattr(metadata, "seq_lens_cpu", None)
@@ -2776,6 +2776,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             valid &= columns.unsqueeze(0) < counts.reshape(-1, 1)
         positions = torch.where(valid, selected, -1).long().reshape(-1)
         size = positions.numel()
+        # Keep the loader's exact selection as well as the filtered positions
+        # used for CPU-reference comparison. Do not lose padding/count metadata.
+        trace.tensor(
+            req_id, "MAP_SELECTED_TOPK", group, layer, total, 0, size, 0,
+            selected.long().reshape(-1), shape=list(selected.shape),
+        )
+        if counts is not None:
+            trace.tensor(
+                req_id, "MAP_SELECTED_COUNT", group, layer, total,
+                0, counts.numel(), 0, counts.long().reshape(-1),
+            )
         trace.tensor(
             req_id,
             "MAP_SELECTED_POS",
@@ -2856,7 +2867,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def enqueue_store_kv_trace(
         self, req_id: str, group: int, starts: Any, ends: Any, rows: Any, events: Any
     ) -> None:
-        """Sample saved CPU bytes after their real D2H completion on a worker."""
+        """Synchronously sample saved CPU bytes after real D2H completion.
+
+        The historical entry-point name is retained for caller compatibility;
+        no diagnostic work is enqueued.
+        """
         if not kv_trace_enabled():
             return
         if not hasattr(self, "kv_trace"):
@@ -2891,11 +2906,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer: int,
         ready: Any,
     ) -> None:
-        """Sample immutable CPU load sources on the worker after actual H2D.
+        """Synchronously sample CPU load sources after actual H2D.
 
         Early CPU publication may precede producer D2H completion. Borrow the
         real per-layer load event, which already carries source dependencies;
-        never read those bytes early or wait for them on the serving thread.
+        wait here before reading those bytes or returning to the caller.
         """
         trace = getattr(self, "kv_trace", None)
         if trace is None:

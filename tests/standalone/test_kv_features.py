@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sample-byte persistence, address mapping, lifetime and backlog tests."""
+"""Synchronous sample persistence, address mapping and lifetime tests."""
 
 import ast
 from contextlib import nullcontext
@@ -113,32 +113,26 @@ def test_bad_table_is_reported_without_submitting_an_out_of_bounds_gather(
 
 
 @pytest.mark.parametrize("requests", [1, 4])
-def test_slow_writer_keeps_more_than_512_observations_and_ordered_end(
+def test_synchronous_writer_keeps_all_observations_and_ordered_end(
     features, tmp_path, requests
 ):
     trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
-    entered, release = threading.Event(), threading.Event()
-    trace.cpu_work("req", lambda: (entered.set(), release.wait(15)), (), ())
-    assert entered.wait(5)
-    try:
-        for request in range(requests):
-            req = f"req{request}"
-            for layer in range(2048):
-                trace.tensor(
-                    req,
-                    "P_COMPUTE",
-                    0,
-                    layer,
-                    4,
-                    0,
-                    4,
-                    0,
-                    torch.arange(4, dtype=torch.uint8),
-                )
-            trace.finish(req)
-            assert trace.accepts(req) and not trace.failed
-    finally:
-        release.set()
+    for request in range(requests):
+        req = f"req{request}"
+        for layer in range(2048):
+            trace.tensor(
+                req,
+                "P_COMPUTE",
+                0,
+                layer,
+                4,
+                0,
+                4,
+                0,
+                torch.arange(4, dtype=torch.uint8),
+            )
+        trace.finish(req)
+        assert trace.accepts(req) and not trace.failed
     assert trace.drain(15)
     paths = list(tmp_path.rglob("index.jsonl"))
     assert len(paths) == requests
@@ -150,13 +144,12 @@ def test_slow_writer_keeps_more_than_512_observations_and_ordered_end(
         assert records[-1]["stage"] == "END" and not records[-1]["failed"]
 
 
-def test_completed_device_readback_is_released_while_writer_is_blocked(
+def test_device_readback_waits_then_flushes_before_returning(
     features, tmp_path, monkeypatch
 ):
     trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
-    entered, release = threading.Event(), threading.Event()
-    trace.cpu_work("req", lambda: (entered.set(), release.wait(15)), (), ())
-    assert entered.wait(5)
+    calls = []
+    current_stream = object()
 
     class DeviceValue:
         shape = (4,)
@@ -165,44 +158,55 @@ def test_completed_device_readback_is_released_while_writer_is_blocked(
 
     value = DeviceValue()
     observed = weakref.ref(value)
-    completed = threading.Event()
-    event = SimpleNamespace(record=lambda stream: None, synchronize=completed.set)
+    data = torch.zeros(4, dtype=torch.uint8)
+
+    def record(stream):
+        assert stream is current_stream
+        calls.append("record")
+
+    def wait():
+        calls.append("wait")
+        data.copy_(torch.arange(4, dtype=torch.uint8))
+
+    event = SimpleNamespace(record=record, synchronize=wait)
     host = SimpleNamespace(
-        copy_=lambda *args, **kwargs: None,
-        contiguous=lambda: torch.arange(4, dtype=torch.uint8),
+        copy_=lambda *args, **kwargs: calls.append("copy"),
+        contiguous=lambda: data,
     )
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                features,
-                "torch",
-                SimpleNamespace(
-                    empty=lambda *args, **kwargs: host,
-                    npu=SimpleNamespace(
-                        Event=lambda: event, current_stream=lambda device: None
-                    ),
+    original_write = features.FeatureFile.write
+
+    def write(file, record, snapshot):
+        assert calls == ["copy", "record", "wait"]
+        calls.append("write")
+        original_write(file, record, snapshot)
+
+    monkeypatch.setattr(features.FeatureFile, "write", write)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            features,
+            "torch",
+            SimpleNamespace(
+                empty=lambda *args, **kwargs: host,
+                uint8=torch.uint8,
+                npu=SimpleNamespace(
+                    Event=lambda: event,
+                    current_stream=lambda device: current_stream,
                 ),
-            )
-            trace.capture(
-                dict(
-                    req="req",
-                    stage="P_LOAD",
-                    group=0,
-                    layer=0,
-                    component=0,
-                    start=0,
-                    end=4,
-                ),
-                lambda value=value: value,
-            )
-        del value
-        assert completed.wait(5)
-        trace.queue.join()
-        assert observed() is None
-        assert trace.ready.qsize() == 1
-        trace.finish("req")
-    finally:
-        release.set()
+            ),
+        )
+        trace.capture(
+            dict(
+                req="req", stage="P_LOAD", group=0, layer=0, component=0, start=0, end=4
+            ),
+            lambda value=value: value,
+        )
+    calls.append("returned")
+    assert calls == ["copy", "record", "wait", "write", "returned"]
+    path, records = rows(tmp_path)
+    assert read(path, records[-1]) == bytes(range(4))
+    del value
+    assert observed() is None
+    trace.finish("req")
     assert trace.drain(5)
     assert not trace.failed
 
@@ -238,21 +242,67 @@ def test_cpu_reader_waits_real_event_and_releases_only_after_capture(
     features, tmp_path
 ):
     trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
-    gate, calls = threading.Event(), []
+    gate, entered, returned = threading.Event(), threading.Event(), threading.Event()
+    calls = []
     obj = SimpleNamespace(refs=1)
     obj.ref_count_up = lambda: setattr(obj, "refs", obj.refs + 1)
     obj.ref_count_down = lambda: setattr(obj, "refs", obj.refs - 1)
+
+    def wait():
+        entered.set()
+        assert gate.wait(5)
+
+    def capture():
+        trace.cpu_work(
+            "req",
+            lambda: calls.append(threading.get_ident()),
+            [obj],
+            [SimpleNamespace(synchronize=wait)],
+        )
+        returned.set()
+
+    caller = threading.Thread(target=capture)
+    caller.start()
+    try:
+        assert entered.wait(5)
+        assert obj.refs == 2 and calls == [] and not returned.is_set()
+    finally:
+        gate.set()
+        caller.join(5)
+    assert returned.is_set()
+    assert trace.drain(5)
+    assert obj.refs == 1 and calls == [caller.ident]
+
+
+def test_passive_cpu_view_is_saved_before_caller_recycles_shared_storage(
+    features, tmp_path
+):
+    trace = features.KVTrace(1, "P", root=tmp_path, emit=lambda r: None)
+    shared = torch.tensor([[11, 0], [22, 0], [33, 0], [44, 0]], dtype=torch.uint8)
+    owner = SimpleNamespace(refs=1)
+    owner.ref_count_up = lambda: setattr(owner, "refs", owner.refs + 1)
+    owner.ref_count_down = lambda: setattr(owner, "refs", owner.refs - 1)
     trace.cpu_work(
         "req",
-        lambda: calls.append(threading.get_ident()),
-        [obj],
-        [SimpleNamespace(synchronize=lambda: gate.wait(5))],
+        lambda: trace.tensor(
+            "req",
+            "P_CPU_LOAD",
+            0,
+            0,
+            4,
+            0,
+            4,
+            0,
+            shared.view(4, 2),
+        ),
+        [owner],
+        (),
     )
-    assert obj.refs == 2 and calls == []
-    assert not trace.drain(0.01)
-    gate.set()
-    assert trace.drain(5)
-    assert obj.refs == 1 and calls == [trace.thread.ident]
+    shared.fill_(99)  # The allocator in the owning rank can now reuse the slab.
+    assert owner.refs == 1
+    path, records = rows(tmp_path)
+    assert read(path, records[-1]) == bytes([11, 22, 33, 44])
+    trace.finish("req")
 
 
 def test_retirement_failure_retains_owners_and_records_cause_on_end(features, tmp_path):
@@ -426,20 +476,57 @@ def test_actual_sparse_features_align_by_logical_position(
         0,
         layer,
         [plane],
-        torch.tensor([[2, 3, -1]]),
-        torch.tensor([[5, 1, -1]]),
-        torch.tensor([2]),
-        8,
+        torch.tensor([[2, 3, 4, -1]]),
+        torch.tensor([[5, 1, 9, -1]]),
+        torch.tensor([3]),
+        10,
+    )
+    # Later decode steps must not replace the first load's data or top-k.
+    plane.fill_(99)
+    obj.trace_selected_kv(
+        "req",
+        0,
+        layer,
+        [plane],
+        torch.tensor([[0]]),
+        torch.tensor([[0]]),
+        torch.tensor([1]),
+        11,
     )
     trace.finish("req")
     assert trace.drain(5)
     path, records = rows(tmp_path)
-    record = next(r for r in records if r.get("stage") == "D_SELECTED")
+    selected_records = [r for r in records if r.get("stage") == "D_SELECTED"]
+    assert len(selected_records) == 1
+    record = selected_records[0]
     assert read(path, record)[:2] == bytes([55, 11 if not corrupt else 12])
     positions = next(r for r in records if r.get("stage") == "MAP_SELECTED_POS")
     assert torch.frombuffer(
         bytearray(read(path, positions)), dtype=torch.int64
-    ).tolist() == [5, 1, -1]
+    ).tolist() == [5, 1, -1, -1]
+    topk = next(r for r in records if r.get("stage") == "MAP_SELECTED_TOPK")
+    assert topk["shape"] == [1, 4]
+    assert torch.frombuffer(
+        bytearray(read(path, topk)), dtype=torch.int64
+    ).tolist() == [5, 1, 9, -1]
+    count = next(r for r in records if r.get("stage") == "MAP_SELECTED_COUNT")
+    assert torch.frombuffer(
+        bytearray(read(path, count)), dtype=torch.int64
+    ).tolist() == [3]
+
+
+def test_decoder_does_not_treat_compact_scratch_as_full_prefix(features, tmp_path):
+    logs = []
+    trace = features.KVTrace(0, "D", root=tmp_path, emit=logs.append)
+    obj = SimpleNamespace(
+        kv_trace=trace,
+        _layerwise_prefill_dma=False,
+        kv_trace_requests={"req": object()},
+    )
+    bind_connector(obj, features)
+    trace.paged = lambda *a, **kw: pytest.fail("D must use sparse load destinations")
+    obj.trace_attention_kv(0, 0, "P_LOAD", None, None, None)
+    assert not trace.failed and not logs and not trace.files
 
 
 def test_direct_mixed_c8_features_read_actual_physical_destinations(features, tmp_path):

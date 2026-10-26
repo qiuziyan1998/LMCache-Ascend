@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in one-byte-per-token KV observations, without content hashes.
 
-Only the first raw byte of each token/component is exported. File writes,
-prefix reuse and CPU source reads run on a background writer. A separate
-worker retires completed device readbacks, so disk writes cannot retain NPU
-buffers. Observations use existing bank streams and completion fences;
-serving never waits for the file writer. Sampling cannot prove equality of
+Only the first raw byte of each token/component is exported. Each caller
+waits for its device readback and writes the observation before returning.
+There are no diagnostic queues or background readers. This intentionally
+blocks serving when DEBUG is enabled. Sampling cannot prove equality of
 the unsampled bytes.
 """
 
@@ -14,8 +13,7 @@ from __future__ import annotations
 # Standard
 from collections import OrderedDict
 from pathlib import Path
-from queue import Queue
-from threading import Event, Thread, get_ident
+from threading import RLock
 from typing import Any
 import json
 import os
@@ -62,7 +60,7 @@ class FeatureFile:
 
     The binary file contains sampled bytes only. JSONL observations refer to
     immutable byte ranges, so subsequent changes never overwrite a baseline.
-    All methods are called by the recorder's single background worker.
+    The recorder serializes access with its reentrant lock.
     """
 
     def __init__(self, directory: Path, base: dict[str, Any]) -> None:
@@ -140,81 +138,79 @@ class KVTrace:
         self.emit, self.role = emit, role
         self.segment_tokens = segment_tokens
         self.root = Path(root) if root is not None else Path.cwd() / "kv-feature-dump"
-        # Finite diagnostic runs must retain their complete observation stream.
-        # Both queues grow on demand; backlog never drops a sample or disables
-        # later requests. The completion worker releases device buffers promptly.
-        self.queue: Queue = Queue(maxsize=0)
-        self.ready: Queue = Queue(maxsize=0)
+        self.lock = RLock()
         self.first_failure: dict[str, Any] | None = None
         self.files: dict[str, FeatureFile] = {}
         self.seen: OrderedDict[tuple, None] = OrderedDict()
         self.failed = False
         self.quarantine: list[Any] = []
-        self.thread = Thread(target=self._run, daemon=True, name="kv-feature-writer")
-        self.completion_thread = Thread(
-            target=self._retire, daemon=True, name="kv-feature-completion"
-        )
-        self.thread.start()
-        self.completion_thread.start()
 
     def error(self, req: str, stage: str, reason: str, **fields: Any) -> None:
         """Stop further device probes after the first failure; report it once."""
-        if self.failed:
-            return
-        self.failed = True
-        self.first_failure = dict(req=req, stage=stage, error=reason, **fields)
-        self.emit(dict(self.base, **self.first_failure))
+        with self.lock:
+            if self.failed:
+                return
+            self.failed = True
+            self.first_failure = dict(req=req, stage=stage, error=reason, **fields)
+            self.emit(dict(self.base, **self.first_failure))
 
     def accepts(self, req: str) -> bool:
-        """Only an actual sampling failure stops observation, never backlog."""
+        """Only an actual sampling failure stops observation."""
         return not self.failed
 
     def claim(self, req: str, stage: str, group: int, layer: int) -> bool:
         """Limit D observations to the first real decode transfer per layer."""
-        if not self.accepts(req):
-            return False
-        key = req, stage, group, layer
-        if key in self.seen:
-            return False
-        self.seen[key] = None
-        return True
+        with self.lock:
+            if not self.accepts(req):
+                return False
+            key = req, stage, group, layer
+            if key in self.seen:
+                return False
+            self.seen[key] = None
+            return True
 
     def record(self, req: str, stage: str, **fields: Any) -> dict[str, Any]:
-        """Build a request-scoped metadata record for background storage."""
+        """Build a request-scoped metadata record."""
         return dict(req=req, stage=stage, **fields)
 
     def capture(self, record: dict[str, Any], producer: Any) -> None:
-        """Capture now and enqueue without a count or byte-budget cutoff."""
-        if not self.accepts(record["req"]):
-            return
-        inline = get_ident() == self.thread.ident
-        host = value = event = None
-        try:
-            value = producer()
-            if value.device.type == "cpu":
-                host = value.clone()
-            else:
-                host = torch.empty(value.shape, dtype=value.dtype, pin_memory=True)
-                host.copy_(value, non_blocking=True)
-                event = torch.npu.Event()
-                event.record(torch.npu.current_stream(value.device))
-            if inline:
+        """Wait for this observation and flush it to disk before returning."""
+        with self.lock:
+            if not self.accepts(record["req"]):
+                return
+            host = value = event = None
+            completed = False
+            try:
+                value = producer()
+                if value.device.type == "cpu":
+                    host = value.clone()
+                else:
+                    host = torch.empty(value.shape, dtype=value.dtype, pin_memory=True)
+                    host.copy_(value, non_blocking=True)
+                    event = torch.npu.Event()
+                    event.record(torch.npu.current_stream(value.device))
                 if event is not None:
-                    event.synchronize()  # Background worker only.
+                    # The caller uses the actual load/compute stream. This
+                    # fence covers the sample and its D2H, not just submission.
+                    event.synchronize()
+                completed = True
                 self._file(record["req"]).write(record, host)
-            else:
-                self.queue.put(("sample", record, host, value, event))
-        except Exception as error:
-            # A failed event record does not prove an async host write ended.
-            if host is not None and value is not None and value.device.type != "cpu":
-                self.quarantine.append((host, value, event))
-            self.error(
-                record["req"],
-                record["stage"],
-                type(error).__name__,
-                detail=str(error)[:500],
-                stack=traceback.format_exc()[-1500:],
-            )
+            except Exception as error:
+                # Keep storage alive if device completion could not be proved.
+                if (
+                    not completed
+                    and host is not None
+                    and value is not None
+                    and value.device.type != "cpu"
+                ):
+                    self.quarantine.append((host, value, event))
+                self.error(
+                    record["req"],
+                    record["stage"],
+                    type(error).__name__,
+                    detail=str(error)[:500],
+                    stack=traceback.format_exc()[-1500:],
+                )
 
     def tensor(
         self,
@@ -381,52 +377,61 @@ class KVTrace:
         stage: str = "P_CPU_STORE",
         **fields: Any,
     ) -> None:
-        """Lease source objects until real producer completion and CPU sampling."""
-        if not self.accepts(req):
-            return
-        inline = get_ident() == self.thread.ident
-        owners = tuple({id(obj): obj for obj in owners}.values())
-        held = []
-        try:
-            for obj in owners:
-                obj.ref_count_up()
-                held.append(obj)
-            if inline:
-                completed = False
-                try:
-                    for event in events:
-                        event.synchronize()
-                    completed = True
-                    callback()
-                finally:
-                    if completed:
-                        self._release(held, self.record(req, stage))
-                    else:
-                        self.quarantine.append((callback, held, tuple(events)))
-                    held = []
-            else:
-                self.queue.put(
-                    (
-                        "work",
-                        self.record(req, stage, **fields),
-                        callback,
-                        held,
-                        tuple(events),
-                    )
+        """Read CPU sources now, after their already-recorded producer events.
+
+        Passive TP views cannot extend the owner's shared allocation lifetime.
+        Complete the read inside the calling operation, before its lease ends.
+        """
+        with self.lock:
+            if not self.accepts(req):
+                return
+            owners = tuple({id(obj): obj for obj in owners}.values())
+            events = tuple(events)
+            held = []
+            waiting = completed = False
+            try:
+                for obj in owners:
+                    obj.ref_count_up()
+                    held.append(obj)
+                waiting = True
+                for event in events:
+                    event.synchronize()
+                completed = True
+                callback()
+            except Exception as error:
+                self.error(
+                    req,
+                    stage,
+                    type(error).__name__,
+                    detail=str(error)[:500],
+                    **fields,
                 )
-        except Exception as error:
-            self._release(held, self.record(req, stage))
-            self.error(req, stage, type(error).__name__, detail=str(error)[:500])
+            finally:
+                if waiting and not completed:
+                    self.quarantine.append((callback, held, events))
+                else:
+                    self._release(held, self.record(req, stage))
 
     def finish(self, req: str, **fields: Any) -> None:
-        """Queue a completion marker after earlier observations, without waiting."""
-        self.queue.put(("end", self.record(req, "END", **fields), None, None, None))
+        """Write completion and close the file synchronously."""
+        with self.lock:
+            failure = self.first_failure
+            end = self.record(req, "END", failed=failure is not None, **fields)
+            if failure is not None:
+                end["cause"] = failure
+            if req in self.files:
+                file = self.files.pop(req)
+                try:
+                    file.write_event(end)
+                finally:
+                    file.close()
+            self.seen = OrderedDict((k, v) for k, v in self.seen.items() if k[0] != req)
+            self.emit(dict(self.base, **end))
 
     def drain(self, timeout: float = 60.0) -> bool:
-        """Shutdown-only wait; unsafe pending device writes prevent slab release."""
-        done = Event()
-        self.queue.put(("drain", {}, done, None, None))
-        return done.wait(timeout) and not self.quarantine
+        """No queued work remains; retain the existing shutdown safety check."""
+        with self.lock:
+            return not self.quarantine
 
     def _file(self, req: str) -> FeatureFile:
         if req not in self.files:
@@ -449,68 +454,3 @@ class KVTrace:
                     type(error).__name__,
                     detail=str(error)[:500],
                 )
-
-    def _retire(self) -> None:
-        """Retire device events independently of slow CPU scans and file I/O."""
-        while True:
-            kind, record, host, device, event = self.queue.get()
-            try:
-                if kind == "sample":
-                    if event is not None:
-                        event.synchronize()  # Background readback completion only.
-                    device = None  # Release NPU storage before waiting for disk.
-                elif kind == "work":
-                    for producer in event:
-                        producer.synchronize()  # Existing DMA producer fences.
-                self.ready.put((kind, record, host, device))
-            except Exception as error:
-                self.quarantine.append((host, device, event))
-                self.error(
-                    record.get("req", "unknown"),
-                    record.get("stage", kind),
-                    type(error).__name__,
-                    detail=str(error)[:500],
-                    stack=traceback.format_exc()[-1500:],
-                )
-            finally:
-                self.queue.task_done()
-                del host, device, event
-
-    def _run(self) -> None:
-        while True:
-            kind, record, host, device = self.ready.get()
-            try:
-                if kind == "drain":
-                    host.set()
-                elif kind == "end":
-                    failure = self.first_failure
-                    end = dict(record, failed=failure is not None)
-                    if failure is not None:
-                        end["cause"] = failure
-                    if record["req"] in self.files:
-                        file = self.files.pop(record["req"])
-                        file.write_event(end)
-                        file.close()
-                    self.seen = OrderedDict(
-                        (k, v) for k, v in self.seen.items() if k[0] != record["req"]
-                    )
-                    self.emit(dict(self.base, **end))
-                elif kind == "work":
-                    if not self.failed:
-                        host()
-                else:
-                    if not self.failed:
-                        self._file(record["req"]).write(record, host)
-            except Exception as error:
-                self.error(
-                    record.get("req", "unknown"),
-                    record.get("stage", kind),
-                    type(error).__name__,
-                    detail=str(error)[:500],
-                    stack=traceback.format_exc()[-1500:],
-                )
-            finally:
-                if kind == "work":
-                    self._release(device, record)
-                self.ready.task_done()
-                del host, device
