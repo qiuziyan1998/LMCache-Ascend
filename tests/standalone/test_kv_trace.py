@@ -140,6 +140,25 @@ def test_batched_checksums_equal_each_independent_segment(trace_module):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 31, 61, 1024])
+def test_parallel_device_seeds_preserve_existing_byte_hash(trace_module, width):
+    raw = torch.randint(
+        0,
+        256,
+        (3, width),
+        dtype=torch.int32,
+        generator=torch.Generator().manual_seed(width),
+    ).to(torch.uint8)
+    expected = trace_module.content_checksums(raw)
+    padded = torch.cat((raw, torch.zeros((3, (-width) % 4), dtype=torch.uint8)), dim=1)
+    words = padded.view(torch.int32)
+    positions = torch.arange(words.shape[1], dtype=torch.int32)
+    actual = trace_module.parallel_word_checksums(
+        words ^ (positions * -1640531527), width
+    )
+    assert torch.equal(actual, expected)
+
+
 def test_unaligned_half_scale_slice_checksums_without_host_readback(trace_module):
     values = torch.arange(9, dtype=torch.float16)[1:7]
     assert values.storage_offset() == 1
@@ -229,6 +248,7 @@ def load_connector_methods(obj, trace_module):
             "finish_kv_trace",
             "trace_attention_kv",
             "trace_direct_kv",
+            "enqueue_load_kv_trace",
         )
     ]
     scope = dict(
@@ -248,6 +268,86 @@ def load_connector_methods(obj, trace_module):
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
     for method in methods:
         setattr(obj, method.name, MethodType(scope[method.name], obj))
+
+
+def test_cpu_load_hash_waits_real_h2d_on_worker_and_freezes_metadata(trace_module):
+    import threading
+
+    released = threading.Event()
+    records, calls = [], []
+    tracer = trace_module.KVTrace(0, "P", emit=records.append)
+    owner = SimpleNamespace(refs=1, value="not ready")
+    owner.ref_count_up = lambda: setattr(owner, "refs", owner.refs + 1)
+    owner.ref_count_down = lambda: setattr(owner, "refs", owner.refs - 1)
+    ready = SimpleNamespace(synchronize=lambda: released.wait(5))
+    connector = SimpleNamespace(kv_trace=tracer)
+    load_connector_methods(connector, trace_module)
+    connector.trace_cpu_kv = lambda *args, **kwargs: calls.append(
+        (threading.get_ident(), args, kwargs, owner.value)
+    )
+    starts, ends, objects = [0], [4], [owner]
+    connector.enqueue_load_kv_trace("request", 1, starts, ends, objects, 3, ready)
+    assert owner.refs == 2 and calls == []
+    starts.append(4)
+    ends.append(8)
+    objects.clear()
+    owner.value = "DMA completed"
+    released.set()
+    tracer.queue.join()
+    assert owner.refs == 1 and len(calls) == 1
+    ident, args, kwargs, value = calls[0]
+    assert ident == tracer.thread.ident
+    assert args == ("P_CPU_LOAD", "request", 1, (0,), (4,), ((owner,),))
+    assert kwargs == dict(layer_ids=(3,))
+    assert value == "DMA completed"
+
+
+def test_missing_cpu_load_fence_reports_coverage_error_without_reading(trace_module):
+    records = []
+    connector = SimpleNamespace(
+        kv_trace=trace_module.KVTrace(0, "P", emit=records.append)
+    )
+    load_connector_methods(connector, trace_module)
+    connector.enqueue_load_kv_trace("request", 0, [0], [4], [], 0, None)
+    assert records[0]["error"] == "missing_load_completion"
+
+
+def test_stall_summary_is_bounded_once_per_job_and_does_not_touch_device(trace_module):
+    records = []
+    trace = trace_module.KVTrace(0, "P", emit=records.append)
+    record = dict(req="request", stage="P_CPU_LOAD", group=1, layer=3)
+    trace.pending_job = (100.0, record, False)
+    trace.check_stall(159.0)
+    assert records == []
+    trace.check_stall(161.0)
+    trace.check_stall(180.0)
+    assert len(records) == 1
+    result = records[0]
+    assert result["stage"] == "STALL" and result["blocked_stage"] == "P_CPU_LOAD"
+    assert result["req"] == "request" and result["elapsed_s"] == 61.0
+    assert result["layer"] == 3 and "error" not in result
+    assert len(result["main_stack"]) <= 8 and len(result["hash_stack"]) <= 8
+    # A different stalled job may emit its own summary.
+    trace.pending_job = (200.0, record, False)
+    trace.check_stall(261.0)
+    assert len(records) == 2
+    trace.pending_job = None
+    trace.check_stall(999.0)
+    assert len(records) == 2
+
+
+def test_shutdown_barrier_cannot_release_storage_ahead_of_cpu_hash(trace_module):
+    import threading
+
+    release = threading.Event()
+    completed = threading.Event()
+    trace = trace_module.KVTrace(0, "P", emit=lambda row: None)
+    trace.cpu_work("request", lambda: release.wait(5) and completed.set(), (), ())
+    assert trace.drain(timeout=0.01) is False
+    assert not completed.is_set()
+    release.set()
+    assert trace.drain(timeout=5) is True
+    assert completed.is_set()
 
 
 @pytest.mark.parametrize("corrupt", [False, True])

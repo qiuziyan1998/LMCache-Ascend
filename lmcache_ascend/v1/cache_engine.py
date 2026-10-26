@@ -11554,6 +11554,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
 
+        if kv_hash_enabled():
+            drain_trace = getattr(self.gpu_connector, "drain_kv_trace", None)
+            if callable(drain_trace):
+                store_thread = getattr(self, "_store_worker_thread", None)
+                if store_thread is not None and store_thread.is_alive():
+                    raise RuntimeError(
+                        "Store worker is still active; keep KV trace CPU slabs alive"
+                    )
+                if not drain_trace():
+                    raise RuntimeError(
+                        "KV trace readers have not drained; keep CPU slabs alive"
+                    )
+
         if self._force_layerwise_prefill_store:
             for req_id in tuple(self._layerwise_prefill_page_owners):
                 self.release_layerwise_prefill_pages(req_id)

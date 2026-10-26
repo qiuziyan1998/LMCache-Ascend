@@ -339,6 +339,35 @@ def test_reuse_debug_disabled_does_not_emit_or_change_dma_rows():
     assert logs == []
 
 
+def test_hash_probe_borrows_p_load_event_after_dma_submission():
+    events = []
+
+    class Event:
+        def record(self, stream):
+            self.recorded = True
+
+        def synchronize(self):
+            raise AssertionError("serving thread must not wait for debug hashes")
+
+    npu = NS(Event=Event, current_stream=lambda: None,
+             stream=lambda stream: nullcontext())
+    submit, _, copies = _reuse_debug_connector(False, npu=npu)
+    obj = submit.connector
+    obj.kv_trace = object()
+    obj.trace_cpu_kv = lambda *a, **kw: pytest.fail("P CPU hash ran on serving thread")
+
+    def enqueue(req, group, starts, ends, owners, layer, ready):
+        assert len(copies) == layer + 1
+        assert ready.recorded
+        registered = obj._layerwise_prefill_transfer_state()[3]
+        assert ready is registered[(group, layer, layer % 2)][1]
+        events.append(ready)
+
+    obj.enqueue_load_kv_trace = enqueue
+    submit(2)
+    assert len(events) == 2
+
+
 def _assert_plan_equal(actual, expected):
     for name in ("chunk", "slot", "chunk_token", "tokens"):
         assert torch.equal(getattr(actual, name), getattr(expected, name)), name

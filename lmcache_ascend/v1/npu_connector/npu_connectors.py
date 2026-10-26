@@ -2963,6 +2963,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         for owner in owners.values():
             owner.ref_count_down()
 
+    def drain_kv_trace(self, timeout: float = 60.0) -> bool:
+        """Drain diagnostic readers before engine shutdown frees CPU slabs."""
+        trace = getattr(self, "kv_trace", None)
+        if trace is None:
+            return True
+        for req_id in tuple(getattr(self, "kv_trace_source_owners", {})):
+            self.finish_kv_trace(req_id)
+        return trace.drain(timeout)
+
     @diagnostic
     def enqueue_store_kv_trace(
         self, req_id: str, group: int, starts: Any, ends: Any, rows: Any, events: Any
@@ -2989,6 +2998,54 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             lambda: self.trace_cpu_kv("P_CPU_STORE", req_id, group, starts, ends, rows),
             owners,
             events,
+        )
+
+    @diagnostic
+    def enqueue_load_kv_trace(
+        self,
+        req_id: str,
+        group: int,
+        starts: Any,
+        ends: Any,
+        objects: Any,
+        layer: int,
+        ready: Any,
+    ) -> None:
+        """Hash immutable CPU load sources on the worker after actual H2D.
+
+        Early CPU publication may precede producer D2H completion. Borrow the
+        real per-layer load event, which already carries source dependencies;
+        never read those bytes early or wait for them on the serving thread.
+        """
+        trace = getattr(self, "kv_trace", None)
+        if trace is None:
+            return
+        if ready is None:
+            trace.error(
+                req_id,
+                "P_CPU_LOAD",
+                "missing_load_completion",
+                group=group,
+                layer=layer,
+            )
+            return
+        starts, ends, objects = tuple(starts), tuple(ends), tuple(objects)
+        trace.cpu_work(
+            req_id,
+            lambda: self.trace_cpu_kv(
+                "P_CPU_LOAD",
+                req_id,
+                group,
+                starts,
+                ends,
+                (objects,),
+                layer_ids=(layer,),
+            ),
+            objects,
+            (ready,),
+            stage="P_CPU_LOAD",
+            group=group,
+            layer=layer,
         )
 
     @diagnostic
@@ -7829,8 +7886,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 if any(obj.metadata.fmt != expected_fmt for obj in format_sources):
                     raise ValueError(f"Expected memory format {expected_fmt}.")
                 validated_page_ids.update(map(id, page_checks))
-                if getattr(self, "kv_trace", None) is not None:
-                    self.trace_cpu_kv("P_CPU_LOAD" if prefill_dma else "D_CPU",
+                if getattr(self, "kv_trace", None) is not None and not prefill_dma:
+                    self.trace_cpu_kv("D_CPU",
                                       req_id, kv_group, starts, ends, (source_objs,),
                                       mirror=not self._layerwise_prefill_dma,
                                       layer_ids=(layer_id,))
@@ -7980,6 +8037,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     load_done[(kv_group, layer_id, bank)] = (
                         layerwise_prefill_generation, load_done_event,
                     )
+                    if getattr(self, "kv_trace", None) is not None:
+                        self.enqueue_load_kv_trace(
+                            req_id, kv_group, starts, ends, source_objs,
+                            layer_id, load_done_event,
+                        )
                     if diagnose_bank_load:
                         prefill_start_timing_log(
                             logger,

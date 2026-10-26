@@ -13,13 +13,15 @@ from __future__ import annotations
 from collections import OrderedDict
 from functools import wraps
 from queue import Full, Queue
-from threading import Lock, Thread, get_ident
+from threading import Event, Lock, Thread, get_ident, main_thread
 from typing import Any, Iterator, Sequence
 import json
 import logging
 import os
 import socket
 import sys
+import time
+import traceback
 
 # Third Party
 import torch
@@ -31,6 +33,7 @@ MAX_PENDING = 8192
 MAX_REQUESTS = 1024
 MAX_HASH_BYTES = 4 * 1024 * 1024
 HASHES_PER_LINE = 32
+STALL_SECONDS = 60.0
 _LOGGER = logging.getLogger("lmcache.kv_trace")
 _EMIT_LOCK = Lock()
 
@@ -56,6 +59,7 @@ def diagnostic(function: Any) -> Any:
                 function.__name__
                 in (
                     "enqueue_store_kv_trace",
+                    "enqueue_load_kv_trace",
                     "trace_prepared_kv",
                     "trace_direct_kv",
                     "finish_kv_trace",
@@ -114,6 +118,8 @@ def content_checksums(values: torch.Tensor) -> torch.Tensor:
     words = raw.view(torch.int32)
     positions = torch.arange(words.shape[1], dtype=torch.int32, device=raw.device)
     indexed = words ^ (positions * -1640531527)
+    if raw.device.type != "cpu":
+        return parallel_word_checksums(indexed, valid_bytes)
     result = []
     for seed in (0, 668265263, -2048144789, -1028477387):
         mixed = indexed ^ seed
@@ -122,6 +128,23 @@ def content_checksums(values: torch.Tensor) -> torch.Tensor:
         mixed = mixed ^ ((mixed >> 16) & 0xFFFF)
         result.append(mixed.sum(dim=1, dtype=torch.int32) ^ valid_bytes)
     return torch.stack(result, dim=1)
+
+
+def parallel_word_checksums(indexed: torch.Tensor, valid_bytes: int) -> torch.Tensor:
+    """Evaluate the same four seeds together, reducing eager NPU dispatches.
+
+    Broadcasting the avalanche across the seed axis keeps mix32x4-v1 byte
+    identical to the CPU reference. No tensor constants are copied from the
+    host on this path. The existing raw-payload bound limits temporary storage.
+    """
+    mixed = torch.stack(
+        (indexed, indexed ^ 668265263, indexed ^ -2048144789, indexed ^ -1028477387),
+        dim=0,
+    )
+    mixed = (mixed ^ ((mixed >> 16) & 0xFFFF)) * -2048144789
+    mixed = (mixed ^ ((mixed >> 13) & 0x7FFFF)) * -1028477387
+    mixed = mixed ^ ((mixed >> 16) & 0xFFFF)
+    return (mixed.sum(dim=-1, dtype=torch.int32) ^ valid_bytes).transpose(0, 1)
 
 
 def prefix_checksums(value: torch.Tensor) -> torch.Tensor:
@@ -244,10 +267,61 @@ class KVTrace:
         )
         self.queue: Queue = Queue(MAX_PENDING)
         self.lock = Lock()
+        self.pending_job: tuple[float, dict, bool] | None = None
         self.seen: OrderedDict[tuple, None] = OrderedDict()
         self.cpu_baselines: dict[tuple, torch.Tensor] = {}
         self.thread = Thread(target=self._run, daemon=True, name="kv-trace")
         self.thread.start()
+        self.watchdog = Thread(target=self._watch, daemon=True, name="kv-trace-watch")
+        self.watchdog.start()
+
+    def check_stall(self, now: float | None = None) -> None:
+        """Log bounded Python stack summaries once per stalled hash job.
+
+        Host inspection only: no signal handlers, device calls or new fences.
+        A slow observation is informational, never a hash mismatch or assert.
+        """
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            pending = self.pending_job
+            if pending is None or pending[2] or now - pending[0] < STALL_SECONDS:
+                return
+            since, record, _ = pending
+            self.pending_job = (since, record, True)
+        frames = sys._current_frames()
+
+        def stack(ident: Any) -> list[str]:
+            frame = frames.get(ident)
+            if frame is None:
+                return []
+            return [
+                f"{os.path.basename(row.filename)}:{row.lineno}:{row.name}"
+                for row in traceback.extract_stack(frame, limit=8)
+            ]
+
+        self.emit(
+            dict(
+                self.base,
+                req=record["req"],
+                stage="STALL",
+                blocked_stage=record["stage"],
+                group=record.get("group"),
+                layer=record.get("layer"),
+                elapsed_s=round(now - since, 1),
+                queued=self.queue.qsize(),
+                main_stack=stack(main_thread().ident),
+                hash_stack=stack(self.thread.ident),
+            )
+        )
+
+    def _watch(self) -> None:
+        tick = Event()
+        while not tick.wait(5):
+            try:
+                self.check_stall()
+            except Exception:
+                # A best-effort host watchdog cannot fail a serving request.
+                continue
 
     def error(self, req: str, stage: str, reason: str, **fields: Any) -> None:
         """Record an explicit coverage failure without failing the request."""
@@ -617,6 +691,19 @@ class KVTrace:
         except Full:
             self.error(req, "END", "checksum_queue_full")
 
+    def drain(self, timeout: float = 60.0) -> bool:
+        """Shutdown-only barrier before the owner unmaps CPU source storage."""
+        completed = Event()
+        deadline = time.monotonic() + timeout
+        try:
+            self.queue.put(
+                (completed.set, dict(req="shutdown", stage="DRAIN"), [], ()),
+                timeout=max(0.0, timeout),
+            )
+        except Full:
+            return False
+        return completed.wait(max(0.0, deadline - time.monotonic()))
+
     def cpu_work(
         self,
         req: str,
@@ -625,6 +712,7 @@ class KVTrace:
         events: Any,
         *,
         stage: str = "P_CPU_STORE",
+        **fields: Any,
     ) -> None:
         """Retain existing CPU buffers until background hashing has completed."""
         held = []
@@ -633,7 +721,7 @@ class KVTrace:
                 obj.ref_count_up()
                 held.append(obj)
             self.queue.put_nowait(
-                (callback, dict(req=req, stage=stage), held, tuple(events))
+                (callback, dict(req=req, stage=stage, **fields), held, tuple(events))
             )
         except Exception as error:
             for obj in held:
@@ -641,6 +729,10 @@ class KVTrace:
             self.error(req, stage, type(error).__name__, detail=str(error)[:160])
 
     def _result(self, record: dict[str, Any], value: torch.Tensor) -> None:
+        if get_ident() == self.thread.ident:
+            with self.lock:
+                if self.pending_job is not None:
+                    self.pending_job = (time.monotonic(), self.pending_job[1], False)
         words = value.tolist()
         if "bounds" in record:
             record = dict(record)
@@ -668,6 +760,13 @@ class KVTrace:
     def _run(self) -> None:
         while True:
             record, host, device, event = self.queue.get()
+            if callable(record) or event is not None:
+                with self.lock:
+                    self.pending_job = (
+                        time.monotonic(),
+                        host if callable(record) else record,
+                        False,
+                    )
             try:
                 if callable(record):
                     for producer in event:
@@ -693,6 +792,8 @@ class KVTrace:
                 else:
                     self.error(record["req"], record["stage"], type(error).__name__)
             finally:
+                with self.lock:
+                    self.pending_job = None
                 if callable(record):
                     for obj in device:
                         try:
