@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sample-byte persistence, address mapping, lifetime and bounded-failure tests."""
+"""Sample-byte persistence, address mapping, lifetime and backlog tests."""
 
 import ast
 from contextlib import nullcontext
@@ -112,62 +112,42 @@ def test_bad_table_is_reported_without_submitting_an_out_of_bounds_gather(
     assert trace.failed
 
 
-def test_buffer_budget_limits_one_request_without_disabling_the_worker(
-    features, tmp_path
-):
-    logs, calls = [], []
-    trace = features.KVTrace(0, "P", root=tmp_path, emit=logs.append)
-    trace.max_pending_bytes = features.TASK_BYTES
-    trace.capture(
-        dict(req="req", stage="P_LOAD", start=0, end=1), lambda: calls.append(True)
-    )
-    assert calls == []
-    assert logs[0]["error"] == "feature_buffer_budget_exceeded"
-    assert not trace.failed
-    assert not trace.accepts("req") and trace.accepts("next")
-    trace.finish("req")
-    assert trace.drain(5)
-    assert logs[-1]["failed"] and logs[-1]["cause"]["error"] == logs[0]["error"]
-    trace.max_pending_bytes += 100
-    trace.tensor("next", "P_LOAD", 0, 0, 4, 0, 4, 0, torch.arange(4, dtype=torch.uint8))
-    trace.finish("next")
-    assert trace.drain(5)
-    assert logs[-1]["failed"] is False and trace.pending_bytes == 0
-    path, records = rows(tmp_path)
-    assert read(path, next(r for r in records if "pieces" in r)) == bytes(range(4))
-
-
+@pytest.mark.parametrize("requests", [1, 4])
 def test_slow_writer_keeps_more_than_512_observations_and_ordered_end(
-    features, tmp_path
+    features, tmp_path, requests
 ):
     trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
     entered, release = threading.Event(), threading.Event()
     trace.cpu_work("req", lambda: (entered.set(), release.wait(15)), (), ())
     assert entered.wait(5)
     try:
-        for layer in range(2048):
-            trace.tensor(
-                "req",
-                "P_COMPUTE",
-                0,
-                layer,
-                4,
-                0,
-                4,
-                0,
-                torch.arange(4, dtype=torch.uint8),
-            )
-        trace.finish("req")
-        assert trace.accepts("req") and not trace.failed
+        for request in range(requests):
+            req = f"req{request}"
+            for layer in range(2048):
+                trace.tensor(
+                    req,
+                    "P_COMPUTE",
+                    0,
+                    layer,
+                    4,
+                    0,
+                    4,
+                    0,
+                    torch.arange(4, dtype=torch.uint8),
+                )
+            trace.finish(req)
+            assert trace.accepts(req) and not trace.failed
     finally:
         release.set()
     assert trace.drain(15)
-    path, records = rows(tmp_path)
-    observations = [r for r in records if "pieces" in r]
-    assert [r["layer"] for r in observations] == list(range(2048))
-    assert all(read(path, r) == bytes(range(4)) for r in observations)
-    assert records[-1]["stage"] == "END" and not records[-1]["failed"]
-    assert trace.pending_bytes == 0
+    paths = list(tmp_path.rglob("index.jsonl"))
+    assert len(paths) == requests
+    for path in paths:
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        observations = [r for r in records if "pieces" in r]
+        assert [r["layer"] for r in observations] == list(range(2048))
+        assert all(read(path, r) == bytes(range(4)) for r in observations)
+        assert records[-1]["stage"] == "END" and not records[-1]["failed"]
 
 
 def test_completed_device_readback_is_released_while_writer_is_blocked(
@@ -224,7 +204,7 @@ def test_completed_device_readback_is_released_while_writer_is_blocked(
     finally:
         release.set()
     assert trace.drain(5)
-    assert not trace.failed and trace.pending_bytes == 0
+    assert not trace.failed
 
 
 def test_failed_event_record_keeps_pending_host_storage_alive(

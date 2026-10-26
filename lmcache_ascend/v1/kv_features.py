@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 from queue import Queue
-from threading import Event, Lock, Thread, get_ident
+from threading import Event, Thread, get_ident
 from typing import Any
 import json
 import os
@@ -37,10 +37,6 @@ from lmcache_ascend.v1.kv_trace import (
 
 FORMAT = "token-byte0-v1"
 BLOCK_TOKENS = 4096
-# Bound outstanding feature snapshots, not the number of layer observations.
-# A single 79+22-layer forward can already enqueue more than 512 small tasks.
-MAX_PENDING_BYTES = 2 * 1024**3
-TASK_BYTES = 4096
 REFERENCE_SEGMENT_TOKENS = BLOCK_TOKENS
 
 
@@ -144,12 +140,11 @@ class KVTrace:
         self.emit, self.role = emit, role
         self.segment_tokens = segment_tokens
         self.root = Path(root) if root is not None else Path.cwd() / "kv-feature-dump"
-        self.queue: Queue = Queue()
-        self.ready: Queue = Queue()
-        self.budget_lock = Lock()
-        self.pending_bytes = 0
-        self.max_pending_bytes = MAX_PENDING_BYTES
-        self.request_failures: dict[str, dict[str, Any]] = {}
+        # Finite diagnostic runs must retain their complete observation stream.
+        # Both queues grow on demand; backlog never drops a sample or disables
+        # later requests. The completion worker releases device buffers promptly.
+        self.queue: Queue = Queue(maxsize=0)
+        self.ready: Queue = Queue(maxsize=0)
         self.first_failure: dict[str, Any] | None = None
         self.files: dict[str, FeatureFile] = {}
         self.seen: OrderedDict[tuple, None] = OrderedDict()
@@ -171,31 +166,8 @@ class KVTrace:
         self.emit(dict(self.base, **self.first_failure))
 
     def accepts(self, req: str) -> bool:
-        """A resource-limited request must not disable unrelated requests."""
-        return not self.failed and req not in self.request_failures
-
-    def _reserve(self, record: dict[str, Any], size: int) -> bool:
-        if not self.accepts(record["req"]):
-            return False
-        with self.budget_lock:
-            if self.pending_bytes + size <= self.max_pending_bytes:
-                self.pending_bytes += size
-                return True
-            failure = dict(
-                req=record["req"],
-                stage=record["stage"],
-                error="feature_buffer_budget_exceeded",
-                pending_bytes=self.pending_bytes,
-                requested_bytes=size,
-                limit_bytes=self.max_pending_bytes,
-            )
-            self.request_failures[record["req"]] = failure
-        self.emit(dict(self.base, **failure))
-        return False
-
-    def _unreserve(self, size: int) -> None:
-        with self.budget_lock:
-            self.pending_bytes -= size
+        """Only an actual sampling failure stops observation, never backlog."""
+        return not self.failed
 
     def claim(self, req: str, stage: str, group: int, layer: int) -> bool:
         """Limit D observations to the first real decode transfer per layer."""
@@ -212,17 +184,10 @@ class KVTrace:
         return dict(req=req, stage=stage, **fields)
 
     def capture(self, record: dict[str, Any], producer: Any) -> None:
-        """Bound snapshot bytes before submitting any device sampling work."""
+        """Capture now and enqueue without a count or byte-budget cutoff."""
         if not self.accepts(record["req"]):
             return
         inline = get_ident() == self.thread.ident
-        # Conservatively charge both device output and host readback until
-        # persistence finishes, plus task metadata. No KV payload is copied.
-        size = TASK_BYTES + 2 * max(
-            0, int(record.get("end", 0)) - int(record.get("start", 0))
-        ) * int(record.get("byte_width", 1))
-        if not inline and not self._reserve(record, size):
-            return
         host = value = event = None
         try:
             value = producer()
@@ -238,13 +203,11 @@ class KVTrace:
                     event.synchronize()  # Background worker only.
                 self._file(record["req"]).write(record, host)
             else:
-                self.queue.put(("sample", record, host, value, event, size))
+                self.queue.put(("sample", record, host, value, event))
         except Exception as error:
             # A failed event record does not prove an async host write ended.
             if host is not None and value is not None and value.device.type != "cpu":
                 self.quarantine.append((host, value, event))
-            if not inline:
-                self._unreserve(size)
             self.error(
                 record["req"],
                 record["stage"],
@@ -423,9 +386,6 @@ class KVTrace:
             return
         inline = get_ident() == self.thread.ident
         owners = tuple({id(obj): obj for obj in owners}.values())
-        size = TASK_BYTES + 16 * len(owners)
-        if not inline and not self._reserve(self.record(req, stage), size):
-            return
         held = []
         try:
             for obj in owners:
@@ -452,23 +412,20 @@ class KVTrace:
                         callback,
                         held,
                         tuple(events),
-                        size,
                     )
                 )
         except Exception as error:
             self._release(held, self.record(req, stage))
-            if not inline:
-                self._unreserve(size)
             self.error(req, stage, type(error).__name__, detail=str(error)[:500])
 
     def finish(self, req: str, **fields: Any) -> None:
         """Queue a completion marker after earlier observations, without waiting."""
-        self.queue.put(("end", self.record(req, "END", **fields), None, None, None, 0))
+        self.queue.put(("end", self.record(req, "END", **fields), None, None, None))
 
     def drain(self, timeout: float = 60.0) -> bool:
         """Shutdown-only wait; unsafe pending device writes prevent slab release."""
         done = Event()
-        self.queue.put(("drain", {}, done, None, None, 0))
+        self.queue.put(("drain", {}, done, None, None))
         return done.wait(timeout) and not self.quarantine
 
     def _file(self, req: str) -> FeatureFile:
@@ -496,7 +453,7 @@ class KVTrace:
     def _retire(self) -> None:
         """Retire device events independently of slow CPU scans and file I/O."""
         while True:
-            kind, record, host, device, event, size = self.queue.get()
+            kind, record, host, device, event = self.queue.get()
             try:
                 if kind == "sample":
                     if event is not None:
@@ -505,7 +462,7 @@ class KVTrace:
                 elif kind == "work":
                     for producer in event:
                         producer.synchronize()  # Existing DMA producer fences.
-                self.ready.put((kind, record, host, device, size))
+                self.ready.put((kind, record, host, device))
             except Exception as error:
                 self.quarantine.append((host, device, event))
                 self.error(
@@ -515,20 +472,18 @@ class KVTrace:
                     detail=str(error)[:500],
                     stack=traceback.format_exc()[-1500:],
                 )
-                self._unreserve(size)
             finally:
                 self.queue.task_done()
                 del host, device, event
 
     def _run(self) -> None:
         while True:
-            kind, record, host, device, size = self.ready.get()
+            kind, record, host, device = self.ready.get()
             try:
                 if kind == "drain":
                     host.set()
                 elif kind == "end":
-                    failure = self.request_failures.get(record["req"])
-                    failure = failure or self.first_failure
+                    failure = self.first_failure
                     end = dict(record, failed=failure is not None)
                     if failure is not None:
                         end["cause"] = failure
@@ -557,7 +512,5 @@ class KVTrace:
             finally:
                 if kind == "work":
                     self._release(device, record)
-                if kind in ("sample", "work"):
-                    self._unreserve(size)
                 self.ready.task_done()
                 del host, device
