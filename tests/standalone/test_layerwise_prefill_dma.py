@@ -829,7 +829,7 @@ def _async_bank_connector(group, offset, bank_count=2, layers=4):
     )
 
 
-@pytest.mark.parametrize("bank_count", [1, 3, 8])
+@pytest.mark.parametrize("bank_count", [1, 3, 4, 8])
 @pytest.mark.parametrize("group", [0, 1, "c8"])
 @pytest.mark.parametrize("has_save", [False, True])
 def test_configurable_bank_dma_rotation_never_overwrites_pending_compute(
@@ -905,6 +905,84 @@ def test_dma_bank_reuse_protects_pending_reads_across_chunks(group, offset, has_
     assert api.observed == expected
     if has_save:
         assert sorted(api.saved) == expected
+
+
+@pytest.mark.parametrize("bank_count", [2, 4, 8])
+@pytest.mark.parametrize("group", [0, 1])
+def test_mixed_requests_join_all_loads_before_read_and_bank_reuse(bank_count, group):
+    """Four requests share bank streams, including duplicate and mixed phases."""
+    npu = _AsyncNPU()
+    streams = [_AsyncStream() for _ in range(bank_count)]
+    phases = (0, 0, 1, bank_count - 1)
+    layers = 2 * bank_count + 1
+    storage, saved, observed = {}, {}, []
+    pending = []
+
+    def copy(_rows, to_cpu):
+        req, layer = pending.pop()
+        bank = (layer + phases[req]) % bank_count
+        assert npu.current_stream() is streams[bank]
+        if to_cpu:
+            streams[bank].enqueue(
+                lambda: saved.__setitem__((req, layer), storage[(req, bank)])
+            )
+        else:
+            streams[bank].enqueue(lambda: storage.__setitem__((req, bank), layer))
+
+    submit, _, _ = _reuse_debug_connector(False, npu=npu, copy_hook=copy, layers=layers)
+    obj = submit.connector
+    obj.kvcaches = [(torch.zeros((4 * bank_count, 4, 2)),) for _ in range(layers)]
+    obj._layerwise_prefill_transfer_state()[0][group] = bank_count
+    obj._layerwise_prefill_bank = (
+        lambda layer, group, phase: (layer + phase) % bank_count
+    )
+    obj._layerwise_prefill_dma_stream = lambda group, bank: streams[bank]
+    generators = []
+    for req, phase in enumerate(phases):
+        generator = obj.run(
+            [0], [4], slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
+            kv_group=group, req_id=f"request-{req}", deferred_layerwise_get=True,
+            prefill_dma_block_ids_by_bank=tuple(
+                (req * bank_count + bank,) for bank in range(bank_count)
+            ),
+            prefill_dma_block_size=4, layerwise_prefill_bank_offset=phase,
+            layerwise_prefill_bank_count=bank_count,
+        )
+        next(generator)
+        generators.append(generator)
+        for layer in range(bank_count):
+            pending.append((req, layer))
+            generator.send(submit.owners[:1])
+
+    for layer in range(layers):
+        obj.wait_for_layerwise_prefill_load(layer, group, bank_offsets=phases)
+
+        def read(layer=layer):
+            for req, phase in enumerate(phases):
+                assert storage[(req, (layer + phase) % bank_count)] == layer
+                observed.append((req, layer))
+
+        npu.compute.enqueue(read)
+        event = npu.Event()
+        event.record(npu.compute)
+        obj.record_layerwise_prefill_bank_use(layer, group, phases, event)
+        for req, phase in enumerate(phases):
+            pending.append((req, layer))
+            obj.save(layer, group, (layer + phase) % bank_count, npu.compute)
+        if layer + bank_count < layers:
+            for req, generator in enumerate(generators):
+                pending.append((req, layer + bank_count))
+                generator.send(submit.owners[:1])
+    for generator in generators:
+        next(generator)
+        generator.close()
+
+    assert not saved and not observed  # Only enqueued, never host-synchronized.
+    for stream in reversed(streams):
+        stream.tail.run()
+    npu.compute.tail.run()
+    assert len(observed) == 4 * layers
+    assert saved == {(req, layer): layer for req in range(4) for layer in range(layers)}
 
 
 @pytest.mark.parametrize("group", [0, 1, "c8"])

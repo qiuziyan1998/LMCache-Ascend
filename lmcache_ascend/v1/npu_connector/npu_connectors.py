@@ -2193,16 +2193,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         generation = generations.get(kv_group)
         if generation is None:
             return ()
-        save_done = getattr(self, "_layerwise_prefill_save_done_events", {})
-        latest_by_bank: dict[int, tuple[int, Any]] = {}
-        for (group, bank, layer), (epoch, event) in save_done.items():
-            if group != kv_group or epoch != generation:
-                continue
-            previous = latest_by_bank.get(bank)
-            if previous is None or layer >= previous[0]:
-                latest_by_bank[bank] = (layer, event)
+        # Layer ordinals are not a submission clock. A later request/chunk
+        # can use a different bank phase and end this bank at a lower layer
+        # ordinal. Selecting max(layer) from the retained per-layer registry
+        # can therefore return an already-completed event from an older save.
+        # This registry is updated after every actual D2H submission, in FIFO
+        # order, and its immutable events fence all preceding bank writes.
+        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
         return tuple(
-            latest_by_bank[bank][1] for bank in sorted(latest_by_bank)
+            record[1]
+            for (group, _bank), record in sorted(tails.items())
+            if group == kv_group and record[0] == generation
         )
 
     def _layerwise_prefill_transfer_state(
