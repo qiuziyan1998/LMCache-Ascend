@@ -48,6 +48,9 @@ def diagnostic(function: Any) -> Any:
 
     @wraps(function)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        trace = getattr(self, "kv_trace", None)
+        if getattr(trace, "failed", False) and function.__name__ != "finish_kv_trace":
+            return None
         try:
             return function(self, *args, **kwargs)
         except Exception as error:
@@ -77,7 +80,13 @@ def diagnostic(function: Any) -> Any:
                     detail=str(error)[:160],
                 )
                 if trace is not None:
-                    trace.emit(dict(trace.base, **record))
+                    trace.error(
+                        request,
+                        function.__name__,
+                        type(error).__name__,
+                        detail=str(error)[:500],
+                        stack=traceback.format_exc()[-1500:],
+                    )
                 else:
                     _emit(record)
             return None

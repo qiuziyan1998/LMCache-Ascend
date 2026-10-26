@@ -54,15 +54,11 @@ from lmcache_ascend.v1.content_diagnostics import (
     register_group0_source_probe,
 )
 from lmcache_ascend.v1.kv_format import KVCacheFormat
-from lmcache_ascend.v1.kv_trace import (
+from lmcache_ascend.v1.kv_features import (
     KVTrace,
     REFERENCE_SEGMENT_TOKENS,
-    content_checksum,
     diagnostic,
     enabled as kv_trace_enabled,
-    packet_planes,
-    prefix_checksums,
-    segments,
 )
 from lmcache_ascend.v1.npu_connector.layerwise_dma import (
     BoundCopyPrefix,
@@ -2395,6 +2391,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
             uses[(kv_group, bank)] = (generation, layer_id, event)
 
+    @property
+    def uses_token_byte_features(self) -> bool:
+        """Select file-based byte sampling instead of legacy CPU content hashes."""
+        return True
+
     @diagnostic
     def configure_kv_trace(
         self,
@@ -2417,45 +2418,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 else min(self.lmcache_chunk_size, REFERENCE_SEGMENT_TOKENS),
             )
         self.kv_trace_requests = {request.req_id: request for request in requests}
-        for request in requests:
-            if not self.kv_trace.claim(request.req_id, "CALIBRATION", -1, -1):
-                continue
-            sample = torch.arange(1024, dtype=torch.int32).to(torch.uint8)
-            expected = "".join(
-                f"{int(x) & 0xFFFFFFFF:08x}" for x in content_checksum(sample).tolist()
-            )
-            self.kv_trace.tensor(
-                request.req_id,
-                "CALIBRATION",
-                -1,
-                -1,
-                0,
-                0,
-                1024,
-                0,
-                sample.to(torch.device("npu", torch.npu.current_device())),
-                expected_hash=expected,
-            )
-            boundary_sample = sample[:130].reshape(65, 2)
-            expected_prefixes = prefix_checksums(boundary_sample)
-            expected_boundary = "".join(
-                f"{int(x) & 0xFFFFFFFF:08x}"
-                for x in content_checksum(expected_prefixes).tolist()
-            )
-            self.kv_trace.tensor(
-                request.req_id,
-                "CALIBRATION",
-                -1,
-                -1,
-                0,
-                0,
-                65,
-                1,
-                prefix_checksums(
-                    boundary_sample.to(torch.device("npu", torch.npu.current_device()))
-                ),
-                expected_hash=expected_boundary,
-            )
+        if tp_size is not None:
+            self.kv_trace.base["tp_size"] = int(tp_size)
+            self.kv_trace.base["tp_rank"] = self._prefill_worker_id % int(tp_size)
+        if groups is not None:
+            self.kv_trace.base["groups"] = list(groups)
         if groups is not None:
             for request in requests:
                 phase = (
@@ -2598,108 +2565,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 prefix=prefix,
                 produced_available=produced is not None,
             )
-            if is_p and stage == "P_COMPUTE" and prefix % self.lmcache_chunk_size:
-                # Only the boundary segment needs a second checksum: the
-                # complete history segments already exist in P_COMPUTE.
-                trace.paged(
-                    req_id,
-                    "P_HISTORY_TAIL",
-                    group,
-                    layer_id,
-                    end,
-                    planes,
-                    table[row],
-                    prefix // self.lmcache_chunk_size * self.lmcache_chunk_size,
-                    prefix,
-                    block_size=int(planes[0].shape[1]),
-                )
-            if is_p and stage == "P_COMPUTE" and spec.is_last_prefill:
-                reference_segment = min(
-                    self.lmcache_chunk_size, REFERENCE_SEGMENT_TOKENS
-                )
-                stored_end = min(end, len(spec.token_ids))
-                trace.paged(
-                    req_id,
-                    "P_FINAL",
-                    group,
-                    layer_id,
-                    end,
-                    planes,
-                    table[row],
-                    0,
-                    stored_end,
-                    block_size=int(planes[0].shape[1]),
-                    segment_tokens=reference_segment,
-                    final=True,
-                    metadata_frontier=len(spec.token_ids),
-                )
-                trace.boundary_prefixes(
-                    req_id,
-                    group,
-                    layer_id,
-                    end,
-                    planes,
-                    table[row],
-                    max(0, (stored_end - 1) // reference_segment * reference_segment),
-                    stored_end,
-                    int(planes[0].shape[1]),
-                )
-            stored_end = min(end, len(spec.token_ids))
-            if (
-                is_p
-                and stage == "P_COMPUTE"
-                and stored_end < end
-                and stored_end % self.lmcache_chunk_size
-            ):
-                trace.paged(
-                    req_id,
-                    "P_STORE_BOUNDARY",
-                    group,
-                    layer_id,
-                    end,
-                    planes,
-                    table[row],
-                    stored_end // self.lmcache_chunk_size * self.lmcache_chunk_size,
-                    stored_end,
-                    block_size=int(planes[0].shape[1]),
-                )
             if produced is not None:
-                for absolute, absolute_stop in segments(
-                    prefix, end, self.lmcache_chunk_size
-                ):
-                    begin = query_start + absolute - prefix
-                    stop = query_start + absolute_stop - prefix
-                    for component, value in enumerate(produced):
-                        raw = (
-                            value[begin:stop]
-                            .to(dtype=planes[component].dtype)
-                            .contiguous()
-                            .view(torch.uint8)
-                            .reshape(stop - begin, -1)
-                        )
-                        trace.tensor(
-                            req_id,
-                            "P_PRODUCED" if is_p else "D_PRODUCED",
-                            group,
-                            layer_id,
-                            end,
-                            absolute,
-                            absolute + stop - begin,
-                            component,
-                            raw,
-                        )
-                trace.paged(
-                    req_id,
-                    "P_SCATTER" if is_p else "D_SCATTER",
-                    group,
-                    layer_id,
-                    end,
-                    planes,
-                    table[row],
-                    prefix,
-                    end,
-                    block_size=int(planes[0].shape[1]),
-                )
+                for component, value in enumerate(produced):
+                    raw = (
+                        value[query_start:query_end]
+                        .to(dtype=planes[component].dtype)
+                        .contiguous()
+                    )
+                    trace.tensor(
+                        req_id,
+                        "P_PRODUCED" if is_p else "D_PRODUCED",
+                        group,
+                        layer_id,
+                        end,
+                        prefix,
+                        end,
+                        component,
+                        raw,
+                    )
 
     @diagnostic
     def trace_cpu_kv(
@@ -2714,7 +2597,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         mirror: bool = False,
         layer_ids: Any = None,
     ) -> None:
-        """Trace all resolved CPU layers and optionally load independent D chunks."""
+        """Sample resolved CPU layers; real D sparse destinations are observed separately."""
         if not kv_trace_enabled():
             return
         if not starts or not ends:
@@ -2798,44 +2681,58 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     ],
                 )
             )
-            batches = {}
-            for start, end, obj in zip(
-                starts, ends, _layer_source_memory_objs(objects, layer), strict=True
+            objects = tuple(_layer_source_memory_objs(objects, layer))
+            frozen_starts, frozen_ends = tuple(starts), tuple(ends)
+
+            def sample_cpu(
+                layer=layer,
+                objects=objects,
+                byte_widths=byte_widths,
+                interleaved=interleaved,
+                starts=frozen_starts,
+                ends=frozen_ends,
             ):
-                value = _layer_memory_tensor(obj, layer)
-                capacity, remainder = divmod(
-                    value.numel() * value.element_size(), sum(byte_widths)
-                )
-                if remainder:
-                    trace.error(
-                        req_id, stage, "packet_capacity", group=group, layer=layer
+                batches = {}
+                for start, end, obj in zip(starts, ends, objects, strict=True):
+                    value = _layer_memory_tensor(obj, layer)
+                    capacity, remainder = divmod(
+                        value.numel() * value.element_size(), sum(byte_widths)
                     )
-                    continue
-                trace.cpu_packet(
+                    if remainder:
+                        trace.error(
+                            req_id, stage, "packet_capacity", group=group, layer=layer
+                        )
+                        return
+                    trace.cpu_packet(
+                        req_id,
+                        stage,
+                        group,
+                        layer,
+                        int(ends[-1]),
+                        int(start),
+                        int(end),
+                        value,
+                        capacity,
+                        byte_widths,
+                        interleaved=interleaved,
+                        batches=batches,
+                    )
+                trace.flush_packets(
                     req_id,
-                    stage,
                     group,
                     layer,
                     int(ends[-1]),
-                    int(start),
-                    int(end),
-                    value,
-                    capacity,
-                    byte_widths,
-                    mirror_device=layout.kv_device if mirror else None,
-                    interleaved=interleaved,
-                    batches=batches,
-                    source_identity=id(obj),
+                    batches,
+                    source_rank=getattr(self, "kv_trace_source_ranks", (None, None))[
+                        group
+                    ],
                 )
-            trace.flush_packets(
-                req_id,
-                group,
-                layer,
-                int(ends[-1]),
-                batches,
-                source_rank=getattr(self, "kv_trace_source_ranks", (None, None))[group],
+
+            trace.cpu_work(
+                req_id, sample_cpu, objects, (), stage=stage, group=group, layer=layer
             )
 
+    @diagnostic
     def trace_selected_kv(
         self,
         req_id: str,
@@ -2847,11 +2744,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         counts: Any,
         total: int,
     ) -> None:
-        """Validate all bytes selected by the first real sparse transfer.
+        """Save selected logical positions and one destination byte per token.
 
-        Called on the transfer stream after its copy. Only coordinates and
-        checksums leave the device. CPU reference objects stay leased until
-        the background comparison ends.
+        No full KV gather, hash or independent payload mirror is performed.
+        The analyzer indexes the archived D_CPU feature vector by position.
+        All probe gathers are clamped; invalid original slots are also saved.
         """
         trace = getattr(self, "kv_trace", None)
         if trace is None or self._layerwise_prefill_dma or group != 0:
@@ -2864,89 +2761,70 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 req_id, "D_SELECTED", "missing_cpu_reference", group=group, layer=layer
             )
             return
-        try:
-            source_limit = int(source[1][-1])
-            selected = (
-                indices.reshape(indices.shape[0], -1)
-                if indices.ndim > 1
-                else indices.reshape(1, -1)
+        selected = (
+            indices.reshape(indices.shape[0], -1)
+            if indices.ndim > 1
+            else indices.reshape(1, -1)
+        )
+        target = slots.reshape_as(selected)
+        source_limit = int(source[1][-1])
+        valid = (selected >= 0) & (selected < min(total, source_limit))
+        if counts is not None:
+            columns = torch.arange(selected.shape[1], device=selected.device)
+            valid &= columns.unsqueeze(0) < counts.reshape(-1, 1)
+        positions = torch.where(valid, selected, -1).long().reshape(-1)
+        size = positions.numel()
+        trace.tensor(
+            req_id,
+            "MAP_SELECTED_POS",
+            group,
+            layer,
+            total,
+            0,
+            size,
+            0,
+            positions,
+            source_end=source_limit,
+        )
+        trace.tensor(
+            req_id,
+            "MAP_SELECTED_SLOT",
+            group,
+            layer,
+            total,
+            0,
+            size,
+            0,
+            target.long().reshape(-1),
+        )
+        for component, plane in enumerate(planes):
+            if not plane.is_contiguous():
+                trace.error(req_id, "D_SELECTED", "feature_plane_not_contiguous")
+                return
+            capacity = plane.shape[0] * plane.shape[1]
+            width = plane[0, 0].numel() * plane.element_size()
+            record = trace.record(
+                req_id,
+                "D_SELECTED",
+                group=group,
+                layer=layer,
+                frontier=total,
+                start=0,
+                end=size,
+                component=component,
+                source_end=source_limit,
+                slot_capacity=capacity,
             )
-            target = slots.reshape_as(selected)
-            valid = (
-                (selected >= 0) & (selected < min(total, source_limit)) & (target >= 0)
-            )
-            if counts is not None:
-                columns = torch.arange(selected.shape[1], device=selected.device)
-                valid &= columns.unsqueeze(0) < counts.reshape(-1, 1)
-            positions = torch.empty(selected.shape, dtype=torch.long, pin_memory=True)
-            positions.copy_(torch.where(valid, selected, -1).long(), non_blocking=True)
-            actual = []
-            safe = torch.where(valid, target, 0).long().reshape(-1)
-            for plane in planes:
-                flat = plane.reshape(-1, *plane.shape[2:])
-                value = (
-                    flat.index_select(0, safe)
-                    .contiguous()
+            trace.capture(
+                record,
+                lambda plane=plane, width=width, capacity=capacity: (
+                    plane.detach()
                     .view(torch.uint8)
-                    .reshape(safe.numel(), -1)
-                )
-                value = value * valid.reshape(-1, 1).to(torch.uint8)
-                digest = content_checksum(value)
-                host = torch.empty(digest.shape, dtype=torch.int32, pin_memory=True)
-                host.copy_(digest, non_blocking=True)
-                actual.append((host, digest))
-            ready = torch.npu.Event()
-            ready.record(torch.npu.current_stream(selected.device))
-            starts, ends, objects, widths, interleaved = source
-
-            def compare() -> None:
-                selected_cpu = positions.reshape(-1)
-                for component, width in enumerate(widths):
-                    expected = torch.zeros(
-                        (selected_cpu.numel(), width), dtype=torch.uint8
+                    .reshape(-1)
+                    .index_select(
+                        0, target.long().reshape(-1).clamp(0, capacity - 1) * width
                     )
-                    for start, end, obj in zip(starts, ends, objects, strict=True):
-                        mask = (selected_cpu >= start) & (selected_cpu < end)
-                        if not bool(mask.any()):
-                            continue
-                        packet = _layer_memory_tensor(obj, layer)
-                        capacity = packet.numel() * packet.element_size() // sum(widths)
-                        plane = packet_planes(packet, capacity, widths, interleaved)[
-                            component
-                        ]
-                        expected[mask] = plane.index_select(
-                            0, selected_cpu[mask] - start
-                        )
-                    expected_hash = "".join(
-                        f"{int(x) & 0xFFFFFFFF:08x}"
-                        for x in content_checksum(expected).tolist()
-                    )
-                    actual_hash = "".join(
-                        f"{int(x) & 0xFFFFFFFF:08x}"
-                        for x in actual[component][0].tolist()
-                    )
-                    trace.emit(
-                        dict(
-                            trace.base,
-                            req=req_id,
-                            stage="D_SELECTED",
-                            group=group,
-                            layer=layer,
-                            frontier=total,
-                            component=component,
-                            hash=actual_hash,
-                            expected_hash=expected_hash,
-                            match=actual_hash == expected_hash,
-                            scope="inherited_history",
-                            source_end=source_limit,
-                            selected=int((selected_cpu >= 0).sum()),
-                        )
-                    )
-
-            trace.cpu_work(req_id, compare, objects, (ready,), stage="D_SELECTED")
-        except Exception as error:
-            trace.error(
-                req_id, "D_SELECTED", type(error).__name__, group=group, layer=layer
+                ),
             )
 
     @diagnostic
@@ -2976,7 +2854,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def enqueue_store_kv_trace(
         self, req_id: str, group: int, starts: Any, ends: Any, rows: Any, events: Any
     ) -> None:
-        """Hash saved CPU bytes after their real D2H completion on a worker."""
+        """Sample saved CPU bytes after their real D2H completion on a worker."""
         if not kv_trace_enabled():
             return
         if not hasattr(self, "kv_trace"):
@@ -3011,7 +2889,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layer: int,
         ready: Any,
     ) -> None:
-        """Hash immutable CPU load sources on the worker after actual H2D.
+        """Sample immutable CPU load sources on the worker after actual H2D.
 
         Early CPU publication may precede producer D2H completion. Borrow the
         real per-layer load event, which already carries source dependencies;
@@ -3076,7 +2954,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         starts: Any,
         ends: Any,
     ) -> None:
-        """Hash fully resident direct-import data without forcing CPU fallback.
+        """Sample fully resident direct-import data without forcing CPU fallback.
 
         Direct Mooncake indexer imports already have all history on the NPU.
         Observe those real destinations on their load stream instead of loading
@@ -3105,7 +2983,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     mapping = getattr(layout, "block_map_cpu", None)
                     factor = layout.layer_slot_factors[layer]
                     physical = (
-                        mapping.to(slots.device)[slots // 128] * 128 + slots % 128
+                        mapping.to(slots.device).index_select(
+                            0, (slots // 128).clamp(0, mapping.numel() - 1)
+                        )
+                        * 128
+                        + slots % 128
                         if mapping is not None
                         else slots // 128 * (128 * factor) + slots % 128
                     )

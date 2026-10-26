@@ -5351,6 +5351,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kv_hash_enabled()
                 and self.metadata.is_first_rank()
                 and not self._force_layerwise_prefill_store
+                and not getattr(self.gpu_connector, "uses_token_byte_features", False)
             ):
                 skip_kv_hash("D", req_id, 1, "direct_npu_not_observed")
             return True
@@ -7667,7 +7668,21 @@ class AscendLMCacheEngine(LMCacheEngine):
                             self.gpu_connector.layerwise_prefill_store_fences(kv_group)
                         )
                     if async_layerwise_store and not hash_fences:
-                        skip_kv_hash("S", req_id, kv_group, "missing_producer_fence")
+                        if getattr(
+                            self.gpu_connector, "uses_token_byte_features", False
+                        ):
+                            trace = getattr(self.gpu_connector, "kv_trace", None)
+                            if trace is not None:
+                                trace.error(
+                                    req_id,
+                                    "P_CPU_STORE",
+                                    "missing_producer_fence",
+                                    group=kv_group,
+                                )
+                        else:
+                            skip_kv_hash(
+                                "S", req_id, kv_group, "missing_producer_fence"
+                            )
                     else:
                         trace = getattr(
                             self.gpu_connector, "enqueue_store_kv_trace", None
@@ -7685,6 +7700,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                             memory_objs,
                             int(self.config.chunk_size),
                             producer_events=hash_fences,
+                            feature_mode=getattr(
+                                self.gpu_connector, "uses_token_byte_features", False
+                            ),
                         )
                         if hash_ready is not None:
                             # The existing Mooncake background worker waits
@@ -10047,8 +10065,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ends,
                     hash_rows,
                     int(self.config.chunk_size),
+                    feature_mode=getattr(
+                        self.gpu_connector, "uses_token_byte_features", False
+                    ),
                 )
-            else:
+            elif not getattr(self.gpu_connector, "uses_token_byte_features", False):
                 skip_kv_hash(
                     "D", kwargs.get("req_id", "unspecified"), kv_group, "no_cpu_sources"
                 )
