@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import threading
 import types
+from functools import wraps
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -77,6 +78,13 @@ class CPUHardware:
 
             def wait_event(self, event):
                 with hardware.lock:
+                    if (
+                        hardware.queue.fault == "skip-save-wait"
+                        and not self.name.endswith("compute")
+                        and event.stream is not None
+                        and event.stream.name.endswith("compute")
+                    ):
+                        return
                     return super().wait_event(event)
 
             def synchronize(self):
@@ -90,7 +98,8 @@ class CPUHardware:
 
             def synchronize(self):
                 with hardware.lock:
-                    super().synchronize()
+                    if self.stream is not None:
+                        super().synchronize()
 
             def wait(self, stream=None):
                 (stream or hardware.queue.current).wait_event(self)
@@ -398,12 +407,18 @@ class CPUHardware:
         from vllm.v1.engine.core import EngineCore  # noqa: F401
         import torch._dynamo  # noqa: F401
 
+        torch._dynamo.config.disable = True
+
         for name, directory in (
             ("lmcache_ascend", self.root / "lmcache_ascend"),
             ("vllm_ascend", self.root.parent / "vllm-ascend/vllm_ascend"),
             (
                 "vllm_ascend.patch.platform",
                 self.root.parent / "vllm-ascend/vllm_ascend/patch/platform",
+            ),
+            (
+                "vllm_ascend.patch.worker",
+                self.root.parent / "vllm-ascend/vllm_ascend/patch/worker",
             ),
             (
                 "lmcache_ascend.v1.npu_connector",
@@ -419,6 +434,9 @@ class CPUHardware:
         build = types.ModuleType("lmcache_ascend._build_info")
         build.__framework_name__ = "pytorch"
         sys.modules[build.__name__] = build
+        ascend_build = types.ModuleType("vllm_ascend._build_info")
+        ascend_build.__device_type__ = "A3"
+        sys.modules[ascend_build.__name__] = ascend_build
         sys.modules["lmcache.c_ops"] = self.native_module("lmcache.c_ops")
         sys.modules["lmcache_ascend.c_ops"] = self.native_module("lmcache_ascend.c_ops")
 
@@ -464,6 +482,32 @@ class CPUHardware:
         )
         self._set(torch, "npu", api)
         npu.npu = api
+
+        class UnsupportedGraph:
+            def __init__(self, *args, **kwargs):
+                raise NotImplementedError("ACL graph execution is not emulated")
+
+        api.NPUGraph = UnsupportedGraph
+        api.ExternalEvent = self.Event
+        api.get_soc_version = lambda: 250
+        api.config = SimpleNamespace(allow_internal_format=False)
+        api.default_stream = lambda *args: self.queue.default_stream
+        api.mem_get_info = lambda *args: (8 * 1024**3, 8 * 1024**3)
+        npu._C = SimpleNamespace(_NPUTaskGroupHandle=UnsupportedGraph)
+        # Run the original Python policies without optional CPU JIT compilation.
+        if "numba" not in sys.modules:
+            numba = types.ModuleType("numba")
+            numba.__spec__ = importlib.machinery.ModuleSpec("numba", loader=None)
+            numba.njit = lambda function=None, **kwargs: (
+                function
+                if callable(function)
+                else lambda implementation: implementation
+            )
+            numba.jit = numba.njit
+            numba.prange = range
+            numba.get_num_threads = lambda: 1
+            numba.set_num_threads = lambda count: None
+            sys.modules["numba"] = numba
         for name in (
             "Stream",
             "Event",
@@ -475,6 +519,28 @@ class CPUHardware:
             self._set(torch.cuda, name, getattr(api, name))
         self._set(torch.Tensor, "record_stream", lambda *_: None)
         self._set(torch.Tensor, "pin_memory", lambda value, *_args, **_kwargs: value)
+        for name in (
+            "tensor",
+            "empty",
+            "zeros",
+            "ones",
+            "full",
+            "empty_like",
+            "zeros_like",
+            "ones_like",
+            "full_like",
+        ):
+            original = getattr(torch, name)
+
+            def unpinned(function):
+                @wraps(function)
+                def allocate(*args, **kwargs):
+                    kwargs.pop("pin_memory", None)
+                    return function(*args, **kwargs)
+
+                return allocate
+
+            self._set(torch, name, unpinned(original))
         return self
 
 
@@ -489,6 +555,7 @@ def prepare_paths(root: Path) -> None:
     os.environ["PYTHONPATH"] = os.pathsep.join(map(str, paths))
     os.environ["VLLM_PLUGINS"] = ""
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ.setdefault("VLLM_VERSION", "0.18.0")
     if sys.platform == "win32":
         # Routed-expert capture is disabled. Fail if it is accidentally used.
         fcntl = types.ModuleType("fcntl")

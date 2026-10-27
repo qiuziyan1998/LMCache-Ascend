@@ -34,12 +34,25 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--batch-tokens", type=int, default=256)
     parser.add_argument("--max-num-seqs", type=int, default=4)
+    parser.add_argument("--connector-only", dest="native_runner", action="store_false")
+    parser.set_defaults(native_runner=True)
     parser.add_argument(
-        "--fault", choices=("none", "skip-load-wait", "corrupt-remote"), default="none"
+        "--fault",
+        choices=("none", "skip-load-wait", "skip-save-wait", "corrupt-remote"),
+        default="none",
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    for name in ("banks", "tp_size", "requests", "layers", "decode_tokens", "rounds"):
+    for name in (
+        "banks",
+        "tp_size",
+        "requests",
+        "layers",
+        "decode_tokens",
+        "rounds",
+        "batch_tokens",
+        "max_num_seqs",
+    ):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     tp_size = args.tp_size
@@ -49,6 +62,7 @@ def main() -> int:
         VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE="true",
         VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS=str(args.banks),
         VLLM_ASCEND_DSA_TWO_GROUPS="1",
+        VLLM_ASCEND_DSA_UNBUNDLE="1",
         VLLM_ASCEND_DSA_SHARED_POOL="1",
         LMCACHE_PREFILL_STORE_DEBUG="0",
         VLLM_LOGGING_LEVEL="WARNING",
@@ -81,6 +95,10 @@ def main() -> int:
     from vllm.v1.executor.abstract import Executor
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
     from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.distributed.kv_transfer import kv_transfer_state
+    from vllm.forward_context import set_forward_context
+    from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
+    from vllm_ascend.attention.utils import record_layerwise_prefill_bank_use
     from lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1 import (
         LMCacheAscendConnectorV1Dynamic as LMCacheConnectorV1,
     )
@@ -146,7 +164,6 @@ def main() -> int:
                 token_ids, lookup_id=lookup_id, request_configs=request_configs
             )
             self.cache[lookup_id] = result
-            print("LOOKUP", lookup_id, result, flush=True)
             return result
 
         def lookup_cache(self, lookup_id):
@@ -338,6 +355,18 @@ def main() -> int:
             assert not self.worker._lmcache_engine._manager._init_failed, (
                 self.worker._lmcache_engine._manager._init_failed_reason
             )
+            if args.native_runner:
+                from cpu_native_runner import make_runner
+
+                self.worker.native_runner = make_runner(
+                    worker_config, self.worker, cache_config, hardware, stats
+                )
+                self.worker.cpu_compute_stream = hardware.Stream()
+                self.worker.cpu_compute_stream.name = (
+                    f"{self.vllm_config.kv_transfer_config.engine_id}-r{rank}/compute"
+                )
+                self.workers.append(self.worker)
+                return
             caches = {}
             raw_tensors = {}
             for spec in self.cache_config.kv_cache_tensors:
@@ -380,7 +409,39 @@ def main() -> int:
                         self.blocks[req_id][group].extend(values)
             for worker in self.workers:
                 self.worker = worker
-                self._execute_worker(scheduler_output)
+                if args.native_runner:
+                    from vllm.config import set_current_vllm_config
+                    from vllm_ascend import ascend_config
+
+                    runner = worker.native_runner
+                    if (
+                        worker is self.workers[0]
+                        and scheduler_output.total_num_scheduled_tokens
+                    ):
+                        role = (
+                            "P"
+                            if worker._lmcache_engine._layerwise_prefill_p_node
+                            else "D"
+                        )
+                        stats[role + "_steps"] += 1
+                        stats["mixed_batches"] += (
+                            len(scheduler_output.num_scheduled_tokens) > 1
+                        )
+                    ascend_config._ASCEND_CONFIG = runner.ascend_config
+                    previous = kv_transfer_state._KV_CONNECTOR_AGENT
+                    kv_transfer_state._KV_CONNECTOR_AGENT = worker
+                    try:
+                        with (
+                            hardware.stream(worker.cpu_compute_stream),
+                            set_current_vllm_config(runner.vllm_config),
+                        ):
+                            worker.native_output = runner.execute_model(
+                                copy.deepcopy(scheduler_output)
+                            )
+                    finally:
+                        kv_transfer_state._KV_CONNECTOR_AGENT = previous
+                else:
+                    self._execute_worker(scheduler_output)
             for req_id, count in scheduler_output.num_scheduled_tokens.items():
                 self.computed[req_id] += count
             if non_block:
@@ -390,8 +451,16 @@ def main() -> int:
             return None
 
         def _execute_worker(self, scheduler_output):
-            with hardware.stream(self.worker.cpu_compute_stream):
-                return self._execute_worker_impl(scheduler_output)
+            previous = kv_transfer_state._KV_CONNECTOR_AGENT
+            kv_transfer_state._KV_CONNECTOR_AGENT = self.worker
+            try:
+                with (
+                    hardware.stream(self.worker.cpu_compute_stream),
+                    set_forward_context({}, self.vllm_config),
+                ):
+                    return self._execute_worker_impl(scheduler_output)
+            finally:
+                kv_transfer_state._KV_CONNECTOR_AGENT = previous
 
         def _execute_worker_impl(self, scheduler_output):
             self.last = scheduler_output
@@ -406,7 +475,20 @@ def main() -> int:
                 role = "P" if bridge._layerwise_prefill_p_node else "D"
                 stats[role + "_steps"] += bool(requests)
                 stats["mixed_batches"] += len(requests) > 1
+            # These methods contain no attention/model parameters. Execute the
+            # real SFA transfer-window callbacks around the dummy arithmetic.
+            callbacks = object.__new__(AscendSFAImpl)
+            pending_operations = []
+            if bridge._layerwise_prefill_p_node:
+                bridge.submit_layerwise_prefill_load(-1)
             for layer in range(layers):
+                previous_operations = pending_operations
+                previous_names = (
+                    callbacks._submit_sfa_layerwise_transfer_window(previous_operations)
+                    if previous_operations
+                    else []
+                )
+                pending_operations = []
                 names = [f"model.layers.{layer}.self_attn.attn"]
                 if layer in index_at:
                     names.append(f"model.layers.{layer}.self_attn.indexer.k_cache")
@@ -510,15 +592,51 @@ def main() -> int:
                                 stats["checked_rows"] += end
 
                         hardware.queue.current.submit(f"compute {name}", compute)
-                    event = hardware.Event()
-                    event.record()
-                    bridge.record_layerwise_prefill_bank_use(name, event)
-                    self.worker.save_kv_layer(name, caches, None)
-                    bridge.submit_layerwise_prefill_load(name)
-                    bridge.finish_layerwise_prefill_save(name)
+                    if bridge._layerwise_prefill_p_node:
+                        record_layerwise_prefill_bank_use(name)
+                        pending_operations.append((name, caches))
+                    else:
+                        self.worker.save_kv_layer(name, caches, None)
+                terminal_names = []
+                if layer == layers - 1 and pending_operations:
+                    if previous_names:
+                        callbacks._finish_sfa_layerwise_transfer_window(
+                            previous_operations, previous_names
+                        )
+                        previous_names = []
+                    terminal_names = callbacks._submit_sfa_layerwise_transfer_window(
+                        pending_operations
+                    )
+                hardware.queue.current.submit("compute output projection")
+                if previous_names:
+                    callbacks._finish_sfa_layerwise_transfer_window(
+                        previous_operations, previous_names
+                    )
+                if terminal_names:
+                    callbacks._finish_sfa_layerwise_transfer_window(
+                        pending_operations, terminal_names
+                    )
+                    pending_operations = []
             self.worker.wait_for_save()
 
         def sample_tokens(self, grammar_output, non_block=False):
+            if args.native_runner:
+                from vllm.config import set_current_vllm_config
+
+                outputs = []
+                for worker in self.workers:
+                    with (
+                        hardware.stream(worker.cpu_compute_stream),
+                        set_current_vllm_config(worker.native_runner.vllm_config),
+                    ):
+                        hardware.queue.until(worker.cpu_compute_stream.tail)
+                        output = worker.native_output
+                        if output is None:
+                            output = worker.native_runner.sample_tokens(grammar_output)
+                        if hasattr(output, "get_output"):
+                            output = output.get_output()
+                        outputs.append(output)
+                return self.kv_aggregator.aggregate(outputs)
             for worker in self.workers:
                 hardware.queue.until(worker.cpu_compute_stream.tail)
             ids = list(self.last.num_scheduled_tokens)
@@ -566,6 +684,11 @@ def main() -> int:
                     qk_rope_head_dim=1,
                     qk_nope_head_dim=8,
                     v_head_dim=8,
+                    **(
+                        {"index_topk": 128, "index_head_dim": 2}
+                        if args.native_runner
+                        else {}
+                    ),
                 )
             )
         )
@@ -617,7 +740,7 @@ def main() -> int:
                     prompt_token_ids=tokens,
                     mm_features=None,
                     sampling_params=SamplingParams(
-                        max_tokens=max_tokens, ignore_eos=True
+                        max_tokens=max_tokens, ignore_eos=True, temperature=0
                     ),
                     pooling_params=None,
                     arrival_time=0.0,
@@ -637,6 +760,9 @@ def main() -> int:
                 raise RuntimeError(f"{phase} scheduler did not finish")
             assert all(len(tokens) == max_tokens for tokens in results.values()), (
                 results
+            )
+            assert all(token == 7 for tokens in results.values() for token in tokens), (
+                f"{phase}: unexpected identity-model output: {results}"
             )
             print(
                 f"[CPU_E2E] {phase}: requests={len(prompts)} steps={step} "
@@ -702,6 +828,7 @@ def main() -> int:
                 banks=args.banks,
                 tp=tp_size,
                 layers=layers,
+                native_model_runner=args.native_runner,
                 requests=args.requests,
                 rounds=args.rounds,
                 **stats,
@@ -716,7 +843,9 @@ def main() -> int:
                     for name in ("vllm", "vllm-ascend", "LMCache", "LMCache-Ascend")
                 },
                 scope=(
-                    "Real EngineCore/AsyncRecomputeScheduler/LMCache Python modules; "
+                    "Real EngineCore/AsyncRecomputeScheduler/"
+                    + ("NPUModelRunner/" if args.native_runner else "")
+                    + "LMCache Python modules; "
                     "CPU identity model, simulated device and Mooncake SDK; "
                     "no ACL kernels or ACL graph replay"
                 ),

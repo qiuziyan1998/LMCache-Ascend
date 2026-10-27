@@ -47,15 +47,18 @@ def test_full_pd_control_path(tmp_path, banks, seed):
     data = json.loads(report.read_text())
     assert data["status"] == "passed"
     assert data["tp"] == 4
+    assert data["native_model_runner"]
     assert data["decode_tokens"] == 16
     assert data["mixed_batches"] > 0
     assert data["checked_rows"] > 10000
     assert data["remote_puts"] > 0 and data["remote_gets"] > 0
 
 
-@pytest.mark.parametrize("fault", ["skip-load-wait", "corrupt-remote"])
+@pytest.mark.parametrize(
+    "fault", ["skip-load-wait", "skip-save-wait", "corrupt-remote"]
+)
 def test_detects_missing_wait_and_transport_corruption(tmp_path, fault):
     result, report = run_case(tmp_path, "--fault", fault, "--rounds", "1")
     assert result.returncode != 0
     assert not report.exists()
-    assert "Historical KV mismatch" in result.stdout + result.stderr
+    assert "KV mismatch" in result.stdout + result.stderr

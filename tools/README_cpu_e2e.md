@@ -1,7 +1,8 @@
 # CPU validation of the vLLM / LMCache P-D control path
 
 `vllm_cpu_e2e.py` runs two **real `EngineCore` instances** with
-`AsyncRecomputeScheduler`, the Ascend connector, `AscendLMCacheEngine`,
+`AsyncRecomputeScheduler`, the original `NPUModelRunner`, the Ascend connector,
+`AscendLMCacheEngine`,
 `StorageManager`, `LocalCPUBackend`, and `MooncakestoreConnector`. These are
 normal imports of the complete repository modules, not extracted method bodies.
 Keep the four repositories in sibling directories: `vllm`, `vllm-ascend`,
@@ -9,7 +10,11 @@ Keep the four repositories in sibling directories: `vllm`, `vllm-ascend`,
 
 The CPU backend replaces the executor RPC boundary, native device functions,
 streams/events, shared-memory mapping, and native Mooncake store SDK. The model
-is an identity model with deterministic KV values. The real scheduler supplies
+is an identity model with deterministic KV values. The real NPU runner executes
+input preparation, request/block-table updates, attention metadata construction,
+model dispatch, sampling, and asynchronous output materialization. The real SFA
+transfer-window callbacks surround the identity model's CPU arithmetic.
+The real scheduler supplies
 request admission, chunk boundaries, block allocations, bank phase metadata,
 and completion state. P and D have distinct HBM buffers and distinct CPU slabs.
 Only the simulated remote store connects their payloads. Every TP worker has
@@ -35,7 +40,9 @@ store; D uses synchronous store configuration and the P feature is disabled.
 The scheduler creates mixed request batches naturally. Request and LMCache
 chunk sizes are intentionally small so many interleavings are inexpensive.
 `--banks`, `--seed`, `--layers`, `--requests`, `--rounds`, `--batch-tokens`,
-`--max-num-seqs`, and `--decode-tokens` can change the case. The completion
+`--max-num-seqs`, and `--decode-tokens` can change the case. `--connector-only`
+retains the earlier lightweight executor for isolating connector behavior.
+The completion
 messages are merged by vLLM's real `KVOutputAggregator` before being delivered
 to the scheduler.
 
@@ -52,19 +59,19 @@ to the scheduler.
   different order from their host submission order.
 - Native copies check source and destination bounds. Missing operations fail
   explicitly instead of silently becoming no-ops.
-- All requests must finish and return the expected token count. A run with no
-  scheduled work cannot pass. Reports include remote reads/writes and checked
-  row counts.
-- Negative tests remove compute-stream waits or corrupt the remote payload.
-  Both must be detected. A deliberate device fault terminates its isolated
+- All requests must finish and return the expected token count and token IDs.
+  A run with no scheduled work cannot pass. Reports include remote reads/writes
+  and checked row counts.
+- Negative tests remove load waits, remove save waits, or corrupt the remote
+  payload. All three must be detected. A deliberate device fault terminates its isolated
   test process without waiting for failed asynchronous stores to shut down.
 
 ## Limits
 
-This tests the Python control path with a CPU identity executor. It does not
-execute GLM arithmetic, the actual NPU model runner/SFA forward implementation,
+This tests the Python execution path with a CPU identity model. It does not
+execute GLM arithmetic, the numerical SFA attention implementation,
 MTP acceptance, native kernels, HCCL, HTTP/proxy routing, or ACL graph replay.
-The dummy executor supplies deterministic top-k indices. The transport has
+The identity model supplies deterministic top-k indices. The transport has
 the native store's API but not its network implementation or failure modes.
 The CPU results therefore do **not** establish that the production NPU race
 has been fixed. Use this harness to reproduce and reject ownership/order
