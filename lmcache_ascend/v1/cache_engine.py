@@ -7964,6 +7964,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"cached_chunks={cached_prefix_chunks}"
             )
         missing_chunks = required_chunks - cached_prefix_chunks
+        if missing_chunks:
+            source_start = int(starts[cached_prefix_chunks])
+            source_end = int(ends[-1])
+        else:
+            source_start = 0
+            source_end = int(ends[-1]) if ends else 0
         self._fill_retrieve_mask(
             ret_mask,
             starts[:cached_prefix_chunks],
@@ -8305,6 +8311,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = source
+                    sparse_payload["source_start"] = source_start
+                    sparse_payload["source_end"] = source_end
                     mem_obj_consumer.send(sparse_payload)
                 else:
                     mem_obj_consumer.send(

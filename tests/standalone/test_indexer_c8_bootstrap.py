@@ -13,8 +13,9 @@ import torch
 
 @pytest.mark.parametrize("joined", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("source_start", [0, 4])
 def test_bootstrap_retains_prefix_and_registers_failure_fence(
-    monkeypatch, joined, fail
+    monkeypatch, joined, fail, source_start
 ):
     source = (
         Path(__file__).parents[2] / "lmcache_ascend/v1/npu_connector/npu_connectors.py"
@@ -60,13 +61,19 @@ def test_bootstrap_retains_prefix_and_registers_failure_fence(
     slots = torch.arange(17)
     if fail:
         with pytest.raises(RuntimeError, match="launch"):
-            connector._run_c8_indexer_bootstrap(plan, pointers, 0, slots, 9, 8, False)
+            connector._run_c8_indexer_bootstrap(
+                plan, pointers, 0, slots, 9, 8, False,
+                source_start=source_start,
+            )
     else:
-        connector._run_c8_indexer_bootstrap(plan, pointers, 0, slots, 9, 8, False)
+        connector._run_c8_indexer_bootstrap(
+            plan, pointers, 0, slots, 9, 8, False,
+            source_start=source_start,
+        )
     args = native.call_args.args
     assert args[0] is plan.states[0] and args[1] is pointers
     assert args[2] is args[3] is dummy
-    assert torch.equal(args[4], slots[:9])
+    assert torch.equal(args[4], slots[source_start:source_start + 9])
     assert args[5:] == (8, False)
     assert native.call_args.kwargs == {"fixed_chunks": True}
     assert len(retained) == 3

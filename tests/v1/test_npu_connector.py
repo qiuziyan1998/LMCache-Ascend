@@ -2772,7 +2772,7 @@ def test_prepared_dense_load_bypasses_shape_cache_and_validates_once(
     assert chunk_ptrs.recorded_streams == [stream, stream]
 
 
-def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
+def test_sparse_head_token_wise_uses_source_token_count(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.num_layers = 1
     request_kvcaches = [(object(), object())]
@@ -2830,13 +2830,10 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
         ),
     )
 
-    def _unexpected_total_tokens(*args, **kwargs):
-        raise AssertionError("sparse total token shape walk should be skipped")
-
     monkeypatch.setattr(
         connector,
         "_sparse_total_tokens_from_layer_chunks",
-        _unexpected_total_tokens,
+        lambda *args, **kwargs: 4,
     )
 
     calls = []
@@ -2862,7 +2859,7 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
     gen.send(([], torch.arange(4, dtype=torch.int32), 0))
 
     assert len(calls) == 1
-    assert calls[0]["total_tokens"] == 18879
+    assert calls[0]["total_tokens"] == 4
     assert calls[0]["kvcaches_ref"] is request_kvcaches
 
 
@@ -4675,3 +4672,84 @@ def test_compact_latent_page_layout_preserves_page_run_boundaries() -> None:
         },
     ]
     assert retained is owners
+
+
+def test_sparse_source_total_uses_pointer_span(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.lmcache_chunk_size = 1024
+    monkeypatch.setattr(
+        connector,
+        "_lmc_plane_num_tokens_from_shape",
+        lambda shape, kv_group, layer_id: int(shape[0]),
+    )
+    memory_objs = [
+        SimpleNamespace(get_shape=lambda: (1024,)),
+        SimpleNamespace(get_shape=lambda: (512,)),
+    ]
+    total = connector._sparse_source_total_tokens(
+        layer_tensors=None,
+        memory_objs=memory_objs,
+        chunk_ptrs_npu=torch.tensor([7, 8]),
+        kv_group=0,
+        layer_id=0,
+        chunk_size=1024,
+    )
+    assert total == 1024 + 512
+    single = connector._sparse_source_total_tokens(
+        layer_tensors=None,
+        memory_objs=memory_objs[:1],
+        chunk_ptrs_npu=torch.tensor([7]),
+        kv_group=0,
+        layer_id=0,
+        chunk_size=1024,
+    )
+    assert single == 1024
+
+
+def test_sparse_selection_rebases_suffix_source() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    result = connector._prepare_sparse_selection_for_source(
+        torch.tensor([[1024, 1500, 2047, 0]], dtype=torch.int32),
+        torch.tensor([3], dtype=torch.int32),
+        source_start=1024,
+        total_tokens=1024,
+        lmcache_cached_tokens=2048,
+    )
+    assert result.tolist() == [[0, 476, 1023, 0]]
+
+
+def test_sparse_selection_allows_empty_bootstrap_suffix() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    result = connector._prepare_sparse_selection_for_source(
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        source_start=1024,
+        total_tokens=1024,
+        lmcache_cached_tokens=2048,
+    )
+    assert result.tolist() == [[0]]
+
+
+def test_sparse_selection_rejects_prefix_from_suffix_source() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    with pytest.raises(ValueError, match="outside the transferred source"):
+        connector._prepare_sparse_selection_for_source(
+            torch.tensor([[500, 1500, 0, 0]], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            source_start=1024,
+            total_tokens=1024,
+            lmcache_cached_tokens=2048,
+        )
+
+
+def test_sparse_selection_keeps_absolute_full_source() -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    selected = torch.tensor([[0, 1000, 2047, 0]], dtype=torch.int32)
+    result = connector._prepare_sparse_selection_for_source(
+        selected,
+        torch.tensor([3], dtype=torch.int32),
+        source_start=0,
+        total_tokens=2048,
+        lmcache_cached_tokens=2048,
+    )
+    assert result is selected

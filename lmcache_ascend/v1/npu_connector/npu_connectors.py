@@ -2725,6 +2725,66 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         last_tokens = self._lmc_plane_num_tokens(layer_tensors[-1], kv_group, layer_id)
         return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
 
+    def _sparse_memory_obj_num_tokens(
+        self,
+        memory_obj: MemoryObj,
+        kv_group: Optional[int],
+        layer_id: int,
+        *,
+        fallback_chunk_size: int,
+    ) -> int:
+        get_shape = getattr(memory_obj, "get_shape", None)
+        if callable(get_shape):
+            return self._lmc_plane_num_tokens_from_shape(
+                get_shape(), kv_group, layer_id
+            )
+        return int(fallback_chunk_size)
+
+    def _sparse_source_total_tokens(
+        self,
+        *,
+        layer_tensors: Optional[List[torch.Tensor]],
+        memory_objs: Optional[List[MemoryObj]],
+        chunk_ptrs_npu: Optional[torch.Tensor],
+        kv_group: Optional[int],
+        layer_id: int,
+        chunk_size: int,
+    ) -> int:
+        """Return the token span represented by this transfer source.
+
+        The pointer-first path keeps only one tensor view, so the source span
+        comes from the pointer table count and the tail object's metadata
+        instead of walking every CPU chunk. Other paths already own every
+        tensor and use their exact per-chunk token counts.
+        """
+        if layer_tensors is not None:
+            return self._sparse_total_tokens_from_layer_chunks(
+                layer_tensors, kv_group, layer_id
+            )
+        if not memory_objs:
+            return 0
+        chunk_count = (
+            int(chunk_ptrs_npu.numel())
+            if chunk_ptrs_npu is not None
+            else len(memory_objs)
+        )
+        if chunk_count <= 0:
+            return 0
+        if chunk_count != len(memory_objs):
+            raise ValueError(
+                "Sparse source pointer/memory chunk coverage mismatch: "
+                f"pointers={chunk_count}, memory_objs={len(memory_objs)}"
+            )
+        last_tokens = self._sparse_memory_obj_num_tokens(
+            memory_objs[-1],
+            kv_group,
+            layer_id,
+            fallback_chunk_size=chunk_size,
+        )
+        return (chunk_count - 1) * int(chunk_size) + min(
+            int(last_tokens), int(chunk_size)
+        )
+
     def _is_deferred_sparse_pointer_cache(
         self, cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]]
     ) -> bool:
@@ -4326,6 +4386,154 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             selected_token_idx,
         )
 
+    def _prepare_sparse_selection_for_source(
+        self,
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        selected_token_counts: Optional[Union[torch.Tensor, list]],
+        *,
+        source_start: Optional[int],
+        total_tokens: int,
+        lmcache_cached_tokens: int,
+    ) -> Optional[Union[torch.Tensor, list]]:
+        """Validate absolute SFA selections against the transferred source.
+
+        SFA packs absolute token positions. For a full-prefix source the
+        positions are already source-local. For a suffix source every selected
+        position must belong to that suffix; those positions are rebased to
+        source-local indices. Prefix selections cannot be served by a suffix
+        source and are rejected instead of being silently mangled.
+        """
+        if selected_token_idx is None or int(total_tokens) <= 0:
+            return selected_token_idx
+
+        counts = selected_token_counts
+        counts_all_zero = False
+        if counts is not None:
+            if isinstance(counts, torch.Tensor):
+                counts_all_zero = counts.numel() == 0 or not bool(
+                    (counts > 0).any().item()
+                )
+            else:
+                counts_all_zero = not any(int(count) > 0 for count in counts)
+
+        if source_start is None:
+            if (
+                counts is not None
+                and not counts_all_zero
+                and int(total_tokens) != int(lmcache_cached_tokens)
+            ):
+                raise ValueError(
+                    "Suffix sparse source is missing source_start: "
+                    f"total_tokens={total_tokens}, "
+                    f"lmcache_cached_tokens={lmcache_cached_tokens}"
+                )
+            source_start = 0
+        source_start = int(source_start)
+        if source_start < 0:
+            raise ValueError(
+                f"Sparse source_start must be non-negative: {source_start}"
+            )
+        source_end = source_start + int(total_tokens)
+
+        if not isinstance(selected_token_idx, torch.Tensor):
+            selected_token_idx = torch.tensor(
+                selected_token_idx, dtype=torch.int32, device=self.kv_device
+            )
+
+        if counts is None:
+            if source_start != 0:
+                raise ValueError(
+                    "Suffix sparse source requires selected_token_counts"
+                )
+            valid = selected_token_idx[selected_token_idx >= 0]
+            if valid.numel():
+                selected_min = int(valid.min().item())
+                selected_max = int(valid.max().item())
+                if selected_min < 0 or selected_max >= int(total_tokens):
+                    raise ValueError(
+                        "Sparse selected token is outside the full source span: "
+                        f"selected_min={selected_min}, selected_max={selected_max}, "
+                        f"source_start={source_start}, total_tokens={total_tokens}"
+                    )
+            return selected_token_idx
+
+        counts_t = (
+            counts
+            if isinstance(counts, torch.Tensor)
+            else torch.tensor(counts, dtype=torch.int32, device=self.kv_device)
+        )
+        counts_t = counts_t.to(
+            device=selected_token_idx.device, dtype=torch.long
+        ).reshape(-1)
+        if counts_t.numel() == 0 or int(counts_t.max().item()) <= 0:
+            return selected_token_idx
+
+        if selected_token_idx.dim() == 1:
+            if counts_t.numel() != 1:
+                raise ValueError(
+                    "single-row sparse payload requires exactly one "
+                    f"selected_token_count, got {counts_t.numel()}"
+                )
+            width = int(selected_token_idx.numel())
+            count = min(int(counts_t[0].item()), width)
+            if count <= 0:
+                return selected_token_idx
+            values = selected_token_idx[:count]
+            bad = (
+                (values < source_start) | (values >= source_end)
+                if source_start
+                else (values < 0) | (values >= source_end)
+            )
+            if bool(bad.any().item()):
+                bad_values = values[bad]
+                raise ValueError(
+                    "Sparse selected token is outside the transferred source: "
+                    f"selected_min={int(bad_values.min().item())}, "
+                    f"selected_max={int(bad_values.max().item())}, "
+                    f"source_start={source_start}, "
+                    f"source_end={source_end}, total_tokens={total_tokens}"
+                )
+            if source_start:
+                rebased = selected_token_idx.clone()
+                rebased[:count].sub_(source_start)
+                return rebased
+            return selected_token_idx
+
+        if selected_token_idx.dim() != 2:
+            raise ValueError(
+                "Selected sparse payload must be one- or two-dimensional, "
+                f"got {selected_token_idx.dim()} dimensions"
+            )
+        rows, width = selected_token_idx.shape
+        if counts_t.numel() != rows:
+            raise ValueError(
+                "selected_token_counts rows must match sparse payload rows: "
+                f"{counts_t.numel()} vs {rows}"
+            )
+        counts_t = counts_t.clamp(min=0, max=width)
+        columns = torch.arange(width, device=selected_token_idx.device)
+        mask = columns.unsqueeze(0) < counts_t.unsqueeze(1)
+        bad = mask & (
+            (selected_token_idx < source_start)
+            | (selected_token_idx >= source_end)
+        )
+        if bool(bad.any().item()):
+            bad_values = selected_token_idx[bad]
+            raise ValueError(
+                "Sparse selected token is outside the transferred source: "
+                f"selected_min={int(bad_values.min().item())}, "
+                f"selected_max={int(bad_values.max().item())}, "
+                f"source_start={source_start}, "
+                f"source_end={source_end}, total_tokens={total_tokens}"
+            )
+        if source_start:
+            return torch.where(
+                mask,
+                selected_token_idx - source_start,
+                selected_token_idx,
+            )
+        return selected_token_idx
+
     @staticmethod
     def _validate_sparse_fixed_chunk_coverage(
         chunk_count: int,
@@ -4491,7 +4699,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _run_c8_indexer_bootstrap(
         self, plan: _SparseDestinationPlan, pointers: torch.Tensor, layer_id: int,
         slots: torch.Tensor, total_tokens: int, chunk_size: int,
-        explicit_selection: bool,
+        explicit_selection: bool, source_start: int = 0,
     ) -> None:
         """Group 1 uses the full prefix through the sparse generator protocol."""
         if explicit_selection:
@@ -4503,9 +4711,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._validate_sparse_fixed_chunk_coverage(
             pointers.numel(), chunk_size, total_tokens
         )
-        if slots.numel() < total_tokens:
+        source_start = int(source_start)
+        source_end = source_start + int(total_tokens)
+        if source_start < 0 or slots.numel() < source_end:
             raise ValueError(
-                "Indexer C8 bootstrap slot mapping is shorter than its source prefix"
+                "Indexer C8 bootstrap slot mapping is shorter than its source "
+                f"range: source_start={source_start}, source_end={source_end}, "
+                f"slots={slots.numel()}"
             )
         current = torch.npu.current_stream()
         join = getattr(self, "_active_sparse_load_join", None)
@@ -4513,7 +4725,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if join is not None:
             # Register before launch so the existing failure path fences it too.
             join.used_stream_indices.add(0)
-        slots = slots[:total_tokens]
+        slots = slots[source_start:source_end]
         dummy = self._dense_direct_dummy_metadata_tensor()
         slots.record_stream(stream)
         pointers.record_stream(stream)
@@ -6083,13 +6295,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: Optional[int] = None,
         layer_id: int = 0,
     ) -> int:
+        return self._lmc_plane_num_tokens_from_shape(
+            lmc_tensor.shape, kv_group, layer_id
+        )
+
+    def _lmc_plane_num_tokens_from_shape(
+        self,
+        shape: Any,
+        kv_group: Optional[int] = None,
+        layer_id: int = 0,
+    ) -> int:
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
         fmt = self._fmt_for(kv_group)
         layout = self._layout_for(kv_group)
         if layout is not None and layout.indexer_c8:
             width = layout.layer_token_bytes[layer_id]
-            if lmc_tensor.numel() % width:
+            if numel % width:
                 raise ValueError("Indexer packet does not contain complete tokens")
-            return lmc_tensor.numel() // width
+            return numel // width
         k_hidden = layout.k_hidden_dims if layout else self.k_hidden_dims
         v_hidden = layout.v_hidden_dims if layout else self.v_hidden_dims
         dsa_hidden = layout.dsa_hidden_dims if layout else self.dsa_hidden_dims
@@ -6105,14 +6330,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             assert plane > 0, (
                 "MLA/DSA hidden dims must be initialized before sparse retrieve."
             )
-            return lmc_tensor.numel() // plane
-        if lmc_tensor.ndim >= 3:
-            return int(lmc_tensor.shape[0])
+            return numel // plane
+        if len(shape) >= 3:
+            return int(shape[0])
         per_token = 2 * self.hidden_dim_size
         assert per_token > 0, (
             "hidden_dim_size must be positive for GQA sparse retrieve."
         )
-        return lmc_tensor.numel() // per_token
+        return numel // per_token
 
     def _expected_memory_format(self, kv_group: Optional[int] = None) -> MemoryFormat:
         fmt = self._fmt_for(kv_group)
@@ -7960,6 +8185,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             diagnostics_enabled = _mtp_dw_diag_enabled()
             req_id = kwargs.get("req_id")
             explicit_sparse_payload = isinstance(sparse_request, dict)
+            payload_source_start = (
+                sparse_request.get("source_start")
+                if explicit_sparse_payload
+                else None
+            )
             target_slot_mapping = None
             payload_event = None
             if explicit_sparse_payload:
@@ -8062,16 +8292,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 else None
             )
             pointer_first = False
+            used_cached_memory = False
             if layer_cached_tensors is not None:
                 cpu_tensors = layer_cached_tensors
             else:
-                layer_memory_objs = (
+                cached_layer_memory = (
                     cached_memory_objs_by_layer[layer_id]
                     if cached_memory_objs_by_layer is not None
                     and layer_id < len(cached_memory_objs_by_layer)
                     and cached_memory_objs_by_layer[layer_id]
-                    else _layer_source_memory_objs(memory_objs_layer, layer_id)
+                    else None
                 )
+                if cached_layer_memory:
+                    layer_memory_objs = cached_layer_memory
+                    used_cached_memory = True
+                else:
+                    layer_memory_objs = _layer_source_memory_objs(
+                        memory_objs_layer, layer_id
+                    )
                 cached_layer_ptrs = (
                     cached_chunk_ptrs_npu[layer_id]
                     if cached_chunk_ptrs_npu is not None
@@ -8115,18 +8353,33 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors,
                     cached_chunk_ptrs_npu,
                 )
-            total_tokens = (
-                lmcache_cached_tokens
-                if lmcache_cached_tokens > 0
-                else self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group, layer_id
-                )
+            total_tokens = self._sparse_source_total_tokens(
+                layer_tensors=None if pointer_first else cpu_tensors,
+                memory_objs=layer_memory_objs if pointer_first else None,
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                chunk_size=chunk_size,
             )
+            source_start = (
+                0
+                if layer_cached_tensors is not None or used_cached_memory
+                else payload_source_start
+            )
+            if has_explicit_sparse_selection and target_slot_mapping is not None:
+                selected_token_idx = self._prepare_sparse_selection_for_source(
+                    selected_token_idx,
+                    selected_token_counts,
+                    source_start=source_start,
+                    total_tokens=total_tokens,
+                    lmcache_cached_tokens=lmcache_cached_tokens,
+                )
             if layout.indexer_c8:
                 self._run_c8_indexer_bootstrap(
                     bootstrap_destination_plan, chunk_ptrs_npu, layer_id,
                     slot_mapping_packed, total_tokens, chunk_size,
                     has_explicit_sparse_selection,
+                    source_start=source_start or 0,
                 )
             elif (
                 bootstrap_destination_plan is not None
