@@ -56,6 +56,7 @@ from lmcache_ascend.v1.content_diagnostics import (
 )
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.direct_npu_audit import DirectNpuAudit
+from lmcache_ascend.v1.kv_fence_debug import KVFenceDebug
 from lmcache_ascend.v1.kv_features import (
     KVTrace,
     REFERENCE_SEGMENT_TOKENS,
@@ -1936,6 +1937,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip().lower() == "true"
         )
+        self.fence_debug = KVFenceDebug.from_environment(
+            "P" if self._layerwise_prefill_dma else "D", self._prefill_worker_id,
+        )
         configured_bank_count = 2
         if self._layerwise_prefill_dma:
             from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
@@ -2394,6 +2398,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._layerwise_prefill_bank(layer_id, kv_group, offset)
             for offset in bank_offsets
         }
+        fence_debug = getattr(self, "fence_debug", None)
+        if fence_debug is not None:
+            fence_debug.wait("p_use", kv_group, layer_id, event)
         for bank in banks:
             self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
             uses[(kv_group, bank)] = (generation, layer_id, event)
@@ -3256,6 +3263,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if load_record is None:
                 # Legacy dense-direct records retain the old two-field key.
                 load_record = load_done.pop((kv_group, int(layer_id)), None)
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None and self._layerwise_prefill_dma:
+                fence_debug.before_read(
+                    kv_group, int(layer_id), selected_bank,
+                    load_record[1] if load_record is not None
+                    and load_record[0] == generation else None,
+                )
             if load_record is not None and load_record[0] == generation:
                 load_records.append((selected_bank, load_record[1]))
                 current_stream.wait_event(load_record[1])
@@ -5148,6 +5162,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer"
             _sparse_h2d_python_stage(join, "native_return")
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None:
+                fence_debug.wait("d_load", kv_group, layer_id, load_stream, req=req_id)
             if (getattr(self, "kv_trace", None) is not None
                     and req_id and trace_explicit):
                 self.trace_selected_kv(req_id, kv_group, layer_id,
@@ -5682,6 +5699,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             if transfer_stream is not current_stream:
                 current_stream.wait_stream(transfer_stream)
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None and not direction:
+                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
             return
 
         if destination_plan is not None:
@@ -5706,6 +5726,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             if not defer_consumer_wait and transfer_stream is not current_stream:
                 current_stream.wait_stream(transfer_stream)
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None and not direction:
+                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
             return
 
         if prepared_layer_state is not None:
@@ -5800,6 +5823,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # compute/communication window free for the transfer.
         if not defer_consumer_wait and transfer_stream is not current_stream:
             current_stream.wait_stream(transfer_stream)
+        fence_debug = getattr(self, "fence_debug", None)
+        if fence_debug is not None and not direction:
+            fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
         return (
@@ -7988,6 +8014,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     load_done[(kv_group, layer_id, bank)] = (
                         layerwise_prefill_generation, load_done_event,
                     )
+                    fence_debug = getattr(self, "fence_debug", None)
+                    if fence_debug is not None:
+                        fence_debug.loaded(str(req_id), kv_group, layer_id, bank,
+                                           load_done_event)
+                        fence_debug.wait("p_load", kv_group, layer_id,
+                                         load_done_event, req=req_id, bank=bank)
                     audit = getattr(self, "prefill_audit", None)
                     if audit is not None:
                         audit.load(kv_group, layer_id, bank,
@@ -8123,6 +8155,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             layerwise_prefill_generation,
                             load_done_event,
                         )
+                        fence_debug = getattr(self, "fence_debug", None)
+                        if fence_debug is not None:
+                            fence_debug.loaded(
+                                str(req_id), kv_group, layer_id, bank,
+                                load_done_event, shared_stream=True,
+                            )
+                            fence_debug.wait(
+                                "p_load", kv_group, layer_id, load_done_event,
+                                req=req_id, bank=bank,
+                            )
                 else:
                     # D-node and non-P-node requests retain the existing
                     # single-layer paged-copy wrapper below.
@@ -8165,6 +8207,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 )
                         if logger.isEnabledFor(10):
                             logger.debug("Finished loading layer %d", layer_id)
+                    fence_debug = getattr(self, "fence_debug", None)
+                    if fence_debug is not None:
+                        fence_debug.wait("d_load", kv_group, layer_id,
+                                         self.load_stream, req=req_id)
                     continue
                 if logger.isEnabledFor(10):
                     logger.debug("Finished loading layer %d", layer_id)
@@ -8430,6 +8476,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 self.trace_selected_kv(req_id, kv_group, layer_id,
                     kvcaches_snapshot[layer_id], slot_mapping_packed,
                     selected_token_idx, selected_token_counts, source.total_tokens)
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None:
+                fence_debug.wait("d_load", kv_group, layer_id,
+                                 torch.npu.current_stream(), req=req_id)
             if perf_enabled:
                 native_done = time.perf_counter()
                 submit_elapsed = native_done - submit_started
@@ -9878,6 +9928,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             layer_id,
                             kwargs.get("req_id"),
                         )
+                        fence_debug = getattr(self, "fence_debug", None)
+                        if fence_debug is not None:
+                            fence_debug.wait("p_save", kv_group, layer_id,
+                                             bank_done_event,
+                                             req=kwargs.get("req_id"), bank=bank)
                         audit = getattr(self, "prefill_audit", None)
                         if audit is not None and prefill_dma:
                             audit.save(

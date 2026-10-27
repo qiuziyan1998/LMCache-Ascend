@@ -1227,6 +1227,7 @@ def _rank0_publication_boundary(connector, messages):
         req_id="request", phase="prefill", request_ordinal=0, location="LocalCPUBackend",
         remote_fill_plan=None, remote_fill_load=False,
         kv_hash_enabled=lambda: False,
+        audit_enabled=lambda: False,
         _RemoteFillMaterializationError=RuntimeError,
         SharedHandleEnvelope=lambda **kwargs: NS(**kwargs),
     )
