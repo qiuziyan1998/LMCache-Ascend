@@ -245,6 +245,7 @@ def main() -> int:
                 device=torch.device("cpu"),
                 use_mla=True,
                 dsa_two_groups=True,
+                worker_id=metadata.worker_id,
             )
             gpu.runtime_kv_group_layer_counts = metadata.runtime_kv_group_layer_counts
             messages = broadcasts.setdefault(self.get_engine_instance_id(), [])

@@ -157,3 +157,23 @@ def test_sparse_transport_preserves_unordered_duplicate_selection():
     assert torch.equal(caches[0][slots], nope[selected])
     assert torch.equal(caches[1][slots], rope[selected])
     assert bool((caches[0][torch.tensor([0, 4, 6, 7])] == -9).all())
+
+
+def test_light_audit_keeps_pd_execution_unchanged(tmp_path, monkeypatch):
+    directory = tmp_path / "audit"
+    monkeypatch.setenv("LMCACHE_PREFILL_AUDIT", "1")
+    monkeypatch.setenv("LMCACHE_PREFILL_AUDIT_DIR", str(directory))
+    result, report = run_case(tmp_path)
+    assert result.returncode == 0, result.stdout[-5000:] + result.stderr[-5000:]
+    assert json.loads(report.read_text())["status"] == "passed"
+    rows = [
+        json.loads(line)
+        for path in directory.glob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert rows
+    assert not [row for row in rows if row.get("error")]
+    assert {"put", "get", "cache_read"}.issubset(
+        {row.get("stage") for row in rows if row["kind"] == "payload"}
+    )
+    assert any(row["kind"] == "flow" for row in rows)

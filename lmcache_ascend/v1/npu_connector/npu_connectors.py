@@ -46,6 +46,7 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.prefill_audit import BankAudit, audit_enabled
 import torch
 
 # First Party
@@ -2200,11 +2201,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # This registry is updated after every actual D2H submission, in FIFO
         # order, and its immutable events fence all preceding bank writes.
         tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
-        return tuple(
+        events = tuple(
             record[1]
             for (group, _bank), record in sorted(tails.items())
             if group == kv_group and record[0] == generation
         )
+        audit = getattr(self, "prefill_audit", None)
+        if audit is not None:
+            audit.publish(kv_group, generation, tuple(map(id, events)))
+        return events
 
     def _layerwise_prefill_transfer_state(
         self,
@@ -2391,6 +2396,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         for bank in banks:
             self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
             uses[(kv_group, bank)] = (generation, layer_id, event)
+            audit = getattr(self, "prefill_audit", None)
+            if audit is not None:
+                audit.use(kv_group, layer_id, bank, generation, id(event))
 
     @property
     def uses_token_byte_features(self) -> bool:
@@ -2406,6 +2414,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         source_ranks: Any = None,
     ) -> None:
         """Install this step's CPU request descriptors for opt-in KV tracing."""
+        if audit_enabled():
+            if not hasattr(self, "prefill_audit"):
+                self.prefill_audit = BankAudit(
+                    self._prefill_worker_id,
+                    "banked_prefill" if self._layerwise_prefill_dma else "original",
+                )
+            self.prefill_audit.begin([request.req_id for request in requests])
         if not kv_trace_enabled():
             return
         if source_ranks is not None:
@@ -2844,6 +2859,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     @diagnostic
     def finish_kv_trace(self, req_id: str) -> None:
         """Emit completion and forget request diagnostic descriptors."""
+        audit = getattr(self, "prefill_audit", None)
+        if audit is not None:
+            audit.finish(req_id)
         trace = getattr(self, "kv_trace", None)
         if trace is not None:
             trace.finish(req_id)
@@ -3217,6 +3235,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if load_record is not None and load_record[0] == generation:
                 load_records.append((selected_bank, load_record[1]))
                 current_stream.wait_event(load_record[1])
+                audit = getattr(self, "prefill_audit", None)
+                if audit is not None:
+                    audit.wait(kv_group, int(layer_id), selected_bank,
+                               generation, id(load_record[1]))
                 continue
             # This bank may have a cache miss while another bank loads a hit.
             # Only its own load event orders its preceding save; another bank's
@@ -3224,6 +3246,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             previous_tail = bank_tails.get((kv_group, selected_bank))
             if previous_tail is not None and previous_tail[0] == generation:
                 current_stream.wait_event(previous_tail[1])
+            audit = getattr(self, "prefill_audit", None)
+            if audit is not None:
+                audit.wait(kv_group, int(layer_id), selected_bank, generation,
+                           id(previous_tail[1]) if previous_tail is not None
+                           and previous_tail[0] == generation else None)
         if overlap is not None:
             overlap.end_interval(overlap_wait, current_stream)
         if diagnose_first_bank:
@@ -7937,6 +7964,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     load_done[(kv_group, layer_id, bank)] = (
                         layerwise_prefill_generation, load_done_event,
                     )
+                    audit = getattr(self, "prefill_audit", None)
+                    if audit is not None:
+                        audit.load(kv_group, layer_id, bank,
+                                   layerwise_prefill_generation, id(load_done_event))
                     if getattr(self, "kv_trace", None) is not None:
                         self.enqueue_load_kv_trace(
                             req_id, kv_group, starts, ends, source_objs,
@@ -9823,6 +9854,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             layer_id,
                             kwargs.get("req_id"),
                         )
+                        audit = getattr(self, "prefill_audit", None)
+                        if audit is not None and prefill_dma:
+                            audit.save(
+                                kv_group, layer_id, bank,
+                                layerwise_prefill_generation, id(bank_done_event),
+                            )
                     else:
                         # The fallback path owns only one reusable staging
                         # tensor and has no compute-entry bank protocol.
