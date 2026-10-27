@@ -38,7 +38,7 @@ def make_runner(config, worker, cache_config, hardware, stats):
         setattr(parallel_state, name, group)
     current_platform._enum = PlatformEnum.CPU
     current_platform.get_attn_backend_cls = NPUPlatform.get_attn_backend_cls
-    config.model_config.hf_text_config.index_topk = 128
+    config.model_config.hf_text_config.index_topk = 2048
     config.model_config.hf_text_config.index_head_dim = 2
 
     class IdentityAttention(AttentionLayerBase):
@@ -94,18 +94,24 @@ def make_runner(config, worker, cache_config, hardware, stats):
                     sparse = [
                         request for request in requests if request.is_sparse_decode
                     ]
+                    selected_by_request = {}
                     if sparse:
                         rows, slots, counts = [], [], []
                         for request in sparse:
                             row = runner.input_batch.req_id_to_index[request.req_id]
                             length = int(runner.input_batch.num_prompt_tokens[row])
-                            selected = torch.arange(length)
+                            selected = (
+                                torch.arange(length)
+                                if group_id or length <= 2048
+                                else torch.linspace(0, length - 1, 2048).long()
+                            )
+                            selected_by_request[request.req_id] = selected
                             rows.append(selected)
                             slots.append(
                                 meta.block_table[row][selected // 128].long() * 128
                                 + selected % 128
                             )
-                            counts.append(length)
+                            counts.append(len(selected))
                         width = max(counts)
                         indices = torch.full((len(rows), width), -1, dtype=torch.long)
                         target = torch.full_like(indices, -1)
@@ -134,42 +140,76 @@ def make_runner(config, worker, cache_config, hardware, stats):
                             runner.input_batch.token_ids_cpu[row, :end].copy()
                         ).long()
                         table = meta.block_table[row].clone()
+                        physical = (
+                            table[torch.arange(end) // 128].long() * 128
+                            + torch.arange(end) % 128
+                        )
+                        history = selected_by_request.get(request.req_id)
+                        if history is None:
+                            history = torch.arange(start)
+                        else:
+                            history = torch.cat(
+                                (
+                                    history[history < start],
+                                    torch.arange(
+                                        int(runner.input_batch.num_prompt_tokens[row]),
+                                        start,
+                                    ),
+                                )
+                            ).unique()
+                        read_ranges, write_ranges = [], []
+                        for cache in planes:
+                            read_ranges.extend(
+                                hardware.tensor_ranges(cache, physical[history])
+                            )
+                            write_ranges.extend(
+                                hardware.tensor_ranges(cache, physical[start:])
+                            )
 
                         def compute(
                             planes=planes,
                             end=end,
                             start=start,
                             tokens=tokens,
-                            table=table,
+                            physical=physical,
+                            history=history,
                             layer=layer,
                             group_id=group_id,
                         ):
-                            positions = torch.arange(end)
-                            physical = (
-                                table[positions // 128].long() * 128 + positions % 128
-                            )
+                            selected = torch.cat((history, torch.arange(start, end)))
                             for plane, cache in enumerate(planes):
                                 view = cache.reshape(-1, cache.shape[-1])
-                                expected = (
-                                    tokens[:, None] * 13
-                                    + positions[:, None] * 7
-                                    + layer * 17
-                                    + group_id * 3
-                                    + plane
-                                    + torch.arange(view.shape[-1])
-                                ) % 1024
-                                expected = expected.to(view.dtype)
-                                assert torch.equal(
-                                    view[physical[:start]], expected[:start]
-                                ), (
-                                    f"Native runner KV mismatch layer={layer} "
-                                    f"group={group_id} history={start}"
-                                )
-                                view[physical[start:]] = expected[start:]
-                                stats["checked_rows"] += end
+                                for offset in range(0, len(selected), 32768):
+                                    pos = selected[offset : offset + 32768]
+                                    expected = (
+                                        (
+                                            tokens[pos, None] * 13
+                                            + pos[:, None] * 7
+                                            + layer * 17
+                                            + group_id * 3
+                                            + plane
+                                            + torch.arange(view.shape[-1])
+                                        )
+                                        .remainder(1024)
+                                        .to(view.dtype)
+                                    )
+                                    old = pos < start
+                                    assert torch.equal(
+                                        view[physical[pos[old]]], expected[old]
+                                    ), (
+                                        f"Native runner KV mismatch layer={layer} "
+                                        f"group={group_id} history={start}"
+                                    )
+                                    view[physical[pos[~old]]] = expected[~old]
+                                    stats["checked_rows"] += len(pos)
                             hardware.queue.counts["compute"] += 1
 
-                        hardware.queue.current.submit(f"compute native {name}", compute)
+                        hardware.submit_access(
+                            f"compute native {name}",
+                            compute,
+                            reads=read_ranges,
+                            writes=write_ranges,
+                        )
                     if is_prefill:
                         record_layerwise_prefill_bank_use(name)
                         pending.append((name, planes))

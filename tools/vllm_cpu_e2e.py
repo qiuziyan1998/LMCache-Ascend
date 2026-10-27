@@ -28,21 +28,30 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--banks", type=int, default=4)
     parser.add_argument("--tp-size", type=int, default=4)
-    parser.add_argument("--requests", type=int, default=4)
+    parser.add_argument("--requests", type=int, default=1)
     parser.add_argument("--layers", type=int, default=9)
     parser.add_argument("--decode-tokens", type=int, default=16)
     parser.add_argument("--rounds", type=int, default=2)
-    parser.add_argument("--batch-tokens", type=int, default=256)
+    parser.add_argument("--context-tokens", type=int, default=500 * 1024)
+    parser.add_argument("--batch-tokens", type=int, default=16 * 1024)
+    parser.add_argument("--cache-chunk-tokens", type=int, default=1024)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--connector-only", dest="native_runner", action="store_false")
     parser.set_defaults(native_runner=True)
     parser.add_argument(
         "--fault",
-        choices=("none", "skip-load-wait", "skip-save-wait", "corrupt-remote"),
+        choices=(
+            "none",
+            "skip-load-wait",
+            "skip-save-wait",
+            "early-ready-event",
+            "corrupt-remote",
+        ),
         default="none",
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    kv_width = 9
     for name in (
         "banks",
         "tp_size",
@@ -51,6 +60,8 @@ def main() -> int:
         "decode_tokens",
         "rounds",
         "batch_tokens",
+        "context_tokens",
+        "cache_chunk_tokens",
         "max_num_seqs",
     ):
         if getattr(args, name) < 1:
@@ -128,17 +139,33 @@ def main() -> int:
         "P_steps": 0,
         "D_steps": 0,
         "decode_tokens": 0,
+        "prefill_chunks": [],
     }
     layers, block_size = args.layers, 128
+    max_length = (
+        args.context_tokens
+        + (args.requests - 1) * 37
+        + args.rounds * (args.decode_tokens + 21)
+        + block_size
+    )
+    max_length = (max_length + block_size - 1) // block_size * block_size
+    cache_blocks = max(
+        64, (max_length // block_size + 4) * min(args.requests, args.max_num_seqs)
+    )
     index_at = tuple(sorted(set(range(0, layers, 4)) | {layers - 1}))
+    # The production capacity preflight reserves the metadata's maximum head
+    # width for both groups and both CPU planes, including indexer objects.
+    cpu_bytes = max_length * args.requests * (layers + len(index_at)) * kv_width * 4
     lmconfig = LMCacheEngineConfig.from_defaults(
-        chunk_size=128,
+        chunk_size=args.cache_chunk_tokens,
         local_cpu=True,
-        max_local_cpu_size=0.1,
+        max_local_cpu_size=max(0.1, cpu_bytes * 1.3 / 1024**3 + 0.03),
         use_layerwise=True,
         dsa_two_groups=True,
         enable_sparse_attention=True,
         save_unfull_chunk=True,
+        # Full-prefix checking on CPU can outlast the accelerator timeout.
+        pin_timeout_sec=3600,
         enable_shared_cpu_cache=True,
         remote_url="mooncakestore://127.0.0.1:50051",
         extra_config={
@@ -149,6 +176,8 @@ def main() -> int:
             "metadata_server": "cpu",
             "master_server_address": "cpu:50051",
             "mooncake_page_first_multi_buffer": True,
+            # CPU simulation time is unrelated to the production network timeout.
+            "transfer_timeout": 300,
         },
     )
     lmconfig.store_async = True
@@ -189,12 +218,12 @@ def main() -> int:
                     worker_id=rank,
                     local_worker_id=rank,
                     kv_dtype=torch.float16,
-                    kv_shape=(layers, 1, block_size, 1, 9),
+                    kv_shape=(layers, 1, args.cache_chunk_tokens, 1, kv_width),
                     use_mla=True,
                     role=self.role,
-                    chunk_size=block_size,
+                    chunk_size=args.cache_chunk_tokens,
                     engine_id=self.vllm_config.kv_transfer_config.engine_id,
-                    max_model_len=2048,
+                    max_model_len=max_length,
                     runtime_kv_group_layer_counts=self.runtime_kv_group_layer_counts,
                     runtime_kv_group_layer_names=self.runtime_kv_group_layer_names,
                 )
@@ -208,10 +237,10 @@ def main() -> int:
                 return None
             metadata = self.get_or_create_metadata()
             gpu = VLLMPagedMemLayerwiseNPUConnector(
-                9,
+                kv_width,
                 layers,
                 False,
-                chunk_size=block_size,
+                chunk_size=args.cache_chunk_tokens,
                 dtype=torch.float16,
                 device=torch.device("cpu"),
                 use_mla=True,
@@ -305,8 +334,8 @@ def main() -> int:
                     f"model.layers.{i}.self_attn.attn": AscendMLAAttentionSpec(
                         block_size=block_size,
                         num_kv_heads=1,
-                        head_size=9,
-                        sparse_head_dim=(8, 1),
+                        head_size=kv_width,
+                        sparse_head_dim=(kv_width - 1, 1),
                         dtype=torch.float16,
                     )
                     for i in range(layers)
@@ -327,7 +356,7 @@ def main() -> int:
                 )
                 return [specs for _ in range(tp_size)]
             if method == "determine_available_memory":
-                return [512 * 1024 * 1024] * tp_size
+                return [16 * 1024**3] * tp_size
             if method == "get_supported_tasks":
                 return [("generate",)]
             if method == "get_kv_connector_handshake_metadata":
@@ -380,7 +409,7 @@ def main() -> int:
                         torch.float16,
                         block_size,
                         1,
-                        8,
+                        kv_width - 1,
                         1,
                         2,
                         is_indexer="indexer" in name,
@@ -424,6 +453,17 @@ def main() -> int:
                             else "D"
                         )
                         stats[role + "_steps"] += 1
+                        if role == "P":
+                            scheduled = scheduler_output.num_scheduled_tokens
+                            stats["prefill_chunks"].append(
+                                {
+                                    req: [
+                                        self.computed[req],
+                                        self.computed[req] + count,
+                                    ]
+                                    for req, count in scheduled.items()
+                                }
+                            )
                         stats["mixed_batches"] += (
                             len(scheduler_output.num_scheduled_tokens) > 1
                         )
@@ -679,11 +719,11 @@ def main() -> int:
                     num_attention_heads=args.tp_size,
                     num_key_value_heads=1,
                     intermediate_size=32,
-                    max_position_embeddings=4096,
-                    kv_lora_rank=8,
+                    max_position_embeddings=max_length,
+                    kv_lora_rank=kv_width - 1,
                     qk_rope_head_dim=1,
-                    qk_nope_head_dim=8,
-                    v_head_dim=8,
+                    qk_nope_head_dim=kv_width - 1,
+                    v_head_dim=kv_width - 1,
                     **(
                         {"index_topk": 128, "index_head_dim": 2}
                         if args.native_runner
@@ -697,18 +737,18 @@ def main() -> int:
                 model=str(model),
                 skip_tokenizer_init=True,
                 enforce_eager=True,
-                max_model_len=2048,
+                max_model_len=max_length,
                 dtype="float16",
             ),
             device_config=DeviceConfig("cpu"),
             parallel_config=ParallelConfig(tensor_parallel_size=args.tp_size),
             cache_config=CacheConfig(
                 block_size=block_size,
-                num_gpu_blocks_override=64,
+                num_gpu_blocks_override=cache_blocks,
                 enable_prefix_caching=False,
             ),
             scheduler_config=SchedulerConfig(
-                max_model_len=2048,
+                max_model_len=max_length,
                 is_encoder_decoder=False,
                 max_num_batched_tokens=args.batch_tokens,
                 max_num_seqs=args.max_num_seqs,
@@ -753,6 +793,12 @@ def main() -> int:
                 if not target.scheduler.has_requests():
                     break
                 outputs, _ = target.step_fn()
+                if phase.startswith("P ") and (step + 1) % 4 == 0:
+                    completed = stats["prefill_chunks"][-1]
+                    print(
+                        f"[CPU_E2E] {phase}: chunk step={step + 1} spans={completed}",
+                        flush=True,
+                    )
                 for output in outputs.values():
                     for item in output.outputs:
                         results[item.request_id].extend(item.new_token_ids)
@@ -773,11 +819,28 @@ def main() -> int:
 
         try:
             sessions = {
-                i: [(i * 29 + j) % 251 for j in range(635 + i * 37)]
+                i: [(i * 29 + j) % 251 for j in range(args.context_tokens + i * 37)]
                 for i in range(args.requests)
             }
             prompts = {f"P-0-{i}": tokens for i, tokens in sessions.items()}
             run_requests(engine, prompts, "P round 0", 1)
+            first_chunks = [
+                row["P-0-0"] for row in stats["prefill_chunks"] if "P-0-0" in row
+            ]
+            if args.native_runner:
+                assert (
+                    len(first_chunks)
+                    >= (args.context_tokens + args.batch_tokens - 1)
+                    // args.batch_tokens
+                )
+                assert (
+                    first_chunks[0][0] == 0
+                    and first_chunks[-1][1] == args.context_tokens
+                )
+                assert all(
+                    a[1] == b[0]
+                    for a, b in zip(first_chunks, first_chunks[1:], strict=False)
+                )
             services["cpu-P", 0].wait_for_pending_stores(prompts)
             os.environ["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] = "false"
             lmconfig = copy.deepcopy(lmconfig)
@@ -811,6 +874,12 @@ def main() -> int:
                 prompts = {f"D-{turn}-{i}": tokens for i, tokens in sessions.items()}
                 run_requests(dengine, prompts, f"D round {turn}", args.decode_tokens)
                 stats["decode_tokens"] += len(prompts) * args.decode_tokens
+            hardware.queue.drain()
+            assert hardware.transfer_stats["early_reads"] == 0
+            assert (
+                hardware.transfer_stats["poisoned_operations"]
+                == hardware.transfer_stats["completed_operations"]
+            )
             puts = sum(call[0] == "put" for call in hardware.remote_calls)
             gets = sum(call[0] == "get" for call in hardware.remote_calls)
             assert (
@@ -828,14 +897,20 @@ def main() -> int:
                 banks=args.banks,
                 tp=tp_size,
                 layers=layers,
+                kv_width=kv_width,
                 native_model_runner=args.native_runner,
                 requests=args.requests,
                 rounds=args.rounds,
+                context_tokens=args.context_tokens,
+                batch_tokens=args.batch_tokens,
+                cache_chunk_tokens=args.cache_chunk_tokens,
+                initial_prefill_chunk_count=len(first_chunks),
                 **stats,
                 remote_puts=puts,
                 remote_gets=gets,
                 device_commands=len(hardware.queue.commands),
                 device_operations=hardware.queue.counts,
+                transfer_validation=hardware.transfer_stats,
                 source_revisions={
                     name: subprocess.check_output(
                         ["git", "rev-parse", "HEAD"], cwd=root.parent / name, text=True
@@ -857,7 +932,7 @@ def main() -> int:
                 )
             print("[CPU_E2E] " + json.dumps(report), flush=True)
         finally:
-            if args.fault != "none" and sys.exc_info()[0] is not None:
+            if sys.exc_info()[0] is not None:
                 # Deliberate device failures leave store workers waiting on
                 # failed transfers, just like a failed accelerator. This CLI
                 # is the isolated fault-test process; do not wait on shutdown.

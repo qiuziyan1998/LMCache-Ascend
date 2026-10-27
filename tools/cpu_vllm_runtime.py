@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib.machinery
+import mmap
 import os
 from pathlib import Path
 import sys
@@ -14,6 +15,7 @@ from functools import wraps
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from prefill_cpu_sim import Device, Event, Stream
@@ -46,7 +48,12 @@ class CPUHardware:
 
             def step(self):
                 with self.lock:
-                    return super().step()
+                    command = self.ready[0][2] if self.ready else None
+                    result = super().step()
+                    # Completed commands must not retain full 500k-token inputs.
+                    if command is not None:
+                        command.action = lambda: None
+                    return result
 
             def until(self, *args):
                 with self.lock:
@@ -62,6 +69,14 @@ class CPUHardware:
         self.pinned: dict[int, torch.Tensor] = {}
         self.named_memory: dict[str, torch.Tensor] = {}
         self.old = {}
+        self.virtual_allocations = []
+        self.pending_writers = {}
+        self.transfer_stats = dict(
+            poisoned_operations=0,
+            completed_operations=0,
+            guarded_reads=0,
+            early_reads=0,
+        )
         hardware = self
 
         class TorchStream(Stream):
@@ -95,6 +110,8 @@ class CPUHardware:
             def record(self, stream=None):
                 with hardware.lock:
                     super().record(stream or hardware.queue.current)
+                    if hardware.queue.fault == "early-ready-event":
+                        self.tail = getattr(self.tail, "write_begin", self.tail)
 
             def synchronize(self):
                 with hardware.lock:
@@ -124,7 +141,12 @@ class CPUHardware:
         yield
 
     def alloc(self, size, *args):
-        tensor = torch.empty(size, dtype=torch.uint8)
+        if size >= 16 * 1024**2:
+            memory = mmap.mmap(-1, size)
+            self.virtual_allocations.append(memory)
+            tensor = torch.frombuffer(memory, dtype=torch.uint8)
+        else:
+            tensor = torch.full((size,), 255, dtype=torch.uint8)
         self.pinned[tensor.data_ptr()] = tensor
         self.queue.memory(tensor, tensor)
         return tensor.data_ptr()
@@ -146,11 +168,97 @@ class CPUHardware:
     def free(self, pointer, *args):
         self.pinned.pop(pointer, None)
 
+    @staticmethod
+    def merge_ranges(ranges):
+        """Coalesce exact byte ranges; never enlarge the accessed region."""
+        merged = []
+        for start, size in sorted(ranges):
+            if size <= 0:
+                continue
+            end = start + size
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        return [(start, end - start) for start, end in merged]
+
+    def _writers(self, ranges):
+        commands = {}
+        for start, size in ranges:
+            end = start + size
+            for tile in range(start // 65536, (end - 1) // 65536 + 1):
+                entries = self.pending_writers.get(tile, ())
+                remaining = [(a, b, c) for a, b, c in entries if not c.done]
+                if remaining:
+                    self.pending_writers[tile] = remaining
+                else:
+                    self.pending_writers.pop(tile, None)
+                for a, b, command in remaining:
+                    if a < end and start < b:
+                        commands[command.number] = command
+        return tuple(commands.values())
+
+    def submit_access(self, label, action, *, reads=(), writes=()):
+        """Poison at device start, commit at completion, check read readiness.
+
+        Poisoning at host submission would overwrite a bank still being read
+        by an earlier layer. The begin command obeys the actual stream/event
+        dependencies instead. A captured writer-version check also catches
+        reads before begin, even when old bytes happen to equal the new bytes.
+        """
+        with self.lock:
+            reads = self.merge_ranges(reads)
+            writes = self.merge_ranges(writes)
+            required = self._writers(reads)
+
+            def begin():
+                for pointer, size in writes:
+                    self.queue.check_address(pointer, size)
+                    ctypes.memset(pointer, 255, size)
+                self.transfer_stats["poisoned_operations"] += 1
+
+            def complete():
+                for command in required:
+                    self.transfer_stats["guarded_reads"] += 1
+                    if not command.done:
+                        self.transfer_stats["early_reads"] += 1
+                        raise AssertionError(
+                            f"read before completion: {label} needs "
+                            f"{command.number}:{command.label}"
+                        )
+                action()
+                self.transfer_stats["completed_operations"] += 1
+
+            started = self.queue.current.submit(label + " begin/poison", begin)
+            command = self.queue.current.submit(label + " complete", complete)
+            command.write_begin = started
+            for start, size in writes:
+                end = start + size
+                for tile in range(start // 65536, (end - 1) // 65536 + 1):
+                    entries = self.pending_writers.setdefault(tile, [])
+                    entries[:] = [(a, b, c) for a, b, c in entries if not c.done]
+                    entries.append((start, end, command))
+            return command
+
+    @staticmethod
+    def tensor_ranges(tensor, rows):
+        """Return exact contiguous physical row runs without per-token loops."""
+        values = np.unique(rows.cpu().numpy().astype(np.int64, copy=False))
+        if not len(values):
+            return []
+        breaks = np.flatnonzero(np.diff(values) != 1) + 1
+        starts = values[np.r_[0, breaks]]
+        ends = values[np.r_[breaks - 1, len(values) - 1]] + 1
+        stride = tensor.shape[-1] * tensor.element_size()
+        return [
+            (tensor.data_ptr() + int(a) * stride, int(b - a) * stride)
+            for a, b in zip(starts, ends, strict=True)
+        ]
+
     def dma(self, copies, to_cpu):
         # Keep raw descriptors immutable, just as pybind converts them before
         # returning to Python. Device effects happen only when the queue runs.
         rows = tuple(tuple(int(x) for x in row) for row in copies)
-        stream = self.queue.current
         with self.lock:
 
             def copy():
@@ -159,7 +267,12 @@ class CPUHardware:
                     self.queue.check_address(dst, size)
                     ctypes.memmove(dst, src, size)
 
-            stream.submit("save native D2H" if to_cpu else "load native H2D", copy)
+            self.submit_access(
+                "save native D2H" if to_cpu else "load native H2D",
+                copy,
+                reads=[(src, size) for _, src, size in rows],
+                writes=[(dst, size) for dst, _, size in rows],
+            )
             self.queue.counts["save" if to_cpu else "load"] += 1
 
     def layer_state(self, sample, caches, mapping, *args):
@@ -179,28 +292,62 @@ class CPUHardware:
         slots, selected, pointers = slots.clone(), selected.clone(), pointers.clone()
         widths = [int(x.shape[-1]) for x in caches]
         element = caches[0].element_size()
+        destination = slots.flatten().long()
+        token_ids = selected.flatten().long()
+        valid = (token_ids >= 0) & (token_ids < total_tokens) & (destination >= 0)
+        destination, token_ids = destination[valid], token_ids[valid]
+        chunks = token_ids // chunk_size
+        if len(chunks) > 1 and bool(torch.any(chunks[1:] < chunks[:-1])):
+            order = torch.argsort(chunks, stable=True)
+            chunks, destination, token_ids = (
+                chunks[order],
+                destination[order],
+                token_ids[order],
+            )
+        chunk_ids, counts = torch.unique_consecutive(chunks, return_counts=True)
+        plans, reads, writes = [], [], []
+        begin = 0
+        for chunk, count in zip(chunk_ids.tolist(), counts.tolist(), strict=True):
+            targets = destination[begin : begin + count]
+            offsets_in_chunk = token_ids[begin : begin + count] % chunk_size
+            begin += count
+            tokens = min(chunk_size, total_tokens - chunk * chunk_size)
+            source = int(pointers[chunk])
+            prefix = 0
+            for cache, width in zip(caches, widths, strict=True):
+                pointer = source + prefix * tokens * element
+                cpu = self.pointer_tensor(pointer, tokens * width, cache.dtype)
+                plans.append(
+                    (
+                        cache.reshape(-1, width),
+                        targets,
+                        cpu.reshape(tokens, width),
+                        offsets_in_chunk,
+                    )
+                )
+                reads.extend(
+                    self.tensor_ranges(cpu.reshape(tokens, width), offsets_in_chunk)
+                )
+                writes.extend(self.tensor_ranges(cache, targets))
+                prefix += width
 
         def copy():
-            for target, token in zip(
-                slots.flatten().tolist(), selected.flatten().tolist(), strict=True
-            ):
-                if token < 0 or token >= total_tokens or target < 0:
-                    continue
-                chunk, offset = divmod(token, chunk_size)
-                tokens = min(chunk_size, total_tokens - chunk * chunk_size)
-                source = int(pointers[chunk])
-                prefix = 0
-                for cache, width in zip(caches, widths, strict=True):
-                    dst = cache.data_ptr() + target * width * element
-                    src = source + (prefix * tokens + offset * width) * element
-                    self.queue.check_address(src, width * element)
-                    self.queue.check_address(dst, width * element)
-                    ctypes.memmove(dst, src, width * element)
-                    prefix += width
+            for view, targets, cpu, source_rows in plans:
+                view[targets] = cpu[source_rows]
 
         with self.lock:
-            self.queue.current.submit("native sparse H2D", copy)
+            self.submit_access(
+                "load native sparse H2D", copy, reads=reads, writes=writes
+            )
             self.queue.counts["load"] += 1
+
+    def pointer_tensor(self, pointer, count, dtype):
+        element = torch.empty((), dtype=dtype).element_size()
+        self.queue.check_address(pointer, count * element)
+        return torch.frombuffer(
+            (ctypes.c_ubyte * (count * element)).from_address(pointer),
+            dtype=dtype,
+        )
 
     def dense_copy(
         self,
@@ -219,43 +366,56 @@ class CPUHardware:
         caches = state.caches
         widths = [int(cache.shape[-1]) for cache in caches]
         element = caches[0].element_size()
+        plans, reads, writes = [], [], []
+        for chunk, pointer in enumerate(pointers.tolist()):
+            start = (
+                chunk * fixed_chunk_size if fixed_chunk_size else int(offsets[chunk])
+            )
+            count = (
+                min(fixed_chunk_size, total_tokens - start)
+                if fixed_chunk_size
+                else int(sizes[chunk])
+            )
+            selected = slots[start : start + count].long().clone()
+            valid = selected >= 0
+            prefix = 0
+            raw = self.pointer_tensor(
+                int(pointer), count * sum(widths), caches[0].dtype
+            )
+            for cache, width in zip(caches, widths, strict=True):
+                cpu = (
+                    raw.reshape(count, sum(widths))[:, prefix : prefix + width]
+                    if interleaved
+                    else raw[prefix * count : (prefix + width) * count].reshape(
+                        count, width
+                    )
+                )
+                view = cache.reshape(-1, width)
+                plans.append((view, selected, valid, cpu))
+                cpu_ranges = (
+                    [(int(pointer), count * sum(widths) * element)]
+                    if interleaved
+                    else [(cpu.data_ptr(), cpu.numel() * element)]
+                )
+                device_ranges = self.tensor_ranges(cache, selected[valid])
+                reads.extend(device_ranges if direction else cpu_ranges)
+                writes.extend(cpu_ranges if direction else device_ranges)
+                prefix += width
 
         def copy():
-            for chunk, pointer in enumerate(pointers.tolist()):
-                start = (
-                    chunk * fixed_chunk_size
-                    if fixed_chunk_size
-                    else int(offsets[chunk])
-                )
-                count = (
-                    min(fixed_chunk_size, total_tokens - start)
-                    if fixed_chunk_size
-                    else int(sizes[chunk])
-                )
-                prefix = 0
-                for cache, width in zip(caches, widths, strict=True):
-                    for token in range(count):
-                        slot = int(slots[start + token])
-                        if slot < 0:
-                            continue
-                        offset = (
-                            token * sum(widths) + prefix
-                            if interleaved
-                            else prefix * count + token * width
-                        )
-                        cpu = int(pointer) + offset * element
-                        npu = cache.data_ptr() + slot * width * element
-                        self.queue.check_address(cpu, width * element)
-                        self.queue.check_address(npu, width * element)
-                        ctypes.memmove(
-                            cpu if direction else npu,
-                            npu if direction else cpu,
-                            width * element,
-                        )
-                    prefix += width
+            for view, selected, valid, cpu in plans:
+                if direction:
+                    cpu[valid] = view[selected[valid]]
+                else:
+                    view[selected[valid]] = cpu[valid]
 
         with self.lock:
-            self.queue.current.submit("save dense" if direction else "load dense", copy)
+            self.submit_access(
+                "save dense" if direction else "load dense",
+                copy,
+                reads=reads,
+                writes=writes,
+            )
             self.queue.counts["save" if direction else "load"] += 1
 
     def dense_fast(
@@ -326,6 +486,8 @@ class CPUHardware:
         class Store:
             def setup(self, *args):
                 self.hostname = args[0]
+                self.network_stream = hardware.Stream()
+                self.network_stream.name = "native-remote-transfer"
                 return 0
 
             def get_hostname(self):
@@ -346,22 +508,41 @@ class CPUHardware:
 
             def batch_put_from_multi_buffers(self, keys, pointers, sizes, *args):
                 with hardware.lock:
-                    for key, row, lengths in zip(keys, pointers, sizes, strict=True):
-                        hardware.remote[key] = b"".join(
-                            ctypes.string_at(p, n)
-                            for p, n in zip(row, lengths, strict=True)
+                    rows = [
+                        (key, tuple(row), tuple(lengths))
+                        for key, row, lengths in zip(keys, pointers, sizes, strict=True)
+                    ]
+
+                    def publish():
+                        for key, row, lengths in rows:
+                            hardware.remote[key] = b"".join(
+                                ctypes.string_at(p, n)
+                                for p, n in zip(row, lengths, strict=True)
+                            )
+                            if hardware.queue.fault == "corrupt-remote":
+                                data = bytearray(hardware.remote[key])
+                                data[0] ^= 1
+                                hardware.remote[key] = bytes(data)
+                            hardware.remote_calls.append(("put", key, sum(lengths)))
+                            hardware.queue.counts["publish"] += 1
+
+                    with hardware.stream(self.network_stream):
+                        finished = hardware.submit_access(
+                            "publish native remote",
+                            publish,
+                            reads=[
+                                (p, n)
+                                for _, row, lengths in rows
+                                for p, n in zip(row, lengths, strict=True)
+                            ],
                         )
-                        if hardware.queue.fault == "corrupt-remote":
-                            data = bytearray(hardware.remote[key])
-                            data[0] ^= 1
-                            hardware.remote[key] = bytes(data)
-                        hardware.remote_calls.append(("put", key, sum(lengths)))
-                        hardware.queue.counts["publish"] += 1
+                    hardware.queue.until(finished)
                 return [0] * len(keys)
 
             def batch_get_into_multi_buffers(self, keys, pointers, sizes):
                 statuses = []
                 with hardware.lock:
+                    plans = []
                     for key, row, lengths in zip(keys, pointers, sizes, strict=True):
                         data = hardware.remote.get(key)
                         if data is None:
@@ -374,10 +555,24 @@ class CPUHardware:
                             )
                         offset = 0
                         for pointer, size in zip(row, lengths, strict=True):
-                            ctypes.memmove(pointer, data[offset : offset + size], size)
+                            hardware.queue.check_address(pointer, size)
+                            plans.append((pointer, size, data[offset : offset + size]))
                             offset += size
                         hardware.remote_calls.append(("get", key, len(data)))
                         statuses.append(len(data))
+                    if plans:
+
+                        def receive():
+                            for pointer, size, payload in plans:
+                                ctypes.memmove(pointer, payload, size)
+
+                        with hardware.stream(self.network_stream):
+                            finished = hardware.submit_access(
+                                "load native remote",
+                                receive,
+                                writes=[(pointer, size) for pointer, size, _ in plans],
+                            )
+                        hardware.queue.until(finished)
                 return statuses
 
             def batch_put_from(self, keys, pointers, sizes, *args):
@@ -519,6 +714,7 @@ class CPUHardware:
             self._set(torch.cuda, name, getattr(api, name))
         self._set(torch.Tensor, "record_stream", lambda *_: None)
         self._set(torch.Tensor, "pin_memory", lambda value, *_args, **_kwargs: value)
+        original_zeros = torch.zeros
         for name in (
             "tensor",
             "empty",
@@ -536,6 +732,20 @@ class CPUHardware:
                 @wraps(function)
                 def allocate(*args, **kwargs):
                     kwargs.pop("pin_memory", None)
+                    shape = args[0] if args else kwargs.get("size")
+                    if (
+                        function is original_zeros
+                        and isinstance(shape, int)
+                        and shape >= 16 * 1024**2
+                        and kwargs.get("dtype") in (torch.uint8, torch.int8)
+                        and str(kwargs.get("device", "cpu")) == "cpu"
+                        and "out" not in kwargs
+                    ):
+                        # Fresh anonymous mappings are zero-filled, like
+                        # torch.zeros, but unused KV capacity stays unresident.
+                        memory = mmap.mmap(-1, shape)
+                        self.virtual_allocations.append(memory)
+                        return torch.frombuffer(memory, dtype=kwargs["dtype"])
                     return function(*args, **kwargs)
 
                 return allocate
