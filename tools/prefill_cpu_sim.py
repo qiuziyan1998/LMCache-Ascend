@@ -415,7 +415,7 @@ def load_store_protocol(path: Path):
 
 
 def load_metadata_getter(path: Path):
-    """Keep the runner's actual uniform/mixed bank selection and view cache."""
+    """Keep the runner's actual fixed bank selection and view cache."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     getter = next(
         n
@@ -424,13 +424,9 @@ def load_metadata_getter(path: Path):
         and n.name == "_get_block_table_and_slot_mapping"
     )
     factory = ast.parse(
-        "def make_getter(self, num_reqs, num_tokens, kv_cache_groups, "
-        "phase_by_request_cpu, phase_by_token_cpu):\n"
+        "def make_getter(self, num_reqs, num_tokens, kv_cache_groups):\n"
         "    num_reqs_padded, num_tokens_padded = num_reqs, num_tokens\n"
         "    prefill_bank_views = {}\n"
-        "    phase_by_request_device = phase_by_token_device = None\n"
-        "    mixed_bank_phase = bool(np.any(phase_by_request_cpu != "
-        "phase_by_request_cpu[0]))\n"
     ).body[0]
     factory.body.extend(
         [getter, ast.parse("return _get_block_table_and_slot_mapping").body[0]]
@@ -479,7 +475,6 @@ class Request:
     number: int
     total: int
     completed: int = 0
-    phase: int = 0
     blocks: dict[int, list[list[int]]] = field(default_factory=dict)
     bundles: dict[int, list[list[int]]] = field(default_factory=dict)
     pages: dict[tuple[int, int], list[Page]] = field(default_factory=dict)
@@ -494,10 +489,6 @@ class Request:
             can_save=True, can_save_latent=True, can_save_indexer=True
         )
     )
-
-    @property
-    def layerwise_prefill_bank_offset(self) -> int:
-        return self.phase
 
 
 class Simulation:
@@ -1124,17 +1115,8 @@ class Simulation:
 
     def build_runner(self) -> None:
         path = self.args.ascend / "vllm_ascend/worker/model_runner_v1.py"
-        names = (
-            "_capture_layerwise_prefill_bank_offsets",
-            "_prepare_layerwise_prefill_bank_phase_masks",
-        )
-        self.runner_methods = production_methods(
-            path, "NPUModelRunner", names, dict(np=np)
-        )
         self.metadata_factory = load_metadata_getter(path)
-        self.methods_used.extend(
-            f"runner.{name}" for name in (*names, "_get_block_table_and_slot_mapping")
-        )
+        self.methods_used.append("runner._get_block_table_and_slot_mapping")
 
     def prepare_runner(self, worker, active, ranges) -> None:
         runner = SimpleNamespace(
@@ -1145,11 +1127,7 @@ class Simulation:
             device="cpu",
             model_config=SimpleNamespace(enable_return_routed_experts=False),
         )
-        bind(runner, self.runner_methods)
-        indices = np.repeat(
-            np.arange(len(active)),
-            [ranges[r.number][1] - ranges[r.number][0] for r in active],
-        )
+        num_tokens = sum(ranges[r.number][1] - ranges[r.number][0] for r in active)
         tables = []
         for bank in range(self.args.banks):
             groups = []
@@ -1173,18 +1151,12 @@ class Simulation:
             layerwise_prefill_block_tables=tables,
             block_table=tables[0],
         )
-        runner._capture_layerwise_prefill_bank_offsets(
-            SimpleNamespace(kv_connector_metadata=Metadata(active))
-        )
-        runner._prepare_layerwise_prefill_bank_phase_masks(indices, len(active))
         worker.runner = runner
         worker.metadata_getter = self.metadata_factory(
             runner,
             len(active),
-            len(indices),
+            num_tokens,
             [SimpleNamespace(kv_cache_spec=object())] * 2,
-            runner._layerwise_prefill_bank_phase_by_request_cpu,
-            runner._layerwise_prefill_bank_phase_by_token_cpu,
         )
         worker.request_row = {r.req_id: i for i, r in enumerate(active)}
 
@@ -1256,7 +1228,7 @@ class Simulation:
         self, request: Request, group: int, layer: int, start: int, end: int
     ) -> torch.Tensor:
         positions = torch.arange(start, end)
-        bank = (layer + request.phase) % self.args.banks
+        bank = layer % self.args.banks
         blocks = torch.tensor(request.blocks[group][bank])
         slots = (
             blocks[positions // self.args.block_size] * self.args.block_size
@@ -1458,7 +1430,6 @@ class Simulation:
                         kv_group=group,
                         req_id=request.req_id,
                         layerwise_prefill_bank_count=self.args.banks,
-                        layerwise_prefill_bank_offset=request.phase,
                         prefill_dma_block_ids_by_bank=tuple(
                             tuple(row) for row in request.blocks[group]
                         ),
@@ -1543,9 +1514,6 @@ class Simulation:
         for request, publication in zip(active, publications, strict=True):
             start, end = ranges[request.number]
             request.completed = end
-            request.phase = (
-                request.phase + (end - start) // self.args.cache_chunk
-            ) % self.args.banks
             request.publication = publication
             request.publications.append(publication)
 
@@ -1676,7 +1644,12 @@ class Simulation:
 
 
 def stale_publication(self, group):
-    """Deliberately restore the old bug to test this simulator's sensitivity."""
+    """Inject an early-layer event in place of the current bank's final save.
+
+    With fixed bank assignment, max(layer) after a fully drained group now
+    selects its actual final save. Use min(layer) to keep this negative test
+    exercising publication before D2H completion.
+    """
     chosen = {}
     for (kv_group, bank, layer), (
         generation,
@@ -1686,7 +1659,7 @@ def stale_publication(self, group):
             kv_group == group
             and generation == self._layerwise_prefill_transfer_generation(group)
         ):
-            if bank not in chosen or layer > chosen[bank][0]:
+            if bank not in chosen or layer < chosen[bank][0]:
                 chosen[bank] = (layer, event)
     return tuple(chosen[bank][1] for bank in sorted(chosen))
 

@@ -15,10 +15,9 @@ _SPEC.loader.exec_module(_MODULE)
 KVFenceDebug = _MODULE.KVFenceDebug
 
 
-def request(name, offset=0, cached=1024, resident=0, can_load=True, sparse=False):
+def request(name, cached=1024, resident=0, can_load=True, sparse=False):
     return NS(
         req_id=name,
-        layerwise_prefill_bank_offset=offset,
         token_ids=range(max(cached, 1) + 1),
         is_sparse_decode=sparse,
         load_spec=NS(
@@ -74,7 +73,7 @@ def test_check_has_no_device_operations():
     a, b = Fence(), Fence()
     d.loaded("a", 0, 0, 0, a)
     d.loaded("b", 0, 0, 0, b)
-    d.before_read(0, 0, 0, b)
+    d.before_read(0, 0, 0, {"a": a, "b": b})
     for stage in ("p_load", "p_use", "p_save", "d_load"):
         d.wait(stage, 0, 0, b)
     assert a.waits == b.waits == 0
@@ -85,7 +84,7 @@ def test_fence_only_does_not_change_protocol_or_build_expected_metadata():
     d, _ = debug("p_use")
     d.begin_step(None, None, 0, 0)
     d.loaded("a", 0, 0, 0, None)
-    d.before_read(0, 0, 0, None)
+    d.before_read(0, 0, 0, {})
     assert not d.expected and not d.submitted and not d.begun
     event = Fence()
     d.wait("p_use", 0, 0, event)
@@ -98,42 +97,21 @@ def test_missing_second_request_on_same_bank_is_rejected_before_compute():
     a = Fence()
     d.loaded("a", 0, 0, 0, a)
     with pytest.raises(RuntimeError, match="request_load_mismatch"):
-        d.before_read(0, 0, 0, a)
+        d.before_read(0, 0, 0, {"a": a})
     assert output[-1]["missing"] == ["b"]
     assert a.waits == 0
 
 
-def test_shared_load_stream_last_event_covers_different_banks():
+def test_every_request_event_is_required_even_on_the_same_fifo():
     d, _ = debug()
-    d.begin_step([request("a"), request("b", offset=1)], (1, 0), 4, 1024)
-    a, b = Fence(), Fence()
-    d.loaded("a", 0, 0, 0, a, shared_stream=True)
-    d.loaded("b", 0, 0, 1, b, shared_stream=True)
-    d.before_read(0, 0, 0, b)
-    d.before_read(0, 0, 1, None)  # The one shared event was consumed above.
-    assert a.waits == b.waits == 0
-
-
-def test_shared_load_stream_still_requires_its_final_event():
-    d, _ = debug()
-    d.begin_step([request("a"), request("b", offset=1)], (1, 0), 4, 1024)
-    a, b = Fence(), Fence()
-    d.loaded("a", 0, 0, 0, a, shared_stream=True)
-    d.loaded("b", 0, 0, 1, b, shared_stream=True)
-    with pytest.raises(RuntimeError, match="wrong_load_event"):
-        d.before_read(0, 0, 0, a)
-
-
-def test_raw_bank_and_shared_bank_require_their_respective_events():
-    d, _ = debug()
-    d.begin_step([request("a"), request("b", offset=1)], (1, 0), 4, 1024)
+    d.begin_step([request("a"), request("b")], (1, 0), 4, 1024)
     a, b = Fence(), Fence()
     d.loaded("a", 0, 0, 0, a)
-    d.loaded("b", 0, 0, 1, b, shared_stream=True)
-    d.before_read(0, 0, 0, a)
+    d.loaded("b", 0, 0, 0, b)
     with pytest.raises(RuntimeError, match="wrong_load_event"):
-        d.before_read(0, 0, 1, None)
-    d.before_read(0, 0, 1, b)
+        d.before_read(0, 0, 0, {"b": b})
+    d.before_read(0, 0, 0, {"a": a, "b": b})
+    assert a.waits == b.waits == 0
 
 
 @pytest.mark.parametrize("returned", [None, Fence()])
@@ -142,7 +120,7 @@ def test_missing_or_old_event_cannot_silently_use_save_fallback(returned):
     d.begin_step([request("a")], (1, 1), 4, 1024)
     d.loaded("a", 0, 0, 0, Fence())
     with pytest.raises(RuntimeError, match="wrong_load_event"):
-        d.before_read(0, 0, 0, returned)
+        d.before_read(0, 0, 0, {"a": returned})
     assert output[-1]["requests"] == ["a"]
 
 
@@ -159,19 +137,18 @@ def test_real_miss_and_resident_prefix_do_not_require_load():
         4,
         1024,
     )
-    d.before_read(0, 0, 0, None)
+    d.before_read(0, 0, 0, {})
     assert not d.expected
 
 
-def test_partial_resident_chunk_requires_load_and_mixed_phases_are_independent():
+def test_partial_resident_chunk_requires_all_requests_on_fixed_bank():
     d, _ = debug()
-    d.begin_step([request("a", 0, resident=511), request("b", 3)], (5, 2), 4, 1024)
+    d.begin_step([request("a", resident=511), request("b")], (5, 2), 4, 1024)
     a, b = Fence(), Fence()
     d.loaded("a", 0, 4, 0, a)
-    d.loaded("b", 0, 4, 3, b)
-    d.before_read(0, 4, 0, a)
-    d.before_read(0, 4, 3, b)
-    d.before_read(0, 4, 0, None)  # Repeated same-stream join is legitimate.
+    d.loaded("b", 0, 4, 0, b)
+    d.before_read(0, 4, 0, {"a": a, "b": b})
+    d.before_read(0, 4, 0, {})  # Repeated same-stream join is legitimate.
     with pytest.raises(RuntimeError, match="load_after_consume"):
         d.loaded("a", 0, 4, 0, a)
 
@@ -182,10 +159,10 @@ def test_new_step_cannot_reuse_old_completion():
         d.begin_step([request("a")], (1, 1), 4, 1024)
         assert not d.latest and not d.consumed
         with pytest.raises(RuntimeError, match="request_load_mismatch"):
-            d.before_read(0, 0, 0, None)
+            d.before_read(0, 0, 0, {})
         event = Fence()
         d.loaded("a", 0, 0, 0, event)
-        d.before_read(0, 0, 0, event)
+        d.before_read(0, 0, 0, {"a": event})
 
 
 def test_role_stage_group_and_exclusive_layer_filter():
@@ -239,13 +216,13 @@ def test_fence_completes_only_selected_snapshot_not_later_work(stage):
 def test_real_bank_callbacks_keep_protocol_and_payload_order(group, banks):
     from test_layerwise_prefill_dma import _async_bank_connector
 
-    api = _async_bank_connector(group, 1, bank_count=banks, layers=banks + 2)
+    api = _async_bank_connector(group, bank_count=banks, layers=banks + 2)
     d, _ = debug()
     api.connector.fence_debug = d
     physical_group = 1 if group == "c8" else group
     counts = (banks + 2, banks + 2)
     for chunk in range(3):
-        d.begin_step([request("request", 1)], counts, banks, 4)
+        d.begin_step([request("request")], counts, banks, 4)
         generator, load = api.start(chunk)
         for layer in range(banks):
             load(layer)
@@ -265,13 +242,13 @@ def test_real_bank_callbacks_keep_protocol_and_payload_order(group, banks):
 def test_real_wait_rejects_dropped_record_instead_of_using_old_save():
     from test_layerwise_prefill_dma import _async_bank_connector
 
-    api = _async_bank_connector(0, 0)
+    api = _async_bank_connector(0)
     d, output = debug()
     api.connector.fence_debug = d
     d.begin_step([request("request")], (4, 4), 2, 4)
     generator, load = api.start(0)
     load(0)
-    api.connector._layerwise_prefill_transfer_state()[3].pop((0, 0, 0))
+    api.connector._layerwise_prefill_transfer_state()[3].pop((0, 0))
     with pytest.raises(RuntimeError, match="wrong_load_event"):
         api.read(0, 0)
     assert not api.observed

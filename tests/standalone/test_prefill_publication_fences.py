@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise real D2H event registration and publication across bank phases."""
+"""Exercise real D2H event registration across chunks and mixed requests."""
 
 import ast
 from pathlib import Path
@@ -87,14 +87,14 @@ def connector():
 
 @pytest.mark.parametrize("banks", [2, 4, 8])
 @pytest.mark.parametrize("group,layers", [(0, 79), (1, 22)])
-def test_publication_waits_latest_save_after_chunk_phase_changes(
+def test_publication_waits_latest_save_on_fixed_banks_across_chunks(
     connector, banks, group, layers
 ):
     streams = [Stream() for _ in range(banks)]
     copied = set()
-    for chunk, phase in enumerate((0, 1, banks - 1, 0)):
+    for chunk in range(4):
         for layer in range(layers):
-            bank = (layer + phase) % banks
+            bank = layer % banks
             streams[bank].submit(
                 lambda layer=layer, chunk=chunk: copied.add((chunk, layer))
             )
@@ -105,7 +105,7 @@ def test_publication_waits_latest_save_after_chunk_phase_changes(
         for fence in fences:
             fence.synchronize()
         assert {(chunk, layer) for layer in range(layers)} <= copied, (
-            "Publication observed unfinished D2H after a bank phase change"
+            "Publication observed unfinished D2H after a chunk change"
         )
 
 
@@ -118,10 +118,10 @@ def test_mixed_request_publication_fences_every_save_on_shared_bank_streams(
     # First a different batch leaves high layer ordinals in the registry.
     for layer in range(79):
         connector.register(0, layer % banks, layer, streams[layer % banks], "previous")
-    # Requests have different phases but share streams, not their KV storage.
+    # Requests share bank streams, but retain separate KV storage.
     for layer in range(79):
-        for req, phase in (("A", 1), ("B", banks - 1), ("C", 1)):
-            bank = (layer + phase) % banks
+        for req in ("A", "B", "C"):
+            bank = layer % banks
             streams[bank].submit(lambda req=req, layer=layer: copied.add((req, layer)))
             connector.register(0, bank, layer, streams[bank], req)
     for fence in connector.layerwise_prefill_store_fences(0):

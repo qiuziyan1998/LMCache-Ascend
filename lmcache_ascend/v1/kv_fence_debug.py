@@ -75,10 +75,7 @@ class KVFenceDebug:
         self.seen: set[tuple[str, int]] = set()
         self.expected: dict[tuple[int, int, int], set[str]] = {}
         self.submitted: dict[tuple[int, int, int], set[str]] = {}
-        self.latest: dict[tuple[int, int, int], Any] = {}
-        self.shared_latest: dict[tuple[int, int], Any] = {}
-        self.shared_keys: set[tuple[int, int, int]] = set()
-        self.shared_joined: set[tuple[int, int]] = set()
+        self.latest: dict[tuple[int, int, int], dict[str, Any]] = {}
         self.consumed: set[tuple[int, int, int]] = set()
         self.step = 0
         self.begun = False
@@ -135,9 +132,6 @@ class KVFenceDebug:
         self.expected.clear()
         self.submitted.clear()
         self.latest.clear()
-        self.shared_latest.clear()
-        self.shared_keys.clear()
-        self.shared_joined.clear()
         self.consumed.clear()
         for request in requests:
             spec = request.load_spec
@@ -152,10 +146,9 @@ class KVFenceDebug:
             masked = min(int(spec.vllm_cached_tokens), count) // chunk_size * chunk_size
             if count <= masked:
                 continue
-            offset = int(getattr(request, "layerwise_prefill_bank_offset", 0))
             for group, layers in enumerate(layer_counts):
                 for layer in range(layers):
-                    key = (group, layer, (layer + offset) % bank_count)
+                    key = (group, layer, layer % bank_count)
                     self.expected.setdefault(key, set()).add(request.req_id)
 
     def loaded(
@@ -165,8 +158,6 @@ class KVFenceDebug:
         layer: int,
         bank: int,
         event: Any,
-        *,
-        shared_stream: bool = False,
     ) -> None:
         """Remember actual submission order, including all requests on one FIFO."""
         if not self.check_protocol:
@@ -174,17 +165,14 @@ class KVFenceDebug:
         key = (group, layer, bank)
         if not self.begun:
             self.fail("missing_step_declaration", group, layer, bank, req=req)
-        if key in self.consumed or (group, layer) in self.shared_joined:
+        if key in self.consumed:
             self.fail("load_after_consume", group, layer, bank, req=req)
         self.submitted.setdefault(key, set()).add(req)
-        self.latest[key] = event
-        if shared_stream:
-            # Legacy dense-direct loads for all banks share one stream and
-            # one layer event. Its last submission covers every earlier load.
-            self.shared_latest[group, layer] = event
-            self.shared_keys.add(key)
+        self.latest.setdefault(key, {})[req] = event
 
-    def before_read(self, group: int, layer: int, bank: int, event: Any) -> None:
+    def before_read(
+        self, group: int, layer: int, bank: int, events: Mapping[str, Any]
+    ) -> None:
         """Reject absent/stale/wrong handoffs without inspecting NPU contents."""
         if not self.check_protocol:
             return
@@ -204,29 +192,16 @@ class KVFenceDebug:
                 missing=sorted(expected - submitted),
                 unexpected=sorted(submitted - expected),
             )
-        shared_key = (group, layer)
-        shared_event = self.shared_latest.get(shared_key)
-        latest = self.latest.get(key)
-        if key in self.shared_keys or latest is None:
-            latest = shared_event if shared_event is not None else latest
-        if (
-            event is None
-            and shared_key in self.shared_joined
-            and latest is shared_event
-        ):
-            event = latest
-        if latest is not event:
+        latest = self.latest.get(key, {})
+        wrong = sorted(
+            req for req in set(latest) | set(events)
+            if latest.get(req) is not events.get(req)
+        )
+        if wrong:
             self.fail(
-                "wrong_load_event",
-                group,
-                layer,
-                bank,
-                requests=sorted(expected),
-                expected_event=latest is not None,
-                actual_event=event is not None,
+                "wrong_load_event", group, layer, bank,
+                requests=wrong, expected_events=len(latest), actual_events=len(events),
             )
-        if shared_event is not None and event is shared_event:
-            self.shared_joined.add(shared_key)
         self.consumed.add(key)
         self.latest.pop(key, None)
         self.submitted.pop(key, None)

@@ -34,7 +34,7 @@ class Event:
             self.fifo.completed += 1
 
 
-def diagnostic(enabled=True, async_store=True, offset=0, req_id="r"):
+def diagnostic(enabled=True, async_store=True, req_id="r"):
     path = ROOT / "lmcache_ascend/v1/npu_connector/npu_connectors.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     closure = next(
@@ -44,7 +44,7 @@ def diagnostic(enabled=True, async_store=True, offset=0, req_id="r"):
     )
     host = [0 if async_store else 23]
     streams = [FIFO(), FIFO()]
-    bank = offset % 2
+    bank = 0
     streams[bank].enqueue(lambda: host.__setitem__(0, 23))
     events = {i: stream.event() for i, stream in enumerate(streams)}
     # A device-wide or full stream drain would execute this unrelated suffix.
@@ -63,7 +63,6 @@ def diagnostic(enabled=True, async_store=True, offset=0, req_id="r"):
         async_layerwise_store=async_store,
         last_store_events=events,
         source_bank_count=2,
-        layerwise_prefill_bank_offset=offset,
     )
     exec(
         compile(ast.Module(body=[closure], type_ignores=[]), str(path), "exec"),
@@ -72,15 +71,14 @@ def diagnostic(enabled=True, async_store=True, offset=0, req_id="r"):
     return namespace[closure.name], events, records, host
 
 
-@pytest.mark.parametrize("offset", [0, 1])
-def test_async_deep_fingerprint_waits_only_relevant_bank_frontier(offset):
-    log, events, records, host = diagnostic(offset=offset)
+def test_async_deep_fingerprint_waits_only_relevant_bank_frontier():
+    log, events, records, host = diagnostic()
     log(0)
     assert records[0]["chunk_ranges"][0]["fingerprint"] == 23
     assert host == [23]
-    assert events[offset].waits == 1
-    assert events[1 - offset].waits == 0
-    assert events[offset].fifo.completed == events[offset].frontier
+    assert events[0].waits == 1
+    assert events[1].waits == 0
+    assert events[0].fifo.completed == events[0].frontier
 
 
 @pytest.mark.parametrize(

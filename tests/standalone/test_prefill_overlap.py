@@ -163,7 +163,7 @@ def test_different_banks_and_unknown_bank_have_no_invented_reuse_sample():
 
 
 @pytest.mark.parametrize("bank_count", [2, 4, 8])
-def test_real_same_bank_predecessor_tracks_rotation_and_chunk_phase(bank_count):
+def test_real_same_bank_predecessor_tracks_fixed_rotation(bank_count):
     batch = overlap.StepTimings(1, (("r", 4096, 8192),))
     expected = []
     for layer in range(bank_count * 2):
@@ -176,7 +176,7 @@ def test_real_same_bank_predecessor_tracks_rotation_and_chunk_phase(bank_count):
                 layer,
                 layer * 10,
                 end,
-                bank=(layer + 1) % bank_count,
+                bank=layer % bank_count,
             )
         )
         if layer >= bank_count:
@@ -201,7 +201,7 @@ def test_sparse_indexer_pairs_its_own_bank_across_nonadjacent_model_layers():
                 ordinal * 10,
                 ordinal * 10 + 1,
                 model_layer=model_layer,
-                bank=(ordinal + 2) % 4,
+                bank=ordinal % 4,
             )
         )
     result = overlap.summarize_step(batch, event_elapsed)
@@ -431,7 +431,7 @@ def test_multi_request_batch_keeps_unequal_spans_and_counts_timing_once():
     for layer in range(8):
         stream.time = layer * 10
         ticket = recorder.start_interval(
-            "wait", stream, 0, None, layer, rotation_slot=layer % 4
+            "wait", stream, 0, layer % 4, layer
         )
         stream.time += 2
         recorder.end_interval(ticket, stream)
@@ -443,7 +443,7 @@ def test_multi_request_batch_keeps_unequal_spans_and_counts_timing_once():
     assert result["layer_samples"] == 4 and result["bank_reuse_samples"] == 4
     assert result["all_wait_ms"] == 16 and result["wait_ms"] == 8
     assert result["unknown_bank_waits"] == 0
-    assert len(result["batch_rotation_slots"]) == 4
+    assert len(result["banks"]) == 4
 
 
 @pytest.mark.parametrize("group", [0, 1, "c8"])
@@ -452,7 +452,7 @@ def test_timing_events_do_not_change_real_bank_fifo_dependencies(group):
     spec = importlib.util.spec_from_file_location("overlap_fifo_fixture", fixture_path)
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
-    api = fixture._async_bank_connector(group, 0)
+    api = fixture._async_bank_connector(group)
     events, output = [], []
 
     class TimingEvent:

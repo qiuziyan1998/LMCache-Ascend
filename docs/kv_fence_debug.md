@@ -58,8 +58,9 @@ before interpreting the final generated text.
 
 When `check` is enabled, the checks derive expected loads from each step's request metadata, before
 submitting transfers. They require a load for every declared hit, distinguish
-real no-load requests, and compare the consumer event to the last submitted
-event on that physical bank. A completed event is not queried as a substitute
+real no-load requests, and compare each request's consumer event to its last
+submitted load event. Layer ordinals select fixed banks, independent of prefix
+length; latent and indexer ordinals start at zero independently. A completed event is not queried as a substitute
 for this ownership check.
 
 - `request_load_mismatch`: a declared request's load is missing, or a load was

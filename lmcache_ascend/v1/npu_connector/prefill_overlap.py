@@ -110,7 +110,6 @@ class TimingInterval:
     model_layer: int
     start: Any
     end: Any
-    rotation_slot: Optional[int] = None
 
 
 @dataclass
@@ -139,22 +138,19 @@ def summarize_step(
     model layers so layers with an indexer do not receive extra weight.
     Negative measurements are preserved for diagnosis instead of clamped.
 
-    With mixed request phases, one consumer gate joins multiple banks. Its
-    rotation_slot identifies the group-layer ordinal modulo bank count: the
-    same per-request physical-bank assignment returns after a full rotation.
-    These batch gates are reported separately from physical-bank DMA totals.
+    Each layer has a fixed bank, shared by every request in the batch.
+    Its gate measures the combined wait for all per-request load events once.
     """
     starts: dict[int, Any] = {}
     waits: dict[int, float] = {}
-    consumers: dict[tuple[int, Optional[int], Optional[int], int], float] = {}
+    consumers: dict[tuple[int, Optional[int], int], float] = {}
     banks: dict[tuple[int, Optional[int]], dict[str, Any]] = {}
-    batch_slots: dict[tuple[int, int], dict[str, Any]] = {}
     for item in batch.intervals:
         duration = elapsed_time(item.start, item.end)
         if item.kind == "wait":
             waits[item.model_layer] = waits.get(item.model_layer, 0.0) + duration
             starts[item.model_layer] = item.end
-            key = (item.group, item.bank, item.rotation_slot, item.model_layer)
+            key = (item.group, item.bank, item.model_layer)
             consumers[key] = consumers.get(key, 0.0) + duration
         else:
             entry = banks.setdefault(
@@ -164,26 +160,19 @@ def summarize_step(
             entry[item.kind + "_ms"] += duration
 
     layer_ratios: dict[int, list[float]] = {}
-    previous_layers: dict[tuple[int, str, int], int] = {}
-    bank_ratios: dict[tuple[int, str, int], list[float]] = {}
+    previous_layers: dict[tuple[int, int], int] = {}
+    bank_ratios: dict[tuple[int, int], list[float]] = {}
     wait_ms, interval_ms, initial_bank_wait_ms = 0.0, 0.0, 0.0
     unknown_bank_waits, invalid_intervals = 0, 0
-    for (group, bank, rotation_slot, current), waited in consumers.items():
-        if bank is None and rotation_slot is None:
+    for (group, bank, current), waited in consumers.items():
+        if bank is None:
             unknown_bank_waits += 1
             continue
-        if bank is None:
-            identity = (group, "batch_rotation", rotation_slot)
-            entry = batch_slots.setdefault(
-                (group, rotation_slot),
-                dict(group=group, rotation_slot=rotation_slot),
-            )
-        else:
-            identity = (group, "physical", bank)
-            entry = banks.setdefault(
-                (group, bank),
-                dict(group=group, bank=bank, load_ms=0.0, save_ms=0.0),
-            )
+        identity = (group, bank)
+        entry = banks.setdefault(
+            identity,
+            dict(group=group, bank=bank, load_ms=0.0, save_ms=0.0),
+        )
         previous = previous_layers.get(identity)
         previous_layers[identity] = current
         if previous is None:
@@ -202,13 +191,7 @@ def summarize_step(
         wait_ms += waited
         interval_ms += period
     ratios = [sum(values) / len(values) for values in layer_ratios.values()]
-    entries = [
-        ((group, "physical", bank), entry) for (group, bank), entry in banks.items()
-    ] + [
-        ((group, "batch_rotation", slot), entry)
-        for (group, slot), entry in batch_slots.items()
-    ]
-    for identity, entry in entries:
+    for identity, entry in banks.items():
         values = bank_ratios.get(identity, [])
         entry["reuse_samples"] = len(values)
         entry["coverage"] = sum(values) / len(values) if values else None
@@ -246,7 +229,6 @@ def summarize_step(
             for values in layer_ratios.values()
         ),
         banks=list(banks.values()),
-        batch_rotation_slots=list(batch_slots.values()),
     )
 
 
@@ -307,7 +289,6 @@ class PrefillOverlapRecorder:
         bank: Optional[int],
         layer: int,
         model_layer: Optional[int] = None,
-        rotation_slot: Optional[int] = None,
     ) -> Optional[TimingInterval]:
         """Record a start, after existing producer waits on the SAME stream."""
         if self.active is None or self.failed:
@@ -320,7 +301,6 @@ class PrefillOverlapRecorder:
             layer if model_layer is None else model_layer,
             self._event(),
             self._event(),
-            rotation_slot,
         )
         ticket.start.record(stream)
         return ticket

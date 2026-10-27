@@ -579,9 +579,7 @@ def main() -> int:
                         start = self.computed[request.req_id]
                         count = scheduler_output.num_scheduled_tokens[request.req_id]
                         end = start + count
-                        bank = (
-                            ordinal + request.layerwise_prefill_bank_offset
-                        ) % args.banks
+                        bank = ordinal % args.banks
                         if request.block_ids_by_bank is not None:
                             blocks = request.block_ids_by_bank[bank][group]
                             slots = tuple(

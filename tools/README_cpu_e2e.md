@@ -15,7 +15,7 @@ input preparation, request/block-table updates, attention metadata construction,
 model dispatch, sampling, and asynchronous output materialization. The real SFA
 transfer-window callbacks surround the identity model's CPU arithmetic.
 The real scheduler supplies
-request admission, chunk boundaries, block allocations, bank phase metadata,
+request admission, chunk boundaries, block allocations, fixed bank mappings,
 and completion state. P and D have distinct HBM buffers and distinct CPU slabs.
 Only the simulated remote store connects their payloads. Every TP worker has
 its own connector and compute stream; nonzero ranks consume the real shared

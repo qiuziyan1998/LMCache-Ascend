@@ -379,7 +379,6 @@ def test_partial_history_produced_and_bank_bytes_align(features, tmp_path, prefi
         kv_trace_requests={
             "req": SimpleNamespace(
                 block_ids_by_bank=[[[1, 0]], [[0, 1]]],
-                layerwise_prefill_bank_offset=0,
                 is_last_prefill=True,
                 token_ids=list(range(7)),
             )
