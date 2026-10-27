@@ -61,10 +61,12 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
+    mooncake_page_key,
     mooncake_page_layout_enabled,
     mooncake_payload_layout,
 )
 from lmcache.v1.prefill_metadata import PrefillMetadataPlan
+from lmcache.v1.prefill_audit import audit_enabled, audit_record
 from lmcache.v1.prefill_kv_hash import (
     kv_hash_enabled,
     skip_kv_hash,
@@ -5341,6 +5343,20 @@ class AscendLMCacheEngine(LMCacheEngine):
             self.storage_manager.batched_get_external_pages(
                 pages, ptrs, sizes, owners, req_id
             )
+            if audit_enabled():
+                try:
+                    self.gpu_connector.audit_direct_indexer_import(
+                        req_id,
+                        [
+                            mooncake_page_key(key, len(keys_layer_major))
+                            for key in pages
+                        ],
+                        ptrs, sizes, owners,
+                    )
+                except Exception as audit_error:
+                    audit_record("coverage", stage="get_npu", req=req_id,
+                                 error="direct_readback_unavailable",
+                                 detail=type(audit_error).__name__)
             if kv_hash_enabled():
                 trace = getattr(self.gpu_connector, "trace_direct_kv", None)
                 if callable(trace):

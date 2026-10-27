@@ -55,6 +55,7 @@ from lmcache_ascend.v1.content_diagnostics import (
     register_group0_source_probe,
 )
 from lmcache_ascend.v1.kv_format import KVCacheFormat
+from lmcache_ascend.v1.direct_npu_audit import DirectNpuAudit
 from lmcache_ascend.v1.kv_features import (
     KVTrace,
     REFERENCE_SEGMENT_TOKENS,
@@ -2415,6 +2416,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         """Install this step's CPU request descriptors for opt-in KV tracing."""
         if audit_enabled():
+            readback = getattr(self, "direct_npu_audit", None)
+            if readback is not None:
+                readback.poll()
             if not hasattr(self, "prefill_audit"):
                 self.prefill_audit = BankAudit(
                     self._prefill_worker_id,
@@ -2859,6 +2863,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     @diagnostic
     def finish_kv_trace(self, req_id: str) -> None:
         """Emit completion and forget request diagnostic descriptors."""
+        readback = getattr(self, "direct_npu_audit", None)
+        if readback is not None:
+            readback.poll()
         audit = getattr(self, "prefill_audit", None)
         if audit is not None:
             audit.finish(req_id)
@@ -2875,12 +2882,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
     def drain_kv_trace(self, timeout: float = 60.0) -> bool:
         """Drain diagnostic readers before engine shutdown frees CPU slabs."""
+        readback = getattr(self, "direct_npu_audit", None)
+        if readback is not None:
+            readback.poll()
         trace = getattr(self, "kv_trace", None)
         if trace is None:
             return True
         for req_id in tuple(getattr(self, "kv_trace_source_owners", {})):
             self.finish_kv_trace(req_id)
         return trace.drain(timeout)
+
+    def audit_direct_indexer_import(
+        self, req_id: str, keys: list[str], pointers: list[list[int]],
+        sizes: list[list[int]], owners: Sequence[torch.Tensor],
+    ) -> None:
+        """Sample direct NPU destinations on the existing readiness stream."""
+        if not audit_enabled():
+            return
+        reader = getattr(self, "direct_npu_audit", None)
+        if reader is None:
+            reader = self.direct_npu_audit = DirectNpuAudit(
+                torch, lmc_ops.layerwise_prefill_dma_copy,
+            )
+        reader.submit(req_id, keys, pointers, sizes, self.load_stream, owners)
 
     @diagnostic
     def enqueue_store_kv_trace(

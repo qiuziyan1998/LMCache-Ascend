@@ -731,7 +731,7 @@ class CPUHardware:
             def unpinned(function):
                 @wraps(function)
                 def allocate(*args, **kwargs):
-                    kwargs.pop("pin_memory", None)
+                    pinned = kwargs.pop("pin_memory", False)
                     shape = args[0] if args else kwargs.get("size")
                     if (
                         function is original_zeros
@@ -746,7 +746,10 @@ class CPUHardware:
                         memory = mmap.mmap(-1, shape)
                         self.virtual_allocations.append(memory)
                         return torch.frombuffer(memory, dtype=kwargs["dtype"])
-                    return function(*args, **kwargs)
+                    tensor = function(*args, **kwargs)
+                    if pinned and tensor.device.type == "cpu":
+                        self.queue.memory(tensor, tensor)
+                    return tensor
 
                 return allocate
 
