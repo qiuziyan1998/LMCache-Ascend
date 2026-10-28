@@ -131,7 +131,6 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         node for node in cls.body
         if isinstance(node, ast.FunctionDef) and node.name in (
             "record_layerwise_prefill_bank_use", "_require_layerwise_prefill_bank_use",
-            "_prepare_layerwise_prefill_source_readiness",
             "wait_for_layerwise_prefill_source_publication",
             "_retain_unfenced_layerwise_prefill_load",
         )
@@ -859,22 +858,31 @@ def test_configurable_bank_dma_rotation_never_overwrites_pending_compute(
         assert sorted(api.saved) == expected
 
 
-def test_eight_bank_source_readiness_includes_the_last_bank_producer():
-    api = _async_bank_connector(0, bank_count=8)
-    published = []
+@pytest.mark.parametrize("bank_count", [2, 4, 8])
+@pytest.mark.parametrize("group", [0, 1, "c8"])
+def test_fixed_bank_load_does_not_join_other_banks_previous_saves(bank_count, group):
+    api = _async_bank_connector(group, bank_count=bank_count, layers=bank_count + 1)
+    kv_group = 1 if group == "c8" else group
+    saved = []
     tails = {}
-    for bank_id, stream in enumerate(api.banks):
-        stream.enqueue(lambda bank_id=bank_id: published.append(bank_id))
+    for bank, stream in enumerate(api.banks):
+        stream.enqueue(lambda bank=bank: saved.append(bank))
         event = api.npu.Event()
         event.record(stream)
-        tails[(0, bank_id)] = (0, event, bank_id, "previous chunk")
+        tails[(kv_group, bank)] = (0, event, bank, "previous chunk")
     api.connector._layerwise_prefill_bank_tail_events = tails
-    api.connector._prepare_layerwise_prefill_source_readiness(0)
-    seen = []
-    api.banks[5].enqueue(lambda: seen.extend(sorted(published)))
-    assert published == seen == []
-    api.banks[5].tail.run()
-    assert seen == list(range(8))
+
+    generator, load = api.start(0)
+    load(0)
+    api.read(0, 0)
+    assert saved == api.observed == []
+    # Run the actual consumer first. Its load follows its own earlier D2H,
+    # while independent banks must remain pending, not indirectly drained.
+    api.npu.compute.tail.run()
+    assert saved == [0]
+    assert api.observed == [(0, 0)]
+    assert all(not stream.tail.done for stream in api.banks[1:])
+    generator.close()
 
 
 @pytest.mark.parametrize("group", [0, 1, "c8"])
@@ -1178,16 +1186,6 @@ def test_early_cpu_page_read_waits_previous_producer_on_either_bank(
     banks[0].tail.run()
     assert cpu[2] == contents[banks[0]] == (0, 2)
     current.close()
-
-
-def test_source_readiness_without_saves_adds_no_bank_work():
-    submit, _, _ = _reuse_debug_connector(False)
-    obj = submit.connector
-    obj._layerwise_prefill_dma_stream = lambda *args: pytest.fail("no producer to fence")
-    obj._prepare_layerwise_prefill_source_readiness(1)
-    # An earlier reset generation is already drained and must not be rejoined.
-    obj._layerwise_prefill_bank_tail_events = {(1, 0): (-1, object(), 0, "old")}
-    obj._prepare_layerwise_prefill_source_readiness(1)
 
 
 def _rank0_publication_boundary(connector, messages):

@@ -3144,33 +3144,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if not event.query():
                 event.synchronize()
 
-    def _prepare_layerwise_prefill_source_readiness(self, kv_group: int) -> None:
-        """Fence prior CPU producers before a new banked load is submitted.
-
-        Early LocalCPU publication can expose pages whose D2H is still on the
-        opposite FIFO after a request's phase changes. Snapshot prior save tails
-        for the active generation before enqueueing new loads; immutable
-        event dependencies cannot include these new waits and form a cycle.
-        Same-bank readiness is already guaranteed by FIFO order. Passive ranks
-        without saves have no tails and incur no additional stream work.
-        """
-        generation = self._layerwise_prefill_transfer_generation(kv_group)
-        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
-        producers = tuple(
-            (bank, record[1])
-            for bank in range(
-                self._layerwise_prefill_transfer_state()[0].get(kv_group, 2)
-            )
-            if (record := tails.get((kv_group, bank))) is not None
-            and record[0] == generation
-        )
-        for bank in range(
-            self._layerwise_prefill_transfer_state()[0].get(kv_group, 2)
-        ):
-            for source_bank, event in producers:
-                if source_bank != bank:
-                    self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
-
     def wait_for_layerwise_prefill_load(
         self,
         layer_id: int,
@@ -7704,8 +7677,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 block_size=int(kwargs["prefill_dma_block_size"]), starts=starts, ends=ends,
                 transfer_stream=self.load_stream,
             )
-        if prefill_dma:
-            self._prepare_layerwise_prefill_source_readiness(kv_group)
         deferred_load_submitted = False
         deferred_load_completed = False
         try:
@@ -7901,8 +7872,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     # Attention already queued the exact last-use event on
                     # this bank FIFO, on every TP rank. Do not snapshot the
                     # current compute stream here: it can include N's FFN or
-                    # N+1's normalization. Initial L0/L1 loads also inherit the
-                    # previous chunk's tail handoff from the same bank FIFO.
+                    # N+1's normalization. Fixed layer-to-bank assignment means
+                    # even the first B loads inherit the previous chunk's saves
+                    # and final-access handoffs on their own FIFO. No all-bank
+                    # producer join is needed. Cross-process CPU sources are
+                    # fenced separately before shared-handle publication.
                     if layer_id >= layerwise_prefill_bank_count:
                         self._require_layerwise_prefill_bank_use(
                             layer_id - layerwise_prefill_bank_count, kv_group, bank,

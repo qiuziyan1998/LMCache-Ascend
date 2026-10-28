@@ -648,7 +648,6 @@ class Simulation:
             "_require_layerwise_prefill_bank_use",
             "wait_for_layerwise_prefill_load",
             "layerwise_prefill_store_fences",
-            "_prepare_layerwise_prefill_source_readiness",
             "wait_for_layerwise_prefill_source_publication",
             "release_layerwise_prefill_dma_cache",
             "_retain_unfenced_layerwise_prefill_load",
