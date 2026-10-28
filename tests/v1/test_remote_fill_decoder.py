@@ -149,6 +149,7 @@ def test_c8_asymmetric_tp_requires_validated_packet(policy, invalid):
 
 def test_post_init_emits_startup_stage_timings() -> None:
     engine = object.__new__(AscendLMCacheEngine)
+    engine.storage_process = None
     engine.metadata = SimpleNamespace(worker_id=1)
     engine.config = SimpleNamespace(
         dsa_group1_load_mode="persistent_direct_hbm",
@@ -1609,6 +1610,7 @@ def test_unarmed_service_failure_stops_decoder_placement_advertisement() -> None
     )
     engine = object.__new__(AscendLMCacheEngine)
     engine._remote_fill_runtime = runtime
+    engine.storage_process = None
     engine._init_failed = False
     engine._health_monitor = None
 
@@ -1813,6 +1815,7 @@ def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = object.__new__(AscendLMCacheEngine)
+    engine.storage_process = None
     engine._force_layerwise_prefill_store = False
     base_close_calls = 0
 

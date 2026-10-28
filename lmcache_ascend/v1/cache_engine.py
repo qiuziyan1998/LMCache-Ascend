@@ -64,7 +64,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_page_layout_enabled,
     mooncake_payload_layout,
 )
-from lmcache.v1.prefill_metadata import PrefillMetadataPlan
+from lmcache.v1.prefill_metadata import PrefillMetadataCache, PrefillMetadataPlan
 from lmcache.v1.remote_fill import (
     ControlPage,
     log_remote_fill_diagnostic,
@@ -1091,6 +1091,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         state: _DirectStoreRequestState,
         batch: _DirectPageBatch,
         required_store_end_hint: int,
+        *,
+        reused_pages: tuple[ControlPage, ...] = (),
+        control_pages: Optional[tuple[ControlPage, ...]] = None,
     ) -> None:
         if (
             state.remote_fill is None
@@ -1100,7 +1103,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             return
         coordinator = self._get_remote_fill_coordinator()
         try:
-            control_pages = self._remote_fill_control_pages(batch)
+            if control_pages is None:
+                control_pages = self._remote_fill_control_pages(batch)
         except Exception as error:
             coordinator.reject_source_batch(
                 state.remote_fill, req_id=batch.req_id, error=error
@@ -1113,6 +1117,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             control_pages=control_pages,
             maximum=self._remote_fill_pages_per_window(),
             context=self._remote_fill_session_context(),
+            reused_pages=reused_pages,
         )
 
     def configure_remote_fill_producer(
@@ -1260,7 +1265,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def _remote_fill_probe_control_pages(
         self,
-        plans: dict[int, list[tuple[int, int, CacheEngineKey]]],
+        plans: dict[int, Iterable[tuple[int, int, CacheEngineKey]]],
         probe_start: int,
         probe_end: int,
     ) -> tuple[ControlPage, ...]:
@@ -1842,21 +1847,86 @@ class AscendLMCacheEngine(LMCacheEngine):
             lease.release()
             raise
 
-    def submit_layerwise_prefill_fills(self, req_ids: Iterable[str]) -> None:
+    def _layerwise_remote_fill_reused_pages(
+        self, state: ProducerRequestState, pages: tuple[ControlPage, ...],
+        tokens: list[int], request_configs: Optional[dict], metadata_cache: Any,
+    ) -> tuple[ControlPage, ...]:
+        """Describe skipped pages once; neither read KV nor infer D residency."""
+        start, end = state.manifest_end, len(tokens)
+        if end < start or (start % self.config.chunk_size and end != start):
+            raise ValueError("RemoteFill manifest cannot replace a registered tail")
+        cursor = start
+        group_count = len(self._remote_fill_direct_groups())
+        for page in pages[::group_count]:
+            if page.chunk_start != cursor:
+                break
+            cursor = page.chunk_end
+        else:
+            if cursor == end:
+                return ()
+        if callable(metadata_cache):
+            metadata_cache = metadata_cache()
+        if metadata_cache is None:
+            if state.manifest_metadata is None:
+                state.manifest_metadata = PrefillMetadataCache()
+            metadata_cache = state.manifest_metadata
+        plans = {
+            group: metadata_cache.prepare(
+                self.token_database, tokens, request_configs=request_configs,
+                kv_group=group, num_layers=self._num_layers_for_kv_group(group),
+                skip_tokens=start // self.config.chunk_size * self.config.chunk_size,
+            ).candidates
+            for group in self._remote_fill_direct_groups()
+        }
+        complete = self._remote_fill_probe_control_pages(plans, start, end)
+        by_identity = {(page.kv_group, page.chunk_index): page for page in complete}
+        if any(by_identity.get((p.kv_group, p.chunk_index)) != p for p in pages):
+            raise ValueError("RemoteFill source differs from the accepted page plan")
+        cursor = start
+        for page in complete[::group_count]:
+            if page.chunk_start != cursor:
+                raise ValueError("RemoteFill accepted page plan has a hole")
+            cursor = page.chunk_end
+        if cursor != end:
+            raise ValueError("RemoteFill accepted page plan is incomplete")
+        sources = {(page.kv_group, page.chunk_index) for page in pages}
+        return tuple(page for page in complete
+                     if (page.kv_group, page.chunk_index) not in sources)
+
+    def submit_layerwise_prefill_fills(
+        self, req_ids: Iterable[str], *,
+        request_metadata: Iterable[tuple[str, list[int], Optional[dict], Any]] = (),
+    ) -> None:
         """Start CPU-to-D fill concurrently with already-submitted Mooncake puts.
 
         Existing RemoteFill byte/window limits apply. Unsupported or unmatched
         group pages retain the persistent fallback. No payload copy is added.
+        request_metadata supplies accepted tokens, key config and a metadata
+        cache/provider; providers run on this caller only when a gap needs keys.
         """
+        metadata = {}
+        if self.config.enable_remote_lmcache_store and not self._is_passive():
+            metadata = {req_id: (tokens, config, cache)
+                        for req_id, tokens, config, cache in request_metadata}
         for req_id in req_ids:
             groups = self._layerwise_cpu_fill_sources.pop(req_id, {})
-            if not groups:
+            if not groups and req_id not in metadata:
                 continue
             leases = tuple(lease for _, lease in groups.values())
-            state = self._direct_store_states[req_id]
+            state = self._direct_store_states.get(req_id)
+            if state is None:
+                state = self._direct_store_states[req_id] = _DirectStoreRequestState()
+            if req_id in metadata:
+                tokens, config, cache = metadata[req_id]
+                if not self._remote_fill_prepare_request(req_id, config, state):
+                    for lease in leases:
+                        lease.release()
+                    continue
             previous = state.remote_fill.last_future
             try:
-                if set(groups) != set(self._remote_fill_direct_groups()):
+                if state.remote_fill.terminal is not None:
+                    continue
+                if groups and set(groups) != set(self._remote_fill_direct_groups()):
                     state.remote_fill.disabled_reason = "banked_prefill_incomplete_groups"
                     continue
                 batches = [batch for batch, _ in groups.values()]
@@ -1867,10 +1937,36 @@ class AscendLMCacheEngine(LMCacheEngine):
                     id(event): event
                     for batch in batches for event in batch.ready_events
                 }.values())
-                batch = merge_deferred_remote_fill_batches(batches, events)
-                self._schedule_remote_fill_batch(
-                    state, batch, max(batch.group_ends.values())
+                batch = (
+                    merge_deferred_remote_fill_batches(batches, events)
+                    if batches else None
                 )
+                if req_id in metadata:
+                    try:
+                        pages = self._remote_fill_control_pages(batch) if batch else ()
+                        reused = self._layerwise_remote_fill_reused_pages(
+                            state.remote_fill, pages, tokens, config, cache,
+                        )
+                    except Exception as error:
+                        self._get_remote_fill_coordinator().reject_source_batch(
+                            state.remote_fill, req_id=req_id, error=error,
+                        )
+                        continue
+                    if batch is None:
+                        self._schedule_remote_fill_probe_pages(
+                            req_id, state, reused, len(tokens),
+                        )
+                    else:
+                        self._schedule_remote_fill_batch(
+                            state, batch, len(tokens), reused_pages=reused,
+                            control_pages=pages,
+                        )
+                    if state.remote_fill.last_future is not previous:
+                        state.remote_fill.manifest_end = len(tokens)
+                elif batch is not None:
+                    self._schedule_remote_fill_batch(
+                        state, batch, max(batch.group_ends.values())
+                    )
             finally:
                 submitted = state.remote_fill.last_future
                 if submitted is previous or submitted is None:

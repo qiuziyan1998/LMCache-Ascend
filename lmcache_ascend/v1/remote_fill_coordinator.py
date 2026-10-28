@@ -83,6 +83,12 @@ class ProducerSessionContext:
 
 
 @dataclass(slots=True)
+class _DestinationCircuit:
+    failures: int = 0
+    open_until: float = 0.0
+
+
+@dataclass(slots=True)
 class ProducerRequestState:
     """One request's producer state, referenced by the persistent-store handle.
 
@@ -98,6 +104,9 @@ class ProducerRequestState:
     next_window_id: int = 0
     source_generation: int = 0
     probe_end: int = 0
+    manifest_end: int = 0
+    manifest_metadata: Any = field(default=None, repr=False)
+    circuit: _DestinationCircuit | None = field(default=None, repr=False)
     queued_bytes: int = 0
     queued_windows: int = 0
     oldest_enqueued_at: float = 0.0
@@ -137,6 +146,8 @@ class RemoteFillCoordinator:
         self.storage_manager = storage_manager
         self._fatal_reporter = WeakMethod(fatal_reporter)
         self._session_lock = threading.RLock()
+        self._circuit_lock = threading.Lock()
+        self._circuits: dict[tuple, _DestinationCircuit] = {}
 
     def configure(
         self,
@@ -165,7 +176,7 @@ class RemoteFillCoordinator:
             reason=state.disabled_reason,
             error=error,
         )
-        self._record_failure()
+        self._record_failure(state)
 
     def _latch_fatal(self, state) -> None:
         handoff = state.handoff
@@ -386,8 +397,8 @@ class RemoteFillCoordinator:
                 severity="warning",
             )
             return False
-        if not self._circuit_allows():
-            state.disabled_reason = "circuit_open"
+        if not self._circuit_allows(state):
+            state.disabled_reason = state.disabled_reason or "circuit_open"
             log_remote_fill_diagnostic(
                 logger,
                 event="remote_fill_fallback",
@@ -414,52 +425,69 @@ class RemoteFillCoordinator:
             )
         return True
 
-    def _circuit_allows(self) -> bool:
-        if not bool(self.config.remote_fill_circuit_breaker_enabled):
+    def _update_circuit(
+        self, state: ProducerRequestState | None, failure: bool | None,
+    ) -> bool:
+        if not self.config.remote_fill_circuit_breaker_enabled:
             return True
-        lock = getattr(self, "_circuit_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._circuit_lock = lock
-        with lock:
+        with self._circuit_lock:
             now = time.monotonic()
-            open_until = float(getattr(self, "_circuit_open_until", 0.0))
-            if now < open_until:
-                return False
-            if open_until:
-                self._circuit_open_until = 0.0
-                self._circuit_failures = 0
-                metrics = getattr(self, "_metrics", None)
-                if metrics is not None:
-                    metrics.set_gauge("circuit_breaker_state", 0)
+            entry = state.circuit if state is not None else None
+            if entry is None:
+                handoff = state.handoff if state is not None else None
+                key = (() if handoff is None else (
+                    handoff.control_endpoint, handoff.destination_engine_id,
+                    handoff.destination_dp_rank, handoff.destination_engine_epoch,
+                    handoff.shared_cache_generation,
+                ))
+                entry = self._circuits.get(key)
+                if entry is None:
+                    # Bound churn without evicting an unexpired open circuit.
+                    if len(self._circuits) >= 128:
+                        expired = next((key for key, value in self._circuits.items()
+                                        if value.open_until <= now), None)
+                        if expired is None:
+                            if state is not None:
+                                state.disabled_reason = "circuit_capacity"
+                            return False
+                        del self._circuits[expired]
+                    entry = self._circuits[key] = _DestinationCircuit()
+                if state is not None:
+                    # Late jobs retain their original epoch's entry, even after
+                    # registry eviction. They cannot reset a replacement entry.
+                    state.circuit = entry
+            if failure is None:
+                if now < entry.open_until:
+                    return False
+                if entry.open_until:
+                    entry.failures = 0
+                    entry.open_until = 0.0
+            elif failure:
+                entry.failures += 1
+                if entry.failures >= (
+                    self.config.remote_fill_circuit_breaker_failure_threshold
+                ):
+                    entry.open_until = (
+                        now + self.config.remote_fill_circuit_breaker_cooldown_sec
+                    )
+            else:
+                entry.failures = 0
+                entry.open_until = 0.0
+            self.get_metrics().set_gauge(
+                "circuit_breaker_state",
+                int(any(value.open_until > now for value in self._circuits.values())),
+            )
             return True
 
-    def _record_failure(self) -> None:
-        if not bool(self.config.remote_fill_circuit_breaker_enabled):
-            return
-        lock = getattr(self, "_circuit_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._circuit_lock = lock
-        with lock:
-            failures = int(getattr(self, "_circuit_failures", 0)) + 1
-            self._circuit_failures = failures
-            if failures >= int(
-                self.config.remote_fill_circuit_breaker_failure_threshold
-            ):
-                self._circuit_open_until = time.monotonic() + float(
-                    self.config.remote_fill_circuit_breaker_cooldown_sec
-                )
-                self.get_metrics().set_gauge("circuit_breaker_state", 1)
+    def _circuit_allows(self, state: ProducerRequestState | None = None) -> bool:
+        return self._update_circuit(state, None)
 
-    def record_success(self) -> None:
-        lock = getattr(self, "_circuit_lock", None)
-        if lock is None:
-            return
-        with lock:
-            self._circuit_failures = 0
-            self._circuit_open_until = 0.0
-            self.get_metrics().set_gauge("circuit_breaker_state", 0)
+    def _record_failure(self, state: ProducerRequestState | None = None) -> None:
+        self._update_circuit(state, True)
+
+    def record_success(self, state: ProducerRequestState | None = None) -> None:
+        """Reset only the successful request's destination circuit."""
+        self._update_circuit(state, False)
 
     def can_coalesce_final_batch(
         self, state: ProducerRequestState, byte_count: int
@@ -667,6 +695,52 @@ class RemoteFillCoordinator:
             state.active_counted = True
         return session
 
+    def _source_preparer(
+        self, windows: int, timeout: float, *, as_future: bool,
+    ) -> Callable[[DirectPushSourcePlan], Any]:
+        """Reuse readiness only inside one ordered job; validate every range."""
+        backend = self.storage_manager.prepare_remote_fill_source
+        if windows <= 1 and as_future:
+            return backend
+        cached = identity = None
+
+        def prepare(plan: DirectPushSourcePlan) -> Any:
+            nonlocal cached, identity
+            current = None
+            if windows > 1 and plan.owners and all(
+                callable(getattr(owner, "untyped_storage", None))
+                for owner in plan.owners
+            ):
+                ranges = direct_push_owner_ranges(plan.owners)
+                current = (
+                    tuple(id(owner) for owner in plan.owners), tuple(ranges),
+                    tuple(id(event) for event in plan.producer_events),
+                )
+            if current is not None and current == identity:
+                validate_direct_push_source_ranges(
+                    tuple(ptr for page in plan.pages for ptr in page.source_ptrs),
+                    tuple(size for page in plan.pages for size in page.source_lengths),
+                    ranges,
+                )
+                prepared = replace(
+                    cached, source_plan=plan,
+                    source_event_wait_ms=0.0, source_registration_ms=0.0,
+                )
+            else:
+                # Do not retain a failed Future/traceback in this closure when
+                # cyclic GC is disabled. Cache only successful preparation.
+                prepared = backend(plan).result(timeout=timeout)
+                if (isinstance(prepared, PreparedDirectPushSource)
+                        and prepared.source_plan is plan):
+                    cached, identity = prepared, current
+            if not as_future:
+                return prepared
+            result = Future()
+            result.set_result(prepared)
+            return result
+
+        return prepare
+
     def submit_probe(
         self,
         req_id: str,
@@ -696,7 +770,7 @@ class RemoteFillCoordinator:
                 )
             except Exception as error:
                 state.disabled_reason = type(error).__name__
-                self._record_failure()
+                self._record_failure(state)
                 return
             self._executor = executor
         control_windows = tuple(
@@ -731,15 +805,16 @@ class RemoteFillCoordinator:
                 results = []
                 charged_bytes = 0
                 source_refused = False
-                prepared_prefix = None
-                prepared_identity = None
                 if source_factory is not None:
+                    prepare_prefix = self._source_preparer(
+                        len(control_windows), session.native_hard_timeout_seconds,
+                        as_future=False,
+                    )
 
                     def prepare_sources(
                         missing: tuple[ControlPage, ...],
                     ) -> PreparedDirectPushSource:
                         nonlocal charged_bytes, source_refused
-                        nonlocal prepared_prefix, prepared_identity
                         byte_count = sum(page.expected_bytes for page in missing)
                         if not self._acquire_queue_capacity(
                             state, byte_count, windows=0
@@ -750,44 +825,7 @@ class RemoteFillCoordinator:
                             )
                         charged_bytes = byte_count
                         plan = source_factory(missing)
-                        # One proof per queued job, retaining its owners/events.
-                        # Non-storage sources keep the ordinary preparation path.
-                        identity = None
-                        if len(control_windows) > 1 and plan.owners and all(
-                            callable(getattr(owner, "untyped_storage", None))
-                            for owner in plan.owners
-                        ):
-                            ranges = direct_push_owner_ranges(plan.owners)
-                            identity = (
-                                tuple(id(owner) for owner in plan.owners),
-                                tuple(ranges),
-                                tuple(id(event) for event in plan.producer_events),
-                            )
-                        if identity is not None and identity == prepared_identity:
-                            validate_direct_push_source_ranges(
-                                tuple(
-                                    ptr for page in plan.pages
-                                    for ptr in page.source_ptrs
-                                ),
-                                tuple(
-                                    size for page in plan.pages
-                                    for size in page.source_lengths
-                                ),
-                                ranges,
-                            )
-                            return replace(
-                                prepared_prefix, source_plan=plan,
-                                source_event_wait_ms=0.0, source_registration_ms=0.0,
-                            )
-                        prepared = self.storage_manager.prepare_remote_fill_source(
-                            plan
-                        ).result(timeout=session.native_hard_timeout_seconds)
-                        if (
-                            isinstance(prepared, PreparedDirectPushSource)
-                            and prepared.source_plan is plan
-                        ):
-                            prepared_prefix, prepared_identity = prepared, identity
-                        return prepared
+                        return prepare_prefix(plan)
 
                 for window_offset, control_pages in enumerate(control_windows):
                     window_id = first_window_id + window_offset
@@ -836,7 +874,7 @@ class RemoteFillCoordinator:
                             "cached-prefix hole",
                             "producer backpressure",
                         ):
-                            self._record_failure()
+                            self._record_failure(state)
                     self._record_window_metrics(state, result)
                     if serving_perf_enabled():
                         serving_perf_log(
@@ -858,7 +896,7 @@ class RemoteFillCoordinator:
                 state.disabled_reason = type(error).__name__
                 if state.session is not None:
                     state.session.direct_viable = False
-                self._record_failure()
+                self._record_failure(state)
                 return None
             finally:
                 self._release_queue_capacity(state, 0)
@@ -868,7 +906,7 @@ class RemoteFillCoordinator:
         except Exception as error:
             self._release_queue_capacity(state, 0)
             state.disabled_reason = type(error).__name__
-            self._record_failure()
+            self._record_failure(state)
             return
         state.futures.append(future)
         state.last_future = future
@@ -882,6 +920,7 @@ class RemoteFillCoordinator:
         control_pages: tuple[ControlPage, ...],
         maximum: int,
         context: ProducerSessionContext,
+        reused_pages: tuple[ControlPage, ...] = (),
     ) -> None:
         if maximum <= 0:
             state.disabled_reason = "invalid_control_page_limit"
@@ -896,6 +935,10 @@ class RemoteFillCoordinator:
         control_windows = tuple(
             control_pages[offset : offset + maximum]
             for offset in range(0, len(control_pages), maximum)
+        )
+        probe_windows = tuple(
+            reused_pages[offset : offset + maximum]
+            for offset in range(0, len(reused_pages), maximum)
         )
         # Every window plan retains the batch-wide owners/events, so its one
         # producer job must be charged for the complete retained source set.
@@ -945,7 +988,7 @@ class RemoteFillCoordinator:
                 reason=state.disabled_reason,
                 error=error,
             )
-            self._record_failure()
+            self._record_failure(state)
             return
         if serving_perf_enabled():
             serving_perf_log(
@@ -972,11 +1015,11 @@ class RemoteFillCoordinator:
                     reason=state.disabled_reason,
                     error=error,
                 )
-                self._record_failure()
+                self._record_failure(state)
                 return
             self._executor = executor
         first_window_id = state.next_window_id
-        state.next_window_id += len(control_windows)
+        state.next_window_id += len(probe_windows) + len(control_windows)
         source_generation = state.source_generation
         previous = state.last_future
 
@@ -1006,9 +1049,30 @@ class RemoteFillCoordinator:
                     ),
                 )
                 results = []
+                for offset, pages in enumerate(probe_windows):
+                    result = session.probe_window(
+                        window_id=first_window_id + offset,
+                        source_generation=source_generation, control_pages=pages,
+                    )
+                    results.append(result)
+                    self._record_window_metrics(state, result)
+                    if not result.direct_satisfied:
+                        state.disabled_reason = result.reason
+                        if result.reason != "cached-prefix hole":
+                            self._record_failure(state)
+                        return tuple(results)
+                preparer = self.storage_manager.prepare_remote_fill_source
+                if len(control_windows) > 1 and batch.owners and all(
+                    callable(getattr(owner, "untyped_storage", None))
+                    for owner in batch.owners
+                ):
+                    preparer = self._source_preparer(
+                        len(control_windows), session.native_hard_timeout_seconds,
+                        as_future=True,
+                    )
                 windows = zip(control_windows, source_plans, strict=True)
                 for window_offset, (window_pages, source_plan) in enumerate(windows):
-                    window_id = first_window_id + window_offset
+                    window_id = first_window_id + len(probe_windows) + window_offset
                     chunk_start = min(page.chunk_start for page in window_pages)
                     chunk_end = max(page.chunk_end for page in window_pages)
                     window_tokens = chunk_end - chunk_start
@@ -1019,7 +1083,7 @@ class RemoteFillCoordinator:
                         source_plan=source_plan,
                         submitter=submitter,
                         activation_factory=activation_factory,
-                        preparer=self.storage_manager.prepare_remote_fill_source,
+                        preparer=preparer,
                     )
                     results.append(result)
                     if not result.direct_satisfied:
@@ -1028,7 +1092,7 @@ class RemoteFillCoordinator:
                             "cached-prefix hole",
                             "direct destination hole",
                         ):
-                            self._record_failure()
+                            self._record_failure(state)
                     self._record_window_metrics(state, result)
                     if serving_perf_enabled():
                         serving_perf_log(
@@ -1099,7 +1163,7 @@ class RemoteFillCoordinator:
                     reason=state.disabled_reason,
                     error=error,
                 )
-                self._record_failure()
+                self._record_failure(state)
                 metrics = self.get_metrics()
                 metrics.failure("prearm failure")
                 metrics.abandon("prearm failure")
@@ -1119,7 +1183,7 @@ class RemoteFillCoordinator:
                 reason=state.disabled_reason,
                 error=error,
             )
-            self._record_failure()
+            self._record_failure(state)
             return
         state.futures.append(future)
         state.last_future = future
@@ -1198,7 +1262,7 @@ class RemoteFillCoordinator:
         else:
             metrics.add_bytes("discarded_bytes", state.submitted_bytes)
         if terminal.direct_satisfied:
-            self.record_success()
+            self.record_success(state)
         elif terminal.outcome == "PERSISTENT_ONLY":
             log_remote_fill_diagnostic(
                 logger,
