@@ -7578,12 +7578,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dma_req_id = kwargs.get("req_id") if prefill_dma else None
         bound_loads = None
         plan_cache = source_cache = None
-        plan_mode = "full"
         reuse_debug = prefill_dma and not prefill_packet and prefill_reuse_debug_enabled(
             getattr(self, "_prefill_worker_id", -1)
         )
         if reuse_debug:
-            debug_phase_drops = debug_map_drops = 0
+            plan_mode = "full"
+            debug_map_drops = 0
             debug_reused = debug_rebuilt = debug_layers = 0
             debug_submit_ms = 0.0
             debug_layer_count = min(2, self._expected_group_layers(kv_group))
@@ -7603,14 +7603,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 plan_cache=plan_cache,
             )
             if plan_cache is not None:
-                reused_plans = sum(
-                    plan_cache[(kv_group, bank)].reused_chunks > 0
-                    for bank in range(len(dma_plans))
-                )
-                plan_mode = (
-                    "full" if reused_plans == 0 else
-                    "reuse" if reused_plans == len(dma_plans) else "mix"
-                )
+                if reuse_debug:
+                    reused_plans = sum(
+                        plan_cache[(kv_group, bank)].reused_chunks > 0
+                        for bank in range(len(dma_plans))
+                    )
+                    plan_mode = (
+                        "full" if reused_plans == 0 else
+                        "reuse" if reused_plans == len(dma_plans) else "mix"
+                    )
                 for bank in range(len(dma_plans)):
                     if plan_cache[(kv_group, bank)].mapping_changed:
                         for cache_key in tuple(bound_loads):
@@ -7967,7 +7968,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             n=len(starts),
                             l=debug_layers,
                             x=f"{debug_reused}/{debug_rebuilt}",
-                            drop=f"{debug_phase_drops}/{debug_map_drops}",
+                            map_drop=debug_map_drops,
                             plan=plan_mode,
                             ms=debug_submit_ms,
                         )

@@ -307,8 +307,8 @@ def test_reuse_debug_aggregates_actual_bind_and_fixed_map_drops_once_per_group()
     assert [fields["x"] for _, _, fields in logs] == [
         "0/4", "4/2", "6/2", "8/0", "0/8"
     ]
-    assert [fields["drop"] for _, _, fields in logs] == [
-        "0/0", "0/0", "0/0", "0/0", "0/2"
+    assert [fields["map_drop"] for _, _, fields in logs] == [
+        0, 0, 0, 0, 2
     ]
     assert [fields["p"] for _, _, fields in logs] == [8, 12, 16, 16, 16]
     assert [fields["plan"] for _, _, fields in logs] == [
@@ -617,7 +617,7 @@ def test_changed_bank_map_invalidates_only_its_bound_rows():
     cache = obj._prefill_dma_bound_loads["request"]
     bank_one = {key: value for key, value in cache.items() if key[2] == 1}
     submit(2, block_ids_by_bank=((1, 0, 2, 3), (0, 1, 2, 3)))
-    assert logs[-1][2]["drop"] == "0/1"
+    assert logs[-1][2]["map_drop"] == 1
     assert logs[-1][2]["plan"] == "mix"
     for key, value in bank_one.items():
         assert cache[key].rows is value.rows
@@ -633,7 +633,7 @@ def test_invalid_second_bank_preserves_first_bank_invalidation_for_retry():
         submit(2, block_ids_by_bank=((1, 0, 2, 3), (9, 1, 2, 3)))
     assert cache[(0, 0)] is first_bank
     submit(2, block_ids_by_bank=((1, 0, 2, 3), (0, 1, 2, 3)))
-    assert logs[-1][2]["drop"] == "0/1"
+    assert logs[-1][2]["map_drop"] == 1
     assert logs[-1][2]["plan"] == "mix"
 
 
