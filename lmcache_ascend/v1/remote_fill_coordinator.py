@@ -276,7 +276,10 @@ class RemoteFillCoordinator:
             allocation = result.reason in (
                 "direct destination hole",
                 "reservation rejected",
+                "probe rejected",
                 "producer backpressure",
+            ) and result.response_code in (
+                "", "RESOURCE_EXHAUSTED", "RESERVATION_REJECTED",
             )
             metrics.abandon(result.reason, allocation=allocation)
             if result.armed or result.reason == "native transfer failed":
@@ -301,6 +304,8 @@ class RemoteFillCoordinator:
                 action=("PAIRED_RESTART_REQUIRED" if fatal else "PERSISTENT_ONLY"),
                 transfer_id=(handoff.transfer_id if handoff is not None else None),
                 reason=str(result.reason),
+                response_code=result.response_code,
+                response_message=result.response_message,
                 memory_safety_uncertain=fatal,
                 severity="critical" if fatal else "warning",
             )
