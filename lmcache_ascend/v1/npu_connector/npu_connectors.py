@@ -2733,6 +2733,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         *,
         fallback_chunk_size: int,
     ) -> int:
+        get_shapes = getattr(memory_obj, "get_shapes", None)
+        if callable(get_shapes):
+            try:
+                shapes = get_shapes()
+            except (AssertionError, IndexError, RuntimeError, TypeError):
+                shapes = None
+            if shapes is not None and 0 <= layer_id < len(shapes):
+                return self._lmc_plane_num_tokens_from_shape(
+                    shapes[layer_id], kv_group, layer_id
+                )
         get_shape = getattr(memory_obj, "get_shape", None)
         if callable(get_shape):
             return self._lmc_plane_num_tokens_from_shape(

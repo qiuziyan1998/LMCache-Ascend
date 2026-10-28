@@ -4706,6 +4706,28 @@ def test_sparse_source_total_uses_pointer_span(monkeypatch) -> None:
     assert single == 1024
 
 
+def test_sparse_memory_obj_uses_layer_shape_for_page_packets(monkeypatch) -> None:
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    monkeypatch.setattr(
+        connector,
+        "_lmc_plane_num_tokens_from_shape",
+        lambda shape, kv_group, layer_id: int(shape[0]),
+    )
+    memory_obj = SimpleNamespace(
+        get_shape=lambda: (1300,),
+        get_shapes=lambda: [(130,), (130,)],
+    )
+    assert (
+        connector._sparse_memory_obj_num_tokens(
+            memory_obj,
+            1,
+            1,
+            fallback_chunk_size=1024,
+        )
+        == 130
+    )
+
+
 def test_sparse_selection_rebases_suffix_source() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     result = connector._prepare_sparse_selection_for_source(
