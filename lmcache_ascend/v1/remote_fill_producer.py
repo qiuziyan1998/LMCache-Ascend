@@ -223,6 +223,8 @@ class RemoteFillWindowResult:
     native_ended_monotonic: float = 0.0
     submitted_bytes: int = 0
     existing_pages: int = 0
+    response_code: str = ""
+    response_message: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +294,7 @@ class RemoteFillProducerMetrics:
             "cached_prefix_hole",
             "direct_destination_hole",
             "probe_control_unavailable",
+            "probe_rejected",
             "probe_result_invalid",
             "reserve_control_unavailable",
             "reservation_rejected",
@@ -766,6 +769,14 @@ class RemoteFillProducerSession:
                 reserve_seconds=reserve_seconds,
             )
         reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
+        # Early refusals create no window and legitimately have no page results.
+        # Refusals WITH results still participate in the FINISH manifest below.
+        if not reserved.page_results and not self._accepted(reserved):
+            self.direct_viable = False
+            return self._abandoned_window(
+                window_id, "probe rejected", response=reserved,
+                reserve_seconds=reserve_seconds,
+            )
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
@@ -775,6 +786,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "probe result invalid",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
             )
         self.window_manifests.append((window_id, digest))
@@ -788,6 +800,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "cached-prefix hole",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
                 existing_pages=existing_pages,
             )
@@ -883,6 +896,12 @@ class RemoteFillProducerSession:
             )
         reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
         descriptors = reserved.descriptors
+        if not reserved.page_results and not self._accepted(reserved):
+            self.direct_viable = False
+            return self._abandoned_window(
+                window_id, "reservation rejected", response=reserved,
+                reserve_seconds=reserve_seconds,
+            )
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
@@ -892,6 +911,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "reservation result invalid",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
             )
         self.window_manifests.append((window_id, digest))
@@ -900,6 +920,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "reservation rejected",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
             )
         existing_pages = sum(item is PageDisposition.EXISTING for item in dispositions)
@@ -1083,9 +1104,6 @@ class RemoteFillProducerSession:
                     "armed native transfer failed without terminal evidence"
                 ) from error
 
-        expected_bytes = sum(
-            descriptor.destination_length for descriptor in descriptors
-        )
         if native_error is None:
             if not isinstance(native_result, NativeDirectPushResult):
                 self.fatal_restart_required = True
@@ -1116,7 +1134,7 @@ class RemoteFillProducerSession:
             completed_bytes = int(native_result.transferred_bytes)
             if (
                 native_result.native_transfer_attempt_id != attempt_id
-                or completed_bytes != expected_bytes
+                or completed_bytes != submitted_bytes
             ):
                 return_code = -1
                 completed_bytes = 0
@@ -1181,7 +1199,7 @@ class RemoteFillProducerSession:
                     native_transfer_attempt_id=attempt_id,
                     native_return_code=return_code,
                     completed_bytes=completed_bytes,
-                    expected_bytes=expected_bytes,
+                    expected_bytes=submitted_bytes,
                 )
             except Exception as status_error:
                 self.fatal_restart_required = True
@@ -1634,6 +1652,8 @@ class RemoteFillProducerSession:
         window_id: int,
         reason: str,
         armed: bool = False,
+        *,
+        response: RemoteFillResponse | None = None,
         **metrics: Any,
     ) -> RemoteFillWindowResult:
         return RemoteFillWindowResult(
@@ -1641,6 +1661,8 @@ class RemoteFillProducerSession:
             direct_satisfied=False,
             armed=armed,
             reason=reason,
+            response_code=response.code.value if response is not None else "",
+            response_message=response.message if response is not None else "",
             **metrics,
         )
 

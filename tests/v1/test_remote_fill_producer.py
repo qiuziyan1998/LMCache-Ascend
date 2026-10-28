@@ -1663,8 +1663,13 @@ def test_probe_hole_latches_persistent_only_without_arm() -> None:
 
 
 @pytest.mark.parametrize("operation", ("probe", "transfer"))
+@pytest.mark.parametrize("code", (
+    ResultCode.RESOURCE_EXHAUSTED, ResultCode.RESERVATION_REJECTED,
+    ResultCode.WINDOW_CONFLICT,
+))
 def test_early_rejected_window_is_excluded_from_finish_manifest(
     operation: str,
+    code: ResultCode,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _ScriptedClient(
@@ -1677,7 +1682,7 @@ def test_early_rejected_window_is_excluded_from_finish_manifest(
         if isinstance(request, ReserveWindowRequest):
             client.requests.append(request)
             return client._response(
-                request, ResultCode.WINDOW_CONFLICT, message="window rejected"
+                request, code, message="window rejected"
             )
         if isinstance(request, FinishRequest):
             assert request.final_manifest_digest == transaction_manifest_digest(
@@ -1717,16 +1722,21 @@ def test_early_rejected_window_is_excluded_from_finish_manifest(
 
     assert not result.direct_satisfied
     assert result.reason == (
-        "probe result invalid"
+        "probe rejected"
         if operation == "probe"
-        else "reservation result invalid"
+        else "reservation rejected"
     )
+    assert result.response_code == code.value
+    assert result.response_message == "window rejected"
+    assert not session.prearm_control_unknown
     assert session.window_manifests == []
     assert terminal.outcome == "PERSISTENT_ONLY"
 
 
+@pytest.mark.parametrize("operation", ("probe", "transfer"))
 def test_malformed_accepted_reservation_aborts_unknown_control_state(
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     client = _ScriptedClient(
         reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
@@ -1741,22 +1751,54 @@ def test_malformed_accepted_reservation_aborts_unknown_control_state(
         return execute(request)
 
     monkeypatch.setattr(client, "execute", malformed_success)
-    result = session.probe_window(
-        window_id=0,
-        source_generation=44,
-        control_pages=_pages(),
-    )
+    args = dict(window_id=0, source_generation=44, control_pages=_pages())
+    if operation == "probe":
+        result = session.probe_window(**args)
+    else:
+        result = session.transfer_window(
+            **args, source_plan=_source_plan(),
+            submitter=lambda **_kw: pytest.fail("invalid success must not submit"),
+            activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+        )
     terminal = session.finish(
         required_store_end=1024,
         persistent_common_end=1024,
     )
 
     assert not result.direct_satisfied
+    assert result.reason == ("probe result invalid" if operation == "probe"
+                             else "reservation result invalid")
+    assert result.response_code == "OK"
     assert session.prearm_control_unknown
     assert session.window_manifests == []
     assert terminal.outcome == "PERSISTENT_ONLY"
     assert any(isinstance(item, AbortRequest) for item in client.requests)
     assert not any(isinstance(item, FinishRequest) for item in client.requests)
+
+
+@pytest.mark.parametrize("operation", ("probe", "transfer"))
+def test_rejected_prepared_window_remains_in_finish_manifest(operation):
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.MISSING)
+    )
+    session = _session(client)
+    args = dict(window_id=0, source_generation=44, control_pages=_pages())
+    if operation == "probe":
+        result = session.probe_window(**args)
+    else:
+        result = session.transfer_window(
+            **args, source_plan=_source_plan(),
+            submitter=lambda **_kw: pytest.fail("refused window must not submit"),
+            activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+        )
+    session.finish(required_store_end=1024, persistent_common_end=1024)
+    finish = next(item for item in client.requests if isinstance(item, FinishRequest))
+    assert session.window_manifests == [(0, manifest_digest(_pages()))]
+    assert finish.final_manifest_digest == transaction_manifest_digest(
+        session.manifest_digest_seed, tuple(session.window_manifests), 1024, 0
+    )
+    assert result.response_code == "RESERVATION_REJECTED"
+    assert not any(isinstance(item, ArmWindowRequest) for item in client.requests)
 
 
 def test_wrong_destination_dp_binding_is_rejected_before_arm() -> None:
@@ -3051,6 +3093,8 @@ def test_terminal_window_preserves_all_evidence(monkeypatch, return_code, mode):
         "native_ended_monotonic": 91.007,
         "submitted_bytes": 64,
         "existing_pages": 1,
+        "response_code": "",
+        "response_message": "",
     }
     assert session.direct_viable is (return_code == 0)
     assert len(reads) == (2 if mode == "0" else 8)
@@ -3115,6 +3159,57 @@ def _queued_batch():
         group_ends={0: 1024, 1: 1024},
         ranges=((0, 1024), (0, 1024)), ready_events=(object(),),
     )
+
+
+@pytest.mark.parametrize("code", (
+    ResultCode.RESOURCE_EXHAUSTED, ResultCode.RESERVATION_REJECTED,
+    ResultCode.WINDOW_CONFLICT,
+))
+def test_coordinator_logs_decoder_refusal_without_changing_circuit_policy(
+    monkeypatch, caplog, code,
+):
+    import json
+
+    engine, coordinator = _queued_coordinator()
+    coordinator.config.remote_fill_circuit_breaker_enabled = True
+    coordinator.config.remote_fill_circuit_breaker_failure_threshold = 3
+    coordinator.config.remote_fill_circuit_breaker_cooldown_sec = 60
+    client = _ScriptedClient(
+        reserve_dispositions=(), reject_on=ReserveWindowRequest,
+    )
+    execute = client.execute
+
+    def reply(request):
+        response = execute(request)
+        return msgspec.structs.replace(response, code=code) if isinstance(
+            request, ReserveWindowRequest
+        ) else response
+
+    monkeypatch.setattr(client, "execute", reply)
+    session = _session(client)
+    monkeypatch.setattr(coordinator, "_create_session", lambda *_args: session)
+    state = ProducerRequestState(handoff=_handoff())
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(coordinator, "_executor", executor, raising=False)
+        with caplog.at_level(logging.WARNING):
+            coordinator.submit_probe(
+                "request", state, _pages(), 1024, maximum=2, context=None,
+            )
+            coordinator.wait(state)
+    records = [json.loads(record.message.split("] ", 1)[1])
+               for record in caplog.records
+               if "LMCACHE_REMOTE_FILL_DIAGNOSTIC" in record.message]
+    assert len(records) == 1
+    assert records[0]["stage"] == "window_terminal"
+    assert records[0]["response_code"] == code.value
+    assert records[0]["response_message"] == "injected rejection"
+    assert records[0]["reason"] == state.disabled_reason == "probe rejected"
+    assert coordinator._circuit_failures == 1
+    assert coordinator._circuit_allows()
+    assert coordinator.metrics_snapshot()["allocation_rejection_total"] == (
+        {} if code is ResultCode.WINDOW_CONFLICT else {"probe_rejected": 1}
+    )
+    assert engine.storage_manager is coordinator.storage_manager
 
 
 @pytest.mark.parametrize("operation", ["probe", "batch"])
