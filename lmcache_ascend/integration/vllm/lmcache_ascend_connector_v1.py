@@ -178,6 +178,21 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             frontiers=frontiers,
         )
 
+    def prepare_warm_sparse_graph_step(
+        self,
+        metadata: Any,
+        target_layer_names: tuple[str, ...],
+        request_ids: tuple[str, ...],
+        frontiers: tuple[int, ...],
+    ) -> Any:
+        """Preview a warm worker-local graph step without starting transfers."""
+        prepare = getattr(self._lmcache_engine, "prepare_warm_sparse_graph_step", None)
+        return (
+            prepare(metadata, target_layer_names, request_ids, frontiers)
+            if callable(prepare)
+            else None
+        )
+
     def capture_live_source_event_handoff(self, forward_context: Any) -> bool:
         """Forward an armed post-forward producer event to the implementation."""
 
