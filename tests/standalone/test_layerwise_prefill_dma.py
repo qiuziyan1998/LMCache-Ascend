@@ -131,7 +131,6 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         node for node in cls.body
         if isinstance(node, ast.FunctionDef) and node.name in (
             "record_layerwise_prefill_bank_use", "_require_layerwise_prefill_bank_use",
-            "_prepare_layerwise_prefill_source_readiness",
             "wait_for_layerwise_prefill_source_publication",
             "_retain_unfenced_layerwise_prefill_load",
         )
@@ -245,7 +244,7 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         _prefill_dma_bound_loads={},
         _layerwise_prefill_load_owners={},
         _layerwise_prefill_load_request_events={},
-        _layerwise_prefill_bank=lambda layer, group, offset: (layer + offset) % 2,
+        _layerwise_prefill_bank=lambda layer, group: layer % 2,
         _layerwise_prefill_dma_stream=lambda group, bank: NS(
             wait_stream=lambda stream: None,
             wait_event=lambda event: None,
@@ -271,7 +270,7 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         for index in range(4)
     ]
 
-    def submit(count, *, offset=0, block_ids=(0, 1, 2, 3), block_ids_by_bank=None):
+    def submit(count, *, block_ids=(0, 1, 2, 3), block_ids_by_bank=None):
         starts = [4 * index for index in range(count)]
         generator = obj.run(
             starts, [start + 4 for start in starts],
@@ -281,13 +280,13 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
                 (block_ids, block_ids)
                 if block_ids_by_bank is None else block_ids_by_bank
             ),
-            prefill_dma_block_size=4, layerwise_prefill_bank_offset=offset,
+            prefill_dma_block_size=4,
         )
         next(generator)
         generator.send(owners[:count])
-        obj.record_layerwise_prefill_bank_use(0, 0, (offset,), npu.Event())
+        obj.record_layerwise_prefill_bank_use(0, 0, npu.Event())
         generator.send(owners[:count])
-        obj.record_layerwise_prefill_bank_use(1, 0, (offset,), npu.Event())
+        obj.record_layerwise_prefill_bank_use(1, 0, npu.Event())
         next(generator)
         generator.close()
 
@@ -296,20 +295,20 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
     return submit, logs, copies
 
 
-def test_reuse_debug_aggregates_actual_bind_and_phase_map_drops_once_per_group():
+def test_reuse_debug_aggregates_actual_bind_and_fixed_map_drops_once_per_group():
     submit, logs, _ = _reuse_debug_connector(True)
     submit(2)
     submit(3)
-    submit(4, offset=1)
     submit(4)
-    submit(4, offset=1, block_ids=(1, 0, 2, 3))
+    submit(4)
+    submit(4, block_ids=(1, 0, 2, 3))
 
     assert len(logs) == 5
     assert [fields["x"] for _, _, fields in logs] == [
-        "0/4", "4/2", "0/8", "6/2", "0/8"
+        "0/4", "4/2", "6/2", "8/0", "0/8"
     ]
-    assert [fields["drop"] for _, _, fields in logs] == [
-        "0/0", "0/0", "0/0", "0/0", "0/4"
+    assert [fields["map_drop"] for _, _, fields in logs] == [
+        0, 0, 0, 0, 2
     ]
     assert [fields["p"] for _, _, fields in logs] == [8, 12, 16, 16, 16]
     assert [fields["plan"] for _, _, fields in logs] == [
@@ -337,6 +336,35 @@ def test_reuse_debug_disabled_does_not_emit_or_change_dma_rows():
         [row[1:] for row in rows] for rows in enabled_copies
     ]
     assert logs == []
+
+
+def test_hash_probe_borrows_p_load_event_after_dma_submission():
+    events = []
+
+    class Event:
+        def record(self, stream):
+            self.recorded = True
+
+        def synchronize(self):
+            raise AssertionError("serving thread must not wait for debug hashes")
+
+    npu = NS(Event=Event, current_stream=lambda: None,
+             stream=lambda stream: nullcontext())
+    submit, _, copies = _reuse_debug_connector(False, npu=npu)
+    obj = submit.connector
+    obj.kv_trace = object()
+    obj.trace_cpu_kv = lambda *a, **kw: pytest.fail("P CPU hash ran on serving thread")
+
+    def enqueue(req, group, starts, ends, owners, layer, ready):
+        assert len(copies) == layer + 1
+        assert ready.recorded
+        registered = obj._layerwise_prefill_transfer_state()[3]
+        assert ready is registered[(group, layer)]["request"][1]
+        events.append(ready)
+
+    obj.enqueue_load_kv_trace = enqueue
+    submit(2)
+    assert len(events) == 2
 
 
 def _assert_plan_equal(actual, expected):
@@ -584,12 +612,12 @@ def test_replaced_source_generation_rebinds_every_address_with_same_slots():
 def test_changed_bank_map_invalidates_only_its_bound_rows():
     submit, logs, _ = _reuse_debug_connector(True)
     submit(2)
-    submit(2, offset=1)
+    submit(2)
     obj = submit.connector
     cache = obj._prefill_dma_bound_loads["request"]
     bank_one = {key: value for key, value in cache.items() if key[2] == 1}
     submit(2, block_ids_by_bank=((1, 0, 2, 3), (0, 1, 2, 3)))
-    assert logs[-1][2]["drop"] == "0/2"
+    assert logs[-1][2]["map_drop"] == 1
     assert logs[-1][2]["plan"] == "mix"
     for key, value in bank_one.items():
         assert cache[key].rows is value.rows
@@ -598,14 +626,14 @@ def test_changed_bank_map_invalidates_only_its_bound_rows():
 def test_invalid_second_bank_preserves_first_bank_invalidation_for_retry():
     submit, logs, _ = _reuse_debug_connector(True)
     submit(2)
-    submit(2, offset=1)
+    submit(2)
     cache = submit.connector._prefill_dma_plan_cache["request"]
     first_bank = cache[(0, 0)]
     with pytest.raises(ValueError, match="exceeds NPU bank"):
         submit(2, block_ids_by_bank=((1, 0, 2, 3), (9, 1, 2, 3)))
     assert cache[(0, 0)] is first_bank
     submit(2, block_ids_by_bank=((1, 0, 2, 3), (0, 1, 2, 3)))
-    assert logs[-1][2]["drop"] == "0/2"
+    assert logs[-1][2]["map_drop"] == 1
     assert logs[-1][2]["plan"] == "mix"
 
 
@@ -621,7 +649,8 @@ def test_request_release_and_generation_reset_clear_incremental_metadata():
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                and node.name == "VLLMPagedMemLayerwiseNPUConnector")
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef)
-               and node.name in ("release_layerwise_prefill_dma_cache",
+               and node.name in ("wait_for_layerwise_prefill_stores",
+                                 "release_layerwise_prefill_dma_cache",
                                  "reset_layerwise_prefill_transfer_state")]
     ns = {}
     future = ast.ImportFrom(
@@ -630,6 +659,9 @@ def test_request_release_and_generation_reset_clear_incremental_metadata():
     exec(compile(ast.fix_missing_locations(ast.Module(
         body=[future, *methods], type_ignores=[]
     )), str(path), "exec"), ns)
+    obj.wait_for_layerwise_prefill_stores = MethodType(
+        ns["wait_for_layerwise_prefill_stores"], obj
+    )
     release = MethodType(ns["release_layerwise_prefill_dma_cache"], obj)
     reset = MethodType(ns["reset_layerwise_prefill_transfer_state"], obj)
     released = []
@@ -717,7 +749,7 @@ class _AsyncNPU:
             self.current = previous
 
 
-def _async_bank_connector(group, offset, bank_count=2, layers=4):
+def _async_bank_connector(group, bank_count=2, layers=4):
     packet = group == "c8"
     group = 1 if packet else group
     npu = _AsyncNPU()
@@ -743,7 +775,7 @@ def _async_bank_connector(group, offset, bank_count=2, layers=4):
     obj.kvcaches = [(torch.zeros((bank_count * 4, 4, 2)),) for _ in range(layers)]
     obj._layerwise_prefill_transfer_state()[0][group] = bank_count
     obj._layerwise_prefill_bank = (
-        lambda layer, group, phase: (layer + phase) % bank_count
+        lambda layer, group: layer % bank_count
     )
     obj._layerwise_prefill_dma_stream = lambda group, bank: banks[bank]
     obj.test_prefill_packet = packet
@@ -766,7 +798,7 @@ def _async_bank_connector(group, offset, bank_count=2, layers=4):
             prefill_dma_block_ids_by_bank=tuple(
                 tuple(range(bank * 4, bank * 4 + 4)) for bank in range(bank_count)
             ),
-            prefill_dma_block_size=4, layerwise_prefill_bank_offset=offset,
+            prefill_dma_block_size=4,
             layerwise_prefill_bank_count=bank_count,
             prefill_c8_memory_objs=[submit.owners[:chunk + 1]] * layers,
         )
@@ -779,20 +811,20 @@ def _async_bank_connector(group, offset, bank_count=2, layers=4):
         return generator, load
 
     def read(chunk, layer):
-        bank = banks[(layer + offset) % bank_count]
+        bank = banks[layer % bank_count]
 
         def verify():
             assert contents[bank] == (chunk, layer), "KV bank overwritten early"
             observed.append((chunk, layer))
 
-        obj.wait_for_layerwise_prefill_load(layer, group, offset)
+        obj.wait_for_layerwise_prefill_load(layer, group)
         npu.compute.enqueue(verify)
         event = npu.Event()
         event.record(npu.compute)
-        obj.record_layerwise_prefill_bank_use(layer, group, (offset,), event)
+        obj.record_layerwise_prefill_bank_use(layer, group, event)
 
     def save(layer):
-        obj.save(layer, group, (layer + offset) % bank_count, npu.compute)
+        obj.save(layer, group, layer % bank_count, npu.compute)
 
     return NS(
         npu=npu, banks=banks, contents=contents, observed=observed,
@@ -800,14 +832,14 @@ def _async_bank_connector(group, offset, bank_count=2, layers=4):
     )
 
 
-@pytest.mark.parametrize("bank_count", [1, 3, 8])
+@pytest.mark.parametrize("bank_count", [1, 3, 4, 8])
 @pytest.mark.parametrize("group", [0, 1, "c8"])
 @pytest.mark.parametrize("has_save", [False, True])
 def test_configurable_bank_dma_rotation_never_overwrites_pending_compute(
     bank_count, group, has_save,
 ):
     layers = 19
-    api = _async_bank_connector(group, bank_count - 1, bank_count, layers)
+    api = _async_bank_connector(group, bank_count, layers)
     for chunk in range(3):
         generator, load = api.start(chunk)
         for layer in range(min(bank_count, layers)):
@@ -830,30 +862,38 @@ def test_configurable_bank_dma_rotation_never_overwrites_pending_compute(
         assert sorted(api.saved) == expected
 
 
-def test_eight_bank_source_readiness_includes_the_last_bank_producer():
-    api = _async_bank_connector(0, 7, bank_count=8)
-    published = []
+@pytest.mark.parametrize("bank_count", [2, 4, 8])
+@pytest.mark.parametrize("group", [0, 1, "c8"])
+def test_fixed_bank_load_does_not_join_other_banks_previous_saves(bank_count, group):
+    api = _async_bank_connector(group, bank_count=bank_count, layers=bank_count + 1)
+    kv_group = 1 if group == "c8" else group
+    saved = []
     tails = {}
-    for bank_id, stream in enumerate(api.banks):
-        stream.enqueue(lambda bank_id=bank_id: published.append(bank_id))
+    for bank, stream in enumerate(api.banks):
+        stream.enqueue(lambda bank=bank: saved.append(bank))
         event = api.npu.Event()
         event.record(stream)
-        tails[(0, bank_id)] = (0, event, bank_id, "previous chunk")
+        tails[(kv_group, bank)] = (0, event, bank, "previous chunk")
     api.connector._layerwise_prefill_bank_tail_events = tails
-    api.connector._prepare_layerwise_prefill_source_readiness(0)
-    seen = []
-    api.banks[5].enqueue(lambda: seen.extend(sorted(published)))
-    assert published == seen == []
-    api.banks[5].tail.run()
-    assert seen == list(range(8))
+
+    generator, load = api.start(0)
+    load(0)
+    api.read(0, 0)
+    assert saved == api.observed == []
+    # Run the actual consumer first. Its load follows its own earlier D2H,
+    # while independent banks must remain pending, not indirectly drained.
+    api.npu.compute.tail.run()
+    assert saved == [0]
+    assert api.observed == [(0, 0)]
+    assert all(not stream.tail.done for stream in api.banks[1:])
+    generator.close()
 
 
 @pytest.mark.parametrize("group", [0, 1, "c8"])
-@pytest.mark.parametrize("offset", [0, 1])
 @pytest.mark.parametrize("has_save", [False, True])
-def test_dma_bank_reuse_protects_pending_reads_across_chunks(group, offset, has_save):
+def test_dma_bank_reuse_protects_pending_reads_across_chunks(group, has_save):
     """Drive DMA ahead of compute, including passive TP ranks without D2H."""
-    api = _async_bank_connector(group, offset)
+    api = _async_bank_connector(group)
     for chunk in range(3):
         generator, load = api.start(chunk)
         load(0)
@@ -878,11 +918,97 @@ def test_dma_bank_reuse_protects_pending_reads_across_chunks(group, offset, has_
         assert sorted(api.saved) == expected
 
 
+@pytest.mark.parametrize("bank_count", [2, 4, 8])
+@pytest.mark.parametrize("group", [0, 1])
+def test_mixed_requests_join_all_loads_before_read_and_bank_reuse(bank_count, group):
+    """Four requests share bank streams, with a separate completion event per request."""
+    npu = _AsyncNPU()
+    streams = [_AsyncStream() for _ in range(bank_count)]
+    request_ids = tuple(f"request-{i}" for i in range(4))
+    layers = 2 * bank_count + 1
+    storage, saved, observed = {}, {}, []
+    pending = []
+
+    def copy(_rows, to_cpu):
+        req, layer = pending.pop()
+        bank = layer % bank_count
+        assert npu.current_stream() is streams[bank]
+        if to_cpu:
+            streams[bank].enqueue(
+                lambda: saved.__setitem__((req, layer), storage[(req, bank)])
+            )
+        else:
+            streams[bank].enqueue(lambda: storage.__setitem__((req, bank), layer))
+
+    submit, _, _ = _reuse_debug_connector(False, npu=npu, copy_hook=copy, layers=layers)
+    obj = submit.connector
+    obj.kvcaches = [(torch.zeros((4 * bank_count, 4, 2)),) for _ in range(layers)]
+    obj._layerwise_prefill_transfer_state()[0][group] = bank_count
+    obj._layerwise_prefill_bank = (
+        lambda layer, group: layer % bank_count
+    )
+    obj._layerwise_prefill_dma_stream = lambda group, bank: streams[bank]
+    generators = []
+    for req, request_id in enumerate(request_ids):
+        generator = obj.run(
+            [0], [4], slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
+            kv_group=group, req_id=request_id, deferred_layerwise_get=True,
+            prefill_dma_block_ids_by_bank=tuple(
+                (req * bank_count + bank,) for bank in range(bank_count)
+            ),
+            prefill_dma_block_size=4,
+            layerwise_prefill_bank_count=bank_count,
+        )
+        next(generator)
+        generators.append(generator)
+        for layer in range(bank_count):
+            pending.append((req, layer))
+            generator.send(submit.owners[:1])
+
+    for layer in range(layers):
+        registered = obj._layerwise_prefill_transfer_state()[3][group, layer]
+        assert set(registered) == set(request_ids)
+        waiting = []
+        original_wait = npu.compute.wait_event
+        npu.compute.wait_event = lambda event: (waiting.append(event), original_wait(event))
+        try:
+            obj.wait_for_layerwise_prefill_load(layer, group, request_ids=request_ids)
+        finally:
+            npu.compute.wait_event = original_wait
+        assert waiting == [registered[r][1] for r in request_ids]
+
+        def read(layer=layer):
+            for req, request_id in enumerate(request_ids):
+                assert storage[(req, layer % bank_count)] == layer
+                observed.append((req, layer))
+
+        npu.compute.enqueue(read)
+        event = npu.Event()
+        event.record(npu.compute)
+        obj.record_layerwise_prefill_bank_use(layer, group, event)
+        for req, request_id in enumerate(request_ids):
+            pending.append((req, layer))
+            obj.save(layer, group, layer % bank_count, npu.compute)
+        if layer + bank_count < layers:
+            for req, generator in enumerate(generators):
+                pending.append((req, layer + bank_count))
+                generator.send(submit.owners[:1])
+    for generator in generators:
+        next(generator)
+        generator.close()
+
+    assert not saved and not observed  # Only enqueued, never host-synchronized.
+    for stream in reversed(streams):
+        stream.tail.run()
+    npu.compute.tail.run()
+    assert len(observed) == 4 * layers
+    assert saved == {(req, layer): layer for req in range(4) for layer in range(layers)}
+
+
 @pytest.mark.parametrize("group", [0, 1, "c8"])
-@pytest.mark.parametrize("offset", [0, 1])
 @pytest.mark.parametrize("has_save", [False, True])
-def test_dma_handoff_does_not_wait_for_next_layer_compute(group, offset, has_save):
-    api = _async_bank_connector(group, offset)
+def test_dma_handoff_does_not_wait_for_next_layer_compute(group, has_save):
+    api = _async_bank_connector(group)
     generator, load = api.start(0)
     load(0)
     load(1)
@@ -894,9 +1020,9 @@ def test_dma_handoff_does_not_wait_for_next_layer_compute(group, offset, has_sav
     load(2)  # N+1 entry, before its bank wait and compute are submitted.
     api.read(0, 1)
     assert api.observed == []
-    api.banks[offset].tail.run()
+    api.banks[0].tail.run()
     assert api.observed == [(0, 0)]
-    assert api.contents[api.banks[offset]] == (0, 2)
+    assert api.contents[api.banks[0]] == (0, 2)
     assert api.saved == ([(0, 0)] if has_save else [])
     assert later_compute == []  # Neither save nor load resnapshots compute.
     # The other bank's layer can remain in flight while this H2D completes.
@@ -911,7 +1037,7 @@ def test_dma_handoff_does_not_wait_for_next_layer_compute(group, offset, has_sav
 
 @pytest.mark.parametrize("group", [0, "c8"])
 def test_missing_or_stale_bank_handoff_rejects_save_and_load(group):
-    api = _async_bank_connector(group, 0)
+    api = _async_bank_connector(group)
     generator, load = api.start(0)
     load(0)
     load(1)
@@ -925,62 +1051,45 @@ def test_missing_or_stale_bank_handoff_rejects_save_and_load(group):
         api.save(2)
 
 
-def test_mixed_phase_handoff_fences_both_banks_without_host_wait():
-    api = _async_bank_connector(0, 0)
+def test_fixed_handoff_fences_only_selected_bank_without_host_wait():
+    api = _async_bank_connector(0)
     completed = []
     api.npu.compute.enqueue(lambda: completed.append("KV access"))
     event = api.npu.Event()
     event.record(api.npu.compute)
-    api.connector.record_layerwise_prefill_bank_use(0, 0, (0, 1, 1), event)
+    api.connector.record_layerwise_prefill_bank_use(0, 0, event)
     api.npu.compute.enqueue(lambda: completed.append("later compute"))
     assert completed == []
-    for bank in api.banks:
-        bank.tail.run()
+    assert api.banks[1].tail is None
+    api.banks[0].tail.run()
     assert completed == ["KV access"]
 
 
 @pytest.mark.parametrize("bank_count", [2, 4, 8])
 @pytest.mark.parametrize("group", [0, 1])
 def test_partial_bank_load_still_fences_cache_miss_d2h(bank_count, group):
-    """A hit on one bank must not let another request overwrite a pending save."""
-    api = _async_bank_connector(group, 0, bank_count=bank_count, layers=bank_count + 1)
+    """A and B share bank 0; B has a pending save but no prefix load."""
+    api = _async_bank_connector(group, bank_count=bank_count, layers=bank_count + 1)
     obj = api.connector
-    old_layer, next_layer = 0, bank_count
-    contents = {bank: old_layer for bank in range(bank_count)}
+    contents = {"hit": "old A", "miss": "old B"}
     saved = []
-    tails = {}
-    # Only bank 0 loads a prefix. Other phases have cache-miss requests whose
-    # N-layer D2H can still be executing when N+B wants to write their slots.
-    api.banks[0].enqueue()
+    api.banks[0].enqueue(lambda: saved.append(contents["miss"]))
+    api.banks[0].enqueue(lambda: contents.update(hit="loaded A"))
     loaded = api.npu.Event()
     loaded.record(api.banks[0])
-    obj._layerwise_prefill_transfer_state()[3][(group, next_layer, 0)] = (0, loaded)
-    for bank in range(1, bank_count):
-        api.banks[bank].enqueue(
-            lambda bank=bank: saved.append((bank, contents[bank]))
-        )
-        done = api.npu.Event()
-        done.record(api.banks[bank])
-        tails[(group, bank)] = (0, done, old_layer, f"miss-{bank}")
-    obj._layerwise_prefill_bank_tail_events = tails
-    obj.wait_for_layerwise_prefill_load(next_layer, group, None)
-    api.npu.compute.enqueue(
-        lambda: contents.update(dict.fromkeys(contents, next_layer))
-    )
-    assert saved == [] and set(contents.values()) == {old_layer}
-    # Execute the consumer as early as possible; no host wait or convenient
-    # completion of the save streams may mask a missing device dependency.
+    obj._layerwise_prefill_transfer_state()[3][group, bank_count] = {"hit": (0, loaded)}
+    obj.wait_for_layerwise_prefill_load(bank_count, group, request_ids=("hit", "miss"))
+    api.npu.compute.enqueue(lambda: contents.update(miss="new B"))
+    assert saved == []
     api.npu.compute.tail.run()
-    for stream in api.banks:
-        stream.tail.run()
-    assert sorted(saved) == [(bank, old_layer) for bank in range(1, bank_count)]
-    assert set(contents.values()) == {next_layer}
+    assert saved == ["old B"]
+    assert contents == {"hit": "loaded A", "miss": "new B"}
 
 
 @pytest.mark.parametrize("bank_count", [4, 8])
 @pytest.mark.parametrize("group", [0, 1])
-def test_mixed_phase_wait_leaves_unused_bank_saves_asynchronous(bank_count, group):
-    api = _async_bank_connector(group, 0, bank_count=bank_count, layers=bank_count + 1)
+def test_fixed_wait_leaves_other_bank_saves_asynchronous(bank_count, group):
+    api = _async_bank_connector(group, bank_count=bank_count, layers=bank_count + 1)
     obj = api.connector
     saved = []
     tails = {}
@@ -990,21 +1099,20 @@ def test_mixed_phase_wait_leaves_unused_bank_saves_asynchronous(bank_count, grou
         done.record(stream)
         tails[(group, bank)] = (0, done, 0, f"request-{bank}")
     obj._layerwise_prefill_bank_tail_events = tails
-    obj.wait_for_layerwise_prefill_load(bank_count, group, bank_offsets=(0, 1, 1))
+    obj.wait_for_layerwise_prefill_load(bank_count, group)
     observed = []
     api.npu.compute.enqueue(lambda: observed.extend(saved))
     api.npu.compute.tail.run()
-    assert observed == [0, 1]
-    assert all(not stream.tail.done for stream in api.banks[2:])
+    assert observed == [0]
+    assert all(not stream.tail.done for stream in api.banks[1:])
 
 
-@pytest.mark.parametrize("phase_flip", [False, True])
 @pytest.mark.parametrize("completed_bank", [None, 0, 1])
 @pytest.mark.parametrize("packet", [False, True])
 def test_early_cpu_page_read_waits_previous_producer_on_either_bank(
-    phase_flip, completed_bank, packet,
+    completed_bank, packet,
 ):
-    """Prior D2H can lag compute; phase-flipped H2D must not read that page."""
+    """Prior D2H can lag compute; next-chunk H2D must not read that page early."""
     npu = _AsyncNPU()
     banks = [_AsyncStream(), _AsyncStream()]
     contents = {}
@@ -1036,12 +1144,12 @@ def test_early_cpu_page_read_waits_previous_producer_on_either_bank(
         obj._prepare_prefill_c8_packets = lambda **kwargs: []
         obj._submit_prefill_c8_packet = lambda prepared, layer, bank, stream, direction: copy(None, direction)
 
-    def start(step, offset):
+    def start(step):
         generator = obj.run(
             [0], [4], slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
             kv_group=1, req_id="request", deferred_layerwise_get=True,
             prefill_dma_block_ids_by_bank=((0, 1, 2, 3), (4, 5, 6, 7)),
-            prefill_dma_block_size=4, layerwise_prefill_bank_offset=offset,
+            prefill_dma_block_size=4,
             prefill_c8_memory_objs=[submit.owners[:1]] * 4,
         )
         next(generator)
@@ -1049,13 +1157,13 @@ def test_early_cpu_page_read_waits_previous_producer_on_either_bank(
             context.update(step=step, layer=layer)
             generator.send(submit.owners[:1])
         def read(layer):
-            obj.wait_for_layerwise_prefill_load(layer, 1, offset)
+            obj.wait_for_layerwise_prefill_load(layer, 1)
             event = npu.Event()
             event.record(npu.compute)
-            obj.record_layerwise_prefill_bank_use(layer, 1, (offset,), event)
+            obj.record_layerwise_prefill_bank_use(layer, 1, event)
         return generator, load, read
 
-    previous, load, read = start(0, 0)
+    previous, load, read = start(0)
     load(0)
     load(1)
     for layer in range(4):
@@ -1074,25 +1182,14 @@ def test_early_cpu_page_read_waits_previous_producer_on_either_bank(
     if completed_bank is not None:
         banks[completed_bank].tail.run()
 
-    offset = int(phase_flip)
-    current, load, read = start(1, offset)
+    current, load, read = start(1)
     load(0)
     load(1)
     read(0)
     load(2)
-    banks[offset].tail.run()
-    assert cpu[2] == contents[banks[offset]] == (0, 2)
+    banks[0].tail.run()
+    assert cpu[2] == contents[banks[0]] == (0, 2)
     current.close()
-
-
-def test_source_readiness_without_saves_adds_no_bank_work():
-    submit, _, _ = _reuse_debug_connector(False)
-    obj = submit.connector
-    obj._layerwise_prefill_dma_stream = lambda *args: pytest.fail("no producer to fence")
-    obj._prepare_layerwise_prefill_source_readiness(1)
-    # An earlier reset generation is already drained and must not be rejoined.
-    obj._layerwise_prefill_bank_tail_events = {(1, 0): (-1, object(), 0, "old")}
-    obj._prepare_layerwise_prefill_source_readiness(1)
 
 
 def _rank0_publication_boundary(connector, messages):
@@ -1119,6 +1216,8 @@ def _rank0_publication_boundary(connector, messages):
         kv_group=1, compact_batch=object(), mem_objs_layer=[], handles_by_layer=[],
         req_id="request", phase="prefill", request_ordinal=0, location="LocalCPUBackend",
         remote_fill_plan=None, remote_fill_load=False,
+        kv_hash_enabled=lambda: False,
+        audit_enabled=lambda: False,
         _RemoteFillMaterializationError=RuntimeError,
         SharedHandleEnvelope=lambda **kwargs: NS(**kwargs),
     )
@@ -1163,7 +1262,7 @@ def test_passive_cpu_load_observes_rank0_producer_before_handle_publication(alre
         [0], [4], slot_mapping=torch.empty(0, dtype=torch.long), sync=True,
         kv_group=1, req_id="passive", deferred_layerwise_get=True,
         prefill_dma_block_ids_by_bank=((0, 1, 2, 3), (4, 5, 6, 7)),
-        prefill_dma_block_size=4, layerwise_prefill_bank_offset=0,
+        prefill_dma_block_size=4,
     )
     next(generator)
     generator.send(passive.owners[:1])

@@ -61,10 +61,22 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
+    mooncake_page_key,
     mooncake_page_layout_enabled,
     mooncake_payload_layout,
 )
 from lmcache.v1.prefill_metadata import PrefillMetadataPlan
+from lmcache.v1.prefill_audit import audit_enabled, audit_record
+from lmcache.v1.prefill_kv_hash import (
+    kv_hash_enabled,
+    skip_kv_hash,
+    submit_kv_hash,
+)
+from lmcache.v1.prefill_store_debug import (
+    prefill_store_allocator_snapshot,
+    prefill_store_debug_enabled,
+    prefill_store_debug_log,
+)
 from lmcache.v1.remote_fill import (
     ControlPage,
     log_remote_fill_diagnostic,
@@ -1763,7 +1775,10 @@ class AscendLMCacheEngine(LMCacheEngine):
     def poll_layerwise_prefill_puts(
         self, *, final: bool = False, req_ids: Optional[Iterable[str]] = None
     ) -> None:
-        """Poll CPU-page persistence, or fence it before final handoff/teardown."""
+        """Poll persistence, or fence persistence and D2H before final reuse."""
+        if final and req_ids is not None:
+            # Both the remote queue and the DMA fence consume this selection.
+            req_ids = tuple(req_ids)
         queue = getattr(self, "_layerwise_put_queue", None)
         if queue is not None:
             if not final:
@@ -1772,6 +1787,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 queue.drain()
             else:
                 queue.drain_requests(req_ids)
+        if final:
+            # LocalCPUBackend also permits async D2H, independently of
+            # store_async, but has no remote put future to fence those reads.
+            wait_stores = getattr(
+                getattr(self, "gpu_connector", None),
+                "wait_for_layerwise_prefill_stores",
+                None,
+            )
+            if wait_stores is not None:
+                wait_stores(req_ids)
 
     def _dense_retrieve_token_results(
         self,
@@ -4463,9 +4488,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         The dense prefill DMA path already records per-layer D2H events.  A
         local CPU backend only installs the MemoryObj pointer, so subsequent
         same-process H2D is protected by those layer events.  Page-first
-        storage additionally forwards the events to the external-page
-        backend.  Legacy tensor puts to a remote backend have no readiness
-        argument and must keep the synchronous drain.
+        storage forwards the events to the external-page backend, including
+        flat-object fallbacks when merged-page allocation fails. Outside page
+        mode, ordinary remote puts still require the synchronous drain.
         """
         cache = getattr(self, "_layerwise_prefill_async_store_support", None)
         if cache is None:
@@ -4491,6 +4516,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             supported = bool(
                 callable(supports_pages)
                 and supports_pages(location=self.store_location)
+                and callable(
+                    getattr(storage_manager, "batched_put_layerwise_objects", None)
+                )
             )
             cache[cache_key] = supported
             return supported
@@ -5346,8 +5374,33 @@ class AscendLMCacheEngine(LMCacheEngine):
             self.storage_manager.batched_get_external_pages(
                 pages, ptrs, sizes, owners, req_id
             )
+            if audit_enabled():
+                try:
+                    self.gpu_connector.audit_direct_indexer_import(
+                        req_id,
+                        [
+                            mooncake_page_key(key, len(keys_layer_major))
+                            for key in pages
+                        ],
+                        ptrs, sizes, owners,
+                    )
+                except Exception as audit_error:
+                    audit_record("coverage", stage="get_npu", req=req_id,
+                                 error="direct_readback_unavailable",
+                                 detail=type(audit_error).__name__)
+            if kv_hash_enabled():
+                trace = getattr(self.gpu_connector, "trace_direct_kv", None)
+                if callable(trace):
+                    trace(req_id, 1, kvcaches, slot_mapping, starts, ends)
             if not retrieve_kwargs.get("_defer_direct_load_readiness", False):
                 consume(record())
+            if (
+                kv_hash_enabled()
+                and self.metadata.is_first_rank()
+                and not self._force_layerwise_prefill_store
+                and not getattr(self.gpu_connector, "uses_token_byte_features", False)
+            ):
+                skip_kv_hash("D", req_id, 1, "direct_npu_not_observed")
             return True
         except Exception as exc:
             if isinstance(exc, NativeExternalPageTransferUnknownError):
@@ -6923,6 +6976,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
         store_result.request_id = req_id
+        store_debug = (
+            self._force_layerwise_prefill_store and prefill_store_debug_enabled()
+        )
 
         metadata_skip = (
             kwargs.get("_prefill_skip_tokens")
@@ -7127,6 +7183,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 for page in page_batch:
                     page.ref_count_down()
                 raise RuntimeError("Layer-page allocation returned wrong page count")
+            if page_batch is None and store_debug:
+                prefill_store_debug_log(
+                    "bulk_retry",
+                    req_id,
+                    kv_group,
+                    start=pending_chunks[0][0],
+                    end=pending_chunks[-1][1],
+                    chunks=len(pending_chunks),
+                )
 
         legacy_suffix = False
         for chunk_index, (start, end, key, keys_multi_layer) in enumerate(
@@ -7169,6 +7234,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                 else:
                     legacy_suffix = True
+                    if store_debug:
+                        prefill_store_debug_log(
+                            "page_single_none",
+                            req_id,
+                            kv_group,
+                            start=start,
+                            end=end,
+                            **prefill_store_allocator_snapshot(local),
+                        )
             if (
                 memory_objs_multi_layer is None
                 and legacy_suffix
@@ -7222,6 +7296,15 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             if memory_objs_multi_layer is None:
                 if self._force_layerwise_prefill_store:
+                    if store_debug:
+                        prefill_store_debug_log(
+                            "alloc_failed",
+                            req_id,
+                            kv_group,
+                            error=True,
+                            start=start,
+                            end=end,
+                        )
                     for obj in {
                         id(item): item
                         for layer_objs in memory_objs
@@ -7625,18 +7708,82 @@ class AscendLMCacheEngine(LMCacheEngine):
                     if callable(fences_fn):
                         layerwise_store_fences = tuple(fences_fn(kv_group))
 
+                if self._force_layerwise_prefill_store and kv_hash_enabled():
+                    hash_fences = layerwise_store_fences
+                    if async_layerwise_store and not hash_fences:
+                        hash_fences = tuple(
+                            self.gpu_connector.layerwise_prefill_store_fences(kv_group)
+                        )
+                    if async_layerwise_store and not hash_fences:
+                        if getattr(
+                            self.gpu_connector, "uses_token_byte_features", False
+                        ):
+                            trace = getattr(self.gpu_connector, "kv_trace", None)
+                            if trace is not None:
+                                trace.error(
+                                    req_id,
+                                    "P_CPU_STORE",
+                                    "missing_producer_fence",
+                                    group=kv_group,
+                                )
+                        else:
+                            skip_kv_hash(
+                                "S", req_id, kv_group, "missing_producer_fence"
+                            )
+                    else:
+                        trace = getattr(
+                            self.gpu_connector, "enqueue_store_kv_trace", None
+                        )
+                        if callable(trace):
+                            trace(
+                                req_id, kv_group, starts, ends, memory_objs, hash_fences
+                            )
+                        hash_ready = submit_kv_hash(
+                            "S",
+                            req_id,
+                            kv_group,
+                            starts,
+                            ends,
+                            memory_objs,
+                            int(self.config.chunk_size),
+                            producer_events=hash_fences,
+                            feature_mode=getattr(
+                                self.gpu_connector, "uses_token_byte_features", False
+                            ),
+                        )
+                        if hash_ready is not None:
+                            # The existing Mooncake background worker waits
+                            # for the pre-store CPU hash, after the bank DMAs.
+                            layerwise_store_fences += (hash_ready,)
+
                 if page_first_store:
                     async_pages = bool(
                         self._force_layerwise_prefill_store
                         and page_store
-                        and str(self.config.remote_url or "").startswith("mooncakestore://")
-                        and all(isinstance(obj, LayerPageMemoryObj) for obj in memory_objs[0])
+                        and str(self.config.remote_url or "").startswith(
+                            "mooncakestore://"
+                        )
+                        and (
+                            async_layerwise_store
+                            or all(
+                                isinstance(obj, LayerPageMemoryObj)
+                                for obj in memory_objs[0]
+                            )
+                        )
                     )
-                    batch_bytes = sum(obj.get_size() for obj in memory_objs[0]) if async_pages else 0
+                    # Flat fallbacks own one object per layer; merged pages
+                    # appear in every row. Charge each physical object once.
+                    batch_bytes = (
+                        sum(obj.get_size() for obj in pending_store_release.values())
+                        if async_pages
+                        else 0
+                    )
                     if async_pages:
                         if self._layerwise_put_queue is None:
                             self._layerwise_put_queue = LayerwisePutQueue(
-                                max_bytes=int(self.config.remote_fill_max_inflight_bytes),
+                                max_bytes=int(
+                                    self.config.remote_fill_max_inflight_bytes
+                                ),
                                 # A compute batch produces one put per DSA group.
                                 max_batches=2 * (self._store_queue_maxsize or 2),
                                 timeout=float(self.config.blocking_timeout_secs),
@@ -7647,8 +7794,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                         and self.config.enable_remote_lmcache_store
                     ):
                         self._queue_layerwise_cpu_fill(
-                            req_id, request_configs, kv_group,
-                            keys[0], memory_objs[0], starts, ends,
+                            req_id,
+                            request_configs,
+                            kv_group,
+                            keys[0],
+                            memory_objs[0],
+                            starts,
+                            ends,
                         )
                     if page_store:
                         page_indices = [
@@ -7667,6 +7819,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                             layer_pages = [
                                 memory_objs[0][index] for index in page_indices
                             ]
+                            if store_debug:
+                                prefill_store_debug_log(
+                                    "page_put",
+                                    req_id,
+                                    kv_group,
+                                    start=starts[page_indices[0]],
+                                    end=ends[page_indices[-1]],
+                                    chunks=len(page_indices),
+                                    async_d2h=async_layerwise_store,
+                                    events=sum(
+                                        not getattr(event, "cpu_hash_fence", False)
+                                        for event in layerwise_store_fences
+                                    ),
+                                    layers=len(memory_objs),
+                                    bytes=layer_pages[0].get_size(),
+                                )
                             try:
                                 page_futures = self.storage_manager.batched_put_layer_pages(
                                     [
@@ -7676,12 +7844,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                                     layer_pages,
                                     location=self.store_location,
                                     req_id=req_id,
-                                    **({
-                                        "publish_local_early": async_pages,
-                                        "producer_events": layerwise_store_fences,
-                                    } if self._force_layerwise_prefill_store else {}),
+                                    **(
+                                        {
+                                            "publish_local_early": async_pages,
+                                            "producer_events": layerwise_store_fences,
+                                        }
+                                        if self._force_layerwise_prefill_store
+                                        else {}
+                                    ),
                                 )
                             except Exception as error:
+                                if store_debug:
+                                    prefill_store_debug_log(
+                                        "page_error",
+                                        req_id,
+                                        kv_group,
+                                        error=True,
+                                        status=type(error).__name__,
+                                    )
                                 if async_pages:
                                     self._layerwise_put_queue.fail(error)
                                 raise
@@ -7690,6 +7870,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                             for page in layer_pages:
                                 pending_store_release.pop(id(page), None)
                         if legacy_indices:
+                            if store_debug:
+                                prefill_store_debug_log(
+                                    "flat_put",
+                                    req_id,
+                                    kv_group,
+                                    start=starts[legacy_indices[0]],
+                                    end=ends[legacy_indices[-1]],
+                                    chunks=len(legacy_indices),
+                                    async_d2h=async_layerwise_store,
+                                    events=sum(
+                                        not getattr(event, "cpu_hash_fence", False)
+                                        for event in layerwise_store_fences
+                                    ),
+                                )
                             legacy_keys = [
                                 layer_keys[index]
                                 for layer_keys in keys
@@ -7700,13 +7894,47 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 for layer_objs in memory_objs
                                 for index in legacy_indices
                             ]
-                            required_futures.extend(
-                                self.storage_manager.batched_put(
+                            if async_layerwise_store:
+                                # Plain batched_put has no producer fence and
+                                # may let Mooncake read unfinished D2H bytes.
+                                # Keep flat CPU objects, but hand their layer
+                                # buffers and bank events to the page writer.
+                                try:
+                                    storage = self.storage_manager
+                                    legacy_futures = (
+                                        storage.batched_put_layerwise_objects(
+                                            [
+                                                [row[index] for index in legacy_indices]
+                                                for row in keys
+                                            ],
+                                            [
+                                                [row[index] for index in legacy_indices]
+                                                for row in memory_objs
+                                            ],
+                                            producer_events=layerwise_store_fences,
+                                            location=self.store_location,
+                                            req_id=req_id,
+                                        )
+                                    )
+                                except Exception as error:
+                                    if store_debug:
+                                        prefill_store_debug_log(
+                                            "flat_error",
+                                            req_id,
+                                            kv_group,
+                                            error=True,
+                                            status=type(error).__name__,
+                                        )
+                                    if async_pages:
+                                        self._layerwise_put_queue.fail(error)
+                                    raise
+                            else:
+                                legacy_futures = self.storage_manager.batched_put(
                                     legacy_keys,
                                     legacy_objs,
                                     location=self.store_location,
                                 )
-                            )
+                            required_futures.extend(legacy_futures)
                             submitted_objs.extend(legacy_objs)
                     else:
                         flattened_keys = [
@@ -7722,7 +7950,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     if async_pages:
                         self._layerwise_put_queue.add(
-                            batch_bytes, required_futures, req_id=req_id,
+                            batch_bytes,
+                            required_futures,
+                            req_id=req_id,
                             keys=(key.without_layer() for key in keys[0]),
                         )
                     else:
@@ -9856,6 +10086,40 @@ class AscendLMCacheEngine(LMCacheEngine):
         defer_finish = False
         dispatch_count = 0
         dispatch_sum_s = dispatch_max_s = 0.0
+        if (
+            kv_hash_enabled()
+            and self.metadata.is_first_rank()
+            and not direct_group1_load
+            and not self._force_layerwise_prefill_store
+        ):
+            hash_rows = (
+                cached_memory_objs
+                if self._retrieve_data_cache_covers(
+                    cached_memory_objs, num_layers, len(starts)
+                )
+                else pre_resolved_shared_mem_layers
+            )
+            if hash_rows is not None:
+                trace = getattr(self.gpu_connector, "trace_cpu_kv", None)
+                if callable(trace):
+                    trace("D_CPU", kwargs.get("req_id", "unspecified"), kv_group,
+                          starts, ends, hash_rows, mirror=True)
+                submit_kv_hash(
+                    "D",
+                    kwargs.get("req_id", "unspecified"),
+                    kv_group,
+                    starts,
+                    ends,
+                    hash_rows,
+                    int(self.config.chunk_size),
+                    feature_mode=getattr(
+                        self.gpu_connector, "uses_token_byte_features", False
+                    ),
+                )
+            elif not getattr(self.gpu_connector, "uses_token_byte_features", False):
+                skip_kv_hash(
+                    "D", kwargs.get("req_id", "unspecified"), kv_group, "no_cpu_sources"
+                )
         try:
             for layer_id in range(num_layers):
                 sparse_request = yield ret_mask
@@ -11471,6 +11735,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
+
+        if kv_hash_enabled():
+            drain_trace = getattr(self.gpu_connector, "drain_kv_trace", None)
+            if callable(drain_trace):
+                store_thread = getattr(self, "_store_worker_thread", None)
+                if store_thread is not None and store_thread.is_alive():
+                    raise RuntimeError(
+                        "Store worker is still active; keep KV trace CPU slabs alive"
+                    )
+                if not drain_trace():
+                    raise RuntimeError(
+                        "KV trace readers have not drained; keep CPU slabs alive"
+                    )
 
         if self._force_layerwise_prefill_store:
             for req_id in tuple(self._layerwise_prefill_page_owners):
