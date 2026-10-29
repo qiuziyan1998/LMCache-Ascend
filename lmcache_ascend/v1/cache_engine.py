@@ -1757,7 +1757,10 @@ class AscendLMCacheEngine(LMCacheEngine):
     def poll_layerwise_prefill_puts(
         self, *, final: bool = False, req_ids: Optional[Iterable[str]] = None
     ) -> None:
-        """Poll CPU-page persistence, or fence it before final handoff/teardown."""
+        """Poll persistence, or fence persistence and D2H before final reuse."""
+        if final and req_ids is not None:
+            # Both the remote queue and the DMA fence consume this selection.
+            req_ids = tuple(req_ids)
         queue = getattr(self, "_layerwise_put_queue", None)
         if queue is not None:
             if not final:
@@ -1766,6 +1769,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 queue.drain()
             else:
                 queue.drain_requests(req_ids)
+        if final:
+            # LocalCPUBackend also permits async D2H, independently of
+            # store_async, but has no remote put future to fence those reads.
+            wait_stores = getattr(
+                getattr(self, "gpu_connector", None),
+                "wait_for_layerwise_prefill_stores",
+                None,
+            )
+            if wait_stores is not None:
+                wait_stores(req_ids)
 
     def _dense_retrieve_token_results(
         self,

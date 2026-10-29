@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import wraps
 from itertools import pairwise
 from threading import Condition, Thread, get_ident
-from typing import Any, Generator, List, Optional, Sequence, Set, Union
+from typing import Any, Generator, Iterable, List, Optional, Sequence, Set, Union
 import hashlib
 import json
 import os
@@ -2082,6 +2082,35 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             failed = self._layerwise_prefill_unfenced_loads = {}
         failed.setdefault(str(req_id), {})[(kv_group, bank, id(stream))] = stream
 
+    def wait_for_layerwise_prefill_stores(
+        self, req_ids: Optional[Iterable[str]] = None
+    ) -> None:
+        """Fence request D2H reads before publication or NPU block reuse.
+
+        Reallocated physical blocks can move to another bank stream, so the
+        old bank's FIFO alone cannot protect their outstanding reads. Waiting
+        here retains CPU pages and DMA bindings for a preempted request.
+        """
+        pending_store_events_by_request = getattr(
+            self, "_layerwise_prefill_async_store_events", {}
+        )
+        selected = tuple(
+            pending_store_events_by_request if req_ids is None else req_ids
+        )
+        for req_id in selected:
+            pending_events = pending_store_events_by_request.get(req_id)
+            if pending_events is None:
+                continue
+            for completion in pending_events.values():
+                if isinstance(completion, (tuple, list)):
+                    for event in completion:
+                        event.synchronize()
+                else:
+                    completion.synchronize()
+            # A failed fence must leave every event registered for retry and
+            # prevent the caller from proceeding with request cleanup/reuse.
+            pending_store_events_by_request.pop(req_id, None)
+
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
         unfenced = getattr(self, "_layerwise_prefill_unfenced_loads", None)
@@ -2093,18 +2122,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for stream in failed_streams.values():
                 stream.synchronize()
             unfenced.pop(req_id, None)
-        pending_store_events_by_request = getattr(
-            self, "_layerwise_prefill_async_store_events", {}
-        )
-        pending_events = pending_store_events_by_request.get(req_id)
-        if pending_events:
-            for completion in pending_events.values():
-                if isinstance(completion, (tuple, list)):
-                    for event in completion:
-                        event.synchronize()
-                else:
-                    completion.synchronize()
-            pending_store_events_by_request.pop(req_id, None)
+        self.wait_for_layerwise_prefill_stores((req_id,))
         load_events_by_request = getattr(
             self, "_layerwise_prefill_load_request_events", {}
         )

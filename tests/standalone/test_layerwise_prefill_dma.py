@@ -649,7 +649,8 @@ def test_request_release_and_generation_reset_clear_incremental_metadata():
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                and node.name == "VLLMPagedMemLayerwiseNPUConnector")
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef)
-               and node.name in ("release_layerwise_prefill_dma_cache",
+               and node.name in ("wait_for_layerwise_prefill_stores",
+                                 "release_layerwise_prefill_dma_cache",
                                  "reset_layerwise_prefill_transfer_state")]
     ns = {}
     future = ast.ImportFrom(
@@ -658,6 +659,9 @@ def test_request_release_and_generation_reset_clear_incremental_metadata():
     exec(compile(ast.fix_missing_locations(ast.Module(
         body=[future, *methods], type_ignores=[]
     )), str(path), "exec"), ns)
+    obj.wait_for_layerwise_prefill_stores = MethodType(
+        ns["wait_for_layerwise_prefill_stores"], obj
+    )
     release = MethodType(ns["release_layerwise_prefill_dma_cache"], obj)
     reset = MethodType(ns["reset_layerwise_prefill_transfer_state"], obj)
     released = []

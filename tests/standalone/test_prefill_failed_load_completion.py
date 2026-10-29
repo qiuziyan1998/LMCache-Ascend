@@ -20,7 +20,11 @@ def _attach_release_methods(connector):
     path = Path(__file__).parents[2] / "lmcache_ascend/v1/npu_connector/npu_connectors.py"
     cls = next(node for node in ast.parse(path.read_text()).body
                if isinstance(node, ast.ClassDef) and node.name == "VLLMPagedMemLayerwiseNPUConnector")
-    names = {"_retain_unfenced_layerwise_prefill_load", "release_layerwise_prefill_dma_cache"}
+    names = {
+        "_retain_unfenced_layerwise_prefill_load",
+        "wait_for_layerwise_prefill_stores",
+        "release_layerwise_prefill_dma_cache",
+    }
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ast.parse("from __future__ import annotations")
     module.body.extend(methods)
