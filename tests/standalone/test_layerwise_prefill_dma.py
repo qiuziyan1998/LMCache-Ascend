@@ -166,7 +166,7 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
         npu = NS(
             stream=lambda stream: nullcontext(),
             current_stream=lambda: None,
-            Event=lambda: NS(record=lambda stream: None),
+            Event=lambda: NS(record=lambda stream: None, synchronize=lambda: None),
         )
 
     class TorchWithoutNPU:
@@ -346,7 +346,7 @@ def test_hash_probe_borrows_p_load_event_after_dma_submission():
             self.recorded = True
 
         def synchronize(self):
-            raise AssertionError("serving thread must not wait for debug hashes")
+            assert self not in events, "serving thread waited for debug hashes"
 
     npu = NS(Event=Event, current_stream=lambda: None,
              stream=lambda stream: nullcontext())
@@ -726,11 +726,14 @@ class _AsyncStream:
 
 class _AsyncNPU:
     class Event:
+        tail = None
+
         def record(self, stream):
             self.tail = stream.tail
 
         def synchronize(self):
-            pytest.fail("Bank handoff must not synchronize the host")
+            if self.tail is not None:
+                self.tail.run()
 
     def __init__(self):
         self.compute = _AsyncStream()
@@ -852,7 +855,10 @@ def test_configurable_bank_dma_rotation_never_overwrites_pending_compute(
                 load(layer + bank_count)
         next(generator)
         generator.close()
-    assert api.observed == api.saved == []
+    if group == 0:
+        assert len(api.observed) == 3 * layers
+    else:
+        assert api.observed == api.saved == []
     for bank in reversed(api.banks):
         bank.tail.run()
     api.npu.compute.tail.run()
@@ -879,7 +885,10 @@ def test_fixed_bank_load_does_not_join_other_banks_previous_saves(bank_count, gr
     generator, load = api.start(0)
     load(0)
     api.read(0, 0)
-    assert saved == api.observed == []
+    if group == 0:
+        assert saved == [0] and api.observed == [(0, 0)]
+    else:
+        assert saved == api.observed == []
     # Run the actual consumer first. Its load follows its own earlier D2H,
     # while independent banks must remain pending, not indirectly drained.
     api.npu.compute.tail.run()
@@ -907,7 +916,10 @@ def test_dma_bank_reuse_protects_pending_reads_across_chunks(group, has_save):
         next(generator)
         generator.close()
 
-    assert api.observed == api.saved == []  # Submission never waits on the host.
+    if group == 0:
+        assert len(api.observed) == 12
+    else:
+        assert api.observed == api.saved == []
     # Adversarial order: eagerly execute DMA, then let compute catch up.
     for bank in api.banks:
         bank.tail.run()
@@ -997,7 +1009,10 @@ def test_mixed_requests_join_all_loads_before_read_and_bank_reuse(bank_count, gr
         next(generator)
         generator.close()
 
-    assert not saved and not observed  # Only enqueued, never host-synchronized.
+    if group == 0:
+        assert len(observed) == 4 * layers
+    else:
+        assert not saved and not observed
     for stream in reversed(streams):
         stream.tail.run()
     npu.compute.tail.run()
@@ -1018,14 +1033,14 @@ def test_dma_handoff_does_not_wait_for_next_layer_compute(group, has_save):
     if has_save:
         api.save(0)
     load(2)  # N+1 entry, before its bank wait and compute are submitted.
-    api.read(0, 1)
-    assert api.observed == []
+    assert api.observed == ([(0, 0)] if group == 0 else [])
     api.banks[0].tail.run()
     assert api.observed == [(0, 0)]
     assert api.contents[api.banks[0]] == (0, 2)
     assert api.saved == ([(0, 0)] if has_save else [])
     assert later_compute == []  # Neither save nor load resnapshots compute.
     # The other bank's layer can remain in flight while this H2D completes.
+    api.read(0, 1)
     load(3)
     api.read(0, 2)
     api.read(0, 3)
@@ -1051,18 +1066,53 @@ def test_missing_or_stale_bank_handoff_rejects_save_and_load(group):
         api.save(2)
 
 
-def test_fixed_handoff_fences_only_selected_bank_without_host_wait():
-    api = _async_bank_connector(0)
+@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize("prefill_enabled", [False, True])
+def test_fixed_handoff_host_fence_is_only_for_p_latent_snapshot(
+    group, prefill_enabled,
+):
+    api = _async_bank_connector(group)
+    api.connector._layerwise_prefill_dma = prefill_enabled
     completed = []
     api.npu.compute.enqueue(lambda: completed.append("KV access"))
     event = api.npu.Event()
     event.record(api.npu.compute)
-    api.connector.record_layerwise_prefill_bank_use(0, 0, event)
+    # Even already-submitted work AFTER the event must not be waited for.
     api.npu.compute.enqueue(lambda: completed.append("later compute"))
-    assert completed == []
+    api.connector.record_layerwise_prefill_bank_use(0, group, event)
+    expected = ["KV access"] if prefill_enabled and group == 0 else []
+    assert completed == expected
     assert api.banks[1].tail is None
     api.banks[0].tail.run()
     assert completed == ["KV access"]
+
+
+def test_default_latent_host_fence_does_not_repeat_debug_wait():
+    api = _async_bank_connector(0)
+    calls = []
+    api.connector.fence_debug = NS(
+        wait=lambda *args: calls.append("debug"),
+    )
+    event = api.npu.Event()
+    event.synchronize = lambda: calls.append("host")
+    api.connector.record_layerwise_prefill_bank_use(0, 0, event)
+    assert calls == ["host"]
+    api.connector.record_layerwise_prefill_bank_use(0, 1, event)
+    assert calls == ["host", "debug"]
+
+
+def test_failed_default_host_fence_cannot_publish_bank_reuse():
+    api = _async_bank_connector(0)
+    event = api.npu.Event()
+
+    def fail():
+        raise RuntimeError("device fence failed")
+
+    event.synchronize = fail
+    with pytest.raises(RuntimeError, match="device fence failed"):
+        api.connector.record_layerwise_prefill_bank_use(0, 0, event)
+    assert not api.connector._layerwise_prefill_bank_use_events
+    assert all(bank.tail is None for bank in api.banks)
 
 
 @pytest.mark.parametrize("bank_count", [2, 4, 8])
