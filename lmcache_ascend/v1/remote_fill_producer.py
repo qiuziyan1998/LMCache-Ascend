@@ -595,6 +595,9 @@ class RemoteFillProducerSession:
         self.direct_viable = True
         self.opened = False
         self.closed = False
+        # Local fallback is not evidence that D closed the transaction. Keep
+        # cleanup retryable through request release, including a lost OPEN ACK.
+        self.remote_cleanup_pending = False
         self.fatal_restart_required = False
         self.prearm_control_unknown = False
         self.d_local_end_open = 0
@@ -680,6 +683,7 @@ class RemoteFillProducerSession:
                 return False
             if self.negotiation_cache is not None:
                 self.negotiation_cache.record(negotiation_key)
+        self.remote_cleanup_pending = True
         try:
             opened = self._execute(
                 OpenRequest(
@@ -704,6 +708,7 @@ class RemoteFillProducerSession:
             _log_remote_fill_open_failure(self, "open_execute", error=error)
             return False
         if not self._accepted(opened):
+            self.remote_cleanup_pending = False
             self.direct_viable = False
             _log_remote_fill_open_failure(self, "open_response", response=opened)
             return False
@@ -1320,20 +1325,10 @@ class RemoteFillProducerSession:
         if self.fatal_restart_required:
             outcome = TerminalOutcome.FATAL_RESTART.value
         elif persistent_common_end < required_store_end:
+            self._try_abort_cleanup("prefiller persistence failed")
             outcome = TerminalOutcome.PERSISTENCE_FAILED.value
         elif not self.opened or self.prearm_control_unknown:
-            if self.prearm_control_unknown:
-                try:
-                    self._execute(
-                        AbortRequest(
-                            common=self._common(),
-                            reason="prefiller pre-arm control state is unknown",
-                        )
-                    )
-                except Exception:
-                    # No native operation was armed. Decoder reservations stay
-                    # hidden and its bounded cleanup owns eventual reclamation.
-                    pass
+            self._try_abort_cleanup("prefiller pre-arm control state is unknown")
             outcome = TerminalOutcome.PERSISTENT_ONLY.value
         else:
             try:
@@ -1372,6 +1367,11 @@ class RemoteFillProducerSession:
                     outcome, direct_satisfied = self._classify_terminal(
                         response
                     )
+                    self.remote_cleanup_pending = False
+        # D may have cancelled an expired lease while P was persisting. The
+        # completed persistent path remains usable by the request.
+        if outcome == TerminalOutcome.CANCELLED.value:
+            outcome = TerminalOutcome.PERSISTENT_ONLY.value
         self._terminal = RemoteFillTerminalResult(
             transfer_id=self.handoff.transfer_id,
             outcome=outcome,
@@ -1393,6 +1393,11 @@ class RemoteFillProducerSession:
             raise
         except Exception:
             self.direct_viable = False
+            aborted = self._try_abort_cleanup("FINISH and STATUS were unavailable")
+            if aborted is not None and aborted.terminal_outcome is not None:
+                outcome, direct_satisfied = self._classify_terminal(aborted)
+                if direct_satisfied:
+                    return outcome, direct_satisfied
             return TerminalOutcome.PERSISTENT_ONLY.value, False
         if response.fatal_restart_required or (
             response.terminal_outcome is TerminalOutcome.FATAL_RESTART
@@ -1419,22 +1424,19 @@ class RemoteFillProducerSession:
             TerminalOutcome.PERSISTENCE_FAILED,
             TerminalOutcome.CANCELLED,
         ):
+            self.remote_cleanup_pending = False
             return self._classify_terminal(response)
         # All native operations were terminal before FINISH. If publication
         # did not happen, explicitly abort the still-hidden transaction so it
         # cannot retain decoder pages indefinitely.
-        try:
-            self._execute(
-                AbortRequest(
-                    common=self._common(),
-                    reason="FINISH terminal state could not be confirmed",
-                )
-            )
-        except RemoteFillFatalError:
-            raise
-        except Exception:
-            pass
+        aborted = self._try_abort_cleanup(
+            "FINISH terminal state could not be confirmed"
+        )
         self.direct_viable = False
+        if aborted is not None and aborted.terminal_outcome is not None:
+            outcome, direct_satisfied = self._classify_terminal(aborted)
+            if direct_satisfied:
+                return outcome, direct_satisfied
         return TerminalOutcome.PERSISTENT_ONLY.value, False
 
     @staticmethod
@@ -1471,25 +1473,34 @@ class RemoteFillProducerSession:
             return outcome, True
         return outcome, False
 
-    def abort(self, reason: str) -> None:
-        """Release a nonfatal hidden transaction that will not be finished."""
+    def abort(self, reason: str) -> RemoteFillResponse | None:
+        """Confirm remote cleanup, even after a local fallback was finalized.
 
-        if self._terminal is not None or self.closed:
-            return
+        Returns the decoder response, or None if no cleanup is pending. An
+        accepted abort may still be draining native work and remains pending.
+        Rejections/transport failures raise so release can retry. Armed ambiguity
+        raises RemoteFillFatalError and retains native owners.
+        """
+
         if self.fatal_restart_required:
             raise RemoteFillFatalError(
                 "an ambiguous armed transaction cannot be aborted safely"
             )
-        if self.opened:
-            response = self._execute(AbortRequest(common=self._common(), reason=reason))
-            if response.code not in (
-                ResultCode.OK,
-                ResultCode.ACCEPTED,
-                ResultCode.TERMINAL,
-            ):
-                raise RuntimeError("remote-fill ABORT was rejected")
+        if not self.remote_cleanup_pending:
+            return None
+        response = self._execute(AbortRequest(common=self._common(), reason=reason))
+        confirmed = response.code in (
+            ResultCode.TERMINAL,
+            ResultCode.NOT_FOUND,
+            ResultCode.STALE_ENGINE_EPOCH,
+            ResultCode.STALE_CACHE_GENERATION,
+        ) or response.terminal_outcome is not None
+        if not confirmed and response.code not in (ResultCode.OK, ResultCode.ACCEPTED):
+            raise RuntimeError("remote-fill ABORT has not confirmed remote cleanup")
+        self.remote_cleanup_pending = not confirmed
         self.direct_viable = False
         self.closed = True
+        return response
 
     def close(self) -> None:
         """Close drained resources; raise on fatal state and retain prepared owners."""
@@ -1500,11 +1511,31 @@ class RemoteFillProducerSession:
             raise RemoteFillFatalError(
                 "cannot close an ambiguous armed remote-fill transaction"
             )
+        self._try_abort_cleanup("prefiller session closed")
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
         self._prepared_sources.clear()
         self.closed = True
+
+    def _try_abort_cleanup(self, reason: str) -> RemoteFillResponse | None:
+        """Bounded best effort; D's idle lease handles a disconnected owner."""
+
+        if not self.remote_cleanup_pending:
+            return None
+        try:
+            return self.abort(reason)
+        except RemoteFillFatalError:
+            raise
+        except Exception:
+            logger.warning(
+                "Remote-fill cleanup unconfirmed transfer_id=%s reason=%s; "
+                "retry on release, decoder idle lease remains the backstop",
+                self.handoff.transfer_id,
+                reason,
+                exc_info=True,
+            )
+            return None
 
     def _common(self) -> OperationIdentity:
         self._operation_sequence += 1

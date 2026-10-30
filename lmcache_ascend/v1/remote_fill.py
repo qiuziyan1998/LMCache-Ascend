@@ -1653,6 +1653,9 @@ def create_decoder_remote_fill_runtime(
             float(config.remote_fill_native_hard_timeout_ms) / 1000.0
         ),
         terminal_record_ttl_sec=float(config.remote_fill_terminal_record_ttl_sec),
+        transaction_idle_timeout_sec=float(
+            config.remote_fill_transaction_idle_timeout_sec
+        ),
     )
     service = RemoteFillService(state, limits)
     bind_endpoint = f"{_format_tcp_host(control_host)}:{control_port}"

@@ -57,7 +57,10 @@ from lmcache_ascend.v1.remote_fill import (
     remote_fill_tp_independent,
 )
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
-from lmcache_ascend.v1.remote_fill_coordinator import ProducerRequestState, RemoteFillCoordinator
+from lmcache_ascend.v1.remote_fill_coordinator import (
+    ProducerRequestState,
+    RemoteFillCoordinator,
+)
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 
 
@@ -1900,6 +1903,7 @@ def _config(*, shared: bool) -> SimpleNamespace:
         remote_fill_descriptor_ttl_sec=10,
         remote_fill_native_hard_timeout_ms=120000,
         remote_fill_terminal_record_ttl_sec=300,
+        remote_fill_transaction_idle_timeout_sec=1800,
     )
 
 

@@ -62,7 +62,10 @@ from lmcache.v1.remote_fill.native import (
 
 # First Party
 import lmcache_ascend.v1.remote_fill_coordinator as coordinator_module
-from lmcache_ascend.v1.remote_fill_coordinator import ProducerRequestState, RemoteFillCoordinator
+from lmcache_ascend.v1.remote_fill_coordinator import (
+    ProducerRequestState,
+    RemoteFillCoordinator,
+)
 import lmcache_ascend.v1.remote_fill_producer as producer_module
 from lmcache_ascend.v1.cache_engine import (
     AscendLMCacheEngine,
@@ -1060,6 +1063,7 @@ class _PrefixRepairHarness:
                 destination_remote_session=_SESSION,
             ),
         )
+        self.state = core
         self.client = RemoteFillClient(
             InProcessRemoteFillTransport(RemoteFillService(core))
         )
@@ -1079,6 +1083,9 @@ class _PrefixRepairHarness:
         if isinstance(request, ArmWindowRequest):
             self.attempt = request.native_transfer_attempt_id
         return response
+
+    def fatal(self, transfers: tuple[str, ...]) -> None:
+        raise AssertionError(f"unexpected fatal transfers: {transfers}")
 
     def allocate(self, transfer_id, window_id, pages, reserve_missing):
         prepared = []
@@ -2177,6 +2184,145 @@ def test_prearm_control_failure_finishes_persistent_only() -> None:
     assert not any(isinstance(item, ArmWindowRequest) for item in client.requests)
 
 
+@pytest.mark.parametrize("finalize", [False, True])
+def test_lost_open_ack_is_closed_by_release(finalize: bool) -> None:
+    h = _PrefixRepairHarness()
+
+    def execute(request: Any) -> RemoteFillResponse:
+        response = h.execute(request)
+        if isinstance(request, OpenRequest):
+            raise TimeoutError("OPEN accepted but its ACK was lost")
+        return response
+
+    h.session.client = SimpleNamespace(execute=execute)
+    assert not h.session.open()
+    assert not h.session.opened
+    assert h.session.remote_cleanup_pending
+    assert h.state.metrics_snapshot().active_transactions == 1
+    terminal = h.finish() if finalize else None
+    coordinator = RemoteFillCoordinator(
+        config=SimpleNamespace(), tp_size=4, storage_manager=None,
+        fatal_reporter=h.fatal,
+    )
+    state = ProducerRequestState(
+        handoff=h.handoff, session=h.session, terminal=terminal
+    )
+    assert coordinator.release("prefix", state, persistent_ready=True)
+    assert h.state.metrics_snapshot().active_transactions == 0
+    assert not h.session.remote_cleanup_pending
+
+
+@pytest.mark.parametrize("failure", ["prearm", "finish", "persistence"])
+def test_local_terminal_does_not_suppress_remote_cleanup_retry(failure: str) -> None:
+    h = _PrefixRepairHarness()
+    fail_abort = True
+
+    def execute(request: Any) -> RemoteFillResponse:
+        if isinstance(request, AbortRequest) and fail_abort:
+            raise TimeoutError("ABORT not delivered")
+        if isinstance(request, (FinishRequest, StatusRequest)):
+            raise TimeoutError("terminal controls not delivered")
+        response = h.execute(request)
+        if failure == "prearm" and isinstance(request, ReserveWindowRequest):
+            raise TimeoutError("RESERVE accepted but reply lost")
+        return response
+
+    h.session.client = SimpleNamespace(execute=execute)
+    result = h.session.transfer_window(
+        window_id=0, source_generation=44, control_pages=h.pages,
+        source_plan=None,
+        source_plan_factory=lambda pages: h.prepare(h.make_plan(pages)).result(),
+        submitter=h.submit, activation_factory=lambda _: None,
+    )
+    assert result.direct_satisfied is (failure != "prearm")
+    terminal = h.session.finish(
+        required_store_end=6,
+        persistent_common_end=0 if failure == "persistence" else 6,
+        final_partial_valid_tokens=2,
+    )
+    assert terminal.outcome == (
+        "PERSISTENCE_FAILED" if failure == "persistence" else "PERSISTENT_ONLY"
+    )
+    assert h.session.closed
+    assert h.session.remote_cleanup_pending
+    assert h.state.metrics_snapshot().active_transactions == 1
+    assert h.hidden
+    fail_abort = False
+    coordinator = RemoteFillCoordinator(
+        config=SimpleNamespace(), tp_size=4, storage_manager=None,
+        fatal_reporter=h.fatal,
+    )
+    state = ProducerRequestState(
+        handoff=h.handoff, session=h.session, terminal=terminal
+    )
+    assert coordinator.release("prefix", state, persistent_ready=True)
+    assert not h.session.remote_cleanup_pending
+    assert not h.hidden
+    assert h.state.metrics_snapshot().active_transactions == 0
+    assert h.state.metrics_snapshot().active_bytes == 0
+    assert h.state.metrics_snapshot().terminal_cancelled_total == 1
+    h.session.abort("duplicate release")
+    assert h.state.metrics_snapshot().terminal_cancelled_total == 1
+
+
+@pytest.mark.parametrize("finish_delivered", [False, True])
+def test_finish_and_status_loss_still_sends_abort(finish_delivered: bool) -> None:
+    h = _PrefixRepairHarness(present=(0, 1))
+    h.session.probe_window(window_id=0, source_generation=44, control_pages=h.pages)
+
+    def execute(request: Any) -> RemoteFillResponse:
+        if isinstance(request, StatusRequest):
+            raise TimeoutError("STATUS lost")
+        if isinstance(request, FinishRequest):
+            if finish_delivered:
+                h.execute(request)
+            raise ReplyLostError("FINISH reply lost")
+        return h.execute(request)
+
+    h.session.client = SimpleNamespace(execute=execute)
+    terminal = h.finish()
+    assert terminal.outcome == "PERSISTENT_ONLY"
+    assert terminal.direct_satisfied is finish_delivered  # Group-0 commit.
+    assert "AbortRequest" in h.events
+    assert not h.session.remote_cleanup_pending
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_disconnected_producer_close_leaves_bounded_decoder_lease() -> None:
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+
+    def unavailable(request: Any) -> RemoteFillResponse:
+        raise TimeoutError("producer disconnected")
+
+    h.session.client = SimpleNamespace(execute=unavailable)
+    h.finish()
+    h.session.close()
+    assert h.session.remote_cleanup_pending
+    h.now += 1800
+    assert h.state.run_maintenance() == ()
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_finish_after_decoder_lease_expiry_uses_persistent_fallback() -> None:
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    h.now += 1800
+    terminal = h.finish()
+    assert terminal.outcome == "PERSISTENT_ONLY"
+    assert not terminal.direct_satisfied
+    assert not h.session.remote_cleanup_pending
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_session_close_aborts_open_transaction_on_shutdown() -> None:
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    h.session.close()
+    assert h.state.metrics_snapshot().active_transactions == 0
+    assert not h.session.remote_cleanup_pending
+
+
 def test_final_partial_page_is_probed_as_an_exact_pair() -> None:
     client = _ScriptedClient(
         reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
@@ -3108,7 +3254,10 @@ def _queued_batch():
     pages = _pages()
     return _DirectPageBatch(
         req_id="request",
-        keys=[SimpleNamespace(kv_group=p.kv_group, to_string=lambda p=p: p.canonical_key) for p in pages],
+        keys=[
+            SimpleNamespace(kv_group=p.kv_group, to_string=lambda p=p: p.canonical_key)
+            for p in pages
+        ],
         ptrs=[[100 + p.kv_group] for p in pages],
         sizes=[[p.expected_bytes] for p in pages],
         owners=(object(),), ready_event=object(),
