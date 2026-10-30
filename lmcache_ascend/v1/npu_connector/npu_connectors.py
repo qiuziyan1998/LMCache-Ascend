@@ -2402,8 +2402,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         Every participating rank calls this, even when it skips D2H. The
         bank FIFO then orders event -> save (if any) -> load, without taking
         another compute-stream snapshot at the later transfer callback.
-        P latent KV also waits for this exact event on the host, retaining
-        the p_use/group-0 workaround independently of debug settings.
         """
         if event is None:
             raise ValueError("Layerwise prefill bank use requires a device event")
@@ -2413,12 +2411,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             uses = self._layerwise_prefill_bank_use_events = {}
         bank = self._layerwise_prefill_bank(layer_id, kv_group)
         fence_debug = getattr(self, "fence_debug", None)
-        if getattr(self, "_layerwise_prefill_dma", False) and kv_group == 0:
-            # Keep the fence at the final bank access, not the later DMA
-            # submission point. Do not include subsequent compute work or
-            # repeat this wait through the optional p_use debug fence.
-            event.synchronize()
-        elif fence_debug is not None:
+        if fence_debug is not None:
             fence_debug.wait("p_use", kv_group, layer_id, event)
         self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
         uses[(kv_group, bank)] = (generation, layer_id, event)

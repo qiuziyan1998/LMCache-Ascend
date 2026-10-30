@@ -4,8 +4,6 @@
 Run inside the serving environment on one NPU. All buffers are allocated before
 the measured handoffs. Payload checks happen only after the final device fence.
 This isolates event/DMA ordering; it does not validate SFA or PD model outputs.
-All modes include the production latent-KV host fence. The p_use mode additionally
-checks compatibility with the old debug setting, without a second host wait.
 """
 
 from __future__ import annotations

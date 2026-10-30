@@ -202,18 +202,11 @@ def test_probe_uses_completed_payloads(banks, mode):
     assert result["passed"], result
 
 
-@pytest.mark.parametrize("mode", ["event", "p_use"])
-@pytest.mark.parametrize("drop_host_wait", [False, True])
-def test_default_host_fence_protects_missing_bank_wait(mode, drop_host_wait):
+@pytest.mark.parametrize("mode,passed", [("event", False), ("p_use", True)])
+def test_probe_detects_missing_compute_to_dma_dependency(mode, passed):
     probe = load_file("broken_probe", "tools/prefill_bank_handoff_check.py")
     fence = load_file("broken_fence", "lmcache_ascend/v1/kv_fence_debug.py")
     runtime = Runtime(drop_bank_wait=True)
-    if drop_host_wait:
-        class NoHostWaitEvent(Event):
-            def synchronize(self):
-                pass
-
-        runtime.Event = NoHostWaitEvent
     args = SimpleNamespace(
         layers=11,
         requests=3,
@@ -226,5 +219,4 @@ def test_default_host_fence_protects_missing_bank_wait(mode, drop_host_wait):
     result = probe.run_case(
         runtime, runtime, production_connector(runtime), fence.KVFenceDebug, args, mode
     )
-    # Dropping both dependencies must still expose corrupted payloads.
-    assert result["passed"] is not drop_host_wait, result
+    assert result["passed"] is passed, result
