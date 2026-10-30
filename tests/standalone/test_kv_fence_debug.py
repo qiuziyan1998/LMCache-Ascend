@@ -67,6 +67,135 @@ def test_reject_ambiguous_experiments(env):
         debug(**env)
 
 
+def test_reuse_and_use_are_alternative_modes_and_all_keeps_original_behavior():
+    with pytest.raises(ValueError, match="only one of p_use and p_reuse"):
+        debug("p_use,p_reuse")
+    d, _ = debug("all")
+    assert "p_use" in d.stages and "p_reuse" not in d.stages
+
+
+def test_reuse_filters_source_layer_and_deduplicates_only_the_same_event():
+    d, output = debug(
+        "p_reuse", LMCACHE_PREFILL_FENCE_GROUPS="0",
+        LMCACHE_PREFILL_FENCE_LAYERS="4:5",
+    )
+    event = Fence()
+    d.before_reuse(0, 0, None)  # First ever load has no preceding reader.
+    d.before_reuse(1, 0, (0, 4, event))
+    d.before_reuse(0, 0, (0, 3, event))
+    d.before_reuse(0, 0, (0, 5, event))
+    assert event.waits == 0
+    for _ in range(4):  # Four requests' saves, followed by their loads.
+        d.before_reuse(0, 0, (0, 4, event))
+        d.before_reuse(0, 0, (0, 4, event))
+    assert event.waits == 1
+    next_chunk = Fence()
+    d.before_reuse(0, 0, (1, 4, next_chunk))
+    assert next_chunk.waits == 1
+    assert len(d._reuse_fences) == 1
+    assert output[-1]["stage"] == "p_reuse" and output[-1]["layer"] == 4
+    decoder, _ = debug("p_reuse", role="D")
+    decoder.before_reuse(0, 0, (0, 4, event))
+    assert event.waits == 1
+
+
+@pytest.mark.parametrize("mode", ["p_use", "p_reuse"])
+@pytest.mark.parametrize("group", [0, 1, "c8"])
+@pytest.mark.parametrize("has_save", [False, True])
+def test_real_reuse_fence_moves_host_wait_but_keeps_original_snapshot(
+    monkeypatch, mode, group, has_save,
+):
+    from test_layerwise_prefill_dma import _AsyncNPU, _async_bank_connector
+
+    waited = []
+
+    def synchronize(event):
+        waited.append(event)
+        event.tail.run()
+
+    monkeypatch.setattr(_AsyncNPU.Event, "synchronize", synchronize)
+    api = _async_bank_connector(group, bank_count=4, layers=5)
+    api.connector.fence_debug, _ = debug(mode)
+    generator, load = api.start(0)
+    for layer in range(4):
+        load(layer)
+    assert waited == []
+    api.read(0, 0)
+    physical_group = 1 if group == "c8" else group
+    original = api.connector._layerwise_prefill_bank_use_events[physical_group, 0][2]
+    assert waited == ([original] if mode == "p_use" else [])
+    assert api.observed == ([(0, 0)] if mode == "p_use" else [])
+    later = []
+    api.npu.compute.enqueue(lambda: later.append("projection/FFN/next layer"))
+    if has_save:
+        for _ in range(4):
+            api.save(0)  # Multiple requests must not repeat the host wait.
+        assert waited == [original]
+    load(4)  # Passive ranks wait here; active ranks already waited before save.
+    assert waited == [original]
+    assert api.observed == [(0, 0)]
+    assert later == []  # Never wait on a new snapshot or the entire stream.
+    assert api.contents[api.banks[0]] == (0, 0)  # H2D only enqueued so far.
+    api.banks[0].tail.run()
+    assert api.contents[api.banks[0]] == (0, 4)
+    assert later == []
+    generator.close()
+
+
+@pytest.mark.parametrize("group,layers", [(0, 79), (1, 22), ("c8", 22), (0, 1)])
+@pytest.mark.parametrize("has_save", [False, True])
+def test_reuse_fences_chunk_wrap_last_layers_and_one_layer_forward(
+    monkeypatch, group, layers, has_save,
+):
+    from test_layerwise_prefill_dma import _AsyncNPU, _async_bank_connector
+
+    waited, uses = [], []
+
+    def synchronize(event):
+        waited.append(event)
+        event.tail.run()
+
+    monkeypatch.setattr(_AsyncNPU.Event, "synchronize", synchronize)
+    api = _async_bank_connector(group, bank_count=4, layers=layers)
+    api.connector.fence_debug, _ = debug("p_reuse")
+    physical_group = 1 if group == "c8" else group
+    for chunk in range(3):
+        generator, load = api.start(chunk)
+        for layer in range(min(4, layers)):
+            previous = api.connector.__dict__.get(
+                "_layerwise_prefill_bank_use_events", {}
+            ).get((physical_group, layer))
+            load(layer)
+            if previous is not None:
+                assert previous[2] in waited  # Previous chunk's final readers.
+        for layer in range(layers):
+            api.read(chunk, layer)
+            event = api.connector._layerwise_prefill_bank_use_events[
+                physical_group, layer % 4
+            ][2]
+            uses.append(event)
+            assert event not in waited  # No p_use host fence in this mode.
+            if has_save:
+                api.save(layer)
+                assert event in waited  # Includes last layers / one-layer MTP.
+            if layer + 4 < layers:
+                load(layer + 4)
+                assert event in waited
+        next(generator)
+        generator.close()
+    for bank in api.banks:
+        if bank.tail is not None:
+            bank.tail.run()
+    api.npu.compute.tail.run()
+    expected = [(chunk, layer) for chunk in range(3) for layer in range(layers)]
+    assert api.observed == expected
+    if has_save:
+        assert sorted(api.saved) == expected
+        assert waited == uses
+    assert len(waited) == len(set(waited))
+    assert len(api.connector.fence_debug._reuse_fences) <= 4
+
+
 def test_check_has_no_device_operations():
     d, output = debug()
     d.begin_step([request("a"), request("b")], (1, 1), 4, 1024)
@@ -74,8 +203,9 @@ def test_check_has_no_device_operations():
     d.loaded("a", 0, 0, 0, a)
     d.loaded("b", 0, 0, 0, b)
     d.before_read(0, 0, 0, {"a": a, "b": b})
-    for stage in ("p_load", "p_use", "p_save", "d_load"):
+    for stage in ("p_load", "p_use", "p_reuse", "p_save", "d_load"):
         d.wait(stage, 0, 0, b)
+    d.before_reuse(0, 0, (0, 0, b))
     assert a.waits == b.waits == 0
     assert len(output) == 1  # Only startup; no per-token/layer spam.
 

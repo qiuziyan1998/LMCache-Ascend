@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in, payload-free isolation of P/D device dependency boundaries.
 
-LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_use|p_save|d_load|all
-Comma-separated stages are accepted. ``check`` never queries/waits on a device.
+LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_use|p_reuse|p_save|d_load|all
+Comma-separated stages are accepted, except mutually exclusive p_use/p_reuse.
+``all`` keeps p_use (not p_reuse). ``check`` never queries/waits on a device.
 LMCACHE_PREFILL_FENCE_GROUPS=0,1 selects KV groups (default: both).
 LMCACHE_PREFILL_FENCE_LAYERS=start:end selects group-local layer ordinals,
 with an exclusive end (default: all). No tensors, files or worker threads are
@@ -17,7 +18,7 @@ import socket
 from typing import Any, Callable, Mapping, Sequence
 
 
-_STAGES = frozenset(("p_load", "p_use", "p_save", "d_load"))
+_STAGES = frozenset(("p_load", "p_use", "p_reuse", "p_save", "d_load"))
 _ENV = "LMCACHE_PREFILL_FENCE_DEBUG"
 
 
@@ -42,9 +43,11 @@ class KVFenceDebug:
         raw = env.get(_ENV, "check").strip().lower()
         stages = set(raw.split(","))
         if stages == {"all"}:
-            stages = set(_STAGES)
+            stages = set(_STAGES) - {"p_reuse"}
         if not stages or stages - (_STAGES | {"check"}):
             raise ValueError(f"Invalid {_ENV}: {raw!r}")
+        if {"p_use", "p_reuse"} <= stages:
+            raise ValueError("Select only one of p_use and p_reuse")
         for name in ("LMCACHE_PREFILL_STORE_DEBUG", "LMCACHE_PREFILL_AUDIT"):
             if env.get(name, "0") == "1":
                 raise ValueError(f"Set {name}=0 when using {_ENV}")
@@ -73,6 +76,8 @@ class KVFenceDebug:
         )
         self.emit = emit or self._print
         self.seen: set[tuple[str, int]] = set()
+        # At most one retained event per group/bank, never a per-request history.
+        self._reuse_fences: dict[tuple[int, int | None], Any] = {}
         self.expected: dict[tuple[int, int, int], set[str]] = {}
         self.submitted: dict[tuple[int, int, int], set[str]] = {}
         self.latest: dict[tuple[int, int, int], dict[str, Any]] = {}
@@ -206,6 +211,24 @@ class KVFenceDebug:
         self.latest.pop(key, None)
         self.submitted.pop(key, None)
 
+    def before_reuse(
+        self,
+        group: int,
+        bank: int,
+        use: tuple[int, int, Any] | None,
+    ) -> None:
+        """Fence the last bank reader before save or overwrite, on every rank.
+
+        First loads can reuse a bank from the preceding chunk, so use the
+        stored event even across transfer generations. With no earlier reader
+        there is nothing to wait for. Layer filtering selects the source layer
+        N, including when the pending operation is load N+bank_count.
+        """
+        if "p_reuse" not in self.stages or use is None:
+            return
+        _generation, layer, event = use
+        self.wait("p_reuse", group, layer, event, bank=bank)
+
     def wait(
         self,
         stage: str,
@@ -219,7 +242,8 @@ class KVFenceDebug:
         """Wait only at the selected boundary, never by taking a global device fence.
 
         ``fence`` is an existing event or the exact transfer stream. Callers
-        must place this immediately after that operation, before later work.
+        place ordinary fences immediately after that operation. p_reuse waits
+        on the original reader event at the later DMA submission boundary.
         """
         if (
             stage not in self.stages
@@ -228,6 +252,9 @@ class KVFenceDebug:
             or layer < self.first
             or (self.end is not None and layer >= self.end)
         ):
+            return
+        reuse_key = (group, bank)
+        if stage == "p_reuse" and self._reuse_fences.get(reuse_key) is fence:
             return
         marker = (stage, group)
         if marker not in self.seen:
@@ -255,3 +282,7 @@ class KVFenceDebug:
                 stage=stage,
                 detail=str(exc)[:400],
             )
+        if stage == "p_reuse":
+            # Multiple requests, then the next load, share the reader event.
+            # Synchronize it once; a new event on this bank replaces this entry.
+            self._reuse_fences[reuse_key] = fence

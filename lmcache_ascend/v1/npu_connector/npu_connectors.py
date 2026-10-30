@@ -7900,6 +7900,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         self._require_layerwise_prefill_bank_use(
                             layer_id - layerwise_prefill_bank_count, kv_group, bank,
                         )
+                    fence_debug = getattr(self, "fence_debug", None)
+                    if fence_debug is not None:
+                        # Also covers passive ranks with no save, and the first
+                        # loads reusing the preceding chunk's bank events.
+                        fence_debug.before_reuse(
+                            kv_group, bank,
+                            getattr(self, "_layerwise_prefill_bank_use_events", {}).get(
+                                (kv_group, bank)
+                            ),
+                        )
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
                         overlap = getattr(self, "prefill_overlap_recorder", None)
@@ -9644,6 +9654,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._require_layerwise_prefill_bank_use(
                         layer_id, kv_group, bank,
                     )
+                    fence_debug = getattr(self, "fence_debug", None)
+                    if fence_debug is not None:
+                        # Wait for the original final-access event, not a
+                        # snapshot that would include later projection/FFN.
+                        fence_debug.before_reuse(
+                            kv_group, bank,
+                            self._layerwise_prefill_bank_use_events[(kv_group, bank)],
+                        )
                     with torch.npu.stream(bank_stream):
                         # The final-access event is already ahead of us on
                         # the bank FIFO; do not wait for later compute here.
