@@ -298,8 +298,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # Read once. Disabled workers never import the snapshot code, read back
         # tensors, record events, or create files. P ignores this D-only switch.
         self._decode_kv_snapshot_dir = (
-            os.getenv("LMCACHE_DECODE_KV_SNAPSHOT_DIR", "").strip()
-            if role == KVConnectorRole.WORKER and (
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.realpath(ascend_envs.__file__))),
+                "decode-kv-snapshots",
+            )
+            if role == KVConnectorRole.WORKER
+            and os.getenv("LMCACHE_DECODE_KV_SNAPSHOT", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            and (
                 self.kv_role == "kv_consumer"
                 or (self.kv_role == "kv_both"
                     and getattr(self.config, "pd_role", None) == "receiver")

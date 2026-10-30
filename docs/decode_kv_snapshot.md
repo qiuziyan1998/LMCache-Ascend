@@ -8,12 +8,14 @@
 只在两台 D 机器的服务启动环境中加入：
 
 ```bash
-export LMCACHE_DECODE_KV_SNAPSHOT_DIR=/workspace/fsi_lab/sqh/vllm-ascend/decode-kv-snapshots
+export LMCACHE_DECODE_KV_SNAPSHOT=1
 ```
 
-P 不设置该变量。为了复现原始问题，P/D 均关闭旧的 `LMCACHE_PREFILL_STORE_DEBUG`、`LMCACHE_PREFILL_FENCE_DEBUG` 和 `LMCACHE_PREFILL_AUDIT`，保留正常的图与生产参数。目录应当位于持久磁盘，不要放到 `/dev/shm`；容器中使用的目录需与收集脚本能访问的目录对应，或收集时使用 `--container`。
+无需指定目录。首次保存时自动在实际加载的 vllm-ascend 根目录下面创建 `decode-kv-snapshots`，路径根据 `vllm_ascend/envs.py` 所在位置确定，不受启动命令工作目录影响。原来的 `LMCACHE_DECODE_KV_SNAPSHOT_DIR` 不再用于开启或指定保存位置。
 
-该变量在 worker 初始化时读取。取消变量并重启 D 服务即关闭；P 即使继承此变量也不会启用。关闭时不导入保存模块、不创建文件、不增加 NPU 操作或同步，只有 D cold-load 完成位置的布尔判断。
+P 不设置该变量。为了复现原始问题，P/D 均关闭旧的 `LMCACHE_PREFILL_STORE_DEBUG`、`LMCACHE_PREFILL_FENCE_DEBUG` 和 `LMCACHE_PREFILL_AUDIT`，保留正常的图与生产参数。容器中使用的目录需与收集脚本能访问的目录对应，或收集时使用 `--container`。
+
+该变量在 worker 初始化时读取。设为 `0` 或取消变量并重启 D 服务即关闭；P 即使继承此变量也不会启用。关闭时不导入保存模块、不创建文件、不增加 NPU 操作或同步，只有 D cold-load 完成位置的布尔判断。
 
 ## 保存边界与范围
 

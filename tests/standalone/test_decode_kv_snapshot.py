@@ -5,6 +5,7 @@ import ast
 from contextlib import nullcontext
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace as NS
@@ -151,6 +152,61 @@ def load_method(path, cls, method):
     return next(
         n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == method
     )
+
+
+@pytest.mark.parametrize(
+    ("flag", "role", "kv_role", "pd_role", "enabled"),
+    [
+        ("1", "worker", "kv_consumer", None, True),
+        ("true", "worker", "kv_both", "receiver", True),
+        ("0", "worker", "kv_consumer", None, False),
+        (None, "worker", "kv_consumer", None, False),
+        ("1", "worker", "kv_producer", None, False),
+        ("1", "scheduler", "kv_consumer", None, False),
+    ],
+)
+def test_snapshot_root_uses_loaded_repo_not_working_directory(
+    tmp_path, monkeypatch, flag, role, kv_role, pd_role, enabled
+):
+    root = tmp_path / "vllm-ascend"
+    unrelated = tmp_path / "launch-directory"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+    if flag is None:
+        monkeypatch.delenv("LMCACHE_DECODE_KV_SNAPSHOT", raising=False)
+    else:
+        monkeypatch.setenv("LMCACHE_DECODE_KV_SNAPSHOT", flag)
+    monkeypatch.setenv("LMCACHE_DECODE_KV_SNAPSHOT_DIR", str(unrelated / "ignored"))
+    init = load_method(
+        ROOT / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py",
+        "LMCacheAscendConnectorV1Impl",
+        "__init__",
+    )
+    assignment = next(
+        node
+        for node in init.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_decode_kv_snapshot_dir"
+            for target in node.targets
+        )
+    )
+    instance = NS(kv_role=kv_role, config=NS(pd_role=pd_role))
+    scope = dict(
+        self=instance,
+        role=role,
+        KVConnectorRole=NS(WORKER="worker"),
+        os=os,
+        ascend_envs=NS(__file__=str(root / "vllm_ascend/envs.py")),
+    )
+    exec(
+        compile(ast.Module(body=[assignment], type_ignores=[]), "directory", "exec"),
+        scope,
+    )
+    expected = str(root / "decode-kv-snapshots") if enabled else ""
+    assert instance._decode_kv_snapshot_dir == expected
+    assert not (unrelated / "decode-kv-snapshots").exists()
 
 
 def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
