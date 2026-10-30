@@ -286,6 +286,7 @@ def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
     adapter = env["Adapter"]()
     adapter._decode_kv_snapshot_dir = str(tmp_path)
     adapter._decode_kv_snapshot_metadata = dict(dp_rank=0, tp_rank=0, tp_size=1)
+    adapter._decode_kv_snapshot_metadata["runtime"] = {"chunk_size": 1024}
     adapter._latent_layer_names = ["layer0"]
     adapter._indexer_layer_names = ["layer0"]
     adapter.lmcache_engine = NS(gpu_connector=connector)
@@ -298,7 +299,9 @@ def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
 
     adapter._synchronize_dsa_cold_dense_readiness = complete
     plan = dict(
-        request=NS(req_id="request"),
+        request=NS(
+            req_id="request", decode_snapshot_request={"prompt_token_ids": [1, 2, 3, 4]}
+        ),
         tokens=[1, 2, 3],
         indexer_kvcaches=[indexer],
         indexer_slots_cpu=torch.tensor([2, 0, 1]),
@@ -307,6 +310,10 @@ def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
     assert events == ["receive_submitted", "receive_completed"]
     manifest = next(tmp_path.rglob("manifest.json"))
     assert json.loads(manifest.read_text())["status"] == "complete"
+    assert json.loads((manifest.parent / "replay.json").read_text()) == {
+        "request": {"prompt_token_ids": [1, 2, 3, 4]},
+        "runtime": {"chunk_size": 1024},
+    }
     assert (manifest.parent / "g0-l0-c0.bin").read_bytes() == latent.view(
         torch.uint8
     ).numpy().tobytes()

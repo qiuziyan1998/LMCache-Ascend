@@ -295,6 +295,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
         )
         self.store_async = self.config.store_async
+        self._decode_snapshot_enabled = (
+            os.getenv("LMCACHE_DECODE_KV_SNAPSHOT", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            and (
+                self.kv_role == "kv_consumer"
+                or (self.kv_role == "kv_both"
+                    and getattr(self.config, "pd_role", None) == "receiver")
+            )
+        )
         # Read once. Disabled workers never import the snapshot code, read back
         # tensors, record events, or create files. P ignores this D-only switch.
         self._decode_kv_snapshot_dir = (
@@ -319,6 +328,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if self._decode_kv_snapshot_dir else None
         )
         if self._decode_kv_snapshot_dir:
+            from lmcache_ascend.v1.decode_snapshot_metadata import capture_runtime
+
+            self._decode_kv_snapshot_metadata["runtime"] = capture_runtime(
+                vllm_config, self.config
+            )
             logger.info(
                 "[D_KV_SNAPSHOT] enabled dir=%s boundary=cold_receive_complete "
                 "full_raw=1 copies_per_request=1",
@@ -471,6 +485,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             tracker, load_spec, is_sparse_decode=is_sparse_decode,
         )
         if (
+            getattr(self, "_decode_snapshot_enabled", False)
+            and metadata is not None
+            and load_spec is not None
+            and getattr(load_spec, "dsa_cold_compact_load", False)
+        ):
+            from lmcache_ascend.v1.decode_snapshot_metadata import capture_request
+
+            request = self._unfinished_requests.get(tracker.req_id)
+            metadata.decode_snapshot_request = capture_request(request)
+        if (
             metadata is not None
             and getattr(self, "_prefill_overlap_enabled", False)
             and not is_sparse_decode
@@ -519,6 +543,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         list(self._indexer_layer_names),
                     ],
                     capture_boundary="cold_receive_complete_before_first_decode",
+                    replay_request=getattr(
+                        plan["request"], "decode_snapshot_request", None
+                    ),
                 ),
             )
         return state

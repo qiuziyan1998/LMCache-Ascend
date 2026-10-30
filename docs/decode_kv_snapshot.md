@@ -53,3 +53,17 @@ decode-kv-snapshots/<公共 request UUID>/<host>-dp<DP>-tp<TP>-p<PID>/
 `received_history_identical` 表示已接收的公共历史所有字节相同；它不证明后续 latent H2D、稀疏映射或模型运算正确。`history_differs` 给出差异位置；重算、模型/参数变化也可能产生数值差异，不能只凭不同就认定内存被覆盖。新增区间没有上轮对应值，单独提供字节数、零字节数和浮点非有限值数量，不作精度判定。文件缺失、rank 不全或仍在写入时报 `incomplete`。
 
 本地已验证 500k/16k 分块、完整字节保留、C8 映射与 scale、完成事件前为错误数据/事件后才写正确数据、缺失和篡改检测。NPU 实机接收与读回仍需服务端验证。
+
+## D-only replay metadata
+
+New captures also include `replay.json`: the actual D prompt token IDs, sampling
+parameters (without remote process addresses), and model/TP/MTP settings. This
+metadata is collected only when the same snapshot switch is enabled; it adds
+no P synchronization. Unsupported request metadata is recorded as an explicit
+replay error while preserving the raw snapshot for comparison.
+
+After restarting, run `tools/decode_kv_replay.py --request-id RESPONSE_UUID` in
+vllm-ascend on a host with the complete TP capture. See that script's adjacent
+Markdown guide. It restores received history through a file-backed Mooncake SDK
+and executes the normal D loading and model paths. Old snapshots lacking replay
+metadata remain usable for byte comparison but not complete request replay.

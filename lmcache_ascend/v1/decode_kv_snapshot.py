@@ -81,6 +81,14 @@ class RawSnapshot:
         self.directory = Path(root) / request_key(req_id) / worker
         # An existing capture is never silently replaced by a later observation.
         self.directory.mkdir(parents=True, exist_ok=False)
+        metadata = dict(metadata)
+        replay = metadata.pop("replay_request", None)
+        runtime = metadata.pop("runtime", None)
+        if replay is not None:
+            (self.directory / "replay.json").write_text(
+                json.dumps(dict(request=replay, runtime=runtime)), encoding="utf-8"
+            )
+            metadata["replay_file"] = "replay.json"
         self.meta = dict(
             metadata,
             format=FORMAT,
