@@ -209,7 +209,22 @@ def test_snapshot_root_uses_loaded_repo_not_working_directory(
     assert not (unrelated / "decode-kv-snapshots").exists()
 
 
-def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
+def test_adapter_has_no_shadowed_methods():
+    tree = ast.parse(
+        (ROOT / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    cls = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "LMCacheAscendConnectorV1Impl"
+    )
+    names = [n.name for n in cls.body if isinstance(n, ast.FunctionDef)]
+    assert len(names) == len(set(names)), "A later definition shadows a worker method"
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path, checkpoint):
     monkeypatch.setitem(sys.modules, NAME, M)
     messages = []
     logger = NS(
@@ -262,19 +277,30 @@ def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
             events.append("receive_submitted")
             return state
 
-    adapter_method = load_method(
-        ROOT / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py",
-        "LMCacheAscendConnectorV1Impl",
-        "_run_dsa_cold_compact_load",
+    tree = ast.parse(
+        (ROOT / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py").read_text(
+            encoding="utf-8"
+        )
     )
+    adapter_class = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "LMCacheAscendConnectorV1Impl"
+    )
+    # Retain every matching definition in source order, just as class creation
+    # does. Selecting the first method would hide a later overriding definition.
+    methods = [
+        n for n in adapter_class.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in {"_run_dsa_cold_compact_load", "_save_dsa_cold_load_snapshot"}
+    ]
     cls = ast.ClassDef(
         name="Adapter",
         bases=[ast.Name(id="Base", ctx=ast.Load())],
         keywords=[],
-        body=[adapter_method],
+        body=methods,
         decorator_list=[],
     )
-    env = dict(Base=Base)
+    env = dict(Base=Base, Any=Any)
     exec(
         compile(
             ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
@@ -289,7 +315,9 @@ def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
     adapter._decode_kv_snapshot_metadata["runtime"] = {"chunk_size": 1024}
     adapter._latent_layer_names = ["layer0"]
     adapter._indexer_layer_names = ["layer0"]
-    adapter.lmcache_engine = NS(gpu_connector=connector)
+    adapter.lmcache_engine = NS(
+        gpu_connector=connector, prepare_checkpoint_restore=lambda request: (0, [])
+    )
 
     def complete(event):
         assert event is state.dense_load_readiness
@@ -298,9 +326,13 @@ def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
         indexer.fill_(29)
 
     adapter._synchronize_dsa_cold_dense_readiness = complete
+    load_spec = (
+        NS(checkpoint_generation=1, dsa_cold_load_generation=1) if checkpoint else NS()
+    )
     plan = dict(
         request=NS(
-            req_id="request", decode_snapshot_request={"prompt_token_ids": [1, 2, 3, 4]}
+            req_id="request", load_spec=load_spec,
+            decode_snapshot_request={"prompt_token_ids": [1, 2, 3, 4]},
         ),
         tokens=[1, 2, 3],
         indexer_kvcaches=[indexer],
@@ -327,7 +359,7 @@ def test_actual_completion_hook_waits_then_writes(monkeypatch, tmp_path):
     assert events == ["receive_submitted"]
     # Disk failures mark only the diagnostic and cannot re-enter transfer fallback.
     adapter._decode_kv_snapshot_dir = str(tmp_path)
-    plan["request"] = NS(req_id="disk-error")
+    plan["request"] = NS(req_id="disk-error", load_spec=load_spec)
 
     def fail_write(*args, **kwargs):
         raise OSError("disk full")

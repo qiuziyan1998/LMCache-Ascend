@@ -166,6 +166,7 @@ def adapter(calls):
         Base,
     )
     obj = cls()
+    obj._decode_kv_snapshot_dir = ""
     obj._lmcache_chunk_size = 4
     obj.lmcache_engine = NS(
         load_group1_pages_direct=lambda *a: calls.append(

@@ -507,48 +507,31 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     metadata.prefill_overlap_span = (start, end)
         return metadata
 
-    def _run_dsa_cold_compact_load(
-        self,
-        plan,
-        npu_device_id,
-        indexer_future,
-        previous_latent_future=None,
-        live_state=None,
-    ):
-        """Optionally archive both received groups before first D execution."""
-        state = super()._run_dsa_cold_compact_load(
-            plan,
-            npu_device_id,
-            indexer_future,
-            previous_latent_future,
-            live_state,
-        )
-        directory = self._decode_kv_snapshot_dir
-        if directory:
-            # super() joins the native receive futures and retains the sources.
-            # Wait its final existing fence before reading NPU destinations.
-            # This only delays this D request's readiness publication.
-            self._synchronize_dsa_cold_dense_readiness(state.dense_load_readiness)
-            self.lmcache_engine.gpu_connector.save_decode_kv_snapshot(
-                directory,
-                plan["request"].req_id,
-                plan["tokens"],
-                state.prepared_sparse_sources.get(0),
-                plan["indexer_kvcaches"],
-                plan["indexer_slots_cpu"],
-                dict(
-                    self._decode_kv_snapshot_metadata,
-                    layer_names=[
-                        list(self._latent_layer_names),
-                        list(self._indexer_layer_names),
-                    ],
-                    capture_boundary="cold_receive_complete_before_first_decode",
-                    replay_request=getattr(
-                        plan["request"], "decode_snapshot_request", None
-                    ),
+    def _save_dsa_cold_load_snapshot(self, plan: Any, state: Any) -> None:
+        """Archive both received groups before publishing this D load as ready."""
+        # The base load joins the native receive futures and retains the sources.
+        # Wait its final existing fence before reading NPU destinations.
+        # This only delays this D request's readiness publication.
+        self._synchronize_dsa_cold_dense_readiness(state.dense_load_readiness)
+        self.lmcache_engine.gpu_connector.save_decode_kv_snapshot(
+            self._decode_kv_snapshot_dir,
+            plan["request"].req_id,
+            plan["tokens"],
+            state.prepared_sparse_sources.get(0),
+            plan["indexer_kvcaches"],
+            plan["indexer_slots_cpu"],
+            dict(
+                self._decode_kv_snapshot_metadata,
+                layer_names=[
+                    list(self._latent_layer_names),
+                    list(self._indexer_layer_names),
+                ],
+                capture_boundary="cold_receive_complete_before_first_decode",
+                replay_request=getattr(
+                    plan["request"], "decode_snapshot_request", None
                 ),
-            )
-        return state
+            ),
+        )
 
     def start_load_kv(
         self,
@@ -1952,13 +1935,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         live_state: Any = None,
     ) -> Any:
         if not hasattr(plan["request"].load_spec, "checkpoint_generation"):
-            return super()._run_dsa_cold_compact_load(
+            state = super()._run_dsa_cold_compact_load(
                 plan,
                 npu_device_id,
                 indexer_future,
                 previous_latent_future,
                 live_state,
             )
+            if self._decode_kv_snapshot_dir:
+                self._save_dsa_cold_load_snapshot(plan, state)
+            return state
         owners = []
         try:
             if npu_device_id is not None:
@@ -1978,13 +1964,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     owners,
                 )
                 owners = []
-            return super()._run_dsa_cold_compact_load(
+            state = super()._run_dsa_cold_compact_load(
                 plan,
                 npu_device_id,
                 indexer_future,
                 None,
                 live_state,
             )
+            if self._decode_kv_snapshot_dir:
+                self._save_dsa_cold_load_snapshot(plan, state)
+            return state
         except BaseException as error:
             gate = plan["latent_shared_ready"]
             if not gate.done():
