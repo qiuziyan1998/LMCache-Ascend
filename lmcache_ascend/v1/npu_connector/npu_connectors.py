@@ -6485,6 +6485,115 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._sparse_direct_validated_layers.update(validation_keys)
         return host_pointer_rows, layer_chunk_ptrs_npu
 
+    def save_decode_kv_snapshot(
+        self,
+        directory: str,
+        req_id: str,
+        tokens: Sequence[int],
+        latent_source: Any,
+        indexer_caches: Any,
+        indexer_slots: torch.Tensor,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Archive received D history after the caller's load-completion fence.
+
+        This opt-in synchronous diagnostic does not select a different transport
+        or enqueue work on P. Failures are logged and recorded, not propagated
+        into a production transport fallback.
+        """
+        from lmcache_ascend.v1.decode_kv_snapshot import (
+            RawSnapshot,
+            cpu_batches,
+            paged_batches,
+            physical_indexer_slots,
+        )
+
+        snapshot = None
+        try:
+            if self._layerwise_prefill_dma:
+                raise ValueError("D snapshots must not run on a banked P connector")
+            if latent_source is None or latent_source.total_tokens != len(tokens):
+                raise ValueError("No complete received latent source")
+            snapshot = RawSnapshot(
+                directory,
+                req_id,
+                tokens,
+                metadata,
+                (len(latent_source.layers), len(indexer_caches)),
+            )
+            logger.info(
+                "[D_KV_SNAPSHOT] req=%s begin tokens=%d dir=%s",
+                req_id,
+                len(tokens),
+                snapshot.directory,
+            )
+            layout = self._group_layouts[0]
+            widths = tuple(
+                int(w) * self.dtype.itemsize
+                for w in (layout.k_hidden_dims, layout.v_hidden_dims)
+                if w
+            )
+            interleaved = self._sparse_lmc_host_interleaved(0)
+            for layer, source in enumerate(latent_source.layers):
+                tensors = (
+                    (_layer_memory_tensor(obj, layer) for obj in source.memory_objs)
+                    if source.memory_objs
+                    else iter(source.tensors)
+                )
+                snapshot.write_layer(
+                    0,
+                    layer,
+                    cpu_batches(
+                        tensors, latent_source.chunk_token_counts, widths, interleaved
+                    ),
+                    [str(self.dtype)] * len(widths),
+                    "received_cpu",
+                )
+            logger.info(
+                "[D_KV_SNAPSHOT] req=%s latent_done layers=%d",
+                req_id,
+                len(latent_source.layers),
+            )
+            layout = self._group_layouts[1]
+            if len(indexer_slots) < len(tokens):
+                raise ValueError("Indexer mapping shorter than received history")
+            # The existing receive-ready event has completed. Use the normal
+            # load stream for readback; no new stream or async file queue.
+            with self._stream_context_or_null(self.load_stream):
+                for layer, cache in enumerate(indexer_caches):
+                    planes = (cache,) if isinstance(cache, torch.Tensor) else cache
+                    c8 = layout.indexer_c8 and planes[0].dtype == torch.int8
+                    slots = physical_indexer_slots(
+                        indexer_slots[: len(tokens)],
+                        c8=c8,
+                        factor=layout.layer_slot_factors[layer] if c8 else 1,
+                        block_map=getattr(layout, "block_map_cpu", None)
+                        if c8
+                        else None,
+                    )
+                    snapshot.write_layer(
+                        1,
+                        layer,
+                        paged_batches(planes, slots),
+                        [str(p.dtype) for p in planes],
+                        "received_npu",
+                    )
+            snapshot.finish()
+            logger.info(
+                "[D_KV_SNAPSHOT] req=%s complete tokens=%d files=%d dir=%s",
+                req_id,
+                len(tokens),
+                len(snapshot.meta["files"]),
+                snapshot.directory,
+            )
+        except Exception as error:
+            logger.exception("[D_KV_SNAPSHOT] req=%s failed: %s", req_id, error)
+            if snapshot is not None:
+                try:
+                    snapshot.fail(error)
+                except OSError:
+                    logger.exception("[D_KV_SNAPSHOT] could not record file error")
+
     def checkpoint_plane_widths(self, kv_group: int) -> tuple[int, ...]:
         """Return the registered CPU format's per-token plane widths."""
         layout = self._group_layouts[kv_group]

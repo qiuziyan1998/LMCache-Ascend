@@ -295,6 +295,29 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
         )
         self.store_async = self.config.store_async
+        # Read once. Disabled workers never import the snapshot code, read back
+        # tensors, record events, or create files. P ignores this D-only switch.
+        self._decode_kv_snapshot_dir = (
+            os.getenv("LMCACHE_DECODE_KV_SNAPSHOT_DIR", "").strip()
+            if role == KVConnectorRole.WORKER and (
+                self.kv_role == "kv_consumer"
+                or (self.kv_role == "kv_both"
+                    and getattr(self.config, "pd_role", None) == "receiver")
+            ) else ""
+        )
+        self._decode_kv_snapshot_metadata = (
+            dict(tp_rank=get_tensor_model_parallel_rank(),
+                 tp_size=vllm_config.parallel_config.tensor_parallel_size,
+                 dp_rank=vllm_config.parallel_config.data_parallel_index,
+                 model=vllm_config.model_config.model)
+            if self._decode_kv_snapshot_dir else None
+        )
+        if self._decode_kv_snapshot_dir:
+            logger.info(
+                "[D_KV_SNAPSHOT] enabled dir=%s boundary=cold_receive_complete "
+                "full_raw=1 copies_per_request=1",
+                self._decode_kv_snapshot_dir,
+            )
         self._force_layerwise_prefill_store = bool(
             self.use_layerwise
             and os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
@@ -453,6 +476,46 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 if start < end:
                     metadata.prefill_overlap_span = (start, end)
         return metadata
+
+    def _run_dsa_cold_compact_load(
+        self,
+        plan,
+        npu_device_id,
+        indexer_future,
+        previous_latent_future=None,
+        live_state=None,
+    ):
+        """Optionally archive both received groups before first D execution."""
+        state = super()._run_dsa_cold_compact_load(
+            plan,
+            npu_device_id,
+            indexer_future,
+            previous_latent_future,
+            live_state,
+        )
+        directory = self._decode_kv_snapshot_dir
+        if directory:
+            # super() joins the native receive futures and retains the sources.
+            # Wait its final existing fence before reading NPU destinations.
+            # This only delays this D request's readiness publication.
+            self._synchronize_dsa_cold_dense_readiness(state.dense_load_readiness)
+            self.lmcache_engine.gpu_connector.save_decode_kv_snapshot(
+                directory,
+                plan["request"].req_id,
+                plan["tokens"],
+                state.prepared_sparse_sources.get(0),
+                plan["indexer_kvcaches"],
+                plan["indexer_slots_cpu"],
+                dict(
+                    self._decode_kv_snapshot_metadata,
+                    layer_names=[
+                        list(self._latent_layer_names),
+                        list(self._indexer_layer_names),
+                    ],
+                    capture_boundary="cold_receive_complete_before_first_decode",
+                ),
+            )
+        return state
 
     def start_load_kv(
         self,
