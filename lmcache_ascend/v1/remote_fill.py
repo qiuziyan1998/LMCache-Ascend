@@ -218,6 +218,63 @@ def _log_remote_fill_event(
     )
 
 
+_PROM_REMOTE_FILL_GAUGES: dict[str, Any] | None = None
+
+
+def _prom_remote_fill_gauges() -> dict[str, Any]:
+    """Create fixed-cardinality decoder remote-fill gauges once per process."""
+
+    global _PROM_REMOTE_FILL_GAUGES
+    if _PROM_REMOTE_FILL_GAUGES is not None:
+        return _PROM_REMOTE_FILL_GAUGES
+    gauges: dict[str, Any] = {}
+    try:
+        # Third Party
+        from prometheus_client import Gauge
+    except Exception:
+        _PROM_REMOTE_FILL_GAUGES = gauges
+        return gauges
+    specs = {
+        "active_transactions": "Active remote-fill decoder transactions",
+        "active_windows": "Active remote-fill decoder windows",
+        "active_bytes": "Bytes reserved by active remote-fill decoder transactions",
+        "reserved_bytes_total": "Bytes ever reserved by the remote-fill decoder",
+        "published_bytes_total": "Bytes published by the remote-fill decoder",
+        "discarded_bytes_total": "Bytes discarded by the remote-fill decoder",
+        "capacity_rejections_total": "Remote-fill decoder capacity rejections",
+        "expired_transactions_total": "Remote-fill decoder idle-expired transactions",
+        "terminal_persistent_only_total": (
+            "Remote-fill decoder PERSISTENT_ONLY terminal outcomes"
+        ),
+    }
+    for name, documentation in specs.items():
+        try:
+            gauges[name] = Gauge(
+                f"lmcache:remote_fill_decoder_{name}",
+                documentation,
+            )
+        except Exception:
+            # Duplicate registration must never break the control service.
+            continue
+    _PROM_REMOTE_FILL_GAUGES = gauges
+    return gauges
+
+
+def _publish_prom_remote_fill(snapshot: Mapping[str, int] | None) -> None:
+    """Publish a decoder metrics snapshot to the process Prometheus registry."""
+
+    if not snapshot:
+        return
+    for name, gauge in _prom_remote_fill_gauges().items():
+        value = snapshot.get(name)
+        if value is None:
+            continue
+        try:
+            gauge.set(int(value))
+        except Exception:
+            continue
+
+
 class RemoteFillLocalBackend(Protocol):
     """Public LocalCPU operations required by remote fill."""
 
@@ -1335,6 +1392,7 @@ class DecoderRemoteFillServiceHost:
         self._started = False
         self._last_metrics = self._read_metrics()
         self._next_idle_metrics_at = monotonic() + 1.0
+        self._next_prom_metrics_at = 0.0
         self._next_maintenance_at = monotonic() + 0.1
         self._thread = Thread(
             target=self._run,
@@ -1404,6 +1462,7 @@ class DecoderRemoteFillServiceHost:
                 self._emit_metrics_if_changed(
                     force=bool(fatal),
                 )
+                self._publish_metrics_gauges_if_due()
                 if fatal and not self._fatal_reported:
                     self._fatal_reported = True
                     self._fatal_restart(fatal)
@@ -1475,6 +1534,19 @@ class DecoderRemoteFillServiceHost:
             level=logging.DEBUG,
             **changes,
         )
+
+    def _publish_metrics_gauges_if_due(self) -> None:
+        """Publish decoder gauges at one-second resolution, DEBUG-independent."""
+
+        now = monotonic()
+        if now < self._next_prom_metrics_at:
+            return
+        self._next_prom_metrics_at = now + 1.0
+        try:
+            _publish_prom_remote_fill(self._read_metrics())
+        except Exception:
+            # Metrics export must never break the control service.
+            pass
 
 
 @dataclass(slots=True)
