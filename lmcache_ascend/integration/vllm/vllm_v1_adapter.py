@@ -22,6 +22,7 @@ from lmcache.v1.prefill_store_debug import (
 )
 from lmcache.v1.prefill_kv_hash import finish_kv_hash, kv_hash_enabled
 from lmcache.v1.cache_engine import LayerwiseStoreResult
+from lmcache.v1.prefill_admission import PrefillAdmissionBudget
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -187,6 +188,8 @@ class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
         default_factory=dict
     )
     checkpoint_results = ()
+    # Keyword-only to preserve CheckpointWorkerMetadata's positional protocol.
+    prefill_admission: tuple[dict, ...] = field(default=(), kw_only=True)
 
     def aggregate(
         self, other: KVConnectorWorkerMetadata
@@ -204,9 +207,13 @@ class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
                     "Tensor-parallel ranks reported different remote-fill outcomes"
                 )
             results[req_id] = dict(result)
+        admission = self.prefill_admission + other.prefill_admission
         if self.checkpoint_results or other.checkpoint_results:
-            return CheckpointWorkerMetadata(merged, results, self.checkpoint_results + other.checkpoint_results)
-        return LiveSourceWorkerMetadata(merged, results)
+            return CheckpointWorkerMetadata(
+                merged, results, self.checkpoint_results + other.checkpoint_results,
+                prefill_admission=admission,
+            )
+        return LiveSourceWorkerMetadata(merged, results, prefill_admission=admission)
 
 
 @dataclass
@@ -295,6 +302,18 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
         )
         self.store_async = self.config.store_async
+        self._prefill_admission_enabled = bool(
+            self.use_layerwise and self._layerwise_prefill_p_node
+        )
+        self._prefill_admission = (
+            PrefillAdmissionBudget(vllm_config.parallel_config.tensor_parallel_size)
+            if self._prefill_admission_enabled and role == KVConnectorRole.SCHEDULER
+            else None
+        )
+        self._prefill_admission_retired: set[str] = set()
+        self._prefill_admission_last_report: Optional[dict] = None
+        self._prefill_admission_report_time = 0.0
+        self._prefill_admission_wait_logged: set[str] = set()
         self._decode_snapshot_enabled = (
             os.getenv("LMCACHE_DECODE_KV_SNAPSHOT", "0").strip().lower()
             in ("1", "true", "yes", "on")
@@ -1242,6 +1261,118 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             ):
                 self._unfenced_live_stores[request.req_id] = request
 
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> Optional[int]:
+        budget = getattr(self, "_prefill_admission", None)
+        if budget is not None and not request.request_id.startswith("mock_req"):
+            allowed, error, details = budget.admit(
+                request.request_id, request.num_tokens
+            )
+            if not allowed:
+                if error:
+                    request.kv_admission_error = error
+                if (
+                    details
+                    and request.request_id not in self._prefill_admission_wait_logged
+                ):
+                    self._prefill_admission_wait_logged.add(request.request_id)
+                    logger.info(
+                        "[P_CPU_ADMISSION] req=%s action=%s %s",
+                        request.request_id,
+                        "reject" if error else "wait",
+                        details,
+                    )
+                return None
+            if details:
+                self._prefill_admission_wait_logged.discard(request.request_id)
+                logger.info(
+                    "[P_CPU_ADMISSION] req=%s action=admit %s",
+                    request.request_id,
+                    details,
+                )
+        return super().get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def has_pending_control(self) -> bool:
+        budget = getattr(self, "_prefill_admission", None)
+        return bool(
+            super().has_pending_control()
+            or (
+                budget is not None
+                and (not budget.ready or budget.retiring or budget.waiting)
+            )
+        )
+
+    def _build_prefill_admission_report(self) -> tuple[dict, ...]:
+        """Publish allocator facts after worker cleanup, with no NPU operation."""
+        if not getattr(self, "_prefill_admission_enabled", False):
+            return ()
+        now = time.monotonic()
+        # Empty scheduler polls must not repeatedly scan a large CPU hot cache.
+        retired = self._prefill_admission_retired
+        previous = self._prefill_admission_last_report
+        if (
+            previous is not None
+            and not retired
+            and now - self._prefill_admission_report_time < 0.25
+        ):
+            return (dict(previous, retired=()),)
+        if retired:
+            # This is the existing nonblocking readiness query, not a new
+            # synchronization. Idle control steps must retire completed owners
+            # even when there is no subsequent model batch to trigger cleanup.
+            self._drain_dense_load_retirements()
+        engine = self.lmcache_engine
+        metadata = engine.metadata
+        rank = metadata.worker_id
+        shared = self.config.get_extra_config_value(
+            "enable_shared_cpu_cache", self.config.enable_shared_cpu_cache
+        )
+        owns_pool = not shared or metadata.is_first_rank()
+        pool = None
+        page_bytes = 0
+        if owns_pool:
+            backend = engine.storage_manager.local_cpu_backend
+            if backend is None:
+                raise RuntimeError(
+                    "Layerwise prefill admission requires LocalCPUBackend"
+                )
+            pool = backend.get_prefill_admission_capacity()
+            # Include alignment for the ordinary per-layer allocation fallback,
+            # not only the smaller alignment overhead of merged pages.
+            allocator = backend.get_memory_allocator()
+            alignment = int(getattr(allocator, "align_bytes", 4096))
+            shapes, dtypes = metadata.get_shapes(), metadata.get_dtypes()
+            layer_counts = metadata.runtime_kv_group_layer_counts
+            if layer_counts is None:
+                raise RuntimeError(
+                    "Layerwise prefill admission requires resolved KV groups"
+                )
+            page_bytes = sum(
+                int(shape.numel()) * dtype.itemsize + alignment * layers
+                for shape, dtype, layers in zip(
+                    shapes, dtypes, layer_counts, strict=True
+                )
+            )
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        pending = {
+            state.req_id
+            for state in (getattr(coordinator, "retirements", None) or {}).values()
+        }
+        completed = tuple(sorted(retired - pending))
+        retired.difference_update(completed)
+        report = dict(
+            rank=rank,
+            pool=pool,
+            page_bytes=page_bytes,
+            chunk_tokens=metadata.chunk_size,
+            max_batch_tokens=self._vllm_config.scheduler_config.max_num_batched_tokens,
+            retired=completed,
+        )
+        self._prefill_admission_last_report = report
+        self._prefill_admission_report_time = now
+        return (report,)
+
     def build_connector_worker_meta(self) -> Optional[KVConnectorWorkerMetadata]:
         if self.lmcache_engine is None:
             return None
@@ -1250,6 +1381,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         remote_fill_results = (
             self.lmcache_engine.drain_remote_fill_terminal_results()
         )
+        admission = self._build_prefill_admission_report()
         if serving_perf_enabled():
             for req_id, descriptor in descriptors.items():
                 serving_perf_log(
@@ -1277,8 +1409,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             LiveSourceWorkerMetadata(
                 {req_id: [descriptor] for req_id, descriptor in descriptors.items()},
                 remote_fill_results,
+                prefill_admission=admission,
             )
-            if descriptors or remote_fill_results
+            if descriptors or remote_fill_results or admission
             else None
         )
 
@@ -1289,6 +1422,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self, metadata: KVConnectorWorkerMetadata, active_req_ids: set[str]
     ) -> None:
         if isinstance(metadata, LiveSourceWorkerMetadata):
+            budget = getattr(self, "_prefill_admission", None)
+            if budget is not None:
+                budget.update(metadata.prefill_admission)
             for result in metadata.checkpoint_results:
                 self.accept_preemption_result(result)
             for req_id, descriptors in metadata.descriptors.items():
@@ -1645,6 +1781,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             self.lmcache_engine.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
             self._forget_layerwise_store_results(req_ids)
         super()._release_finished_worker_requests(req_ids)
+        if getattr(self, "_prefill_admission_enabled", False):
+            self._prefill_admission_retired.update(req_ids)
 
     def _forget_layerwise_store_results(self, req_ids: Iterable[str]) -> None:
         pending = getattr(self, "_layerwise_local_store_results", {})
@@ -1806,6 +1944,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        budget = getattr(self, "_prefill_admission", None)
+        if budget is not None:
+            budget.finish(request.request_id)
+            self._prefill_admission_wait_logged.discard(request.request_id)
         _, return_params = super().request_finished(request, block_ids)
         descriptors = self._scheduler_live_sources.pop(request.request_id, None)
         remote_fill_result = getattr(
@@ -2084,7 +2226,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 metadata = CheckpointWorkerMetadata(checkpoint_results=results)
             else:
                 metadata = CheckpointWorkerMetadata(
-                    metadata.descriptors, metadata.remote_fill_results, results
+                    metadata.descriptors, metadata.remote_fill_results, results,
+                    prefill_admission=metadata.prefill_admission,
                 )
         if not worker.jobs and not worker.restore_owners:
             # Reveal the original class methods, rather than retaining bound

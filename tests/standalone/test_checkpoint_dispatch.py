@@ -218,7 +218,9 @@ def test_checkpoint_results_survive_both_tp_aggregation_orders():
     for merged in (plain.aggregate(result), result.aggregate(plain)):
         assert merged.descriptors == {"a": [1]}
         assert merged.checkpoint_results == ("checkpoint-ready",)
-    assert [f.name for f in fields(plain)] == ["descriptors", "remote_fill_results"]
+    assert [f.name for f in fields(plain)] == [
+        "descriptors", "remote_fill_results", "prefill_admission"
+    ]
 
 
 def test_release_only_control_frame_retires_restore_owners_and_restores_idle_methods():
