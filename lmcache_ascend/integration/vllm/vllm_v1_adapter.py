@@ -1231,7 +1231,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             # Both groups' CPU pages now exist. Start the independent D-cache
             # fill BEFORE waiting for Mooncake puts, not after that barrier.
             self.lmcache_engine.submit_layerwise_prefill_fills(
-                request.req_id for request in metadata.requests
+                (request.req_id for request in metadata.requests),
+                request_metadata=(
+                    (request.req_id, request.token_ids, request.request_configs,
+                     lambda request=request:
+                     self._prefill_metadata_cache_for_request(request, state)
+                     if (state := self._worker_retrieve_state.get(request.req_id))
+                     is not None and state.prefill_metadata_cache is not None
+                     else None)
+                    for request in metadata.requests
+                    if not request.is_sparse_decode
+                ),
             )
             self.lmcache_engine.poll_layerwise_prefill_puts(
                 final=bool(final_requests),

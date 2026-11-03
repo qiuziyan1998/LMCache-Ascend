@@ -3204,8 +3204,8 @@ def test_coordinator_logs_decoder_refusal_without_changing_circuit_policy(
     assert records[0]["response_code"] == code.value
     assert records[0]["response_message"] == "injected rejection"
     assert records[0]["reason"] == state.disabled_reason == "probe rejected"
-    assert coordinator._circuit_failures == 1
-    assert coordinator._circuit_allows()
+    assert state.circuit.failures == 1
+    assert coordinator._circuit_allows(state)
     assert coordinator.metrics_snapshot()["allocation_rejection_total"] == (
         {} if code is ResultCode.WINDOW_CONFLICT else {"probe_rejected": 1}
     )
@@ -3723,7 +3723,9 @@ def test_coordinator_repeated_finish_drop_releases_sources_without_gc():
         pass
 
     engine = object.__new__(AscendLMCacheEngine)
-    engine.config = SimpleNamespace(chunk_size=1024)
+    engine.config = SimpleNamespace(
+        chunk_size=1024, remote_fill_circuit_breaker_enabled=False,
+    )
     engine._direct_store_states = {}
     engine._live_source_builders = {}
     engine._completed_live_sources = {}
@@ -3765,3 +3767,567 @@ def test_coordinator_repeated_finish_drop_releases_sources_without_gc():
     finally:
         if was_enabled:
             gc.enable()
+
+
+class _QueuedManifestJobs:
+    def __init__(self):
+        self.jobs = []
+
+    def submit(self, job):
+        future = Future()
+        self.jobs.append((job, future))
+        return future
+
+    def drain(self):
+        for job, future in self.jobs:
+            if future.done():
+                continue
+            try:
+                future.set_result(job())
+            except BaseException as error:
+                future.set_exception(error)
+
+
+def _banked_manifest_engine(groups=(0,), reused=(0,), *, d_missing=False):
+    h = _PrefixRepairHarness(groups)
+    h.pages = tuple(
+        msgspec.structs.replace(
+            h.pages[group_index], canonical_key=f"g{group}-chunk{chunk}",
+            chunk_index=chunk, chunk_start=chunk * 4,
+            chunk_end=chunk * 4 + count, valid_tokens=count,
+            expected_bytes=2 * count * (7 if group == 0 else 3) * 2,
+        )
+        for chunk, count in enumerate((4, 4, 2))
+        for group_index, group in enumerate(groups)
+    )
+    h.payload = {p.canonical_key: bytes([i + 1]) * p.expected_bytes
+                 for i, p in enumerate(h.pages)}
+    h.cached = {} if d_missing else {
+        p.canonical_key: h.payload[p.canonical_key]
+        for p in h.pages if p.chunk_index in reused
+    }
+    engine, coordinator = _queued_coordinator()
+    engine.config.enable_remote_lmcache_store = True
+    engine.config.chunk_size = 4
+    engine.config.remote_fill_max_inflight_windows_per_request = 2
+    engine.config.remote_fill_native_hard_timeout_ms = 3000
+    engine._is_passive = lambda: False
+    engine._remote_fill_direct_groups = lambda: groups
+    engine._num_layers_for_kv_group = lambda _: 2
+    engine._remote_fill_pages_per_window = lambda: len(groups)
+    engine._remote_fill_session_context = lambda: None
+    engine._remote_fill_immutable_layout = lambda: (
+        "payload-v3", SimpleNamespace(
+            chunk_size=4, layout_tag="payload-v3",
+            num_layers_for_group=lambda _: 2,
+            group=lambda g: SimpleNamespace(
+                expected_bytes=lambda count, layers: (
+                    count * layers * (7 if g == 0 else 3) * 2
+                ),
+            ),
+        ),
+    )
+    engine.token_database = object()
+    engine.storage_manager.prepare_remote_fill_source = h.prepare
+    engine.storage_manager.submit_remote_fill_direct_push = h.submit
+    coordinator._create_session = lambda *_: h.session
+    coordinator._activation_factory = lambda _: None
+    jobs = _QueuedManifestJobs()
+    coordinator._executor = jobs
+    state = _DirectStoreRequestState(
+        committed_end={0: 10, 1: 10},
+        remote_fill=ProducerRequestState(handoff=h.handoff),
+    )
+    engine._direct_store_states = {"prefix": state}
+    engine._layerwise_cpu_fill_sources = {}
+    engine._layerwise_cpu_fill_quarantine = []
+    engine._remote_fill_fatal_transfers = ()
+    engine.mark_init_failed = Mock()
+    released = []
+    for group in groups:
+        pages = tuple(p for p in h.pages
+                      if p.kv_group == group and p.chunk_index not in reused)
+        if not pages:
+            continue
+        plan = h.make_plan(pages)
+        keys = [SimpleNamespace(kv_group=p.kv_group,
+                                to_string=lambda p=p: p.canonical_key)
+                for p in pages]
+        batch = _DirectPageBatch(
+            req_id="prefix", keys=keys,
+            ptrs=[list(p.source_ptrs) for p in plan.pages],
+            sizes=[list(p.source_lengths) for p in plan.pages],
+            owners=plan.owners, ready_event=plan.producer_events[-1],
+            ready_events=plan.producer_events, group_ends={group: pages[-1].chunk_end},
+            ranges=tuple((p.chunk_start, p.chunk_end) for p in pages),
+        )
+        engine._layerwise_cpu_fill_sources.setdefault("prefix", {})[group] = (
+            batch, SimpleNamespace(release=lambda g=group: released.append(g)),
+        )
+
+    def prepare(_database, _tokens, *, kv_group, skip_tokens, **_kwargs):
+        return SimpleNamespace(candidates=[
+            (p.chunk_start, p.chunk_end, SimpleNamespace(
+                to_string=lambda p=p: p.canonical_key,
+            )) for p in h.pages if p.kv_group == kv_group
+            and p.chunk_end > skip_tokens
+        ])
+
+    cache = SimpleNamespace(prepare=Mock(side_effect=prepare))
+    metadata = (("prefix", list(range(10)), None, cache),)
+    return engine, state, h, jobs, metadata, released
+
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+@pytest.mark.parametrize("reused", [(), (0,), (1,), (0, 2), (0, 1, 2)])
+def test_banked_manifest_registers_all_reused_pages_in_one_job(groups, reused):
+    engine, state, h, jobs, metadata, released = _banked_manifest_engine(groups, reused)
+    # One older job already occupies the other allowed producer slot.
+    coordinator = engine._get_remote_fill_coordinator()
+    assert coordinator._acquire_queue_capacity(state.remote_fill, 0)
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    assert len(jobs.jobs) == 1 and state.remote_fill.queued_windows == 2
+    assert state.remote_fill.manifest_end == 10
+    assert not released  # Unfinished job still owns every source lease.
+    jobs.drain()
+    coordinator._release_queue_capacity(state.remote_fill, 0)
+    engine.finish_layerwise_prefill_store(
+        "prefix", None, required_store_end=10, persistence_fenced=True,
+    )
+    assert state.remote_fill.terminal.direct_satisfied
+    assert h.cached == h.payload
+    assert set(h.transferred) == {
+        p.canonical_key for p in h.pages if p.chunk_index not in reused
+    }
+    assert state.remote_fill.queued_bytes == state.remote_fill.queued_windows == 0
+    assert sorted(released) == ([] if len(reused) == 3 else list(groups))
+    if not reused:
+        metadata[0][3].prepare.assert_not_called()
+    # Repeated finalization/planning cannot register the partial tail twice.
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    assert len(jobs.jobs) == 1
+
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+def test_banked_manifest_real_hole_stops_before_suffix_native_io(groups):
+    engine, state, h, jobs, metadata, released = _banked_manifest_engine(
+        groups, d_missing=True,
+    )
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    jobs.drain()
+    engine.finish_layerwise_prefill_store(
+        "prefix", None, required_store_end=10, persistence_fenced=True,
+    )
+    assert not state.remote_fill.terminal.direct_satisfied
+    assert not h.transferred and "ArmWindowRequest" not in h.events
+    assert sorted(released) == list(groups)
+    assert state.remote_fill.queued_bytes == state.remote_fill.queued_windows == 0
+
+
+@pytest.mark.parametrize("passive", [False, True])
+def test_banked_manifest_disabled_and_passive_do_not_consume_metadata(passive):
+    engine, _, _, jobs, _, _ = _banked_manifest_engine(reused=(0, 1, 2))
+    engine.config.enable_remote_lmcache_store = passive
+    engine._is_passive = lambda: passive
+
+    def forbidden():
+        raise AssertionError("disabled/passive metadata work")
+        yield
+
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=forbidden())
+    assert not jobs.jobs
+
+
+def test_destination_circuit_isolates_failures_success_and_epoch(monkeypatch):
+    _, coordinator = _queued_coordinator()
+    coordinator.config.remote_fill_circuit_breaker_enabled = True
+    coordinator.config.remote_fill_circuit_breaker_failure_threshold = 3
+    coordinator.config.remote_fill_circuit_breaker_cooldown_sec = 60
+    now = [100.0]
+    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: now[0])
+    a = ProducerRequestState(handoff=_handoff())
+    b = ProducerRequestState(handoff=_handoff(control_endpoint="tcp://other:19001"))
+    assert coordinator._circuit_allows(a) and coordinator._circuit_allows(b)
+    for _ in range(3):
+        coordinator._record_failure(a)
+    assert not coordinator._circuit_allows(a)
+    assert coordinator._circuit_allows(b)
+    coordinator.record_success(b)
+    assert not coordinator._circuit_allows(a)
+    replacement = ProducerRequestState(handoff=_handoff(destination_engine_epoch=18))
+    assert coordinator._circuit_allows(replacement)
+    for _ in range(3):
+        coordinator._record_failure(replacement)
+    coordinator.record_success(a)
+    assert not coordinator._circuit_allows(replacement)
+    now[0] += 61
+    assert coordinator._circuit_allows(replacement)
+    assert replacement.circuit.failures == 0
+
+
+def test_destination_circuit_registry_is_bounded_without_reopening_live_gates():
+    _, coordinator = _queued_coordinator()
+    coordinator.config.remote_fill_circuit_breaker_enabled = True
+    coordinator.config.remote_fill_circuit_breaker_failure_threshold = 1
+    coordinator.config.remote_fill_circuit_breaker_cooldown_sec = 60
+    states = [ProducerRequestState(handoff=_handoff(destination_engine_epoch=i + 1))
+              for i in range(129)]
+    for state in states[:128]:
+        assert coordinator._circuit_allows(state)
+        coordinator._record_failure(state)
+    assert not coordinator._circuit_allows(states[-1])
+    assert states[-1].disabled_reason == "circuit_capacity"
+    assert len(coordinator._circuits) == 128
+    coordinator.record_success(states[0])
+    assert coordinator._circuit_allows(states[-1])
+    coordinator._record_failure(states[-1])
+    coordinator.record_success(states[0])  # Late evicted entry cannot clear new one.
+    assert not coordinator._circuit_allows(states[-1])
+    assert len(coordinator._circuits) == 128
+
+
+@pytest.mark.parametrize("failure", ["enqueue", "capacity", "fatal"])
+def test_banked_manifest_failure_preserves_frontier_and_source_ownership(failure):
+    engine, state, h, jobs, metadata, released = _banked_manifest_engine()
+    if failure == "enqueue":
+        jobs.submit = lambda _: (_ for _ in ()).throw(RuntimeError("enqueue"))
+    elif failure == "capacity":
+        engine.config.remote_fill_max_inflight_bytes = 1
+    else:
+        def unknown(**_kwargs):
+            raise RuntimeError("native completion unknown")
+        engine.storage_manager.submit_remote_fill_direct_push = unknown
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    jobs.drain()
+    assert state.remote_fill.queued_bytes == state.remote_fill.queued_windows == 0
+    if failure == "fatal":
+        assert isinstance(
+            state.remote_fill.last_future.exception(), RemoteFillFatalError,
+        )
+        assert not released and len(engine._layerwise_cpu_fill_quarantine) == 1
+        assert engine.remote_fill_requires_paired_restart()
+    else:
+        assert state.remote_fill.manifest_end == 0
+        assert released == [0] and not h.transferred
+
+
+def test_banked_manifest_incremental_hits_do_not_repeat_previous_windows():
+    engine, state, h, jobs, metadata, _ = _banked_manifest_engine(reused=(0, 1, 2))
+    for end in (4, 8, 10, 10):
+        current = (("prefix", list(range(end)), None, metadata[0][3]),)
+        engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=current)
+        jobs.drain()
+        assert state.remote_fill.manifest_end == end
+    assert len(jobs.jobs) == 3 and not h.transferred
+    assert h.events.count("ReserveWindowRequest") == 3
+    engine.finish_layerwise_prefill_store(
+        "prefix", None, required_store_end=10, persistence_fenced=True,
+    )
+    assert state.remote_fill.terminal.direct_satisfied
+
+
+def test_banked_manifest_all_new_does_not_call_metadata_provider():
+    engine, _, _, jobs, metadata, _ = _banked_manifest_engine(reused=())
+    provider = Mock(side_effect=AssertionError("unnecessary metadata"))
+    current = (("prefix", metadata[0][1], None, provider),)
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=current)
+    jobs.drain()
+    provider.assert_not_called()
+
+
+def test_banked_ascend_batch_entry_supplies_manifest_before_persistence_barrier():
+    # Execute the actual derived method without importing unavailable vLLM SDKs.
+    import ast
+    from pathlib import Path
+    path = (Path(__file__).parents[2]
+            / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                and n.name == "_finish_layerwise_prefill_batch")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"),
+         namespace)
+    engine, state, _, jobs, metadata, _ = _banked_manifest_engine()
+    order = []
+    engine.poll_layerwise_prefill_puts = lambda **_: order.append("persist")
+    engine.wait_for_pending_sync_stores = jobs.drain
+    request = SimpleNamespace(
+        req_id="prefix", token_ids=metadata[0][1], request_configs=None,
+        is_last_prefill=True, is_sparse_decode=False,
+    )
+    adapter = SimpleNamespace(
+        kv_role="kv_both", lmcache_engine=engine, _completed_layerwise_stores={},
+        _parent=SimpleNamespace(_get_connector_metadata=lambda: SimpleNamespace(
+            requests=(request,),
+        )),
+        _worker_retrieve_state={"prefix": SimpleNamespace(
+            prefill_metadata_cache=metadata[0][3],
+        )},
+        _prefill_metadata_cache_for_request=lambda request, current: (
+            order.append("manifest") or current.prefill_metadata_cache
+        ),
+    )
+    namespace[node.name](adapter)
+    assert state.remote_fill.terminal.direct_satisfied
+    assert order == ["manifest", "persist"]
+
+
+
+def test_banked_manifest_invalid_source_keeps_existing_persistent_fallback():
+    engine, state, _, jobs, metadata, released = _banked_manifest_engine()
+    batch, _ = engine._layerwise_cpu_fill_sources["prefix"][0]
+    batch.sizes[0][0] += 1
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    assert state.remote_fill.disabled_reason == "ValueError"
+    assert state.remote_fill.manifest_end == 0
+    assert released == [0] and not jobs.jobs
+
+
+
+def test_refused_destination_does_not_block_other_destination_admission():
+    engine, coordinator = _queued_coordinator()
+    coordinator.config.enable_remote_lmcache_store = True
+    coordinator.config.remote_fill_circuit_breaker_enabled = True
+    coordinator.config.remote_fill_circuit_breaker_failure_threshold = 3
+    coordinator.config.remote_fill_circuit_breaker_cooldown_sec = 60
+    coordinator.tp_size = 8
+    coordinator._create_session = lambda *_: _session(_ScriptedClient(
+        reserve_dispositions=(), reject_on=ReserveWindowRequest,
+    ))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        coordinator._executor = executor
+        for attempt in range(3):
+            state = ProducerRequestState(handoff=_handoff())
+            coordinator.submit_probe(
+                str(attempt), state, _pages(), 1024, maximum=2, context=None,
+            )
+            coordinator.wait(state)
+        other = ProducerRequestState()
+        assert coordinator.prepare_request(
+            "other", {"lmcache.remote_fill": asdict(_handoff(
+                transfer_id="other", control_endpoint="tcp://other:19001",
+            ))}, other,
+        )
+        assert not other.disabled_reason
+
+
+
+def test_banked_manifest_fallback_cache_reuses_hashes_and_preserves_byte_identity():
+    engine, state, h, jobs, _, _ = _banked_manifest_engine(reused=(0, 1, 2))
+    hashed = []
+
+    class Key:
+        def __init__(self, value, group):
+            self.chunk_hash, self.kv_group = value, group
+
+        def to_string(self):
+            return f"g{self.kv_group}-chunk{int.from_bytes(self.chunk_hash, 'big')}"
+
+        def split_layers(self, count):
+            return tuple((self, layer) for layer in range(count))
+
+    class Database:
+        chunk_size = 4
+        config = SimpleNamespace(save_unfull_chunk=True)
+
+        def process_tokens(self, tokens=None, hashes=None, offsets=None,
+                           kv_group=0, **kwargs):
+            if hashes is None:
+                yield from self.process_tokens_from_prefix(tokens, **kwargs)
+            else:
+                start = 0
+                for value, count in zip(hashes, offsets, strict=True):
+                    yield start, start + count, Key(value, kv_group)
+                    start += count
+
+        def process_tokens_from_prefix(
+            self, tokens, prefix_token_count=0, **_kwargs,
+        ):
+            for start in range(prefix_token_count, len(tokens), 4):
+                hashed.append(start)
+                yield (start, min(start + 4, len(tokens)),
+                       (start // 4).to_bytes(32, 'big'))
+
+    engine.token_database = Database()
+    for end in (4, 8, 10):
+        engine.submit_layerwise_prefill_fills(
+            ("prefix",), request_metadata=(("prefix", list(range(end)), None, None),),
+        )
+        jobs.drain()
+    assert hashed == [0, 4, 8]
+    assert all(isinstance(value, bytes) and len(value) == 32
+               for value in state.remote_fill.manifest_metadata.hashes)
+    engine.finish_layerwise_prefill_store(
+        "prefix", None, required_store_end=10, persistence_fenced=True,
+    )
+    assert state.remote_fill.terminal.direct_satisfied and not h.transferred
+
+
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+@pytest.mark.parametrize("one_window", [False, True])
+def test_banked_batch_prepares_retained_owners_once_and_checks_each_window(
+    monkeypatch, groups, one_window,
+):
+    import torch
+
+    engine, state, h, jobs, metadata, _ = _banked_manifest_engine(groups, reused=())
+    offset = 0
+    offsets = {}
+    payload = bytearray()
+    for page in h.pages:
+        offsets[page.canonical_key] = offset
+        payload.extend(h.payload[page.canonical_key])
+        offset += page.expected_bytes
+    owner = torch.tensor(list(payload), dtype=torch.uint8)
+    event = SimpleNamespace(synchronize=Mock())
+    for batch, _lease in engine._layerwise_cpu_fill_sources["prefix"].values():
+        batch.owners = (owner,)
+        batch.ready_event = event
+        batch.ready_events = (event,)
+        batch.ptrs = [[owner.data_ptr() + offsets[key.to_string()]]
+                      for key in batch.keys]
+    if one_window:
+        engine._remote_fill_pages_per_window = lambda: len(h.pages)
+    checks = Mock(wraps=coordinator_module.validate_direct_push_source_ranges)
+    monkeypatch.setattr(coordinator_module, "validate_direct_push_source_ranges",
+                        checks)
+
+    def prepare(plan):
+        checks(tuple(ptr for page in plan.pages for ptr in page.source_ptrs),
+               tuple(size for page in plan.pages for size in page.source_lengths),
+               coordinator_module.direct_push_owner_ranges(plan.owners))
+        for fence in plan.producer_events:
+            fence.synchronize()
+        return h.prepare(plan)
+
+    preparer = Mock(side_effect=prepare)
+    engine.storage_manager.prepare_remote_fill_source = preparer
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    jobs.drain()
+    engine.finish_layerwise_prefill_store(
+        "prefix", None, required_store_end=10, persistence_fenced=True,
+    )
+    assert state.remote_fill.terminal.direct_satisfied
+    assert h.cached == h.payload
+    assert preparer.call_count == event.synchronize.call_count == 1
+    assert checks.call_count == (1 if one_window else 3)
+
+
+
+@pytest.mark.parametrize("as_future", [False, True])
+def test_job_source_preparation_failure_does_not_cache_owners_without_gc(as_future):
+    import torch
+
+    engine, coordinator = _queued_coordinator()
+    calls = []
+
+    def backend(plan):
+        calls.append(None)
+        result = Future()
+        if len(calls) == 1:
+            result.set_exception(RuntimeError("injected preparation failure"))
+        else:
+            result.set_result(PreparedDirectPushSource(plan, 0, 0, 0))
+        return result
+
+    engine.storage_manager.prepare_remote_fill_source = backend
+    prepare = coordinator._source_preparer(2, 1, as_future=as_future)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        owner = torch.zeros(16, dtype=torch.uint8)
+        reference = weakref.ref(owner)
+        plan = DirectPushSourcePlan(
+            (DirectPushPageSource("page", 0, (owner.data_ptr(),), (16,)),),
+            (owner,), (SimpleNamespace(synchronize=lambda: None),),
+        )
+        with pytest.raises(RuntimeError, match="injected preparation failure"):
+            prepare(plan)
+        del owner, plan
+        assert reference() is None
+        owner = torch.ones(16, dtype=torch.uint8)
+        plan = DirectPushSourcePlan(
+            (DirectPushPageSource("page", 0, (owner.data_ptr(),), (16,)),),
+            (owner,), (SimpleNamespace(synchronize=lambda: None),),
+        )
+        result = prepare(plan)
+        result = result.result() if as_future else result
+        assert result.source_plan is plan and len(calls) == 2
+    finally:
+        (gc.enable if enabled else gc.disable)()
+
+
+
+def test_banked_terminal_request_ignores_later_resident_metadata_marker():
+    import ast
+    from pathlib import Path
+    import lmcache
+
+    path = Path(lmcache.__file__).parent / "integration/vllm/vllm_v1_adapter.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                and n.name == "from_request_tracker")
+    node.decorator_list = []
+    namespace = {
+        "ReqMeta": SimpleNamespace,
+        "SaveSpec": lambda skip, can_save, **kwargs: SimpleNamespace(
+            skip_leading_tokens=skip, can_save=can_save, **kwargs,
+        ),
+        "cdiv": lambda value, unit: (value + unit - 1) // unit,
+    }
+    future = ast.ImportFrom(module="__future__", level=0,
+                            names=[ast.alias(name="annotations")])
+    exec(compile(ast.fix_missing_locations(ast.Module(
+        body=[future, node], type_ignores=[],
+    )), str(path), "exec"), namespace)
+    marker = namespace[node.name](SimpleNamespace(
+        req_id="prefix", token_ids=list(range(11)), prompt_len=10,
+        num_saved_tokens=10, num_lmcache_cached_tokens=0, skip_save=False,
+        is_decode_phase=True, request_configs=None, disagg_spec=None,
+        dsa_current_released_frontier=0, dsa_nonresident_frontier=0,
+    ), block_size=4, lmcache_chunk_size=4, dsa_two_groups=True,
+        windowed_sparse_layerwise_save=True, layerwise_prefill_dma=True)
+    assert marker.token_ids == [] and not marker.save_spec.can_save
+    engine, state, _, jobs, metadata, _ = _banked_manifest_engine()
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    jobs.drain()
+    engine.finish_layerwise_prefill_store(
+        "prefix", None, required_store_end=10, persistence_fenced=True,
+    )
+    assert state.remote_fill.terminal.direct_satisfied
+    coordinator = engine._get_remote_fill_coordinator()
+    snapshot = coordinator.metrics_snapshot()
+    # ReqMeta emits empty-token resident markers when there is no load/save.
+    engine.submit_layerwise_prefill_fills(
+        ("prefix",), request_metadata=((
+            marker.req_id, marker.token_ids, marker.request_configs, None,
+        ),),
+    )
+    assert not state.remote_fill.disabled_reason
+    assert state.remote_fill.manifest_end == 10
+    assert len(jobs.jobs) == 1
+    assert coordinator.metrics_snapshot() == snapshot
+
+
+
+def test_destination_circuit_gauge_expires_when_another_destination_is_admitted(
+    monkeypatch,
+):
+    _, coordinator = _queued_coordinator()
+    coordinator.config.remote_fill_circuit_breaker_enabled = True
+    coordinator.config.remote_fill_circuit_breaker_failure_threshold = 3
+    coordinator.config.remote_fill_circuit_breaker_cooldown_sec = 60
+    now = [100.0]
+    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: now[0])
+    a = ProducerRequestState(handoff=_handoff())
+    b = ProducerRequestState(handoff=_handoff(control_endpoint="tcp://other:19001"))
+    for _ in range(3):
+        coordinator._record_failure(a)
+    coordinator._record_failure(b)
+    coordinator._record_failure(b)
+    assert coordinator.metrics_snapshot()["gauges"]["circuit_breaker_state"] == 1
+    now[0] += 61
+    assert coordinator._circuit_allows(b)
+    assert b.circuit.failures == 2  # A closed circuit still accumulates failures.
+    assert coordinator.metrics_snapshot()["gauges"]["circuit_breaker_state"] == 0

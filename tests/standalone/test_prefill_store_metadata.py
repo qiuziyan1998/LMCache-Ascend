@@ -129,6 +129,7 @@ def _engine():
         body=[future, isolated], type_ignores=[]
     )), str(path), "exec"), runtime)
     engine = runtime["Engine"]()
+    engine.storage_process = None
     engine.metadata = NS(indexer_c8_layout=None)
     engine.token_database = Database()
     engine.config = NS(chunk_size=4, get_extra_config_value=lambda *args: False)
