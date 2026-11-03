@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in, payload-free isolation of P/D device dependency boundaries.
 
-LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_use|p_reuse|p_save|d_load|all
-Comma-separated stages are accepted, except mutually exclusive p_use/p_reuse.
-``all`` keeps p_use (not p_reuse). ``check`` never queries/waits on a device.
+LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_use|p_reuse|p_submit|p_save|d_load|all
+Comma-separated stages are accepted, except p_use/p_reuse/p_submit alternatives.
+``all`` keeps p_use. ``check`` never queries/waits on a device.
+``p_submit`` drains the compute/bank host submission queues, not NPU execution.
 LMCACHE_PREFILL_FENCE_GROUPS=0,1 selects KV groups (default: both).
 LMCACHE_PREFILL_FENCE_LAYERS=start:end selects group-local layer ordinals,
 with an exclusive end (default: all). No tensors, files or worker threads are
@@ -18,7 +19,7 @@ import socket
 from typing import Any, Callable, Mapping, Sequence
 
 
-_STAGES = frozenset(("p_load", "p_use", "p_reuse", "p_save", "d_load"))
+_STAGES = frozenset(("p_load", "p_use", "p_reuse", "p_submit", "p_save", "d_load"))
 _ENV = "LMCACHE_PREFILL_FENCE_DEBUG"
 
 
@@ -43,11 +44,11 @@ class KVFenceDebug:
         raw = env.get(_ENV, "check").strip().lower()
         stages = set(raw.split(","))
         if stages == {"all"}:
-            stages = set(_STAGES) - {"p_reuse"}
+            stages = set(_STAGES) - {"p_reuse", "p_submit"}
         if not stages or stages - (_STAGES | {"check"}):
             raise ValueError(f"Invalid {_ENV}: {raw!r}")
-        if {"p_use", "p_reuse"} <= stages:
-            raise ValueError("Select only one of p_use and p_reuse")
+        if len(stages & {"p_use", "p_reuse", "p_submit"}) > 1:
+            raise ValueError("Select only one of p_use and p_reuse and p_submit")
         for name in ("LMCACHE_PREFILL_STORE_DEBUG", "LMCACHE_PREFILL_AUDIT"):
             if env.get(name, "0") == "1":
                 raise ValueError(f"Set {name}=0 when using {_ENV}")
@@ -228,6 +229,48 @@ class KVFenceDebug:
             return
         _generation, layer, event = use
         self.wait("p_reuse", group, layer, event, bank=bank)
+
+    def after_use_wait(
+        self, group: int, layer: int, bank: int,
+        current_stream: Callable[[], Any], dma_stream: Any,
+    ) -> None:
+        """Drain host submissions after enqueueing DMA's last-reader wait.
+
+        In torch-npu 12d689a0, Stream.npu_stream calls NPUStream::stream(),
+        which runs MakeSureQueueEmpty() before returning the native handle.
+        With per-stream queues, both compute and DMA must be drained. With
+        the shared queue, the second drain is normally already empty. This
+        does not call aclrtSynchronizeEvent/Stream/Device or poll completion.
+        It is a targeted runtime experiment, not the capture-time upstream
+        emptyAllNPUStream() fix: unrelated streams/devices are not drained.
+        """
+        if (
+            "p_submit" not in self.stages
+            or self.role != "P"
+            or group not in self.groups
+            or layer < self.first
+            or (self.end is not None and layer >= self.end)
+        ):
+            return
+        try:
+            # Resolve only after filtering, so other modes do not touch NPU APIs.
+            for stream in (current_stream(), dma_stream):
+                handle = stream.npu_stream
+                if not isinstance(handle, int) or handle == 0:
+                    raise RuntimeError("Task-queue drain returned no NPU stream handle")
+        except Exception as exc:
+            self.fail(
+                "submission_drain_failed", group, layer, bank,
+                stage="p_submit", detail=str(exc)[:400],
+            )
+        marker = ("p_submit", group)
+        if marker not in self.seen:
+            self.seen.add(marker)
+            self.emit(dict(
+                self.base, event="active", stage="p_submit", group=group,
+                layer=layer, bank=bank, queues=["compute", "bank_dma"],
+                device_synchronize=False,
+            ))
 
     def wait(
         self,

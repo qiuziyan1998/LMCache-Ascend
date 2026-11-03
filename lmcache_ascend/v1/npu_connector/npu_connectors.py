@@ -2413,7 +2413,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         fence_debug = getattr(self, "fence_debug", None)
         if fence_debug is not None:
             fence_debug.wait("p_use", kv_group, layer_id, event)
-        self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
+        dma_stream = self._layerwise_prefill_dma_stream(kv_group, bank)
+        dma_stream.wait_event(event)
+        if fence_debug is not None:
+            fence_debug.after_use_wait(
+                kv_group, layer_id, bank, torch.npu.current_stream, dma_stream,
+            )
         uses[(kv_group, bank)] = (generation, layer_id, event)
         audit = getattr(self, "prefill_audit", None)
         if audit is not None:

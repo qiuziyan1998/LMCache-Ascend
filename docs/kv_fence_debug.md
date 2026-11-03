@@ -21,14 +21,15 @@ be used on P and D; each worker applies only the stages belonging to its role.
 | `p_load` | Wait for each P H2D completion event immediately after submission |
 | `p_use` | Wait for the P layer's existing final-bank-access event immediately after SFA, before output projection |
 | `p_reuse` | Wait for that same event immediately before the bank's next save/load submission |
+| `p_submit` | After submitting the bank's last-reader wait, drain the compute and bank DMA host task queues without waiting for NPU completion |
 | `p_save` | Wait for each P D2H completion event immediately after submission |
 | `d_load` | Wait for each D dense/sparse NPU load before returning from its submission |
-| `all` | The original four synchronization stages; uses `p_use`, excludes `p_reuse` |
+| `all` | The original four synchronization stages; uses `p_use`, excludes `p_reuse` and `p_submit` |
 | `0` | Disabled, including the host checks |
 
 Comma-separated stages, e.g. `p_load,p_use`, are supported. Host-only P checks
 are separate: enable `check`, or `check,p_use` to combine them with a fence.
-`p_use,p_reuse` is rejected: these are alternative positions for the same wait.
+Only one of `p_use`, `p_reuse`, and `p_submit` may be selected.
 The fence-only modes do not build expected-load metadata or assert on cache
 misses, so the first isolation run adds just the selected waits.
 Enabling a fence together with the older
@@ -81,6 +82,42 @@ also removes corruption, investigate the compute-to-DMA handoff next. If only
 Mode A works, waiting before bank reuse alone is insufficient: inspect the
 lifetimes of SFA inputs/output/workspace and subsequent host submissions. These
 experiments narrow the suspect window; neither result alone proves a root cause.
+
+## Drain task submission without a device completion fence
+
+To distinguish host task-queue submission from NPU execution completion, use
+this instead of `p_use` on **all P workers**, keeping D fences disabled:
+
+```bash
+export LMCACHE_PREFILL_STORE_DEBUG=0
+export LMCACHE_PREFILL_AUDIT=0
+export LMCACHE_PREFILL_FENCE_DEBUG=p_submit
+export LMCACHE_PREFILL_FENCE_GROUPS=0
+unset LMCACHE_PREFILL_FENCE_LAYERS
+```
+
+The order is `record use_N -> DMA wait_event(use_N) -> drain compute queue ->
+drain that bank's DMA queue`. Existing per-request load events and device-side
+waits remain intact. On the verified torch-npu revision `12d689a0`, reading
+`Stream.npu_stream` calls `NPUStream::stream()` and `MakeSureQueueEmpty()`. With
+per-stream task queues, each of the two queues is drained; otherwise they share
+the device's submission queue. This submits queued work, without discarding it
+or calling event/stream/device synchronization. CPU submission can still take
+time; this is not a zero-overhead mode. No extension rebuild is required.
+
+This is a targeted **runtime** experiment, not a backport of `f5f473ee`, which
+drains all task queues during graph capture. The experiment does not explicitly
+drain unrelated streams or other devices. The stream-handle drain behavior is
+an implementation property of the verified torch-npu version, not a portable
+PyTorch guarantee. A failed/null handle raises `submission_drain_failed`; it
+does not silently substitute the stronger `p_use` synchronization.
+
+If `p_submit` removes corruption, investigate task submission ordering and host
+buffer/metadata lifetime before device completion. If only `p_use` works,
+submission draining at this boundary is insufficient: continue checking actual
+device completion and buffer reuse dependencies. Neither outcome alone proves
+that the upstream graph-capture bug caused the original failure. Keep the same
+inputs, concurrency, bank count and graph settings for this comparison.
 
 ## First run
 

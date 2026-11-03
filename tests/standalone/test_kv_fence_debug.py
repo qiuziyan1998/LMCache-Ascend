@@ -72,6 +72,104 @@ def test_reuse_and_use_are_alternative_modes_and_all_keeps_original_behavior():
         debug("p_use,p_reuse")
     d, _ = debug("all")
     assert "p_use" in d.stages and "p_reuse" not in d.stages
+    assert "p_submit" not in d.stages
+    for mode in ("p_submit,p_use", "p_submit,p_reuse"):
+        with pytest.raises(ValueError, match="Select only one"):
+            debug(mode)
+
+
+def test_submit_drains_host_commands_without_executing_device_work():
+    host_queue, device_queue, completed = [], [], []
+    touched = []
+
+    class SubmissionStream:
+        def __init__(self, name):
+            self.name = name
+
+        @property
+        def npu_stream(self):
+            touched.append(self.name)
+            device_queue.extend(host_queue)
+            host_queue.clear()
+            return 123
+
+        def synchronize(self):
+            pytest.fail("p_submit must not synchronize the NPU")
+
+    host_queue.append(lambda: completed.append("SFA finished"))
+    d, output = debug("p_submit")
+    compute, dma = SubmissionStream("compute"), SubmissionStream("dma")
+    d.after_use_wait(0, 0, 0, lambda: compute, dma)
+    assert touched == ["compute", "dma"]
+    assert host_queue == [] and len(device_queue) == 1 and completed == []
+    assert output[-1]["stage"] == "p_submit"
+    assert output[-1]["device_synchronize"] is False
+    device_queue.pop()()
+    assert completed == ["SFA finished"]
+
+
+def test_submit_filters_before_resolving_any_stream():
+    def forbidden():
+        pytest.fail("Filtered diagnostic must not access NPU streams")
+
+    d, output = debug(
+        "p_submit", LMCACHE_PREFILL_FENCE_GROUPS="0",
+        LMCACHE_PREFILL_FENCE_LAYERS="4:5",
+    )
+    for group, layer in ((1, 4), (0, 3), (0, 5)):
+        d.after_use_wait(group, layer, 0, forbidden, None)
+    assert len(output) == 1
+    for mode, role in (("p_use", "P"), ("check", "P"), ("p_submit", "D")):
+        d, _ = debug(mode, role=role)
+        d.after_use_wait(0, 0, 0, forbidden, None)
+
+
+@pytest.mark.parametrize("handle", [0, None])
+def test_submit_rejects_failed_queue_drain(handle):
+    d, output = debug("p_submit")
+    with pytest.raises(RuntimeError, match="submission_drain_failed"):
+        d.after_use_wait(0, 4, 0, lambda: NS(npu_stream=handle), None)
+    assert output[-1]["layer"] == 4 and output[-1]["bank"] == 0
+
+
+@pytest.mark.parametrize("group", [0, 1, "c8"])
+@pytest.mark.parametrize("banks", [2, 4, 8])
+def test_real_submit_hook_is_after_dma_wait_and_preserves_async_execution(
+    monkeypatch, group, banks,
+):
+    from test_layerwise_prefill_dma import _AsyncStream, _async_bank_connector
+
+    api = _async_bank_connector(group, bank_count=banks, layers=banks + 1)
+    d, output = debug("p_submit")
+    api.connector.fence_debug = d
+    drained = []
+
+    def drain(stream):
+        drained.append(stream)
+        if stream is not api.npu.compute:
+            # The reader's event dependency must already be in this bank FIFO.
+            assert api.npu.compute.tail in stream.tail.dependencies
+        return 123
+
+    monkeypatch.setattr(_AsyncStream, "npu_stream", property(drain), raising=False)
+    generator, load = api.start(0)
+    for layer in range(banks):
+        load(layer)
+    for layer in range(banks + 1):
+        api.read(0, layer)
+        assert drained[-2:] == [api.npu.compute, api.banks[layer % banks]]
+        api.save(layer)
+        if layer + banks < banks + 1:
+            load(layer + banks)
+    generator.close()
+    assert len(drained) == 2 * (banks + 1)
+    assert api.observed == api.saved == []  # No device completion from draining.
+    for bank in api.banks:
+        bank.tail.run()
+    api.npu.compute.tail.run()
+    expected = [(0, layer) for layer in range(banks + 1)]
+    assert api.observed == expected and sorted(api.saved) == expected
+    assert len(output) == 2  # One startup and one activation, not per layer.
 
 
 def test_reuse_filters_source_layer_and_deduplicates_only_the_same_event():
