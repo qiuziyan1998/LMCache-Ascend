@@ -19,12 +19,13 @@ be used on P and D; each worker applies only the stages belonging to its role.
 | --- | --- |
 | `check` | Host-only P handoff checks; no event queries or device waits |
 | `p_load` | Wait for each P H2D completion event immediately after submission |
+| `p_sfa` | Wait for the current compute stream immediately before P latent SFA; input preparation finishes before SFA is submitted |
 | `p_use` | Wait for the P layer's existing final-bank-access event immediately after SFA, before output projection |
 | `p_reuse` | Wait for that same event immediately before the bank's next save/load submission |
 | `p_submit` | After submitting the bank's last-reader wait, drain the compute and bank DMA host task queues without waiting for NPU completion |
 | `p_save` | Wait for each P D2H completion event immediately after submission |
 | `d_load` | Wait for each D dense/sparse NPU load before returning from its submission |
-| `all` | The original four synchronization stages; uses `p_use`, excludes `p_reuse` and `p_submit` |
+| `all` | The original four synchronization stages; uses `p_use`, excludes `p_sfa`, `p_reuse` and `p_submit` |
 | `0` | Disabled, including the host checks |
 
 Comma-separated stages, e.g. `p_load,p_use`, are supported. Host-only P checks
@@ -40,6 +41,39 @@ compute stream. It does not wait for the next layer's FFN. `d_load` covers the
 connector's NPU H2D operators; direct Mooncake-to-NPU imports already use the
 blocking external-get contract and are not turned into another payload copy.
 None of these modes is a performance benchmark.
+
+## Compare SFA input and output boundaries
+
+Update **vllm-ascend, LMCache and LMCache-Ascend** on `dev-lmy` for `p_sfa`.
+In the launch environment of every P worker, set:
+
+```bash
+export LMCACHE_PREFILL_STORE_DEBUG=0
+export LMCACHE_PREFILL_AUDIT=0
+export LMCACHE_PREFILL_FENCE_DEBUG=p_sfa
+export LMCACHE_PREFILL_FENCE_GROUPS=0
+unset LMCACHE_PREFILL_FENCE_LAYERS
+```
+
+Keep D fences off and restart P workers. Repeat the same failing client run,
+with the same template, concurrency, bank count, graph and batch settings.
+An activation line containing `"event":"active","stage":"p_sfa"` must appear
+on each participating P worker. This mode synchronizes only the current
+compute stream at the final SFA call, after its input preparation and queued
+load waits. It creates no event and does not replace bank-use/load events.
+It applies to latent group 0 (including MTP on P), not indexer group 1.
+`p_sfa` may be combined with `check`, but not another device fence. `all`
+retains its previous behavior and does not include `p_sfa`.
+
+Compare with `p_use` under the same client/settings. If only `p_use` prevents
+corruption, inspect data/workspace lifetime while SFA is in flight and host
+submission after it. If `p_sfa` also prevents corruption, inspect input
+production, cross-stream dependencies and mutable input metadata first.
+These are prioritizations for the next check: either fence also changes host
+timing. They do not alone identify a broken operator or prove correct data.
+
+When this mode is off, the model uses a cached false flag: no connector call,
+event allocation, stream lookup or synchronization is added at SFA dispatch.
 
 ## Comparing immediate use and deferred reuse fences
 

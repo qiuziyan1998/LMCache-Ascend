@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in, payload-free isolation of P/D device dependency boundaries.
 
-LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_use|p_reuse|p_submit|p_save|d_load|all
+LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_sfa|p_use|p_reuse|p_submit|p_save|d_load|all
 Comma-separated stages are accepted, except p_use/p_reuse/p_submit alternatives.
 ``all`` keeps p_use. ``check`` never queries/waits on a device.
 ``p_submit`` drains the compute/bank host submission queues, not NPU execution.
@@ -19,7 +19,9 @@ import socket
 from typing import Any, Callable, Mapping, Sequence
 
 
-_STAGES = frozenset(("p_load", "p_use", "p_reuse", "p_submit", "p_save", "d_load"))
+_STAGES = frozenset(
+    ("p_load", "p_sfa", "p_use", "p_reuse", "p_submit", "p_save", "d_load")
+)
 _ENV = "LMCACHE_PREFILL_FENCE_DEBUG"
 
 
@@ -44,11 +46,15 @@ class KVFenceDebug:
         raw = env.get(_ENV, "check").strip().lower()
         stages = set(raw.split(","))
         if stages == {"all"}:
-            stages = set(_STAGES) - {"p_reuse", "p_submit"}
+            stages = set(_STAGES) - {"p_sfa", "p_reuse", "p_submit"}
         if not stages or stages - (_STAGES | {"check"}):
             raise ValueError(f"Invalid {_ENV}: {raw!r}")
         if len(stages & {"p_use", "p_reuse", "p_submit"}) > 1:
             raise ValueError("Select only one of p_use and p_reuse and p_submit")
+        if "p_sfa" in stages and stages - {"p_sfa", "check"}:
+            raise ValueError(
+                "Use p_sfa alone or with check to isolate the SFA input boundary"
+            )
         for name in ("LMCACHE_PREFILL_STORE_DEBUG", "LMCACHE_PREFILL_AUDIT"):
             if env.get(name, "0") == "1":
                 raise ValueError(f"Set {name}=0 when using {_ENV}")
@@ -71,6 +77,8 @@ class KVFenceDebug:
                 raise ValueError("invalid range")
         except ValueError as exc:
             raise ValueError("Invalid LMCACHE_PREFILL_FENCE_GROUPS/LAYERS") from exc
+        if "p_sfa" in stages and 0 not in self.groups:
+            raise ValueError("p_sfa requires latent KV group 0")
         self.role = role
         self.base = dict(
             host=socket.gethostname(), pid=os.getpid(), rank=rank, role=role
@@ -211,6 +219,29 @@ class KVFenceDebug:
         self.consumed.add(key)
         self.latest.pop(key, None)
         self.submitted.pop(key, None)
+
+    def before_sfa(
+        self,
+        group: int,
+        layer: int,
+        bank: int,
+        current_stream: Callable[[], Any],
+    ) -> None:
+        """Finish current-stream input work immediately before latent SFA.
+
+        The callback is resolved only for selected P layers. No final-use
+        event is recorded or replaced, and no payload is inspected or copied.
+        """
+        if (
+            "p_sfa" not in self.stages
+            or self.role != "P"
+            or group != 0
+            or group not in self.groups
+            or layer < self.first
+            or (self.end is not None and layer >= self.end)
+        ):
+            return
+        self.wait("p_sfa", group, layer, current_stream(), bank=bank)
 
     def before_reuse(
         self,

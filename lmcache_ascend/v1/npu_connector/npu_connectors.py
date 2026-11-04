@@ -2390,6 +2390,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         streams[key] = stream
         return stream
 
+    def synchronize_prefill_sfa_inputs(self, layer_id: int, kv_group: int) -> None:
+        """Apply the opt-in host fence immediately before P latent attention."""
+        fence_debug = getattr(self, "fence_debug", None)
+        if fence_debug is not None:
+            fence_debug.before_sfa(
+                kv_group, layer_id, self._layerwise_prefill_bank(layer_id, kv_group),
+                torch.npu.current_stream,
+            )
+
     def record_layerwise_prefill_bank_use(
         self,
         layer_id: int,
