@@ -20,17 +20,20 @@ be used on P and D; each worker applies only the stages belonging to its role.
 | `check` | Host-only P handoff checks; no event queries or device waits |
 | `p_load` | Wait for each P H2D completion event immediately after submission |
 | `p_sfa` | Wait for the current compute stream immediately before P latent SFA; input preparation finishes before SFA is submitted |
+| `p_vup` | Wait for the current compute stream after P latent V-up and before output projection; SFA and V-up may execute without a host wait between them |
 | `p_use` | Wait for the P layer's existing final-bank-access event immediately after SFA, before output projection |
 | `p_reuse` | Wait for that same event immediately before the bank's next save/load submission |
 | `p_submit` | After submitting the bank's last-reader wait, drain the compute and bank DMA host task queues without waiting for NPU completion |
 | `p_save` | Wait for each P D2H completion event immediately after submission |
 | `d_load` | Wait for each D dense/sparse NPU load before returning from its submission |
-| `all` | The original four synchronization stages; uses `p_use`, excludes `p_sfa`, `p_reuse` and `p_submit` |
+| `all` | The original four synchronization stages; uses `p_use`, excludes `p_sfa`, `p_vup`, `p_reuse` and `p_submit` |
 | `0` | Disabled, including the host checks |
 
 Comma-separated stages, e.g. `p_load,p_use`, are supported. Host-only P checks
 are separate: enable `check`, or `check,p_use` to combine them with a fence.
 Only one of `p_use`, `p_reuse`, and `p_submit` may be selected.
+Each of `p_sfa` and `p_vup` is exclusive with every other device fence;
+either may be combined with `check`.
 The fence-only modes do not build expected-load metadata or assert on cache
 misses, so the first isolation run adds just the selected waits.
 Enabling a fence together with the older
@@ -74,6 +77,38 @@ timing. They do not alone identify a broken operator or prove correct data.
 
 When this mode is off, the model uses a cached false flag: no connector call,
 event allocation, stream lookup or synchronization is added at SFA dispatch.
+
+## Compare SFA completion with V-up completion
+
+Update **vllm-ascend, LMCache and LMCache-Ascend** together for `p_vup`.
+To move the host wait from SFA completion to V-up completion, use this in
+every P worker's launch environment and keep D fences disabled:
+
+```bash
+export LMCACHE_PREFILL_STORE_DEBUG=0
+export LMCACHE_PREFILL_AUDIT=0
+export LMCACHE_PREFILL_FENCE_DEBUG=p_vup
+export LMCACHE_PREFILL_FENCE_GROUPS=0
+unset LMCACHE_PREFILL_FENCE_LAYERS
+```
+
+Restart P workers and repeat the same failing client workload. Check for
+`"event":"active","stage":"p_vup"` on each participating P worker.
+This mode synchronizes the current compute stream immediately after
+`_v_up_proj` and before output projection or its weight prefetch. It keeps
+the original SFA final-bank-access event and save/load handoffs unchanged,
+and does not inspect payloads or create another event.
+
+Like `p_sfa`, it applies only to P latent group 0, using the same
+`LMCACHE_PREFILL_FENCE_GROUPS` and group-local `LMCACHE_PREFILL_FENCE_LAYERS`
+filters. Group 1 alone is rejected. `check,p_vup` is accepted; combinations
+with another device fence are rejected. `all` retains the original `p_use`
+behavior and does not include `p_vup`.
+
+If `p_use` prevents corruption but `p_vup` does not, prioritize the interval
+between SFA submission and V-up completion. If both prevent corruption,
+prioritize work submitted after V-up. These comparisons localize the effect
+of the host wait; they do not by themselves identify the faulty operator.
 
 ## Comparing immediate use and deferred reuse fences
 

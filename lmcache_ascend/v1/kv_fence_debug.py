@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in, payload-free isolation of P/D device dependency boundaries.
 
-LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_sfa|p_use|p_reuse|p_submit|p_save|d_load|all
+LMCACHE_PREFILL_FENCE_DEBUG=check|p_load|p_sfa|p_vup|p_use|p_reuse|p_submit|p_save|d_load|all
 Comma-separated stages are accepted, except p_use/p_reuse/p_submit alternatives.
-``all`` keeps p_use. ``check`` never queries/waits on a device.
+``p_sfa`` and ``p_vup`` each require an isolated run, optionally with ``check``.
+``all`` keeps p_use and excludes p_sfa/p_vup. ``check`` never waits on a device.
 ``p_submit`` drains the compute/bank host submission queues, not NPU execution.
 LMCACHE_PREFILL_FENCE_GROUPS=0,1 selects KV groups (default: both).
 LMCACHE_PREFILL_FENCE_LAYERS=start:end selects group-local layer ordinals,
@@ -20,7 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 
 _STAGES = frozenset(
-    ("p_load", "p_sfa", "p_use", "p_reuse", "p_submit", "p_save", "d_load")
+    ("p_load", "p_sfa", "p_vup", "p_use", "p_reuse", "p_submit", "p_save", "d_load")
 )
 _ENV = "LMCACHE_PREFILL_FENCE_DEBUG"
 
@@ -46,7 +47,7 @@ class KVFenceDebug:
         raw = env.get(_ENV, "check").strip().lower()
         stages = set(raw.split(","))
         if stages == {"all"}:
-            stages = set(_STAGES) - {"p_sfa", "p_reuse", "p_submit"}
+            stages = set(_STAGES) - {"p_sfa", "p_vup", "p_reuse", "p_submit"}
         if not stages or stages - (_STAGES | {"check"}):
             raise ValueError(f"Invalid {_ENV}: {raw!r}")
         if len(stages & {"p_use", "p_reuse", "p_submit"}) > 1:
@@ -54,6 +55,10 @@ class KVFenceDebug:
         if "p_sfa" in stages and stages - {"p_sfa", "check"}:
             raise ValueError(
                 "Use p_sfa alone or with check to isolate the SFA input boundary"
+            )
+        if "p_vup" in stages and stages - {"p_vup", "check"}:
+            raise ValueError(
+                "Use p_vup alone or with check to isolate the V-up output boundary"
             )
         for name in ("LMCACHE_PREFILL_STORE_DEBUG", "LMCACHE_PREFILL_AUDIT"):
             if env.get(name, "0") == "1":
@@ -79,6 +84,8 @@ class KVFenceDebug:
             raise ValueError("Invalid LMCACHE_PREFILL_FENCE_GROUPS/LAYERS") from exc
         if "p_sfa" in stages and 0 not in self.groups:
             raise ValueError("p_sfa requires latent KV group 0")
+        if "p_vup" in stages and 0 not in self.groups:
+            raise ValueError("p_vup requires latent KV group 0")
         self.role = role
         self.base = dict(
             host=socket.gethostname(), pid=os.getpid(), rank=rank, role=role
@@ -242,6 +249,29 @@ class KVFenceDebug:
         ):
             return
         self.wait("p_sfa", group, layer, current_stream(), bank=bank)
+
+    def after_vup(
+        self,
+        group: int,
+        layer: int,
+        bank: int,
+        current_stream: Callable[[], Any],
+    ) -> None:
+        """Finish P latent V-up output before submitting output projection.
+
+        Called after V-up submission. Resolve the stream only for selected
+        layers, preserving the existing SFA final-use event and bank handoffs.
+        """
+        if (
+            "p_vup" not in self.stages
+            or self.role != "P"
+            or group != 0
+            or group not in self.groups
+            or layer < self.first
+            or (self.end is not None and layer >= self.end)
+        ):
+            return
+        self.wait("p_vup", group, layer, current_stream(), bank=bank)
 
     def before_reuse(
         self,
