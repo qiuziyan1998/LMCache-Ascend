@@ -1324,9 +1324,11 @@ class RemoteFillCoordinator:
         ):
             return False
         if state.session is not None:
-            if state.terminal is None:
+            if state.terminal is None or state.session.remote_cleanup_pending:
                 try:
-                    state.session.abort("prefiller released request before FINISH")
+                    state.session.abort(
+                        "prefiller released request; confirm remote cleanup"
+                    )
                     if serving_perf_enabled():
                         serving_perf_log(
                             logger,
