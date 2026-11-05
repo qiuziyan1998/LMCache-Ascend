@@ -5,28 +5,373 @@ LMCacheEngine for Ascend NPU.
 """
 
 # Standard
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from bisect import bisect_right
+from collections.abc import Mapping
+from collections import deque
+from concurrent.futures import (
+    Future,
+    wait,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
+from urllib.parse import urlsplit
+from weakref import WeakSet, proxy
+import json
+import logging
+import os
 import queue
+import secrets
 import threading
 import time
 
 # Third Party
 from lmcache.logging import init_logger
+from lmcache.integration.vllm.preemption_checkpoint import LOCAL_CHECKPOINT_CONFIG, CheckpointRestoreMiss
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
     convert_tokens_to_list,
 )
-from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.cache_engine import (
+    _SHARED_SPARSE_DEFER_COMMIT,
+    _SHARED_SPARSE_PREPARE_ONLY,
+    LayerwiseStoreResult,
+    LMCacheEngine,
+)
+from lmcache.v1.serving_perf import (
+    serving_perf_enabled,
+    serving_perf_log,
+    serving_perf_now,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
+from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
+from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
+    LayerPageSource,
+    MemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.token_database import TokenDatabase
+from lmcache.v1.mooncake_layout import (
+    mooncake_layer_pages_enabled,
+    mooncake_page_key,
+    mooncake_page_layout_enabled,
+    mooncake_payload_layout,
+)
+from lmcache.v1.prefill_metadata import PrefillMetadataPlan
+from lmcache.v1.prefill_audit import audit_enabled, audit_record
+from lmcache.v1.prefill_kv_hash import (
+    kv_hash_enabled,
+    skip_kv_hash,
+    submit_kv_hash,
+)
+from lmcache.v1.prefill_store_debug import (
+    prefill_store_allocator_snapshot,
+    prefill_store_debug_enabled,
+    prefill_store_debug_log,
+)
+from lmcache.v1.remote_fill import (
+    ControlPage,
+    log_remote_fill_diagnostic,
+)
+from lmcache.v1.remote_fill.native import (
+    DirectPushPageSource,
+    DirectPushSourcePlan,
+    NativeExternalPageTransferUnknownError,
+)
+from lmcache.v1.shared_cpu_cache import (
+    SharedHandleBatch,
+    SharedHandleEnvelope,
+)
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
+from lmcache.v1.storage_backend.remote_backend import RemoteExternalPageReader
+from lmcache.v1.token_database import (
+    ChunkedTokenDatabase,
+    DSA_INDEX_CACHE_SCHEMA,
+    DSA_INDEX_CACHE_SCHEMA_TAG,
+    TokenDatabase,
+)
+from lmcache.v1.startup_trace import startup_phase
 import torch
 
-logger = init_logger(__name__)
+# First Party
+from lmcache_ascend.v1.content_diagnostics import (
+    fingerprint_compact_group1,
+    log_group1_pointer_table,
+    log_npu_content_diagnostic_event,
+    log_shared_page_source_fingerprint,
+    npu_content_diagnostics_enabled,
+    queue_store_time_source_fingerprint,
+)
+from lmcache_ascend.v1.direct_store_plan import (
+    DirectPageBatch as _DirectPageBatch,
+    build_remote_fill_source_plan,
+    merge_deferred_remote_fill_batches,
+    select_remote_fill_batch_pages,
+)
+from lmcache_ascend.v1.preemption_checkpoint import CheckpointWorker
+from lmcache_ascend.v1.layerwise_cpu_fill import (
+    LayerwiseCPUFillLease,
+    LayerwisePutQueue,
+)
+from lmcache_ascend.v1.remote_fill import (
+    DecoderRemoteFillRuntime,
+    RemoteFillDecoderLayout,
+    build_decoder_layout,
+    create_decoder_remote_fill_runtime,
+    remote_fill_tp_independent,
+)
+from lmcache_ascend.v1.remote_fill_coordinator import (
+    ProducerSessionContext,
+    ProducerRequestState,
+    RemoteFillCoordinator,
+)
+from lmcache_ascend.v1.remote_fill_producer import (
+    RemoteFillFatalError,
+    REMOTE_FILL_REQUEST_CONFIG_KEY,
+)
 
+logger = init_logger(__name__)
+REMOTE_FILL_DEFAULT_CONTROL_PORT = 19000
+_CHECKPOINT_RECLAIM_SCAN_ENTRIES = 4096
+_REMOTE_FILL_REQUEST_HANDOFF_EVENT_SOURCE = (
+    "forward_context.sfa_reshape_cache_event"
+)
+
+
+def _log_remote_fill_producer_fence_state(
+    req_id: str,
+    decision: str,
+    **fields: object,
+) -> None:
+    """Emit a structured producer fence decision without tensor addresses."""
+
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    logger.info(
+        "[LMCACHE_REMOTE_FILL] %s",
+        json.dumps(
+            {
+                "schema": 1,
+                "event": "remote_fill_producer_fence_state",
+                "req_id": req_id,
+                "decision": decision,
+                **fields,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _remote_fill_advertise_host_from_session(remote_session: str) -> str:
+    """Extract the decoder host already advertised by its GlobalTE session."""
+
+    value = str(remote_session).strip()
+    if not value:
+        raise ValueError("remote-fill GlobalTE session is empty")
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    if not parsed.hostname:
+        raise ValueError(
+            "remote-fill cannot infer a routable control host from GlobalTE session"
+        )
+    return parsed.hostname
+
+
+def _validate_remote_fill_control_port(
+    base_port: int,
+    dp_rank: int,
+    dp_size: int,
+    *,
+    internal_api_enabled: bool,
+    internal_api_port_start: int,
+) -> int:
+    """Validate the complete DP port range and return this rank's port."""
+
+    control_port = int(base_port) + dp_rank
+    last_control_port = int(base_port) + dp_size - 1
+    if dp_size <= 0 or not 0 <= dp_rank < dp_size:
+        raise ValueError("remote-fill decoder DP topology is invalid")
+    if not 0 < int(base_port) < 65536 or last_control_port >= 65536:
+        raise ValueError("remote-fill decoder DP control port is invalid")
+    if internal_api_enabled:
+        internal_start = int(internal_api_port_start)
+        internal_end = internal_start + dp_size - 1
+        if max(int(base_port), internal_start) <= min(
+            last_control_port, internal_end
+        ):
+            raise ValueError(
+                "remote-fill decoder control ports overlap the internal API "
+                "port range"
+            )
+    return control_port
+
+LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
+REMOTE_BACKEND_NAME = "RemoteBackend"
+_SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
+_SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
+_REMOTE_FILL_EXACT_LOCATIONS_KEY = "_remote_fill_exact_locations"
+
+
+def _shared_sparse_request(request):
+    prepare_only = defer_commit = False
+    if isinstance(request, dict):
+        prepare_only = bool(request.get(_SHARED_SPARSE_PREPARE_ONLY, False))
+        defer_commit = bool(request.get(_SHARED_SPARSE_DEFER_COMMIT, False))
+        if prepare_only or defer_commit:
+            request = dict(request)
+            request.pop(_SHARED_SPARSE_PREPARE_ONLY, None)
+            request.pop(_SHARED_SPARSE_DEFER_COMMIT, None)
+        return (
+            request,
+            request.get("selected_token_ids"),
+            request.get("token_start_index"),
+            None,
+            prepare_only,
+            defer_commit,
+        )
+    if isinstance(request, tuple):
+        if len(request) == 3:
+            selected, start, target = request
+        else:
+            selected, start = request
+            target = None
+        return None, selected, start, target, False, False
+    return None, request, 0, None, False, False
+
+
+@dataclass(slots=True)
+class _DirectStoreRequestState:
+    futures: deque[Future] = field(default_factory=deque)
+    pending_keys: set[str] = field(default_factory=set)
+    submitted_end: dict[int, int] = field(default_factory=dict)
+    committed_end: dict[int, int] = field(default_factory=dict)
+    planned_end: int = 0
+    # Hash-chain frontier: int for builtin/64-bit algorithms, raw digest
+    # bytes for digest-based algorithms (e.g. sha256_cbor in this vLLM fork).
+    # Must round-trip the exact hash_func output to keep incremental hashing
+    # consistent with batch hashing.
+    planned_hash: Union[int, bytes] = 0
+    accepted_store_end: Optional[int] = None
+    submitted_jobs: int = 0
+    submitted_pages: int = 0
+    submitted_legacy_objects: int = 0
+    submitted_bytes: int = 0
+    fallback_reasons: dict[int, str] = field(default_factory=dict)
+    source_ready_event: Any = None
+    source_ready_event_source: str = "missing"
+    source_ready_token_end: int = 0
+    source_ready_events: tuple[Any, ...] = ()
+    source_ready_events_token_end: int = 0
+    finalized: bool = False
+    remote_fill: Optional[ProducerRequestState] = None
+
+
+
+
+
+def _mtp_dw_diag_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "lmcache_ascend_store"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_debug_summary_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
+    ).lower() in ("summary", "trace", "verbose", "all")
+
+
+def _dsa_debug_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
+    except ValueError:
+        return 8
+
+
+def _dsa_debug_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_debug_enabled():
+        return False
+    if not _dsa_debug_summary_enabled():
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        owner._dsa_shrink_debug_counts = counts
+    count = counts.get(site, 0)
+    if count >= _dsa_debug_limit():
+        return False
+    counts[site] = count + 1
+    return True
+
+
+def _dsa_debug_shape(value: Any) -> Any:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
+    if value is None:
+        return None
+    limit = _dsa_debug_limit() if limit is None else limit
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+        return list(value[:limit])
+    except Exception as exc:
+        return f"{type(value).__name__}:sample_failed:{exc}"
+
+
+def _dsa_debug_minmax_count(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            flat = value.detach().reshape(-1)
+            return (
+                flat.min().to(device="cpu").item(),
+                flat.max().to(device="cpu").item(),
+                int(flat.numel()),
+            )
+        seq = list(value)
+        if not seq:
+            return None
+        return (min(seq), max(seq), len(seq))
+    except Exception as exc:
+        return f"{type(value).__name__}:minmax_failed:{exc}"
 
 class ThreadSafeEventList:
     """queue.Queue-backed, list-compatible thread-safe buffer for
@@ -35,7 +380,7 @@ class ThreadSafeEventList:
     Upstream ``LMCacheEngine`` treats ``self.kv_events`` as a list that
     callers ``.append(...)`` to and ``get_kv_events`` snapshots-and-resets.
     When ``store_async`` is active, appends happen on the background
-    worker thread while drains happen on the main thread — a data race
+    worker thread while drains happen on the main thread - a data race
     on a plain ``list``.  This wrapper funnels all appends through a
     ``queue.Queue`` so we inherit its producer/consumer thread safety,
     while preserving ``.append(...)`` / truthiness semantics that
@@ -64,6 +409,52 @@ class ThreadSafeEventList:
         return out
 
 
+class _SparseCacheAppend:
+    """Rollback guard for append-only request cache mutations."""
+
+    _LAYER_FIELDS = (
+        "cached_keys",
+        "cached_memory_objs",
+        "cached_tensors",
+        "cached_chunk_dev_ptrs",
+        "cached_shared_handles",
+    )
+
+    def __init__(self, cache: dict[str, Any]) -> None:
+        self._ranges = [
+            (values, len(values))
+            for name in ("cached_starts", "cached_ends")
+            if (values := cache.get(name)) is not None
+        ]
+        self._layers = []
+        for name in self._LAYER_FIELDS:
+            values = cache.get(name)
+            if values is not None:
+                self._layers.append(
+                    (values, len(values), [len(layer or []) for layer in values])
+                )
+        pointers = cache.get("cached_chunk_ptrs_npu")
+        self._pointers = None if pointers is None else (pointers, list(pointers))
+        self.committed = False
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def rollback(self) -> None:
+        if self.committed:
+            return
+        for values, size in self._ranges:
+            del values[size:]
+        for values, outer_size, sizes in self._layers:
+            for layer, size in zip(values[:outer_size], sizes, strict=True):
+                if isinstance(layer, list):
+                    del layer[size:]
+            del values[outer_size:]
+        if self._pointers is not None:
+            values, snapshot = self._pointers
+            values[:] = snapshot
+
+
 class AscendLMCacheEngine(LMCacheEngine):
     """Ascend NPU variant of ``LMCacheEngine`` with an async store path."""
 
@@ -75,6 +466,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        collective_all_true_fn: Optional[Callable[[bool], bool]] = None,
     ):
         super().__init__(
             config,
@@ -83,12 +475,79 @@ class AscendLMCacheEngine(LMCacheEngine):
             gpu_connector,
             broadcast_fn,
             broadcast_object_fn,
+            collective_all_true_fn,
         )
         self.is_store_async = self.config.store_async
+        self._pending_sync_store_futures: set[Future] = set()
+        self.checkpoint_worker = (
+            CheckpointWorker(self)
+            if getattr(self.config, "decode_preemption_checkpoint", False)
+            and self.metadata.is_first_rank()
+            else None
+        )
+        self._require_store_completion = False
+        self._force_layerwise_prefill_store = bool(
+            self.config.use_layerwise
+            and os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip()
+            .lower() == "true"
+        )
+        self._direct_store_enabled = bool(
+            self.is_store_async
+            and not self._force_layerwise_prefill_store
+            and self.config.pd_role != "receiver"
+            and (
+                self.config.get_extra_config_value(
+                    "mooncake_direct_npu_prefill_store", False
+                )
+                or bool(self.config.enable_remote_lmcache_store)
+            )
+            and self._is_passive() is False
+            and mooncake_layer_pages_enabled(self.config)
+            and not self.config.get_extra_config_value("save_chunk_meta", False)
+            and self.config.get_extra_config_value("use_ascend_direct", False)
+        )
+        self._direct_store_states: dict[str, _DirectStoreRequestState] = {}
+        self._layerwise_put_queue = None
+        # Keep P-node continuation-prefill pages allocator-owned until the
+        # request finishes. A Python reference alone does not stop LRU eviction;
+        # an extra MemoryObj ref_count does, without PinMonitor's timeout.
+        self._layerwise_prefill_page_owners: dict[str, dict[int, MemoryObj]] = {}
+        # P-node layerwise prefill is called once per compute chunk.  Keep the
+        # hash-chain frontier per request and KV group so the next call only
+        # plans the newly appended suffix instead of rescanning every old
+        # LMCache chunk and rechecking its storage state.
+        self._layerwise_prefill_store_frontiers: dict[
+            str, dict[int, tuple[int, Union[int, bytes]]]
+        ] = {}
+        self._layerwise_prefill_store_metadata_scopes: dict[str, tuple] = {}
+        self._layerwise_cpu_fill_sources: dict[
+            str, dict[int, tuple[_DirectPageBatch, LayerwiseCPUFillLease]]
+        ] = {}
+        self._layerwise_cpu_fill_quarantine: list[LayerwiseCPUFillLease] = []
+        self._direct_store_jobs: deque[Future] = deque()
+        self._direct_retry_args: dict[Future, tuple[Any, ...]] = {}
+        self._direct_completed_futures: WeakSet[Future] = WeakSet()
+        self._live_source_builders: dict[str, dict[str, Any]] = {}
+        self._completed_live_sources: dict[str, dict[str, Any]] = {}
+        self._remote_fill_runtime: Optional[DecoderRemoteFillRuntime] = None
+        self._group1_external_page_reader: Optional[
+            RemoteExternalPageReader
+        ] = None
+        self._remote_fill_decoder_initialized = False
+        self._remote_fill_fatal_transfers: tuple[str, ...] = ()
+        self._remote_fill_fatal_lock = threading.Lock()
+        self._remote_fill_shared_group1_supported = metadata.world_size <= 1
+        # Diagnostic tensor owners are retained only while the opt-in content
+        # diagnostic is enabled.  Fingerprinting is deliberately deferred
+        # until the adapter has fenced the producer event, so diagnostic host
+        # readback cannot hide whether that event was initially incomplete.
+        self._pending_live_source_diagnostics: dict[str, dict[str, Any]] = {}
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
+        # Synchronous engines also close through the shared worker teardown.
+        self._store_queue: Optional[queue.Queue] = None
+        self._store_worker_thread: Optional[threading.Thread] = None
         if self.is_store_async:
-            self._store_queue: Optional[queue.Queue] = None
-            self._store_worker_thread: Optional[threading.Thread] = None
             self._store_lock = threading.Lock()
             self._store_cv = threading.Condition(self._store_lock)
 
@@ -121,9 +580,115 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self._store_worker_thread.start()
 
+    def _post_init_shared_cpu_cache(self) -> None:
+        worker = getattr(self, "checkpoint_worker", None)
+        if worker is not None and getattr(
+            self.config, "decode_checkpoint_writeback", False
+        ):
+            try:
+                worker.local.validate_capacity()
+            except Exception as error:
+                # Peers are waiting for the existing shared-cache envelope.
+                # Validate before the base preflight can publish success.
+                if self.enable_shared_cpu_cache and self.metadata.world_size > 1:
+                    self.broadcast_object_fn(
+                        self._shared_cpu_cache_startup_envelope("error", str(error)),
+                        self.metadata.first_rank,
+                    )
+                raise
+        super()._post_init_shared_cpu_cache()
+
     def post_init(self, **kwargs) -> None:
+        if getattr(self, "checkpoint_worker", None) is not None and not (
+            callable(getattr(self.gpu_connector, "supports_preemption_capture", None))
+            and self.gpu_connector.supports_preemption_capture()
+        ):
+            raise ValueError("Rebuild LMCache-Ascend native extension before enabling decode_preemption_checkpoint")
+        perf_enabled = serving_perf_enabled()
+        base_started = serving_perf_now() if perf_enabled else None
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "lmcache_base_post_init_start",
+                rank=self.metadata.worker_id,
+            )
         super().post_init(**kwargs)
-        if self.is_store_async:
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "lmcache_base_post_init_complete",
+                started=base_started,
+                rank=self.metadata.worker_id,
+            )
+        try:
+            if (
+                self._persistent_direct_hbm_split_group_enabled()
+                and self.config.pd_role != "sender"
+                and self._is_passive()
+            ):
+                reader_started = serving_perf_now() if perf_enabled else None
+                if perf_enabled:
+                    serving_perf_log(
+                        logger,
+                        "group1_external_reader_init_start",
+                        rank=self.metadata.worker_id,
+                    )
+                with startup_phase(
+                    "group1_external_reader", rank=self.metadata.worker_id
+                ):
+                    self._group1_external_page_reader = RemoteExternalPageReader(
+                        self.config,
+                        self.metadata,
+                    )
+                if perf_enabled:
+                    serving_perf_log(
+                        logger,
+                        "group1_external_reader_init_complete",
+                        started=reader_started,
+                        rank=self.metadata.worker_id,
+                    )
+            remote_fill_started = serving_perf_now() if perf_enabled else None
+            if perf_enabled:
+                serving_perf_log(
+                    logger,
+                    "remote_fill_decoder_init_start",
+                    rank=self.metadata.worker_id,
+                )
+            with startup_phase("decoder_remote_fill", rank=self.metadata.worker_id):
+                self._initialize_decoder_remote_fill()
+            if perf_enabled:
+                serving_perf_log(
+                    logger,
+                    "remote_fill_decoder_init_complete",
+                    started=remote_fill_started,
+                    rank=self.metadata.worker_id,
+                )
+        except Exception as error:
+            log_remote_fill_diagnostic(
+                logger,
+                event="remote_fill_startup_failure",
+                code="RF-D-000",
+                stage="decoder_startup_validation",
+                action="STARTUP_ABORT",
+                reason=(
+                    "RemoteFill was enabled but its decoder invariants were "
+                    "not satisfied; the endpoint was not advertised"
+                ),
+                error=error,
+                severity="critical",
+            )
+            try:
+                self._rollback_group1_direct_hbm_startup()
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    "Group-1 direct-HBM startup and rollback both failed"
+                ) from rollback_error
+            raise
+        if (
+            self.is_store_async
+            and not self._direct_store_enabled
+            and not self._force_layerwise_prefill_store
+        ):
             self._device_id = torch.npu.current_device()
             self._ensure_store_worker()
             queue_mode = "unbounded" if self._store_queue_maxsize == 0 else "bounded"
@@ -132,6 +697,3459 @@ class AscendLMCacheEngine(LMCacheEngine):
                 queue_mode,
                 self._store_queue_maxsize,
             )
+        elif self._direct_store_enabled:
+            logger.info(
+                "Direct NPU prefill store enabled: max_queue_size=%d",
+                self._store_queue_maxsize,
+            )
+
+    def get_remote_fill_placement_info(self) -> dict[str, int | str | bool] | None:
+        """Return pointer-free decoder placement or ``None`` when unavailable."""
+
+        runtime = self._remote_fill_runtime
+        if runtime is None or not runtime.available or not self.is_healthy():
+            return None
+        return runtime.placement.to_dict()
+
+    def get_remote_fill_metrics(self) -> dict[str, int] | None:
+        """Return fixed-cardinality decoder metrics when remote fill is active."""
+
+        runtime = self._remote_fill_runtime
+        return None if runtime is None else runtime.metrics_snapshot()
+
+    def remote_fill_requires_paired_restart(self) -> bool:
+        """Return whether an armed remote fill made this process unsafe."""
+
+        return bool(self._remote_fill_fatal_transfers)
+
+    def direct_prefill_store_enabled(self) -> bool:
+        """Return whether this worker can use direct NPU page publication."""
+        return self._direct_store_enabled
+
+    def _remote_fill_direct_groups(self) -> tuple[int, ...]:
+        return (0,) if self._persistent_direct_hbm_split_group_enabled() else (0, 1)
+
+    def _group1_external_page_load(self) -> Callable[..., None]:
+        loader = (
+            self._group1_external_page_reader
+            if self._is_passive()
+            else self.storage_manager
+        )
+        if loader is None:
+            raise RuntimeError("Group-1 external page reader is unavailable")
+        return loader.batched_get_external_pages
+
+    def _rollback_group1_direct_hbm_startup(self) -> None:
+        """Close every resource acquired by direct-HBM decoder startup."""
+        errors: list[BaseException] = []
+        for name in ("_remote_fill_runtime", "_group1_external_page_reader"):
+            resource = getattr(self, name, None)
+            if resource is None:
+                continue
+            try:
+                resource.close()
+            except BaseException as error:
+                errors.append(error)
+            else:
+                setattr(self, name, None)
+        self._remote_fill_decoder_initialized = False
+        if errors:
+            raise RuntimeError(
+                "Group-1 direct-HBM startup rollback failed"
+            ) from errors[0]
+
+    def preflight_group1_direct_hbm(self, kvcaches: list) -> None:
+        """Reject unsupported direct-HBM layouts uniformly across TP ranks."""
+        if (
+            not self._persistent_direct_hbm_split_group_enabled()
+            or self.config.pd_role == "sender"
+        ):
+            return
+        local_error: Optional[BaseException] = None
+        try:
+            check = getattr(
+                self.gpu_connector,
+                "direct_page_layout_supported",
+                None,
+            )
+            if not callable(check) or not check(kvcaches, 1):
+                raise RuntimeError("Group-1 direct-HBM layout is unsupported")
+            self._group1_external_page_load()
+        except BaseException as error:
+            local_error = error
+        ready = local_error is None
+        if self.metadata.world_size > 1:
+            try:
+                collective = getattr(self, "collective_all_true_fn", None)
+                if not callable(collective):
+                    raise RuntimeError(
+                        "Group-1 direct-HBM startup lacks TP consensus"
+                    )
+                ready = bool(collective(ready))
+            except BaseException as error:
+                local_error = local_error or error
+                ready = False
+        if not ready:
+            detail = (
+                f": {type(local_error).__name__}: {local_error}"
+                if local_error is not None
+                else " on another TP rank"
+            )
+            failure = RuntimeError("Group-1 direct-HBM preflight failed" + detail)
+            try:
+                self._rollback_group1_direct_hbm_startup()
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    f"{failure}; startup rollback also failed"
+                ) from rollback_error
+            raise failure
+
+    def prepare_cold_chunk_plan(
+        self, tokens: list[int]
+    ) -> Optional[Callable[[], tuple[tuple[int, int, Any], ...]]]:
+        """Hash once in either loader, without waiting for its sibling's I/O."""
+        if not isinstance(self.token_database, ChunkedTokenDatabase):
+            return None  # Segment plans can contain separator gaps.
+        lock = threading.Lock()
+        chunks = None
+
+        def get_chunks() -> tuple[tuple[int, int, Any], ...]:
+            nonlocal chunks
+            with lock:
+                if chunks is None:
+                    chunks = tuple(
+                        self.token_database.process_tokens(tokens=tokens, make_key=False)
+                    )
+                return chunks
+
+        return get_chunks
+
+    def load_group1_pages_direct(
+        self,
+        tokens: list[int],
+        slot_mapping: torch.Tensor,
+        kvcaches: list,
+        request_configs: Optional[dict],
+        req_id: str,
+        *,
+        chunk_plan: Optional[Callable[[], tuple[tuple[int, int, Any], ...]]] = None,
+    ) -> None:
+        """Load exact persistent Group-1 pages into final vLLM HBM blocks."""
+        perf_enabled = serving_perf_enabled()
+        load_started = serving_perf_now() if perf_enabled else 0.0
+        load_thread_started = time.thread_time_ns() if perf_enabled else 0
+        if not self._persistent_direct_hbm_split_group_enabled():
+            raise RuntimeError("Group-1 direct-HBM mode is disabled")
+        phase_started = serving_perf_now() if perf_enabled else 0.0
+        token_args = {"tokens": tokens}
+        if chunk_plan is not None:
+            chunks = chunk_plan()
+            token_args = {
+                "hashes": [entry[2] for entry in chunks],
+                "offsets": [end - start for start, end, _ in chunks],
+            }
+        plans = list(
+            self.token_database.process_tokens(
+                **token_args,
+                request_configs=request_configs,
+                kv_group=1,
+            )
+        )
+        token_plan_ms = (
+            (serving_perf_now() - phase_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+        if not plans or plans[-1][1] != len(tokens):
+            raise RuntimeError("Group-1 persistent page plan is incomplete")
+        phase_started = serving_perf_now() if perf_enabled else 0.0
+        self._ensure_layerwise_connector_layout(
+            kvcaches=kvcaches,
+            kv_group=1,
+        )
+        layout_ms = (
+            (serving_perf_now() - phase_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+        planner = getattr(
+            self.gpu_connector,
+            "plan_direct_page_destinations",
+            None,
+        )
+        if not callable(planner):
+            raise RuntimeError("Group-1 direct-HBM planner is unavailable")
+        starts = [start for start, _, _ in plans]
+        ends = [end for _, end, _ in plans]
+        keys = [key for _, _, key in plans]
+        phase_started = serving_perf_now() if perf_enabled else 0.0
+        planned = planner(kvcaches, slot_mapping, starts, ends, 1)
+        destination_plan_ms = (
+            (serving_perf_now() - phase_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+        if planned is None:
+            rejection = getattr(
+                self.gpu_connector,
+                "direct_page_plan_rejection",
+                None,
+            )
+            reason = rejection(1) if callable(rejection) else None
+            raise RuntimeError(
+                "Group-1 direct-HBM destination plan failed: "
+                f"{reason or 'unsupported_layout'}"
+            )
+        ptrs, sizes, owners = planned
+        if len(ptrs) != len(keys) or len(sizes) != len(keys):
+            raise RuntimeError("Group-1 direct-HBM page count is invalid")
+        load_pages = self._group1_external_page_load()
+        try:
+            # This strict API returns only after native DMA reaches a known
+            # terminal status; an unrelated Ascend stream event adds no fence.
+            phase_started = serving_perf_now() if perf_enabled else 0.0
+            load_pages(keys, ptrs, sizes, owners, req_id)
+            native_load_ms = (
+                (serving_perf_now() - phase_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
+            elapsed_ms = (
+                (serving_perf_now() - load_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
+            if perf_enabled and elapsed_ms >= 100.0:
+                serving_perf_log(
+                    logger,
+                    "group1_direct_hbm_load_slow",
+                    started=load_started,
+                    req_id=req_id,
+                    pages=len(keys),
+                    bytes=sum(map(sum, sizes)),
+                    token_plan_ms=round(token_plan_ms, 3),
+                    layout_ms=round(layout_ms, 3),
+                    destination_plan_ms=round(destination_plan_ms, 3),
+                    native_load_ms=round(native_load_ms, 3),
+                    thread_cpu_ms=round(
+                        (time.thread_time_ns() - load_thread_started) / 1e6,
+                        3,
+                    ),
+                )
+        except NativeExternalPageTransferUnknownError as error:
+            self._remote_fill_require_paired_restart((req_id,))
+            raise RemoteFillFatalError(
+                "decoder Group-1 external-page DMA state is unknown"
+            ) from error
+
+    def direct_prefill_plan_supported(
+        self,
+        group_caches: dict[int, list],
+    ) -> bool:
+        """Check the current direct layout before choosing the save path."""
+        check = getattr(self.gpu_connector, "direct_page_layout_supported", None)
+        if not callable(check):
+            return False
+        for group, caches in group_caches.items():
+            if not check(caches, group):
+                reason = getattr(
+                    self.gpu_connector, "direct_page_plan_rejection", None
+                )
+                detail = (
+                    reason(group) if callable(reason) else "unsupported_layout"
+                )
+                logged = getattr(self, "_direct_preflight_rejections", set())
+                if (group, detail) not in logged:
+                    logged.add((group, detail))
+                    self._direct_preflight_rejections = logged
+                    logger.warning(
+                        "Direct NPU prefill layout preflight failed; using the "
+                        "safe layerwise writer: kv_group=%d reason=%s",
+                        group,
+                        detail,
+                    )
+                return False
+        return True
+
+    def _get_remote_fill_coordinator(self) -> RemoteFillCoordinator:
+        coordinator = getattr(self, "_remote_fill_coordinator", None)
+        if coordinator is None:
+            coordinator = RemoteFillCoordinator(
+                config=self.config,
+                tp_size=int(self.metadata.world_size),
+                storage_manager=self.storage_manager,
+                fatal_reporter=self._remote_fill_require_paired_restart,
+                tp_independent=remote_fill_tp_independent(self.config, self.metadata),
+            )
+            self._remote_fill_coordinator = coordinator
+        return coordinator
+
+    def _remote_fill_session_context(self) -> ProducerSessionContext:
+        context = getattr(self, "_remote_fill_session_context_cache", None)
+        if context is None:
+            # Control/probe page planning already resolved this immutable layout.
+            # Do not rebuild or validate layout/hash state on the admission thread.
+            _, layout = self._remote_fill_layout_cache
+            context = ProducerSessionContext(
+                layout=layout,
+                chunk_hash_type=self.token_database.chunk_hash_type,
+                chunk_hash_bytes=self.token_database.chunk_hash_bytes,
+                tp_size=int(self.metadata.world_size),
+                shared_group1=not self._persistent_direct_hbm_split_group_enabled(),
+            )
+            self._remote_fill_session_context_cache = context
+        return context
+
+    def _remote_fill_prepare_request(
+        self, req_id: str, request_configs: Optional[dict], state: _DirectStoreRequestState
+    ) -> bool:
+        if not bool(getattr(self.config, "enable_remote_lmcache_store", False)):
+            return False
+        if state.remote_fill is None:
+            if (
+                not isinstance(request_configs, Mapping)
+                or request_configs.get(REMOTE_FILL_REQUEST_CONFIG_KEY) is None
+            ):
+                return False
+            state.remote_fill = ProducerRequestState()
+        return self._get_remote_fill_coordinator().prepare_request(
+            req_id, request_configs, state.remote_fill
+        )
+
+    def close_remote_fill_producer(self) -> None:
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            self.poll_layerwise_prefill_puts(final=True)
+        coordinator = getattr(self, "_remote_fill_coordinator", None)
+        if coordinator is not None:
+            coordinator.close(
+                state.remote_fill
+                for state in getattr(self, "_direct_store_states", {}).values()
+                if state.remote_fill is not None
+            )
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            sources = getattr(self, "_layerwise_cpu_fill_sources", {})
+            for groups in sources.values():
+                for _, lease in groups.values():
+                    lease.release()
+            sources.clear()
+
+    def remote_fill_producer_metrics_snapshot(self) -> dict[str, Any]:
+        coordinator = getattr(self, "_remote_fill_coordinator", None)
+        return {} if coordinator is None else coordinator.metrics_snapshot()
+
+    def _schedule_remote_fill_probe_pages(
+        self,
+        req_id: str,
+        state: _DirectStoreRequestState,
+        pages: tuple[ControlPage, ...],
+        required_store_end_hint: int,
+    ) -> None:
+        if not pages or state.remote_fill is None or state.remote_fill.handoff is None:
+            return
+        source = state.remote_fill.prefix_source
+        events = (
+            self._remote_fill_source_ready_events(state, required_store_end_hint)
+            if source
+            else ()
+        )
+        source_factory = None
+        if source and events:
+            source_factory = lambda missing: self._remote_fill_prefix_source_plan(
+                missing, source, events
+            )
+        self._get_remote_fill_coordinator().submit_probe(
+            req_id,
+            state.remote_fill,
+            pages,
+            required_store_end_hint,
+            maximum=self._remote_fill_pages_per_window(),
+            context=self._remote_fill_session_context(),
+            source_factory=source_factory,
+        )
+
+    def _remote_fill_prefix_source_plan(
+        self,
+        pages: tuple[ControlPage, ...],
+        source: tuple[dict[int, list], dict[int, torch.Tensor]],
+        events: tuple[Any, ...],
+    ) -> DirectPushSourcePlan:
+        """Plan only missing prefix pages using full, dense request mappings."""
+        caches, mappings = source
+        if not pages or not events:
+            raise ValueError("prefix repair requires pages and complete source fences")
+        planned_pages = []
+        owners = {}
+        for group in sorted({page.kv_group for page in pages}):
+            group_pages = [page for page in pages if page.kv_group == group]
+            mapping = mappings[group]
+            if (
+                mapping.ndim != 1
+                or max(page.chunk_end for page in group_pages) > mapping.numel()
+            ):
+                raise ValueError("prefix page is outside the full source mapping")
+            planned = self.gpu_connector.plan_direct_page_sources(
+                caches[group],
+                mapping,
+                [page.chunk_start for page in group_pages],
+                [page.chunk_end for page in group_pages],
+                group,
+                slot_mapping_base=0,
+            )
+            if planned is None:
+                raise ValueError("prefix source layout is not supported")
+            pointers, sizes, group_owners = planned
+            owners.update((id(owner), owner) for owner in group_owners)
+            for page, ptrs, lengths in zip(group_pages, pointers, sizes, strict=True):
+                if sum(lengths) != page.expected_bytes:
+                    raise ValueError("prefix source page byte layout changed")
+                planned_pages.append(
+                    DirectPushPageSource(
+                        canonical_key=page.canonical_key,
+                        kv_group=group,
+                        source_ptrs=tuple(ptrs),
+                        source_lengths=tuple(lengths),
+                    )
+                )
+        return DirectPushSourcePlan(
+            pages=tuple(planned_pages),
+            owners=tuple(owners.values()),
+            producer_events=events,
+        )
+
+    def _schedule_remote_fill_batch(
+        self,
+        state: _DirectStoreRequestState,
+        batch: _DirectPageBatch,
+        required_store_end_hint: int,
+    ) -> None:
+        if (
+            state.remote_fill is None
+            or state.remote_fill.handoff is None
+            or state.remote_fill.disabled_reason
+        ):
+            return
+        coordinator = self._get_remote_fill_coordinator()
+        try:
+            control_pages = self._remote_fill_control_pages(batch)
+        except Exception as error:
+            coordinator.reject_source_batch(
+                state.remote_fill, req_id=batch.req_id, error=error
+            )
+            return
+        coordinator.submit_batch(
+            state.remote_fill,
+            batch,
+            required_store_end_hint,
+            control_pages=control_pages,
+            maximum=self._remote_fill_pages_per_window(),
+            context=self._remote_fill_session_context(),
+        )
+
+    def configure_remote_fill_producer(
+        self,
+        *,
+        client_factory: Optional[Callable[..., Any]] = None,
+        direct_submitter: Optional[Callable[..., Future]] = None,
+        activation_factory: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        """Inject producer boundaries for hardware-independent tests.
+
+        Args:
+            client_factory: Optional ``(handoff, limits) -> RemoteFillClient``
+                factory. Production uses the existing LMCache ZMQ transport.
+            direct_submitter: Optional armed native submission callable.
+                Production forwards to ``StorageManager``.
+            activation_factory: Optional armed-attempt activation builder.
+                Runtime activation requires the explicit feature flag.
+        """
+
+        if any(value is not None for value in (client_factory, direct_submitter, activation_factory)):
+            self._get_remote_fill_coordinator().configure(
+                client_factory=client_factory,
+                direct_submitter=direct_submitter,
+                activation_factory=activation_factory,
+            )
+
+
+    def drain_remote_fill_terminal_results(self) -> dict[str, dict[str, str | int]]:
+        """Drain sanitized producer outcomes for the existing adapter handoff."""
+        coordinator = getattr(self, "_remote_fill_coordinator", None)
+        return {} if coordinator is None else coordinator.drain_terminal_results()
+
+
+
+    def _latch_remote_fill_producer_fatal(
+        self,
+        state: _DirectStoreRequestState,
+    ) -> None:
+        """Expose a producer-side armed ambiguity to the worker supervisor."""
+
+        handoff = state.remote_fill.handoff if state.remote_fill is not None else None
+        if handoff is None:
+            raise RuntimeError("remote-fill fatal state lacks a transfer identity")
+        self._remote_fill_require_paired_restart((handoff.transfer_id,))
+
+
+
+
+
+
+
+
+
+    def _remote_fill_immutable_layout(self) -> tuple[str, RemoteFillDecoderLayout]:
+        """Build the startup-immutable source layout once after opt-in."""
+
+        cached = getattr(self, "_remote_fill_layout_cache", None)
+        if cached is not None:
+            return cached
+        with self._engine_state_lock:
+            cached = getattr(self, "_remote_fill_layout_cache", None)
+            if cached is None:
+                layout_tag, _ = mooncake_payload_layout(self.config, self.metadata)
+                layout = build_decoder_layout(
+                    self.config,
+                    self.metadata,
+                    layout_tag=layout_tag,
+                    num_layers=int(self.num_layers),
+                )
+                cached = (layout_tag, layout)
+                self._remote_fill_layout_cache = cached
+            return cached
+
+
+
+    def _remote_fill_control_pages(
+        self,
+        batch: _DirectPageBatch,
+    ) -> tuple[ControlPage, ...]:
+        if len(batch.keys) != len(batch.sizes) or len(batch.keys) != len(
+            batch.ranges
+        ):
+            raise ValueError("remote-fill source page metadata is incomplete")
+        layout_tag, layout = self._remote_fill_immutable_layout()
+        direct_groups = set(self._remote_fill_direct_groups())
+        pages = [
+            ControlPage(
+                canonical_key=key.to_string(),
+                kv_group=int(key.kv_group),
+                chunk_index=start // int(self.config.chunk_size),
+                chunk_start=start,
+                chunk_end=end,
+                valid_tokens=end - start,
+                destination_tp_rank=0,
+                expected_bytes=sum(page_sizes),
+                layer_count=layout.num_layers_for_group(int(key.kv_group)),
+                layout_tag=layout_tag,
+            )
+            for key, page_sizes, (start, end) in zip(
+                batch.keys, batch.sizes, batch.ranges, strict=True
+            )
+            if int(key.kv_group) in direct_groups
+        ]
+        pages.sort(key=lambda page: (page.chunk_index, page.kv_group))
+        for page in pages:
+            expected = layout.group(page.kv_group).expected_bytes(
+                page.valid_tokens, layout.num_layers_for_group(page.kv_group)
+            )
+            if page.expected_bytes != expected:
+                raise ValueError("remote-fill source page byte layout changed")
+        self._remote_fill_validate_page_pairs(tuple(pages))
+        return tuple(pages)
+
+    def _remote_fill_pages_per_window(self) -> int:
+        """Return the bounded direct-group page capacity of one window."""
+
+        group_count = len(self._remote_fill_direct_groups())
+        by_tokens = (
+            int(self.config.remote_fill_window_tokens)
+            // int(self.config.chunk_size)
+            * group_count
+        )
+        maximum = min(
+            int(self.config.remote_fill_max_control_pages_per_window),
+            by_tokens,
+        )
+        return maximum - maximum % group_count
+
+    _remote_fill_select_batch_pages = staticmethod(select_remote_fill_batch_pages)
+
+    def _remote_fill_validate_page_pairs(
+        self,
+        pages: tuple[ControlPage, ...],
+    ) -> None:
+        by_chunk: dict[int, set[int]] = {}
+        for page in pages:
+            groups = by_chunk.setdefault(page.chunk_index, set())
+            if page.kv_group in groups:
+                raise ValueError("remote-fill page identity is duplicated")
+            groups.add(page.kv_group)
+        expected = set(self._remote_fill_direct_groups())
+        if not by_chunk or any(groups != expected for groups in by_chunk.values()):
+            raise ValueError("remote fill requires exact direct-group pages")
+
+    def _remote_fill_probe_control_pages(
+        self,
+        plans: dict[int, list[tuple[int, int, CacheEngineKey]]],
+        probe_start: int,
+        probe_end: int,
+    ) -> tuple[ControlPage, ...]:
+        """Build pointer-free cached-prefix manifests from canonical plans."""
+
+        _, layout = self._remote_fill_immutable_layout()
+        pages: list[ControlPage] = []
+        for group in self._remote_fill_direct_groups():
+            for start, end, key in plans.get(group, ()):
+                if end <= probe_start or end > probe_end:
+                    continue
+                valid_tokens = end - start
+                pages.append(
+                    ControlPage(
+                        canonical_key=key.to_string(),
+                        kv_group=group,
+                        chunk_index=start // layout.chunk_size,
+                        chunk_start=start,
+                        chunk_end=end,
+                        valid_tokens=valid_tokens,
+                        destination_tp_rank=0,
+                        expected_bytes=layout.group(group).expected_bytes(
+                            valid_tokens, layout.num_layers_for_group(group)
+                        ),
+                        layer_count=layout.num_layers_for_group(group),
+                        layout_tag=layout.layout_tag,
+                    )
+                )
+        pages.sort(key=lambda page: (page.chunk_index, page.kv_group))
+        result = tuple(pages)
+        if result:
+            self._remote_fill_validate_page_pairs(result)
+        return result
+
+    def _remote_fill_prefix_plans(
+        self,
+        tokens: list[int],
+        request_configs: Optional[dict],
+        prefix_end: int,
+    ) -> dict[int, list[tuple[int, int, CacheEngineKey]]]:
+        """Rebuild canonical keys when a full hit has no suffix plan."""
+
+        prefix_tokens = tokens[:prefix_end]
+        latent = list(
+            self.token_database.process_tokens(
+                tokens=prefix_tokens,
+                request_configs=request_configs,
+                kv_group=0,
+            )
+        )
+        direct_groups = self._remote_fill_direct_groups()
+        if 1 not in direct_groups:
+            return {0: latent}
+        hashes = [key.chunk_hash for _, _, key in latent]
+        offsets = [end - start for start, end, _ in latent]
+        indexer = list(
+            self.token_database.process_tokens(
+                hashes=hashes,
+                offsets=offsets,
+                request_configs=request_configs,
+                kv_group=1,
+            )
+        )
+        if len(indexer) != len(latent) or any(
+            (left[0], left[1], left[2].chunk_hash)
+            != (right[0], right[1], right[2].chunk_hash)
+            for left, right in zip(latent, indexer, strict=True)
+        ):
+            raise RuntimeError(
+                "Remote-fill KV groups produced different prefix plans"
+            )
+        return {0: latent, 1: indexer}
+
+
+    _remote_fill_source_plan = staticmethod(build_remote_fill_source_plan)
+
+    _merge_deferred_remote_fill_batches = staticmethod(merge_deferred_remote_fill_batches)
+
+
+    def _wait_remote_fill_windows(self, state: _DirectStoreRequestState) -> None:
+        if state.remote_fill is not None:
+            self._get_remote_fill_coordinator().wait(state.remote_fill)
+
+    def _finish_remote_fill(
+        self, req_id: str, state: _DirectStoreRequestState, required_store_end: int
+    ) -> None:
+        if state.remote_fill is None or state.remote_fill.handoff is None:
+            return
+        if state.remote_fill.terminal is not None:
+            return
+        # Preserve the barrier before observing the persistent completion frontier.
+        coordinator = self._get_remote_fill_coordinator()
+        coordinator.wait(state.remote_fill)
+        coordinator.finish(
+            req_id,
+            state.remote_fill,
+            required_store_end,
+            min(state.committed_end.get(group, 0) for group in (0, 1)),
+        )
+
+    def _wait_direct_backpressure(self) -> None:
+        limit = self._store_queue_maxsize or 2
+        while len(self._direct_store_jobs) >= limit:
+            future = self._direct_store_jobs[0]
+            _, pending = wait(
+                (future,), timeout=self.config.blocking_timeout_secs
+            )
+            if pending:
+                raise TimeoutError("Timed out waiting for direct-store queue space")
+            self._direct_store_jobs.popleft()
+
+    def _direct_store_done(
+        self,
+        req_id: str,
+        key_strings: set[str],
+        future: Future,
+    ) -> None:
+        with self._store_cv:
+            if future in self._direct_completed_futures:
+                return
+            state = self._direct_store_states.get(req_id)
+            try:
+                succeeded = not future.cancelled() and future.exception() is None
+            except Exception:
+                succeeded = False
+            if state is not None:
+                if succeeded:
+                    state.pending_keys.difference_update(key_strings)
+            if not succeeded:
+                return
+            self._direct_completed_futures.add(future)
+            count = self._pending_store_reqs.get(req_id, 1) - 1
+            if count <= 0:
+                self._pending_store_reqs.pop(req_id, None)
+            else:
+                self._pending_store_reqs[req_id] = count
+            self._store_cv.notify_all()
+
+    def _submit_direct_page_batch(self, batch: _DirectPageBatch) -> Future:
+        assert self.storage_manager is not None
+        self._wait_direct_backpressure()
+        started = serving_perf_now() if serving_perf_enabled() else None
+        state = self._direct_store_states.setdefault(
+            batch.req_id, _DirectStoreRequestState()
+        )
+        if (
+            state.remote_fill is not None
+            and state.remote_fill.metrics_started
+            and not state.remote_fill.persistent_started_at
+            and started is not None
+        ):
+            state.remote_fill.persistent_started_at = started
+        key_strings = {key.to_string() for key in batch.keys}
+        state.pending_keys.update(key_strings)
+        with self._store_cv:
+            self._pending_store_reqs[batch.req_id] = (
+                self._pending_store_reqs.get(batch.req_id, 0) + 1
+            )
+        try:
+            future = self.storage_manager.batched_put_external_pages(
+                batch.keys,
+                batch.ptrs,
+                batch.sizes,
+                batch.owners,
+                batch.ready_events,
+                batch.req_id,
+            )
+        except Exception:
+            state.pending_keys.difference_update(key_strings)
+            with self._store_cv:
+                count = self._pending_store_reqs.get(batch.req_id, 1) - 1
+                if count <= 0:
+                    self._pending_store_reqs.pop(batch.req_id, None)
+                else:
+                    self._pending_store_reqs[batch.req_id] = count
+                self._store_cv.notify_all()
+            raise
+        state.futures.append(future)
+        self._direct_store_jobs.append(future)
+        legacy_objects = sum(hasattr(key, "layer_id") for key in batch.keys)
+        state.submitted_jobs += 1
+        state.submitted_pages += len(batch.keys) - legacy_objects
+        state.submitted_legacy_objects += legacy_objects
+        state.submitted_bytes += sum(map(sum, batch.sizes))
+        if started is not None:
+            serving_perf_log(
+                logger,
+                "direct_npu_submit",
+                started=started,
+                req_id=batch.req_id,
+                pages=len(batch.keys) - legacy_objects,
+                legacy_objects=legacy_objects,
+                format=(
+                    "legacy_tail" if legacy_objects else "page"
+                ),
+                queue_depth=len(self._direct_store_jobs),
+            )
+        return future
+
+    def _store_direct_cpu_group(
+        self,
+        req_id: str,
+        tokens: list[int],
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        kv_group: int,
+        start: int,
+        request_configs: Optional[dict],
+        slot_mapping_base: int = 0,
+    ) -> int:
+        if start >= len(tokens):
+            return start
+        if start < slot_mapping_base:
+            raise RuntimeError(
+                "Direct prefill CPU fallback cannot address an uncommitted "
+                "prefix: "
+                f"req_id={req_id}, kv_group={kv_group}, committed={start}, "
+                f"slot_mapping_base={slot_mapping_base}"
+            )
+        mask = torch.zeros(len(tokens), dtype=torch.bool)
+        mask[start:] = True
+        storer = self.store_layer(
+            tokens,
+            mask=mask,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            offset=start,
+            sync=True,
+            req_id=req_id,
+            kv_group=kv_group,
+            request_configs=request_configs,
+            require_completion=True,
+            all_layers_ready=True,
+            slot_mapping_base=slot_mapping_base,
+        )
+        self._require_store_completion = True
+        try:
+            result = None
+            while True:
+                try:
+                    value = next(storer)
+                    if value is not None:
+                        result = value
+                except StopIteration:
+                    break
+            self.wait_for_pending_sync_stores()
+        finally:
+            self._require_store_completion = False
+        return int(getattr(result, "committed_end", start) or start)
+
+    def _retry_direct_cpu(
+        self,
+        req_id: str,
+        tokens: list[int],
+        group_caches: dict[int, list],
+        slot_mappings: dict[int, torch.Tensor],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+        slot_mapping_base: int = 0,
+    ) -> None:
+        for group, kvcaches in group_caches.items():
+            committed = self._store_direct_cpu_group(
+                req_id,
+                tokens,
+                kvcaches,
+                slot_mappings[group],
+                group,
+                state.committed_end.get(group, 0),
+                request_configs,
+                slot_mapping_base,
+            )
+            state.committed_end[group] = committed
+            state.submitted_end[group] = committed
+
+    def _direct_required_end(
+        self,
+        state: _DirectStoreRequestState,
+        tokens: list[int],
+    ) -> int:
+        del tokens
+        if state.accepted_store_end is None:
+            raise RuntimeError("direct store has no authoritative accepted end")
+        return state.accepted_store_end
+
+    def _finalize_direct_store(
+        self,
+        req_id: str,
+        tokens: list[int],
+        groups: Iterable[int],
+        state: _DirectStoreRequestState,
+        final: bool,
+    ) -> None:
+        if not final:
+            return
+        if state.finalized:
+            return
+        required_end = self._direct_required_end(state, tokens)
+        invalid = {
+            group: state.committed_end.get(group, 0)
+            for group in groups
+            if state.committed_end.get(group, 0) != required_end
+        }
+        if invalid:
+            raise RuntimeError(
+                "Direct prefill store published an invalid final frontier: "
+                f"req_id={req_id} committed={invalid} required={required_end}"
+            )
+        self._finish_remote_fill(req_id, state, required_end)
+        if (
+            state.remote_fill is not None
+            and state.remote_fill.terminal is not None
+            and state.remote_fill.terminal.outcome
+            in ("PERSISTENCE_FAILED", "FATAL_RESTART")
+        ):
+            raise RuntimeError(
+                "Remote-fill finalization rejected request forwarding: "
+                f"outcome={state.remote_fill.terminal.outcome}"
+            )
+        state.finalized = True
+        logger.info(
+            "[req_id=%s] Direct prefill store complete for %d tokens: "
+            "submitted pages=%d, legacy objects=%d, size=%.4f GB, jobs=%d, "
+            "committed=%s",
+            req_id,
+            required_end,
+            state.submitted_pages,
+            state.submitted_legacy_objects,
+            state.submitted_bytes / 1024**3,
+            state.submitted_jobs,
+            dict(sorted(state.committed_end.items())),
+        )
+
+    def _direct_suffix_plans(
+        self,
+        state: _DirectStoreRequestState,
+        tokens: list[int],
+        groups: Iterable[int],
+        request_configs: Optional[dict],
+    ) -> dict[int, list[tuple[int, int, CacheEngineKey]]]:
+        """Hash only complete chunks added since the previous forward."""
+        chunk_size = int(self.config.chunk_size)
+        full_end = len(tokens) // chunk_size * chunk_size
+        full_tokens = tokens if full_end == len(tokens) else tokens[:full_end]
+        groups = tuple(groups)
+        if all(
+            state.submitted_end.get(group, 0) >= full_end for group in groups
+        ):
+            return {group: [] for group in groups}
+        base = (
+            state.planned_end
+            if state.planned_end <= full_end
+            and all(
+                state.submitted_end.get(group, 0) >= state.planned_end
+                for group in groups
+            )
+            else 0
+        )
+        if base == full_end:
+            plan0 = []
+        elif base:
+            plan0 = list(
+                self.token_database.process_tokens_from_prefix(
+                    full_tokens,
+                    prefix_token_count=base,
+                    prefix_hash=state.planned_hash,
+                    request_configs=request_configs,
+                    kv_group=0,
+                )
+            )
+        else:
+            base = 0
+            plan0 = list(
+                self.token_database.process_tokens(
+                    tokens=full_tokens,
+                    request_configs=request_configs,
+                    kv_group=0,
+                )
+            )
+        hashes = [key.chunk_hash for _, _, key in plan0]
+        offsets = [end - start for start, end, _ in plan0]
+        plans = {0: plan0}
+        for group in groups:
+            if group == 0:
+                continue
+            if not plan0:
+                plans[group] = []
+                continue
+            plans[group] = [
+                (start + base, end + base, key)
+                for start, end, key in self.token_database.process_tokens(
+                    hashes=hashes,
+                    offsets=offsets,
+                    request_configs=request_configs,
+                    kv_group=group,
+                )
+            ]
+            if len(plans[group]) != len(plan0) or any(
+                (left[0], left[1], left[2].chunk_hash)
+                != (right[0], right[1], right[2].chunk_hash)
+                for left, right in zip(plan0, plans[group], strict=True)
+            ):
+                raise RuntimeError(
+                    "Direct prefill KV groups produced different chunk plans: "
+                    f"kv_group={group}"
+                )
+        if plan0:
+            state.planned_end = plan0[-1][1]
+            state.planned_hash = plan0[-1][2].chunk_hash
+        return plans
+
+    def adopt_completed_layerwise_store(
+        self, result: LayerwiseStoreResult
+    ) -> None:
+        """Reuse a completed layerwise store as direct-store progress."""
+        if result.committed_end <= 0:
+            return
+        state = self._direct_store_states.setdefault(
+            result.request_id, _DirectStoreRequestState()
+        )
+        group = int(result.kv_group)
+        latest_full = None
+        if result.keys:
+            chunk_size = int(self.config.chunk_size)
+            for start, end, key in zip(
+                result.starts, result.ends, result.keys[0], strict=True
+            ):
+                if end - start == chunk_size:
+                    latest_full = (end, key.chunk_hash)
+            if latest_full is not None:
+                end, chunk_hash = latest_full
+                if end == state.planned_end and chunk_hash != state.planned_hash:
+                    raise RuntimeError(
+                        "Completed latent/index stores disagree on their hash "
+                        "frontier"
+                    )
+                if end > state.planned_end:
+                    state.planned_end = end
+                    state.planned_hash = chunk_hash
+        state.submitted_end[group] = max(
+            state.submitted_end.get(group, 0), result.committed_end
+        )
+        state.committed_end[group] = max(
+            state.committed_end.get(group, 0), result.committed_end
+        )
+
+    def _retain_layerwise_prefill_pages(
+        self, req_id: str, memory_objs: Iterable[MemoryObj]
+    ) -> None:
+        """Hold one allocator reference per physical page for this request."""
+        with self._engine_state_lock:
+            owned = self._layerwise_prefill_page_owners.setdefault(req_id, {})
+            for obj in memory_objs:
+                identity = id(obj)
+                if identity not in owned:
+                    obj.ref_count_up()
+                    owned[identity] = obj
+
+    def release_layerwise_prefill_pages(self, req_id: str) -> None:
+        """Release one request's CPU pages and cached DMA bindings.
+
+        Args:
+            req_id: Completed or cancelled request identifier.
+
+        Repeated calls are harmless. Remote puts retain their own source
+        references until completion; this only ends the request's LRU lease.
+        """
+        release_dma = getattr(
+            getattr(self, "gpu_connector", None),
+            "release_layerwise_prefill_dma_cache",
+            None,
+        )
+        if release_dma is not None:
+            release_dma(req_id)
+        self._layerwise_prefill_store_frontiers.pop(req_id, None)
+        getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(req_id, None)
+        with self._engine_state_lock:
+            owned = self._layerwise_prefill_page_owners.pop(req_id, None)
+        if owned is not None:
+            for obj in owned.values():
+                obj.ref_count_down()
+
+    def poll_layerwise_prefill_puts(
+        self, *, final: bool = False, req_ids: Optional[Iterable[str]] = None
+    ) -> None:
+        """Poll persistence, or fence persistence and D2H before final reuse."""
+        if final and req_ids is not None:
+            # Both the remote queue and the DMA fence consume this selection.
+            req_ids = tuple(req_ids)
+        queue = getattr(self, "_layerwise_put_queue", None)
+        if queue is not None:
+            if not final:
+                queue.poll()
+            elif req_ids is None:
+                queue.drain()
+            else:
+                queue.drain_requests(req_ids)
+        if final:
+            # LocalCPUBackend also permits async D2H, independently of
+            # store_async, but has no remote put future to fence those reads.
+            wait_stores = getattr(
+                getattr(self, "gpu_connector", None),
+                "wait_for_layerwise_prefill_stores",
+                None,
+            )
+            if wait_stores is not None:
+                wait_stores(req_ids)
+
+    def _dense_retrieve_token_results(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> Iterable[tuple[int, int, CacheEngineKey]]:
+        results = super()._dense_retrieve_token_results(
+            tokens, mask, request_configs, kv_group, kwargs
+        )
+        queue = getattr(self, "_layerwise_put_queue", None)
+        if queue is None:
+            return results
+
+        def track_prefix():
+            for start, end, key in results:
+                queue.track_keys(kwargs.get("req_id", ""), (key,))
+                yield start, end, key
+
+        return track_prefix()
+
+    def track_prefill_retrieve_keys(
+        self, req_id: str, keys: Iterable[CacheEngineKey]
+    ) -> None:
+        """Keep remote-put dependencies when cached plans bypass tokenization."""
+        queue = getattr(self, "_layerwise_put_queue", None)
+        if queue is not None:
+            queue.track_keys(req_id, keys)
+
+    def _queue_layerwise_cpu_fill(
+        self,
+        req_id: str,
+        request_configs: Optional[dict],
+        kv_group: int,
+        keys: list,
+        pages: list,
+        starts: list[int],
+        ends: list[int],
+    ) -> None:
+        """Retain fully D2H-fenced pages, without copying their payload.
+
+        Must run after draining the NPU storer and before backend submission
+        releases the original page references. This never revisits NPU banks.
+        """
+        if kv_group not in self._remote_fill_direct_groups():
+            return
+        state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
+        if not self._remote_fill_prepare_request(req_id, request_configs, state):
+            return
+        if state.remote_fill.disabled_reason:
+            return
+        if self.config.remote_fill_submission_mode != "per_chunk":
+            state.remote_fill.disabled_reason = "banked_prefill_final_deferred"
+            return
+        fences = self.gpu_connector.layerwise_prefill_store_fences(kv_group)
+        if not fences or not pages or not all(
+            isinstance(page, LayerPageMemoryObj) for page in pages
+        ):
+            state.remote_fill.disabled_reason = "banked_prefill_source_unavailable"
+            return
+        groups = self._layerwise_cpu_fill_sources.setdefault(req_id, {})
+        if kv_group in groups:
+            raise RuntimeError("Duplicate CPU fill group in one prefill batch")
+        lease = LayerwiseCPUFillLease(tuple(pages))
+        try:
+            owners = tuple({
+                int(page.raw_data.untyped_storage().data_ptr()): page.raw_data
+                for page in pages
+            }.values())
+            batch = _DirectPageBatch(
+                req_id=req_id,
+                keys=[key.without_layer() for key in keys],
+                # LayerPage is contiguous: one vector per chunk, not per layer.
+                ptrs=[[page.layer_data_ptr(0)] for page in pages],
+                sizes=[[page.get_size()] for page in pages],
+                owners=owners,
+                ready_event=fences[-1],
+                group_ends={kv_group: ends[-1]},
+                ranges=tuple(zip(starts, ends, strict=True)),
+                ready_events=fences,
+            )
+            groups[kv_group] = (batch, lease)
+        except BaseException:
+            lease.release()
+            raise
+
+    def submit_layerwise_prefill_fills(self, req_ids: Iterable[str]) -> None:
+        """Start CPU-to-D fill concurrently with already-submitted Mooncake puts.
+
+        Existing RemoteFill byte/window limits apply. Unsupported or unmatched
+        group pages retain the persistent fallback. No payload copy is added.
+        """
+        for req_id in req_ids:
+            groups = self._layerwise_cpu_fill_sources.pop(req_id, {})
+            if not groups:
+                continue
+            leases = tuple(lease for _, lease in groups.values())
+            state = self._direct_store_states[req_id]
+            previous = state.remote_fill.last_future
+            try:
+                if set(groups) != set(self._remote_fill_direct_groups()):
+                    state.remote_fill.disabled_reason = "banked_prefill_incomplete_groups"
+                    continue
+                batches = [batch for batch, _ in groups.values()]
+                if any(batch.ranges != batches[0].ranges for batch in batches[1:]):
+                    state.remote_fill.disabled_reason = "banked_prefill_unpaired_pages"
+                    continue
+                events = tuple({
+                    id(event): event
+                    for batch in batches for event in batch.ready_events
+                }.values())
+                batch = merge_deferred_remote_fill_batches(batches, events)
+                self._schedule_remote_fill_batch(
+                    state, batch, max(batch.group_ends.values())
+                )
+            finally:
+                submitted = state.remote_fill.last_future
+                if submitted is previous or submitted is None:
+                    for lease in leases:
+                        lease.release()
+                else:
+                    def release_sources(done: Future, held=leases) -> None:
+                        error = None if done.cancelled() else done.exception()
+                        if isinstance(error, RemoteFillFatalError):
+                            # Unknown native completion: do not recycle DMA
+                            # sources. The existing fatal path restarts workers.
+                            self._layerwise_cpu_fill_quarantine.extend(held)
+                            return
+                        for lease in held:
+                            lease.release()
+
+                    submitted.add_done_callback(release_sources)
+
+    def finish_layerwise_prefill_store(
+        self,
+        req_id: str,
+        request_configs: Optional[dict],
+        *,
+        required_store_end: int,
+        persistence_fenced: bool = False,
+        tokens: Optional[list[int]] = None,
+    ) -> None:
+        """Publish the terminal handoff after banked layerwise saves.
+
+        The adapter adopts each completed group via
+        ``adopt_completed_layerwise_store`` before calling this method. Native
+        fill jobs read leased CPU pages, never overwritten NPU banks.
+        persistence_fenced requires a successful final poll and sync-store wait
+        with no intervening store submission (avoids duplicate batch fences).
+        Passive TP workers and requests without RemoteFill remain unchanged.
+        If this request reused cached KV and emitted no new store receipt,
+        tokens allows recovery from actual persistent objects (or CPU-only
+        copies that must first be persisted). A cache hit count is not proof
+        of remote persistence. Normal completed stores never take this path.
+
+        Raises:
+            RuntimeError: Either KV group's persisted frontier is incomplete.
+            TimeoutError: Required remote puts have not completed in time.
+        """
+        if not self.config.enable_remote_lmcache_store or self._is_passive():
+            return
+        if not persistence_fenced:
+            self.poll_layerwise_prefill_puts(final=True, req_ids=(req_id,))
+            self.wait_for_pending_sync_stores()
+        state = self._direct_store_states.setdefault(
+            req_id, _DirectStoreRequestState()
+        )
+        self._remote_fill_prepare_request(req_id, request_configs, state)
+        if state.remote_fill is None or state.remote_fill.handoff is None:
+            return
+        persistent_end = min(state.committed_end.get(group, 0) for group in (0, 1))
+        if persistent_end < required_store_end and tokens is not None:
+            self._recover_layerwise_prefill_persistence(
+                req_id, tokens, request_configs, state, required_store_end
+            )
+            persistent_end = min(
+                state.committed_end.get(group, 0) for group in (0, 1)
+            )
+        if persistent_end < required_store_end:
+            raise RuntimeError(
+                "Layerwise prefill persistence is incomplete; refusing "
+                f"RemoteFill handoff: req_id={req_id}, "
+                f"committed={state.committed_end}, required={required_store_end}"
+            )
+        if state.remote_fill.last_future is None and state.remote_fill.session is None:
+            state.remote_fill.disabled_reason = (
+                state.remote_fill.disabled_reason or "layerwise_prefill_persistent_only"
+            )
+        self._finish_remote_fill(req_id, state, required_store_end)
+
+    def _recover_layerwise_prefill_persistence(
+        self,
+        req_id: str,
+        tokens: list[int],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+        required_end: int,
+    ) -> None:
+        """Recover missing request receipts once at final PD handoff.
+
+        Query remote objects, not the LocalCPU-first lookup. Probe whole pages
+        in batches, then legacy layer objects only for page misses. Republish
+        genuinely missing objects from CPU, never from reused NPU banks.
+        """
+        assert self.storage_manager is not None
+        remote = self.storage_manager.storage_backends.get(REMOTE_BACKEND_NAME)
+        if remote is None:
+            raise RuntimeError("Layerwise prefill handoff requires RemoteBackend")
+        page_format = mooncake_layer_pages_enabled(self.config)
+        for group in (0, 1):
+            committed = state.committed_end.get(group, 0)
+            if committed >= required_end:
+                continue
+            plan = [
+                (start, end, key)
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens[:required_end],
+                    request_configs=request_configs,
+                    kv_group=group,
+                )
+                if end > committed
+            ]
+            if not plan or plan[0][0] > committed or plan[-1][1] != required_end:
+                raise RuntimeError(
+                    "Cannot recover complete layerwise prefill persistence: "
+                    f"req_id={req_id}, kv_group={group}, required={required_end}"
+                )
+            keys = [key for _, _, key in plan]
+            queue = self._layerwise_put_queue
+            if queue is not None:
+                # A full cache hit can bypass the store generator that normally
+                # inherits outstanding puts from the original prefix producer.
+                queue.track_keys(req_id, keys)
+                queue.drain_requests((req_id,))
+            page_hits = (
+                self.storage_manager.batched_external_pages_exist(keys)
+                if page_format else [False] * len(keys)
+            )
+            missing = [key for key, hit in zip(keys, page_hits, strict=True) if not hit]
+            if missing:
+                num_layers = self._num_layers_for_kv_group(group)
+                layers = [key.split_layers(num_layers) for key in missing]
+                flat_keys = [key for chunk in layers for key in chunk]
+                # batched_contains returns a contiguous prefix. Only complete
+                # chunks count; a partial legacy chunk must be republished.
+                legacy_chunks = remote.batched_contains(flat_keys) // num_layers
+                for index in range(legacy_chunks, len(missing)):
+                    key, layer_keys = missing[index], layers[index]
+                    # After the first hole, later chunks may still exist even
+                    # if their local CPU copy has already been evicted. Probe
+                    # these chunks once, not the entire remaining suffix.
+                    if (
+                        index > legacy_chunks
+                        and remote.batched_contains(layer_keys) == num_layers
+                    ):
+                        continue
+                    self._republish_layerwise_cpu_chunk(req_id, key, layer_keys)
+                self.wait_for_pending_sync_stores()
+            # Publish only after both remote probes and any repair futures
+            # have succeeded. Never infer success from skip_leading_tokens.
+            state.committed_end[group] = required_end
+            state.submitted_end[group] = max(
+                state.submitted_end.get(group, 0), required_end
+            )
+
+    def _republish_layerwise_cpu_chunk(
+        self,
+        req_id: str,
+        key: CacheEngineKey,
+        layer_keys: list[CacheEngineKey],
+    ) -> None:
+        """Persist an already CPU-ready chunk, retaining sources through put."""
+        assert self.storage_manager is not None
+        local = self._shared_local_cpu_backend()
+        pages, _ = local.batched_get_layer_page_prefix([key])
+        if pages:
+            try:
+                futures = self.storage_manager.batched_put_layer_pages(
+                    [key], pages, req_id=req_id, publish_local_early=True
+                )
+            except BaseException:
+                # The storage manager consumes our get references only on
+                # successful submission; native-unknown DMA retains its own.
+                for page in pages:
+                    page.ref_count_down()
+                raise
+        else:
+            owned = []
+            try:
+                for layer_key in layer_keys:
+                    obj = local.get_blocking(layer_key)
+                    if obj is None:
+                        raise RuntimeError(
+                            "Layerwise prefill KV is absent from both remote "
+                            "storage and LocalCPU: "
+                            f"req_id={req_id}, key={layer_key}"
+                        )
+                    owned.append(obj)
+                remote = self.storage_manager.storage_backends[REMOTE_BACKEND_NAME]
+                futures = remote.batched_submit_put_task(layer_keys, owned)
+            finally:
+                # RemoteBackend owns independent references after submission.
+                for obj in owned:
+                    obj.ref_count_down()
+        if not futures:
+            raise RuntimeError("Missing completion receipt for CPU prefix repair")
+        self._track_sync_store_futures(futures, require_completion=True)
+
+    def _track_direct_batch(
+        self,
+        batch: _DirectPageBatch,
+        retry: tuple[Any, ...],
+    ) -> Future:
+        future = self._submit_direct_page_batch(batch)
+        state = self._direct_store_states[batch.req_id]
+        for group, end in batch.group_ends.items():
+            state.submitted_end[group] = max(state.submitted_end.get(group, 0), end)
+        key_strings = {key.to_string() for key in batch.keys}
+        self._direct_retry_args[future] = (*retry, key_strings, batch.group_ends)
+        future.add_done_callback(
+            lambda done,
+            req_id=batch.req_id,
+            keys=key_strings: self._direct_store_done(req_id, keys, done)
+        )
+        return future
+
+    @staticmethod
+    def _remember_direct_source_readiness(
+        state: _DirectStoreRequestState,
+        token_end: int,
+        event: Any,
+        event_source: str,
+        events: tuple[Any, ...] = (),
+    ) -> None:
+        """Retain the producer dependency needed by a deferred final tail."""
+        if event is not None and token_end >= state.source_ready_token_end:
+            state.source_ready_event = event
+            state.source_ready_event_source = (
+                event_source
+                if event_source and event_source != "missing"
+                else "caller_supplied"
+            )
+            state.source_ready_token_end = token_end
+        if events and token_end >= state.source_ready_events_token_end:
+            unique: dict[int, Any] = {}
+            for producer_event in events:
+                if producer_event is not None:
+                    unique.setdefault(id(producer_event), producer_event)
+            state.source_ready_events = tuple(unique.values())
+            state.source_ready_events_token_end = token_end
+
+    @staticmethod
+    def _direct_source_ready_events(
+        state: _DirectStoreRequestState,
+        token_end: int,
+    ) -> tuple[Any, ...]:
+        """Return the complete direct-push fence set through ``token_end``."""
+
+        if state.source_ready_events_token_end < token_end:
+            return ()
+        return state.source_ready_events
+
+    @staticmethod
+    def _remote_fill_source_ready_events(
+        state: _DirectStoreRequestState,
+        token_end: int,
+    ) -> tuple[Any, ...]:
+        """Return only the exact request/frontier-matched producer fence."""
+
+        if (
+            state.source_ready_event is None
+            or state.source_ready_event_source
+            != _REMOTE_FILL_REQUEST_HANDOFF_EVENT_SOURCE
+            or state.source_ready_token_end < token_end
+        ):
+            return ()
+        events = AscendLMCacheEngine._direct_source_ready_events(
+            state, token_end
+        )
+        if not any(event is state.source_ready_event for event in events):
+            return ()
+        return events
+
+    @staticmethod
+    def _direct_source_ready_event(
+        state: _DirectStoreRequestState,
+        token_end: int,
+        *,
+        require_producer_event: bool = False,
+    ) -> tuple[Any, str]:
+        """Return an event that covers every source byte through ``token_end``."""
+        if (
+            state.source_ready_event is not None
+            and state.source_ready_token_end >= token_end
+        ):
+            return state.source_ready_event, state.source_ready_event_source
+        if require_producer_event:
+            raise RuntimeError(
+                "Direct DSA NPU store has no attention producer event "
+                f"covering token_end={token_end}; refusing an unsafe "
+                "current-stream fallback"
+            )
+
+        event = torch.npu.Event()
+        event.record()
+        state.source_ready_event = event
+        state.source_ready_event_source = (
+            "engine_current_stream_fallback_non_dsa"
+        )
+        state.source_ready_token_end = token_end
+        return event, state.source_ready_event_source
+
+    @staticmethod
+    def _remote_fill_has_addressable_source_page(
+        token_end: int,
+        slot_mapping_base: int,
+        chunk_size: int,
+    ) -> bool:
+        """Whether P owns every row of at least one final payload page."""
+
+        if token_end <= 0 or chunk_size <= 0:
+            return False
+        last_page_start = (token_end - 1) // chunk_size * chunk_size
+        return last_page_start >= slot_mapping_base
+
+    def begin_live_source_descriptor(
+        self, req_id: str, groups: tuple[int, ...] = (0, 1)
+    ) -> None:
+        self._live_source_builders.setdefault(
+            req_id,
+            {
+                "segments": [],
+                "compact_layers": None,
+                "compact_runs": [],
+                "compact_owners": None,
+                "latent_layers": None,
+                "latent_pages": [],
+                "ends": {},
+                "groups": groups,
+                "invalid": False,
+                "planned_end": 0,
+                "planned_hash": 0,
+            },
+        )
+
+    def discard_live_source_descriptor(self, req_id: str) -> None:
+        """Discard only live-P2P state while retaining persistent-store state."""
+        self._live_source_builders.pop(req_id, None)
+        self._completed_live_sources.pop(req_id, None)
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", None
+        )
+        if pending_diagnostics is not None:
+            pending_diagnostics.pop(req_id, None)
+
+    def _record_live_source_layout(
+        self,
+        req_id: str,
+        kv_group: int,
+        start: int,
+        end: int,
+        layers: list[dict[str, int]],
+        runs: list[dict[str, int]],
+    ) -> None:
+        builder = self._live_source_builders.get(req_id)
+        if builder is None or kv_group not in builder["groups"]:
+            return
+        if builder["segments"]:
+            builder["invalid"] = True
+            return
+        coverage_end = int(builder["ends"].get(kv_group, 0))
+        if start != coverage_end or end <= start:
+            builder["invalid"] = True
+            return
+        if builder["compact_layers"] not in (None, layers):
+            builder["invalid"] = True
+            return
+        if (
+            not runs
+            or runs[0]["logical_token_start"] != start
+            or sum(run["token_count"] for run in runs) != end - start
+            or any(
+                left["logical_token_start"] + left["token_count"]
+                != right["logical_token_start"]
+                for left, right in zip(runs, runs[1:], strict=False)
+            )
+        ):
+            builder["invalid"] = True
+            return
+        builder["compact_layers"] = layers
+        builder["compact_runs"].extend(runs)
+        builder["ends"][kv_group] = end
+
+    def _record_live_latent_source_layout(
+        self,
+        req_id: str,
+        start: int,
+        end: int,
+        layers: list[dict[str, int]],
+        pages: list[dict[str, Any]],
+    ) -> None:
+        builder = self._live_source_builders.get(req_id)
+        if builder is None or 0 not in builder["groups"]:
+            return
+        coverage_end = int(builder["ends"].get(0, 0))
+        if start != coverage_end or end <= start:
+            builder["invalid"] = True
+            return
+        if builder["latent_layers"] not in (None, layers):
+            builder["invalid"] = True
+            return
+        logical = start
+        for page in pages:
+            page_start = int(page.get("logical_token_start", -1))
+            page_tokens = int(page.get("token_count", 0))
+            runs = page.get("runs", ())
+            if page_start != logical or page_tokens <= 0 or not runs:
+                builder["invalid"] = True
+                return
+            run_logical = page_start
+            for run in runs:
+                run_start = int(run.get("logical_token_start", -1))
+                run_tokens = int(run.get("token_count", 0))
+                if run_start != run_logical or run_tokens <= 0:
+                    builder["invalid"] = True
+                    return
+                run_logical += run_tokens
+            if run_logical != page_start + page_tokens:
+                builder["invalid"] = True
+                return
+            logical += page_tokens
+        if logical != end:
+            builder["invalid"] = True
+            return
+        builder["latent_layers"] = layers
+        builder["latent_pages"].extend(pages)
+        builder["ends"][0] = end
+
+    @staticmethod
+    def _disable_live_latent_group(builder: dict[str, Any]) -> None:
+        """Keep a valid group-1 descriptor when optional group 0 cannot plan."""
+        builder["groups"] = tuple(
+            group for group in builder["groups"] if group != 0
+        )
+        builder["ends"].pop(0, None)
+        builder["latent_layers"] = None
+        builder["latent_pages"].clear()
+        builder["invalid"] = False
+
+    def _record_live_source_pages(
+        self,
+        req_id: str,
+        kv_group: int,
+        ranges: list[tuple[int, int]],
+        ptrs: List[List[int]],
+        sizes: List[List[int]],
+        owners: tuple[torch.Tensor, ...],
+    ) -> None:
+        builder = self._live_source_builders.get(req_id)
+        if builder is None or kv_group not in builder["groups"]:
+            return
+        if (
+            kv_group == 1 and builder["compact_layers"] is not None
+        ) or (
+            kv_group == 0 and builder["latent_layers"] is not None
+        ):
+            # Rank 0's persistent direct-store path observes the same source
+            # pages after compact live capture. The compact descriptor already
+            # owns complete logical coverage, so this duplicate representation
+            # must not invalidate it.
+            return
+        coverage_end = int(builder["ends"].get(kv_group, 0))
+        if len(ranges) != len(ptrs) or len(ptrs) != len(sizes):
+            builder["invalid"] = True
+            return
+        owner_ranges = sorted(
+            (
+                int(owner.data_ptr()),
+                int(owner.numel() * owner.element_size()),
+                index,
+            )
+            for index, owner in enumerate(owners)
+        )
+        starts = [base for base, _, _ in owner_ranges]
+        prefix_ends: list[int] = []
+        prefix_owners: list[tuple[int, int]] = []
+        for base, capacity, index in owner_ranges:
+            owner_end = base + capacity
+            if not prefix_ends or owner_end > prefix_ends[-1]:
+                prefix_owners.append((index, base))
+                prefix_ends.append(owner_end)
+            else:
+                prefix_owners.append(prefix_owners[-1])
+                prefix_ends.append(prefix_ends[-1])
+        for (start, page_end), page_ptrs, page_sizes in zip(
+            ranges, ptrs, sizes, strict=True
+        ):
+            if page_end <= coverage_end:
+                continue
+            if start != coverage_end:
+                builder["invalid"] = True
+                return
+            for ptr, size in zip(page_ptrs, page_sizes, strict=True):
+                owner_pos = bisect_right(starts, ptr) - 1
+                if owner_pos < 0 or ptr + size > prefix_ends[owner_pos]:
+                    builder["invalid"] = True
+                    return
+                index, base = prefix_owners[owner_pos]
+                builder["segments"].append(
+                    {
+                        "group_id": kv_group,
+                        "source_buffer_index": index,
+                        "source_buffer_base": base,
+                        "source_offset": ptr - base,
+                        "length": size,
+                    }
+                )
+            coverage_end = page_end
+        builder["ends"][kv_group] = coverage_end
+
+    def finalize_live_source_descriptor(
+        self, req_id: str, token_count: int, tp_rank: int, dp_rank: int
+    ) -> bool:
+        builder = self._live_source_builders.pop(req_id, None)
+        if builder is None or builder["invalid"]:
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason=(
+                        "missing_builder" if builder is None else "invalid_builder"
+                    ),
+                )
+            return False
+        groups = builder["groups"]
+        if any(builder["ends"].get(group, 0) != token_count for group in groups):
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason="incomplete_coverage",
+                    group_ends=builder["ends"],
+                )
+            return False
+        totals = [0, 0]
+        compact_layers = builder["compact_layers"]
+        latent_layers = builder["latent_layers"]
+        if latent_layers is not None:
+            totals[0] = sum(
+                int(page["token_count"])
+                * sum(layer["token_bytes"] for layer in latent_layers)
+                for page in builder["latent_pages"]
+            )
+        if compact_layers is not None:
+            totals[1] = token_count * sum(
+                layer["token_bytes"] for layer in compact_layers
+            )
+        for segment in builder["segments"]:
+            totals[segment["group_id"]] += segment["length"]
+        if any(not totals[group] for group in groups):
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason="empty_group",
+                    group_byte_totals=totals,
+                )
+            return False
+        descriptor = {
+            "group_byte_totals": totals,
+            "tp_rank": tp_rank,
+            "dp_rank": dp_rank,
+        }
+        if compact_layers is None and latent_layers is None:
+            descriptor["segments"] = builder["segments"]
+        else:
+            if compact_layers is not None:
+                descriptor["format"] = "layer_slot_runs_v1"
+                descriptor["compact_layout"] = {
+                    "group_id": 1,
+                    "token_count": token_count,
+                    "layers": compact_layers,
+                    "runs": builder["compact_runs"],
+                }
+            if latent_layers is not None:
+                # Keep the established group-1 carrier format.  The latent
+                # layout is an optional extension: older peers ignore it and
+                # can still execute group-1 P2P. Keep the base totals valid
+                # for that established schema and carry the group-0 total in
+                # its own extension field; a new peer validates and promotes
+                # it before constructing a hybrid plan.
+                descriptor["format"] = "layer_slot_runs_v1"
+                latent_total = totals[0]
+                descriptor["group_byte_totals"][0] = 0
+                descriptor["latent_group_byte_total"] = latent_total
+                descriptor["latent_layout"] = {
+                    "group_id": 0,
+                    "token_count": token_count,
+                    "layers": latent_layers,
+                    "pages": builder["latent_pages"],
+                }
+        self._completed_live_sources[req_id] = descriptor
+        if (
+            compact_layers is not None
+            and npu_content_diagnostics_enabled()
+            and builder.get("compact_owners")
+        ):
+            pending_diagnostics = getattr(
+                self, "_pending_live_source_diagnostics", None
+            )
+            if pending_diagnostics is None:
+                pending_diagnostics = {}
+                self._pending_live_source_diagnostics = pending_diagnostics
+            pending_diagnostics[req_id] = {
+                "owners": builder["compact_owners"],
+                "layers": compact_layers,
+                "runs": builder["compact_runs"],
+                "token_count": token_count,
+                "chunk_size": int(self.config.chunk_size),
+                "tp_rank": tp_rank,
+                "dp_rank": dp_rank,
+            }
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "live_source_finalize_detail",
+                req_id=req_id,
+                token_count=token_count,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                finalized=True,
+                segments=len(builder["segments"]),
+                compact_layers=len(compact_layers or ()),
+                compact_runs=len(builder["compact_runs"]),
+                latent_layers=len(latent_layers or ()),
+                latent_pages=len(builder["latent_pages"]),
+                group_byte_totals=totals,
+            )
+        return True
+
+    def finalize_live_source_readiness(self, req_ids: Iterable[str]) -> None:
+        """Fingerprint live Group-1 sources after their producer fence.
+
+        The adapter calls this only after synchronizing the final NPU producer
+        event.  Keeping the device-to-host readback here preserves the causal
+        evidence captured by the adapter's pre-readback event query.
+        """
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", {}
+        )
+        for req_id in req_ids:
+            pending = pending_diagnostics.pop(req_id, None)
+            if pending is None:
+                continue
+            descriptor = self._completed_live_sources.get(req_id)
+            if descriptor is None:
+                continue
+            fingerprint = fingerprint_compact_group1(
+                event="group1_source_post_fence_fingerprint",
+                req_id=req_id,
+                owners=pending["owners"],
+                layers=pending["layers"],
+                runs=pending["runs"],
+                token_count=pending["token_count"],
+                chunk_size=pending["chunk_size"],
+                tp_rank=pending["tp_rank"],
+                dp_rank=pending["dp_rank"],
+            )
+            if fingerprint is not None:
+                descriptor["content_diagnostics"] = fingerprint
+
+    def drain_live_source_descriptors(self) -> dict[str, dict[str, Any]]:
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", {}
+        )
+        unfinished = self._completed_live_sources.keys() & (
+            pending_diagnostics.keys()
+        )
+        if unfinished:
+            raise RuntimeError(
+                "Live source descriptors reached publication before their "
+                f"post-fence diagnostics completed: {sorted(unfinished)}"
+            )
+        descriptors = self._completed_live_sources
+        self._completed_live_sources = {}
+        return descriptors
+
+    def capture_live_source_step(
+        self,
+        req_id: str,
+        tokens: list[int],
+        group_caches: dict[int, list],
+        slot_mappings: dict[int, torch.Tensor],
+        request_configs: Optional[dict],
+        slot_mapping_base: int,
+        final: bool,
+    ) -> None:
+        if req_id in self._completed_live_sources:
+            return
+        planner = getattr(self.gpu_connector, "plan_compact_page_layout", None)
+        latent_planner = getattr(
+            self.gpu_connector, "plan_compact_latent_page_layout", None
+        )
+        legacy_planner = getattr(
+            self.gpu_connector, "plan_direct_page_sources", None
+        )
+        if (
+            not callable(planner)
+            and not callable(legacy_planner)
+        ) or set(group_caches) != {0, 1}:
+            self._live_source_builders.pop(req_id, None)
+            return
+        try:
+            self.begin_live_source_descriptor(req_id, (1,))
+            builder = self._live_source_builders[req_id]
+            target_end = (
+                len(tokens)
+                if final
+                else len(tokens) // self.config.chunk_size * self.config.chunk_size
+            )
+            planned_end = int(builder["planned_end"])
+            if planned_end == target_end:
+                return
+            if not slot_mapping_base <= planned_end < target_end:
+                raise ValueError(
+                    "live source token coverage is not available in this step"
+                )
+            target_tokens = tokens[:target_end]
+            plan0 = list(
+                self.token_database.process_tokens_from_prefix(
+                    target_tokens,
+                    prefix_token_count=planned_end,
+                    prefix_hash=builder["planned_hash"],
+                    request_configs=request_configs,
+                    kv_group=0,
+                )
+                if planned_end
+                else self.token_database.process_tokens(
+                    tokens=target_tokens,
+                    request_configs=request_configs,
+                    kv_group=0,
+                )
+            )
+            if (
+                not plan0
+                or plan0[0][0] != planned_end
+                or plan0[-1][1] != target_end
+            ):
+                raise ValueError("live source token plan is not contiguous")
+            hashes = [key.chunk_hash for _, _, key in plan0]
+            offsets = [end - start for start, end, _ in plan0]
+            group1_keys = list(
+                self.token_database.process_tokens(
+                    hashes=hashes,
+                    offsets=offsets,
+                    request_configs=request_configs,
+                    kv_group=1,
+                )
+            )
+            plans = {1: [
+                (latent[0], latent[1], indexer[2])
+                for latent, indexer in zip(plan0, group1_keys, strict=True)
+            ]}
+            if 0 in builder["groups"]:
+                plans[0] = plan0
+            for group, chunks in plans.items():
+                if not chunks:
+                    continue
+                starts = [start for start, _, _ in chunks]
+                ends = [end for _, end, _ in chunks]
+                if group == 0:
+                    if builder["segments"]:
+                        # The v1 wire format supports either legacy segments
+                        # or compact layouts, not a mixture. Preserve the
+                        # already valid legacy group-1 source instead of
+                        # adding a latent layout that would make the entire
+                        # descriptor fail decoder validation.
+                        self._disable_live_latent_group(builder)
+                        continue
+                    try:
+                        if not callable(latent_planner):
+                            raise ValueError(
+                                "compact latent source layout is unsupported"
+                            )
+                        latent_planned = latent_planner(
+                            group_caches[group],
+                            slot_mappings[group],
+                            starts,
+                            ends,
+                            slot_mapping_base=slot_mapping_base,
+                        )
+                        if latent_planned is None:
+                            raise ValueError(
+                                "compact latent source layout is unsupported"
+                            )
+                        layers, pages, _owners = latent_planned
+                        self._record_live_latent_source_layout(
+                            req_id, starts[0], ends[-1], layers, pages
+                        )
+                        if builder["invalid"]:
+                            raise ValueError(
+                                "compact latent source coverage is invalid"
+                            )
+                    except Exception as error:
+                        self._disable_live_latent_group(builder)
+                        logger.warning(
+                            "Live latent source disabled for request %s; "
+                            "preserving group-1 P2P: %s",
+                            req_id,
+                            error,
+                        )
+                    continue
+                planned = (
+                    planner(
+                        group_caches[group],
+                        slot_mappings[group],
+                        starts,
+                        ends,
+                        group,
+                        slot_mapping_base=slot_mapping_base,
+                    )
+                    if callable(planner)
+                    else None
+                )
+                if planned is None and callable(legacy_planner):
+                    planned = legacy_planner(
+                        group_caches[group],
+                        slot_mappings[group],
+                        starts,
+                        ends,
+                        group,
+                        slot_mapping_base=slot_mapping_base,
+                    )
+                    if planned is not None:
+                        ptrs, sizes, owners = planned
+                        self._record_live_source_pages(
+                            req_id,
+                            group,
+                            list(zip(starts, ends, strict=True)),
+                            ptrs,
+                            sizes,
+                            tuple(owners),
+                        )
+                        if builder["invalid"]:
+                            raise ValueError(
+                                "live group-1 source coverage is invalid"
+                            )
+                        continue
+                if planned is None:
+                    raise ValueError("direct page source layout is unsupported")
+                layers, runs, owners = planned
+                self._record_live_source_layout(
+                    req_id, group, starts[0], ends[-1], layers, runs
+                )
+                if npu_content_diagnostics_enabled():
+                    existing_owners = builder.get("compact_owners")
+                    owner_identity = tuple(
+                        int(owner.data_ptr()) for owner in owners
+                    )
+                    if existing_owners is not None and tuple(
+                        int(owner.data_ptr()) for owner in existing_owners
+                    ) != owner_identity:
+                        raise ValueError(
+                            "live group-1 diagnostic owners changed across steps"
+                        )
+                    builder["compact_owners"] = tuple(owners)
+                if builder["invalid"]:
+                    raise ValueError(
+                        "live group-1 source coverage is invalid"
+                    )
+            builder["planned_end"] = target_end
+            builder["planned_hash"] = plan0[-1][2].chunk_hash
+        except Exception as error:
+            self._live_source_builders.pop(req_id, None)
+            logger.warning(
+                "Live source descriptor disabled for request %s: %s",
+                req_id,
+                error,
+            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_capture_failure",
+                    req_id=req_id,
+                    token_count=len(tokens),
+                    groups=sorted(group_caches),
+                    slot_mapping_base=slot_mapping_base,
+                    final=final,
+                    reason=type(error).__name__,
+                    detail=str(error),
+                )
+
+    def _submit_direct_tail(
+        self,
+        req_id: str,
+        tokens: list[int],
+        group_caches: dict[int, list],
+        slot_mappings: dict[int, torch.Tensor],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+        planner: Callable[..., Any],
+        slot_mapping_base: int = 0,
+        *,
+        remote_batches: Optional[list[_DirectPageBatch]] = None,
+    ) -> bool:
+        """Publish an exact-size tail; optionally collect its RemoteFill plan.
+
+        ``remote_batches`` belongs only to the current final store call.
+        Persistent puts are submitted immediately in either case.
+        """
+        started = serving_perf_now() if serving_perf_enabled() else None
+        start = state.planned_end
+        if start >= len(tokens):
+            return True
+        remote_fill = self._remote_fill_prepare_request(
+            req_id, request_configs, state
+        )
+        if remote_fill and set(group_caches) != {0, 1}:
+            state.remote_fill.disabled_reason = "incomplete_groups"
+            remote_fill = False
+        complete_ready_events = self._direct_source_ready_events(
+            state, len(tokens)
+        )
+        remote_ready_events = self._remote_fill_source_ready_events(
+            state, len(tokens)
+        )
+        if remote_fill and not remote_ready_events:
+            state.remote_fill.disabled_reason = "incomplete_producer_fence"
+            self._get_remote_fill_coordinator().get_metrics().abandon(
+                "incomplete producer fence"
+            )
+            remote_fill = False
+        if not remote_fill:
+            group_caches = {
+                group: caches
+                for group, caches in group_caches.items()
+                if state.submitted_end.get(group, 0) < len(tokens)
+            }
+        if not group_caches:
+            return True
+        plan0 = list(
+            self.token_database.process_tokens_from_prefix(
+                tokens,
+                prefix_token_count=start,
+                prefix_hash=state.planned_hash,
+                request_configs=request_configs,
+                kv_group=0,
+            )
+            if start
+            else self.token_database.process_tokens(
+                tokens=tokens, request_configs=request_configs, kv_group=0
+            )
+        )
+        tail = [item for item in plan0 if item[0] == start and item[1] == len(tokens)]
+        if len(tail) != 1:
+            return False
+        _, end, latent_key = tail[0]
+        keys: List[CacheEngineKey] = []
+        ptrs: List[List[int]] = []
+        sizes: List[List[int]] = []
+        owners: dict[int, torch.Tensor] = {}
+        group_ends: dict[int, int] = {}
+        remote_keys: List[CacheEngineKey] = []
+        remote_ptrs: List[List[int]] = []
+        remote_sizes: List[List[int]] = []
+        remote_owners: dict[int, torch.Tensor] = {}
+        remote_group_ends: dict[int, int] = {}
+        remote_probe_plans: dict[
+            int, list[tuple[int, int, CacheEngineKey]]
+        ] = {0: [], 1: []}
+        max_buffers = int(
+            self.config.get_extra_config_value(
+                "mooncake_direct_max_buffers_per_page", 4096
+            )
+        )
+        direct_groups = set(self._remote_fill_direct_groups())
+        for group, kvcaches in group_caches.items():
+            remote_group = remote_fill and group in direct_groups
+            key = latent_key
+            if group:
+                key = next(
+                    self.token_database.process_tokens(
+                        hashes=[latent_key.chunk_hash],
+                        offsets=[end - start],
+                        request_configs=request_configs,
+                        kv_group=group,
+                    )
+                )[2]
+            present = self.storage_manager.batched_external_pages_exist([key])
+            if len(present) != 1:
+                return False
+            persistent_missing = not present[0]
+            if not persistent_missing:
+                state.submitted_end[group] = end
+                if not state.futures:
+                    state.committed_end[group] = end
+                if not remote_group:
+                    continue
+            if remote_group and start < slot_mapping_base:
+                if persistent_missing:
+                    state.remote_fill.disabled_reason = (
+                        "unaddressable_partial_source"
+                    )
+                    remote_fill = False
+                else:
+                    # A full prefix hit may recompute only the final token, so
+                    # the already-committed partial page is not addressable in
+                    # this forward. Register it as probe-only coverage; never
+                    # build a native source from an unrelated slot window.
+                    remote_probe_plans[group].append((start, end, key))
+                continue
+            planned = planner(
+                kvcaches,
+                slot_mappings[group],
+                [start],
+                [end],
+                group,
+                slot_mapping_base=slot_mapping_base,
+            )
+            if planned is None:
+                if remote_group:
+                    state.remote_fill.disabled_reason = "tail_planner_fallback"
+                    remote_fill = False
+                if persistent_missing:
+                    return False
+                continue
+            group_ptrs, group_sizes, group_owners = planned
+            if (
+                len(group_ptrs) != 1
+                or len(group_sizes) != 1
+                or any(len(item) > max_buffers for item in group_ptrs)
+            ):
+                if remote_fill:
+                    state.remote_fill.disabled_reason = "tail_buffer_limit"
+                    remote_fill = False
+                if persistent_missing:
+                    return False
+                continue
+            if remote_group:
+                remote_keys.append(key)
+                remote_ptrs.extend(group_ptrs)
+                remote_sizes.extend(group_sizes)
+                remote_owners.update(
+                    (id(owner), owner) for owner in group_owners
+                )
+                remote_group_ends[group] = end
+            if persistent_missing:
+                keys.append(key)
+                self._record_live_source_pages(
+                    req_id,
+                    group,
+                    [(start, end)],
+                    group_ptrs,
+                    group_sizes,
+                    tuple(group_owners),
+                )
+                ptrs.extend(group_ptrs)
+                sizes.extend(group_sizes)
+                owners.update((id(owner), owner) for owner in group_owners)
+                group_ends[group] = end
+        if remote_fill and any(remote_probe_plans.values()):
+            probe_pages = self._remote_fill_probe_control_pages(
+                remote_probe_plans,
+                start,
+                end,
+            )
+            if len(probe_pages) == len(direct_groups):
+                self._schedule_remote_fill_probe_pages(
+                    req_id,
+                    state,
+                    probe_pages,
+                    len(tokens),
+                )
+            else:
+                state.remote_fill.disabled_reason = "incomplete_partial_probe"
+                remote_fill = False
+        if not keys and not (remote_fill and remote_keys):
+            return True
+        if started is not None:
+            serving_perf_log(
+                logger,
+                "direct_npu_plan",
+                started=started,
+                req_id=req_id,
+                groups=sorted(group_ends),
+                pages=len(keys),
+                legacy_objects=0,
+                buffers=sum(map(len, ptrs)),
+                bytes=sum(map(sum, sizes)),
+                token_count=len(tokens),
+                slot_mapping_base=slot_mapping_base,
+                format="partial_page",
+            )
+        ready_event, ready_event_source = self._direct_source_ready_event(
+            state,
+            len(tokens),
+            require_producer_event=bool(
+                getattr(self.config, "dsa_two_groups", False)
+            ),
+        )
+        if (
+            1 in group_ends
+            and npu_content_diagnostics_enabled()
+        ):
+            log_npu_content_diagnostic_event(
+                "group1_persistent_store_ready_dependency",
+                req_id=req_id,
+                token_count=len(tokens),
+                event_source=ready_event_source,
+                source_ready_token_end=state.source_ready_token_end,
+                format="partial_page",
+            )
+        if keys:
+            batch = _DirectPageBatch(
+                req_id,
+                keys,
+                ptrs,
+                sizes,
+                tuple(owners.values()),
+                ready_event,
+                group_ends,
+                tuple((start, end) for _ in keys),
+                # Same producer fence contract as the full-page persistent
+                # batch: the put must not DMA-read source slots before the
+                # attention scatter of the producing forward completes.
+                complete_ready_events
+                or ((ready_event,) if ready_event is not None else ()),
+            )
+            self._track_direct_batch(
+                batch,
+                (
+                    req_id,
+                    tokens,
+                    group_caches,
+                    slot_mappings,
+                    request_configs,
+                    slot_mapping_base,
+                ),
+            )
+        if remote_fill and remote_keys:
+            if {int(key.kv_group) for key in remote_keys} == direct_groups:
+                remote_batch = _DirectPageBatch(
+                    req_id,
+                    remote_keys,
+                    remote_ptrs,
+                    remote_sizes,
+                    tuple(remote_owners.values()),
+                    ready_event,
+                    remote_group_ends,
+                    tuple((start, end) for _ in remote_keys),
+                    remote_ready_events,
+                )
+                if remote_batches is not None:
+                    remote_batches.append(remote_batch)
+                else:
+                    self._schedule_remote_fill_batch(state, remote_batch, len(tokens))
+            else:
+                state.remote_fill.disabled_reason = "incomplete_partial_pair"
+        return True
+
+    def store_direct_prefill(
+        self,
+        req_id: str,
+        tokens: list[int],
+        group_caches: dict[int, list],
+        slot_mappings: dict[int, torch.Tensor],
+        request_configs: Optional[dict] = None,
+        final: bool = False,
+        slot_mapping_base: int = 0,
+        verified_prefix_end: int = 0,
+        accepted_store_end: Optional[int] = None,
+        source_ready_event: Any = None,
+        source_ready_event_source: str = "missing",
+        source_ready_events: tuple[Any, ...] = (),
+        prefix_slot_mappings: Optional[dict[int, torch.Tensor]] = None,
+    ) -> bool:
+        """Publish newly completed pages and the final tail directly from NPU."""
+        if not self._direct_store_enabled or not group_caches:
+            return False
+        if accepted_store_end is None:
+            accepted_store_end = len(tokens)
+        if not 0 <= accepted_store_end <= len(tokens):
+            raise ValueError(
+                "Direct prefill accepted store end is outside the token range: "
+                f"accepted={accepted_store_end}, tokens={len(tokens)}"
+            )
+        tokens = tokens[:accepted_store_end]
+        if not 0 <= slot_mapping_base <= len(tokens):
+            raise ValueError(
+                "Direct prefill slot-mapping base is outside the token range: "
+                f"base={slot_mapping_base}, tokens={len(tokens)}"
+            )
+        if not 0 <= verified_prefix_end <= slot_mapping_base:
+            raise ValueError(
+                "Direct prefill verified prefix is outside the addressable "
+                "prefix: "
+                f"verified={verified_prefix_end}, base={slot_mapping_base}"
+            )
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+        state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
+        if (
+            state.accepted_store_end is not None
+            and accepted_store_end < state.accepted_store_end
+        ):
+            raise RuntimeError(
+                "Direct prefill accepted store frontier moved backwards: "
+                f"req_id={req_id} previous={state.accepted_store_end} "
+                f"accepted={accepted_store_end}"
+            )
+        state.accepted_store_end = accepted_store_end
+        if final and state.finalized:
+            return True
+        self._remember_direct_source_readiness(
+            state,
+            len(tokens),
+            source_ready_event,
+            source_ready_event_source,
+            source_ready_events,
+        )
+        remote_fill = self._remote_fill_prepare_request(
+            req_id, request_configs, state
+        )
+        if remote_fill and set(group_caches) != {0, 1}:
+            state.remote_fill.disabled_reason = "incomplete_groups"
+            remote_fill = False
+        if (
+            remote_fill and verified_prefix_end > 0
+            and getattr(self.config, "remote_fill_prefix_hole_repair", False)
+            and state.remote_fill.prefix_source is None
+            and prefix_slot_mappings
+            and all(
+                group in prefix_slot_mappings
+                and prefix_slot_mappings[group].ndim == 1
+                and prefix_slot_mappings[group].numel() >= len(tokens)
+                for group in self._remote_fill_direct_groups()
+            )
+        ):
+            state.remote_fill.prefix_source = (
+                dict(group_caches), dict(prefix_slot_mappings)
+            )
+        previous_remote_work = bool(
+            state.remote_fill is not None
+            and (
+                state.remote_fill.session is not None
+                or state.remote_fill.futures
+                or state.remote_fill.probe_end
+                or state.remote_fill.deferred_batches
+            )
+        )
+        if (
+            remote_fill
+            and not previous_remote_work
+            and state.remote_fill.prefix_source is None
+            and not self._remote_fill_has_addressable_source_page(
+                len(tokens),
+                slot_mapping_base,
+                int(self.config.chunk_size),
+            )
+        ):
+            state.remote_fill.disabled_reason = "no_addressable_source_page"
+            self._get_remote_fill_coordinator().get_metrics().abandon(
+                "no addressable source page"
+            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "remote_fill_direct_abandoned",
+                    req_id=req_id,
+                    reason="no_addressable_source_page",
+                    slot_mapping_base=slot_mapping_base,
+                    accepted_store_end=len(tokens),
+                )
+            remote_fill = False
+        complete_ready_events = self._direct_source_ready_events(
+            state, len(tokens)
+        )
+        remote_ready_events = self._remote_fill_source_ready_events(
+            state, len(tokens)
+        )
+        submission_mode = getattr(
+            self.config,
+            "remote_fill_submission_mode",
+            "final_deferred",
+        )
+        deferred_by_mode = bool(
+            remote_fill
+            and not final
+            and submission_mode == "final_deferred"
+            and complete_ready_events
+        )
+        if (
+            remote_fill
+            and not final
+            and submission_mode == "final_deferred"
+        ):
+            remote_ready_events = ()
+        defer_remote_fill_sources = False
+        if remote_fill and not remote_ready_events:
+            log_fence_transition = final or not state.remote_fill.fence_deferred
+            if final:
+                state.remote_fill.disabled_reason = "incomplete_producer_fence"
+                self._get_remote_fill_coordinator().get_metrics().abandon(
+                    "incomplete producer fence"
+                )
+            else:
+                # A later request/frontier-matched handoff may still provide
+                # the complete DSA producer fence without blocking persistence.
+                state.remote_fill.fence_deferred = True
+                defer_remote_fill_sources = True
+            if log_fence_transition:
+                _log_remote_fill_producer_fence_state(
+                    req_id,
+                    "reject_final" if final else "defer_nonfinal",
+                    final=final,
+                    reason=(
+                        "incomplete_producer_fence"
+                        if final
+                        else (
+                            "final_deferred_submission_mode"
+                            if deferred_by_mode
+                            else "awaiting_request_matched_handoff"
+                        )
+                    ),
+                    token_end=len(tokens),
+                    complete_fence_count=(
+                        len(complete_ready_events) if deferred_by_mode else 0
+                    ),
+                    complete_fence_token_end=(
+                        state.source_ready_events_token_end
+                    ),
+                    event_source=state.source_ready_event_source,
+                    transfer_id=state.remote_fill.handoff.transfer_id,
+                    slot_mapping_base=slot_mapping_base,
+                    submission_mode=submission_mode,
+                    deferred_batch_count=len(
+                        state.remote_fill.deferred_batches
+                    ),
+                    deferred_pages=state.remote_fill.deferred_pages,
+                    deferred_bytes=state.remote_fill.deferred_bytes,
+                    submitted_end=dict(sorted(state.submitted_end.items())),
+                )
+            if final:
+                state.remote_fill.deferred_batches.clear()
+                state.remote_fill.deferred_pages = 0
+                state.remote_fill.deferred_bytes = 0
+                state.remote_fill.fence_deferred = False
+            remote_fill = False
+        if remote_fill and state.remote_fill.fence_deferred:
+            deferred_batches = state.remote_fill.deferred_batches
+            if deferred_batches:
+                deferred_batch = self._merge_deferred_remote_fill_batches(
+                    deferred_batches, remote_ready_events
+                )
+                deferred_pages = len(deferred_batch.keys)
+                deferred_bytes = sum(map(sum, deferred_batch.sizes))
+                self._schedule_remote_fill_batch(
+                    state, deferred_batch, len(tokens)
+                )
+                _log_remote_fill_producer_fence_state(
+                    req_id,
+                    "release_deferred_sources",
+                    final=final,
+                    reason="complete_request_matched_fence",
+                    token_end=len(tokens),
+                    complete_fence_count=len(remote_ready_events),
+                    complete_fence_token_end=(
+                        state.source_ready_events_token_end
+                    ),
+                    event_source=state.source_ready_event_source,
+                    transfer_id=state.remote_fill.handoff.transfer_id,
+                    slot_mapping_base=slot_mapping_base,
+                    deferred_batch_count=len(deferred_batches),
+                    deferred_pages=deferred_pages,
+                    deferred_bytes=deferred_bytes,
+                    submitted_end=dict(sorted(state.submitted_end.items())),
+                )
+            state.remote_fill.deferred_batches.clear()
+            state.remote_fill.deferred_pages = 0
+            state.remote_fill.deferred_bytes = 0
+            state.remote_fill.fence_deferred = False
+            remote_fill = not state.remote_fill.disabled_reason
+        for group in group_caches:
+            if group not in state.submitted_end:
+                state.submitted_end[group] = verified_prefix_end
+                state.committed_end[group] = verified_prefix_end
+        started = serving_perf_now() if serving_perf_enabled() else None
+        cpu_fallback_s = 0.0
+        plans = self._direct_suffix_plans(
+            state, tokens, group_caches, request_configs
+        )
+        direct_groups = set(self._remote_fill_direct_groups())
+        if remote_fill:
+            probe_target = verified_prefix_end // int(self.config.chunk_size) * int(
+                self.config.chunk_size
+            )
+            if state.remote_fill.probe_end < probe_target:
+                probe_pages = self._remote_fill_probe_control_pages(
+                    plans,
+                    state.remote_fill.probe_end,
+                    probe_target,
+                )
+                expected_pages = (
+                    (probe_target - state.remote_fill.probe_end)
+                    // int(self.config.chunk_size)
+                    * len(direct_groups)
+                )
+                if len(probe_pages) != expected_pages:
+                    prefix_plans = self._remote_fill_prefix_plans(
+                        tokens,
+                        request_configs,
+                        probe_target,
+                    )
+                    if prefix_plans[0]:
+                        state.planned_end = prefix_plans[0][-1][1]
+                        state.planned_hash = (
+                            prefix_plans[0][-1][2].chunk_hash
+                        )
+                    probe_pages = self._remote_fill_probe_control_pages(
+                        prefix_plans,
+                        state.remote_fill.probe_end,
+                        probe_target,
+                    )
+                if len(probe_pages) != expected_pages:
+                    state.remote_fill.disabled_reason = "incomplete_probe_plan"
+                    remote_fill = False
+                else:
+                    self._schedule_remote_fill_probe_pages(
+                        req_id,
+                        state,
+                        probe_pages,
+                        len(tokens),
+                    )
+                    state.remote_fill.probe_end = probe_target
+
+        keys: List[CacheEngineKey] = []
+        ptrs: List[List[int]] = []
+        sizes: List[List[int]] = []
+        ranges: list[tuple[int, int]] = []
+        owners: dict[int, torch.Tensor] = {}
+        group_ends: dict[int, int] = {}
+        remote_keys: List[CacheEngineKey] = []
+        remote_ptrs: List[List[int]] = []
+        remote_sizes: List[List[int]] = []
+        remote_ranges: list[tuple[int, int]] = []
+        remote_owners: dict[int, torch.Tensor] = {}
+        remote_group_ends: dict[int, int] = {}
+        collect_remote_sources = remote_fill or defer_remote_fill_sources
+        merged_runs = 0
+        chunk_size = int(self.config.chunk_size)
+        planner = getattr(self.gpu_connector, "plan_direct_page_sources", None)
+        if not callable(planner):
+            self.wait_for_direct_stores((req_id,))
+            self._retry_direct_cpu(
+                req_id,
+                tokens,
+                group_caches,
+                slot_mappings,
+                request_configs,
+                state,
+                slot_mapping_base,
+            )
+            self._finalize_direct_store(
+                req_id, tokens, group_caches, state, final
+            )
+            return True
+
+        candidates: dict[int, list[tuple[int, int, CacheEngineKey]]] = {}
+        candidate_ends: dict[int, int] = {}
+        candidate_refs: list[tuple[int, tuple[int, int, CacheEngineKey]]] = []
+        for group in group_caches:
+            submitted = state.submitted_end.get(group, 0)
+            group_candidates = [
+                (start, end, key)
+                for start, end, key in plans[group]
+                if end > submitted and end - start == chunk_size
+            ]
+            candidates[group] = group_candidates
+            candidate_refs.extend((group, item) for item in group_candidates)
+            if group_candidates:
+                candidate_ends[group] = group_candidates[-1][1]
+
+        try:
+            exists = (
+                self.storage_manager.batched_external_pages_exist(
+                    [item[2] for _, item in candidate_refs]
+                )
+                if candidate_refs
+                else []
+            )
+        except Exception:
+            self.wait_for_direct_stores((req_id,))
+            self._retry_direct_cpu(
+                req_id,
+                tokens,
+                group_caches,
+                slot_mappings,
+                request_configs,
+                state,
+                slot_mapping_base,
+            )
+            self._finalize_direct_store(
+                req_id, tokens, group_caches, state, final
+            )
+            return True
+        if len(exists) != len(candidate_refs):
+            raise RuntimeError("Direct page lookup returned an invalid result count")
+        authoritative_candidates = {
+            group: list(group_candidates)
+            for group, group_candidates in candidates.items()
+        }
+        candidates = {group: [] for group in group_caches}
+        missing_by_group: set[int] = set()
+        for (group, item), present in zip(candidate_refs, exists, strict=True):
+            if present:
+                continue
+            missing_by_group.add(group)
+            candidates[group].append(item)
+        unaddressable = {
+            group: [(start, end) for start, end, _ in group_candidates]
+            for group, group_candidates in candidates.items()
+            if any(start < slot_mapping_base for start, _, _ in group_candidates)
+        }
+        if unaddressable:
+            raise RuntimeError(
+                "Direct prefill store found an uncommitted prefix outside its "
+                "slot-mapping window: "
+                f"req_id={req_id}, slot_mapping_base={slot_mapping_base}, "
+                f"missing={unaddressable}"
+            )
+        for group in group_caches.keys() - missing_by_group:
+            if group in candidate_ends:
+                state.submitted_end[group] = max(
+                    state.submitted_end.get(group, 0), candidate_ends[group]
+                )
+            if not state.futures:
+                state.committed_end[group] = max(
+                    state.committed_end.get(group, 0),
+                    state.submitted_end.get(group, 0),
+                )
+
+        for group, kvcaches in group_caches.items():
+            collect_remote_group = (
+                collect_remote_sources and group in direct_groups
+            )
+            submitted = state.committed_end.get(group, 0)
+            persistent_full = candidates[group]
+            persistent_full = [
+                item
+                for item in persistent_full
+                if item[2].to_string() not in state.pending_keys
+            ]
+            full = (
+                authoritative_candidates[group]
+                if collect_remote_group
+                else persistent_full
+            )
+            if full:
+                if collect_remote_group and any(
+                    start < slot_mapping_base for start, _, _ in full
+                ):
+                    state.remote_fill.disabled_reason = "unaddressable_source"
+                    remote_fill = False
+                    defer_remote_fill_sources = False
+                    collect_remote_sources = False
+                    full = persistent_full
+                starts = [start for start, _, _ in full]
+                ends = [end for _, end, _ in full]
+                planned = planner(
+                    kvcaches,
+                    slot_mappings[group],
+                    starts,
+                    ends,
+                    group,
+                    slot_mapping_base=slot_mapping_base,
+                )
+                fallback_reason = None
+                if planned is None:
+                    rejection = getattr(
+                        self.gpu_connector, "direct_page_plan_rejection", None
+                    )
+                    fallback_reason = (
+                        rejection(group) or "unsupported_layout"
+                        if callable(rejection)
+                        else "unsupported_layout"
+                    )
+                else:
+                    group_ptrs, group_sizes, group_owners = planned
+                    max_buffers = int(
+                        self.config.get_extra_config_value(
+                            "mooncake_direct_max_buffers_per_page", 4096
+                        )
+                    )
+                    if any(
+                        len(page_ptrs) > max_buffers for page_ptrs in group_ptrs
+                    ):
+                        fallback_reason = "buffer_limit_exceeded"
+                if fallback_reason is not None:
+                    if collect_remote_group:
+                        state.remote_fill.disabled_reason = fallback_reason
+                        remote_fill = False
+                        defer_remote_fill_sources = False
+                        collect_remote_sources = False
+                    if not persistent_full:
+                        continue
+                    if state.fallback_reasons.get(group) != fallback_reason:
+                        logger.warning(
+                            "Direct NPU prefill store is using CPU fallback: "
+                            "req_id=%s kv_group=%d reason=%s",
+                            req_id,
+                            group,
+                            fallback_reason,
+                        )
+                        state.fallback_reasons[group] = fallback_reason
+                    self.wait_for_direct_stores((req_id,))
+                    fallback_started = (
+                        serving_perf_now() if serving_perf_enabled() else None
+                    )
+                    committed = self._store_direct_cpu_group(
+                        req_id,
+                        tokens,
+                        kvcaches,
+                        slot_mappings[group],
+                        group,
+                        submitted,
+                        request_configs,
+                        slot_mapping_base,
+                    )
+                    state.committed_end[group] = committed
+                    state.submitted_end[group] = committed
+                    if fallback_started is not None:
+                        fallback_elapsed = serving_perf_now() - fallback_started
+                        cpu_fallback_s += fallback_elapsed
+                        serving_perf_log(
+                            logger,
+                            "direct_npu_cpu_fallback",
+                            started=fallback_started,
+                            req_id=req_id,
+                            kv_group=group,
+                            reason=fallback_reason,
+                            start=submitted,
+                            end=committed,
+                        )
+                    continue
+                assert planned is not None
+                if len(group_ptrs) != len(full) or len(group_sizes) != len(full):
+                    raise RuntimeError(
+                        "Direct page planner returned an invalid page count"
+                    )
+                merged_runs += sum(
+                    len(page_ptrs) // len(group_owners)
+                    for page_ptrs in group_ptrs
+                )
+                persistent_key_strings = {
+                    item[2].to_string() for item in persistent_full
+                }
+                persistent_ranges: list[tuple[int, int]] = []
+                persistent_ptrs: List[List[int]] = []
+                persistent_sizes: List[List[int]] = []
+                for item, page_ptrs, page_sizes in zip(
+                    full, group_ptrs, group_sizes, strict=True
+                ):
+                    start, end, key = item
+                    if collect_remote_group:
+                        remote_keys.append(key)
+                        remote_ptrs.append(page_ptrs)
+                        remote_sizes.append(page_sizes)
+                        remote_ranges.append((start, end))
+                    if key.to_string() in persistent_key_strings:
+                        keys.append(key)
+                        persistent_ptrs.append(page_ptrs)
+                        persistent_sizes.append(page_sizes)
+                        persistent_ranges.append((start, end))
+                if persistent_ranges:
+                    self._record_live_source_pages(
+                        req_id,
+                        group,
+                        persistent_ranges,
+                        persistent_ptrs,
+                        persistent_sizes,
+                        tuple(group_owners),
+                    )
+                    ptrs.extend(persistent_ptrs)
+                    sizes.extend(persistent_sizes)
+                    ranges.extend(persistent_ranges)
+                    owners.update((id(owner), owner) for owner in group_owners)
+                    # Existing pages between missing pages are part of the same
+                    # contiguous committed prefix once this batch succeeds.
+                    group_ends[group] = candidate_ends[group]
+                if collect_remote_group:
+                    remote_owners.update(
+                        (id(owner), owner) for owner in group_owners
+                    )
+                    remote_group_ends[group] = full[-1][1]
+
+        if started is not None:
+            elapsed_s = serving_perf_now() - started
+            plan_only_ms = max(elapsed_s - cpu_fallback_s, 0.0) * 1000
+            serving_perf_log(
+                logger,
+                "direct_npu_plan",
+                req_id=req_id,
+                groups=sorted(group_caches),
+                pages=len(keys),
+                buffers=sum(map(len, ptrs)),
+                merged_runs=merged_runs,
+                bytes=sum(map(sum, sizes)),
+                token_count=len(tokens),
+                slot_mapping_base=slot_mapping_base,
+                final=final,
+                format="page",
+                elapsed_ms=round(plan_only_ms, 3),
+                total_ms=round(elapsed_s * 1000, 3),
+                plan_only_ms=round(plan_only_ms, 3),
+                cpu_fallback_ms=round(cpu_fallback_s * 1000, 3),
+                submitted_ends=dict(state.submitted_end),
+                committed_ends=dict(state.committed_end),
+            )
+        ready_event = None
+        ready_event_source = "missing"
+        if keys or (remote_fill and remote_keys):
+            ready_event, ready_event_source = self._direct_source_ready_event(
+                state,
+                len(tokens),
+                require_producer_event=bool(
+                    getattr(self.config, "dsa_two_groups", False)
+                ),
+            )
+            if (
+                1 in group_ends
+                and npu_content_diagnostics_enabled()
+            ):
+                log_npu_content_diagnostic_event(
+                    "group1_persistent_store_ready_dependency",
+                    req_id=req_id,
+                    token_count=len(tokens),
+                    event_source=ready_event_source,
+                    source_ready_token_end=state.source_ready_token_end,
+                    format="page",
+                )
+        elif defer_remote_fill_sources and remote_keys:
+            ready_event = state.source_ready_event
+            ready_event_source = state.source_ready_event_source
+        if keys:
+            # The persistent put synchronizes the producer events carried by
+            # the batch before its unfenced DMA reads the registered NPU
+            # source. Without this fence the DMA can read slots before the
+            # attention scatter of the current forward lands (deterministically
+            # the youngest layer, e.g. the last DSA index layer).
+            persistent_fence_events = complete_ready_events or (
+                (ready_event,) if ready_event is not None else ()
+            )
+            batch = _DirectPageBatch(
+                req_id,
+                keys,
+                ptrs,
+                sizes,
+                tuple(owners.values()),
+                ready_event,
+                group_ends,
+                tuple(ranges),
+                persistent_fence_events,
+            )
+            if npu_content_diagnostics_enabled():
+                try:
+                    queue_store_time_source_fingerprint(
+                        req_id=req_id,
+                        group_caches=group_caches,
+                        slot_mappings=slot_mappings,
+                        slot_mapping_base=slot_mapping_base,
+                        page_ranges=tuple(ranges),
+                        put_producer_events=batch.ready_events,
+                        producer_fence_events=(
+                            complete_ready_events
+                            or ((ready_event,) if ready_event is not None else ())
+                        ),
+                        ready_event_source=ready_event_source,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Store-time source fingerprint failed for %s",
+                        req_id,
+                        exc_info=True,
+                    )
+            try:
+                self._track_direct_batch(
+                    batch,
+                    (
+                        req_id,
+                        tokens,
+                        group_caches,
+                        slot_mappings,
+                        request_configs,
+                        slot_mapping_base,
+                    ),
+                )
+            except Exception as error:
+                retry_started = serving_perf_now()
+                self.wait_for_direct_stores((req_id,))
+                self._retry_direct_cpu(
+                    req_id,
+                    tokens,
+                    group_caches,
+                    slot_mappings,
+                    request_configs,
+                    state,
+                    slot_mapping_base,
+                )
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "direct_npu_cpu_retry",
+                        started=retry_started,
+                        req_id=req_id,
+                        reason=type(error).__name__,
+                        failed_pages=len(keys),
+                    )
+                self._finalize_direct_store(
+                    req_id, tokens, group_caches, state, final
+                )
+                return True
+        final_remote_batches: Optional[list[_DirectPageBatch]] = None
+        if collect_remote_sources and remote_keys:
+            if {int(key.kv_group) for key in remote_keys} != direct_groups:
+                state.remote_fill.disabled_reason = "incomplete_page_pair"
+            else:
+                remote_batch = _DirectPageBatch(
+                    req_id,
+                    remote_keys,
+                    remote_ptrs,
+                    remote_sizes,
+                    tuple(remote_owners.values()),
+                    ready_event,
+                    remote_group_ends,
+                    tuple(remote_ranges),
+                    remote_ready_events,
+                )
+                if remote_fill:
+                    if (
+                        final
+                        and submission_mode == "per_chunk"
+                        and bool(getattr(self.config, "save_unfull_chunk", True))
+                        and len(tokens) % chunk_size
+                        and state.remote_fill.queued_windows
+                        == int(self.config.remote_fill_max_inflight_windows_per_request)
+                        - 1
+                    ):
+                        # Preserve early full-page submission unless combining
+                        # avoids job pressure and fits the current byte budget.
+                        coordinator = self._get_remote_fill_coordinator()
+                        try:
+                            _, layout = self._remote_fill_immutable_layout()
+                            combined_bytes = sum(map(sum, remote_batch.sizes)) + sum(
+                                layout.group(group).expected_bytes(
+                                    len(tokens) % chunk_size,
+                                    layout.num_layers_for_group(group),
+                                )
+                                for group in direct_groups
+                            )
+                        except Exception as error:
+                            coordinator.reject_source_batch(
+                                state.remote_fill, req_id=req_id, error=error
+                            )
+                        else:
+                            if coordinator.can_coalesce_final_batch(
+                                state.remote_fill, combined_bytes
+                            ):
+                                final_remote_batches = [remote_batch]
+                    if final_remote_batches is None:
+                        self._schedule_remote_fill_batch(
+                            state, remote_batch, len(tokens)
+                        )
+                else:
+                    state.remote_fill.deferred_batches.append(remote_batch)
+                    state.remote_fill.deferred_pages += len(remote_batch.keys)
+                    state.remote_fill.deferred_bytes += sum(
+                        map(sum, remote_batch.sizes)
+                    )
+                    _log_remote_fill_producer_fence_state(
+                        req_id,
+                        "retain_deferred_sources",
+                        final=final,
+                        reason=(
+                            "final_deferred_submission_mode"
+                            if deferred_by_mode
+                            else "awaiting_request_matched_handoff"
+                        ),
+                        token_end=len(tokens),
+                        complete_fence_count=(
+                            len(complete_ready_events) if deferred_by_mode else 0
+                        ),
+                        complete_fence_token_end=(
+                            state.source_ready_events_token_end
+                        ),
+                        event_source=state.source_ready_event_source,
+                        transfer_id=state.remote_fill.handoff.transfer_id,
+                        slot_mapping_base=slot_mapping_base,
+                        submission_mode=submission_mode,
+                        deferred_batch_count=len(
+                            state.remote_fill.deferred_batches
+                        ),
+                        deferred_pages=state.remote_fill.deferred_pages,
+                        deferred_bytes=state.remote_fill.deferred_bytes,
+                        submitted_end=dict(sorted(state.submitted_end.items())),
+                    )
+
+        # Final publication is also the chunked-prefill correctness fence.
+        if final:
+            save_tail = bool(getattr(self.config, "save_unfull_chunk", True))
+            required_end = self._direct_required_end(state, tokens)
+            if save_tail and state.planned_end < len(tokens):
+                try:
+                    self._submit_direct_tail(
+                        req_id,
+                        tokens,
+                        group_caches,
+                        slot_mappings,
+                        request_configs,
+                        state,
+                        planner,
+                        slot_mapping_base,
+                        remote_batches=final_remote_batches,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Direct NPU tail planning failed for %s; using CPU fallback",
+                        req_id,
+                        exc_info=True,
+                    )
+            if final_remote_batches:
+                if len(final_remote_batches) > 1 and sum(
+                    sum(map(sum, batch.sizes)) for batch in final_remote_batches
+                ) <= min(
+                    int(self.config.remote_fill_max_inflight_bytes),
+                    int(self.config.remote_fill_max_bytes_per_request),
+                ):
+                    events = tuple(
+                        {
+                            id(event): event
+                            for batch in final_remote_batches
+                            for event in batch.ready_events
+                        }.values()
+                    )
+                    final_remote_batches = [
+                        self._merge_deferred_remote_fill_batches(
+                            final_remote_batches, events
+                        )
+                    ]
+                # Oversized combinations keep separate admission. The existing
+                # coordinator still enforces aggregate bytes and window limits.
+                for final_batch in final_remote_batches:
+                    self._schedule_remote_fill_batch(state, final_batch, len(tokens))
+                final_remote_batches.clear()
+            with self._store_cv:
+                self._pending_store_reqs[req_id] = (
+                    self._pending_store_reqs.get(req_id, 0) + 1
+                )
+            try:
+                self.wait_for_direct_stores((req_id,))
+                repaired = False
+                for group, kvcaches in group_caches.items():
+                    committed = state.committed_end.get(group, 0)
+                    if committed >= required_end:
+                        state.committed_end.setdefault(group, required_end)
+                        state.submitted_end.setdefault(group, required_end)
+                        continue
+                    repair_started = serving_perf_now()
+                    repaired_end = self._store_direct_cpu_group(
+                        req_id,
+                        tokens,
+                        kvcaches,
+                        slot_mappings[group],
+                        group,
+                        committed,
+                        request_configs,
+                        slot_mapping_base,
+                    )
+                    state.committed_end[group] = repaired_end
+                    state.submitted_end[group] = repaired_end
+                    repaired = True
+                    if serving_perf_enabled():
+                        serving_perf_log(
+                            logger,
+                            "direct_npu_cpu_retry",
+                            started=repair_started,
+                            req_id=req_id,
+                            kv_group=group,
+                            reason=(
+                                "incomplete_full_page_coverage"
+                                if committed < state.planned_end
+                                else "tail_planner_fallback"
+                            ),
+                            committed_end=committed,
+                            required_end=required_end,
+                        )
+                if repaired:
+                    logger.warning(
+                        "Repaired incomplete direct prefill coverage for %s",
+                        req_id,
+                    )
+                self._finalize_direct_store(
+                    req_id, tokens, group_caches, state, final=True
+                )
+            finally:
+                with self._store_cv:
+                    count = self._pending_store_reqs.get(req_id, 1) - 1
+                    if count <= 0:
+                        self._pending_store_reqs.pop(req_id, None)
+                    else:
+                        self._pending_store_reqs[req_id] = count
+                    self._store_cv.notify_all()
+        return True
+
+    def wait_for_direct_stores(self, req_ids: Iterable[str]) -> set[str]:
+        """Fence request-owned direct puts before vLLM may release KV blocks."""
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            req_ids = tuple(req_ids)
+            if req_ids:
+                self.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
+        waited: set[str] = set()
+        for req_id in req_ids:
+            state = self._direct_store_states.get(req_id)
+            if state is None:
+                continue
+            started = serving_perf_now() if serving_perf_enabled() else None
+            remote_wait_started = (
+                started
+                if state.remote_fill is not None and state.remote_fill.metrics_started
+                else None
+            )
+            if (
+                started is not None
+                and state.remote_fill is not None
+                and state.remote_fill.metrics_started
+                and not state.remote_fill.backlog_logged
+            ):
+                now = time.perf_counter()
+                serving_perf_log(
+                    logger,
+                    "remote_fill_backlog_at_prefill_end",
+                    req_id=req_id,
+                    remaining_windows=state.remote_fill.queued_windows,
+                    remaining_bytes=state.remote_fill.queued_bytes,
+                    oldest_window_age_ms=round(
+                        max(
+                            now - state.remote_fill.oldest_enqueued_at,
+                            0.0,
+                        )
+                        * 1000,
+                        3,
+                    )
+                    if state.remote_fill.oldest_enqueued_at
+                    else 0.0,
+                )
+                state.remote_fill.backlog_logged = True
+            outstanding = len(state.futures)
+            failed: list[tuple[Future, tuple[Any, ...], Exception]] = []
+            completed: list[tuple[tuple[Any, ...], Optional[Exception]]] = []
+            verified_ends = dict(state.committed_end)
+            while state.futures:
+                future = state.futures.popleft()
+                error = None
+                try:
+                    try:
+                        future.result(timeout=self.config.blocking_timeout_secs)
+                    except FutureTimeoutError:
+                        logger.warning(
+                            "Direct NPU page store exceeded the blocking timeout "
+                            "for %s; waiting for the uncancellable native transfer "
+                            "before releasing KV blocks",
+                            req_id,
+                        )
+                        future.result()
+                except Exception as caught:
+                    error = caught
+                if isinstance(error, NativeExternalPageTransferUnknownError):
+                    self._latch_remote_fill_producer_fatal(state)
+                    raise RemoteFillFatalError(
+                        "persistent external-page DMA exceeded its hard deadline"
+                    ) from error
+                retry = self._direct_retry_args.pop(future, None)
+                if retry is None:
+                    if error is not None:
+                        raise error
+                    continue
+                completed.append((retry, error))
+                if error is None:
+                    self._direct_store_done(req_id, retry[-2], future)
+                else:
+                    failed.append((future, retry, error))
+
+            if failed:
+                retry_started = serving_perf_now()
+                logger.warning(
+                    "Direct NPU page store failed for %s; retrying through the "
+                    "CPU layerwise path after draining %d direct job(s): %s",
+                    req_id,
+                    outstanding,
+                    failed[0][2],
+                )
+                try:
+                    # Replay submission order: successful jobs advance the
+                    # verified frontier; only failed windows use CPU repair.
+                    for retry, error in completed:
+                        (
+                            _,
+                            tokens,
+                            group_caches,
+                            slot_mappings,
+                            configs,
+                            mapping_base,
+                            _,
+                            group_ends,
+                        ) = retry
+                        for group, required_end in group_ends.items():
+                            start = verified_ends.get(group, 0)
+                            if start < mapping_base:
+                                raise RuntimeError(
+                                    "Direct-store completion cannot bridge an "
+                                    "unverified prefix gap: "
+                                    f"req_id={req_id} group={group} "
+                                    f"verified={start} "
+                                    f"mapping_base={mapping_base}"
+                                )
+                            if error is None:
+                                verified_ends[group] = max(start, required_end)
+                                continue
+                            if start >= required_end:
+                                continue
+                            committed = self._store_direct_cpu_group(
+                                req_id,
+                                tokens,
+                                group_caches[group],
+                                slot_mappings[group],
+                                group,
+                                start,
+                                configs,
+                                mapping_base,
+                            )
+                            if committed < required_end:
+                                raise RuntimeError(
+                                    "CPU retry did not restore direct-store coverage: "
+                                    f"req_id={req_id} group={group} "
+                                    f"committed={committed} required={required_end}"
+                                )
+                            verified_ends[group] = committed
+                    # All later direct jobs have also completed, so repairing
+                    # every failed window makes their submitted frontier safe.
+                    for group, end in state.submitted_end.items():
+                        state.committed_end[group] = max(
+                            verified_ends.get(group, 0), end
+                        )
+                finally:
+                    with self._store_cv:
+                        for future, retry, _ in failed:
+                            self._direct_completed_futures.add(future)
+                            state.pending_keys.difference_update(retry[-2])
+                            count = self._pending_store_reqs.get(req_id, 1) - 1
+                            if count <= 0:
+                                self._pending_store_reqs.pop(req_id, None)
+                            else:
+                                self._pending_store_reqs[req_id] = count
+                        self._store_cv.notify_all()
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "direct_npu_cpu_retry",
+                        started=retry_started,
+                        req_id=req_id,
+                        reason=type(failed[0][2]).__name__,
+                        failed_pages=sum(
+                            len(getattr(error, "failed_pages", ()))
+                            for _, _, error in failed
+                        )
+                        or "unknown",
+                    )
+            else:
+                for group, end in state.submitted_end.items():
+                    state.committed_end[group] = max(
+                        state.committed_end.get(group, 0), end
+                    )
+            # The same source owners may also be retained by the optional
+            # remote-fill sink. Drain it before vLLM can release NPU blocks.
+            metrics = (
+                self._get_remote_fill_coordinator().get_metrics()
+                if remote_wait_started is not None
+                else None
+            )
+            self._wait_remote_fill_windows(state)
+            if metrics is not None:
+                metrics.observe(
+                    "final_wait_seconds",
+                    time.perf_counter() - remote_wait_started,
+                )
+            waited.add(req_id)
+            if started is not None:
+                serving_perf_log(
+                    logger,
+                    "direct_npu_final_wait",
+                    started=started,
+                    req_id=req_id,
+                    outstanding_jobs=outstanding,
+                )
+        return waited
+
+    def drop_direct_store_states(self, req_ids: Iterable[str]) -> None:
+        """Forget completed request bookkeeping after vLLM releases ownership."""
+        for req_id in req_ids:
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                sources = getattr(self, "_layerwise_cpu_fill_sources", {})
+                for _, lease in sources.pop(req_id, {}).values():
+                    lease.release()
+            state = self._direct_store_states.get(req_id)
+            if state is not None:
+                releasable = not state.futures and not state.pending_keys
+                if state.remote_fill is not None:
+                    releasable = self._get_remote_fill_coordinator().release(
+                        req_id, state.remote_fill, persistent_ready=releasable
+                    )
+                if releasable:
+                    self._direct_store_states.pop(req_id, None)
+            self._live_source_builders.pop(req_id, None)
+            self._completed_live_sources.pop(req_id, None)
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                self._layerwise_prefill_store_frontiers.pop(req_id, None)
+                getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(
+                    req_id, None
+                )
+            pending_diagnostics = getattr(self, "_pending_live_source_diagnostics", None)
+            if pending_diagnostics is not None:
+                pending_diagnostics.pop(req_id, None)
+
+    def direct_store_committed_ends(self, req_id: str) -> dict[int, int]:
+        """Return a snapshot of successfully persisted group frontiers."""
+        state = self._direct_store_states.get(req_id)
+        return {} if state is None else dict(state.committed_end)
 
     def _store_worker_loop(self) -> None:
         if not self.is_store_async:
@@ -220,6 +4238,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        kv_group = kwargs.get("kv_group", 0)
+
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
 
         with store_stats.profile_process_tokens():
@@ -230,12 +4250,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 offsets,
                 mask,
                 request_configs=request_configs,
+                kv_group=kv_group,
             ):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
                 num_tokens = end - start
-                kv_shapes = self.metadata.get_shapes(num_tokens)
-                kv_dtypes = self.metadata.get_dtypes()
+                kv_shapes, kv_dtypes = self._metadata_shapes_dtypes_for_kv_group(
+                    kv_group=kv_group,
+                    num_tokens=num_tokens,
+                )
 
                 # TODO (Jiayi): should be batched in the future
                 memory_obj = self.storage_manager.allocate(
@@ -244,7 +4267,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     busy_loop=self.config.get_extra_config_value(
                         "force_store_wait", False
                     ),
-                    fmt=self.fmt,
+                    fmt=self._memory_format_for_kv_group(kv_group),
                 )
                 if memory_obj is None:
                     logger.warning(
@@ -255,6 +4278,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
                     break
 
+                if not getattr(self, "_force_layerwise_prefill_store", False):
+                    # Preserve the decoder's logical length for flat MLA/DSA.
+                    memory_obj.metadata.valid_tokens = num_tokens
                 starts.append(start)
                 ends.append(end)
                 keys.append(key)
@@ -298,22 +4324,21 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         put_submitted = False
         try:
-            result = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **kwargs
-            )
-            store_stats.from_gpu_time = result if isinstance(result, float) else 0.0
+            with store_stats.profile_from_gpu():
+                self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
             with self._engine_state_lock:
                 with store_stats.profile_put():
                     transfer_spec = kwargs.get("transfer_spec", None)
                     # TODO: we implicitly rely on batched_put to call ref_count_down
                     # this management should be done in a cleaner way
-                    self.storage_manager.batched_put(
+                    required_futures = self.storage_manager.batched_put(
                         keys,
                         memory_objs,
                         transfer_spec=transfer_spec,
                         location=self.store_location,
                     )
+                    self._track_sync_store_futures(required_futures)
                     put_submitted = True
 
                 self.stats_monitor.on_store_finished(
@@ -326,21 +4351,22 @@ class AscendLMCacheEngine(LMCacheEngine):
                     mem_obj.ref_count_down()
             raise
 
-        tot_time = store_stats.time_to_store()
-
-        logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
-            "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
-            "offload_time: %.4f ms, put_time: %.4f ms",
-            req_id,
-            tot_token_num,
-            num_to_store_tokens,
-            tot_kv_size / 1024**3,
-            tot_time * 1000,
-            tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-            (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
-            store_stats.put_time * 1000,
-        )
+        if serving_perf_enabled():
+            tot_time = store_stats.time_to_store()
+            logger.info(
+                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
+                "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
+                "offload_time: %.4f ms, put_time: %.4f ms",
+                req_id,
+                kv_group,
+                tot_token_num,
+                num_to_store_tokens,
+                tot_kv_size / 1024**3,
+                tot_time * 1000,
+                tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
+                store_stats.put_time * 1000,
+            )
 
     def get_finished_stores(self, finished_req_ids: set) -> set:
         if not self.is_store_async:
@@ -358,7 +4384,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             for req_id in finished_req_ids:
                 if req_id in self._reported_finished_store_ids:
-                    # Already reported — skip to avoid scheduler seeing
+                    # Already reported - skip to avoid scheduler seeing
                     # a duplicate finished_sending for blocks it has
                     # already freed.
                     continue
@@ -377,10 +4403,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         overwrite their freed KV blocks.  If one of those ids still has a
         background store reading paged KV, drain it here to avoid store-after-free.
         """
+        req_id_set = set(req_ids)
+        direct_waited = self.wait_for_direct_stores(req_id_set)
         if not self.is_store_async:
             return set()
 
-        req_id_set = set(req_ids)
         if not req_id_set:
             return set()
 
@@ -389,40 +4416,130 @@ class AscendLMCacheEngine(LMCacheEngine):
                 req_id for req_id in req_id_set if req_id in self._pending_store_reqs
             }
             if not pending_at_start:
-                return set()
+                return direct_waited
 
-            pending_counts = {
-                req_id: self._pending_store_reqs[req_id] for req_id in pending_at_start
-            }
-            logger.info(
-                "Waiting for pending async stores before preemption: "
-                "req_ids=%s pending_counts=%s",
-                sorted(pending_at_start),
-                pending_counts,
-            )
-            start_time = time.monotonic()
+            perf_enabled = serving_perf_enabled()
+            if perf_enabled:
+                pending_counts = {
+                    req_id: self._pending_store_reqs[req_id]
+                for req_id in pending_at_start
+                }
+            if perf_enabled:
+                logger.info(
+                    "Waiting for pending async stores before preemption: "
+                    "req_ids=%s pending_counts=%s",
+                    sorted(pending_at_start),
+                    pending_counts,
+                )
+            start_time = time.monotonic() if perf_enabled else 0.0
             self._store_cv.wait_for(
                 lambda: not any(
                     req_id in self._pending_store_reqs for req_id in req_id_set
                 )
             )
-            elapsed_ms = (time.monotonic() - start_time) * 1000
+            elapsed_ms = (time.monotonic() - start_time) * 1000 if perf_enabled else 0.0
 
-        logger.info(
-            "Pending async stores drained before preemption: req_ids=%s "
-            "elapsed=%.4f ms",
-            sorted(pending_at_start),
-            elapsed_ms,
+        if perf_enabled:
+            logger.info(
+                "Pending async stores drained before preemption: req_ids=%s "
+                "elapsed=%.4f ms",
+                sorted(pending_at_start),
+                elapsed_ms,
+            )
+        return pending_at_start | direct_waited
+
+    def _track_sync_store_futures(
+        self,
+        futures: Iterable[Future],
+        *,
+        require_completion: bool = False,
+    ) -> None:
+        """Track backend futures that must complete before save publication."""
+        if (
+            require_completion
+            or not self.is_store_async
+            or self._require_store_completion
+        ):
+            self._pending_sync_store_futures.update(futures)
+
+    def wait_for_pending_sync_stores(self) -> None:
+        """Wait for stores submitted by the current synchronous save step."""
+        if not self._pending_sync_store_futures:
+            return
+
+        futures = self._pending_sync_store_futures
+        done, pending = wait(
+            futures, timeout=self.config.blocking_timeout_secs
         )
-        return pending_at_start
+        self._pending_sync_store_futures = set(pending)
+
+        for future in done:
+            future.result()
+        if pending:
+            raise TimeoutError(
+                f"Timed out waiting for {len(pending)} remote store operation(s)"
+            )
+
+    def _layerwise_prefill_async_store_supported(
+        self, *, page_first_store: bool
+    ) -> bool:
+        """Return whether P-node DMA stores can publish without a host fence.
+
+        The dense prefill DMA path already records per-layer D2H events.  A
+        local CPU backend only installs the MemoryObj pointer, so subsequent
+        same-process H2D is protected by those layer events.  Page-first
+        storage forwards the events to the external-page backend, including
+        flat-object fallbacks when merged-page allocation fails. Outside page
+        mode, ordinary remote puts still require the synchronous drain.
+        """
+        cache = getattr(self, "_layerwise_prefill_async_store_support", None)
+        if cache is None:
+            cache = {}
+            self._layerwise_prefill_async_store_support = cache
+        cache_key = bool(page_first_store)
+        if cache_key in cache:
+            return bool(cache[cache_key])
+
+        if not callable(
+            getattr(self.gpu_connector, "layerwise_prefill_store_fences", None)
+        ):
+            cache[cache_key] = False
+            return False
+        storage_manager = self.storage_manager
+        if storage_manager is None:
+            cache[cache_key] = False
+            return False
+        if page_first_store:
+            supports_pages = getattr(
+                storage_manager, "supports_batched_put_layer_pages", None
+            )
+            supported = bool(
+                callable(supports_pages)
+                and supports_pages(location=self.store_location)
+                and callable(
+                    getattr(storage_manager, "batched_put_layerwise_objects", None)
+                )
+            )
+            cache[cache_key] = supported
+            return supported
+
+        get_active = getattr(storage_manager, "get_active_storage_backends", None)
+        if not callable(get_active):
+            cache[cache_key] = False
+            return False
+        active = list(get_active(location=self.store_location))
+        # Only LocalCPUBackend admits an ordinary MemoryObj by pointer.  Any
+        # backend which copies/serializes the payload needs a producer fence.
+        supported = bool(active) and all(
+            type(backend).__name__ == "LocalCPUBackend"
+            for _, backend in active
+        )
+        cache[cache_key] = supported
+        return supported
 
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
         if self.kv_events_enabled and self.kv_events:
-            if self.is_store_async:
-                return self.kv_events.drain()
-            events = list(self.kv_events)
-            self.kv_events.clear()
-            return events
+            return self.kv_events.drain()
         return []
 
     def lookup(
@@ -450,6 +4567,5887 @@ class AscendLMCacheEngine(LMCacheEngine):
     def lookup_unpin(self, lookup_id: str) -> None:
         with self._engine_state_lock:
             super().lookup_unpin(lookup_id)
+
+    def _maybe_unpin_retrieved_objs(
+        self,
+        mem_objs: List[MemoryObj],
+        location: Optional[str],
+    ) -> None:
+        # LocalCPU hot-cache objects are unpinned by lookup_unpin() in
+        # wait_for_save(). batched_get returns the same object that lookup
+        # pinned; unpinning here as well drives pin_count negative (#2954).
+        for mem_obj in mem_objs:
+            if mem_obj.is_pinned and location != "LocalCPUBackend":
+                mem_obj.unpin()
+
+    def _append_layerwise_store_cache_chunks(
+        self,
+        *,
+        keys: List[List[CacheEngineKey]],
+        starts: List[int],
+        ends: List[int],
+        memory_objs: List[List[MemoryObj]],
+        cached_keys: Optional[List],
+        cached_starts: Optional[List[int]],
+        cached_ends: Optional[List[int]],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+        cache_chunk_indices: Optional[List[int]] = None,
+    ) -> None:
+        """Append cacheable store chunks; storage still receives the full batch."""
+        num_layers = len(keys)
+        chunk_indices = (
+            list(range(len(starts)))
+            if cache_chunk_indices is None
+            else cache_chunk_indices
+        )
+        if any(index < 0 or index >= len(starts) for index in chunk_indices):
+            raise ValueError(
+                "Layerwise store cache chunk selection is out of range: "
+                f"indices={chunk_indices}, chunk_count={len(starts)}"
+            )
+        selected_starts = [starts[index] for index in chunk_indices]
+        selected_ends = [ends[index] for index in chunk_indices]
+        if cached_starts is not None:
+            cached_starts.extend(selected_starts)
+        if cached_ends is not None:
+            cached_ends.extend(selected_ends)
+        if cached_keys is not None:
+            if not cached_keys:
+                cached_keys.extend([] for _ in range(num_layers))
+            assert len(cached_keys) == num_layers, (
+                f"cached_keys has {len(cached_keys)} layers, expected {num_layers}"
+            )
+            for layer_id, layer_keys in enumerate(keys):
+                cached_keys[layer_id].extend(
+                    layer_keys[index] for index in chunk_indices
+                )
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend([] for _ in range(num_layers))
+            assert len(cached_memory_objs) == num_layers
+            for layer_id, layer_objs in enumerate(memory_objs):
+                cached_memory_objs[layer_id].extend(
+                    layer_objs[index] for index in chunk_indices
+                )
+        if cached_tensors is not None and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
+
+    @staticmethod
+    def _truncate_store_cache_for_full_chunk_successor(
+        *,
+        starts: List[int],
+        ends: List[int],
+        new_starts: List[int],
+        new_ends: List[int],
+        cached_keys: Optional[List],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+    ) -> Optional[int]:
+        """Drop a cached partial tail before publishing its full successor."""
+        replace_at: Optional[int] = None
+        for new_start, new_end in zip(new_starts, new_ends, strict=False):
+            for chunk_index, (old_start, old_end) in enumerate(
+                zip(starts, ends, strict=False)
+            ):
+                if old_start == new_start and new_end > old_end:
+                    replace_at = chunk_index
+                    break
+            if replace_at is not None:
+                break
+        if replace_at is None:
+            return None
+
+        del starts[replace_at:]
+        del ends[replace_at:]
+        for layer_cache in (
+            cached_keys,
+            cached_memory_objs,
+            cached_tensors,
+            cached_chunk_dev_ptrs,
+        ):
+            if layer_cache is None:
+                continue
+            for layer_values in layer_cache:
+                if isinstance(layer_values, list):
+                    del layer_values[replace_at:]
+
+        if cached_chunk_ptrs_npu is not None:
+            for layer_id, ptrs in enumerate(cached_chunk_ptrs_npu):
+                if isinstance(ptrs, torch.Tensor):
+                    cached_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
+        return replace_at
+
+    @staticmethod
+    def _remove_pending_layerwise_store_objs(
+        cached_memory_objs: Optional[List],
+        pending_store_release: dict[int, MemoryObj],
+    ) -> None:
+        if cached_memory_objs is None or not pending_store_release:
+            return
+        pending_ids = set(pending_store_release)
+        for layer_cache in cached_memory_objs:
+            if not layer_cache:
+                continue
+            layer_cache[:] = [
+                mem_obj
+                for mem_obj in layer_cache
+                if id(mem_obj) not in pending_ids
+            ]
+
+    @staticmethod
+    def _layer_memory_tensor(
+        memory_obj: MemoryObj, layer_id: int
+    ) -> torch.Tensor:
+        tensor = (
+            memory_obj.layer_tensor(layer_id)
+            if isinstance(memory_obj, LayerPageMemoryObj)
+            else memory_obj.tensor
+        )
+        if tensor is None:
+            raise ValueError(
+                "Layerwise cache source has no tensor: "
+                f"layer_id={layer_id}, type={type(memory_obj).__name__}"
+            )
+        return tensor
+
+    def _append_layer_store_tensors(
+        self,
+        layer_id: int,
+        memory_objs: List[List[MemoryObj]],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List] = None,
+        cached_chunk_ptrs_npu: Optional[List] = None,
+        cache_chunk_indices: Optional[List[int]] = None,
+        *,
+        kv_group: int,
+    ) -> None:
+        layer_memory_objs = memory_objs[layer_id]
+        if cache_chunk_indices is not None:
+            layer_memory_objs = [
+                layer_memory_objs[index] for index in cache_chunk_indices
+            ]
+        has_pages = any(
+            isinstance(memory_obj, LayerPageMemoryObj)
+            for memory_obj in layer_memory_objs
+        )
+        cache_tensors = cached_tensors is not None and (
+            any(cached_tensors) or not has_pages
+        )
+        new_tensors = (
+            [
+                AscendLMCacheEngine._layer_memory_tensor(mem_obj, layer_id)
+                for mem_obj in layer_memory_objs
+            ]
+            if cache_tensors or not has_pages
+            else []
+        )
+        if layer_memory_objs and cached_chunk_dev_ptrs is not None:
+            # Resolve direct-load pointer tables while the dense store is on
+            # the cold path, before WorkerRetrieveState is sealed.
+            append_ptrs_fn = getattr(
+                self.gpu_connector,
+                "append_sparse_chunk_ptr_cache_for_layer",
+                None,
+            )
+            if append_ptrs_fn is not None:
+                append_ptrs_fn(
+                    layer_id,
+                    (
+                        layer_memory_objs
+                        if has_pages and not cache_tensors
+                        else new_tensors
+                    ),
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                    kv_group=kv_group,
+                )
+
+        if not cache_tensors:
+            return
+        assert cached_tensors is not None
+        while len(cached_tensors) <= layer_id:
+            cached_tensors.append([])
+        cached_tensors[layer_id].extend(new_tensors)
+
+    def _append_retrieve_layer_cache(
+        self,
+        layer_id: int,
+        mem_objs_layer: List[MemoryObj],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        *,
+        num_layers: int,
+        kv_group: int,
+    ) -> None:
+        """Retain storage-get results for later retrieves in the same request."""
+        new_tensors: List[torch.Tensor] = []
+        append_ptrs_fn = getattr(
+            self.gpu_connector,
+            "append_sparse_chunk_ptr_cache_for_layer",
+            None,
+        )
+        pointer_first = (
+            append_ptrs_fn is not None
+            and cached_memory_objs is not None
+            and cached_chunk_dev_ptrs is not None
+            and cached_chunk_ptrs_npu is not None
+            and not any(cached_tensors or ())
+        )
+        if pointer_first:
+            assert append_ptrs_fn is not None
+            if any(not mem_obj.is_valid() for mem_obj in mem_objs_layer):
+                raise ValueError(
+                    "Layerwise sparse retrieve resolved an invalid MemoryObj."
+                )
+            append_ptrs_fn(
+                layer_id,
+                mem_objs_layer,
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+                kv_group=kv_group,
+            )
+        else:
+            new_tensors = [
+                AscendLMCacheEngine._layer_memory_tensor(mem_obj, layer_id)
+                for mem_obj in mem_objs_layer
+            ]
+            if (
+                new_tensors
+                and cached_chunk_dev_ptrs is not None
+                and append_ptrs_fn is not None
+            ):
+                append_ptrs_fn(
+                    layer_id,
+                    new_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                    kv_group=kv_group,
+                )
+
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend([] for _ in range(num_layers))
+            cached_memory_objs[layer_id].extend(mem_objs_layer)
+        if cached_tensors is not None:
+            if not cached_tensors:
+                cached_tensors.extend([] for _ in range(num_layers))
+            cached_tensors[layer_id].extend(new_tensors)
+
+    def _append_group_store_tensors(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        host_pointer_rows: List[List[int]],
+        layer_chunk_ptrs_npu: torch.Tensor,
+        *,
+        kv_group: int = 0,
+    ) -> None:
+        """Publish one native group store's packed pointer metadata."""
+        if not getattr(self, "_force_layerwise_prefill_store", False):
+            return self._append_group_store_tensors_legacy(
+                memory_objs, cached_tensors,
+                cached_chunk_dev_ptrs, cached_chunk_ptrs_npu,
+                host_pointer_rows, layer_chunk_ptrs_npu,
+            )
+        num_layers = len(memory_objs)
+        if len(host_pointer_rows) != num_layers:
+            raise ValueError("Dense group store pointer rows do not match layers.")
+        if (
+            layer_chunk_ptrs_npu.dim() != 2
+            or layer_chunk_ptrs_npu.size(0) != num_layers
+        ):
+            raise ValueError(
+                "Dense group store NPU pointer table must be [layers, chunks]."
+            )
+        has_pages = any(
+            isinstance(memory_obj, LayerPageMemoryObj)
+            for memory_obj in memory_objs[0]
+        )
+        cache_tensors = cached_tensors is not None and (
+            any(cached_tensors) or not has_pages
+        )
+        if cache_tensors and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
+        if cached_chunk_dev_ptrs is not None and not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+
+        for layer_id, layer_memory_objs in enumerate(memory_objs):
+            host_row = host_pointer_rows[layer_id]
+            if len(host_row) != len(layer_memory_objs):
+                raise ValueError("Dense group store pointer count mismatch.")
+            if cache_tensors:
+                tensors = [
+                    AscendLMCacheEngine._layer_memory_tensor(
+                        memory_obj, layer_id
+                    )
+                    for memory_obj in layer_memory_objs
+                ]
+                assert cached_tensors is not None
+                cached_tensors[layer_id].extend(tensors)
+            if cached_chunk_dev_ptrs is not None:
+                append_ptrs_fn = getattr(
+                    self.gpu_connector,
+                    "append_sparse_chunk_ptr_cache_for_layer",
+                    None,
+                )
+                if callable(append_ptrs_fn):
+                    # Reuse the connector's amortized request table.  It
+                    # appends only this layer's suffix and keeps exact-length
+                    # row views; concatenating the full prefix here was the
+                    # quadratic prefill pause.
+                    append_ptrs_fn(
+                        layer_id,
+                        (
+                            tensors
+                            if cache_tensors
+                            else layer_memory_objs
+                        ),
+                        cached_chunk_dev_ptrs,
+                        cached_chunk_ptrs_npu,
+                        kv_group=kv_group,
+                    )
+                else:
+                    # Legacy connector fallback; production layerwise NPU
+                    # connectors always expose the incremental helper above.
+                    cached_chunk_dev_ptrs[layer_id].extend(host_row)
+                    if cached_chunk_ptrs_npu is not None:
+                        existing = cached_chunk_ptrs_npu[layer_id]
+                        new_row = layer_chunk_ptrs_npu[layer_id]
+                        if existing is not None:
+                            raise RuntimeError(
+                                "Legacy group-store connector lacks the "
+                                "incremental pointer-table API"
+                            )
+                        cached_chunk_ptrs_npu[layer_id] = new_row
+
+    def _append_group_store_tensors_legacy(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        host_pointer_rows: List[List[int]],
+        layer_chunk_ptrs_npu: torch.Tensor,
+    ) -> None:
+        """Publish one native group store's packed pointer metadata."""
+        num_layers = len(memory_objs)
+        if len(host_pointer_rows) != num_layers:
+            raise ValueError("Dense group store pointer rows do not match layers.")
+        if (
+            layer_chunk_ptrs_npu.dim() != 2
+            or layer_chunk_ptrs_npu.size(0) != num_layers
+        ):
+            raise ValueError(
+                "Dense group store NPU pointer table must be [layers, chunks]."
+            )
+        has_pages = any(
+            isinstance(memory_obj, LayerPageMemoryObj)
+            for memory_obj in memory_objs[0]
+        )
+        cache_tensors = cached_tensors is not None and (
+            any(cached_tensors) or not has_pages
+        )
+        if cache_tensors and not cached_tensors:
+            cached_tensors.extend([] for _ in range(num_layers))
+        if cached_chunk_dev_ptrs is not None and not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+
+        for layer_id, layer_memory_objs in enumerate(memory_objs):
+            host_row = host_pointer_rows[layer_id]
+            if len(host_row) != len(layer_memory_objs):
+                raise ValueError("Dense group store pointer count mismatch.")
+            if cache_tensors:
+                tensors = [
+                    AscendLMCacheEngine._layer_memory_tensor(
+                        memory_obj, layer_id
+                    )
+                    for memory_obj in layer_memory_objs
+                ]
+                assert cached_tensors is not None
+                cached_tensors[layer_id].extend(tensors)
+            if cached_chunk_dev_ptrs is not None:
+                cached_chunk_dev_ptrs[layer_id].extend(host_row)
+            if cached_chunk_ptrs_npu is not None:
+                existing = cached_chunk_ptrs_npu[layer_id]
+                new_row = layer_chunk_ptrs_npu[layer_id]
+                cached_chunk_ptrs_npu[layer_id] = (
+                    new_row
+                    if existing is None
+                    else torch.cat((existing, new_row), dim=0)
+                )
+
+
+    def _resolve_shared_rank0_layer_pages(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        kv_group: int,
+        keys_layer_major: list[list[CacheEngineKey]],
+        page_chunks: int,
+        base_page_keys: Optional[list[CacheEngineKey]] = None,
+        exact_chunk_locations: Optional[list[str]] = None,
+    ) -> tuple[list[list[MemoryObj]], int]:
+        """Resolve exact-size full or partial layer pages with legacy fallback."""
+        perf_enabled = serving_perf_enabled()
+        resolve_started = serving_perf_now() if perf_enabled else 0.0
+        resolve_thread_started = time.thread_time_ns() if perf_enabled else 0
+        local_get_ms = legacy_probe_ms = remote_probe_ms = remote_get_ms = 0.0
+        tail_resolve_ms = validate_pin_ms = 0.0
+        if not 0 < page_chunks <= len(keys_layer_major[0]):
+            raise ValueError("Layer-page retrieval requires at least one chunk")
+        page_keys = (
+            list(base_page_keys[:page_chunks])
+            if base_page_keys is not None
+            else [
+                key.without_layer()
+                for key in keys_layer_major[0][:page_chunks]
+                if isinstance(key, LayerCacheEngineKey)
+            ]
+        )
+        if len(page_keys) != page_chunks:
+            raise ValueError("Layer-page retrieval requires one base key per page")
+        if exact_chunk_locations is not None:
+            return self._resolve_shared_rank0_exact_layer_pages(
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                keys_layer_major=keys_layer_major,
+                page_chunks=page_chunks,
+                base_page_keys=page_keys,
+                chunk_locations=exact_chunk_locations,
+            )
+
+        local = self._shared_local_cpu_backend()
+        assert self.storage_manager is not None
+        phase_started = serving_perf_now() if perf_enabled else 0.0
+        pages, local_count = local.batched_get_layer_page_prefix(page_keys)
+        if perf_enabled:
+            local_get_ms = (serving_perf_now() - phase_started) * 1000
+        owned: list[MemoryObj] = list(pages)
+        pinned: list[MemoryObj] = []
+        try:
+            tail_start = local_count
+            while tail_start < page_chunks:
+                phase_started = serving_perf_now() if perf_enabled else 0.0
+                legacy_suffix = local.contains_all_exact(
+                    page_keys[tail_start].split_layers(self._num_layers_for_kv_group(kv_group))
+                )
+                if perf_enabled:
+                    legacy_probe_ms += (serving_perf_now() - phase_started) * 1000
+                if legacy_suffix:
+                    break
+                remote = self.storage_manager.storage_backends.get("RemoteBackend")
+                contains = getattr(remote, "batched_contains_layer_pages", None)
+                retrieve = getattr(remote, "batched_get_layer_pages", None)
+                if not callable(contains) or not callable(retrieve):
+                    raise RuntimeError("RemoteBackend does not support layer pages")
+                remote_keys = page_keys[tail_start:page_chunks]
+                phase_started = serving_perf_now() if perf_enabled else 0.0
+                remote_count = contains(remote_keys)
+                if perf_enabled:
+                    remote_probe_ms += (
+                        serving_perf_now() - phase_started
+                    ) * 1000
+                if not 0 <= remote_count <= len(remote_keys):
+                    raise ValueError("Remote layer-page lookup returned invalid count")
+                phase_started = serving_perf_now() if perf_enabled else 0.0
+                fetched = retrieve(remote_keys[:remote_count]) if remote_count else []
+                if perf_enabled:
+                    remote_get_ms += (
+                        serving_perf_now() - phase_started
+                    ) * 1000
+                if len(fetched) != remote_count:
+                    raise ValueError("Remote layer-page result count is inconsistent")
+                pages.extend(fetched)
+                owned.extend(fetched)
+                tail_start += remote_count
+                if tail_start < page_chunks:
+                    # Eviction can leave arbitrarily alternating tier runs.
+                    phase_started = serving_perf_now() if perf_enabled else 0.0
+                    fetched, count = local.batched_get_layer_page_prefix(
+                        page_keys[tail_start:page_chunks]
+                    )
+                    if perf_enabled:
+                        local_get_ms += (serving_perf_now() - phase_started) * 1000
+                    pages.extend(fetched)
+                    owned.extend(fetched)
+                    tail_start += count
+                    local_count += count
+                    if not count:
+                        # Neither tier has a merged page at this boundary.
+                        break
+
+            legacy_page_layers = (
+                [
+                    list(layer)
+                    for layer in zip(
+                        *(
+                            key.split_layers(self._num_layers_for_kv_group(kv_group))
+                            for key in page_keys[tail_start:page_chunks]
+                        ),
+                        strict=True,
+                    )
+                ]
+                if tail_start < page_chunks
+                else [[] for _ in range(self._num_layers_for_kv_group(kv_group))]
+            )
+            tail_keys_layer_major = [
+                legacy_page_layers[layer_id]
+                + list(keys_layer_major[layer_id][page_chunks:])
+                for layer_id in range(self._num_layers_for_kv_group(kv_group))
+            ]
+            phase_started = serving_perf_now() if perf_enabled else 0.0
+            tail = (
+                # This retains the legacy layerwise fallback, but measures it
+                # separately from merged-page retrieval.
+                self._resolve_shared_rank0_page_first_layers(
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    keys_layer_major=tail_keys_layer_major,
+                )
+                if tail_keys_layer_major[0]
+                else [[] for _ in keys_layer_major]
+            )
+            if perf_enabled:
+                tail_resolve_ms = (
+                    serving_perf_now() - phase_started
+                ) * 1000
+            tail_objects = [obj for layer in tail for obj in layer]
+            owned.extend(tail_objects)
+            pinned.extend(tail_objects)
+            if len(pages) != tail_start:
+                raise ValueError(
+                    f"Layer-page result count {len(pages)} != {tail_start}"
+                )
+            phase_started = serving_perf_now() if perf_enabled else 0.0
+            invalid_page = False
+            for chunk_index, page in enumerate(pages):
+                token_count = int(getattr(page, "valid_tokens", 0))
+                expected_shape, _, _ = self._expected_shared_cpu_chunk_metadata(
+                    kv_group=kv_group,
+                    num_tokens=token_count,
+                )
+                invalid_page |= (
+                    page.num_layers != self._num_layers_for_kv_group(kv_group)
+                    or page.get_shape() != expected_shape
+                )
+            if invalid_page or not LayerPageMemoryObj.pin_many(pages):
+                raise ValueError("Invalid or unpinnable layer-page object")
+            pinned.extend(pages)
+            for chunk_index, page in enumerate(pages):
+                self._validate_rank0_shared_mem_obj(
+                    page,
+                    req_id=req_id,
+                    phase=phase,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    chunk_index=chunk_index,
+                )
+            if perf_enabled:
+                validate_pin_ms = (
+                    serving_perf_now() - phase_started
+                ) * 1000
+                elapsed_ms = (serving_perf_now() - resolve_started) * 1000
+                if elapsed_ms >= 100.0:
+                    serving_perf_log(
+                        logger,
+                        "rank0_page_resolve_slow",
+                        started=resolve_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        pages=page_chunks,
+                        local_pages=local_count,
+                        local_get_ms=round(local_get_ms, 3),
+                        legacy_probe_ms=round(legacy_probe_ms, 3),
+                        remote_probe_ms=round(remote_probe_ms, 3),
+                        remote_get_ms=round(remote_get_ms, 3),
+                        tail_resolve_ms=round(tail_resolve_ms, 3),
+                        validate_pin_ms=round(validate_pin_ms, 3),
+                        thread_cpu_ms=round(
+                            (time.thread_time_ns() - resolve_thread_started) / 1e6,
+                            3,
+                        ),
+                    )
+            return [list(pages) + layer for layer in tail], tail_start
+        except Exception:
+            for obj in reversed(pinned):
+                obj.unpin()
+            self._release_shared_retrieve_objs(owned, unpin=False)
+            raise
+
+    def prefetch_shared_layer_pages(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        retrieve_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> Optional[str]:
+        """Fetch shared Group-1 pages without collectives or NPU writes.
+
+        Args:
+            tokens: Token IDs whose Group-1 pages should be prefetched.
+            mask: Optional token-selection mask.
+            retrieve_kwargs: Mutable retrieve state to populate in place. This
+                avoids regenerating metadata or masks during materialization.
+            **kwargs: Layerwise retrieve state. The cache lists are updated in
+                place only after complete page coverage has been validated.
+
+        Returns:
+            The resolved storage location, or ``None`` when this rank or
+            configuration cannot use the shared page-prefetch path.
+
+        Raises:
+            ValueError: If retrieve metadata or returned page coverage is
+                incomplete.
+            RuntimeError: If the configured backend cannot retrieve pages.
+        """
+        if retrieve_kwargs is not None:
+            if kwargs:
+                raise ValueError(
+                    "Pass Group-1 prefetch state either as retrieve_kwargs "
+                    "or keyword fields, not both"
+                )
+            kwargs = retrieve_kwargs
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        if (
+            kv_group != 1
+            or not self._should_use_shared_layerwise_retrieve(kv_group)
+            or self._is_shared_retrieve_passive(kv_group)
+            or not mooncake_layer_pages_enabled(self.config)
+        ):
+            return None
+        self._ensure_layerwise_connector_layout(**kwargs)
+        cached_keys = kwargs["cached_keys"]
+        cached_starts = kwargs["cached_starts"]
+        cached_ends = kwargs["cached_ends"]
+        cached_memory_objs = kwargs["cached_memory_objs"]
+        if self._has_retrieve_data_cache(
+            kwargs.get("cached_tensors"),
+            cached_memory_objs,
+            self._num_layers_for_kv_group(kv_group),
+        ):
+            return kwargs.get("cached_retrieve_location")
+        ret_mask = kwargs.get("ret_mask")
+        if ret_mask is None or ret_mask.numel() != len(tokens):
+            ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+            kwargs["ret_mask"] = ret_mask
+        started = serving_perf_now() if serving_perf_enabled() else None
+        location, _, _, retrieve_keys = self._ensure_retrieve_chunk_metadata(
+            tokens=tokens,
+            mask=mask,
+            request_configs=kwargs.get("request_configs"),
+            cached_keys=cached_keys,
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+            ret_mask=ret_mask,
+            retrieve_kwargs=kwargs,
+        )
+        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        if (
+            len(retrieve_keys) != self._num_layers_for_kv_group(kv_group)
+            or not required_chunks
+            or any(
+                len(layer) != required_chunks for layer in retrieve_keys
+            )
+        ):
+            raise ValueError("Group-1 prefetch metadata is incomplete")
+        memory_objs, layer_page_chunks = self._resolve_shared_rank0_layer_pages(
+            req_id=kwargs.get("req_id", "unspecified"),
+            phase="persistent_parallel_prefetch",
+            kv_group=kv_group,
+            keys_layer_major=retrieve_keys,
+            page_chunks=required_chunks,
+        )
+        if len(memory_objs) != self._num_layers_for_kv_group(kv_group) or any(
+            len(layer) != required_chunks for layer in memory_objs
+        ):
+            unique = {
+                id(obj): obj for layer in memory_objs for obj in layer
+            }
+            self._release_shared_retrieve_objs(
+                list(unique.values()), unpin=True
+            )
+            raise ValueError("Group-1 prefetch page coverage is incomplete")
+        try:
+            if started is not None:
+                serving_perf_log(
+                    logger,
+                    "group1_persistent_prefetch_complete",
+                    started=started,
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    pages=required_chunks,
+                    layers=self._num_layers_for_kv_group(kv_group),
+                    location=location,
+                )
+            cached_memory_objs[:] = memory_objs
+            # Preserve the physical page layout for the later materialization
+            # pass. Without this marker the cached page is treated as one
+            # independent object per layer, which both builds the wrong NPU
+            # source view and can retain/pin the same page once per layer.
+            kwargs["_cached_layer_page_chunks"] = layer_page_chunks
+        except BaseException:
+            unique = {id(obj): obj for layer in memory_objs for obj in layer}
+            self._release_shared_retrieve_objs(
+                list(unique.values()), unpin=True
+            )
+            raise
+        return location
+
+    def _try_direct_indexer_page_load(
+        self,
+        *,
+        req_id: str,
+        keys_layer_major: list[list[CacheEngineKey]],
+        starts: list[int],
+        ends: list[int],
+        retrieve_kwargs: dict[str, Any],
+    ) -> bool:
+        """Load a cold group-1 page set into NPU, or return False for CPU fallback."""
+        if not keys_layer_major or not keys_layer_major[0]:
+            return False
+        planner = getattr(self.gpu_connector, "plan_direct_page_destinations", None)
+        record = getattr(
+            self.gpu_connector, "record_dense_load_readiness", None
+        )
+        consume = getattr(
+            self.gpu_connector, "consume_dense_load_readiness", None
+        )
+        kvcaches = retrieve_kwargs.get("kvcaches")
+        slot_mapping = retrieve_kwargs.get("slot_mapping")
+        direct_load_submitted = False
+        if (
+            not callable(planner)
+            or not callable(record)
+            or not callable(consume)
+            or kvcaches is None
+            or slot_mapping is None
+        ):
+            return False
+        try:
+            pages = [
+                key.without_layer()
+                for key in keys_layer_major[0]
+                if isinstance(key, LayerCacheEngineKey)
+            ]
+            if len(pages) != len(keys_layer_major[0]):
+                return False
+            planned = planner(kvcaches, slot_mapping, starts, ends, 1)
+            if planned is None:
+                if serving_perf_enabled():
+                    rejection = getattr(
+                        self.gpu_connector,
+                        "direct_page_plan_rejection",
+                        None,
+                    )
+                    serving_perf_log(
+                        logger,
+                        "cold_compact_indexer_fallback",
+                        req_id=req_id,
+                        pages=len(pages),
+                        fallback="cpu_staged",
+                        reason=(
+                            rejection(1) or "unsupported_layout"
+                            if callable(rejection)
+                            else "unsupported_layout"
+                        ),
+                    )
+                return False
+            ptrs, sizes, owners = planned
+            if len(ptrs) != len(pages) or len(sizes) != len(pages):
+                return False
+            assert self.storage_manager is not None
+            direct_load_submitted = True
+            self.storage_manager.batched_get_external_pages(
+                pages, ptrs, sizes, owners, req_id
+            )
+            if audit_enabled():
+                try:
+                    self.gpu_connector.audit_direct_indexer_import(
+                        req_id,
+                        [
+                            mooncake_page_key(key, len(keys_layer_major))
+                            for key in pages
+                        ],
+                        ptrs, sizes, owners,
+                    )
+                except Exception as audit_error:
+                    audit_record("coverage", stage="get_npu", req=req_id,
+                                 error="direct_readback_unavailable",
+                                 detail=type(audit_error).__name__)
+            if kv_hash_enabled():
+                trace = getattr(self.gpu_connector, "trace_direct_kv", None)
+                if callable(trace):
+                    trace(req_id, 1, kvcaches, slot_mapping, starts, ends)
+            if not retrieve_kwargs.get("_defer_direct_load_readiness", False):
+                consume(record())
+            if (
+                kv_hash_enabled()
+                and self.metadata.is_first_rank()
+                and not self._force_layerwise_prefill_store
+                and not getattr(self.gpu_connector, "uses_token_byte_features", False)
+            ):
+                skip_kv_hash("D", req_id, 1, "direct_npu_not_observed")
+            return True
+        except Exception as exc:
+            if isinstance(exc, NativeExternalPageTransferUnknownError):
+                self._remote_fill_require_paired_restart((req_id,))
+                raise RemoteFillFatalError(
+                    "decoder external-page DMA exceeded its hard deadline"
+                ) from exc
+            if direct_load_submitted:
+                # A backend failure can be reported after some direct writes
+                # have already been queued.  Fence those writes, while their
+                # destination owners are still live, before CPU fallback is
+                # allowed to target the same group-1 slots.
+                consume(record())
+            logger.warning(
+                "Direct Mooncake-to-NPU indexer load failed; using CPU-staged path",
+                exc_info=True,
+            )
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "cold_compact_indexer_fallback",
+                    req_id=req_id,
+                    pages=len(keys_layer_major[0]),
+                    fallback="cpu_staged",
+                    reason=type(exc).__name__,
+                )
+            return False
+
+    def _prepare_live_split_import(
+        self,
+        *,
+        tokens: list[int],
+        indexer_slots: torch.Tensor,
+        indexer_kvcaches: list,
+        latent_kvcaches: Optional[list] = None,
+        request_configs: Optional[dict],
+        tp_rank: int,
+        dp_rank: int,
+        handled_groups: tuple[int, ...] = (0, 1),
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Allocate cold destinations and describe opaque live-transfer extents."""
+        mask = torch.ones(len(tokens), dtype=torch.bool)
+        chunks = list(
+            self._dense_retrieve_token_results(
+                tokens, mask, request_configs, 0, {}
+            )
+        )
+        if not chunks:
+            raise ValueError("Live split import has no token pages")
+        page_keys = [
+            key.without_layer() if isinstance(key, LayerCacheEngineKey) else key
+            for _, _, key in chunks
+        ]
+        if len(set(page_keys)) != len(page_keys):
+            raise ValueError("Live split import contains duplicate page keys")
+        starts = [start for start, _, _ in chunks]
+        ends = [end for _, end, _ in chunks]
+        valid_tokens = [end - start for start, end, _ in chunks]
+        pages: list[LayerPageMemoryObj] = []
+        if 0 in handled_groups:
+            if self._is_passive():
+                raise RuntimeError(
+                    "Passive ranks cannot allocate live group-0 destinations"
+                )
+            token_width_planner = getattr(
+                self.gpu_connector, "direct_page_token_widths", None
+            )
+            latent_token_bytes = (
+                token_width_planner(latent_kvcaches, 0)
+                if latent_kvcaches and callable(token_width_planner)
+                else None
+            )
+            if not latent_token_bytes:
+                raise ValueError("Live split latent destination layout is unsupported")
+            self._ensure_layerwise_connector_layout(
+                kvcaches=latent_kvcaches,
+                kv_group=0,
+            )
+            shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+                kv_group=0, num_tokens=self.config.chunk_size
+            )
+            local = self._shared_local_cpu_backend()
+            allocated = local.batched_allocate_layer_pages(
+                [shape], [dtype], len(chunks), self._num_layers_for_kv_group(0), fmt,
+                valid_tokens=valid_tokens,
+                full_tokens=self.config.chunk_size,
+                busy_loop=False,
+            )
+            if allocated is None:
+                raise MemoryError("Live split shared-CPU page allocation failed")
+            try:
+                pinned = LayerPageMemoryObj.pin_many(allocated)
+            except BaseException:
+                self._release_shared_retrieve_objs(
+                    list(allocated), unpin=False
+                )
+                raise
+            if not pinned:
+                self._release_shared_retrieve_objs(
+                    list(allocated), unpin=False
+                )
+                raise MemoryError("Live split shared-CPU page pin failed")
+            pages = allocated
+        # Compact v1 destinations describe one plane per physical layer.
+        # C8 uses the existing byte-vector format for the key/scale pair.
+        compact_destination = (
+            1 in handled_groups
+            and getattr(self.gpu_connector, "indexer_c8_layout", None) is None
+        )
+        destination_planner = getattr(
+            self.gpu_connector,
+            "plan_compact_page_layout" if compact_destination
+            else "plan_direct_page_destinations",
+            None,
+        )
+        if not callable(destination_planner) and compact_destination:
+            destination_planner = getattr(
+                self.gpu_connector, "plan_direct_page_destinations", None
+            )
+            compact_destination = False
+        if not callable(destination_planner):
+            self._release_shared_retrieve_objs(list(pages), unpin=True)
+            raise RuntimeError("Live split destination planner is unavailable")
+        try:
+            destination1 = (
+                destination_planner(
+                    indexer_kvcaches, indexer_slots, starts, ends, 1
+                ) if 1 in handled_groups else ([], [], ())
+            )
+            if destination1 is None:
+                raise ValueError("Live split destination layout is unsupported")
+            if compact_destination:
+                dst1_layers, dst1_runs, dst1_owners = destination1
+            else:
+                dst1_ptrs, dst1_sizes, dst1_owners = destination1
+                dst1_layers = dst1_runs = []
+
+            segments: list[dict[str, Any]] = []
+            latent_pages: list[dict[str, int]] = []
+            totals = [0, 0]
+            if 0 in handled_groups:
+                for page, start, valid in zip(
+                    pages, starts, valid_tokens, strict=True
+                ):
+                    size = page.get_size()
+                    latent_pages.append(
+                        {
+                            "logical_token_start": start,
+                            "destination_address": page.data_ptr,
+                            "length": size,
+                            "valid_tokens": valid,
+                        }
+                    )
+                    totals[0] += size
+            if 1 in handled_groups:
+                if compact_destination:
+                    totals[1] = len(tokens) * sum(
+                        layer["token_bytes"] for layer in dst1_layers
+                    )
+                else:
+                    for dest_ptrs, dest_sizes in zip(
+                        dst1_ptrs, dst1_sizes, strict=True
+                    ):
+                        for dst_ptr, size in zip(
+                            dest_ptrs, dest_sizes, strict=True
+                        ):
+                            segments.append({
+                                "group_id": 1,
+                                "destination_address": dst_ptr,
+                                "length": size,
+                                "destination_kind": "npu",
+                            })
+                            totals[1] += size
+            plan = {
+                "segments": segments,
+                "group_byte_totals": tuple(totals),
+                "tp_rank": tp_rank,
+                "dp_rank": dp_rank,
+            }
+            if compact_destination:
+                plan["format"] = (
+                    "hybrid_compact_v1" if latent_pages else "layer_slot_runs_v1"
+                )
+                plan["compact_layout"] = {
+                    "group_id": 1,
+                    "token_count": len(tokens),
+                    "layers": dst1_layers,
+                    "runs": dst1_runs,
+                }
+            if latent_pages:
+                plan["latent_pages"] = latent_pages
+                plan["latent_token_bytes"] = list(latent_token_bytes)
+            context = {
+                "pages": pages,
+                "keys": page_keys,
+                "starts": starts,
+                "ends": ends,
+                "destination_owners": dst1_owners,
+            }
+            return plan, context
+        except Exception:
+            self._release_shared_retrieve_objs(list(pages), unpin=True)
+            raise
+
+    def admit_live_split_pages(self, context: dict[str, Any]) -> None:
+        """Admit completed group-0 pages for the existing shared bootstrap.
+
+        The LocalCPU cache takes its own references synchronously.  The live
+        import's temporary pins and allocator references are then released so
+        the ordinary rank-0 bootstrap can acquire the pages and publish the
+        existing shared-handle collective without a second ownership model.
+        """
+        pages = context["pages"]
+        if not pages:
+            raise RuntimeError("Live split import has no latent pages to admit")
+        context["pages"] = []
+        local = self._shared_local_cpu_backend()
+        try:
+            local.batched_submit_layer_pages(context["keys"], pages)
+            compatible = getattr(
+                local, "contains_compatible_layer_pages_exact", None
+            )
+            if not callable(compatible) or not compatible(
+                context["keys"], pages
+            ):
+                raise RuntimeError(
+                    "Live split pages lost admission to incompatible cache entries"
+                )
+        finally:
+            # Existing entries may win the atomic cache admission race. The
+            # cache owns a reference for every newly admitted page; duplicate
+            # imports retain no cache reference and are released here as well.
+            self._release_shared_retrieve_objs(list(pages), unpin=True)
+
+    def _release_live_split_import(self, context: dict[str, Any]) -> None:
+        """Release an unacknowledged live-import allocation."""
+        pages = context["pages"]
+        context["pages"] = []
+        self._release_shared_retrieve_objs(pages, unpin=True)
+
+    def _append_retrieve_group_cache(
+        self,
+        mem_objs_by_layer: List[Union[List[MemoryObj], LayerPageSource]],
+        cached_memory_objs: Optional[List],
+        cached_tensors: Optional[List],
+        cached_chunk_dev_ptrs: Optional[List],
+        cached_chunk_ptrs_npu: Optional[List],
+        prepared_chunk_dev_ptrs: Optional[List] = None,
+        prepared_chunk_ptrs_npu: Optional[List] = None,
+        defer_pointer_copy: bool = False,
+        kv_group: Optional[int] = None,
+    ) -> None:
+        """Publish an all-layer retained source after one pointer-table copy."""
+        group_append = getattr(
+            self.gpu_connector, "append_sparse_chunk_ptr_cache_for_layers", None
+        )
+        retained_group = (
+            callable(group_append)
+            and cached_memory_objs is not None
+            and cached_chunk_dev_ptrs is not None
+            and cached_chunk_ptrs_npu is not None
+        )
+        page_sources = any(
+            isinstance(source, LayerPageSource) for source in mem_objs_by_layer
+        )
+        if page_sources and (
+            not callable(group_append) or cached_chunk_dev_ptrs is None
+        ):
+            raise ValueError(
+                "Layer-page sparse sources require all-layer pointer append."
+            )
+        pointer_first = retained_group and not any(cached_tensors or ())
+        if retained_group:
+            # The retained source covers exactly this group's layer rows.
+            num_layers = len(mem_objs_by_layer)
+            layer_counts = (
+                len(cached_memory_objs),
+                len(cached_chunk_dev_ptrs),
+                len(cached_chunk_ptrs_npu),
+            )
+            has_prefix_data = (
+                any(bool(layer) for layer in cached_memory_objs)
+                or any(bool(layer) for layer in cached_chunk_dev_ptrs)
+                or any(
+                    row is not None and int(row.numel())
+                    for row in cached_chunk_ptrs_npu
+                )
+                or any(cached_tensors or ())
+            )
+            if has_prefix_data:
+                if any(count != num_layers for count in layer_counts):
+                    raise ValueError(
+                        "Sparse group pointer prefix layer coverage mismatch: "
+                        f"owners/host/NPU={layer_counts}, "
+                        f"expected={num_layers}."
+                    )
+                for layer_id in range(num_layers):
+                    owner_count = len(cached_memory_objs[layer_id])
+                    host_count = len(cached_chunk_dev_ptrs[layer_id])
+                    row = cached_chunk_ptrs_npu[layer_id]
+                    npu_count = 0 if row is None else int(row.numel())
+                    if owner_count != host_count or host_count != npu_count:
+                        raise ValueError(
+                            "Sparse group pointer prefix coverage mismatch: "
+                            f"layer={layer_id}, owners={owner_count}, "
+                            f"host_ptrs={host_count}, npu_ptrs={npu_count}."
+                        )
+        owners_by_layer: List[List[MemoryObj]] = []
+        tensors_by_layer: List[List[torch.Tensor]] = []
+        for layer_id, source in enumerate(mem_objs_by_layer):
+            mem_objs_layer = (
+                [*source.pages, *source.suffix]
+                if isinstance(source, LayerPageSource)
+                else source
+            )
+            if any(not mem_obj.is_valid() for mem_obj in mem_objs_layer):
+                raise ValueError(
+                    f"Layerwise sparse retrieve resolved an invalid layer {layer_id}."
+                )
+            owners_by_layer.append(mem_objs_layer)
+            tensors = []
+            if not pointer_first:
+                tensors = [
+                    AscendLMCacheEngine._layer_memory_tensor(mem_obj, layer_id)
+                    for mem_obj in mem_objs_layer
+                ]
+            tensors_by_layer.append(tensors)
+
+        if not callable(group_append) or cached_chunk_dev_ptrs is None:
+            for layer_id, mem_objs_layer in enumerate(owners_by_layer):
+                self._append_retrieve_layer_cache(
+                    layer_id,
+                    mem_objs_layer,
+                    cached_memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                    num_layers=len(owners_by_layer),
+                    kv_group=kv_group,
+                )
+            return
+        if prepared_chunk_dev_ptrs is None:
+            group_append(
+                mem_objs_by_layer if pointer_first else tensors_by_layer,
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+                kv_group=kv_group,
+                **({"defer_copy": True} if defer_pointer_copy else {}),
+            )
+        else:
+            if any((cached_chunk_dev_ptrs, cached_chunk_ptrs_npu)):
+                raise ValueError(
+                    "Prepared sparse pointer rows require an empty cache suffix."
+                )
+            expected = [len(owners) for owners in owners_by_layer]
+            if [len(row) for row in prepared_chunk_dev_ptrs] != expected:
+                raise ValueError("Prepared sparse host pointer coverage mismatch.")
+            if prepared_chunk_ptrs_npu is None or [
+                0 if row is None else int(row.numel())
+                for row in prepared_chunk_ptrs_npu
+            ] != expected:
+                raise ValueError("Prepared sparse NPU pointer coverage mismatch.")
+            cached_chunk_dev_ptrs.extend(prepared_chunk_dev_ptrs)
+            assert cached_chunk_ptrs_npu is not None
+            cached_chunk_ptrs_npu.extend(prepared_chunk_ptrs_npu)
+        if cached_memory_objs is not None:
+            if not cached_memory_objs:
+                cached_memory_objs.extend(
+                    [] for _ in range(len(mem_objs_by_layer))
+                )
+            for layer_id, mem_objs_layer in enumerate(owners_by_layer):
+                cached_memory_objs[layer_id].extend(mem_objs_layer)
+        if cached_tensors is not None and not pointer_first:
+            if not cached_tensors:
+                cached_tensors.extend(
+                    [] for _ in range(len(mem_objs_by_layer))
+                )
+            for layer_id, tensors in enumerate(tensors_by_layer):
+                cached_tensors[layer_id].extend(tensors)
+
+    def _append_shared_handle_cache(
+        self,
+        layer_id: int,
+        handles: List,
+        cached_shared_handles: Optional[List],
+        chunk_index_base: int = 0,
+        kv_group: int = 0,
+    ) -> None:
+        """Append one validated suffix to a layer's shared handle cache."""
+        if cached_shared_handles is None:
+            return
+        if not cached_shared_handles:
+            cached_shared_handles.extend(
+                [] for _ in range(self._num_layers_for_kv_group(kv_group))
+            )
+        while len(cached_shared_handles) <= layer_id:
+            cached_shared_handles.append([])
+        layer_handles = cached_shared_handles[layer_id]
+        if len(layer_handles) != chunk_index_base:
+            raise ValueError(
+                "Sparse shared handle cache is not append-aligned: "
+                f"layer_id={layer_id}, cached={len(layer_handles)}, "
+                f"append_at={chunk_index_base}"
+            )
+        layer_handles.extend(handles)
+
+    def _fence_shared_cpu_store_publication(self) -> None:
+        fence = getattr(
+            self.gpu_connector,
+            "synchronize_shared_cpu_store_publication",
+            None,
+        )
+        if callable(fence):
+            fence()
+
+    def _is_shared_retrieve_passive(self, kv_group: int) -> bool:
+        """Return whether this rank is passive for a shared retrieve group."""
+        if kv_group == 1:
+            is_indexer_passive = getattr(self, "_is_indexer_passive", None)
+            if callable(is_indexer_passive):
+                return bool(is_indexer_passive())
+        return bool(self._is_passive())
+
+    def _cold_retrieve_collective_mode(
+        self, kv_group: int, direct_external_pages: bool
+    ) -> tuple[bool, bool]:
+        """Resolve shared collective participation for a cold group load."""
+        shared = self._should_use_shared_layerwise_retrieve(kv_group)
+        if direct_external_pages:
+            return False, False
+        return shared, shared and self._is_shared_retrieve_passive(kv_group)
+
+    def _use_sampled_worker_retrieve(self, kv_group: int) -> bool:
+        """Use LocalCPU-prefix/remote-suffix resolution on the active rank."""
+        config = getattr(self, "config", None)
+        return bool(
+            getattr(config, "experimental_sampled_layerwise_lookup", False)
+            and self._should_use_shared_layerwise_retrieve(kv_group)
+            and not self._is_shared_retrieve_passive(kv_group)
+        )
+
+    def _build_retrieve_metadata_extension(
+        self,
+        *,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        cached_metadata_token_ids: Optional[list[int]],
+    ) -> Optional[tuple[List[int], List[int], List[List[CacheEngineKey]]]]:
+        """Hash only a chunk-aligned suffix after validating the cached prefix."""
+        chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        if (
+            chunk_size <= 0
+            or not cached_keys
+            or len(cached_keys) != num_layers
+            or not cached_starts
+            or len(cached_starts) != len(cached_ends)
+            or any(len(layer) != len(cached_starts) for layer in cached_keys)
+        ):
+            return None
+        expected_start = 0
+        for start, end in zip(cached_starts, cached_ends, strict=True):
+            if int(start) != expected_start or int(end) - int(start) != chunk_size:
+                return None
+            expected_start = int(end)
+        if len(tokens) <= expected_start or len(tokens) % chunk_size != 0:
+            return None
+        if (
+            cached_metadata_token_ids is None
+            or len(cached_metadata_token_ids) != expected_start
+        ):
+            return None
+        token_prefix = tokens[:expected_start]
+        if isinstance(token_prefix, torch.Tensor):
+            token_prefix = token_prefix.detach().to(device="cpu").tolist()
+        if token_prefix != cached_metadata_token_ids:
+            return None
+        if mask is not None and (
+            not isinstance(mask, torch.Tensor)
+            or mask.ndim != 1
+            or mask.dtype != torch.bool
+            or int(mask.numel()) != len(tokens)
+            or not bool(mask.all().item())
+        ):
+            return None
+
+        identity = cached_keys[0][0]
+        if not isinstance(identity, CacheEngineKey):
+            return None
+        stable_identity = (
+            identity.model_name,
+            identity.world_size,
+            identity.worker_id,
+            identity.dtype,
+            identity.tags,
+        )
+        for chunk_index in range(len(cached_starts)):
+            chunk_hash = None
+            for layer_id in range(num_layers):
+                cached_key = cached_keys[layer_id][chunk_index]
+                if (
+                    not isinstance(cached_key, CacheEngineKey)
+                    or getattr(cached_key, "layer_id", None) != layer_id
+                    or getattr(cached_key, "kv_group", None) != kv_group
+                    or (
+                        cached_key.model_name,
+                        cached_key.world_size,
+                        cached_key.worker_id,
+                        cached_key.dtype,
+                        cached_key.tags,
+                    )
+                    != stable_identity
+                ):
+                    return None
+                if chunk_hash is None:
+                    chunk_hash = cached_key.chunk_hash
+                elif cached_key.chunk_hash != chunk_hash:
+                    return None
+
+        anchors = [layer[-1] for layer in cached_keys]
+        if len({anchor.chunk_hash for anchor in anchors}) != 1:
+            return None
+        starts: List[int] = []
+        ends: List[int] = []
+        chunk_keys: List[List[CacheEngineKey]] = []
+        for start, end, key in self.token_database.process_tokens_from_prefix(
+            tokens,
+            prefix_token_count=expected_start,
+            prefix_hash=anchors[0].chunk_hash,
+            request_configs=request_configs,
+            kv_group=kv_group,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            layer_keys = key.split_layers(num_layers)
+            if any(
+                layer_key.layer_id != layer_id
+                or layer_key.kv_group != kv_group
+                or layer_key.model_name != anchors[layer_id].model_name
+                or layer_key.world_size != anchors[layer_id].world_size
+                or layer_key.worker_id != anchors[layer_id].worker_id
+                or layer_key.dtype != anchors[layer_id].dtype
+                or layer_key.tags != anchors[layer_id].tags
+                for layer_id, layer_key in enumerate(layer_keys)
+            ):
+                return None
+            starts.append(int(start))
+            ends.append(int(end))
+            chunk_keys.append(layer_keys)
+        if not starts or starts[0] != expected_start or ends[-1] != len(tokens):
+            return None
+        return starts, ends, [
+            list(layer) for layer in zip(*chunk_keys, strict=True)
+        ]
+
+    @staticmethod
+    def _needs_retrieve_metadata_refresh(
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        tokens: Union[torch.Tensor, list[int]],
+    ) -> bool:
+        if not cached_keys or not cached_starts or not cached_ends:
+            return True
+        return len(tokens) > cached_ends[-1]
+
+    @staticmethod
+    def _fill_retrieve_mask(
+        ret_mask: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        *,
+        clear: bool = True,
+    ) -> None:
+        if clear:
+            ret_mask.zero_()
+        if not starts or not ends:
+            return
+        if len(starts) == len(ends) and all(
+            int(start) == int(previous_end)
+            for start, previous_end in zip(starts[1:], ends[:-1], strict=False)
+        ):
+            ret_mask[int(starts[0]) : int(ends[-1])] = True
+            return
+        for start, end in zip(starts, ends, strict=False):
+            ret_mask[int(start) : int(end)] = True
+
+    @staticmethod
+    def _cache_layer_has_entries(layer_cache: Any) -> bool:
+        if layer_cache is None:
+            return False
+        try:
+            return len(layer_cache) > 0
+        except TypeError:
+            return True
+
+    @staticmethod
+    def _has_retrieve_data_cache(
+        cached_tensors: Optional[List],
+        cached_memory_objs: Optional[List],
+        num_layers: int,
+    ) -> bool:
+        return any(
+            cache is not None
+            and len(cache) == num_layers
+            and any(
+                AscendLMCacheEngine._cache_layer_has_entries(layer)
+                for layer in cache
+            )
+            for cache in (cached_tensors, cached_memory_objs)
+        )
+
+    @staticmethod
+    def _retrieve_data_cache_covers(
+        cache_by_layer: Optional[List],
+        num_layers: int,
+        required_chunks: int,
+    ) -> bool:
+        if required_chunks <= 0:
+            return False
+        if cache_by_layer is None or len(cache_by_layer) != num_layers:
+            return False
+        for layer_id in range(num_layers):
+            layer_cache = cache_by_layer[layer_id]
+            if layer_cache is None or len(layer_cache) < required_chunks:
+                return False
+        return True
+
+    @staticmethod
+    def _uniform_layer_cache_chunks(
+        cache_by_layer: Optional[List],
+        num_layers: int,
+        name: str,
+    ) -> int:
+        if not cache_by_layer:
+            return 0
+        if len(cache_by_layer) != num_layers:
+            raise ValueError(
+                f"Sparse retrieve {name} has {len(cache_by_layer)} layers, "
+                f"expected {num_layers}."
+            )
+        counts = {len(layer or []) for layer in cache_by_layer}
+        if len(counts) != 1:
+            raise ValueError(
+                f"Sparse retrieve {name} has inconsistent per-layer chunk "
+                f"counts: {sorted(counts)}"
+            )
+        return counts.pop()
+
+    def _cached_sparse_prefix_chunks(
+        self,
+        cached_tensors: Optional[List],
+        cached_memory_objs: Optional[List],
+        kv_group: int = 0,
+    ) -> int:
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        counts = {
+            count
+            for count in (
+                self._uniform_layer_cache_chunks(
+                    cached_tensors,
+                    num_layers,
+                    "tensor cache",
+                ),
+                self._uniform_layer_cache_chunks(
+                    cached_memory_objs,
+                    num_layers,
+                    "MemoryObj cache",
+                ),
+            )
+            if count
+        }
+        if len(counts) > 1:
+            raise ValueError(
+                "Sparse retrieve tensor and MemoryObj caches cover different "
+                f"prefix lengths: {sorted(counts)}"
+            )
+        return counts.pop() if counts else 0
+
+    def _num_layers_for_kv_group(self, kv_group: int) -> int:
+        """Resolve the authoritative transfer cardinality for a KV group.
+
+        Prefers the NPU connector's registered per-group layout (the runtime
+        truth of how many layer rows the group transfers), then the
+        LMCacheEngine registered/declared group cardinality. Fail-closes
+        when the two sources disagree. Legacy single-group deployments
+        fall back to the global model layer count.
+
+        Args:
+            kv_group: The KV group index (0 = latent, 1 = indexer).
+
+        Returns:
+            The number of layer rows this group transfers.
+
+        Raises:
+            ValueError: If the connector layout and the engine-level group
+                cardinality disagree.
+        """
+        # getattr keeps lightweight/test engine instances (built via
+        # __new__ with a partial attribute set) on the engine-level
+        # resolution.
+        get_num_layers = getattr(
+            getattr(self, "gpu_connector", None), "get_num_layers", None
+        )
+        connector_layers = (
+            get_num_layers(kv_group) if callable(get_num_layers) else None
+        )
+        engine_layers = self.num_layers_for_group(kv_group)
+        if (
+            connector_layers is not None
+            and int(connector_layers) != engine_layers
+        ):
+            raise ValueError(
+                "NPU connector group layout disagrees with the engine group "
+                f"cardinality: kv_group={kv_group} "
+                f"connector={int(connector_layers)} engine={engine_layers}. "
+                "Check the registered KV caches, runtime metadata, and "
+                "explicit fallback configuration."
+            )
+        if connector_layers is not None:
+            return int(connector_layers)
+        return engine_layers
+
+    def _num_transfer_layers_for_call(
+        self,
+        kv_group: int,
+        kwargs: dict,
+    ) -> int:
+        """Resolve and cross-validate the cardinality for one layerwise call.
+
+        Uses _num_layers_for_kv_group(kv_group) and fail-closes against the
+        per-group kvcaches list passed by the serving-engine adapter when
+        present: the registered runtime buffers are the physical truth of
+        how many layer rows this call transfers.
+
+        Args:
+            kv_group: The KV group index of the call.
+            kwargs: The layerwise call kwargs (may contain ``kvcaches``).
+
+        Returns:
+            The number of layer rows for this call.
+
+        Raises:
+            ValueError: If the passed kvcaches length disagrees with the
+                resolved cardinality.
+        """
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        kvcaches = kwargs.get("kvcaches")
+        if kvcaches is not None:
+            kvcaches_len = len(kvcaches)
+            if kvcaches_len != num_layers:
+                raise ValueError(
+                    "Layerwise transfer cardinality mismatch: kv_group="
+                    f"{kv_group} resolved_layers={num_layers} "
+                    f"kvcaches_layers={kvcaches_len}. The registered KV "
+                    "caches for this group disagree with the resolved "
+                    "group cardinality (check runtime metadata, explicit "
+                    "fallback configuration, and serving-engine registration)."
+                )
+        return num_layers
+
+    def _ensure_layerwise_connector_layout(self, **kwargs) -> None:
+        """Initialize connector KV layout before allocating layerwise chunks.
+
+        gpu_connector.get_shape(num_tokens) depends on the MLA/DSA layout
+        being detected (kv_format, kv_lora_rank, qk_rope_head_dim, etc.),
+        which happens in _lazy_initialize_buffer. If store_layer is called
+        before that lazy init has run, get_shape returns a wrong shape and
+        the allocated MemoryObj chunks have the wrong size -- the store
+        kernel then writes KV into a malformed buffer, corrupting the cache.
+        This ensures the layout is initialized before any chunk allocation.
+        """
+        init_kvcaches = getattr(
+            self.gpu_connector, "initialize_kvcaches_ptr", None
+        )
+        lazy_init_with_staging = getattr(
+            self.gpu_connector, "_lazy_initialize_buffer_with_staging", None
+        )
+        lazy_init = getattr(
+            self.gpu_connector, "_lazy_initialize_buffer", None
+        )
+        if not callable(init_kvcaches) or (
+            not callable(lazy_init_with_staging) and not callable(lazy_init)
+        ):
+            return
+        if "kvcaches" in kwargs:
+            init_kvcaches(**kwargs)
+        kvcaches = getattr(self.gpu_connector, "kvcaches", None)
+        if kvcaches is not None:
+            kv_group = kwargs.get("kv_group", 0)
+            if callable(lazy_init_with_staging):
+                lazy_init_with_staging(
+                    kvcaches,
+                    kv_group=kv_group,
+                    init_staging=False,
+                )
+                return
+            # The layerwise NPU connector detects format per kv_group; other
+            # connectors (e.g. the blending buffer connector) may not accept
+            # the kwarg, so fall back to the positional call for them.
+            try:
+                lazy_init(kvcaches, kv_group=kv_group, init_staging=False)
+            except TypeError:
+                try:
+                    lazy_init(kvcaches, kv_group=kv_group)
+                except TypeError:
+                    lazy_init(kvcaches)
+
+    def _expected_shared_cpu_chunk_metadata(
+        self,
+        *,
+        kv_group: int,
+        num_tokens: int,
+        layer_id: int = 0,
+    ):
+        """Use Ascend's group-aware connector shape for shared view checks.
+
+        DSA index chunks are allocated with ``gpu_connector.get_shape(...,
+        kv_group=1)``.  Once vLLM has registered both cache groups, its
+        ``KVLayerGroupsManager`` is the authoritative startup description.
+        Prefer it here because the NPU connector's per-group layout is lazy:
+        querying ``get_shape`` before the first model input can otherwise
+        mirror the wrong active group and reject a valid decoder layout.
+
+        Generic LMCache metadata can still describe only the latent group in
+        older startup/passive paths, so retain the connector fallback.
+        """
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
+            return (
+                torch.Size([policy.layer_bytes(num_tokens, layer_id)]),
+                torch.uint8,
+                self._memory_format_for_kv_group(kv_group),
+            )
+        layer_groups = getattr(
+            self.metadata.kv_layer_groups_manager,
+            "kv_layer_groups",
+            (),
+        )
+        if (
+            self.metadata.use_mla
+            and getattr(self, "dsa_two_groups", False)
+            and 0 <= kv_group < len(layer_groups)
+        ):
+            layer_group = layer_groups[kv_group]
+            return (
+                torch.Size([num_tokens * layer_group.hidden_dim_size]),
+                layer_group.dtype,
+                self._memory_format_for_kv_group(kv_group),
+            )
+
+        get_shape = getattr(self.gpu_connector, "get_shape", None)
+        shape = None
+        if callable(get_shape):
+            try:
+                shape = torch.Size(get_shape(num_tokens, kv_group=kv_group))
+            except TypeError:
+                if kv_group == 0:
+                    shape = torch.Size(get_shape(num_tokens))
+        if shape is not None:
+            return (
+                shape,
+                self._shared_cpu_dtype_for_kv_group(kv_group),
+                self._memory_format_for_kv_group(kv_group),
+            )
+        return super()._expected_shared_cpu_chunk_metadata(
+            kv_group=kv_group,
+            num_tokens=num_tokens,
+        )
+
+    def _resolve_local_cpu_retrieve_location(
+        self,
+        fallback: Optional[str] = None,
+    ) -> Optional[str]:
+        """Prefer LocalCPUBackend for in-process tensor cache hits."""
+        if (
+            self.storage_manager is not None
+            and LOCAL_CPU_BACKEND_NAME in self.storage_manager.storage_backends
+        ):
+            return LOCAL_CPU_BACKEND_NAME
+        return fallback
+
+    def _layerwise_chunk_location(
+        self,
+        keys_multi_layer: List[CacheEngineKey],
+    ) -> Optional[str]:
+        """Return storage location only if every layer key for a chunk exists."""
+        location: Optional[str] = None
+        for layer_key in keys_multi_layer:
+            current_location = self.storage_manager.contains(
+                layer_key, self.retrieve_locations
+            )
+            if current_location is None:
+                return None
+            if location is None:
+                location = current_location
+            elif location != current_location:
+                return None
+        return location
+
+    def _cached_layerwise_location_or_raise(
+        self,
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        retrieve_kwargs: Optional[dict],
+    ) -> Optional[str]:
+        kwargs = retrieve_kwargs or {}
+        req_id = self._get_req_id(kwargs)
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        if not cached_keys or len(cached_keys) < num_layers:
+            return None
+        if not cached_starts or not cached_ends or not cached_keys[0]:
+            return None
+
+        chunk_count = min(
+            len(cached_starts),
+            len(cached_ends),
+            *(len(cached_keys[layer_id]) for layer_id in range(num_layers)),
+        )
+        if chunk_count <= 0:
+            return None
+
+        location: Optional[str] = None
+        for chunk_index in range(chunk_count):
+            keys_multi_layer = [
+                cached_keys[layer_id][chunk_index]
+                for layer_id in range(num_layers)
+            ]
+            current_location = self._layerwise_chunk_location_if_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=int(cached_starts[chunk_index]),
+                end=int(cached_ends[chunk_index]),
+            )
+            if current_location is None:
+                raise ValueError(
+                    "Layerwise sparse retrieve metadata is warm but the "
+                    "cached chunk is no longer complete in storage: "
+                    f"req_id={req_id}, kv_group={kv_group}, "
+                    f"chunk_index={chunk_index}, "
+                    f"start={cached_starts[chunk_index]}, "
+                    f"end={cached_ends[chunk_index]}"
+                )
+            if location is None:
+                location = current_location
+            elif location != current_location:
+                raise ValueError(
+                    "Layerwise sparse retrieve metadata is warm but cached "
+                    "chunks span multiple storage locations, which non-shared "
+                    "layerwise retrieve cannot consume safely: "
+                    f"req_id={req_id}, kv_group={kv_group}, "
+                    f"first_location={location}, "
+                    f"current_location={current_location}, "
+                    f"chunk_index={chunk_index}"
+                )
+        return location
+
+    def _ensure_retrieve_chunk_metadata(
+        self,
+        *,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        cached_keys: List,
+        cached_starts: List[int],
+        cached_ends: List[int],
+        ret_mask: torch.Tensor,
+        retrieve_kwargs: Optional[dict] = None,
+    ) -> tuple[
+        Optional[str],
+        List[int],
+        List[int],
+        List[List[CacheEngineKey]],
+    ]:
+        """Resolve retrieve chunk metadata once, then reuse the request cache."""
+        if self._needs_retrieve_metadata_refresh(
+            cached_keys, cached_starts, cached_ends, tokens
+        ):
+            if retrieve_kwargs is not None:
+                retrieve_kwargs.pop("_retrieve_metadata_warm", None)
+
+            kv_group = 0
+            if retrieve_kwargs is not None:
+                kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+            num_layers = self._num_layers_for_kv_group(kv_group)
+            shared_rank0_retrieve = (
+                retrieve_kwargs is not None
+                and self._should_use_shared_layerwise_retrieve(kv_group)
+                and not self._is_shared_retrieve_passive(kv_group)
+            )
+            sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
+
+            location: Optional[str] = None
+            new_starts: List[int] = []
+            new_ends: List[int] = []
+            keys: List[List[CacheEngineKey]] = []
+            remote_fill_chunk_plan: Optional[
+                list[tuple[int, int, Any]]
+            ] = None
+            remote_fill_locations: Optional[list[str]] = None
+            preflight_state = (
+                retrieve_kwargs.get("shared_cpu_request_preflight_state")
+                if retrieve_kwargs is not None
+                else None
+            )
+            chunk_plan = (
+                preflight_state.pop(
+                    _SHARED_CPU_CHUNK_PLAN_KEY,
+                    None,
+                )
+                if sampled_worker_retrieve
+                and kv_group == 1
+                and isinstance(preflight_state, dict)
+                else None
+            )
+            if retrieve_kwargs is not None:
+                retrieve_kwargs.pop(_REMOTE_FILL_EXACT_LOCATIONS_KEY, None)
+            remote_fill_hint = self._remote_fill_local_full_hint(request_configs)
+            if (
+                shared_rank0_retrieve
+                and not cached_keys
+                and not cached_starts
+                and not cached_ends
+                and remote_fill_hint is not None
+            ):
+                try:
+                    retained_plan = self._remote_fill_retained_local_page_plan(
+                        self._get_req_id(retrieve_kwargs or {}),
+                        kv_group,
+                        remote_fill_hint[0],
+                    )
+                except RuntimeError as exc:
+                    retained_plan = None
+                    logger.warning(
+                        "RemoteFill retained plan is inconsistent; using "
+                        "ordinary sparse metadata lookup: req_id=%s, "
+                        "kv_group=%s, error=%s",
+                        self._get_req_id(retrieve_kwargs or {}),
+                        kv_group,
+                        exc,
+                    )
+                if retained_plan is not None:
+                    remote_fill_chunk_plan, remote_fill_locations = retained_plan
+                    assert retrieve_kwargs is not None
+                    retrieve_kwargs[_REMOTE_FILL_EXACT_LOCATIONS_KEY] = tuple(
+                        remote_fill_locations
+                    )
+            key_plan = remote_fill_chunk_plan or chunk_plan
+            if (
+                key_plan is None
+                and (retrieve_kwargs or {}).get("_cold_chunk_plan") is not None
+            ):
+                key_plan = retrieve_kwargs["_cold_chunk_plan"]()
+            metadata_extension = (
+                self._build_retrieve_metadata_extension(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                    cached_keys=cached_keys,
+                    cached_starts=cached_starts,
+                    cached_ends=cached_ends,
+                    cached_metadata_token_ids=(retrieve_kwargs or {}).get(
+                        "cached_metadata_token_ids"
+                    ),
+                )
+                if key_plan is None
+                else None
+            )
+            chunk_index_base = 0
+            if metadata_extension is not None:
+                extension_starts, extension_ends, extension_keys = metadata_extension
+                chunk_index_base = len(cached_starts)
+                token_results = (
+                    (start, end, extension_keys[layer_id][chunk_index])
+                    for chunk_index, (start, end) in enumerate(
+                        zip(extension_starts, extension_ends, strict=True)
+                    )
+                    for layer_id in (0,)
+                )
+            elif key_plan is not None:
+                generated_keys = self.token_database.process_tokens(
+                    hashes=[entry[2] for entry in key_plan],
+                    offsets=[entry[1] - entry[0] for entry in key_plan],
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+                token_results = (
+                    (start, end, key)
+                    for (start, end, _), (_, _, key) in zip(
+                        key_plan, generated_keys, strict=True
+                    )
+                )
+            else:
+                token_results = self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+            new_chunk_plan: Optional[list[tuple[int, int, Any]]] = (
+                [
+                    (
+                        int(cached_starts[index]),
+                        int(cached_ends[index]),
+                        cached_keys[0][index].chunk_hash,
+                    )
+                    for index in range(
+                        len(cached_starts)
+                        if self._force_layerwise_prefill_store
+                        else chunk_index_base
+                    )
+                ]
+                if sampled_worker_retrieve
+                and kv_group == 0
+                and isinstance(preflight_state, dict)
+                else None
+            )
+            for candidate_index, (start, end, key) in enumerate(token_results):
+                assert isinstance(key, CacheEngineKey)
+                if new_chunk_plan is not None:
+                    new_chunk_plan.append((start, end, key.chunk_hash))
+
+                keys_multi_layer = key.split_layers(num_layers)
+                remote_fill_location = (
+                    remote_fill_locations[candidate_index]
+                    if remote_fill_locations is not None
+                    else None
+                )
+                if remote_fill_location is not None:
+                    current_location = remote_fill_location
+                elif sampled_worker_retrieve:
+                    current_location = (
+                        REMOTE_BACKEND_NAME
+                        if (retrieve_kwargs or {}).get("direct_external_pages")
+                        else "mixed"
+                    )
+                elif shared_rank0_retrieve:
+                    locations_multi_layer: list[str] = []
+                    for layer_key in keys_multi_layer:
+                        layer_location = self._find_shared_rank0_chunk_location(
+                            layer_key
+                        )
+                        if layer_location is None:
+                            locations_multi_layer = []
+                            break
+                        locations_multi_layer.append(layer_location)
+                    current_location = (
+                        locations_multi_layer[0]
+                        if len(set(locations_multi_layer)) == 1
+                        else "mixed"
+                        if locations_multi_layer
+                        else None
+                    )
+                else:
+                    current_location = self._layerwise_chunk_location(
+                        keys_multi_layer
+                    )
+                if current_location:
+                    if location is None:
+                        location = current_location
+                    elif shared_rank0_retrieve:
+                        location = (
+                            location
+                            if location == current_location
+                            else "mixed"
+                        )
+                    else:
+                        assert location == current_location, (
+                            "All retrieved keys should be from the same location "
+                            "when use layerwise retrieval."
+                            "Please support multi-location retrieval in the future."
+                        )
+                else:
+                    break
+
+                new_starts.append(start)
+                new_ends.append(end)
+                keys.append(keys_multi_layer)
+
+            if new_chunk_plan is not None:
+                preflight_state[_SHARED_CPU_CHUNK_PLAN_KEY] = tuple(new_chunk_plan)
+
+            new_keys = (
+                [list(row) for row in zip(*keys, strict=False)] if keys else []
+            )
+            if not new_keys:
+                if metadata_extension is not None:
+                    self._fill_retrieve_mask(
+                        ret_mask, cached_starts, cached_ends
+                    )
+                    if retrieve_kwargs is not None:
+                        retrieve_kwargs["_retrieve_metadata_warm"] = True
+                        retrieve_kwargs["_retrieve_metadata_mode"] = (
+                            "incremental"
+                        )
+                        retrieve_kwargs[
+                            "_retrieve_metadata_generated_chunks"
+                        ] = 0
+                    return location, cached_starts, cached_ends, cached_keys
+                return location, new_starts, new_ends, new_keys
+
+            if not cached_keys:
+                cached_keys[:] = new_keys
+                cached_starts[:] = new_starts
+                cached_ends[:] = new_ends
+            else:
+                prev_chunks = len(cached_starts)
+                for relative_chunk_idx, (start, end) in enumerate(
+                    zip(new_starts, new_ends, strict=False)
+                ):
+                    chunk_idx = chunk_index_base + relative_chunk_idx
+                    if chunk_idx < prev_chunks:
+                        if (
+                            cached_starts[chunk_idx] == start
+                            and cached_ends[chunk_idx] == end
+                        ):
+                            if any(
+                                chunk_idx >= len(cached_keys[layer_id])
+                                or cached_keys[layer_id][chunk_idx]
+                                != new_keys[layer_id][relative_chunk_idx]
+                                for layer_id in range(num_layers)
+                            ):
+                                raise ValueError(
+                                    "Sparse retrieve cached prefix key mismatch "
+                                    f"at chunk {chunk_idx}."
+                                )
+                            continue
+                        raise ValueError(
+                            "Sparse retrieve cached prefix range changed at "
+                            f"chunk {chunk_idx}: cached="
+                            f"[{cached_starts[chunk_idx]}, "
+                            f"{cached_ends[chunk_idx]}), current=[{start}, {end})."
+                        )
+                    cached_starts.append(start)
+                    cached_ends.append(end)
+                    for layer_id in range(num_layers):
+                        cached_keys[layer_id].append(
+                            new_keys[layer_id][relative_chunk_idx]
+                        )
+
+            self._fill_retrieve_mask(ret_mask, cached_starts, cached_ends)
+            if retrieve_kwargs is not None:
+                if location is not None:
+                    retrieve_kwargs["cached_retrieve_location"] = location
+                retrieve_kwargs["_retrieve_metadata_warm"] = True
+                retrieve_kwargs["_retrieve_metadata_mode"] = (
+                    "remote_fill_retained"
+                    if remote_fill_chunk_plan is not None
+                    else "incremental"
+                    if metadata_extension is not None
+                    else "full"
+                )
+                retrieve_kwargs["_retrieve_metadata_generated_chunks"] = len(
+                    new_starts
+                )
+            return location, cached_starts, cached_ends, cached_keys
+
+        if retrieve_kwargs is not None and retrieve_kwargs.get(
+            "_retrieve_metadata_warm"
+        ):
+            if retrieve_kwargs.get("_use_cached_retrieve"):
+                self._fill_retrieve_mask(
+                    ret_mask,
+                    cached_starts,
+                    cached_ends,
+                )
+                location = self._resolve_local_cpu_retrieve_location(
+                    retrieve_kwargs.get("cached_retrieve_location"),
+                )
+                if retrieve_kwargs is not None and location is not None:
+                    retrieve_kwargs["cached_retrieve_location"] = location
+                return location, cached_starts, cached_ends, cached_keys
+
+            self._fill_retrieve_mask(ret_mask, cached_starts, cached_ends)
+
+            location = retrieve_kwargs.get("cached_retrieve_location")
+            kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+            shared_passive_retrieve = (
+                self._should_use_shared_layerwise_retrieve(kv_group)
+                and self._is_shared_retrieve_passive(kv_group)
+            )
+            shared_rank0_retrieve = (
+                self._should_use_shared_layerwise_retrieve(kv_group)
+                and not self._is_shared_retrieve_passive(kv_group)
+            )
+            if (
+                cached_keys
+                and cached_keys[0]
+                and not shared_rank0_retrieve
+                and not shared_passive_retrieve
+            ):
+                # Prefer the hottest tier (LocalCPUBackend is checked first).
+                # After Mooncake write-back, stale cached_retrieve_location may
+                # still point at RemoteBackend and force slow remote reads.
+                preferred_location = self._cached_layerwise_location_or_raise(
+                    cached_keys,
+                    cached_starts,
+                    cached_ends,
+                    retrieve_kwargs,
+                )
+                if preferred_location is not None:
+                    location = preferred_location
+                    retrieve_kwargs["cached_retrieve_location"] = location
+            return location, cached_starts, cached_ends, cached_keys
+
+        self._fill_retrieve_mask(ret_mask, cached_starts, cached_ends)
+
+        location = None
+        if retrieve_kwargs is not None:
+            location = retrieve_kwargs.get("cached_retrieve_location")
+        kv_group = int((retrieve_kwargs or {}).get("kv_group", 0) or 0)
+        shared_passive_retrieve = (
+            retrieve_kwargs is not None
+            and self._should_use_shared_layerwise_retrieve(kv_group)
+            and self._is_shared_retrieve_passive(kv_group)
+        )
+        shared_rank0_retrieve = (
+            retrieve_kwargs is not None
+            and self._should_use_shared_layerwise_retrieve(kv_group)
+            and not self._is_shared_retrieve_passive(kv_group)
+        )
+        if (
+            location is None
+            and cached_keys
+            and cached_keys[0]
+            and not shared_rank0_retrieve
+            and not shared_passive_retrieve
+        ):
+            location = self._cached_layerwise_location_or_raise(
+                cached_keys,
+                cached_starts,
+                cached_ends,
+                retrieve_kwargs,
+            )
+            if retrieve_kwargs is not None and location is not None:
+                retrieve_kwargs["cached_retrieve_location"] = location
+        if retrieve_kwargs is not None:
+            retrieve_kwargs["_retrieve_metadata_warm"] = True
+        return location, cached_starts, cached_ends, cached_keys
+
+    def _layerwise_prefill_store_plan(
+        self,
+        *,
+        req_id: str,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        incremental: bool,
+        metadata_cache: Optional[Any] = None,
+        num_layers: Optional[int] = None,
+        skip_tokens: Optional[int] = None,
+    ) -> tuple[
+        Union[Iterable[tuple[int, int, CacheEngineKey]], PrefillMetadataPlan],
+        int,
+        Optional[tuple[int, Union[int, bytes]]],
+    ]:
+        """Plan only the new P-node suffix when the request grows.
+
+        ``store_layer`` is primed before every chunked-prefill forward.  The
+        old implementation called ``process_tokens`` for the complete prefix
+        on every prime, then checked every old chunk again.  Keep one aligned
+        hash frontier per request/group and start the next plan from it.  The
+        caller publishes the returned frontier only after the store completes,
+        so a failed transfer never makes an unsaved suffix look committed.
+        With a metadata cache, the first result is its prepared plan so the
+        caller can also reuse split layer keys; other callers keep an iterable.
+        """
+        full_tokens = len(tokens)
+        if not incremental:
+            return (
+                self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                ),
+                0,
+                None,
+            )
+
+        if metadata_cache is not None:
+            scopes = getattr(self, "_layerwise_prefill_store_metadata_scopes", None)
+            if scopes is None:
+                scopes = self._layerwise_prefill_store_metadata_scopes = {}
+            signature = (
+                int(self.config.chunk_size),
+                bool(getattr(self.token_database.config, "save_unfull_chunk", True)),
+                request_configs or {},
+            )
+            scope = scopes.get(req_id)
+            if (
+                scope is None
+                or scope[0] is not metadata_cache
+                or scope[1] is not self.token_database
+                or scope[2] != signature
+            ):
+                # Prepared metadata is not proof that the current request
+                # scope was stored. Same-length config/MM replacements must
+                # not inherit another scope's committed frontier.
+                self._layerwise_prefill_store_frontiers.pop(req_id, None)
+                scopes[req_id] = (
+                    metadata_cache,
+                    self.token_database,
+                    deepcopy(signature),
+                )
+
+        frontiers = self._layerwise_prefill_store_frontiers.setdefault(
+            req_id, {}
+        )
+        previous = frontiers.get(kv_group)
+        if previous is not None:
+            previous_end, previous_hash = previous
+            chunk_size = int(self.config.chunk_size)
+            if (
+                previous_end < 0
+                or previous_end > full_tokens
+                or previous_end % chunk_size != 0
+            ):
+                # A restarted/preempted request may reuse its id with a
+                # shorter prefix.  Discard the stale frontier and rebuild
+                # once; subsequent chunks are incremental again.
+                frontiers.pop(kv_group, None)
+                previous = None
+
+        if metadata_cache is not None:
+            if num_layers is None:
+                raise ValueError("Cached prefill store needs a layer count")
+            if skip_tokens is None:
+                skip_tokens = (
+                    int(mask.numel() - mask.long().sum().item())
+                    if mask is not None
+                    else 0
+                )
+            if (
+                not 0 <= skip_tokens <= full_tokens
+                or skip_tokens % int(self.config.chunk_size)
+            ):
+                raise ValueError("Cached prefill store needs an aligned masked prefix")
+            previous_end = previous[0] if previous is not None else 0
+            return (
+                metadata_cache.prepare(
+                    self.token_database,
+                    tokens,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                    num_layers=num_layers,
+                    skip_tokens=max(skip_tokens, previous_end),
+                ),
+                previous_end,
+                previous,
+            )
+
+        if previous is None:
+            return (
+                self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                ),
+                0,
+                None,
+            )
+
+        previous_end, previous_hash = previous
+        if previous_end == full_tokens:
+            return iter(()), previous_end, previous
+        return (
+            self.token_database.process_tokens_from_prefix(
+                tokens,
+                prefix_token_count=previous_end,
+                prefix_hash=previous_hash,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            ),
+            previous_end,
+            previous,
+        )
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def store_layer(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
+        """
+        Store the KV cache in a layerwise manner.
+
+        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask should ALWAYS be like
+            FFFFFTTTTTTT, where True means the tokens needs to be matched.
+
+        :param **kwargs: The additional arguments for the storage backend which
+            will be passed into the gpu_connector.
+
+        return: A generator that yields None for each layer and a
+            LayerwiseStoreResult after the final layer. In the first iteration,
+            the generator allocates the memory objects for all layers and moves
+            the KV cache of the first layer from GPU to CPU. In the next
+            iterations, it moves the KV cache of layer i from GPU to the memory
+            objects (on CPU) and puts the memory objects of layer i-1 to the
+            storage backends. In the last iteration, it puts the memory objects
+            of the last layer to the storage backends and yields the completed
+            store output.
+        """
+        store_result = LayerwiseStoreResult(
+            request_id=str(kwargs.get("req_id", "unspecified")),
+            kv_group=int(kwargs.get("kv_group", 0) or 0),
+        )
+        kv_group = store_result.kv_group
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        deferred_layerwise_put = bool(
+            self._force_layerwise_prefill_store
+            and kwargs.get("deferred_layerwise_put", False)
+        )
+
+        # Health check: block operation if LMCache is unhealthy
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping store_layer operation")
+            if deferred_layerwise_put:
+                # Prime once before the model forward, then preserve distinct
+                # pre- and post-HCOM suspension points for every layer.
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+                yield store_result
+                return
+            for layer_id in range(num_layers):
+                yield
+            # Extra yield consumed by wait_for_save() after the last layer.
+            yield store_result
+            return
+
+        # Passive rank guard: when save_only_first_rank is enabled, only rank 0
+        # stores. Closes the known TODO - store_layer had no _is_passive() check,
+        # causing duplicate stores on non-rank-0 workers under MLA + layerwise.
+        if self._is_passive():
+            logger.debug(
+                "Passive rank (save_only_first_rank), skipping store_layer"
+            )
+            if deferred_layerwise_put:
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+                yield store_result
+                return
+            for layer_id in range(num_layers):
+                yield
+            # Extra yield consumed by wait_for_save() after the last layer.
+            yield store_result
+            return
+
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for store_layer operation"
+        )
+
+        # Get req_id for logging
+        req_id = self._get_req_id(kwargs)
+        store_result.request_id = req_id
+        store_debug = (
+            self._force_layerwise_prefill_store and prefill_store_debug_enabled()
+        )
+
+        metadata_skip = (
+            kwargs.get("_prefill_skip_tokens")
+            if deferred_layerwise_put and kwargs.get("_prefill_metadata_cache")
+            else None
+        )
+        if metadata_skip is not None:
+            num_to_store_tokens = len(tokens) - int(metadata_skip)
+        elif mask is not None:
+            num_to_store_tokens = torch.sum(mask).item()
+        else:
+            num_to_store_tokens = len(tokens)
+
+        # KVCache Check logging
+        self._log_kvcache_for_check(
+            operation="Layerwise store",
+            kwargs=kwargs,
+            token_count=num_to_store_tokens,
+            require_req_id=True,
+        )
+
+        monitor_req_id = self.stats_monitor.on_store_request(num_to_store_tokens)
+
+        # Check if freeze mode is enabled
+        if self.is_frozen():
+            logger.debug(
+                "Freeze mode enabled, skipping store_layer for %d tokens",
+                num_to_store_tokens,
+            )
+            if deferred_layerwise_put:
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+                yield store_result
+                return
+            # Still need to yield to avoid StopIteration
+            for layer_id in range(num_layers):
+                yield
+            yield store_result
+            return
+
+        cached_keys = store_result.keys
+        cached_starts = store_result.starts
+        cached_ends = store_result.ends
+        cached_memory_objs = store_result.memory_objs
+        cached_tensors = store_result.tensors
+        cached_chunk_dev_ptrs = store_result.chunk_dev_ptrs
+        cached_chunk_ptrs_npu = store_result.chunk_ptrs
+
+        starts = []
+        ends = []
+        keys = []
+        memory_objs = []
+        tot_token_num = 0
+        requested_end = 0
+        store_complete = True
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        incremental_prefill = bool(
+            kwargs.get("layerwise_prefill_incremental", False)
+            and deferred_layerwise_put
+            and self._force_layerwise_prefill_store
+            and not kwargs.get("decode_window_save", False)
+        )
+        # Profile-only prime stages close the deferred generator before the
+        # normal per-layer callbacks run.  They still need to advance the
+        # request frontier; otherwise every following chunk is planned from
+        # token zero and the diagnostic run allocates the cumulative prefix.
+        diagnostic_prime_only = bool(
+            getattr(self, "_layerwise_prefill_diagnostic_prime_only", False)
+        )
+
+        # Ensure the connector's MLA/DSA layout is detected before allocating
+        # chunks -- get_shape(num_tokens) below depends on kv_lora_rank etc.
+        # This also establishes the connector's per-group layout cardinality
+        # used by _num_transfer_layers_for_call below.
+        self._ensure_layerwise_connector_layout(**kwargs)
+
+        # Authoritative per-group transfer cardinality (GLM-5.2: 79 latent /
+        # 22 indexer). Fail-closes against the per-group kvcaches list.
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
+
+        prev_key = 0
+        kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
+        page_store = bool(
+            mooncake_layer_pages_enabled(self.config)
+            and self.storage_manager.supports_batched_put_layer_pages(
+                self.store_location
+            )
+        )
+        page_shape = (
+            self.gpu_connector.get_shape(
+                int(self.config.chunk_size), kv_group=kv_group
+            )
+            if page_store
+            else None
+        )
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        mixed_indexer = kv_group == 1 and policy is not None and policy.mixed
+        page_shapes = (
+            self.metadata.indexer_layer_shapes(int(self.config.chunk_size))
+            if mixed_indexer
+            else [page_shape]
+        )
+        page_dtypes = [kv_dtype] * len(page_shapes)
+        local = self._shared_local_cpu_backend() if page_store else None
+        memory_format = self._memory_format_for_kv_group(kv_group)
+        force_store_wait = self.config.get_extra_config_value(
+            "force_store_wait", False
+        )
+        pending_chunks = []
+        token_plan, planned_base, prior_frontier = (
+            self._layerwise_prefill_store_plan(
+                req_id=req_id,
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+                incremental=incremental_prefill,
+                metadata_cache=(
+                    kwargs.get("_prefill_metadata_cache")
+                    if incremental_prefill
+                    else None
+                ),
+                num_layers=num_layers,
+                skip_tokens=metadata_skip,
+            )
+        )
+        if incremental_prefill:
+            # The suffix planner may legitimately return no chunks when a
+            # repeated forward has not appended tokens yet.  Preserve the
+            # already committed frontier in that case.
+            requested_end = planned_base
+        latest_full_frontier = prior_frontier
+        chunk_size = int(self.config.chunk_size)
+        metadata_plan = (
+            token_plan if isinstance(token_plan, PrefillMetadataPlan) else None
+        )
+        candidates = (
+            metadata_plan.candidates if metadata_plan is not None else token_plan
+        )
+        for candidate_index, (start, end, key) in enumerate(candidates):
+            assert isinstance(key, CacheEngineKey)
+            requested_end = end
+            if (
+                incremental_prefill
+                and end - start == chunk_size
+                and end % chunk_size == 0
+            ):
+                latest_full_frontier = (end, key.chunk_hash)
+
+            keys_multi_layer = (
+                metadata_plan.keys_chunk_major[candidate_index]
+                if metadata_plan is not None
+                else key.split_layers(num_layers)
+            )
+            if self._layerwise_put_queue is not None:
+                # A local hit can precede its producer's remote persistence.
+                self._layerwise_put_queue.track_keys(req_id, (key,))
+            if self._layerwise_chunk_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
+                allow_legacy_fallback=not page_store,
+            ):
+                continue
+
+            # Allocate the memory object
+            num_tokens = end - start
+            if num_tokens <= 0:
+                logger.warning(
+                    "Skipping zero-token layerwise store chunk for req_id=%s "
+                    "(kv_group=%s, start=%d, end=%d)",
+                    req_id,
+                    kv_group,
+                    start,
+                    end,
+                )
+                continue
+            pending_chunks.append((start, end, key, keys_multi_layer))
+
+        page_batch = None
+        if pending_chunks and page_store:
+            assert local is not None and page_shape is not None
+            page_batch = local.batched_allocate_layer_pages(
+                page_shapes,
+                page_dtypes,
+                len(pending_chunks),
+                self._num_layers_for_kv_group(kv_group),
+                memory_format,
+                busy_loop=False,
+                valid_tokens=[end - start for start, end, _, _ in pending_chunks],
+                full_tokens=int(self.config.chunk_size),
+                eviction=False,
+            )
+            if page_batch is not None and len(page_batch) != len(pending_chunks):
+                for page in page_batch:
+                    page.ref_count_down()
+                raise RuntimeError("Layer-page allocation returned wrong page count")
+            if page_batch is None and store_debug:
+                prefill_store_debug_log(
+                    "bulk_retry",
+                    req_id,
+                    kv_group,
+                    start=pending_chunks[0][0],
+                    end=pending_chunks[-1][1],
+                    chunks=len(pending_chunks),
+                )
+
+        legacy_suffix = False
+        for chunk_index, (start, end, key, keys_multi_layer) in enumerate(
+            pending_chunks
+        ):
+            num_tokens = end - start
+            kv_shape_single_layer = (
+                page_shape
+                if page_batch is not None
+                else self.gpu_connector.get_shape(num_tokens, kv_group=kv_group)
+            )
+            memory_objs_multi_layer = (
+                [page_batch[chunk_index]] * self._num_layers_for_kv_group(kv_group)
+                if page_batch is not None
+                else None
+            )
+            if memory_objs_multi_layer is None and page_store and not legacy_suffix:
+                assert local is not None and page_shape is not None
+                page = local.batched_allocate_layer_pages(
+                    page_shapes,
+                    page_dtypes,
+                    1,
+                    self._num_layers_for_kv_group(kv_group),
+                    memory_format,
+                    busy_loop=(
+                        force_store_wait and not self._force_layerwise_prefill_store
+                    ),
+                    valid_tokens=num_tokens,
+                    full_tokens=int(self.config.chunk_size),
+                )
+                if page is not None:
+                    if len(page) != 1:
+                        for item in page:
+                            item.ref_count_down()
+                        raise RuntimeError(
+                            "Layer-page allocation returned wrong page count"
+                        )
+                    memory_objs_multi_layer = [page[0]] * self._num_layers_for_kv_group(
+                        kv_group
+                    )
+                else:
+                    legacy_suffix = True
+                    if store_debug:
+                        prefill_store_debug_log(
+                            "page_single_none",
+                            req_id,
+                            kv_group,
+                            start=start,
+                            end=end,
+                            **prefill_store_allocator_snapshot(local),
+                        )
+            if (
+                memory_objs_multi_layer is None
+                and legacy_suffix
+                and self._layerwise_chunk_fully_stored(
+                    keys_multi_layer,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    start=start,
+                    end=end,
+                )
+            ):
+                continue
+            if memory_objs_multi_layer is None:
+                if mixed_indexer:
+                    memory_objs_multi_layer = []
+                    try:
+                        for shape in self.metadata.indexer_layer_shapes(num_tokens):
+                            allocated = self.storage_manager.batched_allocate(
+                                shape,
+                                kv_dtype,
+                                batch_size=1,
+                                fmt=memory_format,
+                                busy_loop=(
+                                    force_store_wait
+                                    and not self._force_layerwise_prefill_store
+                                ),
+                            )
+                            if allocated is None:
+                                break
+                            memory_objs_multi_layer.extend(allocated)
+                    finally:
+                        if len(memory_objs_multi_layer) != num_layers:
+                            for obj in memory_objs_multi_layer:
+                                obj.ref_count_down()
+                            memory_objs_multi_layer = None
+                else:
+                    memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                        kv_shape_single_layer,
+                        kv_dtype,
+                        batch_size=self._num_layers_for_kv_group(kv_group),
+                        fmt=memory_format,
+                        busy_loop=(
+                            force_store_wait and not self._force_layerwise_prefill_store
+                        ),
+                    )
+                if memory_objs_multi_layer is not None:
+                    # Legacy flat chunks (including page-allocation fallback)
+                    # need the logical count just like LayerPageMemoryObj does.
+                    for memory_obj in memory_objs_multi_layer:
+                        memory_obj.metadata.valid_tokens = num_tokens
+
+            if memory_objs_multi_layer is None:
+                if self._force_layerwise_prefill_store:
+                    if store_debug:
+                        prefill_store_debug_log(
+                            "alloc_failed",
+                            req_id,
+                            kv_group,
+                            error=True,
+                            start=start,
+                            end=end,
+                        )
+                    for obj in {
+                        id(item): item
+                        for layer_objs in memory_objs
+                        for item in layer_objs
+                    }.values():
+                        obj.ref_count_down()
+                    raise RuntimeError(
+                        "Layerwise prefill CPU cache is full while request "
+                        f"{req_id} is active; request-owned pages cannot be "
+                        "evicted. Increase CPU cache capacity or reduce "
+                        "concurrent/maximum prompt length."
+                    )
+                logger.warning(
+                    "Local cpu memory under pressure so"
+                    " choosing to not store the KV cache."
+                )
+                store_complete = False
+                break
+
+            if len(memory_objs_multi_layer) != num_layers:
+                logger.error(
+                    "Layerwise store allocation returned wrong layer count: "
+                    "req_id=%s kv_group=%s chunk=[%d,%d) shape=%s dtype=%s "
+                    "fmt=%s got=%d expected=%d decode_window=%s",
+                    req_id,
+                    kv_group,
+                    start,
+                    end,
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    memory_format,
+                    len(memory_objs_multi_layer),
+                    num_layers,
+                    kwargs.get("decode_window_save"),
+                )
+                raise RuntimeError(
+                    "Layerwise store allocation layer count mismatch: "
+                    f"got {len(memory_objs_multi_layer)}, "
+                    f"expected {num_layers}"
+                )
+
+            starts.append(start)
+            ends.append(end)
+            keys.append(keys_multi_layer)
+            memory_objs.append(memory_objs_multi_layer)
+            tot_token_num += num_tokens
+
+            # Create KV event
+            if self.kv_events_enabled and tokens is not None:
+                stored_event = CacheStoreEvent(
+                    block_hashes=[key.chunk_hash],
+                    parent_block_hash=None if start == 0 else prev_key,
+                    token_ids=[],
+                    block_size=num_tokens,
+                    lora_id=None,
+                    medium="cpu",
+                    lora_name=None,
+                )
+                if tokens is not None:
+                    stored_event.token_ids = convert_tokens_to_list(
+                        tokens,
+                        start,
+                        end,
+                    )
+                    if isinstance(tokens, torch.Tensor):
+                        stored_event.medium = tokens.device
+                logger.debug(
+                    f"Added kv cache event '{stored_event}' to kv cache events queue"
+                )
+                self.kv_events.append(stored_event)
+                prev_key = key.chunk_hash
+
+        if _mtp_dw_diag_enabled() and kwargs.get("decode_window_save"):
+            diag_slots = kwargs.get("slot_mapping")
+            if isinstance(diag_slots, torch.Tensor):
+                diag_slots = diag_slots.detach().cpu().reshape(-1)
+            else:
+                diag_slots = torch.empty(0, dtype=torch.long)
+            window_start = kwargs.get("decode_window_start")
+            window_end = kwargs.get("decode_window_end")
+            requested_tokens = (
+                int(window_end) - int(window_start)
+                if window_start is not None and window_end is not None
+                else int(num_to_store_tokens)
+            )
+            _mtp_dw_event(
+                "store",
+                req=req_id,
+                event="begin",
+                frontier=len(tokens),
+                window_start=window_start,
+                window_end=window_end,
+                kv_group=kv_group,
+                requested_tokens=requested_tokens,
+                actual_tokens=tot_token_num,
+                chunk_starts=starts[:8],
+                chunk_ends=ends[:8],
+                slot_count=int(diag_slots.numel()),
+                slot_min=(int(diag_slots.min()) if diag_slots.numel() else None),
+                slot_max=(int(diag_slots.max()) if diag_slots.numel() else None),
+                slot_sample=diag_slots[:8].tolist(),
+            )
+            if tot_token_num != requested_tokens:
+                _mtp_dw_event(
+                    "fail",
+                    req=req_id,
+                    frontier=len(tokens),
+                    window_start=window_start,
+                    window_end=window_end,
+                    kv_group=kv_group,
+                    invariant="store_actual_tokens",
+                    requested_tokens=requested_tokens,
+                    actual_tokens=tot_token_num,
+                )
+
+        if keys:
+            # Transpose the keys and memory objects into layer major format
+            memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
+            keys = [list(row) for row in zip(*keys, strict=False)]
+            if len(memory_objs) != num_layers or len(keys) != num_layers:
+                logger.error(
+                    "Layerwise store transpose produced wrong layer count: "
+                    "req_id=%s kv_group=%s memory_layers=%d key_layers=%d "
+                    "expected=%d chunk_count=%d starts=%s ends=%s "
+                    "decode_window=%s",
+                    req_id,
+                    kv_group,
+                    len(memory_objs),
+                    len(keys),
+                    num_layers,
+                    len(starts),
+                    starts,
+                    ends,
+                    kwargs.get("decode_window_save"),
+                )
+                raise RuntimeError(
+                    "Layerwise store transpose layer count mismatch: "
+                    f"memory_layers={len(memory_objs)}, key_layers={len(keys)}, "
+                    f"expected={num_layers}"
+                )
+            pending_store_release = {
+                id(mem_obj): mem_obj
+                for layer_objs in memory_objs
+                for mem_obj in layer_objs
+            }
+            if self._force_layerwise_prefill_store:
+                self._retain_layerwise_prefill_pages(
+                    req_id, pending_store_release.values()
+                )
+            mem_obj_generator = None
+
+            # Calculate total KV size for logging
+            tot_kv_size = sum(
+                obj.get_size() for obj in pending_store_release.values()
+            )
+
+            assert_layerwise_gpu_connector(self.gpu_connector)
+
+            cache_chunk_indices: Optional[List[int]] = None
+            if bool(kwargs.get("windowed_sparse_save", False)):
+                # Partial tails are valid storage entries, but sparse direct
+                # pointer tables assume fixed-size LMCache chunks. Keep tails
+                # out of request-local pointer/cache publication until a later
+                # full successor for the same aligned chunk is committed.
+                chunk_size = int(self.config.chunk_size)
+                cache_chunk_indices = [
+                    index
+                    for index, (start, end) in enumerate(
+                        zip(starts, ends, strict=False)
+                    )
+                    if start % chunk_size == 0 and end - start == chunk_size
+                ]
+
+                selected_starts = [starts[index] for index in cache_chunk_indices]
+                selected_ends = [ends[index] for index in cache_chunk_indices]
+                self._truncate_store_cache_for_full_chunk_successor(
+                    starts=cached_starts,
+                    ends=cached_ends,
+                    new_starts=selected_starts,
+                    new_ends=selected_ends,
+                    cached_keys=cached_keys,
+                    cached_memory_objs=cached_memory_objs,
+                    cached_tensors=cached_tensors,
+                    cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu=cached_chunk_ptrs_npu,
+                )
+
+            self._append_layerwise_store_cache_chunks(
+                keys=keys,
+                starts=starts,
+                ends=ends,
+                memory_objs=memory_objs,
+                cached_keys=cached_keys,
+                cached_starts=cached_starts,
+                cached_ends=cached_ends,
+                cached_memory_objs=cached_memory_objs,
+                cached_tensors=cached_tensors,
+                cache_chunk_indices=cache_chunk_indices,
+            )
+
+            try:
+                store_perf_enabled = serving_perf_enabled()
+                t_start = time.perf_counter() if store_perf_enabled else 0.0
+                page_first_store = mooncake_page_layout_enabled(self.config)
+                async_layerwise_store = bool(
+                    deferred_layerwise_put
+                    and self._layerwise_prefill_async_store_supported(
+                        page_first_store=page_first_store
+                    )
+                )
+                transfer_kwargs = kwargs
+                if deferred_layerwise_put:
+                    transfer_kwargs = dict(kwargs)
+                    transfer_kwargs[
+                        "layerwise_prefill_async_store"
+                    ] = async_layerwise_store
+                group_store = getattr(
+                    self.gpu_connector, "batched_from_gpu_group", None
+                )
+                supports_group_store = getattr(
+                    self.gpu_connector, "supports_batched_from_gpu_group", None
+                )
+                all_chunks_publishable = cache_chunk_indices is None or (
+                    cache_chunk_indices == list(range(len(starts)))
+                )
+                use_group_store = (
+                    bool(
+                        kwargs.get("decode_window_save")
+                        or kwargs.get("all_layers_ready")
+                    )
+                    and callable(group_store)
+                    and callable(supports_group_store)
+                    and supports_group_store(kv_group)
+                    and all_chunks_publishable
+                )
+                if use_group_store:
+                    if deferred_layerwise_put:
+                        raise RuntimeError(
+                            "Deferred layerwise prefill save does not support "
+                            "the decode-window group-store path"
+                        )
+                    for _ in range(num_layers):
+                        yield
+                    group_started = (
+                        serving_perf_now()
+                        if serving_perf_enabled()
+                        else None
+                    )
+                    host_pointer_rows, layer_chunk_ptrs_npu = group_store(
+                        memory_objs, starts, ends, **kwargs
+                    )
+                    if group_started is not None:
+                        serving_perf_log(
+                            logger,
+                            "npu_group_submit_cpu",
+                            started=group_started,
+                            req_id=req_id,
+                            kv_group=kv_group,
+                            chunks=len(starts),
+                            tokens=sum(
+                                end - start
+                                for start, end in zip(starts, ends, strict=True)
+                            ),
+                        )
+                    self._append_group_store_tensors(
+                        memory_objs,
+                        cached_tensors,
+                        cached_chunk_dev_ptrs,
+                        cached_chunk_ptrs_npu,
+                        host_pointer_rows,
+                        layer_chunk_ptrs_npu,
+                        kv_group=kv_group,
+                    )
+                    if not page_first_store:
+                        for layer_id in range(num_layers):
+                            required_futures = self.storage_manager.batched_put(
+                                keys[layer_id],
+                                memory_objs[layer_id],
+                                location=self.store_location,
+                            )
+                            self._track_sync_store_futures(
+                                required_futures, require_completion=True
+                            )
+                            for mem_obj in memory_objs[layer_id]:
+                                pending_store_release.pop(id(mem_obj), None)
+                else:
+                    mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                        memory_objs, starts, ends, **transfer_kwargs
+                    )
+                    next(mem_obj_generator)
+
+                    if (
+                        diagnostic_prime_only
+                        and incremental_prefill
+                        and latest_full_frontier is not None
+                    ):
+                        self._layerwise_prefill_store_frontiers.setdefault(
+                            req_id, {}
+                        )[kv_group] = latest_full_frontier
+
+                    def publish_completed_layer(layer_id: int) -> None:
+                        self._append_layer_store_tensors(
+                            layer_id,
+                            memory_objs,
+                            cached_tensors,
+                            cached_chunk_dev_ptrs,
+                            cached_chunk_ptrs_npu,
+                            cache_chunk_indices,
+                            kv_group=kv_group,
+                        )
+                        if page_first_store:
+                            return
+                        required_futures = self.storage_manager.batched_put(
+                            keys[layer_id],
+                            memory_objs[layer_id],
+                            location=self.store_location,
+                        )
+                        self._track_sync_store_futures(
+                            required_futures, require_completion=True
+                        )
+                        for mem_obj in memory_objs[layer_id]:
+                            pending_store_release.pop(id(mem_obj), None)
+
+                    if deferred_layerwise_put:
+                        persisted_layers: set[int] = set()
+                        # Priming the outer storer stops here. Each model-layer
+                        # save sends its bank-specific mapping into the NPU
+                        # consumer and returns immediately after D2H launch.
+                        layer_request = yield
+                        for layer_id in range(num_layers):
+                            source_done_layer = mem_obj_generator.send(
+                                layer_request
+                            )
+                            # Pre-HCOM save returns here. The explicit finish
+                            # hook resumes only after HCOM has been submitted.
+                            yield
+                            if source_done_layer is not None:
+                                if not isinstance(source_done_layer, int):
+                                    raise TypeError(
+                                        "Deferred layerwise NPU connector must "
+                                        "yield a completed layer index or None"
+                                    )
+                                if source_done_layer in persisted_layers:
+                                    raise RuntimeError(
+                                        "Layerwise NPU source completion was "
+                                        "reported twice: "
+                                        f"layer={source_done_layer}"
+                                    )
+                                publish_completed_layer(source_done_layer)
+                                persisted_layers.add(source_done_layer)
+                            if layer_id + 1 < num_layers:
+                                layer_request = yield
+                            else:
+                                # Do not drain final bank events or storage
+                                # futures inside the last attention callback.
+                                yield
+
+                        while len(persisted_layers) < num_layers:
+                            try:
+                                source_done_layer = next(mem_obj_generator)
+                            except StopIteration as exc:
+                                raise RuntimeError(
+                                    "Layerwise NPU connector ended before all "
+                                    "source buffers completed"
+                                ) from exc
+                            if source_done_layer is None:
+                                continue
+                            if not isinstance(source_done_layer, int):
+                                raise TypeError(
+                                    "Deferred layerwise NPU connector must "
+                                    "yield a completed layer index or None"
+                                )
+                            if source_done_layer in persisted_layers:
+                                raise RuntimeError(
+                                    "Layerwise NPU source completion was "
+                                    "reported twice: "
+                                    f"layer={source_done_layer}"
+                                )
+                            publish_completed_layer(source_done_layer)
+                            persisted_layers.add(source_done_layer)
+                        try:
+                            next(mem_obj_generator)
+                        except StopIteration:
+                            pass
+                    else:
+                        for layer_id in range(num_layers):
+                            yield
+                            next(mem_obj_generator)
+                            publish_completed_layer(layer_id)
+
+                # One tail event per physical bank fences every save DMA for
+                # this compute chunk.  The events are consumed by the
+                # background Mooncake writer; do not synchronize them here.
+                layerwise_store_fences: tuple[Any, ...] = ()
+                if async_layerwise_store and page_first_store:
+                    fences_fn = getattr(
+                        self.gpu_connector,
+                        "layerwise_prefill_store_fences",
+                        None,
+                    )
+                    if callable(fences_fn):
+                        layerwise_store_fences = tuple(fences_fn(kv_group))
+
+                if self._force_layerwise_prefill_store and kv_hash_enabled():
+                    hash_fences = layerwise_store_fences
+                    if async_layerwise_store and not hash_fences:
+                        hash_fences = tuple(
+                            self.gpu_connector.layerwise_prefill_store_fences(kv_group)
+                        )
+                    if async_layerwise_store and not hash_fences:
+                        if getattr(
+                            self.gpu_connector, "uses_token_byte_features", False
+                        ):
+                            trace = getattr(self.gpu_connector, "kv_trace", None)
+                            if trace is not None:
+                                trace.error(
+                                    req_id,
+                                    "P_CPU_STORE",
+                                    "missing_producer_fence",
+                                    group=kv_group,
+                                )
+                        else:
+                            skip_kv_hash(
+                                "S", req_id, kv_group, "missing_producer_fence"
+                            )
+                    else:
+                        trace = getattr(
+                            self.gpu_connector, "enqueue_store_kv_trace", None
+                        )
+                        if callable(trace):
+                            trace(
+                                req_id, kv_group, starts, ends, memory_objs, hash_fences
+                            )
+                        hash_ready = submit_kv_hash(
+                            "S",
+                            req_id,
+                            kv_group,
+                            starts,
+                            ends,
+                            memory_objs,
+                            int(self.config.chunk_size),
+                            producer_events=hash_fences,
+                            feature_mode=getattr(
+                                self.gpu_connector, "uses_token_byte_features", False
+                            ),
+                        )
+                        if hash_ready is not None:
+                            # The existing Mooncake background worker waits
+                            # for the pre-store CPU hash, after the bank DMAs.
+                            layerwise_store_fences += (hash_ready,)
+
+                if page_first_store:
+                    async_pages = bool(
+                        self._force_layerwise_prefill_store
+                        and page_store
+                        and str(self.config.remote_url or "").startswith(
+                            "mooncakestore://"
+                        )
+                        and (
+                            async_layerwise_store
+                            or all(
+                                isinstance(obj, LayerPageMemoryObj)
+                                for obj in memory_objs[0]
+                            )
+                        )
+                    )
+                    # Flat fallbacks own one object per layer; merged pages
+                    # appear in every row. Charge each physical object once.
+                    batch_bytes = (
+                        sum(obj.get_size() for obj in pending_store_release.values())
+                        if async_pages
+                        else 0
+                    )
+                    if async_pages:
+                        if self._layerwise_put_queue is None:
+                            self._layerwise_put_queue = LayerwisePutQueue(
+                                max_bytes=int(
+                                    self.config.remote_fill_max_inflight_bytes
+                                ),
+                                # A compute batch produces one put per DSA group.
+                                max_batches=2 * (self._store_queue_maxsize or 2),
+                                timeout=float(self.config.blocking_timeout_secs),
+                            )
+                        self._layerwise_put_queue.reserve(batch_bytes)
+                    if (
+                        self._force_layerwise_prefill_store
+                        and self.config.enable_remote_lmcache_store
+                    ):
+                        self._queue_layerwise_cpu_fill(
+                            req_id,
+                            request_configs,
+                            kv_group,
+                            keys[0],
+                            memory_objs[0],
+                            starts,
+                            ends,
+                        )
+                    if page_store:
+                        page_indices = [
+                            index
+                            for index, obj in enumerate(memory_objs[0])
+                            if isinstance(obj, LayerPageMemoryObj)
+                        ]
+                        legacy_indices = [
+                            index
+                            for index, obj in enumerate(memory_objs[0])
+                            if not isinstance(obj, LayerPageMemoryObj)
+                        ]
+                        required_futures = []
+                        submitted_objs = []
+                        if page_indices:
+                            layer_pages = [
+                                memory_objs[0][index] for index in page_indices
+                            ]
+                            if store_debug:
+                                prefill_store_debug_log(
+                                    "page_put",
+                                    req_id,
+                                    kv_group,
+                                    start=starts[page_indices[0]],
+                                    end=ends[page_indices[-1]],
+                                    chunks=len(page_indices),
+                                    async_d2h=async_layerwise_store,
+                                    events=sum(
+                                        not getattr(event, "cpu_hash_fence", False)
+                                        for event in layerwise_store_fences
+                                    ),
+                                    layers=len(memory_objs),
+                                    bytes=layer_pages[0].get_size(),
+                                )
+                            try:
+                                page_futures = self.storage_manager.batched_put_layer_pages(
+                                    [
+                                        keys[0][index].without_layer()
+                                        for index in page_indices
+                                    ],
+                                    layer_pages,
+                                    location=self.store_location,
+                                    req_id=req_id,
+                                    **(
+                                        {
+                                            "publish_local_early": async_pages,
+                                            "producer_events": layerwise_store_fences,
+                                        }
+                                        if self._force_layerwise_prefill_store
+                                        else {}
+                                    ),
+                                )
+                            except Exception as error:
+                                if store_debug:
+                                    prefill_store_debug_log(
+                                        "page_error",
+                                        req_id,
+                                        kv_group,
+                                        error=True,
+                                        status=type(error).__name__,
+                                    )
+                                if async_pages:
+                                    self._layerwise_put_queue.fail(error)
+                                raise
+                            required_futures.extend(page_futures)
+                            submitted_objs.extend(layer_pages)
+                            for page in layer_pages:
+                                pending_store_release.pop(id(page), None)
+                        if legacy_indices:
+                            if store_debug:
+                                prefill_store_debug_log(
+                                    "flat_put",
+                                    req_id,
+                                    kv_group,
+                                    start=starts[legacy_indices[0]],
+                                    end=ends[legacy_indices[-1]],
+                                    chunks=len(legacy_indices),
+                                    async_d2h=async_layerwise_store,
+                                    events=sum(
+                                        not getattr(event, "cpu_hash_fence", False)
+                                        for event in layerwise_store_fences
+                                    ),
+                                )
+                            legacy_keys = [
+                                layer_keys[index]
+                                for layer_keys in keys
+                                for index in legacy_indices
+                            ]
+                            legacy_objs = [
+                                layer_objs[index]
+                                for layer_objs in memory_objs
+                                for index in legacy_indices
+                            ]
+                            if async_layerwise_store:
+                                # Plain batched_put has no producer fence and
+                                # may let Mooncake read unfinished D2H bytes.
+                                # Keep flat CPU objects, but hand their layer
+                                # buffers and bank events to the page writer.
+                                try:
+                                    storage = self.storage_manager
+                                    legacy_futures = (
+                                        storage.batched_put_layerwise_objects(
+                                            [
+                                                [row[index] for index in legacy_indices]
+                                                for row in keys
+                                            ],
+                                            [
+                                                [row[index] for index in legacy_indices]
+                                                for row in memory_objs
+                                            ],
+                                            producer_events=layerwise_store_fences,
+                                            location=self.store_location,
+                                            req_id=req_id,
+                                        )
+                                    )
+                                except Exception as error:
+                                    if store_debug:
+                                        prefill_store_debug_log(
+                                            "flat_error",
+                                            req_id,
+                                            kv_group,
+                                            error=True,
+                                            status=type(error).__name__,
+                                        )
+                                    if async_pages:
+                                        self._layerwise_put_queue.fail(error)
+                                    raise
+                            else:
+                                legacy_futures = self.storage_manager.batched_put(
+                                    legacy_keys,
+                                    legacy_objs,
+                                    location=self.store_location,
+                                )
+                            required_futures.extend(legacy_futures)
+                            submitted_objs.extend(legacy_objs)
+                    else:
+                        flattened_keys = [
+                            key for layer_keys in keys for key in layer_keys
+                        ]
+                        submitted_objs = [
+                            obj for layer_objs in memory_objs for obj in layer_objs
+                        ]
+                        required_futures = self.storage_manager.batched_put(
+                            flattened_keys,
+                            submitted_objs,
+                            location=self.store_location,
+                        )
+                    if async_pages:
+                        self._layerwise_put_queue.add(
+                            batch_bytes,
+                            required_futures,
+                            req_id=req_id,
+                            keys=(key.without_layer() for key in keys[0]),
+                        )
+                    else:
+                        self._track_sync_store_futures(
+                            required_futures, require_completion=True
+                        )
+                    for mem_obj in submitted_objs:
+                        pending_store_release.pop(id(mem_obj), None)
+
+                if store_perf_enabled:
+                    tot_time = time.perf_counter() - t_start
+                    logger.info(
+                        "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
+                        "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
+                        req_id,
+                        kv_group,
+                        tot_token_num,
+                        len(tokens),
+                        tot_kv_size / 1024**3,
+                        tot_time * 1000,
+                        tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                    )
+            finally:
+                if mem_obj_generator is not None:
+                    close_fn = getattr(mem_obj_generator, "close", None)
+                    if close_fn is not None:
+                        try:
+                            close_fn()
+                        except (GeneratorExit, RuntimeError, ValueError):
+                            pass
+                self._remove_pending_layerwise_store_objs(
+                    cached_memory_objs,
+                    pending_store_release,
+                )
+                for mem_obj in list(pending_store_release.values()):
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
+                pending_store_release.clear()
+        else:
+            # If no cache are found, we still need to yield to avoid
+            # `StopIteration`
+            if deferred_layerwise_put:
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+            else:
+                for layer_id in range(num_layers):
+                    yield
+
+        self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        if store_complete:
+            store_result.committed_end = requested_end
+            if incremental_prefill and latest_full_frontier is not None:
+                self._layerwise_prefill_store_frontiers.setdefault(
+                    req_id, {}
+                )[kv_group] = latest_full_frontier
+        if _mtp_dw_diag_enabled() and kwargs.get("decode_window_save"):
+            window_start = kwargs.get("decode_window_start")
+            window_end = kwargs.get("decode_window_end")
+            requested_tokens = (
+                int(window_end) - int(window_start)
+                if window_start is not None and window_end is not None
+                else int(num_to_store_tokens)
+            )
+            _mtp_dw_event(
+                "store",
+                req=req_id,
+                event="complete",
+                frontier=len(tokens),
+                window_start=window_start,
+                window_end=window_end,
+                kv_group=kv_group,
+                requested_tokens=requested_tokens,
+                actual_tokens=tot_token_num,
+            )
+        yield store_result
+
+    def _retrieve_layer_head_token_wise_shared_passive(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        ret_mask: torch.Tensor,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for sparse shared retrieve"
+        )
+        if self.shared_cpu_cache_passive_allocator is None:
+            raise ValueError(
+                "Shared CPU cache passive allocator is not initialized for "
+                "sparse decode. Startup preflight did not complete."
+            )
+
+        request_configs = kwargs.get("request_configs")
+        kv_group = kwargs.get("kv_group", 0)
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
+        req_id = kwargs.get("req_id", "unspecified")
+        phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
+        perf_enabled = serving_perf_enabled()
+        request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        cached_keys = kwargs.get("cached_keys")
+        cached_starts = kwargs.get("cached_starts")
+        cached_ends = kwargs.get("cached_ends")
+        cached_memory_objs = kwargs.get("cached_memory_objs")
+        cached_tensors = kwargs.get("cached_tensors")
+        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_shared_handles = kwargs.get("cached_shared_handles")
+        append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
+
+        metadata_started = serving_perf_now() if perf_enabled else 0.0
+        metadata_warm = bool(
+            kwargs.get("_retrieve_metadata_warm")
+            and cached_keys
+            and cached_starts
+            and cached_ends
+            and int(cached_ends[-1]) == len(tokens)
+        )
+        if metadata_warm:
+            starts = list(cached_starts)
+            ends = list(cached_ends)
+            keys_layer_major = cached_keys
+        else:
+            extension = self._build_retrieve_metadata_extension(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+                cached_keys=cached_keys,
+                cached_starts=cached_starts,
+                cached_ends=cached_ends,
+                cached_metadata_token_ids=kwargs.get(
+                    "cached_metadata_token_ids"
+                ),
+            )
+            if extension is not None:
+                suffix_starts, suffix_ends, suffix_keys = extension
+                starts = list(cached_starts) + suffix_starts
+                ends = list(cached_ends) + suffix_ends
+                keys_layer_major = [
+                    list(cached_keys[layer_id]) + suffix_keys[layer_id]
+                    for layer_id in range(num_layers)
+                ]
+            else:
+                starts, ends, keys = [], [], []
+                token_args = {"tokens": tokens, "mask": mask}
+                if kwargs.get("_cold_chunk_plan") is not None:
+                    chunks = kwargs["_cold_chunk_plan"]()
+                    token_args = {
+                        "hashes": [entry[2] for entry in chunks],
+                        "offsets": [end - start for start, end, _ in chunks],
+                    }
+                for start, end, key in self.token_database.process_tokens(
+                    **token_args,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                ):
+                    assert isinstance(key, CacheEngineKey)
+                    starts.append(start)
+                    ends.append(end)
+                    keys.append(key.split_layers(num_layers))
+                keys_layer_major = (
+                    [list(row) for row in zip(*keys, strict=False)]
+                    if keys
+                    else []
+                )
+        required_chunks = len(starts)
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "metadata_prepare",
+                started=metadata_started,
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                layers=num_layers,
+                chunks=required_chunks,
+                rank=self.metadata.worker_id,
+                passive=True,
+            )
+        cached_prefix_chunks = self._cached_sparse_prefix_chunks(
+            cached_tensors,
+            cached_memory_objs,
+            kv_group=kv_group,
+        )
+        if cached_prefix_chunks > required_chunks:
+            raise ValueError(
+                "Sparse passive cached prefix exceeds current metadata: "
+                f"cached_chunks={cached_prefix_chunks}, "
+                f"required_chunks={required_chunks}"
+            )
+        metadata_counts = {
+            len(values)
+            for values in (cached_starts, cached_ends)
+            if values is not None
+        }
+        if cached_keys is not None:
+            if cached_keys and len(cached_keys) != num_layers:
+                raise ValueError("Sparse passive cached key metadata is incomplete.")
+            metadata_counts.update(len(layer) for layer in cached_keys)
+        if len(metadata_counts) > 1:
+            raise ValueError("Sparse passive cached metadata has inconsistent lengths.")
+        cached_metadata_chunks = metadata_counts.pop() if metadata_counts else 0
+        if not cached_keys:
+            cached_metadata_chunks = 0
+        if not cached_starts or not cached_ends:
+            cached_metadata_chunks = 0
+        if not cached_prefix_chunks <= cached_metadata_chunks <= required_chunks:
+            raise ValueError(
+                "Sparse passive cached metadata does not cover the materialized "
+                f"prefix: metadata={cached_metadata_chunks}, "
+                f"cached={cached_prefix_chunks}, required={required_chunks}"
+            )
+        if not metadata_warm:
+            for chunk_index in range(cached_metadata_chunks):
+                if (
+                    cached_starts[chunk_index] != starts[chunk_index]
+                    or cached_ends[chunk_index] != ends[chunk_index]
+                    or any(
+                        cached_keys[layer_id][chunk_index]
+                        != keys_layer_major[layer_id][chunk_index]
+                        for layer_id in range(num_layers)
+                    )
+                ):
+                    raise ValueError(
+                        "Sparse passive cached prefix changed at chunk "
+                        f"{chunk_index}."
+                    )
+        cached_handle_chunks = self._uniform_layer_cache_chunks(
+            cached_shared_handles,
+            num_layers,
+            "passive shared handle cache",
+        )
+        if cached_handle_chunks != cached_prefix_chunks:
+            raise ValueError(
+                "Sparse passive cached handles do not cover the materialized "
+                f"prefix: handles={cached_handle_chunks}, "
+                f"cached_chunks={cached_prefix_chunks}"
+            )
+        missing_chunks = required_chunks - cached_prefix_chunks
+        self._fill_retrieve_mask(
+            ret_mask,
+            starts[:cached_prefix_chunks],
+            ends[:cached_prefix_chunks],
+        )
+
+        assert_layerwise_gpu_connector(self.gpu_connector)
+        transfer_kwargs = kwargs
+        transient_chunk_dev_ptrs = None
+        transient_chunk_ptrs_npu = None
+        if not cached_prefix_chunks and (
+            cached_chunk_dev_ptrs is not None
+            or cached_chunk_ptrs_npu is not None
+        ):
+            # The consumer needs transient pointers for the transfer, while
+            # the cache engine publishes owners/host/NPU rows atomically.
+            transfer_kwargs = dict(kwargs)
+            if (
+                cached_chunk_dev_ptrs is not None
+                and cached_chunk_ptrs_npu is not None
+            ):
+                transient_chunk_dev_ptrs = []
+                transient_chunk_ptrs_npu = []
+            transfer_kwargs["cached_chunk_dev_ptrs"] = transient_chunk_dev_ptrs
+            transfer_kwargs["cached_chunk_ptrs_npu"] = transient_chunk_ptrs_npu
+        mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(
+            **transfer_kwargs
+        )
+        next(mem_obj_consumer)
+
+        to_release: list[MemoryObj] = []
+        passive_views_handed_off = False
+        metadata_appended = False
+        compact_batch: Optional[SharedHandleBatch] = None
+        compact_final_receive_attempted = False
+        materialize_only = bool(kwargs.get("materialize_only", False))
+        pending_materialized_layers: List[
+            Union[List[MemoryObj], LayerPageSource]
+        ] = []
+        compact_pages = ()
+        page_view_build_s = 0.0
+        pointer_seal_s = 0.0
+        compact_materialize_started = (
+            serving_perf_now() if perf_enabled else 0.0
+        )
+        compact_materialize_thread_started = (
+            time.thread_time_ns() if perf_enabled else 0
+        )
+        legacy_tail_objects = 0
+        prepared_compact_ptrs = False
+        defer_finish = False
+        prepare_count = dispatch_count = 0
+        prepare_sum_s = prepare_max_s = 0.0
+        dispatch_sum_s = dispatch_max_s = 0.0
+
+        try:
+            for layer_id in range(num_layers):
+                sparse_request = yield ret_mask
+                (
+                    sparse_payload,
+                    selected_tokens,
+                    token_start_index,
+                    target_slot_mapping,
+                    prepare_only,
+                    defer_finish,
+                ) = _shared_sparse_request(sparse_request)
+
+                if not missing_chunks:
+                    mem_objs_layer = []
+                    source = mem_objs_layer
+                else:
+                    envelope = None
+                    if compact_batch is None:
+                        envelope = self._receive_matching_shared_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                        )
+                        self._validate_shared_layerwise_envelope(
+                            envelope,
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                        )
+                        if envelope.status != "ok":
+                            raise ValueError(
+                                "Sparse passive prefix extension requires present "
+                                f"handles, received status={envelope.status!r}."
+                            )
+                        compact_batch = envelope.batch
+                        if compact_batch is not None:
+                            page_started = (
+                                serving_perf_now() if perf_enabled else 0.0
+                            )
+                            compact_pages = self._make_passive_layer_page_views(
+                                compact_batch,
+                                starts=starts[cached_prefix_chunks:],
+                                ends=ends[cached_prefix_chunks:],
+                                keys_layer_major=[
+                                    keys[cached_prefix_chunks:]
+                                    for keys in keys_layer_major
+                                ],
+                                kv_group=kv_group,
+                            )
+                            if page_started:
+                                page_view_build_s = (
+                                    serving_perf_now() - page_started
+                                )
+                            if npu_content_diagnostics_enabled():
+                                log_shared_page_source_fingerprint(
+                                    req_id=req_id,
+                                    phase=phase,
+                                    kv_group=kv_group,
+                                    pages=compact_pages,
+                                    chunk_starts=starts[cached_prefix_chunks:],
+                                    slab=getattr(
+                                        self.shared_cpu_cache_passive_allocator,
+                                        "slab_tensor",
+                                        None,
+                                    ),
+                                    rank=self.metadata.worker_id,
+                                    passive=True,
+                                )
+                            to_release.extend(compact_pages)
+                            prepare_page_ptrs = getattr(
+                                self.gpu_connector,
+                                "prepare_sparse_page_ptr_cache_for_layers",
+                                None,
+                            )
+                            if (
+                                len(compact_pages) == missing_chunks
+                                and transient_chunk_dev_ptrs is not None
+                                and transient_chunk_ptrs_npu is not None
+                                and callable(prepare_page_ptrs)
+                            ):
+                                pointer_started = (
+                                    serving_perf_now() if perf_enabled else 0.0
+                                )
+                                prepared_compact_ptrs = bool(
+                                    prepare_page_ptrs(
+                                        [
+                                            LayerPageSource(compact_pages, index)
+                                            for index in range(
+                                                self._num_layers_for_kv_group(kv_group)
+                                            )
+                                        ],
+                                        transient_chunk_dev_ptrs,
+                                        transient_chunk_ptrs_npu,
+                                        **(
+                                            {"defer_copy": True}
+                                            if kwargs.get(
+                                                "_defer_sparse_pointer_copy", False
+                                            )
+                                            else {}
+                                        ),
+                                    )
+                                )
+                                if (
+                                    npu_content_diagnostics_enabled()
+                                    and prepared_compact_ptrs
+                                ):
+                                    log_group1_pointer_table(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        kv_group=kv_group,
+                                        pages=compact_pages,
+                                        dev_ptr_rows=transient_chunk_dev_ptrs,
+                                        rank=self.metadata.worker_id,
+                                    )
+                                if pointer_started:
+                                    pointer_seal_s = (
+                                        serving_perf_now() - pointer_started
+                                    )
+                        elif len(envelope.handles) != missing_chunks:
+                            raise ValueError(
+                                "Sparse shared CPU passive received inconsistent "
+                                f"handle count at layer {layer_id}: "
+                                f"{len(envelope.handles)} != {missing_chunks}"
+                            )
+                    prepare_started = (
+                        serving_perf_now()
+                        if perf_enabled
+                        else 0.0
+                    )
+                    if not metadata_appended:
+                        metadata_appended = True
+                        self._fill_retrieve_mask(
+                            ret_mask,
+                            starts[cached_prefix_chunks:],
+                            ends[cached_prefix_chunks:],
+                            clear=False,
+                        )
+                        if cached_starts is not None:
+                            cached_starts.extend(starts[cached_metadata_chunks:])
+                        if cached_ends is not None:
+                            cached_ends.extend(ends[cached_metadata_chunks:])
+                        if cached_keys is not None:
+                            if not cached_keys:
+                                cached_keys.extend(
+                                    [] for _ in range(num_layers)
+                                )
+                            for cache_layer_id in range(num_layers):
+                                cached_keys[cache_layer_id].extend(
+                                    keys_layer_major[cache_layer_id][
+                                        cached_metadata_chunks:
+                                    ]
+                                )
+                    mem_objs_layer: list[MemoryObj] = []
+                    handles = (
+                        [None] * missing_chunks
+                        if compact_batch is not None
+                        else envelope.handles
+                    )
+                    try:
+                        for chunk_offset, handle in enumerate(
+                            handles[len(compact_pages) :], len(compact_pages)
+                        ):
+                            chunk_index = cached_prefix_chunks + chunk_offset
+                            expected_shape, expected_dtype, expected_fmt = (
+                                self._expected_shared_cpu_chunk_metadata(
+                                    kv_group=kv_group,
+                                    layer_id=layer_id,
+                                    num_tokens=int(
+                                        ends[chunk_index] - starts[chunk_index]
+                                    ),
+                                )
+                            )
+                            if compact_batch is not None:
+                                passive_allocator = (
+                                    self.shared_cpu_cache_passive_allocator
+                                )
+                                mem_obj = passive_allocator.create_batch_view(
+                                    compact_batch,
+                                    layer_id=layer_id,
+                                    chunk_index=chunk_offset,
+                                    shape=expected_shape,
+                                    dtype=expected_dtype,
+                                    fmt=expected_fmt,
+                                    cached_positions=range(
+                                        int(starts[chunk_index]),
+                                        int(ends[chunk_index]),
+                                    ),
+                                )
+                            else:
+                                mem_obj = (
+                                    self.shared_cpu_cache_passive_allocator.create_view(
+                                        handle,
+                                        expected_request_id=req_id,
+                                        expected_phase=phase,
+                                        expected_layer_id=layer_id,
+                                        expected_kv_group=kv_group,
+                                        expected_chunk_index=chunk_index,
+                                        expected_key=(
+                                            keys_layer_major[layer_id][chunk_index]
+                                        ),
+                                        expected_shape=expected_shape,
+                                        expected_dtype=expected_dtype,
+                                        expected_fmt=expected_fmt,
+                                        expected_cached_positions=range(
+                                            int(starts[chunk_index]),
+                                            int(ends[chunk_index]),
+                                        ),
+                                        expected_producer_rank=(
+                                            self.metadata.first_rank
+                                        ),
+                                    )
+                                )
+                            mem_objs_layer.append(mem_obj)
+                    except Exception:
+                        for mem_obj in reversed(mem_objs_layer):
+                            if mem_obj.is_valid():
+                                mem_obj.ref_count_down()
+                        raise
+                    try:
+                        source = (
+                            LayerPageSource(
+                                compact_pages,
+                                layer_id,
+                                tuple(mem_objs_layer),
+                            )
+                            if compact_pages
+                            else mem_objs_layer
+                        )
+                        if materialize_only or compact_pages:
+                            pending_materialized_layers.append(source)
+                        else:
+                            self._append_retrieve_layer_cache(
+                                layer_id,
+                                mem_objs_layer,
+                                cached_memory_objs,
+                                cached_tensors,
+                                cached_chunk_dev_ptrs,
+                                cached_chunk_ptrs_npu,
+                                num_layers=num_layers,
+                                kv_group=kv_group,
+                            )
+                    except Exception:
+                        for mem_obj in mem_objs_layer:
+                            if mem_obj.is_valid():
+                                mem_obj.ref_count_down()
+                        raise
+                    to_release.extend(mem_objs_layer)
+                    if compact_pages:
+                        legacy_tail_objects += len(mem_objs_layer)
+                    self._append_shared_handle_cache(
+                        layer_id,
+                        handles,
+                        cached_shared_handles,
+                        cached_prefix_chunks,
+                        kv_group=kv_group,
+                    )
+                    if perf_enabled:
+                        elapsed_s = serving_perf_now() - prepare_started
+                        prepare_count += 1
+                        prepare_sum_s += elapsed_s
+                        prepare_max_s = max(prepare_max_s, elapsed_s)
+
+                if prepare_only:
+                    sparse_request = yield ret_mask
+                    (
+                        sparse_payload,
+                        selected_tokens,
+                        token_start_index,
+                        target_slot_mapping,
+                        prepare_only,
+                        defer_finish,
+                    ) = _shared_sparse_request(sparse_request)
+                    if prepare_only:
+                        raise ValueError("Duplicate shared sparse prepare request")
+
+                dispatch_started = (
+                    serving_perf_now()
+                    if perf_enabled
+                    else 0.0
+                )
+                if sparse_payload is not None:
+                    sparse_payload["memory_objs_layer"] = source
+                    mem_obj_consumer.send(sparse_payload)
+                else:
+                    mem_obj_consumer.send(
+                        (
+                            source,
+                            selected_tokens,
+                            token_start_index,
+                            target_slot_mapping,
+                        )
+                    )
+                if perf_enabled:
+                    elapsed_s = serving_perf_now() - dispatch_started
+                    dispatch_count += 1
+                    dispatch_sum_s += elapsed_s
+                    dispatch_max_s = max(dispatch_max_s, elapsed_s)
+            if perf_enabled:
+                if prepare_count:
+                    serving_perf_log(
+                        logger,
+                        "passive_layer_prepare",
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        rank=self.metadata.worker_id,
+                        count=prepare_count,
+                        sum_ms=round(prepare_sum_s * 1000, 3),
+                        max_ms=round(prepare_max_s * 1000, 3),
+                        elapsed_ms=round(prepare_sum_s * 1000, 3),
+                    )
+                serving_perf_log(
+                    logger,
+                    "npu_layer_submit_cpu",
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    passive=True,
+                    count=dispatch_count,
+                    sum_ms=round(dispatch_sum_s * 1000, 3),
+                    max_ms=round(dispatch_max_s * 1000, 3),
+                    elapsed_ms=round(dispatch_sum_s * 1000, 3),
+                )
+            next(mem_obj_consumer)
+            if defer_finish:
+                yield ret_mask
+            if compact_batch is not None:
+                compact_final_receive_attempted = True
+                final_envelope = self._receive_matching_shared_envelope(
+                    req_id=req_id,
+                    phase=phase,
+                    request_ordinal=request_ordinal,
+                    layer_id=num_layers,
+                    kv_group=kv_group,
+                )
+                self._validate_shared_layerwise_envelope(
+                    final_envelope,
+                    req_id=req_id,
+                    phase=phase,
+                    request_ordinal=request_ordinal,
+                    layer_id=num_layers,
+                    kv_group=kv_group,
+                )
+                if (
+                    final_envelope.status != "skipped"
+                    or final_envelope.message
+                    != _SHARED_CPU_COMPACT_COMMIT_MESSAGE
+                ):
+                    raise ValueError(
+                        "Compact shared batch received an invalid final status: "
+                        f"status={final_envelope.status!r}, "
+                        f"message={final_envelope.message!r}"
+                    )
+            if pending_materialized_layers:
+                pointer_started = (
+                    serving_perf_now()
+                    if perf_enabled and compact_pages
+                    else 0.0
+                )
+                self._append_retrieve_group_cache(
+                    pending_materialized_layers,
+                    cached_memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                    transient_chunk_dev_ptrs if prepared_compact_ptrs else None,
+                    transient_chunk_ptrs_npu if prepared_compact_ptrs else None,
+                    kv_group=kv_group,
+                    defer_pointer_copy=bool(
+                        kwargs.get("_defer_sparse_pointer_copy", False)
+                    ),
+                )
+                if pointer_started:
+                    pointer_seal_ms = round(
+                        (
+                            pointer_seal_s
+                            + serving_perf_now()
+                            - pointer_started
+                        )
+                        * 1000,
+                        3,
+                    )
+                    serving_perf_log(
+                        logger,
+                        "passive_compact_materialize",
+                        started=pointer_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        rank=self.metadata.worker_id,
+                        physical_pages=len(compact_pages),
+                        logical_entries=missing_chunks
+                        * self._num_layers_for_kv_group(kv_group),
+                        legacy_tail_objects=legacy_tail_objects,
+                        page_view_build_ms=round(page_view_build_s * 1000, 3),
+                        pointer_seal_ms=pointer_seal_ms,
+                        total_materialize_ms=round(
+                            (serving_perf_now() - compact_materialize_started) * 1000,
+                            3,
+                        ),
+                        thread_cpu_ms=round(
+                            (time.thread_time_ns() - compact_materialize_thread_started)
+                            / 1e6,
+                            3,
+                        ),
+                    )
+            passive_views_handed_off = (
+                cached_memory_objs is not None and cached_keys is not None
+            )
+            append.commit()
+            yield ret_mask
+        finally:
+            if compact_batch is not None and not compact_final_receive_attempted:
+                compact_final_receive_attempted = True
+                try:
+                    self._receive_matching_shared_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=num_layers,
+                        kv_group=kv_group,
+                    )
+                except BaseException:
+                    logger.exception(
+                        "Failed to drain compact shared batch final sentinel "
+                        "during passive cleanup"
+                    )
+            if not passive_views_handed_off:
+                for mem_obj in to_release:
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
+            append.rollback()
+
+    def retrieve_layer_head_token_wise(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Retrieve sparse KV layers through the existing generator protocol.
+
+        A sealed ``prepared_sparse_source`` selects the metadata-free warm path.
+        Requests without one retain the full storage/shared-cache bootstrap path.
+        """
+        if kwargs.get("prepared_sparse_source") is not None:
+            yield from self._retrieve_prepared_sparse_layers(
+                tokens,
+                kwargs,
+            )
+            return
+        yield from self._retrieve_layer_head_token_wise_bootstrap(
+            tokens,
+            mask,
+            **kwargs,
+        )
+
+    def _retrieve_prepared_sparse_layers(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        retrieve_kwargs: dict[str, Any],
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Forward already-resolved source layers without cache-engine work."""
+        prepared_source: PreparedSparseSource = retrieve_kwargs[
+            "prepared_sparse_source"
+        ]
+        token_count = int(prepared_source.total_tokens)
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping sparse retrieve")
+            yield torch.zeros(token_count, dtype=torch.bool)
+            return
+
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve_layer operation"
+        )
+
+        ret_mask = retrieve_kwargs.get("ret_mask")
+        if ret_mask is None:
+            ret_mask = torch.zeros(token_count, dtype=torch.bool, device="cpu")
+
+        consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**retrieve_kwargs)
+        next(consumer)
+        try:
+            start_layer = int(retrieve_kwargs.get("prepared_start_layer", 0))
+            if not 0 <= start_layer < len(prepared_source.layers):
+                raise ValueError("prepared_start_layer is outside the source")
+            for _ in prepared_source.layers[start_layer:]:
+                sparse_request = yield ret_mask
+                consumer.send(sparse_request)
+            next(consumer)
+            yield ret_mask
+        finally:
+            consumer.close()
+
+    def _quarantine_failed_sparse_load(
+        self, memory_objs: List[MemoryObj], consumer: Any
+    ) -> None:
+        """Retain unfenced transfer inputs until the worker is restarted."""
+        # Generator locals and request-cache entries disappear during rollback.
+        # Keep a separate strong owner before either can be released. setdefault
+        # also preserves concurrent failing loads without an extra serving lock.
+        self.__dict__.setdefault("_failed_sparse_loads", []).append(
+            (tuple(memory_objs), consumer)
+        )
+        self.mark_init_failed(
+            "sparse load completion is unknown; buffers retained until worker restart"
+        )
+
+    def _retrieve_layer_head_token_wise_bootstrap(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        append = _SparseCacheAppend(kwargs)
+        kwargs["_sparse_cache_append"] = append
+        try:
+            yield from self._retrieve_layer_head_token_wise_bootstrap_impl(
+                tokens,
+                mask,
+                **kwargs,
+            )
+        finally:
+            append.rollback()
+
+    def _retrieve_layer_head_token_wise_bootstrap_impl(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """
+        Retrieve the KV cache in a layerwise manner.
+
+        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask will be all True for
+            sparse attention with chunk size 1
+
+        :param **kwargs: The additional arguments for the storage backend which
+            will be passed into the gpu_connector.
+
+        return: A generator that yields Optional[torch.Tensor]. The tensor will
+            be the boolean mask indicating which tokens are retrieved and will
+            only be returned in the last iteration. In the first iteration,
+            the generator retrieve the memory objects of the first layer from
+            the storage backends. In the next iterations, it moves the KV cache
+            of layer i from the memory objects (on CPU) to GPU and retrieves
+            the memory objects of layer i+1 from the storage backends. In the
+            last iteration, it moves the memory objects of the last layer to
+            the GPU.
+        """
+
+        # Health check: block operation if LMCache is unhealthy
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
+            yield torch.zeros(len(tokens), dtype=torch.bool)
+            return
+
+        kv_group = kwargs.get("kv_group", 0)
+        perf_enabled = serving_perf_enabled()
+        kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
+        direct_external_pages = bool(
+            kv_group == 1 and kwargs.get("direct_external_pages", False)
+        )
+        shared_sparse_retrieve, shared_retrieve_passive = (
+            self._cold_retrieve_collective_mode(kv_group, direct_external_pages)
+        )
+        if not (shared_sparse_retrieve and shared_retrieve_passive):
+            assert self.storage_manager is not None
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve_layer operation"
+        )
+        if shared_sparse_retrieve:
+            self._ensure_layerwise_connector_layout(**kwargs)
+        # Authoritative per-group transfer cardinality (GLM-5.2: 79 latent /
+        # 22 indexer), fail-closed against the per-group kvcaches list.
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
+
+        mem_obj_consumer = None
+        num_tokens = len(tokens)
+        metadata_warm = kwargs.get("_retrieve_metadata_warm", False)
+        ret_mask = kwargs.get("ret_mask")
+        if (
+            ret_mask is None
+            or ret_mask.numel() != num_tokens
+            or ret_mask.device.type != "cpu"
+        ):
+            ret_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
+            kwargs["ret_mask"] = ret_mask
+        elif not metadata_warm:
+            ret_mask.zero_()
+
+        initial_cached_memory_objs = kwargs.get("cached_memory_objs")
+        initial_cached_tensors = kwargs.get("cached_tensors")
+        has_shared_cached_retrieve = (
+            shared_sparse_retrieve
+            and self._has_retrieve_data_cache(
+                initial_cached_tensors,
+                initial_cached_memory_objs,
+                num_layers,
+            )
+        )
+        if has_shared_cached_retrieve:
+            kwargs["_use_cached_retrieve"] = True
+
+        if shared_sparse_retrieve and shared_retrieve_passive:
+            passive_kwargs = dict(kwargs)
+            passive_kwargs.pop("ret_mask", None)
+            yield from self._retrieve_layer_head_token_wise_shared_passive(
+                tokens,
+                mask,
+                ret_mask,
+                **passive_kwargs,
+            )
+            return
+
+        request_configs = kwargs.get("request_configs")
+
+        cached_keys = kwargs.get("cached_keys")
+        assert cached_keys is not None
+        assert isinstance(cached_keys, list)
+
+        cached_starts = kwargs.get("cached_starts")
+        assert cached_starts is not None
+        assert isinstance(cached_starts, list)
+
+        cached_ends = kwargs.get("cached_ends")
+        assert cached_ends is not None
+        assert isinstance(cached_ends, list)
+
+        cached_memory_objs = kwargs.get("cached_memory_objs")
+        cached_tensors = kwargs.get("cached_tensors")
+        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_shared_handles = kwargs.get("cached_shared_handles")
+        append: _SparseCacheAppend = kwargs["_sparse_cache_append"]
+        cached_prefix_chunks = self._cached_sparse_prefix_chunks(
+            cached_tensors,
+            cached_memory_objs,
+            kv_group=kv_group,
+        )
+
+        metadata_started = serving_perf_now() if perf_enabled else 0.0
+        location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+            cached_keys=cached_keys,
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+            ret_mask=ret_mask,
+            retrieve_kwargs=kwargs,
+        )
+        kwargs.pop("_use_cached_retrieve", None)
+        required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "metadata_prepare",
+                started=metadata_started,
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get(
+                    "shared_cpu_phase",
+                    "sparse_decode_bootstrap",
+                ),
+                kv_group=kv_group,
+                layers=len(retrieve_keys),
+                chunks=required_chunks,
+                metadata_mode=kwargs.get("_retrieve_metadata_mode", "unknown"),
+                rank=self.metadata.worker_id,
+                passive=False,
+            )
+        if cached_prefix_chunks > required_chunks:
+            raise ValueError(
+                "Sparse retrieve cached prefix exceeds current metadata: "
+                f"cached_chunks={cached_prefix_chunks}, "
+                f"required_chunks={required_chunks}"
+            )
+        cached_tensors_cover = self._retrieve_data_cache_covers(
+            cached_tensors,
+            num_layers,
+            required_chunks,
+        )
+        cached_memory_objs_cover = self._retrieve_data_cache_covers(
+            cached_memory_objs,
+            num_layers,
+            required_chunks,
+        )
+        use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
+        missing_keys = [
+            layer_keys[cached_prefix_chunks:]
+            for layer_keys in retrieve_keys
+        ]
+        exact_locations_value = kwargs.get(_REMOTE_FILL_EXACT_LOCATIONS_KEY)
+        remote_fill_exact_locations = (
+            list(exact_locations_value)
+            if cached_prefix_chunks == 0
+            and isinstance(exact_locations_value, (list, tuple))
+            and len(exact_locations_value) == required_chunks
+            and all(
+                location == LOCAL_CPU_BACKEND_NAME
+                for location in exact_locations_value
+            )
+            else None
+        )
+        direct_group1_pages = bool(
+            direct_external_pages
+            and remote_fill_exact_locations is None
+            and not use_cached_retrieve
+            and cached_prefix_chunks == 0
+            and mooncake_layer_pages_enabled(self.config)
+            and missing_keys
+            and missing_keys[0]
+            and all(len(layer) == len(missing_keys[0]) for layer in missing_keys)
+        )
+        direct_group1_load = False
+        if direct_group1_pages:
+            direct_group1_load = self._try_direct_indexer_page_load(
+                req_id=kwargs.get("req_id", "unspecified"),
+                keys_layer_major=missing_keys,
+                starts=starts,
+                ends=ends,
+                retrieve_kwargs=kwargs,
+            )
+
+        cached_handle_chunks = 0
+        if shared_sparse_retrieve:
+            cached_handle_chunks = self._uniform_layer_cache_chunks(
+                cached_shared_handles,
+                num_layers,
+                "shared handle cache",
+            )
+            if cached_handle_chunks > cached_prefix_chunks:
+                raise ValueError(
+                    "Sparse shared handle cache exceeds the materialized prefix: "
+                    f"handles={cached_handle_chunks}, "
+                    f"cached_chunks={cached_prefix_chunks}"
+                )
+            if (
+                cached_prefix_chunks < required_chunks
+                and cached_handle_chunks != cached_prefix_chunks
+            ):
+                raise ValueError(
+                    "Sparse shared prefix extension requires complete cached "
+                    f"handles: handles={cached_handle_chunks}, "
+                    f"cached_chunks={cached_prefix_chunks}"
+                )
+        publish_shared_handles = (
+            shared_sparse_retrieve
+            and not shared_retrieve_passive
+            and cached_handle_chunks < required_chunks
+        )
+
+        if use_cached_retrieve:
+            location = self._resolve_local_cpu_retrieve_location(location)
+            if location is not None:
+                kwargs["cached_retrieve_location"] = location
+
+        if not retrieve_keys:
+            retrieve_keys = [[] for _ in range(num_layers)]
+        elif len(retrieve_keys) < num_layers:
+            retrieve_keys.extend(
+                [] for _ in range(num_layers - len(retrieve_keys))
+            )
+
+        assert_layerwise_gpu_connector(self.gpu_connector)
+
+        get_generator = None
+
+        if cached_tensors_cover and cached_tensors is not None:
+            kwargs["cached_tensors"] = cached_tensors
+            if cached_chunk_dev_ptrs is not None:
+                kwargs["cached_chunk_dev_ptrs"] = cached_chunk_dev_ptrs
+            if cached_chunk_ptrs_npu is not None:
+                kwargs["cached_chunk_ptrs_npu"] = cached_chunk_ptrs_npu
+
+        cached_mem_layers = (
+            cached_memory_objs
+            if cached_memory_objs_cover
+            and cached_memory_objs is not None
+            and len(cached_memory_objs) == num_layers
+            else None
+        )
+        shared_chunk_locations_layer_major: list[list[str]] = []
+        pre_resolved_shared_mem_layers: Optional[List[List[MemoryObj]]] = None
+        layer_page_chunks = 0
+        prefetched_layer_page_cache = False
+        cached_layer_page_chunks = kwargs.get("_cached_layer_page_chunks", 0)
+        try:
+            cached_layer_page_chunks = int(cached_layer_page_chunks or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Cached layer-page chunk count must be an integer."
+            ) from exc
+        if cached_layer_page_chunks:
+            if (
+                cached_layer_page_chunks < 0
+                or cached_layer_page_chunks > required_chunks
+                or cached_mem_layers is None
+                or not use_cached_retrieve
+            ):
+                raise ValueError(
+                    "Cached layer-page layout does not cover the current "
+                    "retrieve metadata: "
+                    f"page_chunks={cached_layer_page_chunks}, "
+                    f"required_chunks={required_chunks}, "
+                    f"cached={cached_mem_layers is not None}."
+                )
+            layer_page_chunks = cached_layer_page_chunks
+            prefetched_layer_page_cache = True
+        local_prefix_layers: List[Optional[LocalCPUPrefixGetResult]] = []
+        request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        preflight_error_envelope: Optional[SharedHandleEnvelope] = None
+        preflight_error: Optional[BaseException] = None
+        request_preflight_state = kwargs.get("shared_cpu_request_preflight_state")
+
+        def release_pre_resolved_shared_mem_layers() -> None:
+            nonlocal pre_resolved_shared_mem_layers
+            if pre_resolved_shared_mem_layers is None:
+                return
+            unique = {
+                id(obj): obj
+                for layer in pre_resolved_shared_mem_layers
+                for obj in layer
+            }
+            for mem_obj in reversed(unique.values()):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if getattr(mem_obj, "is_valid", lambda: True)():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release pre-resolved shared sparse "
+                        "MemoryObj after request-level preflight failure"
+                    )
+            pre_resolved_shared_mem_layers = None
+
+        def release_local_prefix_layers() -> None:
+            for local_prefix in reversed(local_prefix_layers):
+                if local_prefix is None:
+                    continue
+                try:
+                    local_prefix.release()
+                except Exception:
+                    logger.exception(
+                        "Failed to release LocalCPU prefix after shared sparse "
+                        "request preflight failure"
+                    )
+            local_prefix_layers.clear()
+
+        def record_request_preflight_error() -> None:
+            if (
+                not isinstance(request_preflight_state, dict)
+                or preflight_error_envelope is None
+                or preflight_error is None
+            ):
+                return
+            request_preflight_state.setdefault(
+                "source_kv_group",
+                kv_group,
+            )
+            request_preflight_state.setdefault(
+                "source_layer_id",
+                preflight_error_envelope.layer_id,
+            )
+            request_preflight_state.setdefault(
+                "message",
+                preflight_error_envelope.message,
+            )
+            request_preflight_state.setdefault(
+                "details",
+                preflight_error_envelope.error_details,
+            )
+            request_preflight_state.setdefault("error", preflight_error)
+
+        def request_preflight_failed_elsewhere() -> bool:
+            return (
+                isinstance(request_preflight_state, dict)
+                and "error" in request_preflight_state
+                and request_preflight_state.get("source_kv_group") != kv_group
+            )
+
+        def make_request_preflight_error_envelope() -> SharedHandleEnvelope:
+            assert isinstance(request_preflight_state, dict)
+            source_kv_group = request_preflight_state.get("source_kv_group")
+            message = (
+                "Shared CPU sparse decode request preflight failed before "
+                "any handle publication."
+            )
+            return self._shared_layerwise_error_envelope(
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                request_ordinal=request_ordinal,
+                layer_id=0,
+                kv_group=kv_group,
+                message=message,
+                details={
+                    "source_kv_group": source_kv_group,
+                    "source_layer_id": request_preflight_state.get(
+                        "source_layer_id"
+                    ),
+                    "source_message": request_preflight_state.get("message"),
+                    "source_details": request_preflight_state.get("details"),
+                },
+            )
+
+        if direct_group1_pages and not direct_group1_load:
+            (
+                pre_resolved_shared_mem_layers,
+                layer_page_chunks,
+            ) = self._resolve_shared_rank0_layer_pages(
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                kv_group=kv_group,
+                keys_layer_major=missing_keys,
+                page_chunks=len(missing_keys[0]),
+            )
+            if npu_content_diagnostics_enabled() and layer_page_chunks:
+                log_shared_page_source_fingerprint(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    kv_group=kv_group,
+                    pages=pre_resolved_shared_mem_layers[0][
+                        :layer_page_chunks
+                    ],
+                    chunk_starts=starts,
+                    rank=self.metadata.worker_id,
+                    passive=False,
+                )
+
+        sampled_worker_retrieve = self._use_sampled_worker_retrieve(kv_group)
+        remote_layers_per_batch = max(
+            1,
+            min(
+                num_layers,
+                int(
+                    self._get_shared_config_value(
+                        "shared_cpu_remote_layers_per_batch",
+                        1,
+                    )
+                ),
+            ),
+        )
+        if mooncake_page_layout_enabled(self.config):
+            remote_layers_per_batch = num_layers
+        if (
+            shared_sparse_retrieve
+            and not use_cached_retrieve
+            and any(missing_keys)
+        ):
+            probe_started = (
+                serving_perf_now() if perf_enabled else 0.0
+            )
+            missing_locations: list[tuple[int, int]] = []
+            if remote_fill_exact_locations is not None:
+                shared_chunk_locations_layer_major = [
+                    list(remote_fill_exact_locations) for _ in missing_keys
+                ]
+            elif sampled_worker_retrieve:
+                local_cpu_backend = self._shared_local_cpu_backend()
+                try:
+                    local_pages = 0
+                    if mooncake_layer_pages_enabled(self.config):
+                        local_pages, _ = (
+                            self.storage_manager.batched_contains_layer_pages(
+                                missing_keys[0], [LOCAL_CPU_BACKEND_NAME]
+                            )
+                        )
+                    # Whole pages already prove all layer locations. Probe
+                    # legacy keys only beyond that prefix; the resolver still
+                    # acquires and validates the actual source objects.
+                    probe_keys = (
+                        [keys[local_pages:] for keys in missing_keys]
+                        if local_pages else missing_keys
+                    )
+                    batched_prefix_get = getattr(
+                        local_cpu_backend,
+                        "batched_get_prefixes_with_misses",
+                        None,
+                    )
+                    if callable(batched_prefix_get):
+                        local_prefix_layers.extend(batched_prefix_get(probe_keys))
+                        if len(local_prefix_layers) != len(missing_keys):
+                            raise ValueError(
+                                "Shared CPU batched local-prefix lookup returned "
+                                "an unexpected layer count: "
+                                f"expected={len(missing_keys)}, "
+                                f"got={len(local_prefix_layers)}"
+                            )
+                    else:
+                        # Compatibility with LMCache versions that predate the
+                        # cross-layer LocalCPU prefix API.
+                        local_prefix_layers.extend(
+                            local_cpu_backend.batched_get_prefix_with_misses(
+                                layer_keys
+                            )
+                            for layer_keys in probe_keys
+                        )
+                    for local_prefix in local_prefix_layers:
+                        layer_locations = [LOCAL_CPU_BACKEND_NAME] * (
+                            local_pages + len(local_prefix.local_memory_objs)
+                        ) + ["RemoteBackend"] * len(local_prefix.remote_positions)
+                        shared_chunk_locations_layer_major.append(layer_locations)
+                except Exception:
+                    release_local_prefix_layers()
+                    raise
+            else:
+                for layer_id, layer_keys in enumerate(missing_keys):
+                    layer_locations: list[str] = []
+                    for chunk_index, key in enumerate(layer_keys):
+                        key_location = self._find_shared_rank0_chunk_location(key)
+                        if key_location is None:
+                            missing_locations.append((layer_id, chunk_index))
+                            key_location = ""
+                        layer_locations.append(key_location)
+                    shared_chunk_locations_layer_major.append(layer_locations)
+            if perf_enabled:
+                local_chunks = sum(
+                    location == LOCAL_CPU_BACKEND_NAME
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                remote_chunks = sum(
+                    location == "RemoteBackend"
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                unresolved_chunks = sum(
+                    not location
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                serving_perf_log(
+                    logger,
+                    "location_probe",
+                    started=probe_started,
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase",
+                        "sparse_decode_bootstrap",
+                    ),
+                    kv_group=kv_group,
+                    layers=len(missing_keys),
+                    chunks=sum(len(layer) for layer in missing_keys),
+                    missing=unresolved_chunks,
+                    local_chunks=local_chunks,
+                    remote_chunks=remote_chunks,
+                    unresolved_chunks=unresolved_chunks,
+                    sampled=sampled_worker_retrieve,
+                    storage_probe_skipped=(
+                        remote_fill_exact_locations is not None
+                    ),
+                )
+            page_first_locations = (
+                self._shared_page_first_common_prefix_plan(
+                    shared_chunk_locations_layer_major
+                )
+                if mooncake_page_layout_enabled(self.config)
+                else None
+            )
+            if page_first_locations is not None:
+                shared_chunk_locations_layer_major = page_first_locations
+            if missing_locations:
+                message = (
+                    "Shared CPU sparse decode missing required chunks before "
+                    "rank0 materialization."
+                )
+                preflight_error_envelope = self._shared_layerwise_error_envelope(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap"),
+                    request_ordinal=request_ordinal,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    message=message,
+                    details={
+                        "missing_locations": missing_locations,
+                        "failed_layer_id": missing_locations[0][0],
+                    },
+                )
+                preflight_error = ValueError(
+                    f"{message} missing={missing_locations}"
+                )
+                record_request_preflight_error()
+            else:
+                try:
+                    capacity_started = (
+                        serving_perf_now()
+                        if perf_enabled
+                        else 0.0
+                    )
+                    capacity_check: Callable[..., dict[str, Any]] = (
+                        self._shared_cpu_runtime_capacity_details
+                    )
+                    if remote_fill_exact_locations is not None:
+                        capacity_check = lambda **_kwargs: {
+                            "fits": True,
+                            "missing_chunk_count": 0,
+                        }
+                    capacity_details = capacity_check(
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase", "sparse_decode_bootstrap"
+                        ),
+                        kv_group=kv_group,
+                        keys_layer_major=missing_keys,
+                        chunk_locations_layer_major=(
+                            shared_chunk_locations_layer_major
+                        ),
+                        token_count=len(tokens),
+                        chunk_token_lengths=[
+                            int(end - start)
+                            for start, end in zip(
+                                starts[cached_prefix_chunks:],
+                                ends[cached_prefix_chunks:],
+                                strict=False,
+                            )
+                        ],
+                    )
+                    if perf_enabled:
+                        serving_perf_log(
+                            logger,
+                            "capacity_preflight",
+                            started=capacity_started,
+                            req_id=kwargs.get("req_id", "unspecified"),
+                            phase=kwargs.get(
+                                "shared_cpu_phase",
+                                "sparse_decode_bootstrap",
+                            ),
+                            kv_group=kv_group,
+                            fits=capacity_details.get("fits"),
+                            missing_chunks=capacity_details.get(
+                                "missing_chunk_count"
+                            ),
+                            required_bytes=capacity_details.get(
+                                "required_bytes"
+                            ),
+                            available_bytes=capacity_details.get(
+                                "available_after_eviction"
+                            ),
+                            skipped=(remote_fill_exact_locations is not None),
+                        )
+                except Exception:
+                    release_local_prefix_layers()
+                    raise
+                if not capacity_details.get("fits", False):
+                    message = (
+                        "Shared CPU sparse decode capacity check failed before "
+                        "rank0 materialization."
+                    )
+                    preflight_error_envelope = self._shared_layerwise_error_envelope(
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase", "sparse_decode_bootstrap"
+                        ),
+                        request_ordinal=request_ordinal,
+                        layer_id=0,
+                        kv_group=kv_group,
+                        message=message,
+                        details=capacity_details,
+                    )
+                    preflight_error = ValueError(
+                        f"{message} details={capacity_details}"
+                    )
+                    release_local_prefix_layers()
+                    record_request_preflight_error()
+                else:
+                    pre_resolved_shared_mem_layers = []
+                    try:
+                        page_chunks = len(missing_keys[0])
+                        if (
+                            mooncake_layer_pages_enabled(self.config)
+                            and page_chunks
+                        ):
+                            release_local_prefix_layers()
+                            materialize_started = (
+                                serving_perf_now() if perf_enabled else 0.0
+                            )
+                            materialize_thread_started = (
+                                time.thread_time_ns() if perf_enabled else 0
+                            )
+                            (
+                                pre_resolved_shared_mem_layers,
+                                layer_page_chunks,
+                            ) = self._resolve_shared_rank0_layer_pages(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase", "sparse_decode_bootstrap"
+                                ),
+                                kv_group=kv_group,
+                                keys_layer_major=missing_keys,
+                                page_chunks=page_chunks,
+                                exact_chunk_locations=(
+                                    remote_fill_exact_locations
+                                ),
+                            )
+                            if perf_enabled:
+                                serving_perf_log(
+                                    logger,
+                                    "rank0_page_materialize",
+                                    started=materialize_started,
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    kv_group=kv_group,
+                                    pages=layer_page_chunks,
+                                    remote_fill_plan_reused=(
+                                        remote_fill_exact_locations is not None
+                                    ),
+                                    thread_cpu_ms=round(
+                                        (
+                                            time.thread_time_ns()
+                                            - materialize_thread_started
+                                        )
+                                        / 1e6,
+                                        3,
+                                    ),
+                                )
+                            if (
+                                npu_content_diagnostics_enabled()
+                                and layer_page_chunks
+                            ):
+                                log_shared_page_source_fingerprint(
+                                    req_id=kwargs.get(
+                                        "req_id", "unspecified"
+                                    ),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    kv_group=kv_group,
+                                    pages=pre_resolved_shared_mem_layers[0][
+                                        :layer_page_chunks
+                                    ],
+                                    chunk_starts=starts[cached_prefix_chunks:],
+                                    rank=self.metadata.worker_id,
+                                    passive=False,
+                                )
+                        elif page_first_locations is not None:
+                            prefixes = None
+                            if local_prefix_layers:
+                                if any(
+                                    prefix is None for prefix in local_prefix_layers
+                                ):
+                                    raise ValueError(
+                                        "Page-first LocalCPU prefix is incomplete"
+                                    )
+                                prefixes = [
+                                    prefix
+                                    for prefix in local_prefix_layers
+                                    if prefix is not None
+                                ]
+                            pre_resolved_shared_mem_layers = (
+                                self._resolve_shared_rank0_page_first_layers(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    kv_group=kv_group,
+                                    keys_layer_major=missing_keys,
+                                    local_prefix_layers=prefixes,
+                                )
+                            )
+                            release_local_prefix_layers()
+                        elif remote_layers_per_batch > 1 and all(
+                            location == "RemoteBackend"
+                            for layer in shared_chunk_locations_layer_major
+                            for location in layer
+                        ):
+                            release_local_prefix_layers()
+                            pre_resolved_shared_mem_layers = (
+                                self._resolve_shared_rank0_remote_layers_windowed(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    kv_group=kv_group,
+                                    keys_layer_major=missing_keys,
+                                    layers_per_batch=remote_layers_per_batch,
+                                )
+                            )
+                        else:
+                            for layer_id, layer_keys in enumerate(missing_keys):
+                                if sampled_worker_retrieve:
+                                    local_prefix = local_prefix_layers[layer_id]
+                                    assert local_prefix is not None
+                                    # The resolver consumes every retained local
+                                    # reference, whether it succeeds or raises.
+                                    local_prefix_layers[layer_id] = None
+                                    mem_objs_layer = (
+                                        self._resolve_shared_rank0_layer_mem_objs(
+                                            req_id=kwargs.get(
+                                                "req_id", "unspecified"
+                                            ),
+                                            phase=kwargs.get(
+                                                "shared_cpu_phase",
+                                                "sparse_decode_bootstrap",
+                                            ),
+                                            layer_id=layer_id,
+                                            kv_group=kv_group,
+                                            keys_layer=layer_keys,
+                                            local_prefix=local_prefix,
+                                        )
+                                    )
+                                else:
+                                    mem_objs_layer = (
+                                        self._resolve_shared_rank0_layer_mem_objs(
+                                            req_id=kwargs.get(
+                                                "req_id", "unspecified"
+                                            ),
+                                            phase=kwargs.get(
+                                                "shared_cpu_phase",
+                                                "sparse_decode_bootstrap",
+                                            ),
+                                            layer_id=layer_id,
+                                            kv_group=kv_group,
+                                            keys_layer=layer_keys,
+                                            chunk_locations=(
+                                                shared_chunk_locations_layer_major[
+                                                    layer_id
+                                                ]
+                                            ),
+                                        )
+                                    )
+                                pre_resolved_shared_mem_layers.append(
+                                    mem_objs_layer
+                                )
+                        release_local_prefix_layers()
+                    except Exception as exc:
+                        failed_layer_id = len(pre_resolved_shared_mem_layers)
+                        release_pre_resolved_shared_mem_layers()
+                        release_local_prefix_layers()
+                        message = (
+                            "Shared CPU sparse decode rank0 materialization failed "
+                            "before any handle publication."
+                        )
+                        preflight_error_envelope = (
+                            self._shared_layerwise_error_envelope(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase",
+                                    "sparse_decode_bootstrap",
+                                ),
+                                request_ordinal=request_ordinal,
+                                layer_id=0,
+                                kv_group=kv_group,
+                                message=message,
+                                details={
+                                    "error": str(exc),
+                                    "location": location,
+                                    "failed_layer_id": failed_layer_id,
+                                },
+                            )
+                        )
+                        preflight_error = ValueError(
+                            f"{message} error={exc}"
+                        )
+                        record_request_preflight_error()
+
+        if (
+            not use_cached_retrieve
+            and not shared_sparse_retrieve
+            and not direct_group1_load
+            and pre_resolved_shared_mem_layers is None
+        ):
+            get_generator = self.storage_manager.layerwise_batched_get(
+                missing_keys, location=location
+            )
+
+        if preflight_error_envelope is None and request_preflight_failed_elsewhere():
+            release_pre_resolved_shared_mem_layers()
+            release_local_prefix_layers()
+            preflight_error_envelope = make_request_preflight_error_envelope()
+            preflight_error = ValueError(
+                "Shared CPU sparse decode request preflight failed before "
+                "handle publication: "
+                f"source_kv_group="
+                f"{request_preflight_state.get('source_kv_group')}, "
+                f"message={request_preflight_state.get('message')}"
+            )
+
+        group_cache_prepared = False
+        compact_handle_batch: Optional[SharedHandleBatch] = None
+        compact_publish_mem_objs: Optional[List[List[MemoryObj]]] = None
+        if (
+            preflight_error_envelope is None
+            and pre_resolved_shared_mem_layers is not None
+            and not use_cached_retrieve
+            and cached_prefix_chunks < required_chunks
+        ):
+            if perf_enabled:
+                group_cache_started = source_view_started = serving_perf_now()
+                group_cache_thread_started = time.thread_time_ns()
+                handle_batch_ms = handle_cache_append_ms = 0.0
+
+                def elapsed_ms(started: float) -> float:
+                    return round((serving_perf_now() - started) * 1000, 3)
+
+                def thread_cpu_ms(started: int) -> float:
+                    return round((time.thread_time_ns() - started) / 1_000_000, 3)
+            try:
+                page_sources = (
+                    [
+                        LayerPageSource(
+                            tuple(
+                                pre_resolved_shared_mem_layers[0][
+                                    :layer_page_chunks
+                                ]
+                            ),
+                            layer_id,
+                            tuple(layer[layer_page_chunks:]),
+                        )
+                        for layer_id, layer in enumerate(
+                            pre_resolved_shared_mem_layers
+                        )
+                    ]
+                    if layer_page_chunks
+                    else pre_resolved_shared_mem_layers
+                )
+                if perf_enabled:
+                    source_view_ms = elapsed_ms(source_view_started)
+                    group_cache_append_started = serving_perf_now()
+                    group_cache_append_thread_started = time.thread_time_ns()
+                self._append_retrieve_group_cache(
+                    page_sources,
+                    cached_memory_objs,
+                    cached_tensors,
+                    cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu,
+                    kv_group=kv_group,
+                    defer_pointer_copy=bool(
+                        kwargs.get("_defer_sparse_pointer_copy", False)
+                    ),
+                )
+                if perf_enabled:
+                    group_cache_append_ms = elapsed_ms(group_cache_append_started)
+                    group_cache_append_thread_cpu_ms = thread_cpu_ms(
+                        group_cache_append_thread_started
+                    )
+                group_cache_prepared = True
+                if publish_shared_handles:
+                    if perf_enabled:
+                        handle_batch_started = serving_perf_now()
+                    compact_handle_batch = self._make_shared_handle_batch(
+                        pre_resolved_shared_mem_layers,
+                        missing_keys,
+                        kv_group=kv_group,
+                    )
+                    if perf_enabled:
+                        handle_batch_ms = elapsed_ms(handle_batch_started)
+                    if compact_handle_batch is not None:
+                        if perf_enabled:
+                            handle_cache_started = serving_perf_now()
+                        if cached_memory_objs is None:
+                            raise ValueError(
+                                "Compact shared publication requires retained "
+                                "MemoryObjs."
+                            )
+                        compact_publish_mem_objs = []
+                        for layer_id in range(num_layers):
+                            publish_mem_objs = cached_memory_objs[layer_id][
+                                cached_handle_chunks:
+                            ]
+                            if (
+                                len(publish_mem_objs)
+                                != compact_handle_batch.num_chunks
+                            ):
+                                raise ValueError(
+                                    "Compact shared publication has incomplete "
+                                    f"layer coverage: layer={layer_id}, "
+                                    f"objects={len(publish_mem_objs)}, "
+                                    f"chunks={compact_handle_batch.num_chunks}"
+                                )
+                            compact_publish_mem_objs.append(publish_mem_objs)
+                            self._append_shared_handle_cache(
+                                layer_id,
+                                [None] * len(publish_mem_objs),
+                                cached_shared_handles,
+                                cached_handle_chunks,
+                                kv_group=kv_group,
+                            )
+                        # These objects were visible in a storage backend before
+                        # this request pinned them.  They have no producer work
+                        # on store_stream, so fencing it would wait for unrelated
+                        # requests without strengthening publication ordering.
+                        if perf_enabled:
+                            handle_cache_append_ms = elapsed_ms(
+                                handle_cache_started
+                            )
+                if perf_enabled:
+                    serving_perf_log(
+                        logger,
+                        "rank0_group_cache_prepare",
+                        started=group_cache_started,
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        kv_group=kv_group,
+                        chunks=required_chunks - cached_prefix_chunks,
+                        remote_fill_plan_reused=(
+                            remote_fill_exact_locations is not None
+                        ),
+                        source_view_ms=source_view_ms,
+                        group_cache_append_ms=group_cache_append_ms,
+                        group_cache_append_thread_cpu_ms=(
+                            group_cache_append_thread_cpu_ms
+                        ),
+                        handle_batch_ms=handle_batch_ms,
+                        handle_cache_append_ms=handle_cache_append_ms,
+                        total_thread_cpu_ms=thread_cpu_ms(
+                            group_cache_thread_started
+                        ),
+                    )
+            except Exception as exc:
+                if not shared_sparse_retrieve:
+                    release_pre_resolved_shared_mem_layers()
+                    raise
+                message = (
+                    "Shared CPU sparse all-layer pointer preflight failed "
+                    "before handle publication."
+                )
+                preflight_error_envelope = self._shared_layerwise_error_envelope(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    request_ordinal=request_ordinal,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    message=message,
+                    details={"error": str(exc)},
+                )
+                preflight_error = ValueError(f"{message} error={exc}")
+                record_request_preflight_error()
+
+        if (
+            preflight_error_envelope is None
+            and prefetched_layer_page_cache
+            and publish_shared_handles
+        ):
+            try:
+                if cached_handle_chunks != 0:
+                    raise ValueError(
+                        "Prefetched layer pages require an empty shared-handle "
+                        "cache before compact publication."
+                    )
+                assert cached_mem_layers is not None
+                compact_handle_batch = self._make_shared_handle_batch(
+                    cached_mem_layers,
+                    retrieve_keys,
+                    kv_group=kv_group,
+                )
+                if compact_handle_batch is None:
+                    raise ValueError(
+                        "Prefetched layer pages cannot be represented by one "
+                        "compact shared-handle batch."
+                    )
+                if (
+                    len(compact_handle_batch.page_offsets)
+                    != layer_page_chunks
+                ):
+                    raise ValueError(
+                        "Prefetched layer-page marker does not match the "
+                        "validated compact batch: "
+                        f"marker={layer_page_chunks}, "
+                        f"batch_pages={len(compact_handle_batch.page_offsets)}."
+                    )
+                if cached_memory_objs is None:
+                    raise ValueError(
+                        "Compact shared publication requires retained MemoryObjs."
+                    )
+                compact_publish_mem_objs = []
+                for layer_id in range(self._num_layers_for_kv_group(kv_group)):
+                    publish_mem_objs = cached_memory_objs[layer_id]
+                    if len(publish_mem_objs) != compact_handle_batch.num_chunks:
+                        raise ValueError(
+                            "Prefetched compact publication has incomplete "
+                            f"layer coverage: layer={layer_id}, "
+                            f"objects={len(publish_mem_objs)}, "
+                            f"chunks={compact_handle_batch.num_chunks}"
+                        )
+                    compact_publish_mem_objs.append(publish_mem_objs)
+                    self._append_shared_handle_cache(
+                        layer_id,
+                        [None] * len(publish_mem_objs),
+                        cached_shared_handles,
+                    )
+                self._fence_shared_cpu_store_publication()
+            except Exception as exc:
+                message = (
+                    "Prefetched shared CPU layer-page preflight failed before "
+                    "handle publication."
+                )
+                preflight_error_envelope = self._shared_layerwise_error_envelope(
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    request_ordinal=request_ordinal,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    message=message,
+                    details={"error": str(exc)},
+                )
+                preflight_error = ValueError(f"{message} error={exc}")
+                record_request_preflight_error()
+
+        if preflight_error_envelope is not None:
+            release_pre_resolved_shared_mem_layers()
+            release_local_prefix_layers()
+            # Compact preflight can append placeholder handle entries before a
+            # later layer exposes incomplete coverage.  This branch executes
+            # before the main generator try/finally below, so restore every
+            # append-only cache to its entry snapshot explicitly.
+            append.rollback()
+            yield ret_mask
+            self._broadcast_shared_envelope(preflight_error_envelope)
+            assert preflight_error is not None
+            raise preflight_error
+
+        pending_pre_resolved_release: List[MemoryObj] = []
+        if (
+            pre_resolved_shared_mem_layers is not None
+            and not use_cached_retrieve
+        ):
+            pending_pre_resolved_release = list(
+                {
+                    id(obj): obj
+                    for layer in pre_resolved_shared_mem_layers
+                    for obj in layer
+                }.values()
+            )
+
+        def release_pending_pre_resolved() -> None:
+            nonlocal pending_pre_resolved_release
+            for mem_obj in pending_pre_resolved_release:
+                if getattr(mem_obj, "is_pinned", False):
+                    mem_obj.unpin()
+                if mem_obj.is_valid():
+                    mem_obj.ref_count_down()
+            pending_pre_resolved_release = []
+
+        published_cached_shared_mem_objs: List[MemoryObj] = []
+        cached_publication_handed_off = False
+        shared_store_publication_ready = compact_handle_batch is not None
+        compact_batch_published = False
+        compact_final_status_attempted = False
+        compact_final_status_sent = False
+        existing_rank0_backing_ids = (
+            self.shared_cpu_rank0_request_object_ids(
+                kwargs.get("req_id"),
+                int(kwargs.get("kv_group", 0) or 0),
+            )
+            if publish_shared_handles and cached_mem_layers is not None
+            else set()
+        )
+
+        def claim_cached_shared_mem_objs_for_publication(
+            mem_objs_layer: List[MemoryObj],
+        ) -> None:
+            """Take the request pin/ref needed by rank0 handle publication."""
+            for mem_obj in mem_objs_layer:
+                if id(mem_obj) in existing_rank0_backing_ids:
+                    continue
+                try:
+                    mem_obj.ref_count_up()
+                except Exception as exc:
+                    raise ValueError(
+                        "Shared CPU sparse decode cached MemoryObj cannot be "
+                        "retained before handle publication."
+                    ) from exc
+                try:
+                    pinned = mem_obj.pin()
+                    if pinned is False:
+                        raise ValueError("MemoryObj.pin() returned False")
+                except Exception:
+                    try:
+                        if getattr(mem_obj, "is_valid", lambda: True)():
+                            mem_obj.ref_count_down()
+                    except Exception:
+                        logger.exception(
+                            "Failed to release cached shared MemoryObj after "
+                            "publication pin failure"
+                        )
+                    raise
+                published_cached_shared_mem_objs.append(mem_obj)
+
+        def release_unowned_cached_publication_objs() -> None:
+            if cached_publication_handed_off:
+                return
+            for mem_obj in reversed(published_cached_shared_mem_objs):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if getattr(mem_obj, "is_valid", lambda: True)():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release cached shared MemoryObj after "
+                        "handle publication failure"
+                    )
+            published_cached_shared_mem_objs.clear()
+
+        sparse_memory_objs_notified = False
+        backend_fetched_objs: List[MemoryObj] = []
+
+        def ensure_mem_obj_consumer():
+            nonlocal mem_obj_consumer, sparse_memory_objs_notified
+            if mem_obj_consumer is not None:
+                return mem_obj_consumer
+            mem_obj_consumer = (
+                self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+            )
+            notify_fn = getattr(
+                self.gpu_connector,
+                "notify_sparse_memory_objs_updated",
+                None,
+            )
+            if (
+                notify_fn is not None
+                and not use_cached_retrieve
+                and not sparse_memory_objs_notified
+            ):
+                notify_fn()
+                sparse_memory_objs_notified = True
+            next(mem_obj_consumer)
+            return mem_obj_consumer
+
+        def release_failed_backend_results() -> None:
+            """Fence failed NPU submissions before dropping backend owners."""
+            if not backend_fetched_objs:
+                if mem_obj_consumer is not None:
+                    try:
+                        mem_obj_consumer.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close sparse bootstrap consumer after "
+                            "retrieval failure"
+                        )
+                return
+            if mem_obj_consumer is not None:
+                synchronize = getattr(
+                    self.gpu_connector,
+                    "synchronize_dense_load_stream",
+                    None,
+                )
+                try:
+                    fenced = False
+                    if callable(synchronize):
+                        synchronize()
+                        fenced = True
+                    else:
+                        load_stream = getattr(
+                            self.gpu_connector, "load_stream", None
+                        )
+                        stream_synchronize = getattr(
+                            load_stream, "synchronize", None
+                        )
+                        if callable(stream_synchronize):
+                            stream_synchronize()
+                            fenced = True
+                    if not fenced:
+                        self._quarantine_failed_sparse_load(
+                            backend_fetched_objs, mem_obj_consumer
+                        )
+                        logger.critical(
+                            "Aborted sparse prefix load has no NPU stream "
+                            "fence API; retaining backend MemoryObjs until worker restart"
+                        )
+                        return
+                except BaseException:
+                    # Retaining the owners is safer than freeing storage while
+                    # an NPU DMA may still be reading it.
+                    self._quarantine_failed_sparse_load(
+                        backend_fetched_objs, mem_obj_consumer
+                    )
+                    logger.critical(
+                        "Failed to fence an aborted sparse prefix load; "
+                        "retaining backend MemoryObjs until worker restart",
+                        exc_info=True,
+                    )
+                    return
+                try:
+                    mem_obj_consumer.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to close sparse bootstrap consumer after "
+                        "retrieval failure"
+                    )
+            unique = {id(mem_obj): mem_obj for mem_obj in backend_fetched_objs}
+            for mem_obj in reversed(unique.values()):
+                try:
+                    if getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
+                except Exception:
+                    logger.exception(
+                        "Failed to release sparse bootstrap backend object "
+                        "after retrieval failure"
+                    )
+            backend_fetched_objs.clear()
+
+        def attempt_compact_final_error(error: BaseException) -> None:
+            nonlocal compact_final_status_attempted, compact_final_status_sent
+            if not compact_batch_published or compact_final_status_attempted:
+                return
+            compact_final_status_attempted = True
+            try:
+                self._broadcast_shared_envelope(
+                    self._shared_layerwise_error_envelope(
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase", "sparse_decode_bootstrap"
+                        ),
+                        request_ordinal=request_ordinal,
+                        layer_id=num_layers,
+                        kv_group=kv_group,
+                        message="Compact shared batch failed before final commit.",
+                        details={"error": str(error)},
+                    )
+                )
+                compact_final_status_sent = True
+            except BaseException:
+                logger.exception(
+                    "Failed to broadcast compact shared batch final error sentinel"
+                )
+
+        defer_finish = False
+        dispatch_count = 0
+        dispatch_sum_s = dispatch_max_s = 0.0
+        if (
+            kv_hash_enabled()
+            and self.metadata.is_first_rank()
+            and not direct_group1_load
+            and not self._force_layerwise_prefill_store
+        ):
+            hash_rows = (
+                cached_memory_objs
+                if self._retrieve_data_cache_covers(
+                    cached_memory_objs, num_layers, len(starts)
+                )
+                else pre_resolved_shared_mem_layers
+            )
+            if hash_rows is not None:
+                trace = getattr(self.gpu_connector, "trace_cpu_kv", None)
+                if callable(trace):
+                    trace("D_CPU", kwargs.get("req_id", "unspecified"), kv_group,
+                          starts, ends, hash_rows, mirror=True)
+                submit_kv_hash(
+                    "D",
+                    kwargs.get("req_id", "unspecified"),
+                    kv_group,
+                    starts,
+                    ends,
+                    hash_rows,
+                    int(self.config.chunk_size),
+                    feature_mode=getattr(
+                        self.gpu_connector, "uses_token_byte_features", False
+                    ),
+                )
+            elif not getattr(self.gpu_connector, "uses_token_byte_features", False):
+                skip_kv_hash(
+                    "D", kwargs.get("req_id", "unspecified"), kv_group, "no_cpu_sources"
+                )
+        try:
+            for layer_id in range(num_layers):
+                sparse_request = yield ret_mask
+                (
+                    sparse_payload,
+                    selected_tokens,
+                    token_start_index,
+                    target_slot_mapping,
+                    prepare_only,
+                    defer_finish,
+                ) = _shared_sparse_request(sparse_request)
+
+                if (
+                    shared_sparse_retrieve
+                    and (not use_cached_retrieve or publish_shared_handles)
+                    and request_preflight_failed_elsewhere()
+                ):
+                    release_pending_pre_resolved()
+                    pre_resolved_shared_mem_layers = None
+                    error_envelope = make_request_preflight_error_envelope()
+                    if not compact_batch_published:
+                        self._broadcast_shared_envelope(error_envelope)
+                    raise ValueError(
+                        "Shared CPU sparse decode request preflight failed "
+                        "before handle publication: "
+                        f"source_kv_group="
+                        f"{request_preflight_state.get('source_kv_group')}, "
+                        f"message={request_preflight_state.get('message')}"
+                    )
+
+                if direct_group1_load:
+                    mem_objs_layer = []
+                elif cached_mem_layers is not None:
+                    mem_objs_layer = cached_mem_layers[layer_id]
+                elif use_cached_retrieve:
+                    mem_objs_layer = []
+                else:
+                    if pre_resolved_shared_mem_layers is not None:
+                        mem_objs_layer = pre_resolved_shared_mem_layers[layer_id]
+                    else:
+                        assert get_generator is not None
+                        task = next(get_generator)
+                        assert task is not None
+                        mem_objs_layer = task.result()
+                        if mem_objs_layer is not None:
+                            backend_fetched_objs.extend(mem_objs_layer)
+                    expected_missing_chunks = (
+                        required_chunks - cached_prefix_chunks
+                    )
+                    retrieved_chunks = (
+                        len(mem_objs_layer)
+                        if mem_objs_layer is not None
+                        else 0
+                    )
+                    if retrieved_chunks != expected_missing_chunks:
+                        # Metadata lookup already filled ret_mask, but a
+                        # backend short read means those tokens are not safe
+                        # to expose. Fail before submitting any stale/missing
+                        # row to the model-visible cache. Pre-resolved shared
+                        # objects are released by the generator's common
+                        # finally path; direct backend results are owned here.
+                        raise RuntimeError(
+                            "Layerwise sparse retrieve returned incomplete "
+                            "layer data; refusing the prefix success mask: "
+                            f"req_id={kwargs.get('req_id', 'unspecified')}, "
+                            f"kv_group={kv_group}, layer_id={layer_id}, "
+                            f"expected_chunks={expected_missing_chunks}, "
+                            f"retrieved_chunks={retrieved_chunks}"
+                        )
+                    if mem_objs_layer is not None and not group_cache_prepared:
+                        if cached_prefix_chunks < required_chunks:
+                            self._append_retrieve_layer_cache(
+                                layer_id,
+                                mem_objs_layer,
+                                cached_memory_objs,
+                                cached_tensors,
+                                cached_chunk_dev_ptrs,
+                                cached_chunk_ptrs_npu,
+                                num_layers=num_layers,
+                                kv_group=kv_group,
+                            )
+                    elif mem_objs_layer is None:
+                        mem_objs_layer = []
+
+                source = (
+                    LayerPageSource(
+                        tuple(mem_objs_layer[:layer_page_chunks]),
+                        layer_id,
+                        tuple(mem_objs_layer[layer_page_chunks:]),
+                    )
+                    if layer_page_chunks
+                    else mem_objs_layer
+                )
+
+                if publish_shared_handles and (
+                    compact_handle_batch is None or layer_id == 0
+                ):
+                    publish_mem_objs = (
+                        compact_publish_mem_objs[layer_id]
+                        if compact_publish_mem_objs is not None
+                        else cached_memory_objs[layer_id][cached_handle_chunks:]
+                        if cached_memory_objs is not None
+                        and len(cached_memory_objs) > layer_id
+                        else []
+                    )
+                    if required_chunks and not publish_mem_objs:
+                        message = (
+                            "Shared CPU sparse decode has no MemoryObjs to "
+                            "publish for required chunks."
+                        )
+                        if not compact_batch_published:
+                            self._broadcast_shared_envelope(
+                                self._shared_layerwise_error_envelope(
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    phase=kwargs.get(
+                                        "shared_cpu_phase",
+                                        "sparse_decode_bootstrap",
+                                    ),
+                                    request_ordinal=request_ordinal,
+                                    layer_id=layer_id,
+                                    kv_group=kv_group,
+                                    message=message,
+                                    details={"required_chunks": required_chunks},
+                                )
+                            )
+                        raise ValueError(message)
+                    try:
+                        if not shared_store_publication_ready:
+                            # Store generators normally synchronize each layer
+                            # before storage publication. Reassert that contract
+                            # at the cross-rank publication boundary so handles
+                            # can never outrun a direct-to-host store.
+                            self._fence_shared_cpu_store_publication()
+                            shared_store_publication_ready = True
+                        if (
+                            cached_mem_layers is not None
+                            and not prefetched_layer_page_cache
+                        ):
+                            claim_cached_shared_mem_objs_for_publication(
+                                publish_mem_objs
+                            )
+                        handles = (
+                            [None] * len(publish_mem_objs)
+                            if compact_handle_batch is not None
+                            else self._make_shared_handles_for_layer(
+                                req_id=kwargs.get("req_id", "unspecified"),
+                                phase=kwargs.get(
+                                    "shared_cpu_phase", "sparse_decode_bootstrap"
+                                ),
+                                keys_layer=retrieve_keys[layer_id][
+                                    cached_handle_chunks:
+                                ],
+                                mem_objs_layer=publish_mem_objs,
+                                layer_id=layer_id,
+                                kv_group=kv_group,
+                                chunk_index_base=cached_handle_chunks,
+                                validate_memory_objs=(
+                                    pre_resolved_shared_mem_layers is None
+                                ),
+                            )
+                        )
+                        if compact_handle_batch is None:
+                            self._append_shared_handle_cache(
+                                layer_id,
+                                handles,
+                                cached_shared_handles,
+                                cached_handle_chunks,
+                                kv_group=kv_group,
+                            )
+                        envelope = SharedHandleEnvelope(
+                            request_id=kwargs.get("req_id", "unspecified"),
+                            phase=kwargs.get(
+                                "shared_cpu_phase", "sparse_decode_bootstrap"
+                            ),
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            status="ok" if handles else "skipped",
+                            generation=self.shared_cpu_cache_generation,
+                            handles=[] if compact_handle_batch is not None else handles,
+                            message=(
+                                None
+                                if handles
+                                else "no sparse decode shared CPU cache chunks selected"
+                            ),
+                            batch=(
+                                compact_handle_batch
+                                if layer_id == 0
+                                else None
+                            ),
+                        )
+                    except Exception as exc:
+                        message = (
+                            "Shared CPU sparse decode rank0 handle publication "
+                            "failed."
+                        )
+                        if not compact_batch_published:
+                            try:
+                                self._broadcast_shared_envelope(
+                                    self._shared_layerwise_error_envelope(
+                                        req_id=kwargs.get("req_id", "unspecified"),
+                                        phase=kwargs.get(
+                                            "shared_cpu_phase",
+                                            "sparse_decode_bootstrap",
+                                        ),
+                                        request_ordinal=request_ordinal,
+                                        layer_id=layer_id,
+                                        kv_group=kv_group,
+                                        message=message,
+                                        details={
+                                            "error": str(exc),
+                                            "required_chunks": required_chunks,
+                                        },
+                                    )
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to broadcast shared CPU sparse decode "
+                                    "handle-publication error envelope"
+                                )
+                        raise
+                    if compact_handle_batch is None or layer_id == 0:
+                        self._broadcast_shared_envelope(envelope)
+                        if compact_handle_batch is not None:
+                            compact_batch_published = True
+
+                if prepare_only:
+                    sparse_request = yield ret_mask
+                    (
+                        sparse_payload,
+                        selected_tokens,
+                        token_start_index,
+                        target_slot_mapping,
+                        prepare_only,
+                        defer_finish,
+                    ) = _shared_sparse_request(sparse_request)
+                    if prepare_only:
+                        raise ValueError("Duplicate shared sparse prepare request")
+
+                dispatch_started = (
+                    serving_perf_now()
+                    if perf_enabled
+                    else 0.0
+                )
+                if direct_group1_load:
+                    pass
+                elif sparse_payload is not None:
+                    sparse_payload["memory_objs_layer"] = source
+                    ensure_mem_obj_consumer().send(sparse_payload)
+                else:
+                    ensure_mem_obj_consumer().send(
+                        (
+                            source,
+                            selected_tokens,
+                            token_start_index,
+                            target_slot_mapping,
+                        )
+                    )
+                if perf_enabled:
+                    elapsed_s = serving_perf_now() - dispatch_started
+                    dispatch_count += 1
+                    dispatch_sum_s += elapsed_s
+                    dispatch_max_s = max(dispatch_max_s, elapsed_s)
+
+            if perf_enabled:
+                serving_perf_log(
+                    logger,
+                    "npu_layer_submit_cpu",
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    passive=False,
+                    count=dispatch_count,
+                    sum_ms=round(dispatch_sum_s * 1000, 3),
+                    max_ms=round(dispatch_max_s * 1000, 3),
+                    elapsed_ms=round(dispatch_sum_s * 1000, 3),
+                )
+
+            if mem_obj_consumer is not None:
+                next(mem_obj_consumer)
+            if defer_finish:
+                yield ret_mask
+            if compact_handle_batch is not None:
+                compact_final_status_attempted = True
+                self._broadcast_shared_envelope(
+                    SharedHandleEnvelope(
+                        request_id=kwargs.get("req_id", "unspecified"),
+                        phase=kwargs.get(
+                            "shared_cpu_phase", "sparse_decode_bootstrap"
+                        ),
+                        request_ordinal=request_ordinal,
+                        layer_id=num_layers,
+                        kv_group=kv_group,
+                        status="skipped",
+                        generation=self.shared_cpu_cache_generation,
+                        handles=[],
+                        message=_SHARED_CPU_COMPACT_COMMIT_MESSAGE,
+                    )
+                )
+                compact_final_status_sent = True
+            if compact_handle_batch is not None and not compact_final_status_sent:
+                raise RuntimeError("Compact shared batch final status was not sent.")
+            # The LMCache vLLM adapter records request state after this final
+            # yield and drains sparse retrievers with close(), so ownership must
+            # be handed off before yielding.
+            cached_publication_handed_off = cached_memory_objs is not None
+            if cached_publication_handed_off:
+                pending_pre_resolved_release = []
+            else:
+                release_pending_pre_resolved()
+            append.commit()
+
+            yield ret_mask
+        except Exception as exc:
+            attempt_compact_final_error(exc)
+            raise
+        finally:
+            attempt_compact_final_error(
+                GeneratorExit("compact shared batch generator exited")
+            )
+            if not append.committed:
+                release_failed_backend_results()
+            release_unowned_cached_publication_objs()
+            release_pending_pre_resolved()
+            append.rollback()
 
     @torch.inference_mode()
     def store(
@@ -489,7 +10487,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         if self._is_passive():
-            logger.debug(f"rank={self.metadata.worker_id} ignore store")
+            logger.debug("rank=%s ignore store", self.metadata.worker_id)
             return
 
         assert self.storage_manager is not None
@@ -558,8 +10556,1155 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         # lmcache-ascend end ---------------------
 
+    def _remote_fill_group1_startup_identity(
+        self,
+        layout: RemoteFillDecoderLayout,
+        payload_descriptor: dict[str, object],
+    ) -> dict[str, object]:
+        """Return the rank-local Group-1 shared-page ABI identity."""
+
+        shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+            kv_group=1,
+            num_tokens=1,
+        )
+        group = layout.group(1)
+        if (
+            dtype != group.dtype
+            or fmt != group.fmt
+            or int(shape.numel())
+            != (
+                group.layer_token_dims[0]
+                if group.layer_token_dims
+                else group.raw_token_dim
+            )
+        ):
+            raise ValueError(
+                "remote-fill Group-1 shared-page metadata disagrees with "
+                "the negotiated decoder layout: "
+                f"shape={tuple(shape)}, elements={int(shape.numel())}, "
+                f"dtype={dtype}, format={fmt.name}, "
+                f"negotiated_elements={group.raw_token_dim}, "
+                f"negotiated_dtype={group.dtype}, "
+                f"negotiated_format={group.fmt.name}"
+            )
+        return {
+            "model_layout": "mla-dsa-layer-page-v3",
+            "layout_tag": layout.layout_tag,
+            "cache_namespace_tag": layout.cache_namespace_tag,
+            "model_artifact_id": layout.model_artifact_id,
+            "payload_layout_version": int(payload_descriptor.get("version", 0)),
+            "group1_payload_schema": str(
+                payload_descriptor.get("group1_schema_version", "")
+            ),
+            "dsa_index_key_schema": DSA_INDEX_CACHE_SCHEMA,
+            "num_layers": layout.num_layers_for_group(1),
+            "valid_tokens": 1,
+            "shape": [int(dimension) for dimension in shape],
+            "dtype": str(dtype),
+            "format": fmt.name,
+            "logical_bytes": group.expected_bytes(1, layout.num_layers_for_group(1)),
+            "shared_cache_generation": int(self.shared_cpu_cache_generation),
+        }
+
+    def _validate_remote_fill_decoder_layout(
+        self,
+        layout: RemoteFillDecoderLayout,
+    ) -> None:
+        """Match both negotiated groups to the model-visible cache layout."""
+
+        layer_groups = tuple(
+            getattr(
+                getattr(self.metadata, "kv_layer_groups_manager", None),
+                "kv_layer_groups",
+                (),
+            )
+        )
+        if layer_groups and len(layer_groups) != 2:
+            raise ValueError(
+                "remote-fill requires exactly two registered decoder cache "
+                f"groups, found {len(layer_groups)}"
+            )
+
+        for kv_group in (0, 1):
+            shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+                kv_group=kv_group,
+                num_tokens=1,
+            )
+            group = layout.group(kv_group)
+            registered_layers = (
+                layer_groups[kv_group].num_layers if layer_groups else None
+            )
+            if (
+                registered_layers is not None
+                and registered_layers != layout.num_layers_for_group(kv_group)
+            ):
+                raise ValueError(
+                    "remote-fill requires registered cache-bearing layer "
+                    "coverage for both groups: "
+                    f"kv_group={kv_group}, "
+                    f"registered_layers={registered_layers}, "
+                    f"negotiated_layers={layout.num_layers_for_group(kv_group)}"
+                )
+            if (
+                dtype != group.dtype
+                or fmt != group.fmt
+                or int(shape.numel())
+                != (
+                    group.layer_token_dims[0]
+                    if group.layer_token_dims
+                    else group.raw_token_dim
+                )
+            ):
+                raise ValueError(
+                    "remote-fill negotiated group layout disagrees with "
+                    "decoder cache metadata: "
+                    f"kv_group={kv_group}, "
+                    f"decoder_shape={tuple(shape)}, "
+                    f"decoder_elements_per_token={int(shape.numel())}, "
+                    f"decoder_dtype={dtype}, decoder_format={fmt.name}, "
+                    f"negotiated_elements_per_token={group.raw_token_dim}, "
+                    f"negotiated_dtype={group.dtype}, "
+                    f"negotiated_format={group.fmt.name}"
+                )
+
+    def _preflight_remote_fill_shared_group1(
+        self,
+        layout: RemoteFillDecoderLayout,
+        payload_descriptor: dict[str, object],
+    ) -> None:
+        """Prove every TP rank can map one real Group-1 layer page.
+
+        This collective is startup-only. Rank 0 allocates and pins a hidden
+        one-token page, broadcasts its compact shared-slab descriptor, and
+        every passive rank creates and validates its ordinary passive view.
+        Every rank then participates in one CPU-group boolean consensus. The
+        remote-fill service is advertised only after every rank succeeds.
+        """
+
+        if self.metadata.world_size <= 1:
+            self._remote_fill_shared_group1_supported = True
+            return
+        first_rank = int(self.metadata.first_rank)
+        worker_id = int(self.metadata.worker_id)
+        ranks = tuple(
+            range(first_rank, first_rank + int(self.metadata.world_size))
+        )
+        if worker_id not in ranks:
+            raise ValueError("remote-fill worker rank is outside its TP group")
+
+        rank0_page: Optional[LayerPageMemoryObj] = None
+        rank0_pinned = False
+        payload: Optional[dict[str, object]] = None
+        if self.metadata.is_first_rank():
+            try:
+                local_backend = self._shared_local_cpu_backend()
+                group = layout.group(1)
+                pages = local_backend.batched_allocate_layer_pages(
+                    group.page_shapes(layout.chunk_size),
+                    [group.dtype] * len(group.page_shapes(layout.chunk_size)),
+                    1,
+                    layout.num_layers_for_group(1),
+                    group.fmt,
+                    busy_loop=False,
+                    valid_tokens=[1],
+                    full_tokens=layout.chunk_size,
+                    eviction=False,
+                )
+                if pages is None or len(pages) != 1:
+                    if pages:
+                        for page in pages:
+                            page.ref_count_down()
+                    raise MemoryError(
+                        "remote-fill Group-1 startup page allocation failed"
+                    )
+                rank0_page = pages[0]
+                if not LayerPageMemoryObj.pin_many([rank0_page]):
+                    raise MemoryError("remote-fill Group-1 startup page pin failed")
+                rank0_pinned = True
+                if (
+                    rank0_page.num_layers != layout.num_layers_for_group(1)
+                    or rank0_page.valid_tokens != 1
+                    or rank0_page.get_size()
+                    != group.expected_bytes(1, layout.num_layers_for_group(1))
+                    or rank0_page.get_dtype() != group.dtype
+                    or rank0_page.get_memory_format() != group.fmt
+                ):
+                    raise ValueError(
+                        "remote-fill Group-1 startup allocation layout mismatch"
+                    )
+                self._validate_rank0_shared_mem_obj(
+                    rank0_page,
+                    req_id="remote-fill-startup",
+                    phase="group1-capability",
+                    layer_id=0,
+                    kv_group=1,
+                    chunk_index=0,
+                )
+                startup_key = CacheEngineKey(
+                    layout.model_name,
+                    layout.key_world_size,
+                    0,
+                    0,
+                    group.dtype,
+                    {
+                        "lmcache.tag.payload_v3": layout.layout_tag,
+                        DSA_INDEX_CACHE_SCHEMA_TAG: DSA_INDEX_CACHE_SCHEMA,
+                    },
+                    kv_group=1,
+                )
+                keys = [[startup_key] for _ in range(layout.num_layers_for_group(1))]
+                batch = self._make_shared_handle_batch(
+                    [[rank0_page] for _ in range(layout.num_layers_for_group(1))],
+                    keys,
+                    kv_group=1,
+                )
+                if batch is None:
+                    raise ValueError(
+                        "remote-fill Group-1 startup page cannot be shared"
+                    )
+                payload = {
+                    "status": "ok",
+                    "identity": self._remote_fill_group1_startup_identity(
+                        layout,
+                        payload_descriptor,
+                    ),
+                    "key": startup_key.to_string(),
+                    "batch": batch.to_dict(),
+                }
+            except Exception as exc:
+                payload = {
+                    "status": "error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+
+        passive_views: list[MemoryObj] = []
+        try:
+            received = self.broadcast_object_fn(payload, first_rank)
+            if self.metadata.is_first_rank():
+                received = payload
+            local_ack: dict[str, object] = {
+                "rank": worker_id,
+                "status": "error",
+                "message": "startup payload was not validated",
+            }
+            try:
+                if not isinstance(received, dict):
+                    raise ValueError("startup payload is not a dictionary")
+                if received.get("status") != "ok":
+                    raise ValueError(
+                        "rank0 Group-1 capability setup failed: "
+                        f"{received.get('message')}"
+                    )
+                expected_identity = self._remote_fill_group1_startup_identity(
+                    layout,
+                    payload_descriptor,
+                )
+                if received.get("identity") != expected_identity:
+                    raise ValueError(
+                        "remote-fill Group-1 startup ABI identity mismatch"
+                    )
+                key_raw = received.get("key")
+                batch_raw = received.get("batch")
+                if not isinstance(key_raw, str) or not isinstance(batch_raw, dict):
+                    raise ValueError("startup shared-page descriptor is incomplete")
+                startup_key = CacheEngineKey.from_string(key_raw)
+                if (
+                    startup_key.kv_group != 1
+                    or startup_key.worker_id != 0
+                    or startup_key.model_name != layout.model_name
+                    or startup_key.world_size != layout.key_world_size
+                    or startup_key.dtype != layout.group(1).dtype
+                ):
+                    raise ValueError("startup shared-page key identity is invalid")
+                batch = SharedHandleBatch.from_dict(batch_raw)
+                if self.metadata.is_first_rank():
+                    if rank0_page is None:
+                        raise ValueError("rank0 startup page owner is missing")
+                    if (
+                        batch.num_layers != layout.num_layers_for_group(1)
+                        or batch.num_chunks != 1
+                        or batch.page_offsets != [int(rank0_page.metadata.address)]
+                        or batch.physical_sizes != [rank0_page.layer_size_bytes(0)]
+                        or batch.page_physical_sizes
+                        != [int(rank0_page.metadata.phy_size)]
+                    ):
+                        raise ValueError("rank0 startup shared descriptor is invalid")
+                else:
+                    views = self._make_passive_layer_page_views(
+                        batch,
+                        starts=[0],
+                        ends=[1],
+                        keys_layer_major=[
+                            [startup_key] for _ in range(layout.num_layers_for_group(1))
+                        ],
+                        kv_group=1,
+                    )
+                    passive_views.extend(views)
+                    if len(views) != 1:
+                        raise ValueError(
+                            "passive Group-1 startup mapping returned wrong count"
+                        )
+                    view = views[0]
+                    shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+                        kv_group=1,
+                        num_tokens=1,
+                    )
+                    if (
+                        view.num_layers != layout.num_layers_for_group(1)
+                        or view.valid_tokens != 1
+                        or view.get_shape() != shape
+                        or view.get_dtype() != dtype
+                        or view.get_memory_format() != fmt
+                        or view.get_size()
+                        != layout.group(1).expected_bytes(
+                            1, layout.num_layers_for_group(1)
+                        )
+                        or int(view.metadata.address) != batch.page_offsets[0]
+                        or int(view.metadata.phy_size) != batch.page_physical_sizes[0]
+                    ):
+                        raise ValueError(
+                            "passive Group-1 startup page validation failed"
+                        )
+                local_ack = {"rank": worker_id, "status": "ok", "message": ""}
+            except Exception as exc:
+                local_ack = {
+                    "rank": worker_id,
+                    "status": "error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+
+            collective = getattr(self, "collective_all_true_fn", None)
+            if not callable(collective):
+                raise ValueError(
+                    "remote-fill Group-1 startup lacks TP consensus callback"
+                )
+            all_ranks_ready = bool(collective(local_ack["status"] == "ok"))
+            if not all_ranks_ready:
+                local_message = str(local_ack.get("message") or "")
+                detail = (
+                    f"rank={worker_id} error={local_message}"
+                    if local_ack["status"] != "ok"
+                    else "another TP rank rejected the shared page"
+                )
+                raise ValueError(
+                    "remote-fill Group-1 shared startup capability failed: "
+                    + detail
+                )
+            self._remote_fill_shared_group1_supported = True
+        finally:
+            self._release_shared_retrieve_objs(passive_views, unpin=False)
+            if rank0_page is not None:
+                if rank0_pinned and rank0_page.is_pinned:
+                    rank0_page.unpin()
+                if rank0_page.is_valid():
+                    rank0_page.ref_count_down()
+
+    def _initialize_decoder_remote_fill(self) -> None:
+        if self._remote_fill_decoder_initialized:
+            return
+        if not bool(self.config.enable_remote_lmcache_store):
+            return
+        if self.metadata.role == "scheduler" or self.config.pd_role == "sender":
+            return
+        configured_control_host = self.config.remote_fill_control_host
+        configured_control_port = self.config.remote_fill_control_port_start
+        is_decoder = self.config.pd_role == "receiver" or bool(
+            configured_control_host or configured_control_port is not None
+        )
+        if not is_decoder:
+            return
+        control_host = str(configured_control_host or "0.0.0.0").strip()
+        base_port = int(
+            configured_control_port or REMOTE_FILL_DEFAULT_CONTROL_PORT
+        )
+        if not (self.save_only_first_rank and self.save_indexer_only_first_rank):
+            raise ValueError(
+                "remote-fill decoder requires TP0 ownership for both DSA groups"
+            )
+        tp_shared = self.metadata.world_size > 1
+        if tp_shared and not (
+            self.enable_shared_cpu_cache and self.shared_cpu_cache_strict
+        ):
+            raise ValueError(
+                "remote-fill TP>1 decoder requires strict shared LocalCPU storage"
+            )
+        if tp_shared and self.shared_cpu_cache_generation <= 0:
+            raise ValueError(
+                "remote-fill TP>1 decoder requires a completed shared-cache preflight"
+            )
+        if not control_host:
+            raise ValueError("remote-fill decoder control bind host is empty")
+        layout_tag, payload_descriptor = mooncake_payload_layout(
+            self.config,
+            self.metadata,
+        )
+        layout = build_decoder_layout(
+            self.config,
+            self.metadata,
+            layout_tag=layout_tag,
+            num_layers=int(self.num_layers),
+        )
+        self._validate_remote_fill_decoder_layout(layout)
+        shared_group1 = not self._persistent_direct_hbm_split_group_enabled()
+        if tp_shared and shared_group1:
+            self._preflight_remote_fill_shared_group1(
+                layout,
+                payload_descriptor,
+            )
+        if not self.metadata.is_first_rank():
+            if self.shared_cpu_cache_mapping is None:
+                raise ValueError(
+                    "remote-fill passive rank lacks the shared-cache mapping"
+                )
+            self._remote_fill_decoder_initialized = True
+            return
+        if self.storage_manager is None:
+            raise ValueError("remote-fill decoder requires StorageManager on TP0")
+        extra = self.metadata.kv_connector_extra_config or {}
+        dp_rank = int(extra.get("lmcache_remote_fill_destination_dp_rank", 0))
+        dp_size = int(extra.get("lmcache_remote_fill_destination_dp_size", 1))
+        control_port = _validate_remote_fill_control_port(
+            int(base_port),
+            dp_rank,
+            dp_size,
+            internal_api_enabled=bool(
+                getattr(self.config, "internal_api_server_enabled", False)
+            ),
+            internal_api_port_start=int(
+                getattr(self.config, "internal_api_server_port_start", 6999)
+            ),
+        )
+        native_session = self.storage_manager.get_remote_fill_destination_session()
+        if not native_session:
+            raise ValueError(
+                "remote-fill decoder requires a registered GlobalTE session"
+            )
+        control_advertise_host = str(
+            getattr(self.config, "remote_fill_control_advertise_host", None)
+            or _remote_fill_advertise_host_from_session(native_session)
+        ).strip()
+        local_backend = self._shared_local_cpu_backend()
+        if not callable(getattr(local_backend, "get_allocator_capacity_bytes", None)):
+            raise ValueError(
+                "remote-fill decoder requires constant-time LocalCPU capacity"
+            )
+        if shared_group1 and not self._remote_fill_shared_group1_supported:
+            raise ValueError("remote-fill Group-1 shared capability is unavailable")
+        epoch = secrets.randbits(63) or 1
+        runtime = create_decoder_remote_fill_runtime(
+            config=self.config,
+            metadata=self.metadata,
+            local_backend=local_backend,
+            layout=layout,
+            destination_engine_epoch=epoch,
+            destination_dp_rank=dp_rank,
+            destination_dp_size=dp_size,
+            destination_remote_session=native_session,
+            control_host=control_host,
+            control_advertise_host=control_advertise_host,
+            control_port=control_port,
+            shared_cache_generation=int(self.shared_cpu_cache_generation),
+            capacity_available=self._remote_fill_capacity_available,
+            capacity_reclaimer=self._remote_fill_reclaim_capacity,
+            fatal_restart=self._remote_fill_require_paired_restart,
+            global_te_push=True,
+            save_only_first_rank=self.save_only_first_rank,
+            save_indexer_only_first_rank=self.save_indexer_only_first_rank,
+            shared_cpu_cache_strict=self.shared_cpu_cache_strict,
+            chunk_hash_type=self.token_database.chunk_hash_type,
+            chunk_hash_bytes=self.token_database.chunk_hash_bytes,
+            shared_group1=shared_group1,
+        )
+        try:
+            runtime.start()
+            if not runtime.available:
+                raise RuntimeError(
+                    "remote-fill decoder control service exited during startup"
+                )
+        except Exception:
+            try:
+                runtime.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close remote-fill runtime after startup failure"
+                )
+            raise
+        self._remote_fill_runtime = runtime
+        self._remote_fill_decoder_initialized = True
+        logger.info(
+            "Remote-fill decoder service started: feature_enabled=%s "
+            "transport_qualified=%s cache_namespace=%s model_artifact_id=%s "
+            "control_endpoint=%s destination_engine_epoch=%d "
+            "destination_dp_rank=%d shared_cache_generation=%d "
+            "group0_dim=%d group1_dim=%d tp_size=%d dp_size=%d "
+            "source_hash_identity=%s:%s",
+            True,
+            True,
+            layout.cache_namespace_tag,
+            layout.model_artifact_id,
+            runtime.placement.control_endpoint,
+            runtime.placement.destination_engine_epoch,
+            dp_rank,
+            self.shared_cpu_cache_generation,
+            layout.groups[0].raw_token_dim,
+            layout.groups[1].raw_token_dim,
+            self.metadata.world_size,
+            dp_size,
+            runtime.placement.token_hash_algorithm,
+            runtime.placement.python_hash_seed,
+        )
+
+    def _remote_fill_capacity_available(self, requested_bytes: int) -> bool:
+        if requested_bytes < 0:
+            return False
+        try:
+            free_bytes, heap_bytes = (
+                self._shared_local_cpu_backend().get_allocator_capacity_bytes()
+            )
+        except (NotImplementedError, RuntimeError):
+            return False
+        reserve = max(
+            int(self.config.remote_fill_min_free_bytes),
+            int(heap_bytes * float(self.config.remote_fill_min_free_ratio)),
+        )
+        return free_bytes - requested_bytes >= reserve
+
+    def _remote_fill_reclaim_capacity(self, requested_bytes: int) -> bool:
+        if requested_bytes < 0:
+            return False
+        reclaim = getattr(
+            self._shared_local_cpu_backend(),
+            "reclaim_evictable_capacity",
+            None,
+        )
+        if not callable(reclaim):
+            return False
+        return bool(
+            reclaim(
+                requested_bytes,
+                min_free_bytes=int(self.config.remote_fill_min_free_bytes),
+                min_free_ratio=float(self.config.remote_fill_min_free_ratio),
+                num_layers=getattr(self.metadata, "runtime_kv_group_layer_counts", None)
+                or self.num_layers,
+                cause="remote_fill_capacity_reclaim",
+            )
+        )
+
+    def _remote_fill_require_paired_restart(
+        self,
+        transfer_ids: tuple[str, ...],
+    ) -> None:
+        normalized = tuple(sorted({item for item in transfer_ids if item}))
+        if not normalized:
+            return
+        lock = getattr(self, "_remote_fill_fatal_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._remote_fill_fatal_lock = lock
+        with lock:
+            previous = self._remote_fill_fatal_transfers
+            self._remote_fill_fatal_transfers = tuple(
+                sorted(set(previous).union(normalized))
+            )
+            first_report = not previous
+        if first_report:
+            self.mark_init_failed(
+                "remote-fill armed transfer requires paired P+D restart"
+            )
+        logger.critical(
+            "Remote-fill process requires paired restart: transfer_count=%d",
+            len(self._remote_fill_fatal_transfers),
+        )
+        logger.critical(
+            '[LMCACHE_REMOTE_FILL] {"schema":1,'
+            '"event":"remote_fill_fatal_restart","count":%d}',
+            len(self._remote_fill_fatal_transfers),
+        )
+        log_remote_fill_diagnostic(
+            logger,
+            event="remote_fill_fatal_restart",
+            code="RF-D-900",
+            stage="armed_native_lifecycle",
+            action="PAIRED_RESTART_REQUIRED",
+            transfer_id=normalized[0] if len(normalized) == 1 else None,
+            reason=(
+                "destination memory may still be targeted; allocator teardown "
+                "is intentionally blocked"
+            ),
+            memory_safety_uncertain=True,
+            severity="critical",
+        )
+
+    def enable_checkpoint_prefix_agreement(self) -> None:
+        """Arm ordered checkpoint control reception on an actual preemption."""
+        if hasattr(self, "_checkpoint_envelope_reader"):
+            return
+        self._checkpoint_prefix_results = {}
+        reader = type(self)._receive_shared_envelope
+        self._checkpoint_envelope_reader = reader
+        receiver = proxy(self)
+        self._receive_shared_envelope = lambda: receiver._receive_checkpoint_envelope(
+            reader
+        )
+        self._remote_fill_all_ranks_materialized = (
+            lambda local_ready, **kwargs: receiver._checkpoint_remote_fill_agreement(
+                local_ready, **kwargs
+            )
+        )
+
+    def _checkpoint_prefix_result(self, identity: tuple) -> Future:
+        condition, _, _ = self._shared_envelope_mailbox()
+        with condition:
+            return self._checkpoint_prefix_results.setdefault(identity, Future())
+
+    def _receive_checkpoint_envelope(self, reader: Callable) -> Any:
+        envelope = reader(self)
+        if envelope.phase not in ("checkpoint_index_prefix", "checkpoint_remote_fill"):
+            return envelope
+        identity = dict(
+            req_id=envelope.request_id,
+            phase=envelope.phase,
+            request_ordinal=envelope.request_ordinal,
+            layer_id=0,
+            kv_group=envelope.kv_group,
+        )
+        self._validate_shared_layerwise_envelope(envelope, **identity)
+        result = self._checkpoint_prefix_result(
+            self._shared_envelope_identity(envelope)
+        )
+        # The mailbox keeps receive_active set across this ordered all-reduce.
+        # All earlier Group-0 envelopes are already buffered and remain consumable.
+        # Native reads already have a bounded drain deadline, potentially longer
+        # than blocking_timeout_secs. Do not leave the collective before that
+        # reader reports its terminal status.
+        ready = self.collective_all_true_fn(result.result())
+        return replace(
+            envelope,
+            status="skipped" if ready else "error",
+            message=None if ready else "checkpoint prefix failed on a TP rank",
+        )
+
+    def finish_checkpoint_prefix(self, request: Any, ready: bool) -> bool:
+        """Agree on TP participation before entering the CPU index-tail stage.
+
+        The marker and reduction share the existing ordered envelope transport;
+        an unrelated broadcast cannot overtake the reduction on any TP rank.
+        This is background TP load coordination, never per-step DP agreement.
+        """
+        return self._ordered_checkpoint_agreement(
+            request.req_id,
+            "checkpoint_index_prefix",
+            request.load_spec.dsa_cold_load_generation,
+            1,
+            ready,
+        )
+
+    def _checkpoint_remote_fill_agreement(
+        self, ready: bool, *, req_id: str, kv_group: int
+    ) -> bool:
+        # RemoteFill already reduces on this CPU group. Route its reduction
+        # through the same ordering so it cannot race a checkpoint marker.
+        result = self._ordered_checkpoint_agreement(
+            req_id, "checkpoint_remote_fill", 0, kv_group, ready
+        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "remote_fill_materialization_consensus",
+                req_id=req_id,
+                kv_group=kv_group,
+                rank=self.metadata.worker_id,
+                local_ready=bool(ready),
+                all_ranks_ready=result,
+            )
+        return result
+
+    def _ordered_checkpoint_agreement(
+        self, req_id: str, phase: str, ordinal: int, kv_group: int, ready: bool
+    ) -> bool:
+        self.enable_checkpoint_prefix_agreement()
+        identity = dict(
+            req_id=req_id,
+            phase=phase,
+            request_ordinal=ordinal,
+            layer_id=0,
+            kv_group=kv_group,
+        )
+        marker = replace(
+            self._shared_layerwise_error_envelope(**identity, message=""),
+            status="skipped",
+        )
+        if self.metadata.is_first_rank():
+            condition, _, _ = self._shared_envelope_mailbox()
+            with condition:
+                self._broadcast_shared_envelope(marker)
+                return bool(self.collective_all_true_fn(ready))
+        key = self._shared_envelope_identity(marker)
+        result = self._checkpoint_prefix_result(key)
+        result.set_result(ready)
+        try:
+            envelope = self._receive_matching_shared_envelope(**identity)
+            self._validate_shared_layerwise_envelope(
+                replace(envelope, status="skipped"), **identity
+            )
+            return envelope.status == "skipped"
+        finally:
+            condition, _, _ = self._shared_envelope_mailbox()
+            with condition:
+                self._checkpoint_prefix_results.pop(key, None)
+
+    def forget_checkpoint_request(self, req_id: str) -> None:
+        """Retire local offer metadata on the existing request-finished event."""
+        if self.checkpoint_worker is not None:
+            self.checkpoint_worker.local.forget(req_id)
+
+    def checkpoint_backend(self) -> Any:
+        """Return the existing registered LocalCPU heap for checkpoint pages."""
+        local = self._shared_local_cpu_backend()
+        if local is None or not local.use_hot:
+            raise RuntimeError("Local checkpoint storage is unavailable")
+        return local
+
+    def checkpoint_resume_admitted(
+        self, req_id: str, generation: int, load_generation: int
+    ) -> None:
+        """Join resumed dispatch with the existing TP release acknowledgement."""
+        if self.checkpoint_worker is not None:
+            self.checkpoint_worker.restore_event(
+                req_id, generation, load_generation, "admitted"
+            )
+
+    def checkpoint_token_results(
+        self,
+        tokens: list[int],
+        request_configs: Any,
+        kv_group: int,
+        state: dict,
+        *,
+        start: int = 0,
+    ) -> Iterable[tuple[int, int, CacheEngineKey]]:
+        """Hash once per operation; only build keys for its checkpoint windows.
+
+        State is private to one immutable token/configuration snapshot and start.
+        The complete prefix hash chain is computed even when its keys are unused.
+        """
+        plan = state.get("checkpoint_chunks")
+        if plan is None:
+            plan = tuple(
+                (a, b, digest)
+                for a, b, digest in self.token_database.process_tokens(
+                    tokens=tokens,
+                    make_key=False,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+                if a >= start
+            )
+            state["checkpoint_chunks"] = plan
+        generated = self.token_database.process_tokens(
+            hashes=[entry[2] for entry in plan],
+            offsets=[entry[1] - entry[0] for entry in plan],
+            request_configs=request_configs,
+            kv_group=kv_group,
+        )
+        return (
+            (a, b, key) for (a, b, _), (_, _, key) in zip(plan, generated, strict=True)
+        )
+
+    def probe_checkpoint_pages(self, keys: list) -> list[bool]:
+        """Distinguish confirmed missing remote pages from transport errors."""
+        return self.storage_manager.batched_external_pages_exist(keys, strict=True)
+
+    def persist_checkpoint_page(
+        self, key: CacheEngineKey, page: Any, req_id: str
+    ) -> Future:
+        """Submit a sealed page; the caller retains its owner until completion."""
+        return self.storage_manager.batched_put_external_pages(
+            [key],
+            [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+            [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+            (page.raw_data,),
+            None,
+            req_id,
+        )
+
+    def load_checkpoint_page(
+        self, key: CacheEngineKey, group: int, tokens: int, req_id: str
+    ) -> Any:
+        """Load a canonical checkpoint page, retaining unknown native destinations."""
+        try:
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        except MemoryError:
+            if not self.reclaim_checkpoint_capacity(tokens, {group: None}):
+                raise
+            page, _ = self.allocate_checkpoint_fragment(group, tokens)
+        try:
+            self.storage_manager.batched_get_external_pages(
+                [key],
+                [[page.layer_data_ptr(i) for i in range(page.num_layers)]],
+                [[page.layer_size_bytes(i) for i in range(page.num_layers)]],
+                (page.raw_data,),
+                req_id,
+            )
+            self.validate_checkpoint_page(group, page)
+            return page
+        except NativeExternalPageTransferUnknownError:
+            self.__dict__.setdefault("_checkpoint_quarantined_owners", []).append(page)
+            raise
+        except BaseException as error:
+            page.ref_count_down()
+            failed = getattr(error, "failed_pages", ())
+            if failed and all(status <= 0 for _, status, _ in failed):
+                if not self.probe_checkpoint_pages([key])[0]:
+                    return None
+            raise
+
+    def checkpoint_page_key(
+        self, spec: Any, group: int, start: int, end: int
+    ) -> CacheEngineKey:
+        """Make an isolated local-only key; unsealed bytes cannot be prefix hits."""
+        return CacheEngineKey(
+            self.metadata.model_name,
+            self.metadata.world_size,
+            self.metadata.worker_id,
+            secrets.token_bytes(16),
+            self._shared_cpu_dtype_for_kv_group(group),
+            {
+                "lmcache.tag.checkpoint": f"{spec.req_id}:{spec.generation}:{start}:{end}"
+            },
+            kv_group=group,
+        )
+
+    @staticmethod
+    def is_checkpoint_page_key(key: CacheEngineKey) -> bool:
+        """Identify private staging keys without touching canonical prefix keys."""
+        return "lmcache.tag.checkpoint" in (key.request_configs or {})
+
+    def validate_checkpoint_page(self, group: int, page: LayerPageMemoryObj) -> None:
+        """Reject incompatible local layouts before constructing transfer operands."""
+        if (
+            page.num_layers != self._num_layers_for_kv_group(group)
+            or page.get_dtype() != self._shared_cpu_dtype_for_kv_group(group)
+            or page.metadata.fmt != self._memory_format_for_kv_group(group)
+        ):
+            raise ValueError("Local checkpoint page layout mismatch")
+
+    def load_checkpoint_prefix(
+        self, tokens: tuple[int, ...], group: int, configs: Any
+    ) -> Any:
+        """Retain the exact original boundary page, fetching only that page on miss."""
+        start, end, key = deque(
+            self.token_database.process_tokens(
+                tokens=list(tokens),
+                request_configs=configs,
+                kv_group=group,
+            ),
+            maxlen=1,
+        ).pop()
+        cached = self.get_checkpoint_prefix(key, group, end - start, with_widths=False)
+        if cached is not None:
+            return cached[0]
+        page, _ = self.allocate_checkpoint_fragment(group, end - start)
+        try:
+            self.storage_manager.batched_get_external_pages(
+                [key],
+                [
+                    [
+                        page.layer_data_ptr(i)
+                        for i in range(self._num_layers_for_kv_group(group))
+                    ]
+                ],
+                [
+                    [
+                        page.layer_tensor(i).numel() * page.get_dtype().itemsize
+                        for i in range(self._num_layers_for_kv_group(group))
+                    ]
+                ],
+                (page.raw_data,),
+                "checkpoint-prefix",
+            )
+            return page
+        except NativeExternalPageTransferUnknownError:
+            self._checkpoint_quarantined_owners = getattr(
+                self, "_checkpoint_quarantined_owners", []
+            )
+            self._checkpoint_quarantined_owners.append(page)
+            raise
+        except BaseException:
+            page.ref_count_down()
+            raise
+
+    def _lookup_remote_fill_two_group_prefix(
+        self,
+        chunks: list,
+        *,
+        search_range: list,
+        lookup_id: str | None,
+        pin: bool,
+        request_configs: Any = None,
+        diagnostics: Any = None,
+    ) -> int:
+        generation = (request_configs or {}).get(LOCAL_CHECKPOINT_CONFIG)
+        if generation is None:
+            return super()._lookup_remote_fill_two_group_prefix(
+                chunks,
+                search_range=search_range,
+                lookup_id=lookup_id,
+                pin=pin,
+                request_configs=request_configs,
+                diagnostics=diagnostics,
+            )
+        worker = self.checkpoint_worker
+        manifest = worker.local.manifest(lookup_id, int(generation)) if worker else None
+        if manifest is None or not chunks:
+            return 0
+        configs = dict(request_configs)
+        configs.pop(LOCAL_CHECKPOINT_CONFIG)
+        prefix = list(
+            self.token_database.process_tokens(
+                tokens=list(manifest.tokens[: manifest.prefix_end]),
+                request_configs=configs,
+            )
+        )
+        hit = (
+            super()._lookup_remote_fill_two_group_prefix(
+                prefix,
+                search_range=search_range,
+                lookup_id=None,
+                pin=False,
+                request_configs=configs,
+            )
+            if prefix
+            else 0
+        )
+        if hit != manifest.prefix_end:
+            return hit
+        expected = list(
+            self.token_database.process_tokens(
+                tokens=list(manifest.tokens[: chunks[-1][1]]),
+                request_configs=configs,
+            )
+        )
+        if chunks != expected:
+            return 0
+        return worker.local.available(lookup_id, int(generation), chunks[-1][1])
+
+    def prepare_checkpoint_restore(self, request: Any) -> tuple[int, list[Any]]:
+        """Normalize on TP0 and broadcast terminal admission before ordinary loads."""
+        spec = request.load_spec
+        identity = dict(
+            req_id=request.req_id,
+            phase="checkpoint_restore",
+            request_ordinal=spec.checkpoint_generation,
+            layer_id=0,
+            kv_group=0,
+        )
+        owners, error = [], None
+        if not self._is_passive():
+            try:
+                base, owners = self.checkpoint_worker.local.normalize(
+                    request.req_id,
+                    spec.checkpoint_generation,
+                    request.token_ids,
+                    request.request_configs,
+                )
+            except Exception as exc:
+                error = exc
+            envelope = self._shared_layerwise_error_envelope(
+                **identity,
+                message=str(error) if error else "",
+            )
+            if error is None:
+                envelope = replace(
+                    envelope, status="skipped", error_details={"base": base}
+                )
+            elif isinstance(error, CheckpointRestoreMiss):
+                envelope = replace(
+                    envelope,
+                    status="skipped",
+                    error_details={"checkpoint_miss_end": error.available_end},
+                )
+            try:
+                self._broadcast_shared_envelope(envelope)
+            except BaseException:
+                for page in owners:
+                    page.ref_count_down()
+                raise
+        else:
+            envelope = self._receive_matching_shared_envelope(**identity)
+            self._validate_shared_layerwise_envelope(envelope, **identity)
+        if (
+            envelope.status == "skipped"
+            and "checkpoint_miss_end" in envelope.error_details
+        ):
+            end = envelope.error_details["checkpoint_miss_end"]
+            if type(end) is not int or not 0 <= end < len(request.token_ids):
+                raise ValueError("Invalid checkpoint miss frontier")
+            raise CheckpointRestoreMiss(end, envelope.message) from error
+        if envelope.status != "skipped":
+            if isinstance(error, NativeExternalPageTransferUnknownError):
+                self._remote_fill_require_paired_restart((request.req_id,))
+                raise error
+            raise RuntimeError(
+                f"Local checkpoint restore unavailable: {envelope.message}"
+            ) from error
+        return int(envelope.error_details["base"]), owners
+
+    def reclaim_checkpoint_capacity(
+        self, tokens: int, group_caches: dict[int, Optional[list]]
+    ) -> bool:
+        """Reclaim once for the missing staging groups, without allocation or waits."""
+        local = self._shared_local_cpu_backend()
+        if local is None or tokens <= 0 or not group_caches:
+            return False
+        allocator = local.get_memory_allocator()
+        round_size = getattr(
+            getattr(allocator, "address_manager", None), "compute_aligned_size", None
+        )
+        required_bytes = 0
+        for group, caches in group_caches.items():
+            if caches is not None:
+                self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
+            policy = getattr(self.metadata, "indexer_c8_layout", None)
+            if group == 1 and policy is not None and policy.mixed:
+                raw_size = sum(
+                    policy.layer_bytes(tokens, i)
+                    for i in range(self._num_layers_for_kv_group(group))
+                )
+            else:
+                raw_size = (
+                    self.gpu_connector.get_shape(tokens, kv_group=group).numel()
+                    * self._shared_cpu_dtype_for_kv_group(group).itemsize
+                    * self._num_layers_for_kv_group(group)
+                )
+            if round_size is not None:
+                required_bytes += round_size(raw_size)
+            else:
+                alignment = allocator.align_bytes
+                required_bytes += (raw_size + alignment - 1) // alignment * alignment
+        return local.reclaim_evictable_capacity(
+            required_bytes,
+            min_free_bytes=0,
+            min_free_ratio=0,
+            num_layers=getattr(self.metadata, "runtime_kv_group_layer_counts", None)
+            or self.num_layers,
+            cause="checkpoint_capacity_reclaim",
+            max_scan_entries=_CHECKPOINT_RECLAIM_SCAN_ENTRIES,
+        )
+
+    def allocate_checkpoint_fragment(
+        self, group: int, tokens: int, caches: Optional[list] = None
+    ) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
+        """Allocate registered capture storage without eviction or busy retry."""
+        return self.prepare_checkpoint_allocator(group, caches)(tokens)
+
+    def prepare_checkpoint_allocator(
+        self, group: int, caches: Optional[list] = None
+    ) -> Callable[[int], tuple[LayerPageMemoryObj, tuple[int, ...]]]:
+        """Prepare group invariants for one capture; allocate exact sizes on demand.
+
+        The caller keeps this allocator within one capture, never across cache
+        reconfiguration. Allocation failure does not reclaim, spin or wait.
+        """
+        if not self.save_only_first_rank or not self.save_indexer_only_first_rank:
+            raise ValueError("Checkpoint requires replicated MLA group writer ownership")
+        if caches is not None:
+            self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
+        local = self._shared_local_cpu_backend()
+        if local is None or not self.gpu_connector.supports_batched_from_gpu_group(
+            group
+        ):
+            raise ValueError("Checkpoint registered group capture is unavailable")
+        widths = self.gpu_connector.checkpoint_plane_widths(group)
+        dtype = self._shared_cpu_dtype_for_kv_group(group)
+        layers = self._num_layers_for_kv_group(group)
+        fmt = self._memory_format_for_kv_group(group)
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        mixed = group == 1 and policy is not None and policy.mixed
+
+        def allocate(tokens: int) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
+            if tokens <= 0:
+                raise ValueError("Checkpoint registered group capture is unavailable")
+            shapes = (
+                self.metadata.indexer_layer_shapes(tokens)
+                if mixed else [self.gpu_connector.get_shape(tokens, kv_group=group)]
+            )
+            pages = local.batched_allocate_layer_pages(
+                shapes, [dtype] * len(shapes), 1, layers, fmt,
+                busy_loop=False, eviction=False,
+                valid_tokens=tokens, full_tokens=tokens,
+            )
+            if not pages:
+                raise MemoryError("Checkpoint CPU staging allocation refused")
+            return pages[0], widths
+
+        return allocate
+
+    def get_checkpoint_prefix(
+        self, key: CacheEngineKey, group: int, tokens: int, *, with_widths: bool = True
+    ) -> Any:
+        """Retain an exact CPU page, optionally computing assembly plane widths."""
+        local = self._shared_local_cpu_backend()
+        pages, count = local.batched_get_layer_page_prefix([key])
+        if not count:
+            return None
+        page = pages[0]
+        if (
+            page.is_valid()
+            and page.valid_tokens == tokens
+            and page.num_layers == self._num_layers_for_kv_group(group)
+            and page.get_dtype() == self._shared_cpu_dtype_for_kv_group(group)
+            and page.metadata.fmt == self._memory_format_for_kv_group(group)
+        ):
+            return page, (
+                self.gpu_connector.checkpoint_plane_widths(group) if with_widths else ()
+            )
+        page.ref_count_down()
+        return None
+
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
+        if getattr(self, "_checkpoint_quarantined_owners", None):
+            raise RuntimeError("Checkpoint prefix DMA is unresolved; allocator owners retained")
+        if getattr(self, "checkpoint_worker", None) is not None:
+            self.checkpoint_worker.close()
+            self.checkpoint_worker = None
+        if getattr(self, "_failed_sparse_loads", None):
+            # Do not tear down storage or its allocator while an unfenced DMA
+            # may still read it. The engine owns the quarantined inputs.
+            raise RuntimeError(
+                "sparse load completion is unknown; worker restart required "
+                "before retained buffers can be released"
+            )
+        fatal_message = (
+            "remote-fill shutdown requires paired P+D restart; "
+            "native-owned memory was deliberately retained"
+        )
+        if self._remote_fill_fatal_transfers:
+            # An unknown native writer may still target registered P or D
+            # storage. Deliberately retain runtime and allocator ownership
+            # until the supervisor terminates the paired deployment.
+            raise RuntimeError(fatal_message)
+        runtime = self._remote_fill_runtime
+        if runtime is not None:
+            runtime.close()
+        if self._remote_fill_fatal_transfers:
+            # Runtime shutdown can itself discover a still-armed transfer.
+            raise RuntimeError(fatal_message)
+        self._remote_fill_runtime = None
+        if self._group1_external_page_reader is not None:
+            self._group1_external_page_reader.close()
+            self._group1_external_page_reader = None
+        self.close_remote_fill_producer()
+        self.wait_for_direct_stores(tuple(self._direct_store_states))
+        self._direct_store_states.clear()
+        self._live_source_builders.clear()
+        self._completed_live_sources.clear()
+        pending_diagnostics = getattr(
+            self, "_pending_live_source_diagnostics", None
+        )
+        if pending_diagnostics is not None:
+            pending_diagnostics.clear()
         # Push poison pill first so any in-flight work drains before
         # ``storage_manager.close()`` runs inside ``super().close()``.
         if self._store_queue is not None:
@@ -591,4 +11736,20 @@ class AscendLMCacheEngine(LMCacheEngine):
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
 
+        if kv_hash_enabled():
+            drain_trace = getattr(self.gpu_connector, "drain_kv_trace", None)
+            if callable(drain_trace):
+                store_thread = getattr(self, "_store_worker_thread", None)
+                if store_thread is not None and store_thread.is_alive():
+                    raise RuntimeError(
+                        "Store worker is still active; keep KV trace CPU slabs alive"
+                    )
+                if not drain_trace():
+                    raise RuntimeError(
+                        "KV trace readers have not drained; keep CPU slabs alive"
+                    )
+
+        if self._force_layerwise_prefill_store:
+            for req_id in tuple(self._layerwise_prefill_page_owners):
+                self.release_layerwise_prefill_pages(req_id)
         super().close()

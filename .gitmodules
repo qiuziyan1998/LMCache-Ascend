@@ -1,7 +1,5 @@
 [submodule "third_party/kvcache-ops"]
 	path = third_party/kvcache-ops
-	url = https://atomgit.com/openeuler/kvcache-ops.git
+	url = https://gitcode.com/gcw_LBsQh0mD/kvcache-ops.git
+	branch = feature-dsa-retrieve
 
-[submodule "third_party/hcomm"]
-	path = third_party/hcomm
-	url = https://gitcode.com/cann/hcomm.git

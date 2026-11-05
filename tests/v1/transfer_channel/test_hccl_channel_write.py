@@ -3,9 +3,7 @@
 # Standard
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
-import faulthandler
 import multiprocessing as mp
-import os
 import sys
 import time
 import warnings
@@ -22,18 +20,14 @@ import pytest
 import torch
 
 # First Party
+from lmcache_ascend import _build_info
 from lmcache_ascend.v1.transfer_channel import CreateTransferChannel
 
-try:
-    # First Party
-    import lmcache_ascend.hccl_npu_comms  # noqa: F401
-
-    _hccl_available = True
-except ImportError:
-    _hccl_available = False
+_cann_ver = _build_info.cann_version_tuple()
 pytestmark = pytest.mark.skipif(
-    not _hccl_available,
-    reason="hccl_npu_comms not built (set HCOMM_SRC_PATH at build time)",
+    not _cann_ver or _cann_ver >= (8, 5),
+    reason="HCCL agent is removed in CANN 8.5+; "
+    "skipped when version is unknown or >= 8.5",
 )
 
 
@@ -46,16 +40,7 @@ class HcclTestConfig:
     recv_device_id: int = 1
     timeout: int = 60
     use_host_memory: bool = False
-    sender_use_host: bool | None = None
-    receiver_use_host: bool | None = None
     use_multi_buffer: bool = False
-    gpu_buffer_pages: int | None = None
-
-    def __post_init__(self):
-        if self.sender_use_host is None:
-            self.sender_use_host = self.use_host_memory
-        if self.receiver_use_host is None:
-            self.receiver_use_host = self.use_host_memory
 
 
 def calculate_tensor_byte_size(kv_shape: Tuple[int, ...], dtype: torch.dtype) -> int:
@@ -72,24 +57,21 @@ def get_allocator(
     dtype: torch.dtype,
     use_host: bool,
     use_multi_buffer: bool = False,
-    gpu_buffer_pages: int | None = None,
 ) -> PagedCpuGpuMemoryAllocator:
     allocator = PagedCpuGpuMemoryAllocator()
-    tensor_size = calculate_tensor_byte_size(kv_shape, dtype)
+    buffer_size = calculate_tensor_byte_size(kv_shape, dtype) * 200
 
-    gpu_pages = gpu_buffer_pages if gpu_buffer_pages is not None else 200
-    if gpu_pages > 0:
-        allocator.init_gpu_memory_allocator(
-            tensor_size * gpu_pages,
-            [torch.Size(kv_shape)],
-            [dtype],
-            MemoryFormat.KV_2LTD,
-            device_id,
-        )
+    allocator.init_gpu_memory_allocator(
+        buffer_size,
+        [torch.Size(kv_shape)],
+        [dtype],
+        MemoryFormat.KV_2LTD,
+        device_id,
+    )
 
     if use_host or use_multi_buffer:
         allocator.init_cpu_memory_allocator(
-            tensor_size * 150,
+            buffer_size,
             [torch.Size(kv_shape)],
             [dtype],
             MemoryFormat.KV_2LTD,
@@ -146,10 +128,7 @@ def _build_channel_buffers(
 
 def write_sender_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) -> None:
     try:
-        faulthandler.enable()
         warnings.filterwarnings("ignore", message=".*torch.Tensor.cuda.*")
-        if config.sender_use_host or config.receiver_use_host:
-            os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
         logger = init_logger(__name__)
         torch.npu.set_device(config.send_device_id)
 
@@ -157,12 +136,12 @@ def write_sender_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) ->
             config.send_device_id,
             config.kv_shape,
             config.dtype,
-            config.sender_use_host,
+            config.use_host_memory,
             config.use_multi_buffer,
-            gpu_buffer_pages=config.gpu_buffer_pages,
         )
-        alloc_type = "cpu" if config.sender_use_host else "gpu"
+        alloc_type = "cpu" if config.use_host_memory else "gpu"
 
+        # Generate data objects
         objs = []
         expected_sums = []
         for i in range(config.num_objs):
@@ -184,7 +163,7 @@ def write_sender_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) ->
             allocator,
             config.kv_shape,
             config.dtype,
-            config.sender_use_host,
+            config.use_host_memory,
             config.use_multi_buffer,
         )
 
@@ -206,11 +185,16 @@ def write_sender_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) ->
             peer_init_url=remote_url,
         )
 
+        # wait for receiver to be initialized
         wait_start = time.time()
         while "receiver_init_done" not in shared_dict:
             time.sleep(0.1)
             if time.time() - wait_start > 30:
                 raise TimeoutError("Sender timed out waiting for receiver buffer refs")
+            logger.info(
+                "Sender: Waiting for receiver initialization, shared_dict keys: %s",
+                list(shared_dict.keys()),
+            )
 
         shared_dict["sender_init_done"] = True
         logger.info("Sender: Sender initialization complete")
@@ -249,10 +233,7 @@ def write_sender_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) ->
 
 def write_receiver_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) -> None:
     try:
-        faulthandler.enable()
         warnings.filterwarnings("ignore", message=".*torch.Tensor.cuda.*")
-        if config.sender_use_host or config.receiver_use_host:
-            os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
         logger = init_logger(__name__)
         torch.npu.set_device(config.recv_device_id)
 
@@ -260,11 +241,10 @@ def write_receiver_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) 
             config.recv_device_id,
             config.kv_shape,
             config.dtype,
-            config.receiver_use_host,
+            config.use_host_memory,
             config.use_multi_buffer,
-            gpu_buffer_pages=config.gpu_buffer_pages,
         )
-        alloc_type = "cpu" if config.receiver_use_host else "gpu"
+        alloc_type = "cpu" if config.use_host_memory else "gpu"
 
         objs = []
         for _ in range(config.num_objs):
@@ -283,7 +263,7 @@ def write_receiver_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) 
             allocator,
             config.kv_shape,
             config.dtype,
-            config.receiver_use_host,
+            config.use_host_memory,
             config.use_multi_buffer,
         )
 
@@ -299,22 +279,34 @@ def write_receiver_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) 
             peer_init_url=local_url,
         )
 
+        # Get buffer refs for the receiver's objects (sender needs these
+        # to know where to write)
         buffer_uuids, mem_indexes = channel.get_local_buffer_refs(objs)
         shared_dict["receiver_buffer_refs_uuids"] = buffer_uuids
         shared_dict["receiver_buffer_refs_indexes"] = mem_indexes
         shared_dict["receiver_init_done"] = True
 
+        # Wait for sender to be initialized
         wait_start = time.time()
         while "sender_init_done" not in shared_dict:
             time.sleep(0.1)
+            logger.info(
+                "Receiver: Waiting for sender initialization, shared_dict keys: %s",
+                list(shared_dict.keys()),
+            )
             if time.time() - wait_start > 30:
                 raise TimeoutError(
                     "Receiver timed out waiting for Sender initialization"
                 )
 
+        # Wait for write to complete
         wait_start = time.time()
         while "write_complete" not in shared_dict:
             time.sleep(0.1)
+            logger.info(
+                "Receiver: Waiting for write completion, shared_dict keys: %s",
+                list(shared_dict.keys()),
+            )
             if time.time() - wait_start > config.timeout:
                 raise TimeoutError("Timed out waiting for write completion.")
 
@@ -323,7 +315,7 @@ def write_receiver_process(config: HcclTestConfig, shared_dict: Dict[str, Any]) 
 
         for i, obj in enumerate(objs):
             expected_val = expected_values[i]
-            tensor_data = obj.tensor if config.receiver_use_host else obj.tensor.cpu()
+            tensor_data = obj.tensor if config.use_host_memory else obj.tensor.cpu()
 
             is_equal = (tensor_data == expected_val).all()
 
@@ -352,10 +344,7 @@ def read_data_provider_process(
 ) -> None:
     """Sender-side process: fills data and exposes buffer refs for reader."""
     try:
-        faulthandler.enable()
         warnings.filterwarnings("ignore", message=".*torch.Tensor.cuda.*")
-        if config.sender_use_host or config.receiver_use_host:
-            os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
         logger = init_logger(__name__)
         torch.npu.set_device(config.send_device_id)
 
@@ -448,10 +437,7 @@ def read_reader_process(
 ) -> None:
     """Receiver-side process: reads from sender's memory via batched_read."""
     try:
-        faulthandler.enable()
         warnings.filterwarnings("ignore", message=".*torch.Tensor.cuda.*")
-        if config.sender_use_host or config.receiver_use_host:
-            os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
         logger = init_logger(__name__)
         torch.npu.set_device(config.recv_device_id)
 
@@ -569,9 +555,7 @@ def multi_buffer_sender_process(
 ) -> None:
     """Sender allocates on CPU buffer; receiver allocates on NPU buffer."""
     try:
-        faulthandler.enable()
         warnings.filterwarnings("ignore", message=".*torch.Tensor.cuda.*")
-        os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
         logger = init_logger(__name__)
         torch.npu.set_device(config.send_device_id)
 
@@ -674,9 +658,7 @@ def multi_buffer_receiver_process(
 ) -> None:
     """Receiver allocates on NPU buffer in a multi-buffer channel."""
     try:
-        faulthandler.enable()
         warnings.filterwarnings("ignore", message=".*torch.Tensor.cuda.*")
-        os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
         logger = init_logger(__name__)
         torch.npu.set_device(config.recv_device_id)
 
@@ -943,70 +925,3 @@ def test_hccl_submit_batched_read(
         read_reader_process,
         receiver_args=(True,),
     )
-
-
-@pytest.mark.skipif(
-    not torch.npu.is_available() or torch.npu.device_count() < 2,
-    reason="Requires at least 2 NPU devices",
-)
-@pytest.mark.parametrize(
-    "num_objs, num_layer, chunk_size, num_kv_head, head_size",
-    [
-        (2, 31, 256, 8, 128),
-        (10, 31, 256, 8, 128),
-    ],
-)
-def test_hccl_write_h2d(num_objs, num_layer, chunk_size, num_kv_head, head_size):
-    """Host-to-Device: sender on CPU, receiver on NPU."""
-    config = HcclTestConfig(
-        num_objs=num_objs,
-        kv_shape=(num_layer, 2, chunk_size, num_kv_head, head_size),
-        timeout=120 if num_objs >= 10 else 60,
-        sender_use_host=True,
-        receiver_use_host=False,
-    )
-    _run_two_process_test(config, write_sender_process, write_receiver_process)
-
-
-@pytest.mark.skipif(
-    not torch.npu.is_available() or torch.npu.device_count() < 2,
-    reason="Requires at least 2 NPU devices",
-)
-@pytest.mark.parametrize(
-    "num_objs, num_layer, chunk_size, num_kv_head, head_size",
-    [
-        (2, 31, 256, 8, 128),
-        (10, 31, 256, 8, 128),
-    ],
-)
-def test_hccl_write_d2h(num_objs, num_layer, chunk_size, num_kv_head, head_size):
-    """Device-to-Host: sender on NPU, receiver on CPU."""
-    config = HcclTestConfig(
-        num_objs=num_objs,
-        kv_shape=(num_layer, 2, chunk_size, num_kv_head, head_size),
-        timeout=120 if num_objs >= 10 else 60,
-        sender_use_host=False,
-        receiver_use_host=True,
-    )
-    _run_two_process_test(config, write_sender_process, write_receiver_process)
-
-
-@pytest.mark.skipif(
-    not torch.npu.is_available() or torch.npu.device_count() < 2,
-    reason="Requires at least 2 NPU devices",
-)
-def test_hccl_write_host_350gb_buffer():
-    """~350 GB host buffer to stress-test MR registration via HcclMemReg.
-
-    No GPU buffer is allocated (gpu_buffer_pages=0) since all data flows
-    through host memory.  Each process pins ~350 GB of host RAM, so the
-    machine needs ~700 GB free.
-    """
-    config = HcclTestConfig(
-        num_objs=2,
-        kv_shape=(1792, 2, 256, 8, 128),
-        timeout=600,
-        use_host_memory=True,
-        gpu_buffer_pages=0,
-    )
-    _run_two_process_test(config, write_sender_process, write_receiver_process)

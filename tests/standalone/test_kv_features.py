@@ -1,0 +1,584 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Synchronous sample persistence, address mapping and lifetime tests."""
+
+import ast
+from contextlib import nullcontext
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import threading
+import weakref
+from types import MethodType, SimpleNamespace
+
+import pytest
+import torch
+
+
+@pytest.fixture
+def features(monkeypatch):
+    root = Path(__file__).resolve().parents[2] / "lmcache_ascend/v1"
+    dependency = "lmcache_ascend.v1.kv_trace"
+    spec = importlib.util.spec_from_file_location(dependency, root / "kv_trace.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    monkeypatch.setitem(sys.modules, dependency, helper)
+    spec = importlib.util.spec_from_file_location(
+        "kv_features_test", root / "kv_features.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rows(root):
+    path = next(root.rglob("index.jsonl"))
+    return path, [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def read(path, record):
+    width = record.get("byte_width", 1)
+    raw = (path.parent / "features.bin").read_bytes()
+    return b"".join(
+        raw[offset : offset + (end - start) * width]
+        for start, end, offset in record["pieces"]
+    )
+
+
+def test_sample_is_exactly_one_raw_byte_per_token(features):
+    value = torch.arange(100, dtype=torch.float32).reshape(10, 10)
+    assert torch.equal(features.token_bytes(value), value.view(torch.uint8)[:, 0])
+    assert features.token_bytes(value).numel() == 10
+    with pytest.raises(ValueError):
+        features.token_bytes(value.T)
+
+
+def test_unchanged_prefix_reuses_extents_and_changes_preserve_old_bytes(
+    features, tmp_path
+):
+    file = features.FeatureFile(tmp_path / "worker", {})
+    original = torch.arange(8192).to(torch.uint8)
+    base = dict(stage="P_COMPUTE", group=0, layer=0, component=0, start=0, end=8192)
+    file.write(base, original)
+    original_size = file.payload.tell()
+    file.write(dict(base, stage="P_LOAD"), original)
+    assert file.payload.tell() == original_size == 8192
+    changed = original.clone()
+    changed[5000] ^= 1
+    file.write(base, changed)
+    assert file.payload.tell() == 8192 + 4096
+    file.close()
+    path, records = rows(tmp_path)
+    observations = [r for r in records if "pieces" in r]
+    assert read(path, observations[0]) == original.numpy().tobytes()
+    assert read(path, observations[1]) == original.numpy().tobytes()
+    assert read(path, observations[2]) == changed.numpy().tobytes()
+
+
+def test_paged_sampling_uses_real_logical_order_and_never_hashes(
+    features, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        sys.modules["lmcache_ascend.v1.kv_trace"],
+        "content_checksum",
+        lambda *args: pytest.fail("hash must not run"),
+    )
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    plane = torch.arange(64, dtype=torch.uint8).reshape(4, 4, 1, 4)
+    trace.paged(
+        "req", "P_LOAD", 0, 0, 8, [plane], torch.tensor([2, 0]), 0, 8, block_size=4
+    )
+    trace.finish("req")
+    assert trace.drain(5)
+    path, records = rows(tmp_path)
+    record = next(r for r in records if r.get("stage") == "P_LOAD")
+    assert list(read(path, record)) == [32, 36, 40, 44, 0, 4, 8, 12]
+    assert records[-1]["stage"] == "END"
+
+
+def test_bad_table_is_reported_without_submitting_an_out_of_bounds_gather(
+    features, tmp_path
+):
+    logs = []
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=logs.append)
+    plane = torch.arange(16, dtype=torch.uint8).reshape(2, 4, 1, 2)
+    trace.paged(
+        "req", "P_LOAD", 0, 0, 8, [plane], torch.tensor([0]), 0, 8, block_size=4
+    )
+    trace.paged(
+        "req", "P_LOAD", 0, 1, 8, [plane], torch.tensor([0]), 0, 8, block_size=4
+    )
+    assert len(logs) == 1 and logs[0]["error"] == "feature_table_range"
+    assert trace.failed
+
+
+@pytest.mark.parametrize("requests", [1, 4])
+def test_synchronous_writer_keeps_all_observations_and_ordered_end(
+    features, tmp_path, requests
+):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    for request in range(requests):
+        req = f"req{request}"
+        for layer in range(2048):
+            trace.tensor(
+                req,
+                "P_COMPUTE",
+                0,
+                layer,
+                4,
+                0,
+                4,
+                0,
+                torch.arange(4, dtype=torch.uint8),
+            )
+        trace.finish(req)
+        assert trace.accepts(req) and not trace.failed
+    assert trace.drain(15)
+    paths = list(tmp_path.rglob("index.jsonl"))
+    assert len(paths) == requests
+    for path in paths:
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        observations = [r for r in records if "pieces" in r]
+        assert [r["layer"] for r in observations] == list(range(2048))
+        assert all(read(path, r) == bytes(range(4)) for r in observations)
+        assert records[-1]["stage"] == "END" and not records[-1]["failed"]
+
+
+def test_device_readback_waits_then_flushes_before_returning(
+    features, tmp_path, monkeypatch
+):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    calls = []
+    current_stream = object()
+
+    class DeviceValue:
+        shape = (4,)
+        dtype = torch.uint8
+        device = SimpleNamespace(type="npu")
+
+    value = DeviceValue()
+    observed = weakref.ref(value)
+    data = torch.zeros(4, dtype=torch.uint8)
+
+    def record(stream):
+        assert stream is current_stream
+        calls.append("record")
+
+    def wait():
+        calls.append("wait")
+        data.copy_(torch.arange(4, dtype=torch.uint8))
+
+    event = SimpleNamespace(record=record, synchronize=wait)
+    host = SimpleNamespace(
+        copy_=lambda *args, **kwargs: calls.append("copy"),
+        contiguous=lambda: data,
+    )
+    original_write = features.FeatureFile.write
+
+    def write(file, record, snapshot):
+        assert calls == ["copy", "record", "wait"]
+        calls.append("write")
+        original_write(file, record, snapshot)
+
+    monkeypatch.setattr(features.FeatureFile, "write", write)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            features,
+            "torch",
+            SimpleNamespace(
+                empty=lambda *args, **kwargs: host,
+                uint8=torch.uint8,
+                npu=SimpleNamespace(
+                    Event=lambda: event,
+                    current_stream=lambda device: current_stream,
+                ),
+            ),
+        )
+        trace.capture(
+            dict(
+                req="req", stage="P_LOAD", group=0, layer=0, component=0, start=0, end=4
+            ),
+            lambda value=value: value,
+        )
+    calls.append("returned")
+    assert calls == ["copy", "record", "wait", "write", "returned"]
+    path, records = rows(tmp_path)
+    assert read(path, records[-1]) == bytes(range(4))
+    del value
+    assert observed() is None
+    trace.finish("req")
+    assert trace.drain(5)
+    assert not trace.failed
+
+
+def test_failed_event_record_keeps_pending_host_storage_alive(
+    features, tmp_path, monkeypatch
+):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    value = SimpleNamespace(
+        shape=(4,), dtype=torch.uint8, device=SimpleNamespace(type="npu")
+    )
+    host = SimpleNamespace(copy_=lambda *args, **kwargs: None)
+    event = SimpleNamespace(
+        record=lambda stream: (_ for _ in ()).throw(RuntimeError("device failed"))
+    )
+    monkeypatch.setattr(
+        features,
+        "torch",
+        SimpleNamespace(
+            empty=lambda *args, **kwargs: host,
+            npu=SimpleNamespace(
+                Event=lambda: event, current_stream=lambda device: None
+            ),
+        ),
+    )
+    trace.capture(dict(req="req", stage="P_LOAD"), lambda: value)
+    assert trace.failed
+    assert trace.quarantine == [(host, value, event)]
+    assert not trace.drain(5)
+
+
+def test_cpu_reader_waits_real_event_and_releases_only_after_capture(
+    features, tmp_path
+):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    gate, entered, returned = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+    obj = SimpleNamespace(refs=1)
+    obj.ref_count_up = lambda: setattr(obj, "refs", obj.refs + 1)
+    obj.ref_count_down = lambda: setattr(obj, "refs", obj.refs - 1)
+
+    def wait():
+        entered.set()
+        assert gate.wait(5)
+
+    def capture():
+        trace.cpu_work(
+            "req",
+            lambda: calls.append(threading.get_ident()),
+            [obj],
+            [SimpleNamespace(synchronize=wait)],
+        )
+        returned.set()
+
+    caller = threading.Thread(target=capture)
+    caller.start()
+    try:
+        assert entered.wait(5)
+        assert obj.refs == 2 and calls == [] and not returned.is_set()
+    finally:
+        gate.set()
+        caller.join(5)
+    assert returned.is_set()
+    assert trace.drain(5)
+    assert obj.refs == 1 and calls == [caller.ident]
+
+
+def test_passive_cpu_view_is_saved_before_caller_recycles_shared_storage(
+    features, tmp_path
+):
+    trace = features.KVTrace(1, "P", root=tmp_path, emit=lambda r: None)
+    shared = torch.tensor([[11, 0], [22, 0], [33, 0], [44, 0]], dtype=torch.uint8)
+    owner = SimpleNamespace(refs=1)
+    owner.ref_count_up = lambda: setattr(owner, "refs", owner.refs + 1)
+    owner.ref_count_down = lambda: setattr(owner, "refs", owner.refs - 1)
+    trace.cpu_work(
+        "req",
+        lambda: trace.tensor(
+            "req",
+            "P_CPU_LOAD",
+            0,
+            0,
+            4,
+            0,
+            4,
+            0,
+            shared.view(4, 2),
+        ),
+        [owner],
+        (),
+    )
+    shared.fill_(99)  # The allocator in the owning rank can now reuse the slab.
+    assert owner.refs == 1
+    path, records = rows(tmp_path)
+    assert read(path, records[-1]) == bytes([11, 22, 33, 44])
+    trace.finish("req")
+
+
+def test_retirement_failure_retains_owners_and_records_cause_on_end(features, tmp_path):
+    logs, calls = [], []
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=logs.append)
+    owner = SimpleNamespace(refs=1)
+    owner.ref_count_up = lambda: setattr(owner, "refs", owner.refs + 1)
+    owner.ref_count_down = lambda: setattr(owner, "refs", owner.refs - 1)
+
+    def fail_wait():
+        raise RuntimeError("DMA completion failed")
+
+    trace.cpu_work(
+        "first",
+        lambda: calls.append(True),
+        [owner],
+        [SimpleNamespace(synchronize=fail_wait)],
+    )
+    trace.finish("later")
+    assert not trace.drain(5)
+    assert calls == [] and owner.refs == 2
+    assert trace.quarantine
+    assert logs[-1]["req"] == "later" and logs[-1]["failed"]
+    assert logs[-1]["cause"]["req"] == "first"
+    assert logs[-1]["cause"]["detail"] == "DMA completion failed"
+
+
+def bind_connector(obj, features, enabled=True):
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "lmcache_ascend/v1/npu_connector/npu_connectors.py"
+    )
+    cls = next(
+        n
+        for n in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.ClassDef) and n.name == "VLLMPagedMemLayerwiseNPUConnector"
+    )
+    methods = [
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name
+        in (
+            "configure_kv_trace",
+            "trace_attention_kv",
+            "trace_cpu_kv",
+            "trace_selected_kv",
+            "finish_kv_trace",
+            "trace_direct_kv",
+            "enqueue_store_kv_trace",
+            "enqueue_load_kv_trace",
+        )
+    ]
+    scope = dict(
+        torch=torch,
+        diagnostic=features.diagnostic,
+        kv_trace_enabled=lambda: enabled,
+        audit_enabled=lambda: False,
+        KVTrace=features.KVTrace,
+        _layer_memory_tensor=lambda obj, layer: obj.tensor,
+        _layer_source_memory_objs=lambda objects, layer: objects,
+    )
+    module = ast.parse("from __future__ import annotations")
+    module.body.extend(methods)
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
+    for method in methods:
+        setattr(obj, method.name, MethodType(scope[method.name], obj))
+
+
+def test_disabled_probes_do_not_inspect_payloads_or_create_recorders(features):
+    class UnexpectedInspection(BaseException):
+        pass
+
+    class Payload:
+        def __getattr__(self, name):
+            raise UnexpectedInspection(name)
+
+        def __iter__(self):
+            raise UnexpectedInspection("iteration")
+
+    obj = SimpleNamespace()
+    bind_connector(obj, features, enabled=False)
+    payload = Payload()
+    obj.configure_kv_trace(payload, payload, payload, payload)
+    obj.trace_attention_kv(0, 0, stage="P_LOAD", planes=payload,
+                           table=payload, metadata=payload)
+    obj.trace_cpu_kv("P_CPU_LOAD", "r", 0, payload, payload, payload)
+    obj.enqueue_store_kv_trace("r", 0, payload, payload, payload, payload)
+    obj.trace_direct_kv("r", 0, payload, payload, payload, payload)
+    obj.finish_kv_trace("r")
+    assert not hasattr(obj, "kv_trace")
+    assert not hasattr(obj, "prefill_audit")
+    assert not hasattr(obj, "kv_trace_requests")
+
+
+@pytest.mark.parametrize("prefix", [3, 4])
+def test_partial_history_produced_and_bank_bytes_align(features, tmp_path, prefix):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    plane = torch.arange(16).to(torch.uint8).reshape(2, 4, 1, 2)
+    obj = SimpleNamespace(
+        kv_trace=trace,
+        _layerwise_prefill_dma=True,
+        lmcache_chunk_size=4,
+        kv_trace_requests={
+            "req": SimpleNamespace(
+                block_ids_by_bank=[[[1, 0]], [[0, 1]]],
+                is_last_prefill=True,
+                token_ids=list(range(7)),
+            )
+        },
+        _group_layouts={0: SimpleNamespace(indexer_c8=False)},
+    )
+    bind_connector(obj, features)
+    meta = SimpleNamespace(
+        req_ids=["req"], seq_lens_cpu=[7], query_start_loc_cpu=[0, 7 - prefix]
+    )
+    table = torch.tensor([[1, 0]])
+    obj.trace_attention_kv(0, 0, "P_LOAD", [plane], table, meta)
+    logical = torch.cat((plane[1], plane[0]))
+    obj.trace_attention_kv(
+        0, 0, "P_COMPUTE", [plane], table, meta, produced=(logical[prefix:7],)
+    )
+    trace.finish("req")
+    assert trace.drain(5)
+    path, records = rows(tmp_path)
+    values = {r["stage"]: read(path, r) for r in records if "pieces" in r}
+    assert values["P_LOAD"] == values["P_COMPUTE"][:prefix]
+    assert values["P_PRODUCED"] == values["P_COMPUTE"][prefix:]
+
+
+def test_cpu_packet_c8_components_skip_allocator_padding(features, tmp_path):
+    trace = features.KVTrace(0, "D", root=tmp_path, emit=lambda r: None)
+    raw = torch.arange(24, dtype=torch.uint8)
+    batches = {}
+    trace.cpu_work(
+        "req",
+        lambda: (
+            trace.cpu_packet(
+                "req", "D_CPU", 1, 0, 3, 0, 3, raw, 4, (4, 2), batches=batches
+            ),
+            trace.flush_packets("req", 1, 0, 3, batches),
+        ),
+        (),
+        (),
+    )
+    trace.finish("req")
+    assert trace.drain(5)
+    path, records = rows(tmp_path)
+    values = {r["component"]: read(path, r) for r in records if "pieces" in r}
+    assert values == {0: bytes([0, 4, 8]), 1: bytes([16, 18, 20])}
+
+
+def test_nested_cpu_save_captures_before_END_and_keeps_sources_leased(
+    features, tmp_path
+):
+    trace = features.KVTrace(0, "P", root=tmp_path, emit=lambda r: None)
+    obj = SimpleNamespace(
+        kv_trace=trace,
+        _layerwise_prefill_dma=True,
+        dtype=torch.float16,
+        _group_layouts={0: SimpleNamespace(indexer_c8=False)},
+        checkpoint_plane_widths=lambda group: (2, 1),
+        _sparse_lmc_host_interleaved=lambda group: False,
+    )
+    bind_connector(obj, features)
+    packet = SimpleNamespace(refs=1, tensor=torch.arange(12, dtype=torch.float16))
+    packet.ref_count_up = lambda: setattr(packet, "refs", packet.refs + 1)
+    packet.ref_count_down = lambda: setattr(packet, "refs", packet.refs - 1)
+    trace.cpu_work(
+        "req",
+        lambda: obj.trace_cpu_kv("P_CPU_STORE", "req", 0, [0], [4], [[packet]]),
+        [packet],
+        (),
+    )
+    trace.finish("req")
+    assert trace.drain(5)
+    _, records = rows(tmp_path)
+    assert len([r for r in records if r.get("stage") == "P_CPU_STORE"]) == 2
+    assert records[-1]["stage"] == "END"
+    assert packet.refs == 1
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+@pytest.mark.parametrize("layer", [0, 78])
+def test_actual_sparse_features_align_by_logical_position(
+    features, tmp_path, corrupt, layer
+):
+    trace = features.KVTrace(0, "D", root=tmp_path, emit=lambda r: None)
+    obj = SimpleNamespace(
+        kv_trace=trace,
+        _layerwise_prefill_dma=False,
+        kv_trace_sources={("req", 0, layer): ((0,), (8,), (), (2,), False)},
+    )
+    bind_connector(obj, features)
+    plane = torch.zeros(2, 4, 1, 2, dtype=torch.uint8)
+    plane.reshape(8, 2)[2, 0] = 55
+    plane.reshape(8, 2)[3, 0] = 11 if not corrupt else 12
+    obj.trace_selected_kv(
+        "req",
+        0,
+        layer,
+        [plane],
+        torch.tensor([[2, 3, 4, -1]]),
+        torch.tensor([[5, 1, 9, -1]]),
+        torch.tensor([3]),
+        10,
+    )
+    # Later decode steps must not replace the first load's data or top-k.
+    plane.fill_(99)
+    obj.trace_selected_kv(
+        "req",
+        0,
+        layer,
+        [plane],
+        torch.tensor([[0]]),
+        torch.tensor([[0]]),
+        torch.tensor([1]),
+        11,
+    )
+    trace.finish("req")
+    assert trace.drain(5)
+    path, records = rows(tmp_path)
+    selected_records = [r for r in records if r.get("stage") == "D_SELECTED"]
+    assert len(selected_records) == 1
+    record = selected_records[0]
+    assert read(path, record)[:2] == bytes([55, 11 if not corrupt else 12])
+    positions = next(r for r in records if r.get("stage") == "MAP_SELECTED_POS")
+    assert torch.frombuffer(
+        bytearray(read(path, positions)), dtype=torch.int64
+    ).tolist() == [5, 1, -1, -1]
+    topk = next(r for r in records if r.get("stage") == "MAP_SELECTED_TOPK")
+    assert topk["shape"] == [1, 4]
+    assert torch.frombuffer(
+        bytearray(read(path, topk)), dtype=torch.int64
+    ).tolist() == [5, 1, 9, -1]
+    count = next(r for r in records if r.get("stage") == "MAP_SELECTED_COUNT")
+    assert torch.frombuffer(
+        bytearray(read(path, count)), dtype=torch.int64
+    ).tolist() == [3]
+
+
+def test_decoder_does_not_treat_compact_scratch_as_full_prefix(features, tmp_path):
+    logs = []
+    trace = features.KVTrace(0, "D", root=tmp_path, emit=logs.append)
+    obj = SimpleNamespace(
+        kv_trace=trace,
+        _layerwise_prefill_dma=False,
+        kv_trace_requests={"req": object()},
+    )
+    bind_connector(obj, features)
+    trace.paged = lambda *a, **kw: pytest.fail("D must use sparse load destinations")
+    obj.trace_attention_kv(0, 0, "P_LOAD", None, None, None)
+    assert not trace.failed and not logs and not trace.files
+
+
+def test_direct_mixed_c8_features_read_actual_physical_destinations(features, tmp_path):
+    trace = features.KVTrace(0, "D", root=tmp_path, emit=lambda r: None)
+    obj = SimpleNamespace(
+        kv_trace=trace,
+        _layerwise_prefill_dma=False,
+        _group_layouts={
+            1: SimpleNamespace(
+                indexer_c8=True, kv_device="cpu", layer_slot_factors=(2,)
+            )
+        },
+        _stream_context_or_null=lambda stream: nullcontext(),
+        load_stream=None,
+    )
+    bind_connector(obj, features)
+    key = torch.arange(1024).to(torch.int8).reshape(4, 128, 1, 2)
+    scale = torch.arange(512, dtype=torch.float16).reshape(4, 128, 1, 1)
+    obj.trace_direct_kv("req", 1, [(key, scale)], torch.arange(128, 256), [0], [128])
+    trace.finish("req")
+    assert trace.drain(5)
+    path, records = rows(tmp_path)
+    actual = [r for r in records if r.get("stage") == "D_DIRECT"]
+    assert len(actual) == 2
+    for record, plane in zip(actual, (key, scale), strict=True):
+        assert read(path, record) == features.token_bytes(plane[2]).numpy().tobytes()

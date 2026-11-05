@@ -54,7 +54,6 @@ jobs:
         -v /usr/local/dcmi:/usr/local/dcmi:ro
         -v /etc/pki/ca-trust:/etc/pki/ca-trust:ro
         -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
-        -v /root/.ssh:/root/.ssh:ro
         --user root
         --cap-add=SYS_PTRACE
 
@@ -62,13 +61,11 @@ jobs:
     steps:
       - name: 🔧 Fix Proxy Configuration
         run: |
-          git config --global http.version HTTP/1.1
-          if getent hosts proxyhk.huawei.com >/dev/null 2>&1; then
-            echo "http_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
-            echo "https_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
-            echo "HTTP_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
-            echo "HTTPS_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
-          fi
+          echo "Overwriting Runner Proxy Settings..."
+          echo "http_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
+          echo "https_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
+          echo "HTTP_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
+          echo "HTTPS_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
 
       - name: Checkout (Workflow Run)
         if: github.event_name == 'workflow_run'
@@ -116,7 +113,7 @@ jobs:
           
           echo ">>> Installing LMCache Core..."
           # TODO (gingfung): use strategy matrix for different version tests
-          pip install lmcache==0.4.4
+          pip install lmcache==0.4.3
 
           echo ">>> Building LMCache-Ascend..."
           export CPLUS_INCLUDE_PATH=/usr/include/c++/12:/usr/include/c++/12/backward:/usr/include/c++/12/`uname -i`-openEuler-linux/:$CPLUS_INCLUDE_PATH
@@ -262,22 +259,11 @@ jobs:
         -v /etc/hccn.conf:/etc/hccn.conf:ro
         -v /etc/pki/ca-trust:/etc/pki/ca-trust:ro
         -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
-        -v /root/.ssh:/root/.ssh:ro
         --user root
         --cap-add=SYS_PTRACE
 
       
     steps:
-      - name: 🔧 Fix Proxy Configuration
-        run: |
-          git config --global http.version HTTP/1.1
-          if getent hosts proxyhk.huawei.com >/dev/null 2>&1; then
-            echo "http_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
-            echo "https_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
-            echo "HTTP_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
-            echo "HTTPS_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
-          fi
-
       - name: Checkout (Workflow Run)
         if: github.event_name == 'workflow_run'
         uses: actions/checkout@v4
@@ -319,17 +305,12 @@ jobs:
       - name: 🔧 Fix Git Safe Directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: 📦 Pre-clone LMCache Test Dependencies
-        run: |
-          LMCACHE_TAG=$(grep -oP 'LMCACHE_UPSTREAM_TAG\s*=\s*"\K[^"]+' lmcache_ascend/__init__.py)
-          git clone --branch "$LMCACHE_TAG" --depth 1 git@github.com:LMCache/LMCache.git /workspace/LMCache
-
       - name: 📦 Install LMCache & Build Project
         run: |
           
           echo ">>> Installing LMCache Core..."
           # TODO (gingfung): use strategy matrix for different version tests
-          pip install lmcache==0.4.4
+          pip install lmcache==0.4.3
 
           echo ">>> Building LMCache-Ascend..."
           export CPLUS_INCLUDE_PATH=/usr/include/c++/12:/usr/include/c++/12/backward:/usr/include/c++/12/`uname -i`-openEuler-linux/:$CPLUS_INCLUDE_PATH

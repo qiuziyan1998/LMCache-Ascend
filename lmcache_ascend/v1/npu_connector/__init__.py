@@ -13,6 +13,9 @@ import torch
 
 # First Party
 from lmcache_ascend import _build_info
+from lmcache_ascend.v1.content_diagnostics import (
+    configure_npu_content_diagnostics,
+)
 
 if _build_info.__framework_name__ == "pytorch":
     # First Party
@@ -43,7 +46,22 @@ def CreateNPUConnector(
     Replaces upstream CreateGPUConnector to return Ascend NPU-specific
     connector implementations.
     """
+    if getattr(metadata, "indexer_c8_layout", None) is not None and not (
+        _build_info.__framework_name__ == "pytorch"
+        and engine == EngineType.VLLM
+        and metadata.use_mla
+        and config.use_layerwise
+        and config.dsa_two_groups
+        and not config.enable_blending
+    ):
+        raise ValueError(
+            "Indexer C8 requires the PyTorch vLLM two-group layerwise "
+            "connector without blending"
+        )
     use_gpu = need_gpu_interm_buffer(config)
+    configure_npu_content_diagnostics(
+        bool(getattr(config, "enable_npu_content_diagnostics", False))
+    )
 
     num_gpus = torch.npu.device_count()
     local_rank = metadata.worker_id % num_gpus
@@ -65,6 +83,13 @@ def CreateNPUConnector(
                 conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
+                conn.runtime_kv_group_layer_counts = getattr(
+                    metadata, "runtime_kv_group_layer_counts", None
+                )
+            conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
+            conn.enable_npu_transfer_validation = getattr(
+                config, "enable_npu_transfer_validation", True
+            )
             return conn
 
         if config.use_gpu_connector_v3:
@@ -75,6 +100,7 @@ def CreateNPUConnector(
             conn = VLLMPagedMemNPUConnectorV2.from_metadata(
                 metadata, use_gpu, device, layout_hints=layout_hints
             )
+            conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
             return conn
     elif engine == EngineType.SGLANG:
         # First Party

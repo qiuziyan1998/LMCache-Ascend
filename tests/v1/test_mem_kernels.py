@@ -1346,6 +1346,196 @@ def test_multi_layer_kv_transfer_mla_format(
 
 @pytest.mark.parametrize("num_tokens", [256, 1024])
 @pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("num_layers", [1, 4])
+@pytest.mark.parametrize("num_blocks", [1000])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("kv_lora_rank", [512])
+@pytest.mark.parametrize("qk_rope_head_dim", [128])
+def test_single_layer_kv_transfer_mla_format(
+    num_tokens,
+    num_kv_heads,
+    num_layers,
+    num_blocks,
+    block_size,
+    kv_lora_rank,
+    qk_rope_head_dim,
+):
+    """Test single-layer MLA format KV cache transfer via stacked staging buffer."""
+    device = "npu"
+    dtype = torch.bfloat16
+
+    kv_cache_src = generate_mla_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    kv_cache_dst = generate_mla_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+
+    page_buffer_size = num_blocks * block_size
+    slot_mapping = random.sample(range(0, page_buffer_size), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping, device=device)
+
+    k_cache, v_cache = kv_cache_src[0]
+    k_hidden_dims = k_cache.shape[-2] * k_cache.shape[-1]
+    v_hidden_dims = v_cache.shape[-2] * v_cache.shape[-1]
+    staging_elems = num_tokens * (k_hidden_dims + v_hidden_dims)
+
+    for layer_id in range(num_layers):
+        staging = torch.empty(staging_elems, dtype=dtype, device=device)
+        lmc_ops.single_layer_kv_transfer(
+            staging,
+            kv_cache_src[layer_id],
+            slot_mapping,
+            True,  # from_gpu
+            3,  # MLA_KV
+            False,  # stacked staging planes
+            False,
+            0,
+            0,
+            0,
+        )
+        lmc_ops.single_layer_kv_transfer(
+            staging,
+            kv_cache_dst[layer_id],
+            slot_mapping,
+            False,  # to_gpu
+            3,  # MLA_KV
+            False,
+            False,
+            0,
+            0,
+            0,
+        )
+
+    torch.npu.synchronize()
+    check_paged_kv_cache_equal(
+        kv_cache_src,
+        kv_cache_dst,
+        slot_mapping,
+        num_heads=num_kv_heads,
+        head_size=128,
+        kv_format=3,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+
+
+@pytest.mark.parametrize("num_lmc_tokens", [512])
+@pytest.mark.parametrize("num_sparse", [128, 256])
+@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("num_layers", [1])
+@pytest.mark.parametrize("num_blocks", [1000])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("kv_lora_rank", [512])
+@pytest.mark.parametrize("qk_rope_head_dim", [128])
+def test_sparse_single_layer_kv_transfer_mla_format(
+    num_lmc_tokens,
+    num_sparse,
+    num_kv_heads,
+    num_layers,
+    num_blocks,
+    block_size,
+    kv_lora_rank,
+    qk_rope_head_dim,
+):
+    """Sparse MLA scatter: LMC stacked staging -> vLLM paged memory."""
+    device = "npu"
+    dtype = torch.bfloat16
+
+    kv_cache_src = generate_mla_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    kv_cache_dst = generate_mla_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+
+    page_buffer_size = num_blocks * block_size
+    full_slot_mapping = random.sample(range(page_buffer_size), num_lmc_tokens)
+    full_slot_mapping = torch.tensor(full_slot_mapping, device=device)
+
+    k_cache, v_cache = kv_cache_src[0]
+    k_hidden_dims = k_cache.shape[-2] * k_cache.shape[-1]
+    v_hidden_dims = v_cache.shape[-2] * v_cache.shape[-1]
+    staging_elems = num_lmc_tokens * (k_hidden_dims + v_hidden_dims)
+    staging = torch.empty(staging_elems, dtype=dtype, device=device)
+
+    lmc_ops.single_layer_kv_transfer(
+        staging,
+        kv_cache_src[0],
+        full_slot_mapping,
+        True,  # from_gpu
+        3,  # MLA_KV
+        False,
+        False,
+        0,
+        0,
+        0,
+    )
+
+    selected_indices = random.sample(range(num_lmc_tokens), num_sparse)
+    sparse_dst_slots = random.sample(range(page_buffer_size), num_sparse)
+    selected_token_idx = torch.tensor(selected_indices, dtype=torch.int32, device=device)
+    slot_mapping_packed = torch.tensor(sparse_dst_slots, device=device)
+
+    lmc_ops.sparse_single_layer_kv_transfer(
+        staging,
+        kv_cache_dst[0],
+        slot_mapping_packed,
+        selected_token_idx,
+        3,  # MLA_KV
+        False,
+        False,
+        0,
+        0,
+        0,
+    )
+
+    torch.npu.synchronize()
+
+    k_src, v_src = kv_cache_src[0]
+    k_dst, v_dst = kv_cache_dst[0]
+    k_src_flat = k_src.reshape(-1, kv_lora_rank)
+    v_src_flat = v_src.reshape(-1, qk_rope_head_dim)
+    k_dst_flat = k_dst.reshape(-1, kv_lora_rank)
+    v_dst_flat = v_dst.reshape(-1, qk_rope_head_dim)
+
+    for i in range(num_sparse):
+        src_slot = full_slot_mapping[selected_token_idx[i]].item()
+        dst_slot = slot_mapping_packed[i].item()
+        assert torch.equal(k_dst_flat[dst_slot], k_src_flat[src_slot])
+        assert torch.equal(v_dst_flat[dst_slot], v_src_flat[src_slot])
+
+
+@pytest.mark.parametrize("num_tokens", [256, 1024])
+@pytest.mark.parametrize("num_kv_heads", [8])
 @pytest.mark.parametrize("chunk_size", [256])
 @pytest.mark.parametrize("num_layers", [1, 32])
 @pytest.mark.parametrize("block_size", [16])

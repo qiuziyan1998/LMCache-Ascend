@@ -1,255 +1,1724 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from functools import partial
+import os
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
 from lmcache.integration.vllm.vllm_v1_adapter import (
-    LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
+    ReqMeta,
 )
+from lmcache.integration.vllm.preemption_checkpoint import CheckpointResult, CheckpointRestoreMiss
 from lmcache.logging import init_logger
-from lmcache.utils import _lmcache_nvtx_annotate
-from vllm.config import (
-    VllmConfig,
+from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
+from lmcache.v1.prefill_store_debug import (
+    prefill_store_debug_enabled,
+    prefill_store_debug_finish,
+    prefill_store_debug_log,
 )
+from lmcache.v1.prefill_kv_hash import finish_kv_hash, kv_hash_enabled
+from lmcache.v1.cache_engine import LayerwiseStoreResult
+from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
 )
-from vllm.distributed.parallel_state import get_pp_group
-from vllm.v1.request import RequestStatus
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import is_forward_context_available
+from vllm_ascend import envs as ascend_envs
+from vllm_ascend.live_source_handoff import (
+    LIVE_SOURCE_EVENT_HANDOFF_KEY,
+)
 import torch
+
+# First Party
+from lmcache_ascend.v1.content_diagnostics import (
+    log_npu_content_diagnostic_event,
+    npu_content_diagnostics_enabled,
+)
+from lmcache_ascend.v1.npu_connector.prefill_overlap import (
+    AclEventTimer,
+    PrefillOverlapRecorder,
+    request_spans,
+)
+from lmcache_ascend.v1.remote_fill_producer import parse_remote_fill_handoff
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.forward_context import ForwardContext
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+_MOONCAKE_PREFERRED_SEGMENT_CONFIG = "lmcache.mooncake_preferred_segment"
+_MOONCAKE_PREFERRED_KV_GROUP_CONFIG = "lmcache.mooncake_preferred_kv_group"
+_REMOTE_FILL_ROUTING_KEYS = (
+    "do_remote_decode",
+    "do_remote_prefill",
+    "last_token_id",
+    "live_split_capabilities",
+    "live_split_transfer_id",
+    "num_prompt_blocks",
+    "remote_block_ids",
+    "remote_dcp_size",
+    "remote_dp_rank",
+    "remote_engine_id",
+    "remote_host",
+    "remote_multi_nodes_meta_mapping",
+    "remote_pcp_size",
+    "remote_port",
+    "remote_ptp_size",
+    "remote_request_id",
+)
+_REMOTE_FILL_PUBLIC_HANDOFF_KEYS = (
+    "transfer_id",
+    "request_attempt",
+    "source_engine_id",
+    "destination_engine_id",
+    "destination_engine_epoch",
+    "destination_dp_rank",
+    "shared_cache_generation",
+    "destination_tp_size",
+    "destination_dp_size",
+    "global_te_push",
+    "token_hash_algorithm",
+    "python_hash_seed",
+)
+
+
+def _remote_fill_response_params(
+    params: Mapping[str, Any],
+    terminal: Mapping[str, str | int],
+    base: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the pointer-free producer response returned through vLLM."""
+
+    result = dict(base or {})
+    for key in _REMOTE_FILL_ROUTING_KEYS:
+        if key in params:
+            result[key] = params[key]
+    raw_handoff = params.get("lmcache.remote_fill")
+    public_handoff: dict[str, Any] = {}
+    if isinstance(raw_handoff, Mapping):
+        for key in _REMOTE_FILL_PUBLIC_HANDOFF_KEYS:
+            if key in raw_handoff:
+                public_handoff[key] = raw_handoff[key]
+    public_handoff["terminal"] = dict(terminal)
+    result["lmcache.remote_fill"] = public_handoff
+    return result
+
+
+def _remote_fill_handoff_qualified(request_configs: Any) -> bool:
+    """Return whether this request may activate direct remote fill."""
+    try:
+        handoff = parse_remote_fill_handoff(request_configs)
+    except ValueError:
+        return False
+    return bool(handoff is not None and handoff.global_te_push)
+
+
+def _remote_fill_request_qualified(request: Any) -> bool:
+    """Cache handoff qualification on one worker request metadata object."""
+
+    cached = getattr(request, "_lmcache_remote_fill_qualified", None)
+    if cached is None:
+        cached = _remote_fill_handoff_qualified(request.request_configs)
+        request._lmcache_remote_fill_qualified = cached
+    return bool(cached)
+
+
+def _persistent_direct_hbm_enabled(config: Any) -> bool:
+    return config.dsa_group1_load_mode == "persistent_direct_hbm"
+
+
+def _prepare_remote_fill_persistent_placement(
+    request_configs: Any,
+    *,
+    group1_direct_hbm: bool = False,
+) -> bool:
+    """Select split-group Mooncake placement for qualified persistence."""
+
+    if not _remote_fill_handoff_qualified(request_configs):
+        return False
+    assert isinstance(request_configs, dict)
+    if group1_direct_hbm:
+        segment = request_configs.get(_MOONCAKE_PREFERRED_SEGMENT_CONFIG)
+        if not isinstance(segment, str) or not segment.strip():
+            raise ValueError(
+                "Group-1 direct HBM requires a decoder-local Mooncake segment"
+            )
+        request_configs[_MOONCAKE_PREFERRED_SEGMENT_CONFIG] = segment.strip()
+        request_configs[_MOONCAKE_PREFERRED_KV_GROUP_CONFIG] = 1
+    else:
+        request_configs.pop(_MOONCAKE_PREFERRED_SEGMENT_CONFIG, None)
+        request_configs.pop(_MOONCAKE_PREFERRED_KV_GROUP_CONFIG, None)
+    return True
+
+
+def _validate_remote_fill_sleep_mode(config: Any, vllm_config: Any) -> None:
+    """Reject an allocator lifecycle that cannot yet drain armed writes."""
+
+    if (
+        getattr(config, "enable_remote_lmcache_store", False)
+        and bool(
+            getattr(
+                getattr(vllm_config, "model_config", None),
+                "enable_sleep_mode",
+                False,
+            )
+        )
+    ):
+        raise ValueError(
+            "direct remote LMCache store is incompatible with vLLM sleep mode "
+            "until armed transfers can be drained before allocator changes"
+        )
+
+
+@dataclass
+class LiveSourceWorkerMetadata(KVConnectorWorkerMetadata):
+    descriptors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    remote_fill_results: dict[str, dict[str, str | int]] = field(
+        default_factory=dict
+    )
+    checkpoint_results = ()
+
+    def aggregate(
+        self, other: KVConnectorWorkerMetadata
+    ) -> "LiveSourceWorkerMetadata":
+        if not isinstance(other, LiveSourceWorkerMetadata):
+            raise TypeError("Cannot aggregate incompatible LMCache worker metadata")
+        merged = {req_id: list(items) for req_id, items in self.descriptors.items()}
+        for req_id, items in other.descriptors.items():
+            merged.setdefault(req_id, []).extend(items)
+        results = dict(self.remote_fill_results)
+        for req_id, result in other.remote_fill_results.items():
+            existing = results.get(req_id)
+            if existing is not None and existing != result:
+                raise ValueError(
+                    "Tensor-parallel ranks reported different remote-fill outcomes"
+                )
+            results[req_id] = dict(result)
+        if self.checkpoint_results or other.checkpoint_results:
+            return CheckpointWorkerMetadata(merged, results, self.checkpoint_results + other.checkpoint_results)
+        return LiveSourceWorkerMetadata(merged, results)
+
+
+@dataclass
+class CheckpointWorkerMetadata(LiveSourceWorkerMetadata):
+    checkpoint_results: tuple[CheckpointResult, ...] = ()
+
+
+@dataclass(slots=True)
+class _LiveSourceReadyFence:
+    event: Any
+    event_source: str
+    ready_at_finalize: Optional[bool]
+
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
+    supports_preemption_checkpoint = True
+
+    def _record_dsa_cold_dense_load_readiness(
+        self, state, readiness=None, additional_owners=()
+    ):
+        if (
+            self._prepare_cold_graph_pointers
+            and readiness is None
+            and not state.dense_prefix_resident_tokens
+        ):
+            source = state.prepared_sparse_sources.get(0)
+            caches = self._kvcaches_for_group(0)
+            if (
+                source is not None and caches
+                and isinstance(caches[0], (tuple, list))
+                and len(caches[0]) == 2 and caches[0][0].ndim == 4
+            ):
+                from lmcache_ascend.v1.npu_connector.sparse_graph import prepare_source_pointer_pairs
+
+                key = caches[0][0]
+                with torch.npu.stream(self.lmcache_engine.gpu_connector.load_stream):
+                    prepare_source_pointer_pairs(
+                        source, self._lmcache_chunk_size,
+                        key.shape[-2] * key.shape[-1] * key.element_size(),
+                    )
+        return super()._record_dsa_cold_dense_load_readiness(
+            state, readiness, additional_owners
+        )
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
-        super().__init__(vllm_config, role, parent)
+        self._prepare_cold_graph_pointers = bool(
+            int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))
+        )
+        self._defer_prepared_sparse_setup = self._prepare_cold_graph_pointers
+        # Cache the existing dense-load compatibility switches on scheduler and
+        # worker alike. Legacy staged copies cannot export async readiness.
+        self._resident_cold_load_enabled = not any(
+            os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+            for name in (
+                "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE",
+                "LMCACHE_ASCEND_DENSE_DIRECT_LOAD_DISABLE",
+            )
+        )
+        super().__init__(
+            vllm_config,
+            role,
+            parent,
+            **(
+                {"kv_cache_config": kv_cache_config}
+                if kv_cache_config is not None
+                else {}
+            ),
+        )
+        checkpoint_worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
+        if checkpoint_worker is not None:
+            checkpoint_worker.configure_capacity(self._decode_window_save_window_size, self._lmcache_chunk_size)
+        # LMCache-NPU initializes this field only for worker connectors;
+        # EngineCore also constructs this implementation for the scheduler.
+        self.use_layerwise = bool(
+            getattr(
+                self,
+                "use_layerwise",
+                getattr(self.config, "use_layerwise", False),
+            )
+        )
         self.store_async = self.config.store_async
-        self._wait_for_save_done = True
-        self._finished_req_ids_waiting_for_save: set[str] = set()
-        self._late_finished_sending: set[str] = set()
-        logger.debug("store_async: %s", self.store_async)
+        self._force_layerwise_prefill_store = bool(
+            self.use_layerwise
+            and os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip()
+            .lower() == "true"
+        )
+        self._prefill_overlap_enabled = bool(
+            self._force_layerwise_prefill_store
+            and ascend_envs.VLLM_ASCEND_PREFILL_OVERLAP_STATS
+        )
+        self._prefill_overlap_recorder = None
+        if self._prefill_overlap_enabled and role == KVConnectorRole.WORKER:
+            device = torch.npu.current_device()
+            self._prefill_overlap_recorder = PrefillOverlapRecorder(
+                partial(torch.npu.Event, enable_timing=True),
+                logger.info,
+                elapsed_time=AclEventTimer(),
+                worker=dict(
+                    tp_rank=get_tensor_model_parallel_rank(),
+                    dp_rank=int(vllm_config.parallel_config.data_parallel_index),
+                ),
+                initialize_thread=partial(torch.npu.set_device, device),
+            )
+            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
+                self._prefill_overlap_recorder
+            )
+        get_extra = getattr(self.config, "get_extra_config_value", None)
+        _validate_remote_fill_sleep_mode(self.config, vllm_config)
+        self._remote_store_requested = bool(
+            getattr(self.config, "enable_remote_lmcache_store", False)
+            and getattr(self.config, "pd_role", None) != "receiver"
+        )
+        self._direct_store_requested = bool(
+            self._remote_store_requested
+            or (
+                get_extra("mooncake_direct_npu_prefill_store", False)
+                if callable(get_extra)
+                else False
+            )
+        )
+        # The provider must not self-activate the hybrid wire format.  A new
+        # LMCache provider can be paired with an older vLLM/Mooncake consumer;
+        # in that case an unnegotiated latent extension could discard the
+        # otherwise valid group-1 source descriptor. AscendMultiConnector enables this
+        # only after both sides of the in-process transport negotiate support.
+        self._live_latent_split_requested = False
+        self._direct_store_observed_layers: set[str] = set()
+        self._direct_store_step_supported: Optional[bool] = None
+        self._completed_layerwise_stores: dict[
+            tuple[str, int], LayerwiseStoreResult
+        ] = {}
+        self._scheduler_live_sources: dict[str, list[dict[str, Any]]] = {}
+        self._scheduler_remote_fill_results: dict[
+            str, dict[str, str | int]
+        ] = {}
+        self._unfenced_live_stores: dict[str, ReqMeta] = {}
+        self._latest_live_source_ready_event: Any = None
+        self._latest_live_source_ready_event_source = "missing"
+        self._latest_direct_source_ready_events: dict[str, Any] = {}
+        self._live_source_ready_fences: dict[str, _LiveSourceReadyFence] = {}
+        self._finalized_live_source_submissions: set[str] = set()
 
-    @_lmcache_nvtx_annotate
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        self.current_layer = 0
-        self._wait_for_save_done = False
-        super().start_load_kv(forward_context, **kwargs)
-
-    @_lmcache_nvtx_annotate
-    def wait_for_save(self):
-        """Blocking until the KV cache is saved to the connector buffer."""
-
-        connector_metadata = self._parent._get_connector_metadata()
-        assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-
-        if self.kv_role == "kv_consumer":
-            if self.lmcache_engine is not None:
-                for request in connector_metadata.requests:
-                    self.lmcache_engine.lookup_unpin(request.req_id)
-            self._wait_for_save_done = True
-            return
-
-        if self.use_layerwise:
-            assert not self.store_async, (
+        if self._direct_store_requested and self._force_layerwise_prefill_store:
+            logger.warning(
+                "[PREFILL_STORE_FALLBACK] Layerwise prefill reuses two KV banks; "
+                "ignoring all-layer NPU direct-store/RemoteFill source reads. "
+                "Using per-layer NPU-to-CPU saves before bank reuse and "
+                "persistent remote publication. RemoteFill can send the "
+                "completed CPU pages concurrently with Mooncake persistence."
+            )
+        if self._direct_store_requested and not self._force_layerwise_prefill_store:
+            extra = self.config.extra_config or {}
+            valid = (
+                self.store_async
+                and self.config.store_async_max_queue_size == 2
+                and str(self.config.remote_url).startswith("mooncakestore://")
+                and self.use_layerwise
+                and (
+                    getattr(self, "_remote_store_requested", False)
+                    or self.config.enable_shared_cpu_cache
+                )
+                and extra.get("mooncake_page_first_multi_buffer", False)
+                and extra.get("mooncake_layer_merged_page_objects", False)
+                and extra.get("save_only_first_rank", False)
+                and extra.get("use_ascend_direct", False)
+                and not extra.get("save_chunk_meta", False)
+            )
+            if not valid:
+                raise ValueError(
+                    "mooncake_direct_npu_prefill_store requires store_async=true, "
+                    "store_async_max_queue_size=2, layerwise merged Mooncake pages, "
+                    "save_only_first_rank, use_ascend_direct, and "
+                    "save_chunk_meta=false"
+                )
+        if (
+            role != KVConnectorRole.SCHEDULER
+            and self.kv_role != "kv_consumer"
+            and self.use_layerwise
+            and self.store_async
+            and not self._direct_store_requested
+            and not self._force_layerwise_prefill_store
+        ):
+            raise ValueError(
                 "Layerwise storing is not supported with async store"
             )
-            for request in connector_metadata.requests:
-                layerwise_storer = self._layerwise_save_storers.pop(
-                    request.req_id, None
-                )
-                if layerwise_storer is not None:
-                    next(layerwise_storer)
-                self.lmcache_engine.lookup_unpin(request.req_id)
-            self._wait_for_save_done = True
-            self._replay_finished_stores_after_save()
+        logger.debug("store_async: %s", self.store_async)
+
+    def configure_live_latent_source(self, enabled: bool) -> None:
+        """Apply the two-sided hybrid-transport capability decision."""
+        configure = getattr(super(), "configure_live_latent_source", None)
+        if callable(configure):
+            configure(enabled)
             return
+        # Preserve startup compatibility with an older LMCache-NPU base.  It
+        # has no hybrid transport hook, so fail closed without affecting the
+        # established group-1 path.
+        self._live_latent_split_requested = False
 
-        assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
+    def _producer_fence_handoff_targets(
+        self,
+        requests: Iterable[ReqMeta],
+    ) -> tuple[tuple[str, int], ...]:
+        mode = getattr(
+            self.config, "remote_fill_submission_mode", "final_deferred"
+        )
+        return tuple(
+            sorted({
+                (request.req_id, len(request.token_ids))
+                for request in requests
+                if (
+                    request.live_source_requested and request.is_last_prefill
+                )
+                or (
+                    getattr(self, "_remote_store_requested", False)
+                    and _remote_fill_request_qualified(request)
+                    and (mode == "per_chunk" or request.is_last_prefill)
+                )
+            })
+        )
 
+    def _build_request_meta(
+        self, tracker: Any, load_spec: Any, *, is_sparse_decode: bool = False,
+    ) -> Optional[ReqMeta]:
+        metadata = super()._build_request_meta(
+            tracker, load_spec, is_sparse_decode=is_sparse_decode,
+        )
+        if (
+            metadata is not None
+            and getattr(self, "_prefill_overlap_enabled", False)
+            and not is_sparse_decode
+        ):
+            request = self._unfinished_requests.get(tracker.req_id)
+            if request is not None:
+                start = int(request.num_computed_tokens)
+                end = min(len(tracker.token_ids), int(tracker.prompt_len))
+                if start < end:
+                    metadata.prefill_overlap_span = (start, end)
+        return metadata
+
+    def start_load_kv(
+        self,
+        forward_context: ForwardContext,
+        **kwargs: Any,
+    ) -> None:
+        """Start loads and arm a real producer-event handoff when required."""
+
+        recorder = getattr(self, "_prefill_overlap_recorder", None)
+        if recorder is not None:
+            requests = self._parent._get_connector_metadata().requests
+            recorder.begin_step(request_spans(
+                requests, forward_context.attn_metadata,
+            ))
+            self._prefill_overlap_step_active = recorder.active is not None
+            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
+                recorder if self._prefill_overlap_step_active else None
+            )
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            self.lmcache_engine.poll_layerwise_prefill_puts()
+        if (
+            getattr(self, "_force_layerwise_prefill_store", False)
+            and self._remote_store_requested
+            and forward_context.attn_metadata is not None
+        ):
+            # Do this before super() primes the storers and creates cache keys.
+            # The direct callback is bypassed for banked P nodes, but the
+            # Group-1 decoder-local Mooncake placement must not be bypassed.
+            for request in self._parent._get_connector_metadata().requests:
+                _prepare_remote_fill_persistent_placement(
+                    request.request_configs,
+                    group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
+                )
+        try:
+            super().start_load_kv(forward_context, **kwargs)
+        except BaseException:
+            if recorder is not None:
+                recorder.finish_step("incomplete")
+            raise
+        if forward_context.attn_metadata is None or not self.config.dsa_two_groups:
+            return
+        requests = self._direct_prefill_requests() or []
+        targets = self._producer_fence_handoff_targets(requests)
+        if not targets or not self._latent_layer_names:
+            return
+        existing = forward_context.additional_kwargs.setdefault(
+            LIVE_SOURCE_EVENT_HANDOFF_KEY, targets
+        )
+        if existing != targets:
+            forward_context.additional_kwargs.pop(
+                LIVE_SOURCE_EVENT_HANDOFF_KEY, None
+            )
+            logger.warning(
+                "Conflicting live-source event handoff; using persistent fallback"
+            )
+
+    def wait_for_save(self) -> None:
+        """Seal timing events after all ordinary bank submissions, without a fence."""
+        recorder = getattr(self, "_prefill_overlap_recorder", None)
+        try:
+            super().wait_for_save()
+        except BaseException:
+            if recorder is not None:
+                recorder.finish_step("incomplete")
+            raise
+        else:
+            if recorder is not None:
+                recorder.finish_step()
+
+    def capture_live_source_event_handoff(
+        self,
+        forward_context: ForwardContext,
+    ) -> bool:
+        """Retain the published event across deferred MTP finalization."""
+
+        arm = forward_context.additional_kwargs.pop(
+            LIVE_SOURCE_EVENT_HANDOFF_KEY, None
+        )
+        if arm is None:
+            return False
+        requests = self._direct_prefill_requests() or ()
+        targets = self._producer_fence_handoff_targets(requests)
+        if arm != targets:
+            return False
+        attn_metadata = forward_context.attn_metadata
+        # A single event cannot fence multiple DBO microbatch streams.
+        if not isinstance(attn_metadata, Mapping):
+            return False
+
+        for producer_layer_name in reversed(self._latent_layer_names):
+            source_ready_event = self._source_ready_event(
+                producer_layer_name, attn_metadata
+            )
+            if source_ready_event is not None:
+                break
+        else:
+            return False
+
+        metadata = self._parent._get_connector_metadata()
+        if getattr(metadata, "_live_source_event_handoff", None) is not None:
+            delattr(metadata, "_live_source_event_handoff")
+            logger.warning(
+                "Duplicate live-source event handoff; using persistent fallback"
+            )
+            return False
+        metadata._live_source_event_handoff = (  # type: ignore[attr-defined]
+            targets,
+            source_ready_event,
+        )
+        return True
+
+    def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
+        if (
+            getattr(self, "_force_layerwise_prefill_store", False)
+            or not getattr(self, "_direct_store_requested", False)
+            or self.kv_role == "kv_consumer"
+            or self.lmcache_engine is None
+            or self._parent._connector_metadata is None
+        ):
+            return None
+        metadata = self._parent._get_connector_metadata()
+        requests = list(getattr(metadata, "requests", ()))
+        if not requests or any(
+            request.is_sparse_decode
+            or request.is_decode_window_save
+            or not request.slot_mapping
+            or (
+                self.config.dsa_two_groups
+                and (
+                    request.save_spec is None
+                    or request.save_spec.can_save_indexer
+                )
+                and not request.indexer_slot_mapping
+            )
+            or (
+                self.kv_role != "kv_producer"
+                and not request.live_source_requested
+                and (
+                    request.save_spec is None
+                    or not request.save_spec.can_save
+                )
+            )
+            for request in requests
+        ):
+            return None
+        return requests
+
+    def _consume_completed_layerwise_store(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+        completed: bool,
+        result: Optional[LayerwiseStoreResult],
+    ) -> None:
+        super()._consume_completed_layerwise_store(
+            request, kv_group, completed, result
+        )
+        if (
+            (self._direct_store_requested or self._force_layerwise_prefill_store)
+            and completed
+            and result is not None
+            and result.committed_end > 0
+        ):
+            self._completed_layerwise_stores[(request.req_id, kv_group)] = result
+
+    def _abort_save_step(self, requests: Iterable[ReqMeta]) -> None:
+        requests = tuple(requests)
+        req_ids = {request.req_id for request in requests}
+        try:
+            super()._abort_save_step(requests)
+        finally:
+            if is_forward_context_available():
+                get_forward_context().additional_kwargs.pop(
+                    LIVE_SOURCE_EVENT_HANDOFF_KEY, None
+                )
+            metadata = getattr(self._parent, "_connector_metadata", None)
+            if metadata is not None and hasattr(
+                metadata, "_live_source_event_handoff"
+            ):
+                delattr(metadata, "_live_source_event_handoff")
+            self._direct_store_step_supported = None
+            self._direct_store_observed_layers.clear()
+            self._latest_live_source_ready_event = None
+            self._latest_live_source_ready_event_source = "missing"
+            getattr(self, "_latest_direct_source_ready_events", {}).clear()
+            for key in list(self._completed_layerwise_stores):
+                if key[0] in req_ids:
+                    self._completed_layerwise_stores.pop(key, None)
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                self._forget_layerwise_store_results(req_ids)
+            if self.lmcache_engine is not None:
+                try:
+                    self.lmcache_engine.wait_for_direct_stores(req_ids)
+                except Exception:
+                    logger.exception(
+                        "Failed to drain direct stores while aborting %s",
+                        sorted(req_ids),
+                    )
+                for req_id in req_ids:
+                    self._unfenced_live_stores.pop(req_id, None)
+                    fences = getattr(self, "_live_source_ready_fences", None)
+                    if fences is not None:
+                        fences.pop(req_id, None)
+                    finalized = getattr(
+                        self, "_finalized_live_source_submissions", None
+                    )
+                    if finalized is not None:
+                        finalized.discard(req_id)
+                self.lmcache_engine.drop_direct_store_states(req_ids)
+
+    @staticmethod
+    def _source_ready_event(layer_name: str, attn_metadata: Any) -> Any:
+        metadata = attn_metadata
+        if isinstance(attn_metadata, Mapping):
+            metadata = attn_metadata.get(layer_name)
+            if metadata is None and layer_name.endswith(".indexer.k_cache"):
+                # SFA publishes one event after writing both the latent and
+                # unbundled indexer caches, but ForwardContext stores it under
+                # the latent attention-layer name.  Resolve the synthetic
+                # indexer cache callback back to that unique sibling layer.
+                sibling_metadata = [
+                    value
+                    for name, value in attn_metadata.items()
+                    if isinstance(name, str)
+                    and name.rsplit(".", 1)[0] + ".indexer.k_cache"
+                    == layer_name
+                ]
+                if len(sibling_metadata) == 1:
+                    metadata = sibling_metadata[0]
+        return getattr(metadata, "reshape_cache_event", None)
+
+    @staticmethod
+    def _query_source_ready_event(event: Any) -> Optional[bool]:
+        query = getattr(event, "query", None)
+        if not callable(query):
+            return None
+        try:
+            return bool(query())
+        except Exception:
+            logger.warning("Failed to query live-source NPU event", exc_info=True)
+            return None
+
+    def _fence_live_source_descriptors(self) -> None:
+        fences = getattr(self, "_live_source_ready_fences", None)
+        if not fences:
+            return
         assert self.lmcache_engine is not None
 
-        # lmcache-ascend start ---------------------
-        ordering_event = torch.npu.Event()
-        ordering_event.record()
-        # lmcache-ascend end ---------------------
+        by_event: dict[int, tuple[Any, list[tuple[str, _LiveSourceReadyFence]]]] = {}
+        for req_id, fence in fences.items():
+            entry = by_event.setdefault(id(fence.event), (fence.event, []))
+            entry[1].append((req_id, fence))
 
-        for request in connector_metadata.requests:
-            self.lmcache_engine.lookup_unpin(request.req_id)
-
-            try:
-                save_spec = request.save_spec
-                if (
-                    save_spec is None or not save_spec.can_save
-                ) and self.kv_role != "kv_producer":
-                    continue
-
-                token_ids = request.token_ids
-
-                slot_mapping = request.slot_mapping
-                assert isinstance(slot_mapping, torch.Tensor)
-                assert len(slot_mapping) == len(token_ids)
-
-                # lmcache-ascend start ---------------------
-                slot_mapping = slot_mapping.pin_memory()
-                with torch.npu.stream(self.lmcache_engine.gpu_connector.store_stream):
-                    slot_mapping_npu = slot_mapping.to(
-                        device="npu", dtype=torch.long, non_blocking=True
+        completed: list[str] = []
+        perf_enabled = serving_perf_enabled()
+        content_enabled = npu_content_diagnostics_enabled()
+        time_fence = perf_enabled or content_enabled
+        for event, requests in by_event.values():
+            ready_before_publish = (
+                self._query_source_ready_event(event)
+                if content_enabled
+                else None
+            )
+            started = time.perf_counter() if time_fence else 0.0
+            # This is an event-local producer fence.  It does not drain
+            # unrelated NPU streams or invoke torch.npu.synchronize().
+            event.synchronize()
+            wait_ms = (time.perf_counter() - started) * 1000 if time_fence else 0.0
+            req_ids = [req_id for req_id, _ in requests]
+            finalize_readiness = getattr(
+                self.lmcache_engine, "finalize_live_source_readiness", None
+            )
+            if callable(finalize_readiness):
+                finalize_readiness(req_ids)
+            for req_id, fence in requests:
+                if perf_enabled:
+                    serving_perf_log(
+                        logger,
+                        "live_source_ready_fence",
+                        req_id=req_id,
+                        event_source=fence.event_source,
+                        ready_at_finalize=fence.ready_at_finalize,
+                        ready_before_publish=ready_before_publish,
+                        wait_ms=round(wait_ms, 3),
+                        fence_scope="producer_event",
                     )
-                # lmcache-ascend end ---------------------
+                if content_enabled:
+                    log_npu_content_diagnostic_event(
+                        "group1_source_ready_fence",
+                        req_id=req_id,
+                        event_source=fence.event_source,
+                        ready_at_finalize=fence.ready_at_finalize,
+                        ready_before_publish=ready_before_publish,
+                        ready_after_fence=True,
+                        wait_ms=round(wait_ms, 3),
+                        query_precedes_device_readback=True,
+                        fence_scope="producer_event",
+                    )
+                completed.append(req_id)
+        for req_id in completed:
+            fences.pop(req_id, None)
 
-                skip_leading_tokens = save_spec.skip_leading_tokens
-
-                if skip_leading_tokens == len(token_ids):
-                    continue
-                skip_leading_tokens = (
-                    skip_leading_tokens
-                    // self._lmcache_chunk_size
-                    * self._lmcache_chunk_size
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Use one direct page submission after all required layers are ready."""
+        requests = self._direct_prefill_requests()
+        if requests is None:
+            super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+            return
+        if self._remote_store_requested:
+            for request in requests:
+                if _remote_fill_request_qualified(request):
+                    _prepare_remote_fill_persistent_placement(
+                        request.request_configs,
+                        group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
+                    )
+        expected = set(self._latent_layer_names)
+        if self.config.dsa_two_groups:
+            expected.update(self._indexer_layer_names)
+        if not expected:
+            super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+            return
+        if self._direct_store_step_supported is None:
+            self._direct_store_step_supported = self._preflight_direct_store(
+                requests
+            )
+        if not self._direct_store_step_supported:
+            super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+            return
+        if layer_name in expected:
+            direct_ready_events = getattr(
+                self, "_latest_direct_source_ready_events", None
+            )
+            if direct_ready_events is None:
+                direct_ready_events = {}
+                self._latest_direct_source_ready_events = direct_ready_events
+            if layer_name in self._direct_store_observed_layers:
+                self._direct_store_observed_layers.clear()
+                self._latest_live_source_ready_event = None
+                self._latest_live_source_ready_event_source = "missing"
+                direct_ready_events.clear()
+            self._direct_store_observed_layers.add(layer_name)
+            source_ready_event = LMCacheAscendConnectorV1Impl._source_ready_event(
+                layer_name, attn_metadata
+            )
+            if source_ready_event is not None:
+                direct_ready_events[layer_name] = source_ready_event
+                self._latest_live_source_ready_event = source_ready_event
+                self._latest_live_source_ready_event_source = (
+                    "attn_metadata.reshape_cache_event"
                 )
-
-                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
-
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
-                    len(token_ids),
-                    skip_leading_tokens,
-                    request.req_id,
-                )
-
-                is_last_prefill = request.is_last_prefill
-                if is_last_prefill:
-                    if request.disagg_spec:
-                        request.disagg_spec.is_last_prefill = True
-                else:
-                    if not self.enable_blending:
-                        token_len = len(token_ids)
-                        aligned_token_len = (
-                            token_len
-                            // self._lmcache_chunk_size
-                            * self._lmcache_chunk_size
-                        )
-                        token_ids = token_ids[:aligned_token_len]
-                        store_mask = store_mask[:aligned_token_len]
-                        slot_mapping = slot_mapping[:aligned_token_len]
-
-                self.lmcache_engine.store(
-                    token_ids,
-                    mask=store_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens,
-                    transfer_spec=request.disagg_spec,
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                    ordering_event=ordering_event,
-                    slot_mapping_npu=slot_mapping_npu,
-                )
-
-                if get_pp_group().is_last_rank:
-                    save_spec.skip_leading_tokens = len(token_ids)
-                    if request.disagg_spec:
-                        request.disagg_spec.num_transferred_tokens = len(token_ids)
-            except Exception:
-                # Do not let one failing request abort the save loop
-                logger.exception(
-                    "wait_for_save failed for request %s; skipping save",
-                    request.req_id,
-                )
-                continue
-
-        self._wait_for_save_done = True
-        self._replay_finished_stores_after_save()
-
-    def _may_register_store_after_wait_for_save(self, request: "Request") -> bool:
-        if self.kv_role == "kv_consumer":
-            return False
-        save_spec = request.save_spec
-        if save_spec is None:
-            return False
-        if not save_spec.can_save and self.kv_role != "kv_producer":
-            return False
-        return save_spec.skip_leading_tokens != len(request.token_ids)
-
-    def _replay_finished_stores_after_save(self) -> None:
-        if not self._finished_req_ids_waiting_for_save or self.lmcache_engine is None:
+        if not expected.issubset(self._direct_store_observed_layers):
             return
 
-        finished_sending = self.lmcache_engine.get_finished_stores(
-            self._finished_req_ids_waiting_for_save
+        retain_remote_fill_fence = bool(
+            getattr(self, "_remote_store_requested", False)
+            and any(_remote_fill_request_qualified(request) for request in requests)
         )
-        if finished_sending:
-            self._late_finished_sending |= finished_sending
-        self._finished_req_ids_waiting_for_save = set()
+        complete_events = getattr(
+            self, "_latest_direct_source_ready_events", {}
+        )
+        source_ready_events: tuple[Any, ...] = ()
+        if expected.issubset(complete_events):
+            unique_events: dict[int, Any] = {}
+            for producer_event in complete_events.values():
+                unique_events.setdefault(id(producer_event), producer_event)
+            source_ready_events = tuple(unique_events.values())
+        self._submit_direct_prefill_requests(
+            requests,
+            source_ready_event=self._latest_live_source_ready_event,
+            source_ready_event_source=(
+                self._latest_live_source_ready_event_source
+            ),
+            source_ready_events=source_ready_events,
+        )
+        if retain_remote_fill_fence:
+            return
+        self._direct_store_observed_layers.clear()
+        self._latest_live_source_ready_event = None
+        self._latest_live_source_ready_event_source = "missing"
+        getattr(self, "_latest_direct_source_ready_events", {}).clear()
 
-    @_lmcache_nvtx_annotate
-    def get_finished(
-        self, finished_req_ids: set[str]
-    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        if self.lmcache_engine is None:
-            return None, None
-        query_req_ids = set(finished_req_ids)
-        if not self._wait_for_save_done:
-            # NOTE (gingfung): The is a workaround logic for the case
-            # where the requests is deferred (i.e. spec_decode or MTP)
-            # and the model_runner call get_finished before wait_for_save.
-            connector_metadata = self._parent._get_connector_metadata()
-            assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+    def _direct_group_caches(self) -> dict[int, list]:
+        self._refresh_kvcaches_list()
+        groups = {0: self._kvcaches_for_group(0)}
+        if self.config.dsa_two_groups:
+            groups[1] = self._kvcaches_for_group(1)
+        return {group: caches for group, caches in groups.items() if caches}
 
-            waiting_for_save = {
-                request.req_id
-                for request in connector_metadata.requests
-                if request.req_id in finished_req_ids
-                and self._may_register_store_after_wait_for_save(request)
+    def _direct_selected_groups(
+        self, request: ReqMeta, group_caches: dict[int, list]
+    ) -> dict[int, list]:
+        selected = dict(group_caches)
+        if (
+            getattr(self, "_remote_store_requested", False)
+            and _remote_fill_request_qualified(request)
+        ):
+            # Persistent SaveSpec flags describe which immutable pages still
+            # need Mooncake puts.  The direct destination has an independent
+            # LocalCPU prefix, so it needs both authoritative source groups;
+            # the engine's persistent existence probe still suppresses
+            # duplicate Mooncake writes.
+            return selected
+        save_spec = request.save_spec
+        if save_spec is not None and self.config.dsa_two_groups:
+            if not save_spec.can_save_latent:
+                selected.pop(0, None)
+            if not save_spec.can_save_indexer:
+                selected.pop(1, None)
+        return selected
+
+    def _direct_request_inputs(
+        self, request: ReqMeta, group_caches: dict[int, list]
+    ) -> tuple[dict[int, list], dict[int, torch.Tensor], int]:
+        mapping_base = int(getattr(request, "save_slot_mapping_base", 0) or 0)
+        selected = self._direct_selected_groups(request, group_caches)
+        slot_mappings = {
+            group: self._windowed_sparse_save_mapping(request, group, mapping_base)
+            for group in selected
+        }
+        if any(mapping is None for mapping in slot_mappings.values()):
+            mapping_base = 0
+            slot_mappings = {
+                group: (
+                    request.indexer_slot_mapping[0]
+                    if group
+                    else request.slot_mapping[0]
+                )
+                for group in selected
             }
-            if waiting_for_save:
-                self._finished_req_ids_waiting_for_save |= waiting_for_save
-                query_req_ids -= waiting_for_save
+        return selected, slot_mappings, mapping_base
 
-        finished_sending = self.lmcache_engine.get_finished_stores(query_req_ids)
-        if self._late_finished_sending:
-            finished_sending |= self._late_finished_sending
-            self._late_finished_sending = set()
-        return (
-            finished_sending if finished_sending else None,
-            None,
+    def _preflight_direct_store(self, requests: list[ReqMeta]) -> bool:
+        assert self.lmcache_engine is not None
+        group_caches = self._direct_group_caches()
+        selected_groups = {
+            group
+            for request in requests
+            for group in self._direct_selected_groups(request, group_caches)
+        }
+        selected = {
+            group: group_caches[group] for group in sorted(selected_groups)
+        }
+        return not selected or self.lmcache_engine.direct_prefill_plan_supported(
+            selected
         )
+
+    def _submit_direct_prefill_requests(
+        self,
+        requests: list[ReqMeta],
+        adopted_requests: Optional[set[str]] = None,
+        *,
+        finish_batch: bool = False,
+        source_ready_event: Any = None,
+        source_ready_event_source: str = "missing",
+        source_ready_events: tuple[Any, ...] = (),
+    ) -> None:
+        """Submit direct pages; also used by the wait-for-save fallback."""
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            # Neither a late callback nor finalization may expose banked NPU
+            # addresses after subsequent layers have overwritten their data.
+            return
+        assert self.lmcache_engine is not None
+        live_source_ready_fences = getattr(
+            self, "_live_source_ready_fences", {}
+        )
+        finalized_live_sources = getattr(
+            self, "_finalized_live_source_submissions", set()
+        )
+        requests = [
+            request
+            for request in requests
+            if request.req_id not in self._unfenced_live_stores
+            and request.req_id not in live_source_ready_fences
+            and request.req_id not in finalized_live_sources
+        ]
+        if not requests:
+            return
+        if not finish_batch and getattr(
+            self, "_remote_store_requested", False
+        ):
+            # RemoteFill accepts readiness only from the exact post-forward
+            # request/frontier handoff. Callback events remain retained until
+            # _finish_save_batch submits this chunk.
+            requests = [
+                request
+                for request in requests
+                if not _remote_fill_request_qualified(request)
+            ]
+            if not requests:
+                return
+        group_caches = self._direct_group_caches()
+        for request in requests:
+            live_source = bool(getattr(request, "live_source_requested", False))
+            selected, slot_mappings, mapping_base = self._direct_request_inputs(
+                request, group_caches
+            )
+            live_selected = group_caches if live_source else selected
+            if not selected and not live_selected:
+                continue
+            load_spec = getattr(request, "load_spec", None)
+            committed_prefix = getattr(load_spec, "dsa_committed_end", None)
+            if committed_prefix is None:
+                committed_prefix = getattr(load_spec, "lmcache_cached_tokens", 0)
+            verified_prefix_end = min(
+                mapping_base,
+                int(committed_prefix or 0),
+            )
+            live_token_ids = (
+                getattr(request, "live_source_token_ids", None)
+                if live_source
+                and getattr(request, "live_source_token_ids", None)
+                else request.token_ids
+            )
+            live_latent_mapping = getattr(
+                request, "live_source_slot_mapping", None
+            )
+            live_indexer_mapping = getattr(
+                request, "live_source_indexer_slot_mapping", None
+            )
+            live_slot_mappings = slot_mappings
+            if live_source:
+                live_slot_mappings = (
+                    {
+                        group: (
+                            live_indexer_mapping[0]
+                            if group
+                            else live_latent_mapping[0]
+                        )
+                        for group in live_selected
+                    }
+                    if live_latent_mapping
+                    and (
+                        not self.config.dsa_two_groups
+                        or live_indexer_mapping
+                    )
+                    else slot_mappings
+                )
+            parallel = self._vllm_config.parallel_config
+            topology_supported = (
+                int(getattr(parallel, "pipeline_parallel_size", 1)) == 1
+                and int(getattr(parallel, "prefill_context_parallel_size", 1)) == 1
+                and int(getattr(parallel, "decode_context_parallel_size", 1)) == 1
+            )
+            remote_fill_request = bool(
+                self._remote_store_requested
+                and _remote_fill_request_qualified(request)
+            )
+            if remote_fill_request:
+                # Group 0 keeps the prefiller-local default. Direct-HBM Group 1
+                # is prepositioned in the selected decoder's Mooncake segment.
+                _prepare_remote_fill_persistent_placement(
+                    request.request_configs,
+                    group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
+                )
+                live_source = False
+                self.lmcache_engine.discard_live_source_descriptor(request.req_id)
+            if live_source and not topology_supported:
+                logger.warning(
+                    "Live split disabled for %s: PP/PCP/DCP must all equal 1",
+                    request.req_id,
+                )
+                live_source = False
+            if (
+                live_source
+                and request.is_last_prefill
+                and source_ready_event is None
+            ):
+                # The descriptor exposes model-cache addresses to a remote
+                # reader.  A current-stream event is not a valid substitute
+                # for the attention producer's reshape_cache_event: Group 1
+                # may have been restored or scattered on another stream.
+                # Fail closed to the persistent path instead of publishing
+                # bytes whose producer ordering is unknown.
+                self.lmcache_engine.discard_live_source_descriptor(
+                    request.req_id
+                )
+                logger.warning(
+                    "Live split disabled for %s: final Group-1 source has "
+                    "no producer NPU event",
+                    request.req_id,
+                )
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "live_source_missing_producer_event",
+                        req_id=request.req_id,
+                        event_source=source_ready_event_source,
+                        action="persistent_only",
+                    )
+                log_npu_content_diagnostic_event(
+                    "group1_source_missing_producer_event",
+                    req_id=request.req_id,
+                    event_source=source_ready_event_source,
+                    action="persistent_only",
+                    fallback_event_created=False,
+                )
+                live_source = False
+            if live_source:
+                live_groups = (
+                    (0, 1)
+                    if getattr(self, "_live_latent_split_requested", False)
+                    and get_tensor_model_parallel_rank() == 0
+                    else (1,)
+                )
+                self.lmcache_engine.begin_live_source_descriptor(
+                    request.req_id, live_groups
+                )
+                self.lmcache_engine.capture_live_source_step(
+                    request.req_id,
+                    live_token_ids,
+                    live_selected,
+                    live_slot_mappings,
+                    request.request_configs,
+                    0,
+                    request.is_last_prefill,
+                )
+            else:
+                live_groups = ()
+            finalized_live = False
+            if live_source and request.is_last_prefill:
+                ready_at_finalize = (
+                    LMCacheAscendConnectorV1Impl._query_source_ready_event(
+                        source_ready_event
+                    )
+                    if source_ready_event is not None
+                    and npu_content_diagnostics_enabled()
+                    else None
+                )
+                finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
+                    request.req_id,
+                    len(live_token_ids),
+                    get_tensor_model_parallel_rank(),
+                    int(getattr(parallel, "data_parallel_index", 0) or 0),
+                )
+                if finalized_live:
+                    finalized = getattr(
+                        self, "_finalized_live_source_submissions", None
+                    )
+                    if finalized is None:
+                        finalized = set()
+                        self._finalized_live_source_submissions = finalized
+                    finalized.add(request.req_id)
+                if finalized_live and source_ready_event is not None:
+                    fences = getattr(self, "_live_source_ready_fences", None)
+                    if fences is None:
+                        fences = {}
+                        self._live_source_ready_fences = fences
+                    fences[request.req_id] = _LiveSourceReadyFence(
+                        event=source_ready_event,
+                        event_source=source_ready_event_source,
+                        ready_at_finalize=ready_at_finalize,
+                    )
+                elif finalized_live:
+                    raise RuntimeError(
+                        "Final live Group-1 descriptor has no producer NPU event"
+                    )
+            direct_store = self.lmcache_engine.direct_prefill_store_enabled()
+            if direct_store and selected:
+                direct_final = request.is_last_prefill
+                if remote_fill_request:
+                    # save_kv_layer can observe the last scheduler window before
+                    # the request-matched forward-context handoff is adopted.
+                    # Only _finish_save_batch owns that final causal boundary.
+                    direct_final = direct_final and finish_batch
+                self.lmcache_engine.store_direct_prefill(
+                    request.req_id,
+                    request.token_ids,
+                    selected,
+                    slot_mappings,
+                    request.request_configs,
+                    final=direct_final,
+                    slot_mapping_base=mapping_base,
+                    verified_prefix_end=verified_prefix_end,
+                    # ReqMeta.token_ids is the scheduler-accepted store range
+                    # after chunked-prefill and final-token policy.
+                    accepted_store_end=len(request.token_ids),
+                    source_ready_event=source_ready_event,
+                    source_ready_event_source=source_ready_event_source,
+                    source_ready_events=source_ready_events,
+                    prefix_slot_mappings=(
+                        {
+                            group: (
+                                request.indexer_slot_mapping
+                                if group else request.slot_mapping
+                            )[0]
+                            for group in selected
+                        }
+                        if remote_fill_request and verified_prefix_end > 0
+                        and getattr(
+                            self.config, "remote_fill_prefix_hole_repair", False
+                        )
+                        and not request.is_sparse_decode
+                        and request.slot_mapping and request.indexer_slot_mapping
+                        else None
+                    ),
+                )
+            if (
+                finalized_live
+                and direct_store
+                and selected
+                and not direct_final
+            ):
+                self._unfenced_live_stores[request.req_id] = request
+
+    def build_connector_worker_meta(self) -> Optional[KVConnectorWorkerMetadata]:
+        if self.lmcache_engine is None:
+            return None
+        self._fence_live_source_descriptors()
+        descriptors = self.lmcache_engine.drain_live_source_descriptors()
+        remote_fill_results = (
+            self.lmcache_engine.drain_remote_fill_terminal_results()
+        )
+        if serving_perf_enabled():
+            for req_id, descriptor in descriptors.items():
+                serving_perf_log(
+                    logger,
+                    "live_source_worker_emit",
+                    req_id=req_id,
+                    tp_rank=descriptor.get("tp_rank"),
+                    dp_rank=descriptor.get("dp_rank"),
+                    segments=len(descriptor.get("segments", ())),
+                    compact_layers=len(
+                        descriptor.get("compact_layout", {}).get("layers", ())
+                    ),
+                    compact_runs=len(
+                        descriptor.get("compact_layout", {}).get("runs", ())
+                    ),
+                    latent_layers=len(
+                        descriptor.get("latent_layout", {}).get("layers", ())
+                    ),
+                    latent_pages=len(
+                        descriptor.get("latent_layout", {}).get("pages", ())
+                    ),
+                    group_byte_totals=descriptor.get("group_byte_totals"),
+                )
+        return (
+            LiveSourceWorkerMetadata(
+                {req_id: [descriptor] for req_id, descriptor in descriptors.items()},
+                remote_fill_results,
+            )
+            if descriptors or remote_fill_results
+            else None
+        )
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        super().update_connector_output(connector_output)
+
+    def update_connector_worker_metadata(
+        self, metadata: KVConnectorWorkerMetadata, active_req_ids: set[str]
+    ) -> None:
+        if isinstance(metadata, LiveSourceWorkerMetadata):
+            for result in metadata.checkpoint_results:
+                self.accept_preemption_result(result)
+            for req_id, descriptors in metadata.descriptors.items():
+                active = req_id in active_req_ids
+                tracked = req_id in self._unfinished_requests
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "live_source_scheduler_ingest",
+                        req_id=req_id,
+                        active=active,
+                        tracked=tracked,
+                        descriptor_count=len(descriptors),
+                        ranks=[
+                            [item.get("tp_rank"), item.get("dp_rank")]
+                            for item in descriptors
+                        ],
+                    )
+                # The final prefiller token may set the request status to
+                # finished before this worker metadata is consumed.  The
+                # scheduler still calls request_finished() later in the same
+                # output-processing pass, and _unfinished_requests remains the
+                # authoritative LMCache lifetime fence until then. Dropping a
+                # descriptor solely because active is false loses the live
+                # split offer; supported topologies then fall back to the
+                # ordinary persistent-transfer path.
+                if not tracked:
+                    continue
+                self._scheduler_live_sources[req_id] = list(descriptors)
+            for req_id, result in metadata.remote_fill_results.items():
+                if req_id in self._unfinished_requests:
+                    results = getattr(
+                        self, "_scheduler_remote_fill_results", None
+                    )
+                    if results is None:
+                        results = {}
+                        self._scheduler_remote_fill_results = results
+                    results[req_id] = dict(result)
+
+    def update_state_after_alloc(
+        self, request: "Request", num_external_tokens: int, blocks: Any = None
+    ) -> None:
+        if request.request_id not in self._unfinished_requests:
+            self._scheduler_live_sources.pop(request.request_id, None)
+            getattr(self, "_scheduler_remote_fill_results", {}).pop(
+                request.request_id, None
+            )
+        super().update_state_after_alloc(request, num_external_tokens, blocks)
+
+    def _effective_skip_leading_tokens(
+        self,
+        _request: ReqMeta,
+        save_spec: Any,
+    ) -> int:
+        # Ascend chunked prefill must not use producer transfer progress here.
+        return save_spec.skip_leading_tokens
+
+    def _prepare_direct_store_inputs(
+        self,
+        _request: ReqMeta,
+        slot_mapping: torch.Tensor,
+        save_context: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        assert self.lmcache_engine is not None
+        ordering_event = save_context.get("ordering_event")
+        if ordering_event is None:
+            ordering_event = torch.npu.Event()
+            ordering_event.record()
+            save_context["ordering_event"] = ordering_event
+
+        if slot_mapping.device.type == "npu":
+            slot_mapping_npu = slot_mapping.to(dtype=torch.long)
+        else:
+            slot_mapping = slot_mapping.pin_memory()
+            with torch.npu.stream(
+                self.lmcache_engine.gpu_connector.store_stream
+            ):
+                slot_mapping_npu = slot_mapping.to(
+                    device="npu",
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+        return slot_mapping, {
+            "ordering_event": ordering_event,
+            "slot_mapping_npu": slot_mapping_npu,
+        }
+
+    def _finish_layerwise_prefill_batch(self) -> None:
+        """Fence persistent saves without revisiting the reused NPU banks."""
+        if self.kv_role == "kv_consumer" or self.lmcache_engine is None:
+            return
+        metadata = self._parent._get_connector_metadata()
+        final_requests = tuple(
+            request
+            for request in metadata.requests
+            if request.is_last_prefill and not request.is_sparse_decode
+        )
+        store_debug = (
+            prefill_store_debug_enabled() and get_tensor_model_parallel_rank() == 0
+        )
+        if store_debug:
+            for request in final_requests:
+                prefill_store_debug_log(
+                    "persist_begin", request.req_id, end=len(request.token_ids)
+                )
+        try:
+            # Both groups' CPU pages now exist. Start the independent D-cache
+            # fill BEFORE waiting for Mooncake puts, not after that barrier.
+            self.lmcache_engine.submit_layerwise_prefill_fills(
+                request.req_id for request in metadata.requests
+            )
+            self.lmcache_engine.poll_layerwise_prefill_puts(
+                final=bool(final_requests),
+                req_ids=tuple(request.req_id for request in final_requests),
+            )
+            # Only legacy/non-page fallback puts land in this set. Normal
+            # Mooncake CPU-page puts use the bounded asynchronous queue above.
+            self.lmcache_engine.wait_for_pending_sync_stores()
+        except Exception as error:
+            if store_debug:
+                for request in metadata.requests:
+                    prefill_store_debug_log(
+                        "persist_error",
+                        request.req_id,
+                        error=True,
+                        status=type(error).__name__,
+                    )
+            raise
+        finally:
+            completed = self._completed_layerwise_stores
+            self._completed_layerwise_stores = {}
+        pending = getattr(self, "_layerwise_local_store_results", None)
+        if pending is None:
+            pending = self._layerwise_local_store_results = {}
+        pending.update(completed)
+        if not final_requests:
+            return
+        # Local completion is deliberately NOT adopted as persistent progress
+        # until its remote barrier (including reused-prefix dependencies)
+        # succeeds. Other requests may still have remote puts in flight.
+        for request in final_requests:
+            for group in (0, 1):
+                result = pending.pop((request.req_id, group), None)
+                if result is not None:
+                    self.lmcache_engine.adopt_completed_layerwise_store(result)
+            self.lmcache_engine.finish_layerwise_prefill_store(
+                request.req_id,
+                request.request_configs,
+                required_store_end=len(request.token_ids),
+                persistence_fenced=True,
+                tokens=request.token_ids,
+            )
+            if store_debug:
+                prefill_store_debug_finish(request.req_id)
+            if kv_hash_enabled() and get_tensor_model_parallel_rank() == 0:
+                finish_kv_hash(request.req_id)
+            if kv_hash_enabled():
+                trace = getattr(
+                    self.lmcache_engine.gpu_connector, "finish_kv_trace", None
+                )
+                if callable(trace):
+                    trace(request.req_id)
+
+    def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        if getattr(self, "_force_layerwise_prefill_store", False):
+            self._finish_layerwise_prefill_batch()
+            return
+        # Preserve the final attention producer dependency before resetting
+        # per-step bookkeeping.  Prefix-hit/cold-resume steps can reach this
+        # deferred path when not every registered cache callback fires.  The
+        # previous reset silently discarded reshape_cache_event and caused a
+        # live descriptor to be fenced by an unrelated current-stream event.
+        source_ready_event = getattr(
+            self, "_latest_live_source_ready_event", None
+        )
+        source_ready_event_source = getattr(
+            self, "_latest_live_source_ready_event_source", "missing"
+        )
+        direct_ready_events = dict(
+            getattr(self, "_latest_direct_source_ready_events", {})
+        )
+        observed_direct_layers = set(self._direct_store_observed_layers)
+        expected_direct_layers = set(self._latent_layer_names)
+        if self.config.dsa_two_groups:
+            expected_direct_layers.update(self._indexer_layer_names)
+        source_ready_events: tuple[Any, ...] = ()
+        if expected_direct_layers and expected_direct_layers.issubset(
+            direct_ready_events
+        ):
+            unique_events: dict[int, Any] = {}
+            for producer_event in direct_ready_events.values():
+                unique_events.setdefault(id(producer_event), producer_event)
+            source_ready_events = tuple(unique_events.values())
+        self._direct_store_step_supported = None
+        self._direct_store_observed_layers.clear()
+        self._latest_live_source_ready_event = None
+        self._latest_live_source_ready_event_source = "missing"
+        getattr(self, "_latest_direct_source_ready_events", {}).clear()
+        if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
+            perf_enabled = serving_perf_enabled()
+            pending_sync_started = time.perf_counter() if perf_enabled else 0.0
+            try:
+                self.lmcache_engine.wait_for_pending_sync_stores()
+                if perf_enabled:
+                    pending_sync_wait_ms = (
+                        time.perf_counter() - pending_sync_started
+                    ) * 1000
+            finally:
+                completed = self._completed_layerwise_stores
+                self._completed_layerwise_stores = {}
+            requests = self._direct_prefill_requests() or []
+            metadata = self._parent._get_connector_metadata()
+            handoff = getattr(metadata, "_live_source_event_handoff", None)
+            if hasattr(metadata, "_live_source_event_handoff"):
+                delattr(metadata, "_live_source_event_handoff")
+            expected_targets = self._producer_fence_handoff_targets(requests)
+            expected_ids = {req_id for req_id, _ in expected_targets}
+            handoff_status = "absent"
+            if (
+                expected_targets
+                and isinstance(handoff, tuple)
+                and len(handoff) == 2
+                and handoff[0] == expected_targets
+                and handoff[1] is not None
+            ):
+                _, source_ready_event = handoff
+                source_ready_event_source = (
+                    "forward_context.sfa_reshape_cache_event"
+                )
+                # The request/frontier-matched event causally joins preceding
+                # cache writes on this forward stream, including callbacks.
+                source_ready_events = (source_ready_event,)
+                handoff_status = "adopted"
+            elif not expected_targets:
+                handoff_status = "not_armed"
+            elif handoff is not None and not (
+                isinstance(handoff, tuple) and len(handoff) == 2
+            ):
+                handoff_status = "malformed"
+            elif isinstance(handoff, tuple) and handoff[0] != expected_targets:
+                handoff_status = "target_mismatch"
+            elif isinstance(handoff, tuple) and handoff[1] is None:
+                handoff_status = "missing_event"
+            if perf_enabled:
+                for request in requests:
+                    remote_fill_eligible = bool(
+                        getattr(request, "_lmcache_remote_fill_qualified", False)
+                    )
+                    if request.req_id not in expected_ids and not remote_fill_eligible:
+                        continue
+                    serving_perf_log(
+                        logger,
+                        "remote_fill_producer_fence_decision",
+                        req_id=request.req_id,
+                        pending_sync_wait_ms=round(pending_sync_wait_ms, 3),
+                        handoff_status=handoff_status,
+                        expected_layer_count=len(expected_direct_layers),
+                        observed_layer_count=len(
+                            expected_direct_layers & observed_direct_layers
+                        ),
+                        event_layer_count=len(
+                            expected_direct_layers & direct_ready_events.keys()
+                        ),
+                        callback_fence_complete=bool(
+                            expected_direct_layers
+                            and expected_direct_layers.issubset(direct_ready_events)
+                        ),
+                        complete_fence_count=len(source_ready_events),
+                        source_event_present=source_ready_event is not None,
+                        event_source=source_ready_event_source,
+                        accepted_store_end=len(request.token_ids),
+                        submission_mode=getattr(
+                            self.config,
+                            "remote_fill_submission_mode",
+                            "final_deferred",
+                        ),
+                        remote_fill_eligible=remote_fill_eligible,
+                    )
+            request_ids = {request.req_id for request in requests}
+            adopted_requests = set()
+            for (req_id, _), result in completed.items():
+                if req_id in request_ids:
+                    self.lmcache_engine.adopt_completed_layerwise_store(result)
+                    adopted_requests.add(req_id)
+            if requests:
+                # Reuse completed layerwise progress before fencing a window
+                # whose callbacks did not cover every registered cache.
+                self._submit_direct_prefill_requests(
+                    requests,
+                    adopted_requests,
+                    finish_batch=True,
+                    source_ready_event=source_ready_event,
+                    source_ready_event_source=source_ready_event_source,
+                    source_ready_events=source_ready_events,
+                )
+            final_ids = {
+                request.req_id for request in requests if request.is_last_prefill
+            }
+            if final_ids:
+                fenced_ids = final_ids - self._unfenced_live_stores.keys()
+                if fenced_ids:
+                    self.lmcache_engine.wait_for_direct_stores(fenced_ids)
+                for request in requests:
+                    if (
+                        request.req_id not in final_ids
+                        or request.req_id in self._unfenced_live_stores
+                    ):
+                        continue
+                    for group, committed_end in (
+                        self.lmcache_engine.direct_store_committed_ends(
+                            request.req_id
+                        ).items()
+                    ):
+                        self._record_prefill_save_group_completed(
+                            request,
+                            group,
+                            LayerwiseStoreResult(
+                                request_id=request.req_id,
+                                kv_group=group,
+                                committed_end=committed_end,
+                            ),
+                        )
+                    self._mark_prefill_committed(request)
+
+    def _handle_save_request_error(
+        self,
+        request: ReqMeta,
+        _error: Exception,
+    ) -> bool:
+        logger.exception(
+            "wait_for_save failed for request %s; skipping save",
+            request.req_id,
+        )
+        return True
+
+    def _finish_aborted_cold_load(self, req_id: str) -> None:
+        """Retire the aborted receiver's stores before its send acknowledgement."""
+        # Match request_finished(): these modes never promise a send ack.
+        if not self.store_async or self.kv_role == "kv_consumer":
+            return
+        if self.lmcache_engine is None:
+            super()._finish_aborted_cold_load(req_id)
+            return
+        self._late_finished_sending.update(
+            self._finalize_worker_requests_after_store({req_id})
+        )
+
+    def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
+        if not getattr(self, "_force_layerwise_prefill_store", False):
+            return super()._release_finished_worker_requests(req_ids)
+        req_ids = tuple(req_ids)
+        if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
+            # Cancellation may happen before the normal final-prefill fence.
+            self.lmcache_engine.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
+            self._forget_layerwise_store_results(req_ids)
+        super()._release_finished_worker_requests(req_ids)
+
+    def _forget_layerwise_store_results(self, req_ids: Iterable[str]) -> None:
+        pending = getattr(self, "_layerwise_local_store_results", {})
+        for req_id in req_ids:
+            for group in (0, 1):
+                pending.pop((req_id, group), None)
+
+    def _finalize_worker_requests_after_store(
+        self, finished_req_ids: set[str]
+    ) -> set[str]:
+        """Release worker state once its store pipeline no longer owns it."""
+        if self.lmcache_engine is None:
+            return super()._finalize_worker_requests_after_store(
+                finished_req_ids
+            )
+        live_finished = finished_req_ids & self._unfenced_live_stores.keys()
+        failed_sending: set[str] = set()
+        if live_finished:
+            requests = [self._unfenced_live_stores[req_id] for req_id in live_finished]
+            try:
+                for request in requests:
+                    try:
+                        selected, slot_mappings, mapping_base = (
+                            self._direct_request_inputs(
+                                request, self._direct_group_caches()
+                            )
+                        )
+                        self.lmcache_engine.store_direct_prefill(
+                            request.req_id,
+                            request.token_ids,
+                            selected,
+                            slot_mappings,
+                            request.request_configs,
+                            final=True,
+                            slot_mapping_base=mapping_base,
+                            accepted_store_end=len(request.token_ids),
+                        )
+                    except Exception as error:
+                        self._handle_save_request_error(request, error)
+                        try:
+                            self.lmcache_engine.wait_for_pending_stores(
+                                (request.req_id,)
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to drain rejected persistent store for %s",
+                                request.req_id,
+                            )
+                            continue
+                        self.lmcache_engine.drop_direct_store_states((request.req_id,))
+                        failed_sending.add(request.req_id)
+                        continue
+                    for group, committed_end in (
+                        self.lmcache_engine.direct_store_committed_ends(
+                            request.req_id
+                        ).items()
+                    ):
+                        self._record_prefill_save_group_completed(
+                            request,
+                            group,
+                            LayerwiseStoreResult(
+                                request_id=request.req_id,
+                                kv_group=group,
+                                committed_end=committed_end,
+                            ),
+                        )
+                    self._mark_prefill_committed(request)
+            finally:
+                for req_id in live_finished:
+                    self._unfenced_live_stores.pop(req_id, None)
+        finished_sending = set(
+            self.lmcache_engine.get_finished_stores(finished_req_ids) or ()
+        )
+        finished_sending.update(failed_sending)
+        releasable_req_ids = (
+            finished_sending if self.store_async else finished_req_ids
+        )
+        if releasable_req_ids:
+            self._release_finished_worker_requests(releasable_req_ids)
+            self.lmcache_engine.drop_direct_store_states(releasable_req_ids)
+            finalized = getattr(
+                self, "_finalized_live_source_submissions", None
+            )
+            if finalized is not None:
+                finalized.difference_update(releasable_req_ids)
+        for req_id in finished_req_ids - releasable_req_ids:
+            # Retrieval pins are request-owned, not async-store-owned. Storage
+            # submissions retain their own sources until their futures finish.
+            self._drop_worker_retrieve_state(req_id)
+        return finished_sending
 
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
         if self.lmcache_engine is None:
             return
+        if preempted_req_ids and getattr(self, "_force_layerwise_prefill_store", False):
+            self.lmcache_engine.poll_layerwise_prefill_puts(
+                final=True, req_ids=preempted_req_ids
+            )
+            self._forget_layerwise_store_results(preempted_req_ids)
+        worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
+        metadata = (
+            self._parent._get_connector_metadata()
+            if self._parent.has_connector_metadata()
+            else None
+        )
+        if metadata is not None and metadata.preemption_captures:
+            self.lmcache_engine.enable_checkpoint_prefix_agreement()
+        waited_req_ids = None
+        if worker is not None and metadata is not None:
+            for req_id, generation in metadata.preemption_cancels:
+                worker.cancel(req_id, generation)
+            captures = metadata.preemption_captures
+            if captures:
+                self._activate_checkpoint_io()
+                # This also drains direct stores before capture/HBM reuse.
+                waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+                    preempted_req_ids
+                )
+                caches = self._direct_group_caches()
+                for capture in captures:
+                    if capture.req_id in preempted_req_ids:
+                        worker.capture(capture, caches, self._block_size, self._worker_retrieve_state.get(capture.req_id))
 
         logger.debug(
             "LMCache-Ascend handling preemptions: req_ids=%s",
             sorted(preempted_req_ids),
         )
 
-        # Lookup pins are request-scoped and normally released in wait_for_save().
-        # A preempted request may leave that path before its metadata is replayed.
+        # Lookup pins are request-scoped; release via _drop_worker_retrieve_state.
         for req_id in preempted_req_ids:
-            self.lmcache_engine.lookup_unpin(req_id)
+            self._drop_worker_retrieve_state(req_id)
 
         if not self.store_async or self.kv_role == "kv_consumer":
             return
 
-        waited_req_ids = self.lmcache_engine.wait_for_pending_stores(preempted_req_ids)
+        if waited_req_ids is None:
+            waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+                preempted_req_ids
+            )
+        for req_id in preempted_req_ids:
+            getattr(self, "_scheduler_remote_fill_results", {}).pop(
+                req_id, None
+            )
+            self._unfenced_live_stores.pop(req_id, None)
+            fences = getattr(self, "_live_source_ready_fences", None)
+            if fences is not None:
+                fences.pop(req_id, None)
+            finalized = getattr(
+                self, "_finalized_live_source_submissions", None
+            )
+            if finalized is not None:
+                finalized.discard(req_id)
+        self.lmcache_engine.drop_direct_store_states(preempted_req_ids)
         if waited_req_ids:
             logger.info(
                 "Handled preemptions after draining async stores: req_ids=%s",
@@ -262,32 +1731,360 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         _, return_params = super().request_finished(request, block_ids)
-
-        # chunk_hashes return start ---------------------
-        if getattr(self.config, "enable_chunk_hashes_return", False):
-            inner = self.lookup_client
-            while hasattr(inner, "actual_lookup_client"):
-                inner = inner.actual_lookup_client
-            new_hashes = inner.get_cached_hashes(request.request_id)
-            return_params = return_params or {}
-            return_params["chunk_hashes"] = new_hashes
-        # chunk_hashes return end ---------------------
-
-        if (
-            request.status == RequestStatus.FINISHED_ABORTED
-            and self.lmcache_engine is not None
-        ):
-            self.lmcache_engine.lookup_unpin(request.request_id)
-
-            if self.store_async and self.kv_role != "kv_consumer":
-                try:
-                    self.lmcache_engine.wait_for_pending_stores({request.request_id})
-                except Exception:
-                    logger.warning(
-                        "wait_for_pending_stores failed for aborted request %s",
-                        request.request_id,
-                        exc_info=True,
+        descriptors = self._scheduler_live_sources.pop(request.request_id, None)
+        remote_fill_result = getattr(
+            self, "_scheduler_remote_fill_results", {}
+        ).pop(request.request_id, None)
+        params = getattr(request, "kv_transfer_params", None)
+        if remote_fill_result is not None and isinstance(params, dict):
+            handoff = params.get("lmcache.remote_fill")
+            if (
+                isinstance(handoff, dict)
+                and handoff.get("transfer_id")
+                == remote_fill_result.get("transfer_id")
+            ):
+                handoff["terminal"] = dict(remote_fill_result)
+                return_params = _remote_fill_response_params(
+                    params, remote_fill_result, return_params
+                )
+                if serving_perf_enabled():
+                    serving_perf_log(
+                        logger,
+                        "remote_fill_scheduler_attach",
+                        req_id=request.request_id,
+                        outcome=remote_fill_result.get("outcome"),
+                        persistent_common_end=remote_fill_result.get(
+                            "persistent_common_end"
+                        ),
+                        required_store_end=remote_fill_result.get("required_store_end"),
                     )
-
+            else:
+                logger.warning(
+                    "Remote-fill result identity mismatch for request %s; "
+                    "leaving direct destination unpublished",
+                    request.request_id,
+                )
+        if descriptors:
+            parallel = self._vllm_config.parallel_config
+            tp_size = int(parallel.tensor_parallel_size)
+            dp_rank = int(
+                getattr(parallel, "data_parallel_index", None) or 0
+            )
+            expected = {
+                (tp_rank, dp_rank) for tp_rank in range(tp_size)
+            }
+            actual = {
+                (int(item["tp_rank"]), int(item["dp_rank"]))
+                for item in descriptors
+            }
+            if actual != expected or len(descriptors) != len(expected):
+                logger.warning(
+                    "Incomplete live source ranks for %s: expected=%s actual=%s; "
+                    "using persistent fallback",
+                    request.request_id,
+                    sorted(expected),
+                    sorted(actual),
+                )
+                descriptors = None
+        if (
+            descriptors
+            and isinstance(params, dict)
+            and params.get("request_live_split", False)
+        ):
+            # MultiConnector children share this request. Publish the source
+            # here so the following Mooncake child can canonicalize it even
+            # when the generic vLLM MultiConnector is selected.
+            params["ascend_live_split_source_v1"] = {
+                "descriptors": descriptors
+            }
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_attach",
+                    req_id=request.request_id,
+                    attached=True,
+                    descriptor_count=len(descriptors),
+                )
+        elif isinstance(params, dict) and params.get("request_live_split", False):
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_attach",
+                    req_id=request.request_id,
+                    attached=False,
+                    descriptor_count=len(descriptors or ()),
+                    reason=(
+                        "missing_or_incomplete_descriptor"
+                        if not descriptors
+                        else "request_not_eligible"
+                    ),
+                )
+        if (
+            isinstance(return_params, dict)
+            and isinstance(params, dict)
+            and params.get("do_remote_decode")
+            and isinstance(getattr(request, "num_cached_tokens", None), int)
+            and request.num_cached_tokens >= 0
+        ):
+            # LMCache-Ascend keeps the P-side public handoff in the
+            # do_remote_decode form. Preserve the existing sanitized handoff
+            # and add the P-side prefix-cache hit count for the D worker.
+            return_params["remote_prefill_cached_tokens"] = (
+                request.num_cached_tokens
+            )
         delay_free = self.store_async and self.kv_role != "kv_consumer"
         return delay_free, return_params
+
+    def _submit_dsa_cold_compact_load(self, request: ReqMeta) -> None:
+        if hasattr(request.load_spec, "checkpoint_generation"):
+            # The local index tail uses the existing CPU-load stream/fences.
+            # Preserve the existing guard against concurrent runtime graph capture.
+            request.load_spec.dsa_group1_direct_hbm = False
+            worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
+            if worker is not None:
+                worker.begin_restore(
+                    request.req_id,
+                    request.load_spec.checkpoint_generation,
+                    request.load_spec.dsa_cold_load_generation,
+                )
+                self._activate_checkpoint_io()
+        super()._submit_dsa_cold_compact_load(request)
+
+    def _run_dsa_cold_compact_load(
+        self,
+        plan: Any,
+        npu_device_id: Any,
+        indexer_future: Any,
+        previous_latent_future: Any = None,
+        live_state: Any = None,
+    ) -> Any:
+        if not hasattr(plan["request"].load_spec, "checkpoint_generation"):
+            return super()._run_dsa_cold_compact_load(
+                plan,
+                npu_device_id,
+                indexer_future,
+                previous_latent_future,
+                live_state,
+            )
+        owners = []
+        try:
+            if npu_device_id is not None:
+                torch.npu.set_device(npu_device_id)
+            if previous_latent_future is not None:
+                try:
+                    previous_latent_future.exception()
+                except BaseException:
+                    pass  # Preserve ordering without inheriting an older failure.
+            request = plan["request"]
+            _, owners = self.lmcache_engine.prepare_checkpoint_restore(request)
+            if owners:
+                self.lmcache_engine.checkpoint_worker.hold_restore(
+                    request.req_id,
+                    request.load_spec.checkpoint_generation,
+                    request.load_spec.dsa_cold_load_generation,
+                    owners,
+                )
+                owners = []
+            return super()._run_dsa_cold_compact_load(
+                plan,
+                npu_device_id,
+                indexer_future,
+                None,
+                live_state,
+            )
+        except BaseException as error:
+            gate = plan["latent_shared_ready"]
+            if not gate.done():
+                gate.set_exception(error)
+            raise
+        finally:
+            for page in owners:
+                page.ref_count_down()
+
+    def _run_dsa_cold_indexer_load(self, plan: Any, npu_device_id: Any) -> Any:
+        request = plan["request"]
+        if not hasattr(request.load_spec, "checkpoint_generation"):
+            return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
+        if self.config.pd_role is None:
+            # Standalone keeps both groups in the ordinary shared-CPU path.
+            # Normalize the checkpoint before even speculative CPU prefetch can
+            # observe its tail; no per-rank direct-HBM reader is initialized here.
+            plan["latent_shared_ready"].result()
+            return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
+        error = None
+        try:
+            plan["latent_shared_ready"].result()
+            if npu_device_id is not None:
+                torch.npu.set_device(npu_device_id)
+            chunk = self._lmcache_chunk_size
+            base = request.load_spec.checkpoint_prefix_end // chunk * chunk
+            if base:
+                self.lmcache_engine.load_group1_pages_direct(
+                    plan["tokens"][:base],
+                    plan["indexer_slots_cpu"][:base],
+                    plan["indexer_kvcaches"],
+                    request.request_configs,
+                    request.req_id,
+                )
+            tail = dict(plan)
+            tail["token_mask"] = plan["token_mask"].clone()
+            tail["token_mask"][:base] = False
+            tail["token_count"] -= base
+        except BaseException as exc:
+            error = exc
+        agreed = self.lmcache_engine.finish_checkpoint_prefix(request, error is None)
+        if error is not None:
+            raise error
+        if not agreed:
+            raise RuntimeError("Checkpoint prefix failed on another TP rank")
+        result = super()._run_dsa_cold_indexer_load(tail, npu_device_id)
+        # Both the persistent prefix and the CPU tail have reached readiness.
+        return plan["token_mask"], result[1], result[2], result[3]
+
+    def _record_checkpoint_restore_miss(
+        self, request: Any, generation: int, error: BaseException
+    ) -> bool:
+        """Report only the pretransfer miss shared by every TP rank."""
+        if not isinstance(error, CheckpointRestoreMiss) or not hasattr(
+            request.load_spec, "checkpoint_generation"
+        ):
+            return False
+        worker = self.lmcache_engine.checkpoint_worker
+        if worker is not None:
+            notify = getattr(worker, "restore_event", None)
+            if notify is not None:
+                notify(
+                    request.req_id, request.load_spec.checkpoint_generation,
+                    generation, "failed",
+                )
+            worker.results.append(
+                CheckpointResult(
+                    request.req_id,
+                    request.load_spec.checkpoint_generation,
+                    "restore_miss",
+                    error.available_end,
+                    str(error),
+                    load_generation=generation,
+                )
+            )
+        return True
+
+    def _activate_checkpoint_io(self) -> None:
+        """Poll only while a real preemption owns capture/persistence work."""
+        if "_checkpoint_io_originals" in self.__dict__:
+            return
+        from types import MethodType
+        from weakref import proxy
+
+        self._checkpoint_io_originals = (
+            type(self).start_load_kv,
+            type(self).build_connector_worker_meta,
+            type(self.lmcache_engine).get_finished_stores,
+        )
+        # Weak method receivers avoid new ownership cycles with Python GC off.
+        receiver = proxy(self)
+        self.start_load_kv = MethodType(type(self)._checkpoint_start_load, receiver)
+        self.build_connector_worker_meta = MethodType(
+            type(self)._checkpoint_worker_meta, receiver
+        )
+        self.lmcache_engine.get_finished_stores = MethodType(type(self)._checkpoint_finished_stores, receiver)
+
+    def _checkpoint_start_load(self, forward_context: Any, **kwargs: Any) -> None:
+        worker = self.lmcache_engine.checkpoint_worker
+        metadata = self._parent._get_connector_metadata()
+        for req_id, generation in metadata.preemption_cancels:
+            worker.cancel(req_id, generation)
+        for release in metadata.preemption_releases:
+            worker.release_restore(*release)
+        for seal in metadata.preemption_seals:
+            worker.seal(seal)
+        self._checkpoint_io_originals[0](self, forward_context, **kwargs)
+
+    def _checkpoint_finished_stores(self, finished_req_ids: set) -> set:
+        for req_id in finished_req_ids:
+            self.lmcache_engine.checkpoint_worker.cancel(req_id)
+        return self._checkpoint_io_originals[2](self.lmcache_engine, finished_req_ids)
+
+    def _checkpoint_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        metadata = self._checkpoint_io_originals[1](self)
+        worker = self.lmcache_engine.checkpoint_worker
+        results = worker.poll()
+        if results:
+            if metadata is None:
+                metadata = CheckpointWorkerMetadata(checkpoint_results=results)
+            else:
+                metadata = CheckpointWorkerMetadata(
+                    metadata.descriptors, metadata.remote_fill_results, results
+                )
+        if not worker.jobs and not worker.restore_owners:
+            # Reveal the original class methods, rather than retaining bound
+            # instance methods/cycles when cyclic GC is disabled.
+            del self.start_load_kv, self.build_connector_worker_meta
+            del self.lmcache_engine.get_finished_stores
+            del self._checkpoint_io_originals
+        return metadata
+
+    def _validate_preemption_checkpoint_setup(self, config: Any, vllm_config: Any) -> None:
+        """Reject unsupported checkpoint setups before manager/service creation."""
+        parallel = vllm_config.parallel_config
+        spec = vllm_config.speculative_config
+        shared_cpu = config.get_extra_config_value("enable_shared_cpu_cache", config.enable_shared_cpu_cache)
+        standalone = config.pd_role is None
+        if standalone or getattr(config, "decode_checkpoint_writeback", False):
+            from lmcache.v1.mooncake_layout import (
+                mooncake_layer_pages_enabled, mooncake_page_layout_enabled,
+            )
+            from lmcache.v1.storage_backend.connector.base_connector import (
+                resolve_save_chunk_meta,
+            )
+            if (
+                not str(config.remote_url).startswith("mooncakestore://")
+                or not mooncake_page_layout_enabled(config)
+                or resolve_save_chunk_meta(config)
+                or (standalone and not mooncake_layer_pages_enabled(config))
+            ):
+                raise ValueError(
+                    "Checkpoint write-back/standalone restore requires the Mooncake "
+                    "page-first backend; standalone also requires shared merged pages"
+                )
+        load_mode_supported = (
+            config.dsa_group1_load_mode in (
+                "p2p_preferred", "persistent_serial", "persistent_parallel_prefetch"
+            )
+            if standalone else config.dsa_group1_load_mode == "persistent_direct_hbm"
+        )
+        if not (
+            self.kv_role == "kv_both" and config.pd_role in (None, "receiver")
+            and config.store_async and config.use_layerwise and shared_cpu
+            and config.enable_sparse_attention and config.dsa_two_groups
+            and config.enable_dsa_cold_compact_load
+            and config.get_extra_config_value("save_only_first_rank", True)
+            and not vllm_config.cache_config.enable_prefix_caching
+            and load_mode_supported
+            and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size
+            == parallel.decode_context_parallel_size == 1
+            and (spec is None or (
+                spec.method in ("mtp", "deepseek_mtp") and spec.num_speculative_tokens == 1
+                and not spec.parallel_drafting and not spec.disable_padded_drafter_batch
+            ))
+        ):
+            raise ValueError(
+                "decode_preemption_checkpoint requires the two-group shared-CPU "
+                "kv_both server with async stores, cold-compact loading, "
+                "persistent_direct_hbm on a receiver or CPU loading standalone, "
+                "PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding"
+            )
+        if not callable(getattr(type(self._parent), "handle_preemptions_with_metadata", None)):
+            raise ValueError("decode_preemption_checkpoint requires the dynamic LMCache checkpoint connector")
+        scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        if not getattr(scheduler, "supports_checkpoint_restore_retry", False):
+            raise ValueError(
+                "decode_preemption_checkpoint requires the updated Ascend "
+                "RecomputeScheduler or AsyncRecomputeScheduler for safe restore retries"
+            )
+        if self._role == KVConnectorRole.WORKER:
+            # Lazy worker-only import; the scheduler must not initialize NPU ops.
+            from lmcache_ascend import c_ops
+
+            if not hasattr(c_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared"):
+                raise ValueError("Rebuild LMCache-Ascend native extension before enabling decode_preemption_checkpoint")

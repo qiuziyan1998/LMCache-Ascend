@@ -4,9 +4,10 @@
 #include <iostream>
 #include <vector>
 
-#include "hccl_network_pub.h"
-#include <acl/acl.h>
-#include <hccl/hccl_types.h>
+#include "acl/acl.h"
+#include "hccl/hccl.h"
+#include "hccl/hccl_network_pub.h"
+#include "hccl/hccl_types.h"
 
 #define ACL_CHECK(answer)                                                      \
   do {                                                                         \

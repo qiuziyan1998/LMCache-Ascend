@@ -1,14 +1,55 @@
 #include "mem_kernels.h"
+#include "graph/sparse_graph_kernel.h"
+#include "common/slow_path_diagnostics.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <memory>
 #include <pybind11/pybind11.h>
+#include <limits>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/npu/Module.h>
 
 namespace py = pybind11;
+
+static bool is_mla_dsa_format(kvcache_ops::KVCacheFormat format) {
+  return format == kvcache_ops::KVCacheFormat::MLA_KV ||
+         format == kvcache_ops::KVCacheFormat::DSA_KV ||
+         format == kvcache_ops::KVCacheFormat::MLA_LATENT ||
+         format == kvcache_ops::KVCacheFormat::DSA_INDEX;
+}
+
+// Map two-group formats to the kernel template they reuse.
+// MLA_LATENT has the same 2-plane (k_nope, k_pe) structure as MLA_KV.
+// DSA_INDEX is a single plane; mapped to MLA_KV with v_hidden_dims=0
+// (V-plane copy becomes a no-op).
+static kvcache_ops::KVCacheFormat
+kernel_format(kvcache_ops::KVCacheFormat format) {
+  if (format == kvcache_ops::KVCacheFormat::DSA_KV)
+    return kvcache_ops::KVCacheFormat::DSA_KV;
+  // MLA_KV, MLA_LATENT, DSA_INDEX all use the MLA_KV kernel template.
+  return kvcache_ops::KVCacheFormat::MLA_KV;
+}
+
+static void launch_single_layer_mla_dsa_kernel(const SingleLayerKVConfig &config,
+                                               bool page2L) {
+  kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa(
+      config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+      kernel_format(config.kvcache_format), config.ub_params.aiv_num, config.ub_params.stream,
+      config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+      config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+      config.strides.lmc_bytes, config.strides.vllm_k_bytes,
+      config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
+      config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
+      config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
+      config.dims.lmc_num_tokens, config.dims.block_size, page2L,
+      config.token_major);
+}
 
 /**
  * Quickly offload KV cache from vLLM paged memory to the offloading buffer
@@ -101,6 +142,7 @@ void fused_multi_layer_kv_transfer(
   size_t required_size = 0;
   switch (config.kvcache_format) {
   case kvcache_ops::KVCacheFormat::MLA_KV:
+  case kvcache_ops::KVCacheFormat::MLA_LATENT:
     required_size = static_cast<size_t>(config.num_layers) * config.num_tokens *
                     (config.k_hidden_dims + config.v_hidden_dims) *
                     key_value.element_size();
@@ -110,6 +152,10 @@ void fused_multi_layer_kv_transfer(
         static_cast<size_t>(config.num_layers) * config.num_tokens *
         (config.k_hidden_dims + config.v_hidden_dims + config.dsa_hidden_dims) *
         key_value.element_size();
+    break;
+  case kvcache_ops::KVCacheFormat::DSA_INDEX:
+    required_size = static_cast<size_t>(config.num_layers) * config.num_tokens *
+                    config.dsa_hidden_dims * key_value.element_size();
     break;
   default:
     required_size = static_cast<size_t>(config.kv_size) * config.num_layers *
@@ -231,24 +277,30 @@ void single_layer_kv_transfer(
     const int kvcache_format_raw, // 1: MERGED_KV, 2: SEPARATE_KV
     const bool
         token_major, // true: [tokens, 2, hidden], false: [2, tokens, hidden]
-    const bool vllm_two_major // true: [2, blocks, ...], false: [blocks, 2, ...]
-                              // (only for MERGED_KV)
-) {
+    const bool vllm_two_major, // true: [2, blocks, ...], false: [blocks, 2, ...]
+                               // (only for MERGED_KV)
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
   bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
 
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping));
 
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       lmc_key_value_cache, vllm_kv_caches, slot_mapping, direction, token_major,
-      vllm_two_major, is_separate);
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
 
   at_npu::native::OpCommand cmd;
-  cmd.Name(is_separate ? "single_layer_kv_transfer_kernel_v2_separate"
-                       : "single_layer_kv_transfer_kernel_v2");
 
-  cmd.SetCustomHandler([config, is_separate]() -> int {
-    if (!is_separate) {
-      // Merged KV Kernel
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    cmd.Name("single_layer_kv_transfer_kernel_v2_mla_dsa");
+    cmd.SetCustomHandler([config]() -> int {
+      launch_single_layer_mla_dsa_kernel(config, config.direction);
+      return 0;
+    });
+  } else if (!is_separate) {
+    cmd.Name("single_layer_kv_transfer_kernel_v2");
+    cmd.SetCustomHandler([config]() -> int {
       kvcache_ops::single_layer_kv_transfer_kernel_v2(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
           config.ub_params.aiv_num, config.ub_params.stream,
@@ -259,8 +311,11 @@ void single_layer_kv_transfer(
           config.strides.lmc_bytes, config.ub_params.max_tokens_per_loop,
           config.dims.num_heads, config.dims.head_dims, config.dims.num_tokens,
           config.dims.block_size, config.direction, config.token_major);
-    } else {
-      // Separate KV Kernel
+      return 0;
+    });
+  } else {
+    cmd.Name("single_layer_kv_transfer_kernel_v2_separate");
+    cmd.SetCustomHandler([config]() -> int {
       kvcache_ops::single_layer_kv_transfer_kernel_v2_separate(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
           config.ub_params.aiv_num, config.ub_params.stream,
@@ -272,9 +327,9 @@ void single_layer_kv_transfer(
           config.ub_params.max_tokens_per_loop, config.dims.num_heads,
           config.dims.head_dims, config.dims.num_tokens, config.dims.block_size,
           config.direction, config.token_major);
-    }
-    return 0;
-  });
+      return 0;
+    });
+  }
   cmd.Run();
 }
 
@@ -287,10 +342,10 @@ void batched_fused_single_layer_kv_transfer(
                                   // token_major=true:  [num_tokens, 2,
                                   // num_heads*head_size] token_major=false: [2,
                                   // num_tokens, num_heads*head_size]
-    std::vector<torch::Tensor>    // separate format： list[k_tensor, v_tensor]
-        &vllm_kv_caches, // k_tensor/v_tensor = [num_blocks，block_size,
+    std::vector<torch::Tensor>    // separate format: list[k_tensor, v_tensor]
+        &vllm_kv_caches, // k_tensor/v_tensor = [num_blocks, block_size,
                          // num_heads, head_size]
-                         //  Mergeed format：
+                         //  Merged format:
                          //  vllm_two_major=true:  [2, num_blocks, block_size,
                          //  num_heads, head_size] vllm_two_major=false:
                          //  [num_blocks, 2, block_size, num_heads, head_size]
@@ -303,8 +358,9 @@ void batched_fused_single_layer_kv_transfer(
     const int kvcache_format_raw,
     const bool
         token_major, // true: [tokens, 2, hidden], false: [2, tokens, hidden]
-    const bool vllm_two_major // true: [2, blocks, ...], false: [blocks, 2, ...]
-) {
+    const bool vllm_two_major, // true: [2, blocks, ...], false: [blocks, 2, ...]
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
 
   bool is_separate = validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
 
@@ -313,11 +369,18 @@ void batched_fused_single_layer_kv_transfer(
 
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       staging_cache, vllm_kv_caches, slot_mapping_full, direction, token_major,
-      vllm_two_major, is_separate);
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
 
   int64_t element_size = staging_cache.element_size();
 
-  if (!is_separate) {
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    auto launcher = [config](bool is_gather) {
+      launch_single_layer_mla_dsa_kernel(config, is_gather);
+    };
+    run_batched_fused_transfer(config, lmc_tensors, chunk_offsets, chunk_sizes,
+                               element_size, launcher);
+  } else if (!is_separate) {
     auto launcher = [config](bool is_gather) {
       kvcache_ops::single_layer_kv_transfer_kernel_v2(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
@@ -350,6 +413,929 @@ void batched_fused_single_layer_kv_transfer(
     run_batched_fused_transfer(config, lmc_tensors, chunk_offsets, chunk_sizes,
                                element_size, launcher);
   }
+}
+
+static void launch_sparse_single_layer_kernel(const SingleLayerKVConfig &config,
+                                              uint8_t *selected_token_idx_ptr) {
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        kernel_format(config.kvcache_format), config.ub_params.aiv_num, config.ub_params.stream,
+        config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, config.strides.lmc_bytes,
+        config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+        config.strides.vllm_dsa_bytes, config.ub_params.max_tokens_per_loop,
+        config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims,
+        config.dims.num_tokens, config.dims.lmc_num_tokens,
+        config.dims.block_size, config.token_major);
+    return;
+  }
+
+  bool is_separate =
+      config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV;
+  if (!is_separate) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_sparse(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, config.ptrs.lmc_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, config.strides.vllm_k_stride,
+        config.strides.vllm_val_offset, config.strides.vllm_k_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.strides.lmc_bytes, config.ub_params.max_tokens_per_loop,
+        config.dims.num_heads, config.dims.head_dims, config.dims.num_tokens,
+        config.dims.block_size, config.token_major);
+  } else {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_separate_sparse(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, config.ptrs.lmc_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.slot_mapping_ptr, selected_token_idx_ptr,
+        config.strides.vllm_k_stride, config.strides.vllm_v_stride,
+        config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.strides.lmc_bytes, config.ub_params.max_tokens_per_loop,
+        config.dims.num_heads, config.dims.head_dims, config.dims.num_tokens,
+        config.dims.block_size, config.token_major);
+  }
+}
+
+void sparse_single_layer_kv_transfer(
+    torch::Tensor &lmc_key_value_cache, std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      lmc_key_value_cache, vllm_kv_caches, slot_mapping_packed, false,
+      token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
+      v_hidden_dims, dsa_hidden_dims);
+
+  uint8_t *selected_token_idx_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+
+  at_npu::native::OpCommand cmd;
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    cmd.Name("single_layer_kv_transfer_kernel_v2_mla_dsa_sparse");
+  } else {
+    bool is_separate =
+        config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV;
+    cmd.Name(is_separate ? "single_layer_kv_transfer_kernel_v2_separate_sparse"
+                         : "single_layer_kv_transfer_kernel_v2_sparse");
+  }
+
+  cmd.SetCustomHandler([config, selected_token_idx_ptr]() -> int {
+    launch_sparse_single_layer_kernel(config, selected_token_idx_ptr);
+    return 0;
+  });
+  cmd.Run();
+}
+
+namespace {
+
+static void launch_sparse_multi_chunk_direct_kernel(
+    const SingleLayerKVConfig &config, uint8_t *selected_token_idx_ptr,
+    uint8_t *chunk_ptrs_ptr, int32_t num_chunks, int32_t chunk_size,
+    int32_t total_tokens, bool lmc_host_interleaved,
+    uint8_t *selected_token_counts_ptr = nullptr, int32_t row_width = 0,
+    int32_t request_count = 0, int32_t selected_count_stride = 1) {
+  if (is_mla_dsa_format(config.kvcache_format)) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        kernel_format(config.kvcache_format), config.ub_params.aiv_num, config.ub_params.stream,
+        chunk_ptrs_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, selected_token_counts_ptr,
+        config.strides.vllm_k_bytes,
+        config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
+        config.ub_params.max_tokens_per_loop, config.k_hidden_dims,
+        config.v_hidden_dims, config.dsa_hidden_dims, config.dims.num_tokens,
+        num_chunks, chunk_size, total_tokens, config.dims.block_size,
+        lmc_host_interleaved, row_width, request_count,
+        selected_count_stride);
+    return;
+  }
+
+  const bool is_separate =
+      config.kvcache_format != kvcache_ops::KVCacheFormat::MERGED_KV;
+  if (!is_separate) {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_sparse_multi_chunk(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, chunk_ptrs_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.slot_mapping_ptr,
+        selected_token_idx_ptr, config.strides.vllm_k_stride,
+        config.strides.vllm_val_offset, config.strides.vllm_k_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.ub_params.max_tokens_per_loop, config.dims.num_heads,
+        config.dims.head_dims, config.dims.num_tokens, num_chunks, chunk_size,
+        total_tokens, config.dims.block_size, config.token_major);
+  } else {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_separate_sparse_multi_chunk(
+        config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+        config.ub_params.aiv_num, config.ub_params.stream, chunk_ptrs_ptr,
+        config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+        config.ptrs.slot_mapping_ptr, selected_token_idx_ptr,
+        config.strides.vllm_k_stride, config.strides.vllm_v_stride,
+        config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+        config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+        config.ub_params.max_tokens_per_loop, config.dims.num_heads,
+        config.dims.head_dims, config.dims.num_tokens, num_chunks, chunk_size,
+        total_tokens, config.dims.block_size, config.token_major);
+  }
+}
+
+static void launch_dense_multi_chunk_direct_kernel(
+    const SingleLayerKVConfig &config, uint8_t *chunk_ptrs_ptr,
+    uint8_t *chunk_offsets_ptr, uint8_t *chunk_sizes_ptr, int32_t num_chunks,
+    int32_t fixed_chunk_size, int32_t total_tokens, bool lmc_host_interleaved,
+    bool page2l) {
+  TORCH_CHECK(is_mla_dsa_format(config.kvcache_format),
+              "Dense direct multi-chunk transfer only supports MLA/DSA formats.");
+
+  kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
+      config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
+      kernel_format(config.kvcache_format), config.ub_params.aiv_num,
+      config.ub_params.stream, chunk_ptrs_ptr, chunk_offsets_ptr,
+      chunk_sizes_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
+      config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+      config.strides.vllm_k_bytes, config.strides.vllm_v_bytes,
+      config.strides.vllm_dsa_bytes, config.ub_params.max_tokens_per_loop,
+      config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims,
+      config.dims.num_tokens, num_chunks, fixed_chunk_size, total_tokens,
+      config.dims.block_size, page2l, lmc_host_interleaved);
+}
+
+static uint32_t direct_aiv_num(int32_t num_tokens) {
+  const uint32_t token_cores =
+      num_tokens > 0 ? static_cast<uint32_t>(num_tokens) : 1U;
+  // The device core count is invariant for the lifetime of a worker process.
+  static const uint32_t hardware_cores = [] {
+    auto platform =
+        platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
+    const uint32_t aiv_num = platform->GetCoreNumAiv();
+    return std::max(1U, aiv_num);
+  }();
+  return std::min(hardware_cores, token_cores);
+}
+
+} // namespace
+
+void sparse_mla_dsa_batched_direct_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    const int64_t chunk_size, const int64_t total_tokens,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
+    const bool lmc_host_interleaved,
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu,
+    const c10::optional<torch::Tensor> &selected_token_counts) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+  TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
+  TORCH_CHECK(total_tokens > 0, "total_tokens must be positive.");
+  TORCH_CHECK(!lmc_tensors.empty(), "lmc_tensors must not be empty.");
+
+  for (const auto &chunk : lmc_tensors) {
+    TORCH_CHECK(
+        chunk.device().is_cpu(),
+        "Direct sparse retrieve requires CPU pinned memory objects.");
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  const int32_t num_sparse =
+      static_cast<int32_t>(selected_token_idx.numel());
+  if (num_sparse == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(lmc_tensors.size());
+  torch::Tensor chunk_ptrs_tensor;
+  if (chunk_ptrs_npu.has_value() && chunk_ptrs_npu->defined() &&
+      chunk_ptrs_npu->numel() == num_chunks) {
+    chunk_ptrs_tensor = *chunk_ptrs_npu;
+  } else {
+    std::vector<int64_t> chunk_ptrs_host(num_chunks);
+    for (int32_t chunk_i = 0; chunk_i < num_chunks; ++chunk_i) {
+      chunk_ptrs_host[chunk_i] = reinterpret_cast<int64_t>(
+          get_kernel_ptr<uint8_t, torch::Tensor>(lmc_tensors[chunk_i]));
+    }
+    auto npu_options = slot_mapping_packed.options();
+    chunk_ptrs_tensor =
+        torch::tensor(chunk_ptrs_host, npu_options.dtype(at::ScalarType::Long));
+  }
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      lmc_tensors[0], vllm_kv_caches, slot_mapping_packed, false, token_major,
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
+  config.dims.num_tokens = num_sparse;
+  const int32_t request_count = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->numel())
+      : 0;
+  const int32_t row_width =
+      request_count > 0 ? num_sparse / request_count : 0;
+  const int32_t selected_count_stride = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->stride(0))
+      : 1;
+  // Count-aware payloads retain fixed-width rows so the kernel can skip each
+  // row's padded tail.  The connector normally submits one request per
+  // launch, therefore request_count is commonly one even when the row
+  // contains thousands of selected tokens.  Size the launch from the token
+  // capacity and let the kernel shard valid tokens within each row.
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
+
+  uint8_t *selected_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
+  uint8_t *counts_ptr = selected_token_counts.has_value()
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
+      : nullptr;
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
+
+  const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, selected_ptr, counts_ptr, row_width,
+                        request_count, selected_count_stride,
+                        chunk_ptrs_ptr, num_chunks,
+                        chunk_size_i, total_tokens_i,
+                        lmc_host_interleaved]() -> int {
+    launch_sparse_multi_chunk_direct_kernel(
+        config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
+        total_tokens_i, lmc_host_interleaved, counts_ptr, row_width,
+        request_count, selected_count_stride);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void sparse_mla_dsa_batched_direct_kv_transfer_fast(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_packed,
+    torch::Tensor &selected_token_idx, torch::Tensor &chunk_ptrs_npu,
+    const int64_t chunk_size, const int64_t total_tokens,
+    const bool lmc_host_interleaved, const bool validate_inputs,
+    const c10::optional<torch::Tensor> &selected_token_counts) {
+  if (validate_inputs) {
+    validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+    TORCH_CHECK(chunk_size > 0, "chunk_size must be positive.");
+    TORCH_CHECK(total_tokens > 0, "total_tokens must be positive.");
+    TORCH_CHECK(chunk_ptrs_npu.defined() && chunk_ptrs_npu.numel() > 0,
+                "chunk_ptrs_npu must not be empty.");
+    TORCH_CHECK(chunk_ptrs_npu.device().is_privateuseone(),
+                "chunk_ptrs_npu must be on NPU.");
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  const int32_t num_sparse =
+      static_cast<int32_t>(selected_token_idx.numel());
+  if (num_sparse == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+
+  SingleLayerKVConfig config = layer_state.config;
+  config.dims.num_tokens = num_sparse;
+  const int32_t request_count = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->numel())
+      : 0;
+  const int32_t row_width =
+      request_count > 0 ? num_sparse / request_count : 0;
+  const int32_t selected_count_stride = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->stride(0))
+      : 1;
+  config.ub_params.aiv_num = direct_aiv_num(num_sparse);
+  config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
+  config.ptrs.slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
+
+  uint8_t *selected_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
+  uint8_t *counts_ptr = selected_token_counts.has_value()
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
+      : nullptr;
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+
+  const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, selected_ptr, counts_ptr, row_width,
+                        request_count, selected_count_stride,
+                        chunk_ptrs_ptr, num_chunks,
+                        chunk_size_i, total_tokens_i,
+                        lmc_host_interleaved]() -> int {
+    launch_sparse_multi_chunk_direct_kernel(
+        config, selected_ptr, chunk_ptrs_ptr, num_chunks, chunk_size_i,
+        total_tokens_i, lmc_host_interleaved, counts_ptr, row_width,
+        request_count, selected_count_stride);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void sparse_graph_kv_transfer(
+    const SparseDirectDestinationState &state,
+    torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
+    torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size, int64_t max_aiv_cores) {
+  // Host metadata checks run at eager warmup/capture only, never on replay.
+  TORCH_CHECK(selected.dim() == 2 && selected.is_contiguous(),
+              "Graph selected tokens must be a contiguous matrix");
+  TORCH_CHECK(slots.sizes() == selected.sizes() && slots.is_contiguous(),
+              "Graph slots must match selected tokens");
+  TORCH_CHECK(selected.scalar_type() == at::kInt || selected.scalar_type() == at::kLong,
+              "Graph selected tokens must be int32/int64");
+  TORCH_CHECK(slots.scalar_type() == at::kInt || slots.scalar_type() == at::kLong,
+              "Graph slots must be int32/int64");
+  const int64_t requests = selected.size(0);
+  TORCH_CHECK(requests > 0 && selected.size(1) > 0 &&
+                  selected.numel() <= std::numeric_limits<int32_t>::max(),
+              "Graph payload exceeds int32 packed addressing");
+  TORCH_CHECK((counts.dim() == 1 || (counts.dim() == 2 && counts.size(1) > 0)) &&
+                  counts.size(0) == requests && counts.scalar_type() == at::kInt &&
+                  counts.stride(0) > 0 && counts.stride(0) <= std::numeric_limits<int32_t>::max(),
+              "Graph counts must have one int32 count per row");
+  TORCH_CHECK(limits.numel() == requests && limits.is_contiguous() &&
+                  limits.scalar_type() == at::kInt,
+              "Graph limits must have one contiguous int32 value per row");
+  TORCH_CHECK(ptrs.dim() == 2 && ptrs.size(0) == 2 && ptrs.size(1) > 0 &&
+                  ptrs.size(1) % requests == 0 && ptrs.is_contiguous() &&
+                  ptrs.scalar_type() == at::kLong,
+              "Graph sources must be two contiguous int64 plane tables");
+  TORCH_CHECK(chunk_size > 0 && chunk_size <= std::numeric_limits<int32_t>::max() &&
+                  ptrs.size(1) <= std::numeric_limits<int32_t>::max() / chunk_size,
+              "Graph source capacity exceeds int32 token addressing");
+  TORCH_CHECK(state.scalar_type_num == kvcache_ops::AscendType::FP16 ||
+                  state.scalar_type_num == kvcache_ops::AscendType::BF16,
+              "Graph KV transfer supports FP16/BF16");
+  const int64_t k_bytes = state.k_hidden_dims * 2;
+  const int64_t pe_bytes = state.v_hidden_dims * 2;
+  TORCH_CHECK(state.vllm_k_ptr && state.vllm_v_ptr && k_bytes > 0 && pe_bytes > 0 &&
+                  k_bytes % 32 == 0 && pe_bytes % 32 == 0 &&
+                  k_bytes <= 16384 && pe_bytes <= 16384,
+              "Graph K/PE token widths must be 32-byte aligned and fit copy queues");
+  TORCH_CHECK(selected.device().is_privateuseone() && slots.device() == selected.device() &&
+                  counts.device() == selected.device() && ptrs.device() == selected.device() &&
+                  limits.device() == selected.device(),
+              "Graph transfer inputs must be on the same NPU");
+  const c10::OptionalDeviceGuard guard(device_of(selected));
+  TORCH_CHECK(max_aiv_cores >= 0 && max_aiv_cores <= std::numeric_limits<uint32_t>::max(),
+              "max_aiv_cores must be zero (automatic) or a positive uint32 value");
+  uint32_t cores = direct_aiv_num(static_cast<int32_t>(selected.numel()));
+  // Serial retrieval is critical-path work. Only a prefetch caller caps AIVs.
+  if (max_aiv_cores > 0) {
+    cores = std::min(cores, static_cast<uint32_t>(max_aiv_cores));
+  }
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  auto *slot_ptr = static_cast<uint8_t *>(slots.data_ptr());
+  auto *selected_ptr = static_cast<uint8_t *>(selected.data_ptr());
+  auto *counts_ptr = static_cast<uint8_t *>(counts.data_ptr());
+  auto *ptr_table = static_cast<uint8_t *>(ptrs.data_ptr());
+  auto *limit_ptr = static_cast<uint8_t *>(limits.data_ptr());
+  const bool index64 = selected.scalar_type() == at::kLong;
+  const bool slot64 = slots.scalar_type() == at::kLong;
+  const int32_t chunks_per_request = ptrs.size(1) / requests;
+  const int32_t row_width = selected.size(1);
+  const int32_t count_stride = counts.stride(0);
+  const int64_t destination_slots = std::min(state.vllm_k_bytes / k_bytes,
+                                            state.vllm_v_bytes / pe_bytes);
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_graph_kv_transfer");
+  cmd.SetCustomHandler([=]() -> int {
+    lmc::launch_sparse_graph_transfer(
+        cores, stream, index64, slot64, state.vllm_k_ptr, state.vllm_v_ptr,
+        slot_ptr, selected_ptr, counts_ptr, ptr_table, limit_ptr,
+        static_cast<int32_t>(chunk_size), chunks_per_request,
+        static_cast<int32_t>(requests), row_width, count_stride,
+        static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    torch::Tensor &chunk_ptrs_npu, const int64_t chunk_size,
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const c10::optional<torch::Tensor> &selected_token_counts,
+    const int64_t diagnostic_layer_id) {
+  struct HandlerTiming {
+    std::atomic<int64_t> entry_wall_ns{0};
+    std::atomic<int64_t> exit_wall_ns{0};
+    std::atomic<int64_t> entry_cpu_ns{0};
+    std::atomic<int64_t> exit_cpu_ns{0};
+  };
+  const bool diagnose = lmc::slow_diag::detailed_enabled();
+  const int64_t entry_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+  const int64_t entry_cpu_ns = diagnose ? lmc::slow_diag::thread_cpu_ns() : 0;
+  const int gil_held = diagnose ? PyGILState_Check() : 0;
+  const c10::OptionalDeviceGuard slot_device_guard(
+      device_of(slot_mapping_packed));
+  const int64_t guard_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+
+  const int32_t num_sparse = static_cast<int32_t>(selected_token_idx.numel());
+  if (num_sparse == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+  const int32_t request_count = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->numel())
+      : 0;
+  const int32_t row_width =
+      request_count > 0 ? num_sparse / request_count : 0;
+  const int32_t selected_count_stride = selected_token_counts.has_value()
+      ? static_cast<int32_t>(selected_token_counts->stride(0))
+      : 1;
+  const uint32_t aiv_num = direct_aiv_num(num_sparse);
+  const int64_t shape_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const int64_t stream_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_packed);
+  uint8_t *selected_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  torch::Tensor counts_tensor =
+      selected_token_counts.value_or(torch::Tensor());
+  uint8_t *counts_ptr = selected_token_counts.has_value()
+      ? get_kernel_ptr<uint8_t, torch::Tensor>(counts_tensor)
+      : nullptr;
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+
+  const int32_t chunk_size_i = static_cast<int32_t>(chunk_size);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const SparseDirectDestinationState state = destination_state;
+  const int64_t pointer_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+  auto handler_timing = diagnose ? std::make_shared<HandlerTiming>() : nullptr;
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([state, stream, aiv_num, slot_mapping_ptr, selected_ptr,
+                        counts_ptr, row_width, request_count,
+                        selected_count_stride,
+                        chunk_ptrs_ptr, num_sparse, num_chunks, chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved,
+                        handler_timing]() -> int {
+    if (handler_timing) {
+      handler_timing->entry_wall_ns.store(lmc::slow_diag::wall_ns(),
+                                          std::memory_order_relaxed);
+      handler_timing->entry_cpu_ns.store(lmc::slow_diag::thread_cpu_ns(),
+                                         std::memory_order_relaxed);
+    }
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_sparse_multi_chunk(
+        state.scalar_type_num, state.slot_type_num,
+        kernel_format(state.kvcache_format), aiv_num, stream, chunk_ptrs_ptr,
+        state.vllm_k_ptr, state.vllm_v_ptr, state.vllm_dsa_ptr,
+        slot_mapping_ptr, selected_ptr, counts_ptr, state.vllm_k_bytes,
+        state.vllm_v_bytes,
+        state.vllm_dsa_bytes, state.max_tokens_per_loop, state.k_hidden_dims,
+        state.v_hidden_dims, state.dsa_hidden_dims, num_sparse, num_chunks,
+        chunk_size_i, total_tokens_i, state.block_size, lmc_host_interleaved,
+        row_width, request_count, selected_count_stride);
+    if (handler_timing) {
+      handler_timing->exit_cpu_ns.store(lmc::slow_diag::thread_cpu_ns(),
+                                        std::memory_order_relaxed);
+      handler_timing->exit_wall_ns.store(lmc::slow_diag::wall_ns(),
+                                         std::memory_order_relaxed);
+    }
+    return 0;
+  });
+  const int64_t command_wall_ns = diagnose ? lmc::slow_diag::wall_ns() : 0;
+  cmd.Run();
+  if (diagnose) {
+    const int64_t return_wall_ns = lmc::slow_diag::wall_ns();
+    const int64_t return_cpu_ns = lmc::slow_diag::thread_cpu_ns();
+    const double total_ms =
+        lmc::slow_diag::elapsed_ms(entry_wall_ns, return_wall_ns);
+    if (total_ms >= lmc::slow_diag::kSlowPathMs) {
+      const int64_t handler_entry_ns =
+          handler_timing->entry_wall_ns.load(std::memory_order_relaxed);
+      const int64_t handler_exit_ns =
+          handler_timing->exit_wall_ns.load(std::memory_order_relaxed);
+      const int64_t handler_entry_cpu_ns =
+          handler_timing->entry_cpu_ns.load(std::memory_order_relaxed);
+      const int64_t handler_exit_cpu_ns =
+          handler_timing->exit_cpu_ns.load(std::memory_order_relaxed);
+      const double run_to_handler_ms = handler_entry_ns
+          ? lmc::slow_diag::elapsed_ms(command_wall_ns, handler_entry_ns)
+          : -1.0;
+      const double handler_ms = handler_exit_ns
+          ? lmc::slow_diag::elapsed_ms(handler_entry_ns, handler_exit_ns)
+          : -1.0;
+      const double handler_to_return_ms = handler_exit_ns
+          ? lmc::slow_diag::elapsed_ms(handler_exit_ns, return_wall_ns)
+          : -1.0;
+      const double handler_cpu_ms =
+          handler_exit_cpu_ns && handler_entry_cpu_ns
+          ? lmc::slow_diag::elapsed_ms(handler_entry_cpu_ns,
+                                      handler_exit_cpu_ns)
+          : -1.0;
+      std::fprintf(
+          stderr,
+          "[LMCACHE_COLD_PERF_NATIVE] {\"schema\":1,\"event\":\"sparse_"
+          "prepared_native_slow\",\"pid\":%ld,\"tid\":%ld,\"layer_id\":%ld,"
+          "\"gil_held\":%d,\"num_sparse\":%d,\"num_chunks\":%d,"
+          "\"total_tokens\":%d,\"total_ms\":%.3f,\"thread_cpu_ms\":%.3f,"
+          "\"device_guard_ms\":%.3f,\"shape_ms\":%.3f,\"stream_lookup_ms\":%.3f,"
+          "\"pointer_extract_ms\":%.3f,\"command_build_ms\":%.3f,"
+          "\"run_to_handler_ms\":%.3f,\"handler_ms\":%.3f,"
+          "\"handler_thread_cpu_ms\":%.3f,\"handler_to_return_ms\":%.3f}\n",
+          static_cast<long>(getpid()), lmc::slow_diag::thread_id(),
+          static_cast<long>(diagnostic_layer_id), gil_held, num_sparse,
+          num_chunks, total_tokens_i, total_ms,
+          lmc::slow_diag::elapsed_ms(entry_cpu_ns, return_cpu_ns),
+          lmc::slow_diag::elapsed_ms(entry_wall_ns, guard_wall_ns),
+          lmc::slow_diag::elapsed_ms(guard_wall_ns, shape_wall_ns),
+          lmc::slow_diag::elapsed_ms(shape_wall_ns, stream_wall_ns),
+          lmc::slow_diag::elapsed_ms(stream_wall_ns, pointer_wall_ns),
+          lmc::slow_diag::elapsed_ms(pointer_wall_ns, command_wall_ns),
+          run_to_handler_ms, handler_ms, handler_cpu_ms,
+          handler_to_return_ms);
+    }
+  }
+}
+
+static void validate_dense_direct_inputs(torch::Tensor &slot_mapping_full,
+                                         torch::Tensor &chunk_ptrs_npu,
+                                         torch::Tensor &chunk_offsets_npu,
+                                         torch::Tensor &chunk_sizes_npu,
+                                         int64_t total_tokens,
+                                         int64_t fixed_chunk_size) {
+  TORCH_CHECK(slot_mapping_full.dim() == 1,
+              "slot_mapping_full must be 1D.");
+  TORCH_CHECK(chunk_ptrs_npu.dim() == 1, "chunk_ptrs_npu must be 1D.");
+  TORCH_CHECK(chunk_offsets_npu.dim() == 1, "chunk_offsets_npu must be 1D.");
+  TORCH_CHECK(chunk_sizes_npu.dim() == 1, "chunk_sizes_npu must be 1D.");
+  TORCH_CHECK(slot_mapping_full.scalar_type() == at::ScalarType::Int ||
+                  slot_mapping_full.scalar_type() == at::ScalarType::Long,
+              "slot_mapping_full must be torch.int32 or torch.int64.");
+  TORCH_CHECK(chunk_offsets_npu.scalar_type() == at::ScalarType::Int,
+              "chunk_offsets_npu must be torch.int32.");
+  TORCH_CHECK(chunk_sizes_npu.scalar_type() == at::ScalarType::Int,
+              "chunk_sizes_npu must be torch.int32.");
+  TORCH_CHECK(chunk_ptrs_npu.scalar_type() == at::ScalarType::Long,
+              "chunk_ptrs_npu must be torch.int64.");
+  if (fixed_chunk_size > 0) {
+    TORCH_CHECK(chunk_offsets_npu.numel() > 0 && chunk_sizes_npu.numel() > 0,
+                "fixed dense direct metadata tensors must not be empty.");
+  } else {
+    TORCH_CHECK(chunk_ptrs_npu.numel() == chunk_offsets_npu.numel() &&
+                    chunk_ptrs_npu.numel() == chunk_sizes_npu.numel(),
+                "chunk pointer, offset and size tensors must have the same length.");
+  }
+  TORCH_CHECK(chunk_ptrs_npu.numel() > 0, "chunk_ptrs_npu must not be empty.");
+  TORCH_CHECK(total_tokens > 0, "total_tokens must be positive.");
+  TORCH_CHECK(fixed_chunk_size >= 0,
+              "fixed_chunk_size must be non-negative.");
+  TORCH_CHECK(slot_mapping_full.size(0) <= total_tokens,
+              "slot_mapping_full length cannot exceed total_tokens.");
+  TORCH_CHECK(total_tokens <= std::numeric_limits<int32_t>::max(),
+              "total_tokens exceeds dense direct int32 kernel limit.");
+  TORCH_CHECK(fixed_chunk_size <= std::numeric_limits<int32_t>::max(),
+              "fixed_chunk_size exceeds dense direct int32 kernel limit.");
+  TORCH_CHECK(slot_mapping_full.size(0) <= std::numeric_limits<int32_t>::max(),
+              "slot_mapping_full length exceeds dense direct int32 kernel limit.");
+  TORCH_CHECK(chunk_ptrs_npu.numel() <= std::numeric_limits<int32_t>::max(),
+              "chunk count exceeds dense direct int32 kernel limit.");
+  if (fixed_chunk_size > 0) {
+    const int64_t num_chunks = chunk_ptrs_npu.numel();
+    TORCH_CHECK((num_chunks - 1) * fixed_chunk_size < total_tokens &&
+                    num_chunks * fixed_chunk_size >= total_tokens,
+                "fixed_chunk_size does not cover total_tokens.");
+  }
+  TORCH_CHECK(slot_mapping_full.device().is_privateuseone(),
+              "slot_mapping_full must be on NPU.");
+  TORCH_CHECK(chunk_ptrs_npu.device().is_privateuseone(),
+              "chunk_ptrs_npu must be on NPU.");
+  TORCH_CHECK(chunk_offsets_npu.device().is_privateuseone(),
+              "chunk_offsets_npu must be on NPU.");
+  TORCH_CHECK(chunk_sizes_npu.device().is_privateuseone(),
+              "chunk_sizes_npu must be on NPU.");
+}
+
+void dense_mla_dsa_batched_direct_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, const int64_t total_tokens,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
+    const bool lmc_host_interleaved, const bool direction,
+    const c10::optional<torch::Tensor> &chunk_ptrs_npu,
+    const int64_t fixed_chunk_size) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  TORCH_CHECK(is_mla_dsa_format(
+                  static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw)),
+              "Dense direct transfer only supports MLA/DSA formats.");
+  TORCH_CHECK(!lmc_tensors.empty(), "lmc_tensors must not be empty.");
+
+  for (const auto &chunk : lmc_tensors) {
+    TORCH_CHECK(chunk.device().is_cpu(),
+                "Dense direct transfer requires CPU pinned memory objects.");
+  }
+
+  const int64_t num_chunks_i64 = static_cast<int64_t>(lmc_tensors.size());
+  torch::Tensor chunk_ptrs_tensor;
+  if (chunk_ptrs_npu.has_value() && chunk_ptrs_npu->defined() &&
+      chunk_ptrs_npu->numel() == num_chunks_i64) {
+    chunk_ptrs_tensor = *chunk_ptrs_npu;
+  } else {
+    std::vector<int64_t> chunk_ptrs_host(num_chunks_i64);
+    for (int64_t chunk_i = 0; chunk_i < num_chunks_i64; ++chunk_i) {
+      chunk_ptrs_host[chunk_i] = reinterpret_cast<int64_t>(
+          get_kernel_ptr<uint8_t, torch::Tensor>(lmc_tensors[chunk_i]));
+    }
+    auto npu_options = slot_mapping_full.options();
+    chunk_ptrs_tensor =
+        torch::tensor(chunk_ptrs_host, npu_options.dtype(at::ScalarType::Long));
+  }
+
+  validate_dense_direct_inputs(slot_mapping_full, chunk_ptrs_tensor,
+                               chunk_offsets_npu, chunk_sizes_npu,
+                               total_tokens, fixed_chunk_size);
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      lmc_tensors[0], vllm_kv_caches, slot_mapping_full, direction,
+      token_major, vllm_two_major, kvcache_format_raw, k_hidden_dims,
+      v_hidden_dims, dsa_hidden_dims);
+  config.dims.num_tokens = num_tokens;
+  config.ub_params.aiv_num = direct_aiv_num(num_tokens);
+
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_tensor);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+  const int32_t num_chunks = static_cast<int32_t>(num_chunks_i64);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, chunk_ptrs_ptr, chunk_offsets_ptr,
+                        chunk_sizes_ptr, num_chunks, fixed_chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved, direction]() -> int {
+    launch_dense_multi_chunk_direct_kernel(
+        config, chunk_ptrs_ptr, chunk_offsets_ptr, chunk_sizes_ptr,
+        num_chunks, fixed_chunk_size_i, total_tokens_i, lmc_host_interleaved,
+        direction);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void dense_mla_dsa_batched_direct_kv_transfer_fast(
+    SparseDirectLayerState &layer_state, torch::Tensor &slot_mapping_full,
+    torch::Tensor &chunk_ptrs_npu, torch::Tensor &chunk_offsets_npu,
+    torch::Tensor &chunk_sizes_npu, const int64_t total_tokens,
+    const bool lmc_host_interleaved, const bool direction,
+    const bool validate_inputs,
+    const int64_t fixed_chunk_size) {
+  if (validate_inputs) {
+    validate_dense_direct_inputs(slot_mapping_full, chunk_ptrs_npu,
+                                 chunk_offsets_npu, chunk_sizes_npu,
+                                 total_tokens, fixed_chunk_size);
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+
+  SingleLayerKVConfig config = layer_state.config;
+  config.dims.num_tokens = num_tokens;
+  config.ub_params.aiv_num = direct_aiv_num(num_tokens);
+  config.ub_params.stream = c10_npu::getCurrentNPUStream().stream();
+  config.ptrs.slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
+
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([config, chunk_ptrs_ptr, chunk_offsets_ptr,
+                        chunk_sizes_ptr, num_chunks, fixed_chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved, direction]() -> int {
+    launch_dense_multi_chunk_direct_kernel(
+        config, chunk_ptrs_ptr, chunk_offsets_ptr, chunk_sizes_ptr,
+        num_chunks, fixed_chunk_size_i, total_tokens_i, lmc_host_interleaved,
+        direction);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void dense_mla_dsa_batched_direct_kv_transfer_prepared(
+    const SparseDirectDestinationState &destination_state,
+    torch::Tensor &slot_mapping_full, torch::Tensor &chunk_ptrs_npu,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const bool validate_inputs, const int64_t fixed_chunk_size) {
+  if (validate_inputs) {
+    validate_dense_direct_inputs(slot_mapping_full, chunk_ptrs_npu,
+                                 chunk_offsets_npu, chunk_sizes_npu,
+                                 total_tokens, fixed_chunk_size);
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
+  uint8_t *chunk_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_ptrs_npu);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+  const int32_t num_chunks = static_cast<int32_t>(chunk_ptrs_npu.numel());
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+  const uint32_t aiv_num = direct_aiv_num(num_tokens);
+  const SparseDirectDestinationState state = destination_state;
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_batched_direct_kv_transfer");
+  cmd.SetCustomHandler([state, stream, aiv_num, slot_mapping_ptr,
+                        chunk_ptrs_ptr, chunk_offsets_ptr, chunk_sizes_ptr,
+                        num_tokens, num_chunks, fixed_chunk_size_i,
+                        total_tokens_i, lmc_host_interleaved]() -> int {
+    kvcache_ops::single_layer_kv_transfer_kernel_v2_mla_dsa_dense_multi_chunk(
+        state.scalar_type_num, state.slot_type_num,
+        kernel_format(state.kvcache_format), aiv_num, stream, chunk_ptrs_ptr,
+        chunk_offsets_ptr, chunk_sizes_ptr, state.vllm_k_ptr, state.vllm_v_ptr,
+        state.vllm_dsa_ptr, slot_mapping_ptr, state.vllm_k_bytes,
+        state.vllm_v_bytes, state.vllm_dsa_bytes, state.max_tokens_per_loop,
+        state.k_hidden_dims, state.v_hidden_dims, state.dsa_hidden_dims,
+        num_tokens, num_chunks, fixed_chunk_size_i, total_tokens_i,
+        state.block_size, false, lmc_host_interleaved);
+    return 0;
+  });
+  cmd.Run();
+}
+
+void dense_mla_dsa_group_direct_kv_transfer_fast(
+    const std::vector<SparseDirectLayerState> &layer_states,
+    torch::Tensor &slot_mapping_full, torch::Tensor &layer_chunk_ptrs_npu,
+    torch::Tensor &chunk_offsets_npu, torch::Tensor &chunk_sizes_npu,
+    const int64_t total_tokens, const bool lmc_host_interleaved,
+    const bool direction, const bool validate_inputs,
+    const int64_t fixed_chunk_size) {
+  TORCH_CHECK(!layer_states.empty(), "layer_states must not be empty.");
+  TORCH_CHECK(layer_chunk_ptrs_npu.dim() == 2,
+              "layer_chunk_ptrs_npu must be 2D [layers, chunks].");
+  TORCH_CHECK(layer_chunk_ptrs_npu.size(0) ==
+                  static_cast<int64_t>(layer_states.size()),
+              "layer pointer table row count must match layer_states.");
+  TORCH_CHECK(layer_chunk_ptrs_npu.size(1) > 0,
+              "layer pointer table must contain at least one chunk.");
+  TORCH_CHECK(layer_chunk_ptrs_npu.is_contiguous(),
+              "layer_chunk_ptrs_npu must be contiguous.");
+
+  if (validate_inputs) {
+    torch::Tensor first_pointer_row = layer_chunk_ptrs_npu.select(0, 0);
+    validate_dense_direct_inputs(slot_mapping_full, first_pointer_row,
+                                 chunk_offsets_npu, chunk_sizes_npu,
+                                 total_tokens, fixed_chunk_size);
+    TORCH_CHECK(layer_states.size() <=
+                    static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                "layer count exceeds dense direct int32 kernel limit.");
+    TORCH_CHECK(layer_chunk_ptrs_npu.device() == slot_mapping_full.device() &&
+                    chunk_offsets_npu.device() == slot_mapping_full.device() &&
+                    chunk_sizes_npu.device() == slot_mapping_full.device(),
+                "dense group metadata tensors must use the slot-mapping "
+                "device index.");
+    TORCH_CHECK(chunk_offsets_npu.numel() == chunk_sizes_npu.numel(),
+                "chunk offset and size metadata lengths must match.");
+  }
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_full));
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping_full.size(0));
+  if (num_tokens == 0) {
+    return;
+  }
+  const int32_t num_chunks =
+      static_cast<int32_t>(layer_chunk_ptrs_npu.size(1));
+
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(slot_mapping_full);
+  uint8_t *layer_chunk_ptrs_base =
+      get_kernel_ptr<uint8_t, torch::Tensor>(layer_chunk_ptrs_npu);
+  uint8_t *chunk_offsets_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_offsets_npu);
+  uint8_t *chunk_sizes_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(chunk_sizes_npu);
+
+  std::vector<SingleLayerKVConfig> configs;
+  configs.reserve(layer_states.size());
+  for (const auto &layer_state : layer_states) {
+    SingleLayerKVConfig config = layer_state.config;
+    config.dims.num_tokens = num_tokens;
+    config.ub_params.aiv_num = direct_aiv_num(num_tokens);
+    config.ub_params.stream = stream;
+    config.ptrs.slot_mapping_ptr = slot_mapping_ptr;
+    configs.push_back(config);
+  }
+
+  const int32_t total_tokens_i = static_cast<int32_t>(total_tokens);
+  const int32_t fixed_chunk_size_i = static_cast<int32_t>(fixed_chunk_size);
+  const int64_t pointer_row_bytes =
+      static_cast<int64_t>(num_chunks) * sizeof(int64_t);
+  at_npu::native::OpCommand cmd;
+  cmd.Name("dense_mla_dsa_group_direct_kv_transfer");
+  cmd.SetCustomHandler(
+      [configs, layer_chunk_ptrs_base, chunk_offsets_ptr, chunk_sizes_ptr,
+       num_chunks, pointer_row_bytes, fixed_chunk_size_i, total_tokens_i,
+       lmc_host_interleaved, direction]() -> int {
+        for (size_t layer_id = 0; layer_id < configs.size(); ++layer_id) {
+          uint8_t *layer_chunk_ptrs =
+              layer_chunk_ptrs_base + layer_id * pointer_row_bytes;
+          launch_dense_multi_chunk_direct_kernel(
+              configs[layer_id], layer_chunk_ptrs, chunk_offsets_ptr,
+              chunk_sizes_ptr, num_chunks, fixed_chunk_size_i, total_tokens_i,
+              lmc_host_interleaved, direction);
+        }
+        return 0;
+      });
+  cmd.Run();
+}
+
+void batched_fused_sparse_single_layer_kv_transfer(
+    std::vector<torch::Tensor> &lmc_tensors, torch::Tensor &staging_cache,
+    std::vector<torch::Tensor> &vllm_kv_caches,
+    torch::Tensor &slot_mapping_packed, torch::Tensor &selected_token_idx,
+    std::vector<int64_t> &chunk_offsets, std::vector<int64_t> &chunk_sizes,
+    const int kvcache_format_raw, const bool token_major,
+    const bool vllm_two_major, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
+    const c10::optional<torch::Tensor> &sparse_indices_cpu) {
+  validate_vllm_caches(vllm_kv_caches, kvcache_format_raw);
+  validate_sparse_single_layer_inputs(slot_mapping_packed, selected_token_idx);
+
+  const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping_packed));
+
+  SingleLayerKVConfig config = prepare_single_layer_kv_config(
+      staging_cache, vllm_kv_caches, slot_mapping_packed, false, token_major,
+      vllm_two_major, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
+
+  uint8_t *selected_token_idx_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(selected_token_idx);
+  int64_t element_size = staging_cache.element_size();
+
+  auto launcher = [config, selected_token_idx_ptr]() {
+    launch_sparse_single_layer_kernel(config, selected_token_idx_ptr);
+  };
+
+  run_batched_fused_sparse_transfer(config, lmc_tensors, chunk_offsets,
+                                    chunk_sizes, element_size,
+                                    selected_token_idx, sparse_indices_cpu,
+                                    launcher);
 }
 
 void load_and_reshape_flash(

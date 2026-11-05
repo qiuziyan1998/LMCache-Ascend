@@ -56,7 +56,7 @@ public:
                                             size_t bufferSize);
   int aclUnregisterHostPtr(void *hostPtr);
   int halUnregisterHostPtr(void *hostPtr);
-  void *getDevicePtr(void *hostPtr);
+  void *getDevicePtr(void *hostPtr, size_t requiredSize = 1);
   size_t getRecordSize(void *hostPtr);
   void unregisterAll();
 };
@@ -73,4 +73,4 @@ int unregister_ptr(void *ptr);
 void *register_mapping(void *hostPtr, void *devPtr, size_t size);
 
 // Takes in input a host pointer, returns the corresponding device pointer
-void *get_device_ptr(void *ptr);
+void *get_device_ptr(void *ptr, size_t requiredSize = 1);

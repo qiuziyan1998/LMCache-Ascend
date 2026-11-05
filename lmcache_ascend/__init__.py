@@ -7,13 +7,14 @@ from ._version import __version_tuple__ as __version_tuple__  # noqa: F401  # is
 
 # Standard
 import sys
+from typing import Optional
 
 # First Party
 from lmcache_ascend import _build_info
 
 # NOTE: Must be manually edited per each version and
 # is also used by the test infrastructure.
-LMCACHE_UPSTREAM_TAG = "v0.4.4"
+LMCACHE_UPSTREAM_TAG = "v0.4.3"
 LMCACHE_ASCEND_PATCHED = False
 
 
@@ -29,6 +30,120 @@ def _patch_config():
     # Third Party
     from lmcache.v1.config_base import _to_bool, _to_int_list, create_config_class
     import lmcache.v1.config
+
+    upstream_validate_config = lmcache.v1.config._validate_config
+
+    def _validate_ascend_config(config):
+        """Apply RemoteFill's fixed Ascend contract before validation."""
+
+        remote_fill_active = bool(
+            getattr(config, "enable_remote_lmcache_store", False)
+        )
+        if remote_fill_active:
+            # None of these are independent feature choices. RemoteFill uses
+            # the existing direct-NPU, page-first, rank0-owned DSA path and
+            # finalizes persistent stores asynchronously on the prefiller.
+            config.use_layerwise = True
+            config.enable_sparse_attention = True
+            config.dsa_two_groups = True
+            config.save_unfull_chunk = True
+            extra_config = dict(config.extra_config or {})
+            if (
+                getattr(config, "dsa_group1_load_mode", "")
+                == "persistent_direct_hbm"
+                and bool(extra_config.get("save_chunk_meta", False))
+            ):
+                raise ValueError(
+                    "dsa_group1_load_mode=persistent_direct_hbm requires "
+                    "extra_config.save_chunk_meta=false"
+                )
+            extra_config.update(
+                {
+                    "save_only_first_rank": True,
+                    "mooncake_page_first_multi_buffer": True,
+                    "mooncake_layer_merged_page_objects": True,
+                    "save_chunk_meta": False,
+                }
+            )
+            if getattr(config, "pd_role", None) == "receiver":
+                config.enable_shared_cpu_cache = True
+                config.shared_cpu_cache_strict = True
+            else:
+                config.store_async = True
+                config.store_async_max_queue_size = 2
+                extra_config["use_ascend_direct"] = True
+            config.extra_config = extra_config
+        return upstream_validate_config(config)
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["enable_shared_cpu_cache"] = {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Enable decode-node-local shared CPU cache handle "
+        "publication for rank0-only LMCache storage.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_strict"] = {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Fail fast on invalid shared CPU cache config, missing "
+        "chunks, or unsafe handle/pointer validation.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_name"] = {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+        "description": "Optional debug override for the POSIX shm name. "
+        "Unset means rank0 derives a unique engine-local name.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_size_gb"] = {
+        "type": Optional[float],
+        "default": None,
+        "env_converter": float,
+        "description": "Optional shared CPU slab size override in GB. "
+        "Unset means use effective max_local_cpu_size.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_numa_policy"] = {
+        "type": str,
+        "default": "first_touch",
+        "env_converter": str,
+        "description": "NUMA placement for the shared CPU slab: "
+        "'first_touch' preserves the existing behavior; 'interleave' "
+        "distributes pages across allowed NUMA nodes.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS["shared_cpu_cache_numa_nodes"] = {
+        "type": str | int | list[int] | None,
+        "default": None,
+        "env_converter": lambda value: value,
+        "description": "Optional NUMA node list for shared CPU slab "
+        "interleaving. Unset means all nodes allowed to the process.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS[
+        "shared_cpu_materialize_index_on_decode_cold"
+    ] = {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Materialize DSA index during sparse decode cold "
+        "bootstrap when dsa_two_groups=true.",
+    }
+
+    lmcache.v1.config._CONFIG_DEFINITIONS[
+        "shared_cpu_cache_passive_writable"
+    ] = {
+        "type": Optional[bool],
+        "default": None,
+        "env_converter": _to_bool,
+        "description": "Optional passive-rank shm mmap mode override. "
+        "Unset means try read-only first and retry read-write if host "
+        "registration requires it.",
+    }
 
     # Add new config item for p2p npu usage
     lmcache.v1.config._CONFIG_DEFINITIONS["p2p_use_npu"] = {
@@ -79,22 +194,6 @@ def _patch_config():
         "If a receiver crashes and never sends PullDoneSignal, "
         "pinned MemObjs are released after this timeout. "
         "This config is only used when p2p_pull_mode is set to True.",
-    }
-
-    # P2P sync control-plane lookup cache (scheduler lookup daemon thread)
-    lmcache.v1.config._CONFIG_DEFINITIONS["p2p_sync_lookup_cache_ttl"] = {
-        "type": float,
-        "default": 5.0,
-        "env_converter": float,
-        "description": "TTL in seconds for entries in the P2P sync lookup cache. "
-        "Used on the sync ZMQ control-plane path for batched peer lookups.",
-    }
-    lmcache.v1.config._CONFIG_DEFINITIONS["p2p_sync_lookup_cache_max_entries"] = {
-        "type": int,
-        "default": 1024,
-        "env_converter": int,
-        "description": "Maximum number of entries in the P2P sync lookup cache. "
-        "Oldest entries are evicted when the limit is exceeded.",
     }
 
     # Add new pd_pull_mode config
@@ -208,29 +307,8 @@ def _patch_config():
         "Set 0 for an unbounded queue; values > 0 enable bounded backpressure.",
     }
 
-    # Add enable_chunk_hashes_return config
-    lmcache.v1.config._CONFIG_DEFINITIONS["enable_chunk_hashes_return"] = {
-        "type": bool,
-        "default": False,
-        "env_converter": _to_bool,
-        "description": "Whether to track chunk hashes during lookup and "
-        "include them in request_finished return params. "
-        "If True, chunk_hashes will be available in return_params. "
-        "Default is False (disabled, no impact on original functionality).",
-    }
-
-    # Add lookup_hashes_cache_size config
-    lmcache.v1.config._CONFIG_DEFINITIONS["lookup_hashes_cache_size"] = {
-        "type": int,
-        "default": 0,
-        "env_converter": int,
-        "description": "Maximum number of cached chunk hash entries. "
-        "When exceeded, the oldest entry is evicted to prevent unbounded "
-        "memory growth. Default is 0 (unlimited).",
-    }
-
     namespace_extras = {
-        "validate": lmcache.v1.config._validate_config,
+        "validate": _validate_ascend_config,
         "log_config": lmcache.v1.config._log_config,
         "get_extra_config_value": lmcache.v1.config._get_extra_config_value,
         "get_lmcache_worker_ids": lmcache.v1.config._get_lmcache_worker_ids,
@@ -251,7 +329,7 @@ def _patch_config():
     # patch ran, its module-level ``LMCacheEngineConfig`` still points to
     # the OLD class whose ``_from_file`` closure now iterates the mutated
     # _CONFIG_DEFINITIONS dict (with keys like ``p2p_use_npu``), while the
-    # OLD ``__init__`` doesn't accept them → TypeError.  Fix by updating
+    # OLD ``__init__`` doesn't accept them -> TypeError. Fix by updating
     # the stale reference.
     _utils_mod = sys.modules.get("lmcache.integration.vllm.utils")
     if _utils_mod is not None:
@@ -283,6 +361,10 @@ def _patch_ops():
         ascend_c_ops.GPUKVFormat = GPUKVFormat
 
     sys.modules["lmcache.c_ops"] = ascend_c_ops
+    # When torch.cuda.is_available() is False, upstream memory_management imports
+    # non_cuda_equivalents whose alloc_pinned_ptr is not aclrtHostRegister'd.
+    # Ascend KV kernels require host-registered CPU buffers (get_device_ptr).
+    sys.modules["lmcache.non_cuda_equivalents"] = ascend_c_ops
 
 
 def _patch_storage_backend_init():
@@ -299,12 +381,19 @@ def _patch_storage_backend_init():
 
 def _patch_torch_capability():
     # Third Party
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+    from torch_npu.contrib import transfer_to_npu
     import torch
+    from torch._dynamo.device_interface import CudaInterface
 
     # Note: torch_npu do not support get_device_capability
     capability_mock = lambda *args: (0, 0)
     torch.npu.get_device_capability = capability_mock
+    # transfer_to_npu already bound the original NPU callable under CUDA.
+    # Repair that alias too before an early connector import reaches Dynamo.
+    torch.cuda.get_device_capability = capability_mock
+    # Compiler CUDA detection must use genuine CUDA availability, not the
+    # remapped NPU flag: NPU properties have no CUDA compute-capability major.
+    CudaInterface.is_available = staticmethod(transfer_to_npu.is_available)
 
 
 def _patch_transfer_channel():
@@ -326,61 +415,6 @@ def _patch_cacheblend():
     from lmcache_ascend.v1.blend.utils import get_or_create_blender
 
     LMCBlenderBuilder.get_or_create = partial(get_or_create_blender, LMCBlenderBuilder)
-
-
-def _patch_cachegen():
-    # Third Party
-    import lmcache.storage_backend.serde.cachegen_decoder as cachegen_decoder
-    import lmcache.storage_backend.serde.cachegen_encoder as cachegen_encoder
-
-    # First Party
-    from lmcache_ascend.serde.pac import pac_decode_function, pac_encode_function
-
-    cachegen_encoder.encode_function = pac_encode_function
-    cachegen_decoder.decode_function_gpu = pac_decode_function
-
-
-def _patch_remote_backend():
-    # Standard
-    from typing import List, Optional
-
-    # Third Party
-    from lmcache.utils import CacheEngineKey
-    from lmcache.v1.memory_management import MemoryObj
-    from lmcache.v1.storage_backend.naive_serde import CacheGenDeserializer
-    from lmcache.v1.storage_backend.remote_backend import RemoteBackend
-
-    # The core remote backend implementation deserializes an NPU resident tensor that
-    # isn't managed by a parent allocator. To mesh with the rest of LMCache it needs to
-    # be a host registered CPU tensor.
-    #
-    # Patch the get function with that functionality - allocate managed CPU memory,
-    # copy over the data
-    old_batched_get_blocking = RemoteBackend.batched_get_blocking
-
-    def new_batched_get_blocking(
-        self,
-        keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
-        source_bufs = old_batched_get_blocking(self, keys)
-
-        if isinstance(self.deserializer, CacheGenDeserializer):
-            allocator = self.get_allocator_backend()
-
-            target_bufs = []
-            for source_buf in source_bufs:
-                shape = source_buf.tensor.shape
-                dtype = source_buf.tensor.dtype
-
-                target_buf = allocator.allocate(shape, dtype)
-                target_buf.tensor.copy_(source_buf.tensor, non_blocking=True)
-                target_bufs.append(target_buf)
-        else:
-            target_bufs = source_bufs
-
-        return target_bufs
-
-    RemoteBackend.batched_get_blocking = new_batched_get_blocking
 
 
 def _patch_multi_process():
@@ -489,6 +523,27 @@ def _patch_vllm_v1_adapter():
         if callable(method):
             method(preempted_req_ids)
 
+    def uses_layerwise_model_callbacks(self):
+        return bool(getattr(self._lmcache_engine, "use_layerwise", False))
+
+    def supports_staged_sfa_sparse_load(self):
+        engine = self._lmcache_engine
+        config = getattr(engine, "config", None)
+        return bool(
+            getattr(engine, "use_layerwise", False)
+            and getattr(engine, "kv_role", None)
+            in ("kv_both", "kv_consumer")
+            and getattr(config, "dsa_two_groups", False)
+            and getattr(config, "enable_sparse_attention", False)
+        )
+
+    vllm_lmcache_connector.LMCacheConnectorV1.supports_dsa_index_lmcache = True
+    vllm_lmcache_connector.LMCacheConnectorV1.uses_layerwise_model_callbacks = property(
+        uses_layerwise_model_callbacks
+    )
+    vllm_lmcache_connector.LMCacheConnectorV1.supports_staged_sfa_sparse_load = (
+        property(supports_staged_sfa_sparse_load)
+    )
     vllm_lmcache_connector.LMCacheConnectorV1.handle_preemptions = handle_preemptions
 
 
@@ -543,16 +598,6 @@ def _patch_lookup_client():
     lmc_lookup_client.LMCacheLookupClient.lookup = normalize_token_ids(
         lmc_lookup_client.LMCacheLookupClient.lookup
     )
-
-
-def _patch_cache_controller_worker():
-    # Third Party
-    import lmcache.v1.cache_controller.worker as lmc_worker
-
-    # First Party
-    from lmcache_ascend.v1.cache_controller.worker import async_put_and_wait_msg
-
-    lmc_worker.LMCacheWorker.async_put_and_wait_msg = async_put_and_wait_msg
 
 
 def _patch_sys_detection():
@@ -632,49 +677,6 @@ def _patch_rpc_utils():
         _factory_mod.get_zmq_rpc_path_lmcache = get_zmq_rpc_path_lmcache
 
 
-def _patch_storage_manager():
-    # Prefetch all done callback: write loaded data back to hot cache
-    # so subsequent requests hit DDR instead of SSD/P2P.
-    # Third Party
-    from lmcache.v1.storage_backend.storage_manager import StorageManager
-
-    # First Party
-    from lmcache_ascend.v1.storage_backend.storage_manager import (
-        patched_prefetch_all_done_callback,
-    )
-
-    StorageManager.prefetch_all_done_callback = patched_prefetch_all_done_callback
-
-
-def _patch_lookup_client_factory():
-    # Replace LMCacheAsyncLookupClient with Ascend subclass that caches
-    # chunk_hashes during lookup and exposes them via get_cached_hashes().
-    # Third Party
-    import lmcache.v1.lookup_client.lmcache_async_lookup_client as lmc_async
-
-    # First Party
-    from lmcache_ascend.v1.lookup_client.lmcache_async_lookup_client import (
-        LMCacheAsyncLookupClient,
-    )
-
-    lmc_async.LMCacheAsyncLookupClient = LMCacheAsyncLookupClient
-
-
-def _patch_api_server():
-    # Register /memory/prefetch and /memory/evict REST endpoints.
-    # Third Party
-    from lmcache.v1.internal_api_server.api_server import InternalAPIServer
-
-    # First Party
-    from lmcache_ascend.v1.internal_api_server import (
-        InternalAPIServer__init__,
-        _capture_original_init,
-    )
-
-    _capture_original_init(InternalAPIServer.__init__)
-    InternalAPIServer.__init__ = InternalAPIServer__init__
-
-
 # Check if we've already patched to avoid redundant work
 if not LMCACHE_ASCEND_PATCHED:
     # Standard
@@ -701,16 +703,12 @@ if not LMCACHE_ASCEND_PATCHED:
 
     _patch_hash_token()
 
-    _patch_cachegen()
-    _patch_remote_backend()
-
     if _build_info.__framework_name__ == "pytorch":
         _patch_storage_backend_init()
         _patch_transfer_channel()
         _patch_cacheblend()
         _patch_multi_process()
         _patch_lookup_client()
-        _patch_cache_controller_worker()
         _patch_rpc_utils()
 
     _patch_kv_layer_group()
@@ -721,13 +719,9 @@ if not LMCACHE_ASCEND_PATCHED:
         if _build_info.__framework_name__ == "pytorch":
             _patch_sys_detection()
 
-        _patch_lookup_client_factory()
         _patch_vllm_v1_adapter()
 
         _patch_cache_engine()
-
-        _patch_storage_manager()
-        _patch_api_server()
 
     if _build_info.__framework_name__ == "mindspore":
         # First Party

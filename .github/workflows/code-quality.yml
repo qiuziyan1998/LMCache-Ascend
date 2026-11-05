@@ -37,7 +37,6 @@ jobs:
             files.pythonhosted.org:443
             atomgit.com:443
             api.github.com:443
-            gitcode.com:443
 
       - name: Checkout code
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
@@ -80,14 +79,6 @@ jobs:
                 state: 'pending',
                 description: 'Queued (Waiting for runner pick-up)...',
                 context: '910C Unit Tests Status'
-              });
-              await github.rest.repos.createCommitStatus({
-                owner,
-                repo,
-                sha,
-                state: 'pending',
-                description: 'Queued (Waiting for runner pick-up)...',
-                context: '910C Perf & Accuracy Status'
               });
             } catch (error) {
               // 403 means "Forbidden" (likely a Fork PR). We ignore it.

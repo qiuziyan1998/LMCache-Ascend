@@ -1,11 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any, List, Optional, Set, Union
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from functools import wraps
+from itertools import pairwise
+from threading import Condition, Thread, get_ident
+from typing import Any, Generator, Iterable, List, Optional, Sequence, Set, Union
+import hashlib
+import json
+import os
+import sys
+import time
+import traceback
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.v1.serving_perf import (
+    prefill_reuse_debug_enabled,
+    prefill_reuse_debug_log,
+    prefill_start_timing_enabled,
+    prefill_start_timing_log,
+    serving_perf_detailed_enabled,
+    serving_perf_enabled,
+    serving_perf_log,
+)
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.gpu_connectors import (
     SGLangGPUConnector,
@@ -14,18 +34,612 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemLayerwiseGPUConnector,
 )
+from lmcache.v1.gpu_connector.sparse import (
+    PreparedSparseSource,
+)
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import (
+    GPUMemoryAllocator,
+    LayerPageMemoryObj,
+    LayerPageSource,
+    MemoryFormat,
+    MemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.prefill_audit import BankAudit, audit_enabled
 import torch
 
 # First Party
+from lmcache_ascend.v1.content_diagnostics import (
+    npu_content_diagnostics_enabled,
+    register_group0_source_probe,
+)
 from lmcache_ascend.v1.kv_format import KVCacheFormat
+from lmcache_ascend.v1.direct_npu_audit import DirectNpuAudit
+from lmcache_ascend.v1.kv_fence_debug import KVFenceDebug
+from lmcache_ascend.v1.kv_features import (
+    KVTrace,
+    REFERENCE_SEGMENT_TOKENS,
+    diagnostic,
+    enabled as kv_trace_enabled,
+)
+from lmcache_ascend.v1.npu_connector.layerwise_dma import (
+    BoundCopyPrefix,
+    IncrementalDmaPlan,
+    SourceAddressCache,
+    bind_copy_addresses,
+    bind_incremental_copy_addresses,
+    plan_block_id_ranges_incremental,
+    prepare_source_addresses,
+)
+from lmcache_ascend.v1.npu_connector.utils import (
+    batched_fused_single_layer_kv_transfer,
+    batched_fused_sparse_single_layer_kv_transfer,
+    dense_mla_dsa_batched_direct_kv_transfer,
+    dense_mla_dsa_batched_direct_kv_transfer_fast,
+    dense_mla_dsa_batched_direct_kv_transfer_prepared,
+    dense_mla_dsa_group_direct_kv_transfer_fast,
+    prepare_sparse_direct_destination_state,
+    prepare_sparse_direct_layer_state,
+    sparse_mla_dsa_batched_direct_kv_transfer,
+    sparse_mla_dsa_batched_direct_kv_transfer_fast,
+    sparse_mla_dsa_batched_direct_kv_transfer_prepared,
+)
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+_COLD_PERF_SLOW_MS = 100.0
+
+
+@dataclass
+class PreparedGroupCapture:
+    """Own raw-pointer operands until the capture completion fence finishes."""
+
+    states: list[Any]
+    tensors: list[list[torch.Tensor]]
+    slots: torch.Tensor
+    pointers: torch.Tensor
+    offsets: torch.Tensor
+    sizes: torch.Tensor
+    host_metadata: tuple[torch.Tensor, ...]
+    host_rows: list[list[int]]
+    total_tokens: int
+    interleaved: bool
+    fixed_chunk_size: int
+    validation_keys: list[Any]
+    validate: bool
+    c8_group: Any = None
+    c8_chunk_capacity: int = 0
+
+
+def _log_cold_perf_slow(
+    event: str, started: float, thread_started: int, **fields: Any
+) -> None:
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if elapsed_ms >= _COLD_PERF_SLOW_MS:
+        serving_perf_log(
+            logger,
+            event,
+            elapsed_ms=round(elapsed_ms, 3),
+            thread_cpu_ms=round(
+                (time.thread_time_ns() - thread_started) / 1_000_000, 3
+            ),
+            **fields,
+        )
+
+
+def _layer_memory_tensor(memory_obj: MemoryObj, layer_id: int) -> torch.Tensor:
+    tensor = (
+        memory_obj.layer_tensor(layer_id)
+        if isinstance(memory_obj, LayerPageMemoryObj)
+        else memory_obj.tensor
+    )
+    if tensor is None:
+        raise ValueError("Layerwise source has no tensor")
+    return tensor
+
+
+def _checkpoint_page_rows(
+    memory_objs: List[List[MemoryObj]],
+    starts: List[int],
+    ends: List[int],
+    fmt: MemoryFormat,
+    layout: Any,
+) -> Optional[tuple[list[torch.Tensor], list[list[int]]]]:
+    """Map shared physical pages once; retain generic per-layer fallback."""
+    pages = memory_objs[0]
+    layers = len(memory_objs)
+    if not (
+        all(row is pages for row in memory_objs)
+        and all(isinstance(page, LayerPageMemoryObj) for page in pages)
+    ):
+        return None
+    if len(pages) != len(starts):
+        raise ValueError("Checkpoint capture page count mismatch")
+    buffers, mapped = [], []
+    for page, start, end in zip(pages, starts, ends, strict=True):
+        raw = page.raw_data
+        if (
+            raw is None
+            or raw.device.type != "cpu"
+            or raw.dtype != torch.uint8
+            or not raw.is_contiguous()
+            or page.num_layers != layers
+        ):
+            return None
+        offsets = page.group_prefix_sum
+        if (
+            not page.is_valid()
+            or page.metadata.fmt != fmt
+            or not page.layer_layout_is_valid()
+            or len(offsets) != layers + 1
+            or offsets[0] != 0
+            or offsets[-1] > raw.numel()
+            or any(a >= b for a, b in pairwise(offsets))
+        ):
+            raise ValueError("Checkpoint capture has invalid physical page extents")
+        if layout.indexer_c8 and (
+            any(dtype != torch.uint8 for dtype in page.get_dtypes())
+            or any(
+                b - a < (end - start) * layout.layer_token_bytes[layer]
+                for layer, (a, b) in enumerate(pairwise(offsets))
+            )
+        ):
+            raise ValueError("C8 checkpoint packet has insufficient byte capacity")
+        base = int(lmc_ops.get_device_ptr(raw.data_ptr(), offsets[-1]))
+        if not base:
+            # Separately registered layer spans may still satisfy the old path.
+            return None
+        buffers.append(raw)
+        mapped.append(base)
+    return buffers, [
+        [
+            base + page.group_prefix_sum[layer]
+            for page, base in zip(pages, mapped, strict=True)
+        ]
+        for layer in range(layers)
+    ]
+
+
+def _layer_memory_host_ptr(memory_obj: MemoryObj, layer_id: int) -> int:
+    """Return a layer source address without materializing a tensor view.
+
+    P-node prefill DMA only needs the raw host address.  Layer pages already
+    store one homogeneous all-layer allocation, so constructing a typed
+    ``torch.Tensor`` view for every layer/chunk is unnecessary preparation
+    work.  Keep the legacy tensor path for non-page objects.
+    """
+    if isinstance(memory_obj, LayerPageMemoryObj):
+        return int(memory_obj.layer_data_ptr(layer_id))
+    data_ptr = getattr(memory_obj, "data_ptr", None)
+    if isinstance(data_ptr, int):
+        return int(data_ptr)
+    if callable(data_ptr):
+        return int(data_ptr())
+    tensor = _layer_memory_tensor(memory_obj, layer_id)
+    return int(tensor.data_ptr())
+
+
+def _layer_source_tensors(
+    source: Union[List[MemoryObj], LayerPageSource],
+    layer_id: int,
+    expected_fmt: MemoryFormat,
+) -> list[torch.Tensor]:
+    memory_objs = _layer_source_memory_objs(source, layer_id)
+    if any(memory_obj.metadata.fmt != expected_fmt for memory_obj in memory_objs):
+        raise ValueError(f"Expected memory format {expected_fmt}.")
+    return [_layer_memory_tensor(memory_obj, layer_id) for memory_obj in memory_objs]
+
+
+def _layer_source_memory_objs(
+    source: Union[List[MemoryObj], LayerPageSource], layer_id: int
+) -> Sequence[MemoryObj]:
+    if isinstance(source, LayerPageSource):
+        if source.layer_id != layer_id:
+            raise ValueError(
+                f"Layer-page source selects {source.layer_id}, expected {layer_id}"
+            )
+        return (*source.pages, *source.suffix)
+    return source
+
+
+def _resolve_layerwise_slot_mapping(
+    layer_request: Any,
+    default_mapping: torch.Tensor,
+    default_base: int = 0,
+) -> tuple[torch.Tensor, int]:
+    if layer_request is None:
+        return default_mapping, default_base
+    if not isinstance(layer_request, dict) or "slot_mapping" not in layer_request:
+        raise TypeError(
+            "Layerwise transfer request must be a dict containing slot_mapping"
+        )
+    slot_mapping = layer_request["slot_mapping"]
+    if not isinstance(slot_mapping, torch.Tensor):
+        raise TypeError("Layerwise slot_mapping must be a torch.Tensor")
+    slot_mapping_base = int(layer_request.get("slot_mapping_base", 0))
+    if slot_mapping_base < 0:
+        raise ValueError(
+            "slot_mapping_base must be non-negative, "
+            f"got {slot_mapping_base}"
+        )
+    return slot_mapping, slot_mapping_base
+
+
+def _slice_layerwise_slot_mapping(
+    slot_mapping: torch.Tensor,
+    starts: Sequence[int],
+    ends: Sequence[int],
+    slot_mapping_base: int = 0,
+    *,
+    allow_view: bool = False,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    if len(starts) != len(ends):
+        raise ValueError(
+            "Layerwise transfer chunk starts/ends length mismatch: "
+            f"starts={len(starts)}, ends={len(ends)}"
+        )
+    chunks: list[torch.Tensor] = []
+    for start, end in zip(starts, ends, strict=True):
+        local_start = start - slot_mapping_base
+        local_end = end - slot_mapping_base
+        if (
+            local_start < 0
+            or local_end < local_start
+            or local_end > len(slot_mapping)
+        ):
+            raise ValueError(
+                "Layerwise transfer chunk is outside the provided slot-mapping "
+                "window: "
+                f"chunk=[{start}, {end}), base={slot_mapping_base}, "
+                f"mapping_tokens={len(slot_mapping)}, "
+                f"local_chunk=[{local_start}, {local_end})"
+            )
+        chunks.append(slot_mapping[local_start:local_end])
+    if not chunks:
+        return chunks, slot_mapping.new_empty((0,))
+    if len(chunks) == 1:
+        return chunks, chunks[0]
+    # The normal prefill prefix is contiguous; a view avoids a device cat and
+    # allocation. Disjoint selected ranges still require concatenation.
+    contiguous = allow_view and all(
+        left == right for left, right in zip(ends[:-1], starts[1:], strict=True)
+    )
+    full = (
+        slot_mapping[starts[0] - slot_mapping_base : ends[-1] - slot_mapping_base]
+        if contiguous else torch.cat(chunks, dim=0)
+    )
+    return chunks, full
+
+
+def _cached_layerwise_slot_mapping(
+    cache: Optional[dict],
+    slot_mapping: torch.Tensor,
+    starts: Sequence[int],
+    ends: Sequence[int],
+    slot_mapping_base: int = 0,
+) -> tuple[list[torch.Tensor], torch.Tensor, bool]:
+    """Reuse immutable bank maps within ONE transfer generator/forward.
+
+    Ranges are fixed for the generator. Retain the input owner to prevent id
+    reuse. The next forward gets a fresh cache, even if tensor addresses repeat.
+    No tensor-content scan or host/device synchronization is needed.
+    """
+    if cache is None:
+        chunks, full = _slice_layerwise_slot_mapping(
+            slot_mapping, starts, ends, slot_mapping_base
+        )
+        return chunks, full, True
+    key = (id(slot_mapping), slot_mapping_base)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached[1], cached[2], False
+    chunks, full = _slice_layerwise_slot_mapping(
+        slot_mapping, starts, ends, slot_mapping_base, allow_view=True
+    )
+    cache[key] = (slot_mapping, chunks, full)
+    return chunks, full, True
+
+
+def _prefill_dma_plans(
+    block_ids_by_bank: Sequence[Sequence[int]],
+    block_size: int,
+    starts: Sequence[int],
+    ends: Sequence[int],
+    slot_mapping_base: int,
+    chunk_sizes: Sequence[int],
+    kv_group: int,
+    kvcaches: Sequence,
+    direction: str,
+    cycle,
+    plan_cache: Optional[dict[tuple[int, int], IncrementalDmaPlan]] = None,
+) -> tuple:
+    """Plan all P-node banks once, before entering the model forward.
+
+    Cycle tables were built from the registered allocator layout at startup.
+    Only segment boundaries are indexed; no token scan or D2H sync is needed.
+    """
+    started = time.perf_counter() if prefill_start_timing_enabled() else 0.0
+    if not block_ids_by_bank:
+        raise ValueError("Layerwise prefill DMA requires bank block maps")
+    if (not kvcaches[0][0].is_contiguous()
+            or not kvcaches[0][-1].is_contiguous()):
+        raise ValueError("Layerwise prefill DMA requires contiguous NPU planes")
+    capacity = int(kvcaches[0][0].shape[0]) * int(kvcaches[0][0].shape[1])
+    plans = []
+    pending_states = {}
+    for bank in range(len(block_ids_by_bank)):
+        if plan_cache is None:
+            plan = cycle.plan_block_id_ranges(
+                block_ids_by_bank[bank], block_size, starts, ends, slot_mapping_base
+            )
+            exceeds_capacity = bool((plan.slot + plan.tokens > capacity).any())
+        else:
+            key = (kv_group, bank)
+            state = plan_block_id_ranges_incremental(
+                cycle, block_ids_by_bank[bank], block_size, starts, ends,
+                plan_cache.get(key), slot_mapping_base,
+                slot_capacity=capacity,
+            )
+            exceeds_capacity = state.max_slot_end > capacity
+            if not exceeds_capacity:
+                pending_states[key] = state
+            plan = state.plan
+        if exceeds_capacity:
+            raise ValueError("Layerwise prefill DMA slot map exceeds NPU bank")
+        plans.append(plan)
+    if plan_cache is not None:
+        # Commit both maps together so a failed second bank cannot hide the
+        # first bank's mapping change from bound-address invalidation on retry.
+        plan_cache.update(pending_states)
+    if started:
+        prefill_start_timing_log(
+            logger, "dma_plan", started, direction=direction,
+            kv_group=kv_group, tokens=sum(chunk_sizes),
+            segments_by_bank=[len(plan) for plan in plans],
+        )
+    return tuple(plans)
+
+
+def _payload_event_list(payload_event: Any) -> list[Any]:
+    if payload_event is None:
+        return []
+    if isinstance(payload_event, (list, tuple)):
+        return [event for event in payload_event if event is not None]
+    return [payload_event]
+
+
+def _mtp_dw_diag_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
+def _mtp_dw_deep_diag_enabled() -> bool:
+    return _mtp_dw_diag_enabled() and os.environ.get(
+        "VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"
+    ) == "1"
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {
+        "schema": 1,
+        "stage": stage,
+        "owner": "lmcache_ascend_retrieve",
+    }
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+_MTP_DW_DEEP_SEEN_LIMIT = 256
+_MTP_DW_CHECKSUM_LIMIT = 32
+_MTP_DW_UINT64_MASK = (1 << 64) - 1
+
+
+def _bounded_stable_int_checksum(values: Any) -> int:
+    """Match vLLM Ascend's checksum over the first 32 integers."""
+    prefix = list(values[:_MTP_DW_CHECKSUM_LIMIT])
+    checksum = 0xCBF29CE484222325
+    for value in prefix:
+        checksum ^= int(value) & _MTP_DW_UINT64_MASK
+        checksum = (checksum * 0x100000001B3) & _MTP_DW_UINT64_MASK
+    checksum ^= len(prefix)
+    return checksum
+
+
+def _bounded_tensor_fingerprint(tensor: torch.Tensor) -> int:
+    """Return a layout-preserving checksum over a bounded tensor byte prefix."""
+    raw = (
+        tensor.detach()
+        .contiguous()
+        .to(device="cpu")
+        .view(torch.uint8)
+        .reshape(-1)
+    )
+    return _bounded_stable_int_checksum(raw.tolist())
+
+
+def _sparse_content_probe(
+    *,
+    cpu_tensors: List[torch.Tensor],
+    layer_cache: Any,
+    selected_token_idx: torch.Tensor,
+    target_slots: torch.Tensor,
+    chunk_size: int,
+    token_major: bool,
+) -> dict[str, Any]:
+    """Compare sampled stacked CPU planes with their scattered NPU slots.
+
+    MLA/DSA sparse CPU chunks are stacked by plane. The probe is diagnostics
+    only and intentionally supports that production layout; token-major layouts
+    are reported as unsupported rather than interpreted heuristically.
+    """
+    if token_major:
+        return {"supported": False, "reason": "token_major"}
+    planes = (
+        tuple(layer_cache)
+        if isinstance(layer_cache, (tuple, list))
+        else (layer_cache,)
+    )
+    if not planes or not all(isinstance(plane, torch.Tensor) for plane in planes):
+        return {"supported": False, "reason": "invalid_layer_cache"}
+    if any(plane.ndim < 2 for plane in planes):
+        return {"supported": False, "reason": "unexpected_plane_rank"}
+
+    slot_capacity = int(planes[0].shape[0]) * int(planes[0].shape[1])
+    flat_planes = []
+    for plane in planes:
+        if int(plane.shape[0]) * int(plane.shape[1]) != slot_capacity:
+            return {"supported": False, "reason": "plane_slot_capacity_mismatch"}
+        flat_planes.append(plane.reshape(slot_capacity, -1))
+    plane_widths = [int(plane.shape[1]) for plane in flat_planes]
+    record_width = sum(plane_widths)
+    if record_width <= 0 or chunk_size <= 0:
+        return {"supported": False, "reason": "invalid_dimensions"}
+
+    selected = selected_token_idx.detach().reshape(-1).to(device="cpu").tolist()
+    slots = target_slots.detach().reshape(-1).to(device="cpu").tolist()
+    pairs: list[dict[str, Any]] = []
+    for source_token, target_slot in zip(selected[:2], slots[:2], strict=False):
+        source_token = int(source_token)
+        target_slot = int(target_slot)
+        chunk_index, local_token = divmod(source_token, chunk_size)
+        if chunk_index < 0 or chunk_index >= len(cpu_tensors):
+            return {"supported": False, "reason": "source_chunk_oob"}
+        cpu_chunk = cpu_tensors[chunk_index].detach().reshape(-1)
+        if int(cpu_chunk.numel()) % record_width:
+            return {"supported": False, "reason": "cpu_chunk_layout_mismatch"}
+        chunk_tokens = int(cpu_chunk.numel()) // record_width
+        if (
+            local_token >= chunk_tokens
+            or target_slot < 0
+            or target_slot >= slot_capacity
+        ):
+            return {"supported": False, "reason": "sample_index_oob"}
+        plane_offset = 0
+        plane_checksums = []
+        for plane_index, width in enumerate(plane_widths):
+            source_start = plane_offset + local_token * width
+            source = cpu_chunk[source_start : source_start + width]
+            target = flat_planes[plane_index][target_slot]
+            source_checksum = _bounded_tensor_fingerprint(source)
+            target_checksum = _bounded_tensor_fingerprint(target)
+            plane_checksums.append(
+                {
+                    "plane": plane_index,
+                    "source_checksum": source_checksum,
+                    "target_checksum": target_checksum,
+                    "match": source_checksum == target_checksum,
+                }
+            )
+            plane_offset += chunk_tokens * width
+        pairs.append(
+            {
+                "source_token": source_token,
+                "target_slot": target_slot,
+                "planes": plane_checksums,
+            }
+        )
+    return {
+        "supported": True,
+        "pairs": pairs,
+        "all_match": all(
+            plane["match"] for pair in pairs for plane in pair["planes"]
+        ),
+    }
+
+
+def _remember_bounded_key(seen: dict[Any, None], key: Any) -> None:
+    """Remember a diagnostic key without retaining unbounded request state."""
+    seen[key] = None
+    while len(seen) > _MTP_DW_DEEP_SEEN_LIMIT:
+        del seen[next(iter(seen))]
+
+
+def _should_capture_deep_payload(
+    *,
+    enabled: bool,
+    explicit_payload: bool,
+    committed_end: int,
+    req_id: Any,
+    kv_group: int,
+    seen: dict[Any, None],
+) -> bool:
+    """Select the first successful committed payload for a request and group."""
+    if (
+        not enabled
+        or not explicit_payload
+        or committed_end <= 0
+        or req_id is None
+    ):
+        return False
+    return (str(req_id), int(kv_group), int(committed_end)) not in seen
+
+
+def _conflicting_duplicate_target_slots(
+    selected_values: list[int],
+    slot_values: list[int],
+    limit: int = 8,
+) -> list[dict[str, int]]:
+    """Report bounded cases where one target slot has different sources."""
+    seen: dict[int, int] = {}
+    conflicts: list[dict[str, int]] = []
+    for selected, slot in zip(selected_values, slot_values, strict=False):
+        selected = int(selected)
+        slot = int(slot)
+        previous = seen.setdefault(slot, selected)
+        if previous != selected:
+            conflicts.append(
+                {"slot": slot, "first_selected": previous, "selected": selected}
+            )
+            if len(conflicts) >= limit:
+                break
+    return conflicts
+
+
+_SPARSE_DIRECT_RECORD_STREAM = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_RECORD_STREAM", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_DIRECT_DISABLE = os.getenv(
+    "LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_DISABLE = os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_LOAD_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_LOAD_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_STORE_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
+_DENSE_DIRECT_GROUP_STORE_DISABLE = os.getenv(
+    "LMCACHE_ASCEND_DENSE_DIRECT_GROUP_STORE_DISABLE", "0"
+).lower() in ("1", "true", "yes", "on")
+_SPARSE_TRANSFER_TOPK = max(
+    0, int(os.getenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "0"))
+)
+
+_SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
+_SPARSE_H2D_STALL_TIMEOUT_ENV = "LMCACHE_COLD_PERF_SPARSE_H2D_STALL_SECONDS"
+
+
+def _sparse_h2d_stall_timeout() -> float:
+    try:
+        return max(1.0, float(os.getenv(_SPARSE_H2D_STALL_TIMEOUT_ENV, "30")))
+    except ValueError:
+        return 30.0
+
+
+def _wait_payload_events(stream: Any, payload_event: Any) -> None:
+    if isinstance(payload_event, (list, tuple)):
+        for event in payload_event:
+            if event is not None:
+                stream.wait_event(event)
+    elif payload_event is not None:
+        stream.wait_event(payload_event)
+
 
 _IS_310P = None
 
@@ -254,7 +868,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                 )
                 del self.buffer_mapping[layer_id - 2]
 
-                logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
+                logger.debug(
+                    "Finished loading layer %d into paged memory",
+                    layer_id - 2,
+                )
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
@@ -281,7 +898,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
-                logger.debug(f"Finished loading layer {layer_id - 1} into buffer")
+                logger.debug(
+                    "Finished loading layer %d into buffer",
+                    layer_id - 1,
+                )
 
             if layer_id < self.num_layers:
                 memory_objs_layer = yield
@@ -334,12 +954,10 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         This function is a generator that moves the KV cache from the paged GPU
         memory to the memory objects. The first iteration will prepare some
         related metadata and initiate the transfer in the first layer. In each
-        of the following iterations, it will first wait until the storing of
-        previous layer finishes, and then initiate string the KV cache of the
-        current layer one. The storing process of the KV cache is paged GPU
-        memory -> GPU buffer -> memory objects. The last iteration simply waits
-        for the last layer to finish.
-        In total, this the generator will yield num_layers + 1 times.
+        of the following iterations, it waits for the previous layer and starts
+        the current layer transfer. The storing process is paged GPU memory ->
+        GPU buffer -> memory objects. The final iteration waits for the last
+        layer.
 
         :param memory_objs: The memory objects to store the KV cache. The first
             dimension is the number of layers, and the second dimension is the
@@ -413,7 +1031,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
             yield
             self.store_stream.synchronize()
-            logger.debug(f"Finished offloading layer {layer_id}")
+            logger.debug("Finished offloading layer %d", layer_id)
 
         # free the buffer memory
         tmp_gpu_buffer_obj.ref_count_down()
@@ -441,6 +1059,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.kv_lora_rank: int = 0
         self.qk_rope_head_dim: int = 0
         self.dsa_head_dim: int = 0
+        self.dsa_two_groups: bool = kwargs.get("dsa_two_groups", False)
 
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
@@ -493,7 +1112,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
-        self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
+        self.kv_format = KVCacheFormat.detect(
+            kv_caches,
+            use_mla=self.use_mla,
+            dsa_two_groups=getattr(self, "dsa_two_groups", False),
+        )
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError(
@@ -692,9 +1315,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         """
         assert memory_obj.tensor is not None
 
-        with torch.npu.stream(self.store_stream):
-            self.initialize_kvcaches_ptr(**kwargs)
-
+        self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
@@ -704,32 +1325,29 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        with torch.npu.stream(self.store_stream):
-            kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
         assert self.gpu_buffer.device == self.kvcaches_device
 
-        with torch.npu.stream(self.store_stream):
-            tmp_gpu_buffer = torch.empty(
-                memory_obj.tensor.size(), dtype=self.dtype, device=self.device
-            )
+        tmp_gpu_buffer = torch.empty(
+            memory_obj.tensor.size(), dtype=self.dtype, device=self.device
+        )
 
-            lmc_ops.multi_layer_kv_transfer_310p(
-                tmp_gpu_buffer,
-                kv_cache_pointers,
-                slot_mapping[start:end],
-                self.kvcaches_device,
-                self.page_buffer_size,
-                True,
-                self.use_mla,
-                self.num_kv_head,
-                self.head_size,
-                self.block_size,
-                self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-            )
+        lmc_ops.multi_layer_kv_transfer_310p(
+            tmp_gpu_buffer,
+            kv_cache_pointers,
+            slot_mapping[start:end],
+            self.kvcaches_device,
+            self.page_buffer_size,
+            True,
+            self.use_mla,
+            self.num_kv_head,
+            self.head_size,
+            self.block_size,
+            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+        )
 
-            memory_obj.tensor.copy_(tmp_gpu_buffer)
-
+        memory_obj.tensor.copy_(tmp_gpu_buffer)
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
@@ -818,6 +1436,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
+        with torch.npu.stream(self.store_stream):
+            self._initialize_pointers(self.kvcaches)
+
         if "slot_mapping_npu" in kwargs:
             slot_mapping: torch.Tensor = kwargs["slot_mapping_npu"]
         elif "slot_mapping" in kwargs:
@@ -838,7 +1459,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
 
         with torch.npu.stream(self.store_stream):
-            kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+            kv_cache_pointers = self.kv_cache_pointers_on_gpu[
+                self.kvcaches_device.index
+            ]
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
@@ -1025,7 +1648,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
                     proxies = [item[0] for item in batch]
 
-                    # Submit RDMA read for current batch → transport_stream.
+                    # Submit RDMA read for current batch -> transport_stream.
                     cur_read_event = ProxyMemoryObj.submit_resolve_batch(proxies)
 
                     # While the current batch is being read on
@@ -1091,21 +1714,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         else:
             self.store_stream.wait_stream(current_stream)
 
-        start_event = torch.npu.Event(enable_timing=True)
-        end_event = torch.npu.Event(enable_timing=True)
-        start_event.record(self.store_stream)
-
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             if is_310p():
                 self.from_gpu_310p(memory_obj, start, end, **kwargs)
             else:
                 self.from_gpu(memory_obj, start, end, **kwargs)
-
-        end_event.record(self.store_stream)
         self.store_stream.synchronize()
-        from_gpu_time = start_event.elapsed_time(end_event)
-
-        return from_gpu_time / 1000.0  # convert to seconds
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         if self.kv_format == KVCacheFormat.MLA_KV:
@@ -1123,7 +1737,236 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
 
 
+class _GroupLayout:
+    """Per-kv_group KV layout state for the layerwise NPU connector.
+
+    In two-group MLA+DSA mode (``dsa_two_groups``) a single connector
+    instance serves both ``kv_group=0`` (latent / MLA_LATENT) and
+    ``kv_group=1`` (indexer / DSA_INDEX). The two groups have different
+    formats, hidden dims and staging-buffer sizes, so each group keeps its
+    own layout entry instead of sharing one set of fields on the connector.
+    """
+
+    __slots__ = (
+        "kv_format",
+        "k_hidden_dims",
+        "v_hidden_dims",
+        "dsa_hidden_dims",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "dsa_head_dim",
+        "vllm_two_major",
+        "kv_device",
+        "gpu_buffer_allocator",
+        "staging_bytes_per_slot",
+        "num_layers",
+        "layer_indices",
+        "layout_signature",
+        "storage_dtype",
+        "indexer_c8",
+        "layer_slot_factors",
+        "layer_token_bytes",
+        "block_map_cpu",
+        "block_map_device",
+    )
+
+    def __init__(self) -> None:
+        self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
+        self.k_hidden_dims: int = 0
+        self.v_hidden_dims: int = 0
+        self.dsa_hidden_dims: int = 0
+        self.kv_lora_rank: int = 0
+        self.qk_rope_head_dim: int = 0
+        self.dsa_head_dim: int = 0
+        self.vllm_two_major: bool = False
+        self.kv_device: Optional[torch.device] = None
+        self.gpu_buffer_allocator: Optional[GPUMemoryAllocator] = None
+        self.staging_bytes_per_slot: int = 0
+        self.num_layers: int = 0
+        self.layer_indices: tuple[int, ...] = ()
+        self.layout_signature: Optional[str] = None
+        self.storage_dtype: Optional[torch.dtype] = None
+        self.indexer_c8: bool = False
+        self.layer_slot_factors: tuple[int, ...] = ()
+        self.layer_token_bytes: tuple[int, ...] = ()
+        self.block_map_cpu = None
+        self.block_map_device = None
+
+
+@dataclass(frozen=True, eq=False)
+class _SparseDestinationLayout:
+    """Worker-lifetime storage contract; KV contents may still change."""
+
+    kvcaches_ref: list
+    signature: tuple
+    tensor_refs: tuple
+
+
+class _SparseDestinationPlan:
+    """Process-owned direct-retrieve states for one paged-KV group."""
+
+    __slots__ = ("kvcaches_ref", "signature", "states", "binding", "c8_group")
+
+    def __init__(
+        self,
+        kvcaches_ref: list,
+        signature: tuple,
+        states: tuple[Any, ...],
+        binding: Optional[_SparseDestinationLayout] = None,
+    ) -> None:
+        self.kvcaches_ref = kvcaches_ref
+        self.signature = signature
+        self.states = states
+        self.binding = binding
+        self.c8_group = None
+
+
+class _SparseH2DStallWatchdog:
+    """Report a sparse host submission that exceeds its deadline."""
+
+    def __init__(self, timeout: float) -> None:
+        self._timeout = timeout
+        self._condition = Condition()
+        self._host_state: Optional[dict[str, Any]] = None
+        self._reported = False
+        Thread(
+            target=self._run,
+            name="lmcache-sparse-h2d-watchdog",
+            daemon=True,
+        ).start()
+
+    def begin_host(self, **fields: Any) -> Optional[dict[str, Any]]:
+        started = time.perf_counter()
+        state = {
+            "_started": started,
+            "_deadline": started + self._timeout,
+            "_thread_id": get_ident(),
+            "pending_stage": "entry",
+            "timeout_seconds": self._timeout,
+            **fields,
+        }
+        with self._condition:
+            if self._reported:
+                return None
+            self._host_state = state
+            self._condition.notify()
+        return state
+
+    def update_host(self, state: Optional[dict[str, Any]], stage: str) -> None:
+        if state is not None and self._host_state is state:
+            state["pending_stage"] = stage
+
+    def end_host(self, state: Optional[dict[str, Any]]) -> None:
+        if state is None:
+            return
+        with self._condition:
+            if self._host_state is state:
+                self._host_state = None
+                self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._host_state is None or self._reported:
+                    self._condition.wait()
+                state = self._host_state
+                remaining = state["_deadline"] - time.perf_counter()
+                if remaining > 0:
+                    self._condition.wait(remaining)
+                    continue
+                frame = sys._current_frames().get(state["_thread_id"])
+                fields = {key: value for key, value in state.items() if key[0] != "_"}
+                fields["python_thread_id"] = state["_thread_id"]
+                self._host_state = None
+                self._reported = True
+                started = state["_started"]
+            stack = traceback.extract_stack(frame)[-16:] if frame is not None else ()
+            serving_perf_log(
+                logger,
+                "sparse_h2d_python_stall",
+                started=started,
+                python_stack=[
+                    {
+                        "file": item.filename,
+                        "line": item.lineno,
+                        "function": item.name,
+                        "code": item.line,
+                    }
+                    for item in stack
+                ],
+                **fields,
+            )
+
+
+class _SparseLoadJoin:
+    """One layer/group fan-out from a compute stream to load streams."""
+
+    __slots__ = (
+        "compute_stream",
+        "host_state",
+        "used_stream_indices",
+        "watchdog",
+    )
+
+    def __init__(
+        self,
+        compute_stream: Any,
+        watchdog: Optional[_SparseH2DStallWatchdog] = None,
+    ) -> None:
+        self.compute_stream = compute_stream
+        self.host_state: Optional[dict[str, Any]] = None
+        self.used_stream_indices: set[int] = set()
+        self.watchdog = watchdog
+
+
+def _trace_sparse_h2d_python(func):
+    """Arm one cold-perf-only Python stack watchdog around sparse submission."""
+
+    @wraps(func)
+    def wrapped(self, *args, **kwargs):
+        join = getattr(self, "_active_sparse_load_join", None)
+        watchdog = getattr(join, "watchdog", None)
+        if watchdog is None:
+            return func(self, *args, **kwargs)
+        try:
+            state = watchdog.begin_host(
+                req_id=kwargs.get("req_id"),
+                kv_group=kwargs.get("kv_group"),
+                layer=kwargs.get("layer_id"),
+                load_stream_index=kwargs.get("load_stream_idx"),
+            )
+        except Exception:
+            return func(self, *args, **kwargs)
+        join.host_state = state
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            try:
+                watchdog.end_host(state)
+            except Exception:
+                pass
+            join.host_state = None
+
+    return wrapped
+
+
+def _sparse_h2d_python_stage(join: Optional[_SparseLoadJoin], stage: str) -> None:
+    if join is None or join.host_state is None:
+        return
+    try:
+        join.watchdog.update_host(join.host_state, stage)
+    except Exception:
+        pass
+
+
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
+    supports_layer_page_source = True
+
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        """Whether the connector can honor the two-bank transfer protocol."""
+        return not (_DENSE_DIRECT_LOAD_DISABLE or _DENSE_DIRECT_STORE_DISABLE)
+
     def __init__(
         self,
         hidden_dim_size: int,
@@ -1131,53 +1974,5364 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         use_gpu: bool = False,
         **kwargs,
     ):
+        self.indexer_c8_layout = kwargs.pop("indexer_c8_layout", None)
+        self.indexer_hbm_block_map = kwargs.pop("indexer_hbm_block_map", None)
+        mapping = self.indexer_hbm_block_map
+        if mapping is not None and (
+            self.indexer_c8_layout is None
+            or not self.indexer_c8_layout.mixed
+            or not isinstance(mapping, tuple)
+            or not mapping
+            or len(mapping) % 18
+            or any(type(b) is not int for b in mapping)
+            or mapping[0] != 0
+            or set(mapping) != set(range(len(mapping)))
+        ):
+            raise ValueError(
+                "Paired-bank HBM layout requires a complete mixed-C8 block permutation"
+            )
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
+        self._prefill_worker_id = int(kwargs.get("worker_id", -1))
+        # This connector is shared by P and D.  Only the explicitly enabled
+        # P process may use mutable pointer tables or bank-transfer metadata.
+        self._layerwise_prefill_dma = (
+            os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip().lower() == "true"
+        )
+        self.fence_debug = KVFenceDebug.from_environment(
+            "P" if self._layerwise_prefill_dma else "D", self._prefill_worker_id,
+        )
+        configured_bank_count = 2
+        if self._layerwise_prefill_dma:
+            from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
+            configured_bank_count = layerwise_prefill_bank_count()
+        self.load_stream_num = 4
+        self.load_stream_list = [
+            torch.cuda.Stream() for __ in range(self.load_stream_num)
+        ]
+        self.load_stream_idx = 0
+        self._sparse_load_done_events = [
+            torch.npu.Event() for _ in range(self.load_stream_num)
+        ]
+        self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
+        self._sparse_h2d_stall_watchdog: Optional[_SparseH2DStallWatchdog] = None
+        if _SPARSE_TRANSFER_TOPK:
+            logger.warning(
+                "Limiting each sparse LMCache transfer to the first %d "
+                "explicitly selected tokens for debugging; implicit dense "
+                "bootstrap ignores this limit and vLLM's sparse-attention "
+                "width is unchanged",
+                _SPARSE_TRANSFER_TOPK,
+            )
+
+        self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
+        self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
+        self.runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
+        self.enable_npu_transfer_validation = bool(
+            kwargs.get("enable_npu_transfer_validation", True)
+        )
+        self.max_staging_tokens = int(kwargs.get("max_staging_tokens", 0) or 0)
+        # Concurrent layerwise staging buffers per kv_group (retrieve batch +
+        # overlapping store). Default 2 covers retrieve+store for one request.
+        self._layerwise_staging_concurrency = 2 if self.dsa_two_groups else 1
+
+        # Per-kv_group layout state. Detection and the GPU staging buffer
+        # are initialized lazily per group by _lazy_initialize_buffer, so
+        # both kv_group=0 (MLA_LATENT) and kv_group=1 (DSA_INDEX) get their
+        # own format/dims instead of the first group pinning a single
+        # self.kv_format. _current_kv_group selects the group being served;
+        # the mirrored instance attributes below are kept in sync for
+        # backward-compatible readers (benchmarks, logs, external callers).
+        self._group_layouts: dict[int, _GroupLayout] = {}
+        self._current_kv_group: int = 0
+
+        # Mirrored attributes for the current group (updated by
+        # _lazy_initialize_buffer). The layerwise hot paths snapshot values
+        # from the returned _GroupLayout into locals to remain safe even if
+        # per-group generators interleave.
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
+        self.kv_lora_rank: int = 0
+        self.qk_rope_head_dim: int = 0
+        self.dsa_head_dim: int = 0
+        self.k_hidden_dims: int = 0
+        self.v_hidden_dims: int = 0
+        self.dsa_hidden_dims: int = 0
+        self.vllm_two_major: bool = False
+        self.kv_device: Optional[torch.device] = None
 
-        # layerwise mode currently does not support MLA
-        self.use_mla = kwargs.get("use_mla", False)
+        self._layerwise_sparse_idx_cache: Optional[torch.Tensor] = None
+        # Legacy direct/dense state remains source-layout specialized. Prepared
+        # direct retrieve paths use destination-only plans below.
+        self._sparse_direct_layer_states: Optional[dict] = None
+        self._sparse_direct_validated_layers: set = set()
+        # One process-owned destination plan per latent/indexer KV group.
+        self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
+        self._sealed_sparse_destination_layout: Optional[
+            _SparseDestinationLayout
+        ] = None
+        self._direct_page_layout_cache: dict[
+            int, tuple[tuple, list[tuple[int, int]]]
+        ] = {}
 
-    def _lazy_initialize_buffer(self, kv_caches):
+        # Dense layerwise-prefill transfers reuse a small number of physical
+        # KV banks.  Save completion must therefore be visible to both the
+        # load stream (before it overwrites a bank) and the compute stream
+        # (when there is no load for the layer that is about to use it).
+        # Keep the state per KV group: latent and indexer own independent
+        # physical banks even though they share the connector streams.
+        self._layerwise_prefill_bank_counts: dict[int, int] = (
+            dict.fromkeys((0, 1), configured_bank_count)
+            if self._layerwise_prefill_dma else {}
+        )
+        self._layerwise_prefill_transfer_generations: dict[int, int] = {}
+        # Raw layerwise-prefill DMA uses one FIFO stream per physical bank and
+        # KV group.  Save/load operations for a bank must share this stream:
+        # save(N) -> load(N + bank_count) -> save(N + bank_count) -> ... .
+        # This is the ordering that protects bank reuse without making the
+        # compute stream wait for unrelated layers.
+        self._layerwise_prefill_dma_streams: dict[tuple[int, int], Any] = {}
+        # Latest final-access event per physical bank. Its device wait is
+        # queued at the attention callback, before any following save/load.
+        self._layerwise_prefill_bank_use_events: dict[
+            tuple[int, int], tuple[int, int, Any]
+        ] = {}
+        # Keep one D2H completion fence per group/bank/layer for publication
+        # and teardown.  The bank FIFO streams above, not these bookkeeping
+        # events, enforce save/load ordering on the hot compute path.
+        self._layerwise_prefill_save_done_events: dict[
+            tuple[int, int, int], tuple[int, Any]
+        ] = {}
+        self._layerwise_prefill_load_done_events: dict[
+            tuple[int, int], dict[Optional[str], tuple[int, Any]]
+        ] = {}
+        self._prefill_dma_bound_loads: dict[
+            str, dict[tuple[int, int, int], BoundCopyPrefix]
+        ] = {}
+        self._prefill_dma_plan_cache: dict[
+            str, dict[tuple[int, int], IncrementalDmaPlan]
+        ] = {}
+        self._prefill_dma_source_cache: dict[
+            str, dict[tuple[int, int], SourceAddressCache]
+        ] = {}
+        # Async P-node stores can publish the CPU object before the D2H event
+        # completes.  Keep the latest event per request/group so request
+        # teardown fences the source KV cache exactly once.
+        self._layerwise_prefill_async_store_events: dict[
+            str, dict[int, Any]
+        ] = {}
+        # Deferred H2D reads keep their MemoryObjs alive until request
+        # teardown.  A Python list in the generator is insufficient because
+        # the allocator may recycle the page as soon as the layer callback
+        # returns; the extra reference is released only after the bank streams
+        # are fenced by release_layerwise_prefill_dma_cache.
+        self._layerwise_prefill_load_owners: dict[
+            str, dict[int, MemoryObj]
+        ] = {}
+        self._layerwise_prefill_load_request_events: dict[str, list[Any]] = {}
+
+    def _retain_unfenced_layerwise_prefill_load(
+        self, req_id: str, kv_group: int, bank: Optional[int], stream: Any,
+    ) -> None:
+        """Remember a submission whose completion event could not be installed.
+
+        This error-only registry retains the exact stream even if later reset
+        code replaces its bank mapping. Successful transfers need no latch.
         """
-        Lazily initialize the GPU buffer allocator if it is not initialized yet.
-        Currently, we use the `kv_caches` (kv cache pointer) to determine
-        the gpu buffer size in gpu connector.
-        Also, the first request might be a bit slower due to buffer creation.
+        failed = getattr(self, "_layerwise_prefill_unfenced_loads", None)
+        if failed is None:
+            failed = self._layerwise_prefill_unfenced_loads = {}
+        failed.setdefault(str(req_id), {})[(kv_group, bank, id(stream))] = stream
 
-        Supports both legacy formats and new SEPARATE_KV format:
-        - Legacy MERGED_KV: [2, num_blocks, block_size, num_heads, head_size]
-        - New SEPARATE_KV: tuple(key_tensor, value_tensor) where each is
-          [num_blocks, block_size, num_heads, head_size]
+    def wait_for_layerwise_prefill_stores(
+        self, req_ids: Optional[Iterable[str]] = None
+    ) -> None:
+        """Fence request D2H reads before publication or NPU block reuse.
+
+        Reallocated physical blocks can move to another bank stream, so the
+        old bank's FIFO alone cannot protect their outstanding reads. Waiting
+        here retains CPU pages and DMA bindings for a preempted request.
         """
-        if self.use_gpu and self.gpu_buffer_allocator is None:
-            logger.info("Lazily initializing GPU buffer.")
+        pending_store_events_by_request = getattr(
+            self, "_layerwise_prefill_async_store_events", {}
+        )
+        selected = tuple(
+            pending_store_events_by_request if req_ids is None else req_ids
+        )
+        for req_id in selected:
+            pending_events = pending_store_events_by_request.get(req_id)
+            if pending_events is None:
+                continue
+            for completion in pending_events.values():
+                if isinstance(completion, (tuple, list)):
+                    for event in completion:
+                        event.synchronize()
+                else:
+                    completion.synchronize()
+            # A failed fence must leave every event registered for retry and
+            # prevent the caller from proceeding with request cleanup/reuse.
+            pending_store_events_by_request.pop(req_id, None)
 
-            self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
+    def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
+        """Discard one finished request's historical H2D address bindings."""
+        unfenced = getattr(self, "_layerwise_prefill_unfenced_loads", None)
+        failed_streams = unfenced.get(req_id) if unfenced else None
+        if failed_streams:
+            # A native call or Event.record may fail after enqueuing reads.
+            # Earlier events cannot fence those reads. Keep both this latch
+            # and every request owner if any fallback fence is unsuccessful.
+            for stream in failed_streams.values():
+                stream.synchronize()
+            unfenced.pop(req_id, None)
+        self.wait_for_layerwise_prefill_stores((req_id,))
+        load_events_by_request = getattr(
+            self, "_layerwise_prefill_load_request_events", {}
+        )
+        # Keep the event list registered until every fence succeeds.  If an
+        # event reports an unknown completion, the request-owned MemoryObjs
+        # must remain leased so a retry/abort path cannot recycle them while
+        # a bank DMA may still be reading.
+        load_events = load_events_by_request.get(req_id)
+        if load_events:
+            for event in load_events:
+                event.synchronize()
+            load_events_by_request.pop(req_id, None)
+        load_owners = getattr(self, "_layerwise_prefill_load_owners", {}).get(req_id)
+        if load_owners:
+            self._layerwise_prefill_load_owners.pop(req_id, None)
+            for owner in load_owners.values():
+                if owner.is_valid():
+                    owner.ref_count_down()
+        self._prefill_dma_bound_loads.pop(req_id, None)
+        getattr(self, "_prefill_dma_plan_cache", {}).pop(req_id, None)
+        getattr(self, "_prefill_dma_source_cache", {}).pop(req_id, None)
 
-            if self.kv_format == KVCacheFormat.UNDEFINED:
+    def supports_dense_sparse_cache_retention(self) -> bool:
+        return not _DENSE_DIRECT_LOAD_DISABLE
+
+    def synchronize_dense_load_stream(self, stream: Optional[Any] = None) -> None:
+        """Synchronize dense load work before unsafe host-side cleanup."""
+        (self.load_stream if stream is None else stream).synchronize()
+
+    def record_dense_load_readiness(self, stream: Optional[Any] = None) -> Any:
+        """Record and return an opaque completion fence for dense load work."""
+        event = torch.npu.Event()
+        event.record(self.load_stream if stream is None else stream)
+        return event
+
+    def synchronize_dense_load_readiness(self, readiness: Any) -> None:
+        """Synchronize one exact dense-load completion fence."""
+        readiness.synchronize()
+
+    def query_dense_load_readiness(self, readiness: Any) -> bool:
+        """Return whether an exact dense-load fence completed without waiting."""
+        return bool(readiness.query())
+
+    def consume_dense_load_readiness(self, readiness: Any) -> None:
+        """Order the current consumer stream after an opaque dense-load fence."""
+        torch.npu.current_stream().wait_event(readiness)
+
+    def stage_dense_load_tensor(
+        self, tensor: torch.Tensor, *, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Copy small CPU metadata on the existing dense-load stream."""
+        if self.kv_device is None:
+            raise RuntimeError("KV device is unavailable for dense-load staging")
+        if tensor.device.type != "cpu":
+            raise ValueError("Dense-load metadata source must be a CPU tensor")
+        source = tensor.to(dtype=dtype)
+        if self.kv_device.type == "cpu":
+            return source
+        if not source.is_pinned():
+            source = source.pin_memory()
+        with self._stream_context_or_null(self.load_stream):
+            staged = source.to(
+                device=self.kv_device, dtype=dtype, non_blocking=True
+            )
+        return staged
+
+    def _get_sparse_h2d_stall_watchdog(
+        self,
+    ) -> Optional[_SparseH2DStallWatchdog]:
+        if not serving_perf_enabled():
+            return None
+        watchdog = getattr(self, "_sparse_h2d_stall_watchdog", None)
+        if watchdog is None:
+            try:
+                watchdog = _SparseH2DStallWatchdog(_sparse_h2d_stall_timeout())
+            except Exception:
+                return None
+            self._sparse_h2d_stall_watchdog = watchdog
+        return watchdog
+
+    def layerwise_prefill_store_fences(self, kv_group: int) -> tuple[Any, ...]:
+        """Borrow the current generation's bank-tail D2H events.
+
+        Call only after draining ``batched_from_gpu`` for the entire KV group.
+        Each returned event is recorded after the last save DMA submitted on
+        one physical bank stream.  Because operations on each bank stream are
+        ordered, the tail events fence every earlier save DMA for this
+        chunk while avoiding a host-side synchronization.  Empty means
+        unavailable.
+        """
+        generations = getattr(self, "_layerwise_prefill_transfer_generations", {})
+        generation = generations.get(kv_group)
+        if generation is None:
+            return ()
+        # Layer ordinals are not a submission clock. A later request/chunk
+        # can start overwriting a bank while an older higher-layer entry is
+        # still retained. Selecting max(layer) from the per-layer registry
+        # can therefore return an already-completed event from an older save.
+        # This registry is updated after every actual D2H submission, in FIFO
+        # order, and its immutable events fence all preceding bank writes.
+        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
+        events = tuple(
+            record[1]
+            for (group, _bank), record in sorted(tails.items())
+            if group == kv_group and record[0] == generation
+        )
+        audit = getattr(self, "prefill_audit", None)
+        if audit is not None:
+            audit.publish(kv_group, generation, tuple(map(id, events)))
+        return events
+
+    def _layerwise_prefill_transfer_state(
+        self,
+    ) -> tuple[
+        dict[int, int],
+        dict[int, int],
+        dict[tuple[int, int, int], tuple[int, Any]],
+        dict[tuple[int, int], dict[Optional[str], tuple[int, Any]]],
+    ]:
+        """Return lazily initialized state used by P-node bank hand-offs.
+
+        ``save_done`` is keyed by ``(kv_group, bank, layer_id)`` for
+        publication and teardown. Loads are keyed by ``(kv_group, layer_id)``
+        and then request ID. All requests select the same bank for a layer,
+        but each retains its own completion event. Per-bank FIFO streams
+        carry save/load ordering; consumers join every request's load.
+        """
+        bank_counts = getattr(self, "_layerwise_prefill_bank_counts", None)
+        if bank_counts is None:
+            bank_counts = {}
+            self._layerwise_prefill_bank_counts = bank_counts
+        generations = getattr(
+            self,
+            "_layerwise_prefill_transfer_generations",
+            None,
+        )
+        if generations is None:
+            generations = {}
+            self._layerwise_prefill_transfer_generations = generations
+        save_done = getattr(self, "_layerwise_prefill_save_done_events", None)
+        if save_done is None:
+            save_done = {}
+            self._layerwise_prefill_save_done_events = save_done
+        load_done = getattr(self, "_layerwise_prefill_load_done_events", None)
+        if load_done is None:
+            load_done = {}
+            self._layerwise_prefill_load_done_events = load_done
+        return bank_counts, generations, save_done, load_done
+
+    def _layerwise_prefill_transfer_generation(self, kv_group: int) -> int:
+        _, generations, _, _ = self._layerwise_prefill_transfer_state()
+        return generations.setdefault(int(kv_group), 0)
+
+    def _check_layerwise_prefill_transfer_generation(
+        self,
+        kv_group: int,
+        generation: int,
+    ) -> None:
+        current = self._layerwise_prefill_transfer_generation(kv_group)
+        if generation != current:
+            raise RuntimeError(
+                "Layerwise-prefill transfer belongs to a reset step: "
+                f"kv_group={kv_group}, transfer_generation={generation}, "
+                f"current_generation={current}"
+            )
+
+    def reset_layerwise_prefill_transfer_state(
+        self,
+        kv_group: Optional[int] = None,
+        *,
+        synchronize: bool = True,
+    ) -> None:
+        """Invalidate layerwise-prefill events at a request/step boundary.
+
+        Abort and cancellation callers should keep ``synchronize=True`` so
+        already submitted H2D/D2H work is complete before its banks or host
+        buffers are reused.  A normal step boundary may pass ``False`` only
+        after the regular load/store drains have completed.
+        """
+        if synchronize:
+            self.load_stream.synchronize()
+            self.store_stream.synchronize()
+            self._synchronize_layerwise_prefill_dma_streams(kv_group)
+        # An aborted/restarted transfer can reuse the request ID with new
+        # pages or block mappings. Never carry bound addresses across reset.
+        getattr(self, "_prefill_dma_bound_loads", {}).clear()
+        getattr(self, "_prefill_dma_plan_cache", {}).clear()
+        getattr(self, "_prefill_dma_source_cache", {}).clear()
+
+        bank_counts, generations, save_done, load_done = (
+            self._layerwise_prefill_transfer_state()
+        )
+        if kv_group is None:
+            groups = set(bank_counts) | set(generations)
+            groups.update(group for group, *_ in save_done)
+            groups.update(key[0] for key in load_done)
+        else:
+            groups = {int(kv_group)}
+
+        for group in groups:
+            generations[group] = generations.get(group, 0) + 1
+        save_done_keys = [key for key in save_done if key[0] in groups]
+        load_done_keys = [key for key in load_done if key[0] in groups]
+        for key in save_done_keys:
+            del save_done[key]
+        for key in load_done_keys:
+            del load_done[key]
+        bank_uses = getattr(self, "_layerwise_prefill_bank_use_events", {})
+        for key in tuple(bank_uses):
+            if key[0] in groups:
+                del bank_uses[key]
+
+    def _set_layerwise_prefill_bank_count(
+        self,
+        kv_group: int,
+        bank_count: int,
+    ) -> None:
+        if bank_count <= 0:
+            raise ValueError("layerwise_prefill_bank_count must be positive")
+        bank_counts, _, save_done, load_done = (
+            self._layerwise_prefill_transfer_state()
+        )
+        previous = bank_counts.get(kv_group)
+        if previous is not None and previous != bank_count:
+            if any(group == kv_group for group, *_ in save_done) or any(
+                key[0] == kv_group for key in load_done
+            ):
+                raise RuntimeError(
+                    "Cannot change layerwise-prefill bank count while transfer "
+                    f"events are live: kv_group={kv_group}, previous={previous}, "
+                    f"requested={bank_count}"
+                )
+        bank_counts[kv_group] = bank_count
+
+    def _layerwise_prefill_bank(
+        self,
+        layer_id: int,
+        kv_group: int,
+    ) -> int:
+        bank_counts, _, _, _ = self._layerwise_prefill_transfer_state()
+        bank_count = bank_counts.get(kv_group, 2)
+        return int(layer_id) % bank_count
+
+    def _layerwise_prefill_dma_stream(
+        self,
+        kv_group: int,
+        bank: int,
+    ) -> Any:
+        """Return the FIFO stream for one layerwise-prefill physical bank."""
+        key = (int(kv_group), int(bank))
+        streams = getattr(self, "_layerwise_prefill_dma_streams", None)
+        if streams is None:
+            streams = {}
+            self._layerwise_prefill_dma_streams = streams
+        stream = streams.get(key)
+        if stream is not None:
+            return stream
+
+        # The production NPU runtime exposes torch.npu.Stream.  Keep the
+        # load stream fallback for lightweight CPU/unit-test doubles that do
+        # not expose a Stream factory; it is never selected on an NPU worker.
+        npu = getattr(torch, "npu", None)
+        stream_factory = getattr(npu, "Stream", None)
+        stream = stream_factory() if callable(stream_factory) else self.load_stream
+        streams[key] = stream
+        return stream
+
+    def record_layerwise_prefill_bank_use(
+        self,
+        layer_id: int,
+        kv_group: int,
+        event: Any,
+    ) -> None:
+        """Queue final-compute-access waits before a P bank's next DMA.
+
+        Attention records ``event`` immediately after its last KV access.
+        Every participating rank calls this, even when it skips D2H. The
+        bank FIFO then orders event -> save (if any) -> load, without taking
+        another compute-stream snapshot at the later transfer callback.
+        """
+        if event is None:
+            raise ValueError("Layerwise prefill bank use requires a device event")
+        generation = self._layerwise_prefill_transfer_generation(kv_group)
+        uses = getattr(self, "_layerwise_prefill_bank_use_events", None)
+        if uses is None:
+            uses = self._layerwise_prefill_bank_use_events = {}
+        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        fence_debug = getattr(self, "fence_debug", None)
+        if fence_debug is not None:
+            fence_debug.wait("p_use", kv_group, layer_id, event)
+        self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
+        uses[(kv_group, bank)] = (generation, layer_id, event)
+        audit = getattr(self, "prefill_audit", None)
+        if audit is not None:
+            audit.use(kv_group, layer_id, bank, generation, id(event))
+
+    @property
+    def uses_token_byte_features(self) -> bool:
+        """Select file-based byte sampling instead of legacy CPU content hashes."""
+        return True
+
+    @diagnostic
+    def configure_kv_trace(
+        self,
+        requests: Any,
+        groups: Any = None,
+        tp_size: Any = None,
+        source_ranks: Any = None,
+    ) -> None:
+        """Install this step's CPU request descriptors for opt-in KV tracing."""
+        if audit_enabled():
+            readback = getattr(self, "direct_npu_audit", None)
+            if readback is not None:
+                readback.poll()
+            if not hasattr(self, "prefill_audit"):
+                self.prefill_audit = BankAudit(
+                    self._prefill_worker_id,
+                    "banked_prefill" if self._layerwise_prefill_dma else "original",
+                )
+            self.prefill_audit.begin([request.req_id for request in requests])
+        if not kv_trace_enabled():
+            return
+        if source_ranks is not None:
+            self.kv_trace_source_ranks = tuple(source_ranks)
+        if not hasattr(self, "kv_trace"):
+            self.kv_trace = KVTrace(
+                self._prefill_worker_id,
+                "P" if self._layerwise_prefill_dma else "D",
+                segment_tokens=self.lmcache_chunk_size
+                if self._layerwise_prefill_dma
+                else min(self.lmcache_chunk_size, REFERENCE_SEGMENT_TOKENS),
+            )
+        self.kv_trace_requests = {request.req_id: request for request in requests}
+        if tp_size is not None:
+            self.kv_trace.base["tp_size"] = int(tp_size)
+            self.kv_trace.base["tp_rank"] = self._prefill_worker_id % int(tp_size)
+        if groups is not None:
+            self.kv_trace.base["groups"] = list(groups)
+        if groups is not None:
+            for request in requests:
+                phase = (
+                    "BEGIN:" + str(len(request.token_ids))
+                    if self._layerwise_prefill_dma
+                    else "BEGIN"
+                )
+                if self.kv_trace.claim(request.req_id, phase, -1, -1):
+                    self.kv_trace.emit(
+                        dict(
+                            self.kv_trace.base,
+                            req=request.req_id,
+                            stage="BEGIN",
+                            frontier=len(request.token_ids),
+                            groups=list(groups),
+                            tp_size=tp_size,
+                            history_end=int(request.load_spec.lmcache_cached_tokens)
+                            if getattr(request, "load_spec", None) is not None
+                            else 0,
+                            final=bool(request.is_last_prefill),
+                        )
+                    )
+
+    @diagnostic
+    def trace_attention_kv(
+        self,
+        layer_id: int,
+        group: int,
+        stage: str,
+        planes: Any,
+        table: Any,
+        metadata: Any,
+        produced: Any = None,
+    ) -> None:
+        """Trace P bank rows; D is sampled at its actual sparse load boundary."""
+        trace = getattr(self, "kv_trace", None)
+        if trace is None or not self._layerwise_prefill_dma:
+            return
+        ids = getattr(metadata, "req_ids", None)
+        lengths = getattr(metadata, "seq_lens_cpu", None)
+        starts = getattr(metadata, "query_start_loc_cpu", None)
+        if not ids:
+            for req_id in getattr(self, "kv_trace_requests", {}):
+                trace.error(
+                    req_id,
+                    stage,
+                    "missing_attention_request_ids",
+                    group=group,
+                    layer=layer_id,
+                )
+            return
+        if lengths is None or starts is None or table is None:
+            for req_id in ids:
+                trace.error(
+                    req_id,
+                    stage,
+                    "missing_attention_request_mapping",
+                    group=group,
+                    layer=layer_id,
+                )
+            return
+        for row, req_id in enumerate(ids):
+            if not trace.accepts(req_id):
+                continue
+            spec = getattr(self, "kv_trace_requests", {}).get(req_id)
+            if spec is None:
+                trace.error(
+                    req_id,
+                    stage,
+                    "request_missing_from_connector_metadata",
+                    group=group,
+                    layer=layer_id,
+                )
+                continue
+            end = int(lengths[row])
+            query_start, query_end = int(starts[row]), int(starts[row + 1])
+            if end <= 0 or query_end <= query_start:
+                continue
+            prefix = end - (query_end - query_start)
+            is_p = self._layerwise_prefill_dma
+            if not is_p and not trace.claim(req_id, stage, group, layer_id):
+                continue
+            observed_end = prefix if stage.endswith("LOAD") else end
+            if is_p and stage == "P_LOAD" and spec.block_ids_by_bank:
+                bank = layer_id % len(spec.block_ids_by_bank)
+                count = (end + int(planes[0].shape[1]) - 1) // int(planes[0].shape[1])
+                expected = torch.tensor(
+                    spec.block_ids_by_bank[bank][group][:count], dtype=torch.int64
+                )
+                layout = self._group_layouts.get(group)
+                if group == 1 and planes[0].dtype == torch.int8 and layout is not None:
+                    mapping = getattr(layout, "block_map_cpu", None)
+                    factors = getattr(layout, "layer_slot_factors", ())
+                    expected = (
+                        mapping[expected]
+                        if mapping is not None
+                        else expected * (factors[layer_id] if factors else 1)
+                    )
+                trace.tensor(
+                    req_id,
+                    "MAP_EXPECTED",
+                    group,
+                    layer_id,
+                    end,
+                    0,
+                    count,
+                    0,
+                    expected,
+                    bank=bank,
+                )
+                trace.tensor(
+                    req_id,
+                    "MAP_ACTUAL",
+                    group,
+                    layer_id,
+                    end,
+                    0,
+                    count,
+                    0,
+                    table[row, :count].long(),
+                    bank=bank,
+                )
+            trace.paged(
+                req_id,
+                stage,
+                group,
+                layer_id,
+                end,
+                planes,
+                table[row],
+                0,
+                observed_end,
+                block_size=int(planes[0].shape[1]),
+                bank=layer_id
+                % len(spec.block_ids_by_bank)
+                if is_p and spec.block_ids_by_bank
+                else None,
+                final=bool(spec.is_last_prefill),
+                metadata_frontier=len(spec.token_ids),
+                prefix=prefix,
+                produced_available=produced is not None,
+            )
+            if produced is not None:
+                for component, value in enumerate(produced):
+                    raw = (
+                        value[query_start:query_end]
+                        .to(dtype=planes[component].dtype)
+                        .contiguous()
+                    )
+                    trace.tensor(
+                        req_id,
+                        "P_PRODUCED" if is_p else "D_PRODUCED",
+                        group,
+                        layer_id,
+                        end,
+                        prefix,
+                        end,
+                        component,
+                        raw,
+                    )
+
+    @diagnostic
+    def trace_cpu_kv(
+        self,
+        stage: str,
+        req_id: str,
+        group: int,
+        starts: Any,
+        ends: Any,
+        rows: Any,
+        *,
+        mirror: bool = False,
+        layer_ids: Any = None,
+    ) -> None:
+        """Sample resolved CPU layers; real D sparse destinations are observed separately."""
+        if not kv_trace_enabled():
+            return
+        if not starts or not ends:
+            return
+        if not hasattr(self, "kv_trace"):
+            self.kv_trace = KVTrace(
+                self._prefill_worker_id,
+                "P" if self._layerwise_prefill_dma else "D",
+                segment_tokens=self.lmcache_chunk_size
+                if self._layerwise_prefill_dma
+                else min(self.lmcache_chunk_size, REFERENCE_SEGMENT_TOKENS),
+            )
+        trace = self.kv_trace
+        layout = self._group_layouts.get(group)
+        if layout is None:
+            trace.error(req_id, stage, "layout_not_initialized", group=group)
+            return
+        for local_layer, objects in enumerate(rows):
+            layer = local_layer if layer_ids is None else int(layer_ids[local_layer])
+            if not self._layerwise_prefill_dma and not trace.claim(
+                req_id, stage, group, layer
+            ):
+                continue
+            widths = self.checkpoint_plane_widths(group)
+            if widths and isinstance(widths[0], tuple):
+                widths = widths[layer]
+            byte_widths = (
+                widths
+                if layout.indexer_c8
+                else tuple(int(w) * self.dtype.itemsize for w in widths)
+            )
+            interleaved = not layout.indexer_c8 and self._sparse_lmc_host_interleaved(
+                group
+            )
+            if interleaved:
+                byte_widths = tuple(
+                    int(w) * self.dtype.itemsize
+                    for w in (layout.k_hidden_dims, layout.v_hidden_dims)
+                    if w
+                )
+            if not self._layerwise_prefill_dma:
+                sources = getattr(self, "kv_trace_sources", None)
+                if sources is None:
+                    sources = self.kv_trace_sources = {}
+                sources[(req_id, group, layer)] = (
+                    tuple(starts),
+                    tuple(ends),
+                    tuple(_layer_source_memory_objs(objects, layer)),
+                    tuple(byte_widths),
+                    interleaved,
+                )
+                source_owners = getattr(self, "kv_trace_source_owners", None)
+                if source_owners is None:
+                    source_owners = self.kv_trace_source_owners = {}
+                owned = source_owners.setdefault(req_id, {})
+                for obj in _layer_source_memory_objs(objects, layer):
+                    if id(obj) not in owned:
+                        obj.ref_count_up()
+                        owned[id(obj)] = obj
+            trace.emit(
+                dict(
+                    trace.base,
+                    req=req_id,
+                    stage="SOURCE",
+                    phase=stage,
+                    group=group,
+                    layer=layer,
+                    frontier=int(ends[-1]),
+                    start=int(starts[0]),
+                    end=int(ends[-1]),
+                    chunks=len(ends),
+                    components=len(byte_widths),
+                    ranges=None
+                    if all(
+                        int(ends[i]) == int(starts[i + 1])
+                        for i in range(len(starts) - 1)
+                    )
+                    else [
+                        [int(start), int(end)]
+                        for start, end in zip(starts, ends, strict=True)
+                    ],
+                )
+            )
+            objects = tuple(_layer_source_memory_objs(objects, layer))
+            frozen_starts, frozen_ends = tuple(starts), tuple(ends)
+
+            def sample_cpu(
+                layer=layer,
+                objects=objects,
+                byte_widths=byte_widths,
+                interleaved=interleaved,
+                starts=frozen_starts,
+                ends=frozen_ends,
+            ):
+                batches = {}
+                for start, end, obj in zip(starts, ends, objects, strict=True):
+                    value = _layer_memory_tensor(obj, layer)
+                    capacity, remainder = divmod(
+                        value.numel() * value.element_size(), sum(byte_widths)
+                    )
+                    if remainder:
+                        trace.error(
+                            req_id, stage, "packet_capacity", group=group, layer=layer
+                        )
+                        return
+                    trace.cpu_packet(
+                        req_id,
+                        stage,
+                        group,
+                        layer,
+                        int(ends[-1]),
+                        int(start),
+                        int(end),
+                        value,
+                        capacity,
+                        byte_widths,
+                        interleaved=interleaved,
+                        batches=batches,
+                    )
+                trace.flush_packets(
+                    req_id,
+                    group,
+                    layer,
+                    int(ends[-1]),
+                    batches,
+                    source_rank=getattr(self, "kv_trace_source_ranks", (None, None))[
+                        group
+                    ],
+                )
+
+            trace.cpu_work(
+                req_id, sample_cpu, objects, (), stage=stage, group=group, layer=layer
+            )
+
+    @diagnostic
+    def trace_selected_kv(
+        self,
+        req_id: str,
+        group: int,
+        layer: int,
+        planes: Any,
+        slots: Any,
+        indices: Any,
+        counts: Any,
+        total: int,
+    ) -> None:
+        """Save selected logical positions and one destination byte per token.
+
+        No full KV gather, hash or independent payload mirror is performed.
+        The analyzer indexes the archived D_CPU feature vector by position.
+        All probe gathers are clamped; invalid original slots are also saved.
+        """
+        trace = getattr(self, "kv_trace", None)
+        if trace is None or self._layerwise_prefill_dma or group != 0:
+            return
+        if not trace.claim(req_id, "D_SELECTED", group, layer):
+            return
+        source = getattr(self, "kv_trace_sources", {}).get((req_id, group, layer))
+        if source is None:
+            trace.error(
+                req_id, "D_SELECTED", "missing_cpu_reference", group=group, layer=layer
+            )
+            return
+        selected = (
+            indices.reshape(indices.shape[0], -1)
+            if indices.ndim > 1
+            else indices.reshape(1, -1)
+        )
+        target = slots.reshape_as(selected)
+        source_limit = int(source[1][-1])
+        valid = (selected >= 0) & (selected < min(total, source_limit))
+        if counts is not None:
+            columns = torch.arange(selected.shape[1], device=selected.device)
+            valid &= columns.unsqueeze(0) < counts.reshape(-1, 1)
+        positions = torch.where(valid, selected, -1).long().reshape(-1)
+        size = positions.numel()
+        # Keep the loader's exact selection as well as the filtered positions
+        # used for CPU-reference comparison. Do not lose padding/count metadata.
+        trace.tensor(
+            req_id, "MAP_SELECTED_TOPK", group, layer, total, 0, size, 0,
+            selected.long().reshape(-1), shape=list(selected.shape),
+        )
+        if counts is not None:
+            trace.tensor(
+                req_id, "MAP_SELECTED_COUNT", group, layer, total,
+                0, counts.numel(), 0, counts.long().reshape(-1),
+            )
+        trace.tensor(
+            req_id,
+            "MAP_SELECTED_POS",
+            group,
+            layer,
+            total,
+            0,
+            size,
+            0,
+            positions,
+            source_end=source_limit,
+        )
+        trace.tensor(
+            req_id,
+            "MAP_SELECTED_SLOT",
+            group,
+            layer,
+            total,
+            0,
+            size,
+            0,
+            target.long().reshape(-1),
+        )
+        for component, plane in enumerate(planes):
+            if not plane.is_contiguous():
+                trace.error(req_id, "D_SELECTED", "feature_plane_not_contiguous")
+                return
+            capacity = plane.shape[0] * plane.shape[1]
+            width = plane[0, 0].numel() * plane.element_size()
+            record = trace.record(
+                req_id,
+                "D_SELECTED",
+                group=group,
+                layer=layer,
+                frontier=total,
+                start=0,
+                end=size,
+                component=component,
+                source_end=source_limit,
+                slot_capacity=capacity,
+            )
+            trace.capture(
+                record,
+                lambda plane=plane, width=width, capacity=capacity: (
+                    plane.detach()
+                    .view(torch.uint8)
+                    .reshape(-1)
+                    .index_select(
+                        0, target.long().reshape(-1).clamp(0, capacity - 1) * width
+                    )
+                ),
+            )
+
+    @diagnostic
+    def finish_kv_trace(self, req_id: str) -> None:
+        """Emit completion and forget request diagnostic descriptors."""
+        readback = getattr(self, "direct_npu_audit", None)
+        if readback is not None:
+            readback.poll()
+        audit = getattr(self, "prefill_audit", None)
+        if audit is not None:
+            audit.finish(req_id)
+        trace = getattr(self, "kv_trace", None)
+        if trace is not None:
+            trace.finish(req_id)
+        sources = getattr(self, "kv_trace_sources", {})
+        for key in tuple(sources):
+            if key[0] == req_id:
+                sources.pop(key)
+        owners = getattr(self, "kv_trace_source_owners", {}).pop(req_id, {})
+        for owner in owners.values():
+            owner.ref_count_down()
+
+    def drain_kv_trace(self, timeout: float = 60.0) -> bool:
+        """Drain diagnostic readers before engine shutdown frees CPU slabs."""
+        readback = getattr(self, "direct_npu_audit", None)
+        if readback is not None:
+            readback.poll()
+        trace = getattr(self, "kv_trace", None)
+        if trace is None:
+            return True
+        for req_id in tuple(getattr(self, "kv_trace_source_owners", {})):
+            self.finish_kv_trace(req_id)
+        return trace.drain(timeout)
+
+    def audit_direct_indexer_import(
+        self, req_id: str, keys: list[str], pointers: list[list[int]],
+        sizes: list[list[int]], owners: Sequence[torch.Tensor],
+    ) -> None:
+        """Sample direct NPU destinations on the existing readiness stream."""
+        if not audit_enabled():
+            return
+        reader = getattr(self, "direct_npu_audit", None)
+        if reader is None:
+            reader = self.direct_npu_audit = DirectNpuAudit(
+                torch, lmc_ops.layerwise_prefill_dma_copy,
+            )
+        reader.submit(req_id, keys, pointers, sizes, self.load_stream, owners)
+
+    @diagnostic
+    def enqueue_store_kv_trace(
+        self, req_id: str, group: int, starts: Any, ends: Any, rows: Any, events: Any
+    ) -> None:
+        """Synchronously sample saved CPU bytes after real D2H completion.
+
+        The historical entry-point name is retained for caller compatibility;
+        no diagnostic work is enqueued.
+        """
+        if not kv_trace_enabled():
+            return
+        if not hasattr(self, "kv_trace"):
+            self.kv_trace = KVTrace(
+                self._prefill_worker_id, "P", segment_tokens=self.lmcache_chunk_size
+            )
+        starts, ends = tuple(starts), tuple(ends)
+        rows = tuple(
+            tuple(_layer_source_memory_objs(row, layer))
+            for layer, row in enumerate(rows)
+        )
+        owners = [
+            obj
+            for layer, row in enumerate(rows)
+            for obj in _layer_source_memory_objs(row, layer)
+        ]
+        self.kv_trace.cpu_work(
+            req_id,
+            lambda: self.trace_cpu_kv("P_CPU_STORE", req_id, group, starts, ends, rows),
+            owners,
+            events,
+        )
+
+    @diagnostic
+    def enqueue_load_kv_trace(
+        self,
+        req_id: str,
+        group: int,
+        starts: Any,
+        ends: Any,
+        objects: Any,
+        layer: int,
+        ready: Any,
+    ) -> None:
+        """Synchronously sample CPU load sources after actual H2D.
+
+        Early CPU publication may precede producer D2H completion. Borrow the
+        real per-layer load event, which already carries source dependencies;
+        wait here before reading those bytes or returning to the caller.
+        """
+        trace = getattr(self, "kv_trace", None)
+        if trace is None:
+            return
+        if ready is None:
+            trace.error(
+                req_id,
+                "P_CPU_LOAD",
+                "missing_load_completion",
+                group=group,
+                layer=layer,
+            )
+            return
+        starts, ends, objects = tuple(starts), tuple(ends), tuple(objects)
+        trace.cpu_work(
+            req_id,
+            lambda: self.trace_cpu_kv(
+                "P_CPU_LOAD",
+                req_id,
+                group,
+                starts,
+                ends,
+                (objects,),
+                layer_ids=(layer,),
+            ),
+            objects,
+            (ready,),
+            stage="P_CPU_LOAD",
+            group=group,
+            layer=layer,
+        )
+
+    @diagnostic
+    def trace_prepared_kv(self, req_id: str, source: Any) -> None:
+        """Observe all TP ranks' sealed D CPU source before first decode."""
+        counts = source.chunk_token_counts
+        ends, end = [], 0
+        for count in counts:
+            end += int(count)
+            ends.append(end)
+        self.trace_cpu_kv(
+            "D_CPU",
+            req_id,
+            0,
+            [0] + ends[:-1],
+            ends,
+            [layer.memory_objs for layer in source.layers],
+            mirror=True,
+        )
+
+    @diagnostic
+    def trace_direct_kv(
+        self,
+        req_id: str,
+        group: int,
+        kvcaches: Any,
+        slot_mapping: Any,
+        starts: Any,
+        ends: Any,
+    ) -> None:
+        """Sample fully resident direct-import data without forcing CPU fallback.
+
+        Direct Mooncake indexer imports already have all history on the NPU.
+        Observe those real destinations on their load stream instead of loading
+        a second full copy or changing the transport selected by production.
+        """
+        trace = getattr(self, "kv_trace", None)
+        if trace is None or self._layerwise_prefill_dma or not starts:
+            return
+        layout = self._group_layouts[group]
+        ranges = []
+        for start, end in zip(starts, ends, strict=True):
+            if ranges and ranges[-1][1] == start:
+                ranges[-1] = (ranges[-1][0], end)
+            else:
+                ranges.append((start, end))
+        with self._stream_context_or_null(self.load_stream):
+            slots = slot_mapping[: int(ends[-1])].to(
+                device=layout.kv_device, dtype=torch.long
+            )
+            for layer, cache in enumerate(kvcaches):
+                if not trace.claim(req_id, "D_DIRECT", group, layer):
+                    continue
+                planes = (cache,) if isinstance(cache, torch.Tensor) else cache
+                physical = slots
+                if layout.indexer_c8 and planes[0].dtype == torch.int8:
+                    mapping = getattr(layout, "block_map_cpu", None)
+                    factor = layout.layer_slot_factors[layer]
+                    physical = (
+                        mapping.to(slots.device).index_select(
+                            0, (slots // 128).clamp(0, mapping.numel() - 1)
+                        )
+                        * 128
+                        + slots % 128
+                        if mapping is not None
+                        else slots // 128 * (128 * factor) + slots % 128
+                    )
+                token_planes = [
+                    plane.reshape(-1, 1, *plane.shape[2:]) for plane in planes
+                ]
+                for start, end in ranges:
+                    trace.paged(
+                        req_id,
+                        "D_DIRECT",
+                        group,
+                        layer,
+                        int(ends[-1]),
+                        token_planes,
+                        physical,
+                        int(start),
+                        int(end),
+                        block_size=1,
+                        source_rank=getattr(
+                            self, "kv_trace_source_ranks", (None, None)
+                        )[group],
+                    )
+
+    def _require_layerwise_prefill_bank_use(
+        self, layer_id: int, kv_group: int, bank: int,
+    ) -> None:
+        """Reject a transfer if the source layer never handed off its bank."""
+        use = getattr(self, "_layerwise_prefill_bank_use_events", {}).get(
+            (kv_group, bank)
+        )
+        if use is None or use[:2] != (
+            self._layerwise_prefill_transfer_generation(kv_group), layer_id,
+        ):
+            raise RuntimeError(
+                "Missing final-access event for layerwise prefill bank: "
+                f"group={kv_group}, bank={bank}, source_layer={layer_id}. "
+                "Update vllm-ascend, LMCache and LMCache-Ascend together."
+            )
+
+    def _synchronize_layerwise_prefill_dma_streams(
+        self,
+        kv_group: Optional[int] = None,
+    ) -> None:
+        """Fence bank FIFO streams at cleanup/publication boundaries only."""
+        streams = getattr(self, "_layerwise_prefill_dma_streams", {})
+        selected = (
+            stream
+            for (group, _bank), stream in streams.items()
+            if kv_group is None or group == int(kv_group)
+        )
+        seen: set[int] = set()
+        for stream in selected:
+            identity = id(stream)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            stream.synchronize()
+
+    def _flush_prefill_first_bank_timing_events(self) -> None:
+        """Read completed diagnostic events without introducing a new fence."""
+        pending = getattr(self, "_prefill_first_bank_timing_events", None)
+        if not pending:
+            return
+        remaining = []
+        for start_event, end_event, fields in pending:
+            if not end_event.query():
+                remaining.append((start_event, end_event, fields))
+                continue
+            device_ms = round(start_event.elapsed_time(end_event), 3)
+            prefill_start_timing_log(
+                logger, "first_bank_wait_device", time.perf_counter(),
+                elapsed_ms=device_ms, device_wait_ms=device_ms,
+                scope="device_event", **fields,
+            )
+        self._prefill_first_bank_timing_events = remaining
+
+    def wait_for_layerwise_prefill_source_publication(self, kv_group: int) -> None:
+        """Make prior CPU writes visible before rank0 shares handles with TP peers.
+
+        Peer processes cannot wait on this rank's NPU events. Only the P-node
+        shared-source publication boundary may wait on pending prior D2H tails;
+        completed tails incur queries only. Never snapshot later compute work.
+        """
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            return
+        generation = self._layerwise_prefill_transfer_generation(kv_group)
+        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
+        events = tuple(
+            record[1] for bank in range(
+                self._layerwise_prefill_transfer_state()[0].get(kv_group, 2)
+            )
+            if (record := tails.get((kv_group, bank))) is not None
+            and record[0] == generation
+        )
+        for event in events:
+            if not event.query():
+                event.synchronize()
+
+    def wait_for_layerwise_prefill_load(
+        self,
+        layer_id: int,
+        kv_group: int,
+        model_layer_id: Optional[int] = None,
+        request_ids: Optional[tuple[str, ...]] = None,
+    ) -> None:
+        """Join each request's load event before accessing the fixed layer bank.
+
+        Every request uses group-local layer_id % bank_count. Events remain
+        separate by request even when their transfers share the same FIFO.
+        A batch with no loads still waits for this bank's prior save tail.
+        No host synchronization is introduced.
+        """
+        _, generations, _, load_done = self._layerwise_prefill_transfer_state()
+        generation = generations.setdefault(int(kv_group), 0)
+        current_stream = torch.npu.current_stream()
+        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        bank_streams = getattr(self, "_layerwise_prefill_dma_streams", {})
+        bank_fifo_active = (int(kv_group), bank) in bank_streams
+        diagnose_first_bank = prefill_start_timing_enabled()
+        if diagnose_first_bank:
+            wait_started = time.perf_counter()
+            device_wait_start = torch.npu.Event(enable_timing=True)
+            device_wait_end = torch.npu.Event(enable_timing=True)
+            device_wait_start.record(current_stream)
+        overlap = getattr(self, "prefill_overlap_recorder", None)
+        overlap_wait = (
+            overlap.start_interval(
+                "wait", current_stream, kv_group, bank, layer_id, model_layer_id,
+            ) if overlap is not None else None
+        )
+        row = load_done.pop((kv_group, int(layer_id)), {})
+        if request_ids is not None and set(row) - set(request_ids):
+            raise RuntimeError(
+                "Prefill load events belong to requests outside this batch: "
+                f"group={kv_group}, layer={layer_id}"
+            )
+        events = {}
+        for req_id, (event_generation, event) in row.items():
+            if event_generation != generation:
+                raise RuntimeError(
+                    "Stale prefill request load event: "
+                    f"req={req_id}, group={kv_group}, layer={layer_id}"
+                )
+            events[req_id] = event
+        fence_debug = getattr(self, "fence_debug", None)
+        if fence_debug is not None and self._layerwise_prefill_dma:
+            fence_debug.before_read(kv_group, int(layer_id), bank, events)
+        # Do not collapse these waits to the last bank event. Every request
+        # keeps its own handoff, independent of batch/submission order.
+        for event in events.values():
+            current_stream.wait_event(event)
+        waited_event = next(reversed(events.values())) if events else None
+        if not events:
+            previous_tail = getattr(
+                self, "_layerwise_prefill_bank_tail_events", {}
+            ).get((kv_group, bank))
+            if previous_tail is not None and previous_tail[0] == generation:
+                waited_event = previous_tail[1]
+                current_stream.wait_event(waited_event)
+        audit = getattr(self, "prefill_audit", None)
+        if audit is not None:
+            audit.wait(kv_group, int(layer_id), bank, generation,
+                       id(waited_event) if waited_event is not None else None)
+        if overlap is not None:
+            overlap.end_interval(overlap_wait, current_stream)
+        if diagnose_first_bank:
+            device_wait_end.record(current_stream)
+            fields = dict(
+                kv_group=kv_group, layer_id=layer_id, bank=bank,
+                load_event_pending=any(not event.query() for event in events.values()),
+                save_event=not events and not bank_fifo_active,
+                load_event=bool(events), load_requests=len(events),
+            )
+            pending = getattr(self, "_prefill_first_bank_timing_events", None)
+            if pending is None:
+                pending = self._prefill_first_bank_timing_events = []
+            pending.append((device_wait_start, device_wait_end, fields))
+            prefill_start_timing_log(
+                logger, "first_bank_wait_enqueue", wait_started, **fields,
+            )
+
+    @contextmanager
+    def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
+        """Join sparse request load streams after all layer submissions.
+
+        The producer dependency from the compute stream to each load stream is
+        preserved. Only the reverse load-to-compute waits are collected until
+        the scope exits, allowing different requests to transfer concurrently.
+        """
+        if self._active_sparse_load_join is not None:
+            raise RuntimeError("overlapping sparse load joins are unsupported")
+        compute_stream = (
+            torch.npu.current_stream()
+            if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
+            else torch.cuda.current_stream()
+        )
+        join = _SparseLoadJoin(compute_stream, self._get_sparse_h2d_stall_watchdog())
+        self._active_sparse_load_join = join
+        try:
+            yield
+        except BaseException:
+            for stream_index in sorted(join.used_stream_indices):
+                self.load_stream_list[stream_index].synchronize()
+            raise
+        else:
+            try:
+                for stream_index in sorted(join.used_stream_indices):
+                    self._sparse_load_done_events[stream_index].record(
+                        self.load_stream_list[stream_index]
+                    )
+                for stream_index in sorted(join.used_stream_indices):
+                    compute_stream.wait_event(
+                        self._sparse_load_done_events[stream_index]
+                    )
+            except BaseException:
+                for stream_index in sorted(join.used_stream_indices):
+                    self.load_stream_list[stream_index].synchronize()
+                raise
+        finally:
+            self._active_sparse_load_join = None
+
+    def _reset_sparse_direct_layer_states(self) -> None:
+        self._sparse_direct_layer_states = None
+        self._sparse_direct_validated_layers = set()
+
+    def synchronize_shared_cpu_store_publication(self) -> None:
+        """Complete this rank's store work before publishing shared handles."""
+        self.store_stream.synchronize()
+        if getattr(self, "_layerwise_prefill_dma", False):
+            self._synchronize_layerwise_prefill_dma_streams()
+
+    def _mirror_layout(self, layout: _GroupLayout) -> None:
+        """Mirror a group's layout into the instance attributes."""
+        self.kv_format = layout.kv_format
+        self.k_hidden_dims = layout.k_hidden_dims
+        self.v_hidden_dims = layout.v_hidden_dims
+        self.dsa_hidden_dims = layout.dsa_hidden_dims
+        self.kv_lora_rank = layout.kv_lora_rank
+        self.qk_rope_head_dim = layout.qk_rope_head_dim
+        self.dsa_head_dim = layout.dsa_head_dim
+        self.vllm_two_major = layout.vllm_two_major
+        self.kv_device = layout.kv_device
+        self.gpu_buffer_allocator = layout.gpu_buffer_allocator
+
+    def _lazy_initialize_buffer_with_staging(
+        self,
+        kv_caches,
+        *,
+        kv_group: int,
+        init_staging: bool,
+    ) -> _GroupLayout:
+        return self._lazy_initialize_buffer(
+            kv_caches,
+            kv_group=kv_group,
+            init_staging=init_staging,
+        )
+
+    def _sparse_total_tokens_from_layer_chunks(
+        self,
+        layer_tensors: List[torch.Tensor],
+        kv_group: Optional[int] = None,
+        layer_id: int = 0,
+    ) -> int:
+        num_chunks = len(layer_tensors)
+        if num_chunks == 0:
+            return 0
+        if num_chunks == 1:
+            return self._lmc_plane_num_tokens(layer_tensors[0], kv_group, layer_id)
+        last_tokens = self._lmc_plane_num_tokens(layer_tensors[-1], kv_group, layer_id)
+        return (num_chunks - 1) * self.lmcache_chunk_size + last_tokens
+
+    def _is_deferred_sparse_pointer_cache(
+        self, cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]]
+    ) -> bool:
+        if (not getattr(self, "_layerwise_prefill_dma", False)
+                or cached_chunk_ptrs_npu is None):
+            return False
+        deferred = getattr(self, "_deferred_sparse_pointer_caches", {})
+        return deferred.get(id(cached_chunk_ptrs_npu)) is cached_chunk_ptrs_npu
+
+    def prepare_layerwise_prefill_source_pointers(
+        self,
+        new_sources_by_layer: List[
+            Union[Sequence[Union[torch.Tensor, MemoryObj]], LayerPageSource]
+        ],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: List[Optional[torch.Tensor]],
+        *,
+        kv_group: int = 0,
+        prefill_dma: bool = False,
+    ) -> None:
+        """Append source metadata, deferring device tables for raw prefill DMA.
+
+        The caller enables ``prefill_dma`` only for deferred P-node loads.
+        Those loads submit host addresses directly, so only their eventual
+        sparse consumer needs an NPU pointer table. Keep the mutable cache
+        identity to distinguish this state from an invalid ordinary cache.
+        """
+        prefill_dma = prefill_dma and getattr(self, "_layerwise_prefill_dma", False)
+        if not prefill_dma:
+            self.materialize_sparse_chunk_ptr_cache(
+                cached_chunk_dev_ptrs, cached_chunk_ptrs_npu, kv_group=kv_group
+            )
+            self.append_sparse_chunk_ptr_cache_for_layers(
+                new_sources_by_layer,
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+                kv_group=kv_group,
+            )
+            return
+        self.append_sparse_chunk_ptr_cache_for_layers(
+            new_sources_by_layer,
+            cached_chunk_dev_ptrs,
+            None,
+            kv_group=kv_group,
+        )
+        self.release_sparse_chunk_ptr_cache(cached_chunk_ptrs_npu)
+        cached_chunk_ptrs_npu[:] = [None] * len(cached_chunk_dev_ptrs)
+        deferred = getattr(self, "_deferred_sparse_pointer_caches", None)
+        if deferred is None:
+            deferred = self._deferred_sparse_pointer_caches = {}
+        deferred[id(cached_chunk_ptrs_npu)] = cached_chunk_ptrs_npu
+
+    def materialize_sparse_chunk_ptr_cache(
+        self,
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: List[Optional[torch.Tensor]],
+        *,
+        kv_group: Optional[int] = None,
+        defer_copy: bool = False,
+    ) -> None:
+        """Materialize a deferred source table once, before sparse consumption."""
+        if not self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            return
+        num_layers = len(cached_chunk_dev_ptrs)
+        if kv_group is not None and num_layers != self._expected_group_layers(kv_group):
+            raise ValueError("Deferred sparse pointer cache has incomplete layers")
+        if not num_layers or len(cached_chunk_ptrs_npu) != num_layers:
+            raise ValueError("Deferred sparse pointer cache has incomplete layers")
+        num_chunks = len(cached_chunk_dev_ptrs[0])
+        if any(len(row) != num_chunks for row in cached_chunk_dev_ptrs):
+            raise ValueError("Deferred sparse pointer cache has ragged host rows")
+        if any(row is not None for row in cached_chunk_ptrs_npu):
+            raise ValueError("Deferred sparse pointer cache has unexpected NPU rows")
+        if not num_chunks:
+            return
+        if defer_copy:
+            table = self.stage_dense_load_tensor(
+                torch.tensor(cached_chunk_dev_ptrs, dtype=torch.long),
+                dtype=torch.long,
+            )
+        else:
+            table = torch.tensor(
+                cached_chunk_dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
+        tables = getattr(self, "_layerwise_pointer_tables", None)
+        if tables is None:
+            tables = self._layerwise_pointer_tables = {}
+        tables[id(cached_chunk_ptrs_npu)] = {
+            "table": table,
+            "capacity": num_chunks,
+            "length": num_chunks,
+        }
+        cached_chunk_ptrs_npu[:] = list(table.unbind(0))
+        self._deferred_sparse_pointer_caches.pop(id(cached_chunk_ptrs_npu))
+
+    def append_sparse_chunk_ptr_cache_for_layer(
+        self,
+        layer_id: int,
+        new_sources: List[Union[torch.Tensor, MemoryObj]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        kv_group: int = 0,
+    ) -> None:
+        """Resolve and append NPU device ptrs for newly retrieved chunks only."""
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            return self._append_sparse_chunk_ptr_cache_for_layer_legacy(
+                layer_id, new_sources, cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu, kv_group=kv_group,
+            )
+        if not new_sources:
+            return
+
+        new_dev_ptrs = [
+            self._resolve_registered_cpu_source_device_ptr(
+                source_obj,
+                layer_id=layer_id,
+                chunk_index=chunk_index,
+                source="append_sparse_chunk_ptr_cache_for_layer",
+            )
+            for chunk_index, source_obj in enumerate(new_sources)
+        ]
+
+        old_count = (
+            len(cached_chunk_dev_ptrs[layer_id])
+            if layer_id < len(cached_chunk_dev_ptrs)
+            else 0
+        )
+
+        # Use the call's group rather than mutable connector state because
+        # interleaved group generators can leave that state stale.
+        num_layers = self._expected_group_layers(kv_group)
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) <= layer_id:
+            cached_chunk_dev_ptrs.append([])
+
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+        while (
+            cached_chunk_ptrs_npu is not None and len(cached_chunk_ptrs_npu) <= layer_id
+        ):
+            cached_chunk_ptrs_npu.append(None)
+
+        cached_chunk_dev_ptrs[layer_id].extend(new_dev_ptrs)
+
+        if cached_chunk_ptrs_npu is None:
+            return
+        if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            return
+
+        new_ptrs_npu = torch.tensor(
+            new_dev_ptrs, dtype=torch.long, device=self.kv_device
+        )
+        existing = cached_chunk_ptrs_npu[layer_id]
+        tables = getattr(self, "_layerwise_pointer_tables", None)
+        if tables is None:
+            tables = self._layerwise_pointer_tables = {}
+        table_key = (id(cached_chunk_ptrs_npu), int(layer_id))
+        state = tables.get(table_key)
+        required = old_count + int(new_ptrs_npu.numel())
+        if state is None or state["length"] != old_count:
+            capacity = max(4, old_count)
+            while capacity < required:
+                capacity *= 2
+            table = torch.empty(
+                (capacity,), dtype=new_ptrs_npu.dtype, device=new_ptrs_npu.device
+            )
+            if old_count:
+                if (
+                    not isinstance(existing, torch.Tensor)
+                    or int(existing.numel()) < old_count
+                ):
+                    raise ValueError("Sparse pointer prefix is incomplete")
+                table[:old_count].copy_(existing[:old_count].to(device=table.device))
+            state = {"table": table, "capacity": capacity, "length": old_count}
+            tables[table_key] = state
+        elif required > state["capacity"]:
+            capacity = state["capacity"]
+            while capacity < required:
+                capacity *= 2
+            table = torch.empty(
+                (capacity,), dtype=state["table"].dtype, device=state["table"].device
+            )
+            if old_count:
+                table[:old_count].copy_(state["table"][:old_count])
+            state["table"] = table
+            state["capacity"] = capacity
+        state["table"][old_count:required].copy_(new_ptrs_npu.to(device=state["table"].device))
+        state["length"] = required
+        cached_chunk_ptrs_npu[layer_id] = state["table"][:required]
+
+    def _append_sparse_chunk_ptr_cache_for_layer_legacy(
+        self,
+        layer_id: int,
+        new_sources: List[Union[torch.Tensor, MemoryObj]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        kv_group: int,
+    ) -> None:
+        """Resolve and append NPU device ptrs for newly retrieved chunks only."""
+        if not new_sources:
+            return
+
+        new_dev_ptrs = [
+            self._resolve_registered_cpu_source_device_ptr(
+                source_obj,
+                layer_id=layer_id,
+                chunk_index=chunk_index,
+                source="append_sparse_chunk_ptr_cache_for_layer",
+            )
+            for chunk_index, source_obj in enumerate(new_sources)
+        ]
+
+        updated_ptrs_npu = None
+        if cached_chunk_ptrs_npu is not None:
+            new_ptrs_npu = torch.tensor(
+                new_dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
+            existing = (
+                cached_chunk_ptrs_npu[layer_id]
+                if layer_id < len(cached_chunk_ptrs_npu)
+                else None
+            )
+            updated_ptrs_npu = (
+                new_ptrs_npu
+                if existing is None
+                else torch.cat((existing, new_ptrs_npu), dim=0)
+            )
+
+        # Use the call's group rather than mutable connector state because
+        # interleaved group generators can leave that state stale.
+        num_layers = self._expected_group_layers(kv_group)
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) <= layer_id:
+            cached_chunk_dev_ptrs.append([])
+
+        if cached_chunk_ptrs_npu is not None and not cached_chunk_ptrs_npu:
+            cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+        while (
+            cached_chunk_ptrs_npu is not None and len(cached_chunk_ptrs_npu) <= layer_id
+        ):
+            cached_chunk_ptrs_npu.append(None)
+
+        cached_chunk_dev_ptrs[layer_id].extend(new_dev_ptrs)
+
+        if cached_chunk_ptrs_npu is None:
+            return
+
+        cached_chunk_ptrs_npu[layer_id] = updated_ptrs_npu
+
+
+    def append_sparse_chunk_ptr_cache_for_layers(
+        self,
+        new_sources_by_layer: List[
+            Union[Sequence[Union[torch.Tensor, MemoryObj]], LayerPageSource]
+        ],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
+        kv_group: Optional[int] = None,
+    ) -> None:
+        """Atomically refresh every layer pointer row with one H2D copy."""
+        diagnose = serving_perf_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
+        if not new_sources_by_layer:
+            return
+        # The caller passes exactly this group's layer rows; use that length
+        # instead of the last-wins mirrored instance count.
+        num_layers = len(new_sources_by_layer)
+        expected_layers = self._expected_group_layers(kv_group)
+        if num_layers != expected_layers:
+            raise ValueError(
+                "Sparse group pointer append must cover every layer: "
+                f"layers={num_layers}, "
+                f"expected={expected_layers}, kv_group={kv_group}"
+            )
+        suffix_counts = {
+            len(sources.pages) + len(sources.suffix)
+            if isinstance(sources, LayerPageSource)
+            else len(sources)
+            for sources in new_sources_by_layer
+        }
+        if len(suffix_counts) != 1:
+            raise ValueError(
+                "Sparse group pointer append has ragged suffix chunk count: "
+                f"counts={sorted(suffix_counts)}"
+            )
+        if suffix_counts.pop() == 0:
+            return
+
+        rows_started = time.perf_counter() if diagnose else 0.0
+        staged_rows = self._layer_page_pointer_rows(new_sources_by_layer)
+        rows_ms = (time.perf_counter() - rows_started) * 1000 if diagnose else 0.0
+        row_source = "page" if staged_rows is not None else "layerwise"
+        if staged_rows is None:
+            staged_rows = [
+                [
+                    self._resolve_registered_cpu_source_device_ptr(
+                        source_obj,
+                        layer_id=layer_id,
+                        chunk_index=chunk_index,
+                        source="append_sparse_chunk_ptr_cache_for_layers",
+                    )
+                    for chunk_index, source_obj in enumerate(
+                        _layer_source_memory_objs(layer_sources, layer_id)
+                    )
+                ]
+                for layer_id, layer_sources in enumerate(new_sources_by_layer)
+            ]
+        publish_started = time.perf_counter() if diagnose else 0.0
+        self._append_sparse_chunk_ptr_rows(
+            staged_rows,
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+            defer_copy=defer_copy,
+        )
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_pointer_cache_append_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                chunks=len(staged_rows[0]),
+                row_source=row_source,
+                rows_ms=round(rows_ms, 3),
+                publish_ms=round(
+                    (time.perf_counter() - publish_started) * 1000, 3
+                ),
+            )
+
+    def prepare_sparse_page_ptr_cache_for_layers(
+        self,
+        sources_by_layer: List[LayerPageSource],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
+    ) -> bool:
+        """Prepare a transient homogeneous page pointer table, if compatible."""
+        if any(source.suffix for source in sources_by_layer):
+            return False
+        staged_rows = self._layer_page_pointer_rows(sources_by_layer)
+        if staged_rows is None:
+            return False
+        self._append_sparse_chunk_ptr_rows(
+            staged_rows,
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+            defer_copy=defer_copy,
+        )
+        return True
+
+    def _append_sparse_chunk_ptr_rows(
+        self,
+        staged_rows: list[list[int]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
+    ) -> None:
+        """Append only the new chunk columns to a request pointer table.
+
+        Chunked prefill advances monotonically.  Rebuilding a rectangular
+        ``complete_rows`` tensor for every chunk copies the whole prompt on
+        every layer and is the source of the observed multi-second pause.
+        Keep an amortized-capacity table per request and write only the
+        suffix.  The public cache remains a list of exact-length row views.
+        """
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            return self._append_sparse_chunk_ptr_rows_legacy(
+                staged_rows, cached_chunk_dev_ptrs, cached_chunk_ptrs_npu,
+                defer_copy=defer_copy,
+            )
+        num_layers = len(staged_rows)
+        diagnose = serving_perf_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
+        prefix_counts = {
+            len(cached_chunk_dev_ptrs[layer_id])
+            if layer_id < len(cached_chunk_dev_ptrs)
+            else 0
+            for layer_id in range(num_layers)
+        }
+        if len(prefix_counts) != 1:
+            raise ValueError(
+                "Sparse group pointer append has ragged existing prefix: "
+                f"prefix_counts={sorted(prefix_counts)}"
+            )
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) < num_layers:
+            cached_chunk_dev_ptrs.append([])
+        if cached_chunk_ptrs_npu is not None:
+            if not cached_chunk_ptrs_npu:
+                cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+            while len(cached_chunk_ptrs_npu) < num_layers:
+                cached_chunk_ptrs_npu.append(None)
+        old_count = len(cached_chunk_dev_ptrs[0])
+        suffix_count = len(staged_rows[0])
+        if any(len(row) != suffix_count for row in staged_rows):
+            raise ValueError("Sparse pointer append has ragged suffix rows")
+        new_count = old_count + suffix_count
+        for layer_id in range(num_layers):
+            cached_chunk_dev_ptrs[layer_id].extend(staged_rows[layer_id])
+
+        if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            return
+
+        table_ms = unbind_ms = 0.0
+        if cached_chunk_ptrs_npu is not None:
+            tables = getattr(self, "_layerwise_pointer_tables", None)
+            if tables is None:
+                tables = self._layerwise_pointer_tables = {}
+            table_key = id(cached_chunk_ptrs_npu)
+            state = tables.get(table_key)
+            table_started = time.perf_counter() if diagnose else 0.0
+
+            if state is None:
+                device = next(
+                    (row.device for row in cached_chunk_ptrs_npu if row is not None),
+                    self.kv_device or torch.device("cpu"),
+                )
+                capacity = max(4, 1 << max(0, (max(old_count, 1) - 1).bit_length()))
+                while capacity < new_count:
+                    capacity *= 2
+                table = torch.empty(
+                    (num_layers, capacity), dtype=torch.long, device=device
+                )
+                if old_count:
+                    warm = cached_chunk_ptrs_npu[:num_layers]
+                    if not all(isinstance(row, torch.Tensor) for row in warm):
+                        raise ValueError("Sparse pointer prefix is incomplete")
+                    table[:, :old_count].copy_(torch.stack(warm).to(device=device))
+                state = {"table": table, "capacity": capacity, "length": old_count}
+                tables[table_key] = state
+            elif (
+                state["length"] != old_count
+                or state["table"].shape[0] != num_layers
+            ):
+                device = state["table"].device
+                capacity = max(4, new_count)
+                while capacity < new_count:
+                    capacity *= 2
+                table = torch.empty(
+                    (num_layers, capacity),
+                    dtype=state["table"].dtype,
+                    device=device,
+                )
+                if old_count:
+                    warm = cached_chunk_ptrs_npu[:num_layers]
+                    if not all(isinstance(row, torch.Tensor) for row in warm):
+                        raise ValueError("Sparse pointer prefix is incomplete")
+                    table[:, :old_count].copy_(torch.stack(warm).to(device=device))
+                state = {"table": table, "capacity": capacity, "length": old_count}
+                tables[table_key] = state
+            elif new_count > state["capacity"]:
+                old_table = state["table"]
+                capacity = state["capacity"]
+                while capacity < new_count:
+                    capacity *= 2
+                table = torch.empty(
+                    (num_layers, capacity),
+                    dtype=old_table.dtype,
+                    device=old_table.device,
+                )
+                if old_count:
+                    table[:, :old_count].copy_(old_table[:, :old_count])
+                state = {"table": table, "capacity": capacity, "length": old_count}
+                tables[table_key] = state
+
+            table = state["table"]
+            if suffix_count:
+                suffix_cpu = torch.as_tensor(staged_rows, dtype=torch.long)
+                if defer_copy and table.device.type != "cpu":
+                    suffix_device = self.stage_dense_load_tensor(
+                        suffix_cpu, dtype=torch.long
+                    )
+                    context = self._stream_context_or_null(self.load_stream)
+                else:
+                    suffix_device = suffix_cpu.to(device=table.device)
+                    context = nullcontext()
+                with context:
+                    table[:, old_count:new_count].copy_(suffix_device)
+            state["length"] = new_count
+            cached_chunk_ptrs_npu[:] = [
+                table[layer_id, :new_count] for layer_id in range(num_layers)
+            ]
+            if diagnose:
+                table_ms = (time.perf_counter() - table_started) * 1000
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_pointer_table_publish_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                chunks=new_count,
+                table_h2d_submit_ms=round(table_ms, 3),
+                unbind_ms=round(unbind_ms, 3),
+            )
+
+    def _append_sparse_chunk_ptr_rows_legacy(
+        self,
+        staged_rows: list[list[int]],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        defer_copy: bool = False,
+    ) -> None:
+        """Append complete host rows and refresh their shared NPU table."""
+        num_layers = len(staged_rows)
+        diagnose = serving_perf_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
+        prefix_counts = {
+            len(cached_chunk_dev_ptrs[layer_id])
+            if layer_id < len(cached_chunk_dev_ptrs)
+            else 0
+            for layer_id in range(num_layers)
+        }
+        if len(prefix_counts) != 1:
+            raise ValueError(
+                "Sparse group pointer append has ragged existing prefix: "
+                f"prefix_counts={sorted(prefix_counts)}"
+            )
+        complete_rows = [
+            list(cached_chunk_dev_ptrs[layer_id]) + staged_rows[layer_id]
+            if layer_id < len(cached_chunk_dev_ptrs)
+            else staged_rows[layer_id]
+            for layer_id in range(num_layers)
+        ]
+        row_views = None
+        table_started = time.perf_counter() if diagnose else 0.0
+        if cached_chunk_ptrs_npu is not None:
+            if defer_copy:
+                pointer_table = self.stage_dense_load_tensor(
+                    torch.tensor(complete_rows, dtype=torch.long),
+                    dtype=torch.long,
+                )
+            else:
+                pointer_table = torch.tensor(
+                    complete_rows, dtype=torch.long, device=self.kv_device
+                )
+            table_ms = (time.perf_counter() - table_started) * 1000 if diagnose else 0.0
+            unbind_started = time.perf_counter() if diagnose else 0.0
+            # The row views retain the table storage after this function returns.
+            row_views = list(pointer_table.unbind(0))
+            unbind_ms = (
+                (time.perf_counter() - unbind_started) * 1000 if diagnose else 0.0
+            )
+        else:
+            table_ms = unbind_ms = 0.0
+
+        if not cached_chunk_dev_ptrs:
+            cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
+        while len(cached_chunk_dev_ptrs) < num_layers:
+            cached_chunk_dev_ptrs.append([])
+        if cached_chunk_ptrs_npu is not None:
+            if not cached_chunk_ptrs_npu:
+                cached_chunk_ptrs_npu.extend(None for _ in range(num_layers))
+            while len(cached_chunk_ptrs_npu) < num_layers:
+                cached_chunk_ptrs_npu.append(None)
+        for layer_id in range(num_layers):
+            cached_chunk_dev_ptrs[layer_id].extend(staged_rows[layer_id])
+            if cached_chunk_ptrs_npu is not None:
+                assert row_views is not None
+                cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_pointer_table_publish_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                chunks=len(complete_rows[0]),
+                table_h2d_submit_ms=round(table_ms, 3),
+                unbind_ms=round(unbind_ms, 3),
+            )
+
+
+    def release_sparse_chunk_ptr_cache(
+        self,
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> None:
+        """Release request-local amortized pointer-table backing storage."""
+        if cached_chunk_ptrs_npu is None:
+            return
+        deferred = getattr(self, "_deferred_sparse_pointer_caches", None)
+        if deferred is not None:
+            deferred.pop(id(cached_chunk_ptrs_npu), None)
+        tables = getattr(self, "_layerwise_pointer_tables", None)
+        if not tables:
+            return
+        identity = id(cached_chunk_ptrs_npu)
+        for key in tuple(tables):
+            key_identity = key[0] if isinstance(key, tuple) else key
+            if key_identity == identity:
+                tables.pop(key, None)
+
+    def _layer_page_pointer_rows(
+        self,
+        sources_by_layer: Sequence[
+            Union[Sequence[Union[torch.Tensor, MemoryObj]], LayerPageSource]
+        ],
+    ) -> Optional[list[list[int]]]:
+        """Resolve a homogeneous layer-page batch once per physical page."""
+        diagnose = serving_perf_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
+        if not sources_by_layer or not all(
+            isinstance(source, LayerPageSource)
+            and source.layer_id == layer_id
+            for layer_id, source in enumerate(sources_by_layer)
+        ):
+            return None
+        rows = list(sources_by_layer)
+        first = rows[0]
+        assert isinstance(first, LayerPageSource)
+        pages = first.pages
+        # The batch covers exactly this group's layer rows.
+        page_layers = len(rows)
+        if any(
+            len(source.pages) != len(pages)
+            or any(
+                left is not right
+                for left, right in zip(source.pages, pages, strict=True)
+            )
+            for source in rows
+            if isinstance(source, LayerPageSource)
+        ):
+            return None
+        compatible_layout = None
+        for page in pages:
+            if (
+                not page.valid
+                or page.num_layers != page_layers
+                or page.valid_tokens <= 0
+            ):
+                return None
+            metadata = page.metadata
+            shapes = tuple(metadata.shapes or ())
+            dtypes = tuple(metadata.dtypes or ())
+            layer_size = page.layer_size
+            if layer_size is None:
+                if not page.layer_layout_is_valid():
+                    return None
+                sizes = tuple(page.layer_size_bytes(i) for i in range(page_layers))
+                if any(size <= 0 or size % page.valid_tokens for size in sizes):
+                    return None
+                token_widths = tuple(size // page.valid_tokens for size in sizes)
+            else:
+                # Preserve the homogeneous Group-0 path's scalar sizing.
+                if (
+                    layer_size <= 0
+                    or layer_size % page.valid_tokens
+                    or tuple(page.group_prefix_sum)
+                    != tuple(i * layer_size for i in range(page_layers + 1))
+                    or len(set(shapes)) != 1
+                ):
+                    return None
+                token_widths = layer_size // page.valid_tokens
+            page_layout = (metadata.fmt, dtypes[0] if dtypes else None, token_widths)
+            if (
+                len(shapes) != page_layers
+                or len(dtypes) != page_layers
+                or len(set(dtypes)) != 1
+                or (compatible_layout is not None and page_layout != compatible_layout)
+            ):
+                return None
+            compatible_layout = page_layout
+
+        validation_ms = (time.perf_counter() - started) * 1000 if diagnose else 0.0
+        result = [[] for _ in range(page_layers)]
+        for chunk_index, page in enumerate(pages):
+            base = self._resolve_registered_cpu_source_device_ptr(
+                page,
+                layer_id=0,
+                chunk_index=chunk_index,
+                source="append_sparse_chunk_ptr_cache_for_layers_page",
+                required_bytes=page.get_size(),
+            )
+            for layer_id, row in enumerate(result):
+                row.append(base + page.group_prefix_sum[layer_id])
+        for layer_id, source in enumerate(rows):
+            assert isinstance(source, LayerPageSource)
+            result[layer_id].extend(
+                self._resolve_registered_cpu_source_device_ptr(
+                    suffix,
+                    layer_id=layer_id,
+                    chunk_index=len(pages) + index,
+                    source="append_sparse_chunk_ptr_cache_for_layers_suffix",
+                )
+                for index, suffix in enumerate(source.suffix)
+            )
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_page_pointer_rows_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                pages=len(pages),
+                validation_ms=round(validation_ms, 3),
+                pointer_resolve_ms=round(
+                    (time.perf_counter() - started) * 1000 - validation_ms, 3
+                ),
+            )
+        return result
+
+    def _resolve_registered_cpu_source_device_ptr(
+        self,
+        source_obj: Union[torch.Tensor, MemoryObj],
+        *,
+        layer_id: int,
+        chunk_index: int,
+        source: str,
+        required_bytes: Optional[int] = None,
+    ) -> int:
+        diagnose = serving_perf_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
+        host_ptr = int(
+            source_obj.data_ptr()
+            if isinstance(source_obj, torch.Tensor)
+            else source_obj.layer_data_ptr(layer_id)
+            if isinstance(source_obj, LayerPageMemoryObj)
+            else source_obj.data_ptr
+        )
+        validate_span = getattr(self, "enable_npu_transfer_validation", False)
+        if validate_span:
+            if required_bytes is None:
+                required_bytes = (
+                    int(source_obj.numel() * source_obj.element_size())
+                    if isinstance(source_obj, torch.Tensor)
+                    else source_obj.layer_size_bytes(layer_id)
+                    if isinstance(source_obj, LayerPageMemoryObj)
+                    else int(source_obj.get_size())
+                )
+            dev_ptr = lmc_ops.get_device_ptr(host_ptr, required_bytes)
+        else:
+            dev_ptr = lmc_ops.get_device_ptr(host_ptr)
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_get_device_ptr_slow",
+                started,
+                thread_started,
+                source=source,
+                layer_id=layer_id,
+                chunk_index=chunk_index,
+                required_bytes=(required_bytes if validate_span else None),
+                found=bool(dev_ptr),
+            )
+        if dev_ptr is None or int(dev_ptr) == 0:
+            raise RuntimeError(
+                "Ascend sparse pointer-cache install failed: CPU tensor is not "
+                "registered, its registered span is too small, or "
+                "get_device_ptr returned null. "
+                f"source={source}, layer_id={layer_id}, "
+                f"chunk_index={chunk_index}, host_ptr={host_ptr}, "
+                f"required_bytes={required_bytes if validate_span else 'unchecked'}"
+            )
+        return int(dev_ptr)
+
+    @staticmethod
+    def _sparse_direct_source_signature(
+        *,
+        layer_tensors: List[torch.Tensor],
+        slot_mapping_ref: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+    ) -> tuple:
+        """Metadata that must match to reuse SparseDirectLayerState."""
+        return (
+            tuple(
+                VLLMPagedMemLayerwiseNPUConnector._tensor_layout_signature(tensor)
+                for tensor in layer_tensors
+            ),
+            int(slot_mapping_ref.numel()),
+            slot_mapping_ref.dtype,
+            str(slot_mapping_ref.device),
+            int(total_tokens),
+            int(sparse_kv_format),
+            bool(sparse_token_major),
+            bool(sparse_vllm_two_major),
+            int(sparse_k_hidden_dims),
+            int(sparse_v_hidden_dims),
+            int(sparse_dsa_hidden_dims),
+        )
+
+    @staticmethod
+    def _stream_context_or_null(stream):
+        if stream is None or not hasattr(stream, "device"):
+            return nullcontext()
+        stream_device = getattr(stream, "device", None)
+        if getattr(stream_device, "type", None) == "npu" and hasattr(torch, "npu"):
+            return torch.npu.stream(stream)
+        return torch.cuda.stream(stream)
+
+    def _slot_mapping_on_kv_device(
+        self, slot_mapping: torch.Tensor, stream
+    ) -> torch.Tensor:
+        if self.kv_device is None or slot_mapping.device == self.kv_device:
+            return slot_mapping
+        with self._stream_context_or_null(stream):
+            return slot_mapping.to(self.kv_device, non_blocking=True)
+
+    @staticmethod
+    def _sparse_direct_pointer_cache_signature(
+        *,
+        chunk_ptrs_npu: torch.Tensor,
+        slot_mapping_ref: torch.Tensor,
+        source_layout_ref: Optional[torch.Tensor],
+        total_tokens: int,
+        chunk_size: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+    ) -> tuple:
+        """Cheap runtime source identity for the decode hot path.
+
+        The native fast path overwrites slot_mapping_ptr and consumes
+        chunk_ptrs_npu at launch time, so the cached layer state only needs the
+        stable source layout and scalar metadata. Avoid keying on per-request
+        tensor addresses that would force prepare_sparse_direct_layer_state()
+        to run again on every decode step.
+        """
+        return (
+            2,
+            VLLMPagedMemLayerwiseNPUConnector._tensor_layout_signature(
+                source_layout_ref
+            ),
+            chunk_ptrs_npu.dtype,
+            str(chunk_ptrs_npu.device),
+            int(chunk_ptrs_npu.numel()),
+            slot_mapping_ref.dtype,
+            str(slot_mapping_ref.device),
+            int(slot_mapping_ref.numel()),
+            int(total_tokens),
+            int(chunk_size),
+            int(sparse_kv_format),
+            int(sparse_token_major),
+            int(sparse_vllm_two_major),
+            int(sparse_k_hidden_dims),
+            int(sparse_v_hidden_dims),
+            int(sparse_dsa_hidden_dims),
+        )
+
+    @staticmethod
+    def _tensor_layout_signature(tensor) -> tuple:
+        if isinstance(tensor, torch.Tensor):
+            return (
+                tuple(int(dim) for dim in tensor.shape),
+                tuple(int(stride) for stride in tensor.stride()),
+                tensor.dtype,
+                str(tensor.device),
+                int(tensor.element_size()),
+                int(tensor.numel() * tensor.element_size()),
+            )
+        return (type(tensor).__name__,)
+
+    def _vllm_layer_cache_identity_signature(self, value) -> tuple:
+        is_tensor = isinstance(value, torch.Tensor)
+        tensors = (value,) if is_tensor else value
+        if not isinstance(tensors, (tuple, list)):
+            return (id(value),)
+        if not getattr(self, "enable_npu_transfer_validation", False):
+            return (id(value),) if is_tensor else (id(value), len(tensors))
+        return (
+            id(value),
+            tuple(
+                (
+                    id(tensor),
+                    int(tensor.data_ptr()),
+                    self._tensor_layout_signature(tensor),
+                )
+                for tensor in tensors
+            ),
+        )
+
+    def seal_sparse_destination_layout(
+        self, kvcaches_ref: list
+    ) -> Optional[_SparseDestinationLayout]:
+        """Seal final Group-0 buffers after capture, returning an opaque binding.
+
+        The caller must prevent storage/layout mutation for the worker lifetime.
+        Repeated calls validate refresh candidates and retain the canonical list;
+        a structural change raises RuntimeError. Disabled validation returns None.
+        Only tensor metadata is read; no device work is submitted.
+        """
+        if not self.enable_npu_transfer_validation:
+            return None
+        # Sealing follows graph capture, before the first latent transfer may
+        # initialize its lazy layout. Use the already validated runtime count;
+        # the mirrored num_layers may describe the preflighted indexer group.
+        runtime_counts = self.runtime_kv_group_layer_counts
+        if runtime_counts is None:
+            expected_layers = self._expected_group_layers(0)
+        else:
+            expected_layers = runtime_counts[0]
+            initialized_layers = self.get_num_layers(0)
+            if initialized_layers is not None and initialized_layers != expected_layers:
+                raise ValueError(
+                    "Sparse destination layout disagrees with runtime layers"
+                )
+        if len(kvcaches_ref) != expected_layers:
+            raise ValueError("Cannot seal sparse destinations with wrong layer count")
+        signature = tuple(
+            self._vllm_layer_cache_identity_signature(layer) for layer in kvcaches_ref
+        )
+        binding = getattr(self, "_sealed_sparse_destination_layout", None)
+        if binding is not None:
+            if signature != binding.signature:
+                raise RuntimeError("Sealed sparse destinations changed; restart worker")
+            return binding
+        binding = _SparseDestinationLayout(
+            kvcaches_ref,
+            signature,
+            tuple(
+                (layer,) if isinstance(layer, torch.Tensor) else tuple(layer)
+                for layer in kvcaches_ref
+            ),
+        )
+        self._sealed_sparse_destination_layout = binding
+        return binding
+
+    def _get_or_create_sparse_destination_plan(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        slot_mapping_ref: torch.Tensor,
+        sparse_kv_format: int,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        expected_device: Optional[torch.device],
+        diagnostics: Optional[dict[str, Any]] = None,
+        registered_destination_layout: Optional[_SparseDestinationLayout] = None,
+    ) -> _SparseDestinationPlan:
+        """Resolve process-invariant native states for one destination group."""
+        resolve_started = time.perf_counter() if diagnostics is not None else 0.0
+        if expected_device is None:
+            raise RuntimeError(f"kv_group={kv_group} has no initialized NPU device")
+        num_layers = len(kvcaches_ref)
+        if num_layers != self._expected_group_layers(kv_group):
+            raise ValueError(
+                "Prepared sparse destination has the wrong layer count: "
+                f"kvcaches={num_layers}, "
+                f"expected={self._expected_group_layers(kv_group)}"
+            )
+        if slot_mapping_ref.device != expected_device:
+            raise ValueError(
+                "Prepared sparse slot mapping is on the wrong device: "
+                f"device={slot_mapping_ref.device}, expected={expected_device}"
+            )
+
+        binding = registered_destination_layout
+        c8 = kv_group == 1 and getattr(self, "indexer_c8_layout", None) is not None
+        if binding is not None and (
+            binding is not getattr(self, "_sealed_sparse_destination_layout", None)
+            or kv_group != 0
+            or kvcaches_ref is not binding.kvcaches_ref
+            or not self.enable_npu_transfer_validation
+        ):
+            raise RuntimeError("Stale or incompatible sparse destination binding")
+        signature = (
+            slot_mapping_ref.dtype,
+            str(slot_mapping_ref.device),
+            int(sparse_kv_format),
+            int(sparse_k_hidden_dims),
+            int(sparse_v_hidden_dims),
+            int(sparse_dsa_hidden_dims),
+            tuple(
+                tuple(
+                    (int(t.data_ptr()), self._tensor_layout_signature(t)) for t in layer
+                )
+                for layer in kvcaches_ref
+            )
+            if c8
+            else binding.signature
+            if binding is not None
+            else (
+                tuple(
+                    self._vllm_layer_cache_identity_signature(layer)
+                    for layer in kvcaches_ref
+                )
+                if getattr(self, "enable_npu_transfer_validation", False)
+                else ()
+            ),
+        )
+        plans = getattr(self, "_sparse_destination_plans", None)
+        if plans is None:
+            plans = {}
+            self._sparse_destination_plans = plans
+        plan = plans.pop(kv_group, None)
+        if (
+            plan is not None
+            and (plan.kvcaches_ref is kvcaches_ref or c8)
+            and plan.signature == signature
+        ):
+            if binding is not None and plan.binding is not binding:
+                # Associate an existing plan once. Later tuple comparisons skip
+                # the shared signature object by identity, without walking layers.
+                plan = _SparseDestinationPlan(
+                    kvcaches_ref, signature, plan.states, binding
+                )
+            plans[kv_group] = plan
+            if diagnostics is not None:
+                diagnostics["destination_plan_cache_hit"] = True
+                diagnostics["destination_plan_resolve_ms"] = round(
+                    (time.perf_counter() - resolve_started) * 1000, 3
+                )
+            return plan
+
+        states = (
+            tuple(
+                lmc_ops.IndexerC8State(
+                    layer[0],
+                    layer[1] if len(layer) == 2 else None,
+                    self._group_layouts[kv_group].layer_slot_factors[i],
+                    **(
+                        {"block_map": self._group_layouts[kv_group].block_map_device}
+                        if getattr(
+                            self._group_layouts[kv_group], "block_map_device", None
+                        )
+                        is not None
+                        and layer[0].dtype == torch.int8
+                        else {}
+                    ),
+                )
+                for i, layer in enumerate(kvcaches_ref)
+            )
+            if c8
+            else tuple(
+                prepare_sparse_direct_destination_state(
+                    kvcaches_ref[layer_id],
+                    slot_mapping_ref,
+                    sparse_kv_format,
+                    sparse_k_hidden_dims,
+                    sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims,
+                )
+                for layer_id in range(num_layers)
+            )
+        )
+        if (
+            binding is not None
+            and binding is not self._sealed_sparse_destination_layout
+        ):
+            raise RuntimeError("Sparse destination binding changed during preparation")
+        plan = _SparseDestinationPlan(kvcaches_ref, signature, states, binding)
+        if c8:
+            plan.c8_group = lmc_ops.IndexerC8GroupState(list(states))
+        plans[kv_group] = plan
+        while len(plans) > _SPARSE_DESTINATION_PLAN_CACHE_SIZE:
+            del plans[next(iter(plans))]
+        if diagnostics is not None:
+            diagnostics["destination_plan_cache_hit"] = False
+            diagnostics["destination_plan_resolve_ms"] = round(
+                (time.perf_counter() - resolve_started) * 1000, 3
+            )
+        return plan
+
+    def _sparse_direct_state_key(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        layer_tensors: List[torch.Tensor],
+        slot_mapping_ref: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        source_signature: Optional[tuple] = None,
+    ) -> Optional[tuple]:
+        if kvcaches_ref is None or not layer_tensors:
+            return None
+        if total_tokens <= 0:
+            total_tokens = self._sparse_total_tokens_from_layer_chunks(
+                layer_tensors, kv_group, layer_id
+            )
+        if source_signature is None:
+            source_signature = self._sparse_direct_source_signature(
+                layer_tensors=layer_tensors,
+                slot_mapping_ref=slot_mapping_ref,
+                total_tokens=total_tokens,
+                sparse_kv_format=sparse_kv_format,
+                sparse_token_major=sparse_token_major,
+                sparse_vllm_two_major=sparse_vllm_two_major,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            )
+        vllm_signature = self._vllm_layer_cache_identity_signature(
+            kvcaches_ref[layer_id]
+        )
+        return (
+            id(kvcaches_ref),
+            kv_group,
+            layer_id,
+            vllm_signature,
+            source_signature,
+        )
+
+    def _get_or_create_sparse_direct_layer_state(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        layer_tensors: List[torch.Tensor],
+        slot_mapping_ref: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        source_signature: Optional[tuple] = None,
+        return_key: bool = False,
+        require_prepared: bool = False,
+    ):
+        if kvcaches_ref is None:
+            return (None, None) if return_key else None
+
+        if self._sparse_direct_layer_states is None:
+            self._sparse_direct_layer_states = {}
+
+        if not layer_tensors:
+            return (None, None) if return_key else None
+
+        if total_tokens <= 0:
+            total_tokens = self._sparse_total_tokens_from_layer_chunks(
+                layer_tensors, kv_group, layer_id
+            )
+
+        state_key = self._sparse_direct_state_key(
+            kvcaches_ref=kvcaches_ref,
+            kv_group=kv_group,
+            layer_id=layer_id,
+            layer_tensors=layer_tensors,
+            slot_mapping_ref=slot_mapping_ref,
+            total_tokens=total_tokens,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            source_signature=source_signature,
+        )
+        assert state_key is not None
+        state = self._sparse_direct_layer_states.get(state_key)
+        if state is not None:
+            return (state, state_key) if return_key else state
+
+        if require_prepared:
+            raise RuntimeError(
+                "Ascend dense-direct layer state was not prepared before the "
+                "layerwise-prefill transfer window: "
+                f"kv_group={kv_group}, layer={layer_id}"
+            )
+
+        state = prepare_sparse_direct_layer_state(
+            layer_tensors[0],
+            kvcaches_ref[layer_id],
+            slot_mapping_ref,
+            sparse_token_major,
+            sparse_vllm_two_major,
+            sparse_kv_format,
+            sparse_k_hidden_dims,
+            sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims,
+            total_tokens,
+        )
+        self._sparse_direct_layer_states[state_key] = state
+        return (state, state_key) if return_key else state
+
+    @staticmethod
+    def _unpack_sparse_dynamic_request(
+        sparse_request: Any,
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """Normalize the vLLM-owned portion of one sparse layer payload."""
+        selected_token_counts = None
+        target_slot_mapping = None
+        payload_event = None
+        if isinstance(sparse_request, dict):
+            selected_token_idx = sparse_request.get("selected_token_ids")
+            token_start_index = sparse_request.get("token_start_index", 0)
+            target_slot_mapping = sparse_request.get("target_slot_mapping")
+            selected_token_counts = sparse_request.get("selected_token_counts")
+            payload_event = sparse_request.get(
+                "payload_events", sparse_request.get("payload_event")
+            )
+        elif isinstance(sparse_request, tuple):
+            if len(sparse_request) == 4:
+                (
+                    selected_token_idx,
+                    token_start_index,
+                    target_slot_mapping,
+                    selected_token_counts,
+                ) = sparse_request
+            elif len(sparse_request) == 3:
+                (
+                    selected_token_idx,
+                    token_start_index,
+                    target_slot_mapping,
+                ) = sparse_request
+            elif len(sparse_request) == 2:
+                selected_token_idx, token_start_index = sparse_request
+            else:
+                raise ValueError("Sparse payload tuple must have 2, 3, or 4 items")
+        else:
+            selected_token_idx = sparse_request
+            token_start_index = 0
+        return (
+            selected_token_idx,
+            token_start_index,
+            target_slot_mapping,
+            payload_event,
+            selected_token_counts,
+        )
+
+    @staticmethod
+    def _normalize_sparse_selection(
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        target_slot_mapping: Optional[Union[torch.Tensor, list]],
+    ) -> tuple[Optional[Union[torch.Tensor, list]], bool]:
+        """Preserve dense-bootstrap intent before packing materializes it.
+
+        Without an explicit target map, the existing contract treats both
+        ``None`` and an empty selection as an implicit dense bootstrap. With
+        an explicit target map, an empty selection remains an explicit no-op
+        and is validated by ``_pack_sparse_explicit_slot_inputs``.
+        """
+        if target_slot_mapping is None and selected_token_idx is not None:
+            selection_empty = (
+                selected_token_idx.numel() == 0
+                if isinstance(selected_token_idx, torch.Tensor)
+                else len(selected_token_idx) == 0
+            )
+            if selection_empty:
+                selected_token_idx = None
+        return selected_token_idx, selected_token_idx is not None
+
+    def _pack_sparse_layer_inputs(
+        self,
+        slot_mapping: torch.Tensor,
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        token_start_index: int,
+        target_slot_mapping: Optional[Union[torch.Tensor, list]] = None,
+        selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build parallel destination/source arrays for the sparse copy kernel."""
+        if selected_token_idx is not None and not isinstance(
+            selected_token_idx, torch.Tensor
+        ):
+            selected_token_idx = torch.tensor(
+                selected_token_idx, dtype=torch.int32, device=self.kv_device
+            )
+
+        if target_slot_mapping is not None:
+            packed, selected, _ = self._pack_sparse_explicit_slot_inputs(
+                selected_token_idx,
+                target_slot_mapping,
+                selected_token_counts,
+            )
+            return packed, selected
+
+        if selected_token_idx is not None and selected_token_idx.numel() > 0:
+            if selected_token_idx.dim() > 1:
+                rows = selected_token_idx.reshape(selected_token_idx.shape[0], -1)
+                starts = token_start_index
+                start_values = None
+                if isinstance(starts, int):
+                    start_values = [int(starts)] * int(rows.shape[0])
+                elif isinstance(starts, (list, tuple)):
+                    if len(starts) == 1 and rows.shape[0] != 1:
+                        start_values = [int(starts[0])] * int(rows.shape[0])
+                    else:
+                        start_values = [int(start) for start in starts]
+                elif isinstance(starts, torch.Tensor) and starts.device.type == "cpu":
+                    starts = starts.reshape(-1).to(dtype=torch.long)
+                    if starts.numel() == 1 and rows.shape[0] != 1:
+                        starts = starts.expand(rows.shape[0])
+                    start_values = [int(start) for start in starts.tolist()]
+                else:
+                    if not isinstance(starts, torch.Tensor):
+                        starts = torch.tensor(
+                            starts,
+                            dtype=torch.long,
+                            device=slot_mapping.device,
+                        )
+                    starts = starts.reshape(-1).to(
+                        device=slot_mapping.device, dtype=torch.long
+                    )
+                    if starts.numel() == 1 and rows.shape[0] != 1:
+                        starts = starts.expand(rows.shape[0])
+                num_starts = (
+                    len(start_values)
+                    if start_values is not None
+                    else int(starts.numel())
+                )
+                if num_starts != int(rows.shape[0]):
+                    raise ValueError(
+                        "token_start_index rows must match selected_token_idx rows: "
+                        f"{num_starts} vs {rows.shape[0]}"
+                    )
+                if start_values is None:
+                    row_width = int(rows.shape[1])
+                    row_offsets = torch.arange(
+                        row_width,
+                        dtype=torch.long,
+                        device=slot_mapping.device,
+                    )
+                    gather_indices = (
+                        starts.reshape(-1, 1) + row_offsets.reshape(1, -1)
+                    ).reshape(-1)
+                    slot_mapping_packed = slot_mapping[gather_indices]
+                    selected_token_idx = rows.reshape(-1)
+                    selected_token_idx = self._sparse_selected_token_idx(
+                        selected_token_idx, slot_mapping_packed.shape[0]
+                    )
+                    return slot_mapping_packed, selected_token_idx
+
+                slot_chunks = []
+                selected_chunks = []
+                for row_idx in range(rows.shape[0]):
+                    row = rows[row_idx]
+                    start = start_values[row_idx]
+                    end = start + int(row.numel())
+                    if end > int(slot_mapping.numel()):
+                        raise ValueError(
+                            "sparse slot_mapping too short for multi-row selected "
+                            f"tokens: start={start} end={end} "
+                            f"slot_mapping={slot_mapping.numel()}"
+                        )
+                    slot_chunks.append(slot_mapping[start:end])
+                    selected_chunks.append(row)
+                slot_mapping_packed = (
+                    torch.cat(slot_chunks, dim=0) if slot_chunks else slot_mapping[:0]
+                )
+                selected_token_idx = (
+                    torch.cat(selected_chunks, dim=0)
+                    if selected_chunks
+                    else selected_token_idx.reshape(-1)[:0]
+                )
+                selected_token_idx = self._sparse_selected_token_idx(
+                    selected_token_idx, slot_mapping_packed.shape[0]
+                )
+                return slot_mapping_packed, selected_token_idx
+
+            num_sparse = int(selected_token_idx.numel())
+            start = int(token_start_index)
+            end = start + num_sparse
+            if end <= slot_mapping.numel():
+                slot_mapping_packed = slot_mapping[start:end]
+            elif start < slot_mapping.numel():
+                slot_mapping_packed = slot_mapping[start:]
+                selected_token_idx = selected_token_idx[: slot_mapping_packed.numel()]
+            else:
+                slot_mapping_packed = slot_mapping[:0]
+                selected_token_idx = selected_token_idx[:0]
+            selected_token_idx = self._sparse_selected_token_idx(
+                selected_token_idx, slot_mapping_packed.shape[0]
+            )
+            return slot_mapping_packed, selected_token_idx
+
+        slot_mapping_packed = (
+            slot_mapping
+            if token_start_index == 0
+            else slot_mapping[int(token_start_index) :]
+        )
+        selected_token_idx = self._sparse_selected_token_idx(
+            None, slot_mapping_packed.shape[0]
+        )
+        return slot_mapping_packed, selected_token_idx
+
+    def _pack_sparse_explicit_slot_inputs(
+        self,
+        selected_token_idx: Optional[Union[torch.Tensor, list]],
+        target_slot_mapping: Union[torch.Tensor, list],
+        selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Use caller-provided target slots for row-wise MTP sparse loads."""
+        if selected_token_idx is None:
+            selected_token_idx = []
+        if not isinstance(selected_token_idx, torch.Tensor):
+            selected_token_idx = torch.tensor(
+                selected_token_idx, dtype=torch.int32, device=self.kv_device
+            )
+        if (
+            selected_token_idx.dtype != torch.int32
+            or selected_token_idx.device != self.kv_device
+        ):
+            selected_token_idx = selected_token_idx.to(
+                device=self.kv_device, dtype=torch.int32
+            )
+
+        if not isinstance(target_slot_mapping, torch.Tensor):
+            target_slot_mapping = torch.tensor(
+                target_slot_mapping, dtype=torch.long, device=self.kv_device
+            )
+        if (
+            target_slot_mapping.dtype != torch.long
+            or target_slot_mapping.device != self.kv_device
+        ):
+            target_slot_mapping = target_slot_mapping.to(
+                device=self.kv_device, dtype=torch.long
+            )
+        if selected_token_idx.shape != target_slot_mapping.shape:
+            raise ValueError(
+                "target_slot_mapping and selected_token_idx must have the same "
+                f"shape: {tuple(target_slot_mapping.shape)} vs "
+                f"{tuple(selected_token_idx.shape)}"
+            )
+        if selected_token_counts is not None:
+            if not isinstance(selected_token_counts, torch.Tensor):
+                selected_token_counts = torch.tensor(
+                    selected_token_counts,
+                    dtype=torch.long,
+                    device=self.kv_device,
+                )
+            if (
+                selected_token_counts.dtype != torch.int32
+                or selected_token_counts.device != self.kv_device
+            ):
+                selected_token_counts = selected_token_counts.to(
+                    device=self.kv_device, dtype=torch.int32
+                )
+            selected_token_counts = selected_token_counts.reshape(-1)
+            if selected_token_idx.dim() == 1:
+                if selected_token_counts.numel() != 1:
+                    raise ValueError(
+                        "single-row sparse payload requires exactly one "
+                        f"selected_token_count, got {selected_token_counts.numel()}"
+                    )
+            elif selected_token_idx.dim() == 2:
+                if selected_token_counts.numel() != selected_token_idx.shape[0]:
+                    raise ValueError(
+                        "selected_token_counts rows must match sparse payload rows: "
+                        f"{selected_token_counts.numel()} vs "
+                        f"{selected_token_idx.shape[0]}"
+                    )
+            else:
+                raise ValueError(
+                    "selected_token_counts requires a one- or two-dimensional "
+                    f"sparse payload, got {selected_token_idx.dim()} dimensions"
+                )
+        else:
+            selected_token_idx = selected_token_idx.reshape(-1)
+            target_slot_mapping = target_slot_mapping.reshape(-1)
+        if int(target_slot_mapping.numel()) != int(selected_token_idx.numel()):
+            raise ValueError(
+                "target_slot_mapping and selected_token_idx must have the same "
+                f"length: {target_slot_mapping.numel()} vs {selected_token_idx.numel()}"
+            )
+        selected_token_idx = self._sparse_selected_token_idx(
+            selected_token_idx, target_slot_mapping.numel()
+        )
+        return target_slot_mapping, selected_token_idx, selected_token_counts
+
+    def _run_sparse_staging_kv_transfer_layer(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        load_stream: torch.cuda.Stream,
+        current_stream: torch.cuda.Stream,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        total_tokens: int,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        layer_tensors: List[torch.Tensor],
+        payload_event: Optional[Any] = None,
+    ) -> str:
+        """Diagnostic fallback: CPU chunks -> NPU staging -> paged KV.
+
+        This keeps the same sparse source rows and target slots as the direct
+        registered-host path, but routes data through the older staging kernel.
+        It is intentionally behind LMCACHE_ASCEND_SPARSE_DIRECT_DISABLE because
+        it is slower and uses a full retrieved-token staging buffer.
+        """
+        num_sparse = int(selected_token_idx.numel())
+        if num_sparse == 0 or not layer_tensors:
+            return "none"
+
+        chunk_offsets: list[int] = []
+        chunk_sizes: list[int] = []
+        covered_tokens = 0
+        for tensor in layer_tensors:
+            chunk_tokens = self._lmc_plane_num_tokens(tensor, kv_group, layer_id)
+            chunk_offsets.append(covered_tokens)
+            chunk_sizes.append(chunk_tokens)
+            covered_tokens += chunk_tokens
+
+        if total_tokens <= 0:
+            total_tokens = covered_tokens
+        if covered_tokens < int(total_tokens):
+            raise ValueError(
+                "Sparse staging fallback has insufficient CPU chunk tokens: "
+                f"kv_group={kv_group} layer_id={layer_id} "
+                f"covered_tokens={covered_tokens} total_tokens={int(total_tokens)}"
+            )
+        expected_fmt = self._expected_memory_format(kv_group)
+        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
+        try:
+            tmp_gpu_buffer_obj, staging_tensor = (
+                self._allocate_layerwise_staging_buffer(
+                    num_tokens=covered_tokens,
+                    kv_group=kv_group,
+                    layout=self._group_layout(kv_group),
+                    k_hidden_dims=sparse_k_hidden_dims,
+                    v_hidden_dims=sparse_v_hidden_dims,
+                    dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    expected_fmt=expected_fmt,
+                )
+            )
+            with torch.cuda.stream(load_stream):
+                load_stream.wait_stream(current_stream)
+                payload_events = _payload_event_list(payload_event)
+                if payload_events:
+                    for event in payload_events:
+                        load_stream.wait_event(event)
+                assert staging_tensor is not None
+                batched_fused_sparse_single_layer_kv_transfer(
+                    layer_tensors,
+                    staging_tensor,
+                    kvcaches_ref[layer_id],
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    chunk_offsets,
+                    chunk_sizes,
+                    sparse_kv_format,
+                    sparse_token_major,
+                    sparse_vllm_two_major,
+                    sparse_k_hidden_dims,
+                    sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims,
+                )
+            return "batched_fused_sparse_single_layer_kv_transfer"
+        finally:
+            current_stream.wait_stream(load_stream)
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+
+    @staticmethod
+    def _limit_sparse_transfer_inputs(
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not _SPARSE_TRANSFER_TOPK
+            or _SPARSE_TRANSFER_TOPK >= selected_token_idx.numel()
+        ):
+            return slot_mapping_packed, selected_token_idx
+        return (
+            slot_mapping_packed[:_SPARSE_TRANSFER_TOPK],
+            selected_token_idx[:_SPARSE_TRANSFER_TOPK],
+        )
+
+    @classmethod
+    def _maybe_limit_sparse_transfer_inputs(
+        cls,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        *,
+        has_explicit_sparse_selection: bool,
+        selected_token_counts: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the debug TOPK bound only to simple explicit selections."""
+        if not has_explicit_sparse_selection or selected_token_counts is not None:
+            return slot_mapping_packed, selected_token_idx
+        return cls._limit_sparse_transfer_inputs(
+            slot_mapping_packed,
+            selected_token_idx,
+        )
+
+    @staticmethod
+    def _validate_sparse_fixed_chunk_coverage(
+        chunk_count: int,
+        chunk_size: int,
+        total_tokens: int,
+    ) -> None:
+        expected = (total_tokens + chunk_size - 1) // chunk_size
+        if chunk_count != expected:
+            raise ValueError(
+                "Sparse direct retrieve requires exact full/tail chunk coverage: "
+                f"chunks={chunk_count}, expected={expected}, "
+                f"chunk_size={chunk_size}, total_tokens={total_tokens}"
+            )
+
+    @_trace_sparse_h2d_python
+    def _run_sparse_direct_kv_transfer_layer(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        load_stream: torch.cuda.Stream,
+        load_stream_idx: int,
+        current_stream: torch.cuda.Stream,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        chunk_size: int,
+        total_tokens: int,
+        chunk_ptrs_npu: torch.Tensor,
+        sparse_kv_format: int,
+        sparse_token_major: bool,
+        sparse_vllm_two_major: bool,
+        sparse_k_hidden_dims: int,
+        sparse_v_hidden_dims: int,
+        sparse_dsa_hidden_dims: int,
+        sparse_host_interleaved: bool,
+        layer_tensors: Optional[List[torch.Tensor]] = None,
+        slot_mapping_ref: Optional[torch.Tensor] = None,
+        cpu_tensors: Optional[List[torch.Tensor]] = None,
+        payload_event: Optional[Any] = None,
+        selected_token_counts: Optional[torch.Tensor] = None,
+        req_id: Optional[str] = None,
+        trace_explicit: bool = False,
+    ) -> str:
+        join = getattr(self, "_active_sparse_load_join", None)
+        _sparse_h2d_python_stage(join, "input_metadata")
+        num_sparse = int(selected_token_idx.numel())
+        if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
+            return "none"
+        chunk_count = int(chunk_ptrs_npu.numel())
+        chunk_size_int = int(chunk_size)
+        _sparse_h2d_python_stage(join, "validate_coverage")
+        self._validate_sparse_fixed_chunk_coverage(
+            chunk_count, chunk_size_int, int(total_tokens)
+        )
+        resolve_tensors = (
+            layer_tensors
+            if layer_tensors is not None
+            else (cpu_tensors if cpu_tensors is not None else [])
+        )
+        resolve_slot_mapping = (
+            slot_mapping_ref if slot_mapping_ref is not None else slot_mapping_packed
+        )
+        _sparse_h2d_python_stage(join, "pointer_signature")
+        runtime_source_signature = self._sparse_direct_pointer_cache_signature(
+            chunk_ptrs_npu=chunk_ptrs_npu,
+            slot_mapping_ref=resolve_slot_mapping,
+            source_layout_ref=resolve_tensors[0] if resolve_tensors else None,
+            total_tokens=total_tokens,
+            chunk_size=chunk_size,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+        )
+
+        _sparse_h2d_python_stage(join, "resolve_layer_state")
+        layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
+            kvcaches_ref=kvcaches_ref,
+            kv_group=kv_group,
+            layer_id=layer_id,
+            layer_tensors=resolve_tensors,
+            slot_mapping_ref=resolve_slot_mapping,
+            total_tokens=total_tokens,
+            sparse_kv_format=sparse_kv_format,
+            sparse_token_major=sparse_token_major,
+            sparse_vllm_two_major=sparse_vllm_two_major,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            source_signature=runtime_source_signature,
+            return_key=True,
+        )
+        if validate_key is None:
+            validate_key = (kv_group, layer_id)
+
+        # The custom kernel consumes these raw pointers asynchronously.
+        _sparse_h2d_python_stage(join, "record_stream_ownership")
+        slot_mapping_packed.record_stream(load_stream)
+        selected_token_idx.record_stream(load_stream)
+        chunk_ptrs_npu.record_stream(load_stream)
+        if selected_token_counts is not None:
+            selected_token_counts.record_stream(load_stream)
+
+        if join is not None:
+            if self.load_stream_list[load_stream_idx] is not load_stream:
+                raise RuntimeError("sparse load stream index does not match its stream")
+            join.used_stream_indices.add(load_stream_idx)
+        _sparse_h2d_python_stage(join, "load_stream_context")
+        with torch.cuda.stream(load_stream):
+            _sparse_h2d_python_stage(join, "load_stream_dependency")
+            load_stream.wait_stream(current_stream)
+            if layer_state is not None:
+                _sparse_h2d_python_stage(join, "validation_decision")
+                validate_inputs = (
+                    getattr(self, "enable_npu_transfer_validation", True)
+                    and validate_key not in self._sparse_direct_validated_layers
+                )
+                _sparse_h2d_python_stage(join, "native_fast_submit")
+                sparse_mla_dsa_batched_direct_kv_transfer_fast(
+                    layer_state,
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    chunk_ptrs_npu,
+                    chunk_size,
+                    total_tokens,
+                    sparse_host_interleaved,
+                    validate_inputs,
+                    selected_token_counts,
+                )
+                if validate_inputs:
+                    self._sparse_direct_validated_layers.add(validate_key)
+                kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer_fast"
+            else:
+                _sparse_h2d_python_stage(join, "fallback_input_check")
+                assert cpu_tensors is not None and len(cpu_tensors) > 0
+                _sparse_h2d_python_stage(join, "native_fallback_submit")
+                sparse_mla_dsa_batched_direct_kv_transfer(
+                    cpu_tensors,
+                    kvcaches_ref[layer_id],
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    chunk_size,
+                    total_tokens,
+                    sparse_kv_format,
+                    sparse_token_major,
+                    sparse_vllm_two_major,
+                    sparse_k_hidden_dims,
+                    sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims,
+                    sparse_host_interleaved,
+                    chunk_ptrs_npu,
+                    selected_token_counts,
+                )
+                kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer"
+            _sparse_h2d_python_stage(join, "native_return")
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None:
+                fence_debug.wait("d_load", kv_group, layer_id, load_stream, req=req_id)
+            if (getattr(self, "kv_trace", None) is not None
+                    and req_id and trace_explicit):
+                self.trace_selected_kv(req_id, kv_group, layer_id,
+                    kvcaches_ref[layer_id], slot_mapping_packed,
+                    selected_token_idx, selected_token_counts, total_tokens)
+
+        if join is None:
+            current_stream.wait_stream(load_stream)
+        return kernel_name
+
+    def _run_c8_indexer_bootstrap(
+        self, plan: _SparseDestinationPlan, pointers: torch.Tensor, layer_id: int,
+        slots: torch.Tensor, total_tokens: int, chunk_size: int,
+        explicit_selection: bool,
+    ) -> None:
+        """Group 1 uses the full prefix through the sparse generator protocol."""
+        if explicit_selection:
+            raise ValueError(
+                "Indexer C8 bootstrap requires the implicit full-prefix selection"
+            )
+        if total_tokens <= 0:
+            return
+        self._validate_sparse_fixed_chunk_coverage(
+            pointers.numel(), chunk_size, total_tokens
+        )
+        if slots.numel() < total_tokens:
+            raise ValueError(
+                "Indexer C8 bootstrap slot mapping is shorter than its source prefix"
+            )
+        current = torch.npu.current_stream()
+        join = getattr(self, "_active_sparse_load_join", None)
+        stream = self.load_stream_list[0] if join is not None else current
+        if join is not None:
+            # Register before launch so the existing failure path fences it too.
+            join.used_stream_indices.add(0)
+        slots = slots[:total_tokens]
+        dummy = self._dense_direct_dummy_metadata_tensor()
+        slots.record_stream(stream)
+        pointers.record_stream(stream)
+        dummy.record_stream(stream)
+        with self._stream_context_or_null(stream):
+            if stream is not current:
+                stream.wait_stream(current)
+            lmc_ops.indexer_c8_transfer_prepared(
+                plan.states[layer_id], pointers, dummy, dummy, slots,
+                chunk_size, False, fixed_chunks=True,
+            )
+
+    def _run_prepared_sparse_direct_kv_transfer_layer(
+        self,
+        *,
+        plan: _SparseDestinationPlan,
+        chunk_ptrs_npu: torch.Tensor,
+        layer_id: int,
+        slot_mapping_packed: torch.Tensor,
+        selected_token_idx: torch.Tensor,
+        chunk_size: int,
+        total_tokens: int,
+        sparse_host_interleaved: bool,
+        selected_token_counts: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Launch one prepared layer directly on the current compute stream."""
+        if selected_token_idx.numel() == 0:
+            return
+        if total_tokens <= 0:
+            return
+        self._validate_sparse_fixed_chunk_coverage(
+            int(chunk_ptrs_npu.numel()), int(chunk_size), int(total_tokens)
+        )
+        sparse_mla_dsa_batched_direct_kv_transfer_prepared(
+            plan.states[layer_id],
+            slot_mapping_packed,
+            selected_token_idx,
+            chunk_ptrs_npu,
+            chunk_size,
+            total_tokens,
+            sparse_host_interleaved,
+            selected_token_counts,
+            layer_id,
+        )
+
+    def _sparse_selected_token_idx(
+        self,
+        selected_token_idx: Optional[torch.Tensor],
+        num_sparse: int,
+    ) -> torch.Tensor:
+        if selected_token_idx is None:
+            cached = self._layerwise_sparse_idx_cache
+            if cached is None or cached.shape[0] != num_sparse:
+                cached = torch.arange(
+                    num_sparse, dtype=torch.int32, device=self.kv_device
+                )
+                self._layerwise_sparse_idx_cache = cached
+            return cached
+        if (
+            selected_token_idx.dtype == torch.int32
+            and selected_token_idx.device == self.kv_device
+        ):
+            return selected_token_idx
+        return selected_token_idx.to(device=self.kv_device, dtype=torch.int32)
+
+    def _is_mla_dsa_format(self, kv_group: Optional[int] = None) -> bool:
+        fmt = self._fmt_for(kv_group)
+        return fmt in (
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.DSA_KV,
+            KVCacheFormat.MLA_LATENT,
+            KVCacheFormat.DSA_INDEX,
+        )
+
+    def _layerwise_token_major(self, kv_group: Optional[int] = None) -> bool:
+        # GQA uses token-interleaved CPU chunks; MLA/DSA use stacked K|V|DSA planes.
+        return not self._is_mla_dsa_format(kv_group)
+
+    def _sparse_lmc_host_interleaved(self, kv_group: Optional[int] = None) -> bool:
+        # Must match batched_fused CPU layout (_layerwise_token_major).
+        return self._layerwise_token_major(kv_group)
+
+    def notify_sparse_memory_objs_updated(self) -> None:
+        """Reset fast-path state after sparse source MemoryObjs change.
+
+        The legacy path caches layout derived from a sample source tensor. The
+        prepared path is not reset here because its native plan contains only
+        process-owned destination state and consumes request pointers dynamically.
+        """
+        self._reset_sparse_direct_layer_states()
+
+    def _resolve_sparse_chunk_ptrs_npu(
+        self,
+        layer_id: int,
+        cpu_tensors: List[torch.Tensor],
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = None,
+        expected_num_chunks: Optional[int] = None,
+        cached_chunk_dev_ptrs: Optional[List[List[int]]] = None,
+        source_objs: Optional[Sequence[MemoryObj]] = None,
+        stream: Optional[Any] = None,
+    ) -> torch.Tensor:
+        num_chunks = (
+            len(cpu_tensors)
+            if expected_num_chunks is None
+            else expected_num_chunks
+        )
+        if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            if cached_chunk_dev_ptrs is None:
+                raise RuntimeError("Deferred sparse pointer cache has no host rows")
+            self.materialize_sparse_chunk_ptr_cache(
+                cached_chunk_dev_ptrs, cached_chunk_ptrs_npu
+            )
+        if cached_chunk_ptrs_npu is not None and layer_id < len(cached_chunk_ptrs_npu):
+            cached = cached_chunk_ptrs_npu[layer_id]
+            if cached is not None and cached.numel() == num_chunks:
+                if cached_chunk_dev_ptrs is not None and (
+                    layer_id >= len(cached_chunk_dev_ptrs)
+                    or len(cached_chunk_dev_ptrs[layer_id]) != num_chunks
+                ):
+                    raise RuntimeError(
+                        "Ascend sparse pointer-cache reuse has incomplete host "
+                        f"coverage at layer {layer_id}: chunks={num_chunks}."
+                    )
+                if cached.dtype != torch.long:
+                    raise RuntimeError(
+                        "Ascend sparse pointer-cache reuse failed: cached NPU "
+                        "pointer tensor has invalid dtype before direct kernel "
+                        f"launch at layer {layer_id}: dtype={cached.dtype}, "
+                        "expected=torch.int64."
+                    )
+                expected_device = torch.device(self.kv_device)
+                if cached.device != expected_device:
+                    raise RuntimeError(
+                        "Ascend sparse pointer-cache reuse failed: cached NPU "
+                        "pointer tensor is on the wrong device before direct "
+                        f"kernel launch at layer {layer_id}: "
+                        f"device={cached.device}, expected={expected_device}."
+                    )
+                return cached
+
+        dev_ptrs = None
+        if cached_chunk_dev_ptrs is not None and layer_id < len(
+            cached_chunk_dev_ptrs
+        ):
+            cached_dev_ptrs = cached_chunk_dev_ptrs[layer_id]
+            if len(cached_dev_ptrs) == num_chunks:
+                dev_ptrs = list(cached_dev_ptrs)
+
+        pointer_sources: Sequence[Union[torch.Tensor, MemoryObj]] = (
+            source_objs if source_objs is not None else cpu_tensors
+        )
+        if dev_ptrs is None and len(pointer_sources) != num_chunks:
+            raise RuntimeError(
+                "Ascend sparse pointer-first source has no complete cached "
+                f"pointer table at layer {layer_id}: "
+                f"pointer_sources={len(pointer_sources)}, chunks={num_chunks}."
+            )
+        if dev_ptrs is None:
+            dev_ptrs = [
+                self._resolve_registered_cpu_source_device_ptr(
+                    source,
+                    layer_id=layer_id,
+                    chunk_index=chunk_index,
+                    source="_resolve_sparse_chunk_ptrs_npu",
+                )
+                for chunk_index, source in enumerate(pointer_sources)
+            ]
+        with self._stream_context_or_null(stream):
+            chunk_ptrs_npu = torch.tensor(
+                dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
+        if cached_chunk_dev_ptrs is not None:
+            while len(cached_chunk_dev_ptrs) <= layer_id:
+                cached_chunk_dev_ptrs.append([])
+            cached_chunk_dev_ptrs[layer_id] = dev_ptrs
+        if cached_chunk_ptrs_npu is not None:
+            while len(cached_chunk_ptrs_npu) <= layer_id:
+                cached_chunk_ptrs_npu.append(None)
+            cached_chunk_ptrs_npu[layer_id] = chunk_ptrs_npu
+        return chunk_ptrs_npu
+
+    def _prepare_dense_direct_chunk_metadata(
+        self,
+        chunk_offsets: List[int],
+        chunk_sizes: List[int],
+        *,
+        total_tokens: int,
+        kv_group: int,
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        if not chunk_offsets or not chunk_sizes:
+            raise ValueError(
+                "Dense direct layerwise transfer requires at least one CPU chunk."
+            )
+        if len(chunk_offsets) != len(chunk_sizes):
+            raise ValueError(
+                "Dense direct layerwise transfer chunk metadata mismatch: "
+                f"offsets={len(chunk_offsets)} sizes={len(chunk_sizes)}"
+            )
+        if chunk_offsets[0] != 0:
+            raise ValueError(
+                "Dense direct layerwise transfer chunk offsets must start at 0: "
+                f"kv_group={kv_group} first_offset={chunk_offsets[0]}"
+            )
+        expected_offset = 0
+        fixed_chunk_size = int(chunk_sizes[0])
+        fixed_layout = fixed_chunk_size > 0
+        last_chunk_idx = len(chunk_sizes) - 1
+        for chunk_idx, (offset, size) in enumerate(
+            zip(chunk_offsets, chunk_sizes, strict=False)
+        ):
+            offset = int(offset)
+            size = int(size)
+            if size <= 0:
+                raise ValueError(
+                    "Dense direct layerwise transfer chunk size must be positive: "
+                    f"kv_group={kv_group} chunk_idx={chunk_idx} size={size}"
+                )
+            if offset != expected_offset:
+                raise ValueError(
+                    "Dense direct layerwise transfer chunks must be contiguous: "
+                    f"kv_group={kv_group} chunk_idx={chunk_idx} "
+                    f"offset={offset} expected={expected_offset}"
+                )
+            expected_offset += size
+            if chunk_idx < last_chunk_idx:
+                fixed_layout = fixed_layout and size == fixed_chunk_size
+            else:
+                fixed_layout = fixed_layout and size <= fixed_chunk_size
+        if expected_offset != int(total_tokens):
+            raise ValueError(
+                "Dense direct layerwise transfer chunk metadata does not cover "
+                f"the slot mapping: kv_group={kv_group} "
+                f"covered_tokens={expected_offset} total_tokens={total_tokens}"
+            )
+        if fixed_layout:
+            dummy = self._dense_direct_dummy_metadata_tensor()
+            return fixed_chunk_size, dummy, dummy
+        return (
+            0,
+            torch.tensor(chunk_offsets, dtype=torch.int32, device=self.kv_device),
+            torch.tensor(chunk_sizes, dtype=torch.int32, device=self.kv_device),
+        )
+
+    def _dense_direct_dummy_metadata_tensor(self) -> torch.Tensor:
+        dummy = getattr(self, "_dense_direct_dummy_metadata_npu", None)
+        if (
+            dummy is None
+            or dummy.dtype != torch.int32
+            or dummy.device != torch.device(self.kv_device)
+        ):
+            dummy = torch.empty(1, dtype=torch.int32, device=self.kv_device)
+            self._dense_direct_dummy_metadata_npu = dummy
+        return dummy
+
+    @staticmethod
+    def _dense_direct_pointer_cache_signature(
+        *,
+        chunk_ptrs_npu: torch.Tensor,
+        chunk_offsets_npu: torch.Tensor,
+        chunk_sizes_npu: torch.Tensor,
+        slot_mapping_ref: torch.Tensor,
+        source_layout_ref: Optional[torch.Tensor],
+        total_tokens: int,
+        fixed_chunk_size: int,
+        dense_kv_format: int,
+        dense_token_major: bool,
+        dense_vllm_two_major: bool,
+        dense_k_hidden_dims: int,
+        dense_v_hidden_dims: int,
+        dense_dsa_hidden_dims: int,
+        direction: bool,
+    ) -> tuple:
+        return (
+            4,
+            VLLMPagedMemLayerwiseNPUConnector._tensor_layout_signature(
+                source_layout_ref
+            ),
+            chunk_ptrs_npu.dtype,
+            str(chunk_ptrs_npu.device),
+            int(chunk_ptrs_npu.numel()),
+            chunk_offsets_npu.dtype,
+            str(chunk_offsets_npu.device),
+            int(chunk_offsets_npu.numel()),
+            chunk_sizes_npu.dtype,
+            str(chunk_sizes_npu.device),
+            int(chunk_sizes_npu.numel()),
+            slot_mapping_ref.dtype,
+            str(slot_mapping_ref.device),
+            int(slot_mapping_ref.numel()),
+            int(total_tokens),
+            int(fixed_chunk_size),
+            int(dense_kv_format),
+            int(dense_token_major),
+            int(dense_vllm_two_major),
+            int(dense_k_hidden_dims),
+            int(dense_v_hidden_dims),
+            int(dense_dsa_hidden_dims),
+            int(direction),
+        )
+
+    def _prepare_prefill_c8_packets(
+        self, *, layout, kvcaches, memory_objs, block_ids_by_bank,
+        block_size, starts, ends, transfer_stream,
+    ):
+        """Prepare complete key/scale packets before the transfer-window yield.
+
+        Native packet scales follow the physical key capacity, not the valid
+        tail length. Pad each chunk's mapping with excluded slots so retained
+        pages keep that offset while only requested rows are transferred.
+        """
+        if not self.indexer_c8_layout.mixed:
+            raise ValueError("Uniform-C8 banked prefill needs an explicit logical capacity")
+        if getattr(self, "indexer_hbm_block_map", None) is not None:
+            raise ValueError("Banked prefill requires BF16 logical IDs, not a paired map")
+        if not block_ids_by_bank or block_size != 128:
+            raise ValueError(
+                "Banked C8 requires logical bank maps with 128-token blocks"
+            )
+        if any(factor != (2 if self.indexer_c8_layout.is_c8(i) else 1)
+               for i, factor in enumerate(layout.layer_slot_factors)):
+            raise ValueError("Banked mixed-C8 requires factor-2 INT8 and factor-1 BF16 views")
+        if len(memory_objs) != len(kvcaches):
+            raise ValueError("Banked C8 requires prepared source rows for every layer")
+        logical_capacity = next(
+            int(layer[0].shape[0]) * block_size
+            for i, layer in enumerate(kvcaches)
+            if not self.indexer_c8_layout.is_c8(i)
+        )
+        if len(starts) != len(ends):
+            raise ValueError("Banked C8 chunk range lengths disagree")
+        # Logical rows are identical across owners. Build each bank once on
+        # CPU, then share immutable padded metadata for equal packet capacities
+        # within this preparation only (never across requests or steps).
+        valid_slots_by_bank = []
+        for blocks in block_ids_by_bank:
+            blocks_cpu = torch.as_tensor(blocks, dtype=torch.long, device="cpu")
+            rows = []
+            for start, end in zip(starts, ends, strict=True):
+                if start < 0 or end <= start or end > len(blocks) * block_size:
+                    raise ValueError("Banked C8 range exceeds logical block table")
+                positions = torch.arange(start, end, dtype=torch.long, device="cpu")
+                slots = blocks_cpu.index_select(0, positions // block_size)
+                slots = slots * block_size + positions % block_size
+                if bool(((slots < 0) | (slots >= logical_capacity)).any()):
+                    raise ValueError("Banked C8 logical slot exceeds registered capacity")
+                rows.append(slots)
+            valid_slots_by_bank.append(rows)
+        metadata_by_capacity = {}
+        prepared = []
+        # This snapshot is before model execution, never in a layer callback.
+        transfer_stream.wait_stream(torch.npu.current_stream())
+        with self._stream_context_or_null(transfer_stream):
+            for layer_id, (layer, objects) in enumerate(zip(kvcaches, memory_objs, strict=True)):
+                objects = _layer_source_memory_objs(objects, layer_id)
+                if len(objects) != len(starts) or len(starts) != len(ends):
+                    raise ValueError("Banked C8 packet count disagrees with chunk ranges")
+                capacities, pointers = [], []
+                for chunk_id, (obj, start, end) in enumerate(zip(objects, starts, ends, strict=True)):
+                    if isinstance(obj, LayerPageMemoryObj):
+                        packet_bytes = obj.layer_size_bytes(layer_id)
+                    else:
+                        tensor = _layer_memory_tensor(obj, layer_id)
+                        packet_bytes = tensor.numel() * tensor.element_size()
+                    width = layout.layer_token_bytes[layer_id]
+                    capacity, remainder = divmod(packet_bytes, width)
+                    if remainder or not 0 < end - start <= capacity:
+                        raise ValueError("Banked C8 packet has invalid physical/valid capacity")
+                    capacities.append(capacity)
+                    pointers.append(self._resolve_registered_cpu_source_device_ptr(
+                        obj, layer_id=layer_id, chunk_index=chunk_id,
+                        source="_prepare_prefill_c8_packets",
+                    ))
+                capacity_key = tuple(capacities)
+                metadata = metadata_by_capacity.get(capacity_key)
+                if metadata is None:
+                    offsets, cursor = [], 0
+                    for capacity in capacities:
+                        offsets.append(cursor)
+                        cursor += capacity
+                    slots_by_bank = []
+                    for rows in valid_slots_by_bank:
+                        slots = torch.full((cursor,), -1, dtype=torch.long, device="cpu")
+                        for offset, valid_slots in zip(offsets, rows, strict=True):
+                            slots[offset:offset + valid_slots.numel()].copy_(valid_slots)
+                        slots_by_bank.append(slots.to(device=layout.kv_device))
+                    metadata = (
+                        torch.tensor(offsets, dtype=torch.long, device=layout.kv_device),
+                        torch.tensor(capacities, dtype=torch.long, device=layout.kv_device),
+                        tuple(slots_by_bank), max(capacities, default=0),
+                    )
+                    metadata_by_capacity[capacity_key] = metadata
+                state = lmc_ops.IndexerC8State(
+                    layer[0], layer[1] if len(layer) == 2 else None,
+                    layout.layer_slot_factors[layer_id],
+                )
+                prepared.append((state,
+                    torch.tensor(pointers, dtype=torch.long, device=layout.kv_device),
+                    *metadata))
+            ready = torch.npu.Event()
+            ready.record(transfer_stream)
+        for bank in range(len(block_ids_by_bank)):
+            self._layerwise_prefill_dma_stream(1, bank).wait_event(ready)
+        return prepared
+
+    def _submit_prefill_c8_packet(self, prepared, layer_id, bank, stream, direction):
+        state, pointers, offsets, counts, slots_by_bank, capacity = prepared[layer_id]
+        slots = slots_by_bank[bank]
+        for tensor in (pointers, offsets, counts, slots):
+            tensor.record_stream(stream)
+        lmc_ops.indexer_c8_transfer_prepared(
+            state, pointers, offsets, counts, slots, capacity, direction,
+            fixed_chunks=False,
+        )
+
+    def _run_dense_direct_kv_transfer_layer(
+        self,
+        *,
+        kvcaches_ref: list,
+        kv_group: int,
+        layer_id: int,
+        transfer_stream,
+        current_stream,
+        slot_mapping_full: torch.Tensor,
+        chunk_ptrs_npu: torch.Tensor,
+        chunk_offsets_npu: torch.Tensor,
+        chunk_sizes_npu: torch.Tensor,
+        total_tokens: int,
+        fixed_chunk_size: int,
+        dense_kv_format: int,
+        dense_token_major: bool,
+        dense_vllm_two_major: bool,
+        dense_k_hidden_dims: int,
+        dense_v_hidden_dims: int,
+        dense_dsa_hidden_dims: int,
+        dense_host_interleaved: bool,
+        layer_tensors: List[torch.Tensor],
+        direction: bool,
+        destination_plan: Optional[_SparseDestinationPlan] = None,
+        c8_chunk_capacity: int = 0,
+        defer_consumer_wait: bool = False,
+        require_prepared_state: bool = False,
+        prepared_layer_state: Any = None,
+        prepared_validation_key: Optional[tuple] = None,
+    ) -> None:
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            defer_consumer_wait = False
+            require_prepared_state = False
+            prepared_layer_state = None
+            prepared_validation_key = None
+        num_tokens = int(slot_mapping_full.numel())
+        if num_tokens == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
+            return
+
+        # Custom kernels consume raw pointers on transfer_stream, so make the
+        # allocator retain per-layer metadata and record shared inputs once.
+        chunk_ptrs_npu.record_stream(transfer_stream)
+        if layer_id == 0:
+            slot_mapping_full.record_stream(transfer_stream)
+            chunk_offsets_npu.record_stream(transfer_stream)
+            if chunk_sizes_npu is not chunk_offsets_npu:
+                chunk_sizes_npu.record_stream(transfer_stream)
+
+        if kv_group == 1 and getattr(self, "indexer_c8_layout", None) is not None:
+            if total_tokens != num_tokens:
+                raise ValueError("C8 transfer requires an exact slot-mapping window")
+            if defer_consumer_wait:
+                raise RuntimeError("Deferred C8 requires prepared bank FIFO packets")
+            if destination_plan is None:
+                destination_plan = self._get_or_create_sparse_destination_plan(
+                    kvcaches_ref=kvcaches_ref,
+                    kv_group=kv_group,
+                    slot_mapping_ref=slot_mapping_full,
+                    sparse_kv_format=dense_kv_format,
+                    sparse_k_hidden_dims=dense_k_hidden_dims,
+                    sparse_v_hidden_dims=dense_v_hidden_dims,
+                    sparse_dsa_hidden_dims=dense_dsa_hidden_dims,
+                    expected_device=kvcaches_ref[layer_id][0].device,
+                )
+            capacity = fixed_chunk_size or c8_chunk_capacity
+            if capacity <= 0:
+                raise ValueError(
+                    "C8 transfer requires the validated maximum chunk size"
+                )
+            with self._stream_context_or_null(transfer_stream):
+                if transfer_stream is not current_stream:
+                    transfer_stream.wait_stream(current_stream)
+                lmc_ops.indexer_c8_transfer_prepared(
+                    destination_plan.states[layer_id],
+                    chunk_ptrs_npu,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    slot_mapping_full,
+                    capacity,
+                    direction,
+                    fixed_chunks=bool(fixed_chunk_size),
+                )
+            if transfer_stream is not current_stream:
+                current_stream.wait_stream(transfer_stream)
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None and not direction:
+                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
+            return
+
+        if destination_plan is not None:
+            if direction:
+                raise ValueError("Prepared dense destination only supports H2D.")
+            with self._stream_context_or_null(transfer_stream):
+                if transfer_stream is not current_stream:
+                    transfer_stream.wait_stream(current_stream)
+                dense_mla_dsa_batched_direct_kv_transfer_prepared(
+                    destination_plan.states[layer_id],
+                    slot_mapping_full,
+                    chunk_ptrs_npu,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    total_tokens,
+                    dense_host_interleaved,
+                    validate_inputs=(
+                        getattr(self, "enable_npu_transfer_validation", True)
+                        and layer_id == 0
+                    ),
+                    fixed_chunk_size=fixed_chunk_size,
+                )
+            if not defer_consumer_wait and transfer_stream is not current_stream:
+                current_stream.wait_stream(transfer_stream)
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None and not direction:
+                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
+            return
+
+        if prepared_layer_state is not None:
+            if prepared_validation_key is None:
+                raise RuntimeError(
+                    "A prepared dense-direct layer state requires its "
+                    f"validation key: kv_group={kv_group}, layer={layer_id}"
+                )
+            layer_state = prepared_layer_state
+            validate_key = prepared_validation_key
+        else:
+            source_signature = self._dense_direct_pointer_cache_signature(
+                chunk_ptrs_npu=chunk_ptrs_npu,
+                chunk_offsets_npu=chunk_offsets_npu,
+                chunk_sizes_npu=chunk_sizes_npu,
+                slot_mapping_ref=slot_mapping_full,
+                source_layout_ref=layer_tensors[0] if layer_tensors else None,
+                total_tokens=total_tokens,
+                fixed_chunk_size=fixed_chunk_size,
+                dense_kv_format=dense_kv_format,
+                dense_token_major=dense_token_major,
+                dense_vllm_two_major=dense_vllm_two_major,
+                dense_k_hidden_dims=dense_k_hidden_dims,
+                dense_v_hidden_dims=dense_v_hidden_dims,
+                dense_dsa_hidden_dims=dense_dsa_hidden_dims,
+                direction=direction,
+            )
+            layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
+                kvcaches_ref=kvcaches_ref,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                layer_tensors=layer_tensors,
+                slot_mapping_ref=slot_mapping_full,
+                total_tokens=total_tokens,
+                sparse_kv_format=dense_kv_format,
+                sparse_token_major=dense_token_major,
+                sparse_vllm_two_major=dense_vllm_two_major,
+                sparse_k_hidden_dims=dense_k_hidden_dims,
+                sparse_v_hidden_dims=dense_v_hidden_dims,
+                sparse_dsa_hidden_dims=dense_dsa_hidden_dims,
+                source_signature=source_signature,
+                return_key=True,
+                require_prepared=require_prepared_state,
+            )
+        if validate_key is None:
+            validate_key = ("dense", kv_group, layer_id)
+
+        with self._stream_context_or_null(transfer_stream):
+            if transfer_stream is not current_stream:
+                transfer_stream.wait_stream(current_stream)
+            if layer_state is not None:
+                validate_inputs = (
+                    getattr(self, "enable_npu_transfer_validation", True)
+                    and validate_key not in self._sparse_direct_validated_layers
+                )
+                dense_mla_dsa_batched_direct_kv_transfer_fast(
+                    layer_state,
+                    slot_mapping_full,
+                    chunk_ptrs_npu,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    total_tokens,
+                    dense_host_interleaved,
+                    direction,
+                    validate_inputs=validate_inputs,
+                    fixed_chunk_size=fixed_chunk_size,
+                )
+                if validate_inputs:
+                    self._sparse_direct_validated_layers.add(validate_key)
+            else:
+                dense_mla_dsa_batched_direct_kv_transfer(
+                    layer_tensors,
+                    kvcaches_ref[layer_id],
+                    slot_mapping_full,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    total_tokens,
+                    dense_kv_format,
+                    dense_token_major,
+                    dense_vllm_two_major,
+                    dense_k_hidden_dims,
+                    dense_v_hidden_dims,
+                    dense_dsa_hidden_dims,
+                    dense_host_interleaved,
+                    direction,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    fixed_chunk_size=fixed_chunk_size,
+                )
+        # Ordinary loads/stores preserve the legacy immediate consumer wait.
+        # P-node layerwise prefill instead publishes an explicit completion
+        # event: the next layer waits at its entry, leaving the intervening
+        # compute/communication window free for the transfer.
+        if not defer_consumer_wait and transfer_stream is not current_stream:
+            current_stream.wait_stream(transfer_stream)
+        fence_debug = getattr(self, "fence_debug", None)
+        if fence_debug is not None and not direction:
+            fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
+
+    def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
+        return (
+            not _DENSE_DIRECT_STORE_DISABLE
+            and not _DENSE_DIRECT_GROUP_STORE_DISABLE
+            and self._is_mla_dsa_format(kv_group)
+        )
+
+    def _reject_direct_page_plan(self, kv_group: int, reason: str):
+        rejections = getattr(self, "_direct_page_plan_rejections", None)
+        if rejections is None:
+            rejections = self._direct_page_plan_rejections = {}
+        rejections[kv_group] = reason
+        return None
+
+    def _direct_page_tensor_layout(
+        self, kvcaches: list, kv_group: int
+    ) -> Optional[tuple[list[tuple[int, int]], tuple[torch.Tensor, ...], int]]:
+        """Validate and cache the pointer layout shared by all page plans."""
+        try:
+            layout = self._lazy_initialize_buffer_with_staging(
+                kvcaches, kv_group=kv_group, init_staging=False
+            )
+            if layout.kv_format not in (
+                KVCacheFormat.MLA_LATENT,
+                KVCacheFormat.DSA_INDEX,
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, f"unsupported_format:{layout.kv_format}"
+                )
+            c8 = getattr(layout, "indexer_c8", False)
+            planes = 2 if kv_group == 0 or c8 else 1
+            layers = kvcaches[: self._expected_group_layers(kv_group)]
+            if len(layers) != self._expected_group_layers(kv_group) or any(
+                len(layer) != (2 if layer[0].dtype == torch.int8 else 1)
+                if c8
+                else len(layer) != planes
+                for layer in layers
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "owner_layout_mismatch"
+                )
+            owners = tuple(tensor for layer in layers for tensor in layer)
+            if not c8 and owners[0].dtype != getattr(self, "dtype", owners[0].dtype):
+                return self._reject_direct_page_plan(
+                    kv_group, "connector_dtype_mismatch"
+                )
+            invalid_owners = (
+                any(tensor.device != owners[0].device for tensor in owners[1:])
+                if c8 else any(
+                    tensor.dtype != owners[0].dtype
+                    or tensor.device != owners[0].device
+                    for tensor in owners[1:]
+                )
+            )
+            if invalid_owners:
+                return self._reject_direct_page_plan(
+                    kv_group, "owner_dtype_or_device_mismatch"
+                )
+            if c8 and any(
+                layer[0].ndim != 4
+                or layer[0].shape[1:] != (128, 1, 128)
+                or (
+                    layer[0].dtype == torch.int8
+                    and (
+                        layer[1].dtype != torch.float16
+                        or layer[1].shape != (*layer[0].shape[:3], 1)
+                    )
+                )
+                or (layer[0].dtype != torch.int8 and layer[0].dtype != self.dtype)
+                for layer in layers
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "c8_key_scale_layout_mismatch"
+                )
+
+            signature = tuple(
+                (
+                    int(tensor.data_ptr()),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                    tensor.device,
+                )
+                for tensor in owners
+            )
+            cache = getattr(self, "_direct_page_layout_cache", None)
+            if cache is None:
+                cache = self._direct_page_layout_cache = {}
+            cached = cache.get(kv_group)
+            if cached is not None and cached[0] == signature:
+                tensor_meta = cached[1]
+            else:
+                tensor_meta = []
+                plane_layouts = []
+                for tensor in owners:
+                    if tensor.ndim < 3 or not tensor.is_contiguous():
+                        return self._reject_direct_page_plan(
+                            kv_group, "unsupported_tensor_layout"
+                        )
+                    token_bytes = int(
+                        tensor[0, 0].numel() * tensor.element_size()
+                    )
+                    if (
+                        tensor.stride(1) * tensor.element_size() != token_bytes
+                        or tensor.stride(0)
+                        != tensor.shape[1] * tensor.stride(1)
+                    ):
+                        return self._reject_direct_page_plan(
+                            kv_group, "unsupported_tensor_stride"
+                        )
+                    tensor_meta.append((int(tensor.data_ptr()), token_bytes))
+                    plane_layouts.append(
+                        (tuple(tensor.shape[2:]), tuple(tensor.stride()[2:]))
+                    )
+                reference = plane_layouts[:planes]
+                if not c8 and any(
+                    plane_layouts[offset : offset + planes] != reference
+                    for offset in range(planes, len(plane_layouts), planes)
+                ):
+                    return self._reject_direct_page_plan(
+                        kv_group, "owner_plane_layout_mismatch"
+                    )
+                cache[kv_group] = (signature, tensor_meta)
+            expected_token_bytes = (
+                sum(layout.layer_token_bytes)
+                if c8
+                else (
+                    self.get_shape(1, kv_group).numel()
+                    * owners[0].element_size()
+                    * self._expected_group_layers(kv_group)
+                )
+            )
+            if (
+                sum(token_bytes for _, token_bytes in tensor_meta)
+                != expected_token_bytes
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "page_byte_layout_mismatch"
+                )
+            slot_capacity = (
+                min(
+                    int(layer[0].shape[0] * layer[0].shape[1])
+                    // layout.layer_slot_factors[i]
+                    for i, layer in enumerate(layers)
+                )
+                if c8
+                else min(int(tensor.shape[0] * tensor.shape[1]) for tensor in owners)
+            )
+            getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
+            return tensor_meta, owners, slot_capacity
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return self._reject_direct_page_plan(
+                kv_group, f"{type(exc).__name__}:{exc}"
+            )
+
+    def direct_page_layout_supported(self, kvcaches: list, kv_group: int) -> bool:
+        """Check direct-store eligibility without scanning request slot mappings."""
+        return self._direct_page_tensor_layout(kvcaches, kv_group) is not None
+
+    def direct_page_token_widths(
+        self, kvcaches: list, kv_group: int
+    ) -> Optional[tuple[int, ...]]:
+        """Return the ordered per-plane byte layout used by a direct page."""
+        layout = self._direct_page_tensor_layout(kvcaches, kv_group)
+        if layout is None:
+            return None
+        tensor_meta, _owners, _slot_capacity = layout
+        return tuple(token_bytes for _base, token_bytes in tensor_meta)
+
+    def plan_compact_page_layout(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[
+            list[dict[str, int]],
+            list[dict[str, int]],
+            tuple[torch.Tensor, ...],
+        ]
+    ]:
+        """Describe layer buffers and logical slot runs without expansion."""
+        try:
+            direct_layout = self._direct_page_tensor_layout(kvcaches, kv_group)
+            if direct_layout is None or kv_group != 1:
+                return self._reject_direct_page_plan(
+                    kv_group, "compact_layout_requires_group1"
+                )
+            tensor_meta, owners, slot_capacity = direct_layout
+            if len(tensor_meta) != self._expected_group_layers(kv_group):
+                # Compact descriptors encode one buffer per physical layer.
+                # Composite C8 pages use the existing byte-vector planner.
+                return self._reject_direct_page_plan(
+                    kv_group, "compact_layout_requires_single_plane"
+                )
+            if not starts or len(starts) != len(ends) or len(slot_mapping) == 0:
+                return self._reject_direct_page_plan(kv_group, "invalid_ranges")
+            logical_start, logical_end = min(starts), max(ends)
+            local_start = logical_start - slot_mapping_base
+            local_end = logical_end - slot_mapping_base
+            if (
+                local_start < 0
+                or local_end > len(slot_mapping)
+                or any(
+                    left != right
+                    for left, right in zip(
+                        ends[:-1], starts[1:], strict=True
+                    )
+                )
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "noncontiguous_slot_window"
+                )
+            slots = slot_mapping[local_start:local_end].detach().to(
+                device="cpu", dtype=torch.long
+            )
+            if bool(((slots < 0) | (slots >= slot_capacity)).any()):
+                return self._reject_direct_page_plan(
+                    kv_group, "slot_value_out_of_bounds"
+                )
+            breaks = torch.where(slots[1:] != slots[:-1] + 1)[0] + 1
+            boundaries = [0, *breaks.tolist(), slots.numel()]
+            runs = [
+                {
+                    "logical_token_start": logical_start + left,
+                    "physical_slot_start": int(slots[left]),
+                    "token_count": right - left,
+                }
+                for left, right in pairwise(boundaries)
+            ]
+            layers = [
+                {
+                    "layer_id": layer_id,
+                    "buffer_base": base,
+                    "token_bytes": token_bytes,
+                    "slot_capacity": slot_capacity,
+                }
+                for layer_id, (base, token_bytes) in enumerate(tensor_meta)
+            ]
+            getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
+            return layers, runs, owners
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return self._reject_direct_page_plan(
+                kv_group, f"{type(exc).__name__}:{exc}"
+            )
+
+    def plan_compact_latent_page_layout(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[
+            list[dict[str, int]],
+            list[dict[str, Any]],
+            tuple[torch.Tensor, ...],
+        ]
+    ]:
+        """Describe group-0 buffers and page-scoped logical slot runs.
+
+        Unlike the group-1 compact layout, the page boundaries are retained
+        because one decoder destination is an all-layer shared-CPU page.  The
+        receiving worker can therefore reconstruct the exact byte order used
+        by :meth:`plan_direct_page_sources` without transporting the Cartesian
+        product of pages, layer planes, and slot runs.
+        """
+        kv_group = 0
+        try:
+            direct_layout = self._direct_page_tensor_layout(kvcaches, kv_group)
+            if direct_layout is None:
+                return None
+            tensor_meta, owners, slot_capacity = direct_layout
+            if not starts or len(starts) != len(ends) or len(slot_mapping) == 0:
+                return self._reject_direct_page_plan(kv_group, "invalid_ranges")
+            logical_start, logical_end = min(starts), max(ends)
+            local_start = logical_start - slot_mapping_base
+            local_end = logical_end - slot_mapping_base
+            if (
+                local_start < 0
+                or local_end > len(slot_mapping)
+                or any(
+                    left != right
+                    for left, right in zip(
+                        ends[:-1], starts[1:], strict=True
+                    )
+                )
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "noncontiguous_slot_window"
+                )
+            slots = slot_mapping[local_start:local_end].detach().to(
+                device="cpu", dtype=torch.long
+            )
+            if bool(((slots < 0) | (slots >= slot_capacity)).any()):
+                return self._reject_direct_page_plan(
+                    kv_group, "slot_value_out_of_bounds"
+                )
+
+            pages: list[dict[str, Any]] = []
+            for start, end in zip(starts, ends, strict=True):
+                page_start = start - logical_start
+                page_end = end - logical_start
+                if page_start < 0 or page_end <= page_start or page_end > len(slots):
+                    return self._reject_direct_page_plan(
+                        kv_group, "page_range_out_of_bounds"
+                    )
+                page_slots = slots[page_start:page_end]
+                breaks = torch.where(page_slots[1:] != page_slots[:-1] + 1)[0] + 1
+                boundaries = [0, *breaks.tolist(), page_slots.numel()]
+                runs = [
+                    {
+                        "logical_token_start": start + left,
+                        "physical_slot_start": int(page_slots[left]),
+                        "token_count": right - left,
+                    }
+                    for left, right in pairwise(boundaries)
+                ]
+                pages.append(
+                    {
+                        "logical_token_start": start,
+                        "token_count": end - start,
+                        "runs": runs,
+                    }
+                )
+
+            layers = [
+                {
+                    "layer_id": layer_id,
+                    "buffer_base": base,
+                    "token_bytes": token_bytes,
+                    "slot_capacity": slot_capacity,
+                }
+                for layer_id, (base, token_bytes) in enumerate(tensor_meta)
+            ]
+            getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
+            return layers, pages, owners
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return self._reject_direct_page_plan(
+                kv_group, f"{type(exc).__name__}:{exc}"
+            )
+
+    def _plan_direct_page_buffers(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+        layerwise: bool = False,
+        slot_mapping_base: int = 0,
+    ) -> Optional[tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]]:
+        """Describe LMCache page buffers in paged NPU KV tensor storage."""
+        try:
+            direct_layout = self._direct_page_tensor_layout(kvcaches, kv_group)
+            if direct_layout is None:
+                return None
+            tensor_meta, owners, slot_capacity = direct_layout
+            group_layers = self._expected_group_layers(kv_group)
+            layout = self._group_layouts[kv_group]
+            c8 = getattr(layout, "indexer_c8", False)
+            planes = len(tensor_meta) // group_layers
+            if c8:
+                plane_offsets, plane_factors, plane_mapped = [0], [], []
+                for i, layer in enumerate(kvcaches[:group_layers]):
+                    plane_offsets.append(plane_offsets[-1] + len(layer))
+                    plane_factors.extend([layout.layer_slot_factors[i]] * len(layer))
+                    plane_mapped.extend(
+                        [
+                            getattr(layout, "block_map_cpu", None) is not None
+                            and layer[0].dtype == torch.int8
+                        ]
+                        * len(layer)
+                    )
+            remap_slots = c8 and (2 in layout.layer_slot_factors or any(plane_mapped))
+            if not starts or len(starts) != len(ends):
+                return self._reject_direct_page_plan(kv_group, "invalid_ranges")
+            slot_base, slot_end = min(starts), max(ends)
+            local_base = slot_base - slot_mapping_base
+            local_end = slot_end - slot_mapping_base
+            if (
+                slot_mapping_base < 0
+                or local_base < 0
+                or local_end > len(slot_mapping)
+            ):
+                return self._reject_direct_page_plan(
+                    kv_group, "slot_window_out_of_range"
+                )
+            slots = (
+                slot_mapping[local_base:local_end]
+                .detach()
+                .to(device="cpu", dtype=torch.long)
+            )
+            all_ptrs: List[List[int]] = []
+            all_sizes: List[List[int]] = []
+            tensor_token_bytes = sum(token_bytes for _, token_bytes in tensor_meta)
+            metadata_token_bytes = sum(layout.layer_token_bytes) if c8 else 0
+            for start, end in zip(starts, ends, strict=True):
+                local_start, local_end = start - slot_base, end - slot_base
+                if (
+                    local_start < 0
+                    or local_end <= local_start
+                    or local_end > slots.numel()
+                ):
+                    return self._reject_direct_page_plan(
+                        kv_group, "page_range_out_of_bounds"
+                    )
+                page_slots = slots[local_start:local_end]
+                if bool(((page_slots < 0) | (page_slots >= slot_capacity)).any()):
+                    return self._reject_direct_page_plan(
+                        kv_group, "slot_value_out_of_bounds"
+                    )
+                breaks = torch.where(page_slots[1:] != page_slots[:-1] + 1)[0] + 1
+                boundaries = [0, *breaks.tolist(), page_slots.numel()]
+                runs = [
+                    (int(page_slots[left]), right - left)
+                    for left, right in pairwise(boundaries)
+                ]
+
+                physical_runs = runs
+                if remap_slots:
+                    block_map = getattr(layout, "block_map_cpu", None)
+                    physical_slots = (
+                        block_map[page_slots // 128] * 128 + page_slots % 128
+                        if block_map is not None
+                        else page_slots + (page_slots // 128) * 128
+                    )
+                    breaks = (
+                        torch.where(physical_slots[1:] != physical_slots[:-1] + 1)[0]
+                        + 1
+                    )
+                    boundaries = [0, *breaks.tolist(), physical_slots.numel()]
+                    physical_runs = [
+                        (int(physical_slots[left]), right - left)
+                        for left, right in pairwise(boundaries)
+                    ]
+                page_ptrs, page_sizes = [], []
+                for layer in range(group_layers if layerwise else 1):
+                    ptrs: List[int] = []
+                    sizes: List[int] = []
+                    if c8:
+                        first = plane_offsets[layer] if layerwise else 0
+                        last = (
+                            plane_offsets[layer + 1] if layerwise else len(tensor_meta)
+                        )
+                        for plane in range(first, last):
+                            base, token_bytes = tensor_meta[plane]
+                            for slot, count in (
+                                physical_runs
+                                if plane_factors[plane] == 2 or plane_mapped[plane]
+                                else runs
+                            ):
+                                ptrs.append(base + slot * token_bytes)
+                                sizes.append(count * token_bytes)
+                    else:
+                        metadata = (
+                            tensor_meta[layer * planes : (layer + 1) * planes]
+                            if layerwise
+                            else tensor_meta
+                        )
+                        for base, token_bytes in metadata:
+                            for slot, count in runs:
+                                ptrs.append(base + slot * token_bytes)
+                                sizes.append(count * token_bytes)
+                    page_ptrs.append(ptrs)
+                    page_sizes.append(sizes)
+                expected = tensor_token_bytes * (end - start)
+                metadata_bytes = (
+                    metadata_token_bytes * (end - start)
+                    if c8
+                    else (
+                        self.get_shape(end - start, kv_group).numel()
+                        * owners[0].element_size()
+                        * group_layers
+                    )
+                )
+                if sum(map(sum, page_sizes)) != expected or expected != metadata_bytes:
+                    return self._reject_direct_page_plan(
+                        kv_group, "page_byte_layout_mismatch"
+                    )
+                all_ptrs.extend(page_ptrs)
+                all_sizes.extend(page_sizes)
+            getattr(self, "_direct_page_plan_rejections", {}).pop(kv_group, None)
+            return all_ptrs, all_sizes, owners
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError) as exc:
+            return self._reject_direct_page_plan(
+                kv_group, f"{type(exc).__name__}:{exc}"
+            )
+
+    def direct_page_plan_rejection(self, kv_group: int) -> Optional[str]:
+        """Return the most recent rejection for aggregate fallback diagnostics."""
+        return getattr(self, "_direct_page_plan_rejections", {}).get(kv_group)
+
+    def plan_direct_page_sources(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+        layerwise: bool = False,
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
+    ]:
+        """Describe source buffers for a direct page store."""
+        return self._plan_direct_page_buffers(
+            kvcaches,
+            slot_mapping,
+            starts,
+            ends,
+            kv_group,
+            layerwise,
+            slot_mapping_base,
+        )
+
+    def plan_direct_page_destinations(
+        self,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        starts: List[int],
+        ends: List[int],
+        kv_group: int,
+        layerwise: bool = False,
+        slot_mapping_base: int = 0,
+    ) -> Optional[
+        tuple[List[List[int]], List[List[int]], tuple[torch.Tensor, ...]]
+    ]:
+        """Describe destination buffers for a direct page load."""
+        if _DENSE_DIRECT_LOAD_DISABLE:
+            return self._reject_direct_page_plan(
+                kv_group, "dense_direct_load_disabled"
+            )
+        return self._plan_direct_page_buffers(
+            kvcaches,
+            slot_mapping,
+            starts,
+            ends,
+            kv_group,
+            layerwise,
+            slot_mapping_base,
+        )
+
+    def batched_from_gpu_group(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ) -> tuple[List[List[int]], torch.Tensor]:
+        """Store a KV group with one pybind call and one OpCommand."""
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping_base = int(kwargs.get("slot_mapping_base", 0))
+        if slot_mapping_base < 0:
+            raise ValueError(
+                f"slot_mapping_base must be non-negative, got {slot_mapping_base}"
+            )
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        layout = self._lazy_initialize_buffer_with_staging(
+            self.kvcaches, kv_group=kv_group, init_staging=False
+        )
+        if not self.supports_batched_from_gpu_group(kv_group):
+            raise ValueError(
+                "Dense direct group store requires an MLA/DSA layout and an "
+                "enabled dense-direct store path."
+            )
+
+        slot_mapping_chunks = []
+        chunk_offsets = []
+        chunk_sizes = []
+        current_offset = 0
+        for start, end in zip(starts, ends, strict=False):
+            local_start = start - slot_mapping_base
+            local_end = end - slot_mapping_base
+            if (
+                local_start < 0
+                or local_end < local_start
+                or local_end > len(slot_mapping)
+            ):
+                raise ValueError(
+                    "Layerwise group store chunk is outside the provided "
+                    f"slot-mapping window: chunk=[{start}, {end}), "
+                    f"base={slot_mapping_base}, mapping_tokens={len(slot_mapping)}"
+                )
+            slot_mapping_chunks.append(slot_mapping[local_start:local_end])
+            chunk_size = end - start
+            chunk_offsets.append(current_offset)
+            chunk_sizes.append(chunk_size)
+            current_offset += chunk_size
+        if not slot_mapping_chunks:
+            raise ValueError("Dense direct group store requires at least one chunk.")
+        slot_mapping_full = (
+            slot_mapping_chunks[0]
+            if len(slot_mapping_chunks) == 1
+            else torch.cat(slot_mapping_chunks, dim=0)
+        )
+        num_tokens = len(slot_mapping_full)
+        self._check_layerwise_transfer_invariants(
+            operation="store",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping_full,
+            kvcaches_ref=self.kvcaches,
+        )
+        slot_mapping_full = self._slot_mapping_on_kv_device(
+            slot_mapping_full, self.store_stream
+        )
+        expected_layers = self._expected_group_layers(kv_group)
+        if len(memory_objs) != expected_layers:
+            raise RuntimeError(
+                "NPU group store memory object layer count mismatch: "
+                f"got {len(memory_objs)}, expected {expected_layers}"
+            )
+        if len(self.kvcaches) < expected_layers:
+            raise RuntimeError(
+                "NPU group store KV cache layer count mismatch: "
+                f"got {len(self.kvcaches)}, expected at least {expected_layers}"
+            )
+
+        if layout.indexer_c8:
+            plan = self.prepare_group_capture(
+                memory_objs,
+                chunk_offsets,
+                [a + b for a, b in zip(chunk_offsets, chunk_sizes, strict=True)],
+                kvcaches=self.kvcaches,
+                slot_mapping=slot_mapping_full,
+                kv_group=kv_group,
+            )
+            self.enqueue_group_capture(plan)
+            torch.npu.current_stream().wait_stream(self.store_stream)
+            self.store_stream.synchronize()
+            return plan.host_rows, plan.pointers
+
+        expected_fmt = self._expected_memory_format(kv_group)
+        token_major = self._layerwise_token_major(kv_group)
+        dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        dense_fixed_chunk_size, chunk_offsets_npu, chunk_sizes_npu = (
+            self._prepare_dense_direct_chunk_metadata(
+                chunk_offsets,
+                chunk_sizes,
+                total_tokens=num_tokens,
+                kv_group=kv_group,
+            )
+        )
+        layer_tensors: List[List[torch.Tensor]] = []
+        for layer_id, memory_objs_layer in enumerate(memory_objs):
+            tensors = []
+            for memory_obj in memory_objs_layer:
+                tensor = _layer_memory_tensor(memory_obj, layer_id)
+                if memory_obj.metadata.fmt != expected_fmt:
+                    raise ValueError(
+                        f"Expected memory format {expected_fmt}, "
+                        f"got {memory_obj.metadata.fmt}."
+                    )
+                tensors.append(tensor)
+            if len(tensors) != len(starts):
+                raise ValueError(
+                    "Dense direct group store chunk count mismatch: "
+                    f"layer={layer_id}, tensors={len(tensors)}, ranges={len(starts)}"
+                )
+            layer_tensors.append(tensors)
+
+        layer_states = []
+        validation_keys = []
+        for layer_id, tensors in enumerate(layer_tensors):
+            layer_state, validation_key = self._get_or_create_sparse_direct_layer_state(
+                kvcaches_ref=self.kvcaches,
+                kv_group=kv_group,
+                layer_id=layer_id,
+                layer_tensors=tensors,
+                slot_mapping_ref=slot_mapping_full,
+                total_tokens=num_tokens,
+                sparse_kv_format=layout.kv_format.value,
+                sparse_token_major=token_major,
+                sparse_vllm_two_major=layout.vllm_two_major,
+                sparse_k_hidden_dims=layout.k_hidden_dims,
+                sparse_v_hidden_dims=layout.v_hidden_dims,
+                sparse_dsa_hidden_dims=layout.dsa_hidden_dims,
+                return_key=True,
+            )
+            if layer_state is None or validation_key is None:
+                raise RuntimeError(
+                    f"Failed to prepare dense direct state for layer {layer_id}."
+                )
+            layer_states.append(layer_state)
+            validation_keys.append(validation_key)
+
+        validate_inputs = (
+            getattr(self, "enable_npu_transfer_validation", True)
+            and any(
+                key not in self._sparse_direct_validated_layers
+                for key in validation_keys
+            )
+        )
+        current_stream = torch.npu.current_stream()
+        with self._stream_context_or_null(self.store_stream):
+            self.store_stream.wait_stream(current_stream)
+            host_pointer_rows, layer_chunk_ptrs_npu = (
+                dense_mla_dsa_group_direct_kv_transfer_fast(
+                    layer_states,
+                    layer_tensors,
+                    slot_mapping_full,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    num_tokens,
+                    dense_host_interleaved,
+                    True,
+                    validate_inputs=validate_inputs,
+                    fixed_chunk_size=dense_fixed_chunk_size,
+                )
+            )
+        current_stream.wait_stream(self.store_stream)
+        self.store_stream.synchronize()
+        if validate_inputs:
+            self._sparse_direct_validated_layers.update(validation_keys)
+        return host_pointer_rows, layer_chunk_ptrs_npu
+
+    def checkpoint_plane_widths(self, kv_group: int) -> tuple[int, ...]:
+        """Return the registered CPU format's per-token plane widths."""
+        layout = self._group_layouts[kv_group]
+        if layout.indexer_c8:
+            if any(width != 130 for width in layout.layer_token_bytes):
+                return tuple(
+                    (128, 2) if width == 130 else (256,)
+                    for width in layout.layer_token_bytes
+                )
+            return (128, 2)
+        widths = ((layout.dsa_hidden_dims,) if kv_group == 1
+                  else tuple(x for x in (layout.k_hidden_dims, layout.v_hidden_dims) if x))
+        if self._sparse_lmc_host_interleaved(kv_group):
+            return (sum(widths),)
+        return widths
+
+    def finish_checkpoint_capture(self) -> None:
+        """Fence submitted capture operands, including a partially failed launch."""
+        self.store_stream.synchronize()
+
+    def supports_preemption_capture(self) -> bool:
+        """Whether the installed native extension has prepared group capture."""
+        return hasattr(lmc_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared")
+
+    def prepare_group_capture(
+        self,
+        memory_objs: List[List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs: Any,
+    ) -> PreparedGroupCapture:
+        """Prepare fragmented checkpoint pages in one dense group submission.
+
+        The checkpoint writer owns registered pages for each interval. Ordinary
+        multi-chunk stores retain their original preparation and dispatch.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        caches = self.kvcaches
+        group = int(kwargs.get("kv_group", 0))
+        group_layers = self._expected_group_layers(group)
+        slots = kwargs["slot_mapping"]
+        base = int(kwargs.get("slot_mapping_base", 0))
+        if (
+            not starts
+            or len(starts) != len(ends)
+            or base < 0
+            or starts[0] != base
+            or ends[-1] - base != len(slots)
+            or any(a >= b for a, b in zip(starts, ends, strict=True))
+            or any(a != b for a, b in zip(starts[1:], ends[:-1], strict=True))
+            or not len(slots)
+        ):
+            raise ValueError(
+                "Checkpoint capture requires contiguous resident intervals"
+            )
+        if (
+            caches is None
+            or len(caches) < group_layers
+            or len(memory_objs) != group_layers
+        ):
+            raise ValueError("Checkpoint capture layer count mismatch")
+        layout = self._lazy_initialize_buffer_with_staging(
+            caches, kv_group=group, init_staging=False
+        )
+        if not self.supports_batched_from_gpu_group(group):
+            raise ValueError(
+                "Checkpoint capture requires the dense MLA/DSA group kernel"
+            )
+        self._check_layerwise_transfer_invariants(
+            operation="store",
+            kv_group=group,
+            slot_mapping_full=slots,
+            kvcaches_ref=caches,
+        )
+        fmt = self._expected_memory_format(group)
+        page_rows = _checkpoint_page_rows(memory_objs, starts, ends, fmt, layout)
+        if page_rows is not None:
+            buffers, rows = page_rows
+            tensors = [buffers]  # Keep every raw allocation alive through the fence.
+            samples = (
+                []
+                if layout.indexer_c8
+                else [
+                    memory_objs[0][0].layer_tensor(layer)
+                    for layer in range(group_layers)
+                ]
+            )
+        else:
+            tensors = []
+            for layer, objects in enumerate(memory_objs):
+                if len(objects) != len(starts) or any(
+                    obj.metadata.fmt != fmt for obj in objects
+                ):
+                    raise ValueError(
+                        "Checkpoint capture requires correctly formatted "
+                        "pages per layer"
+                    )
+                tensors.append([_layer_memory_tensor(obj, layer) for obj in objects])
+                if layout.indexer_c8 and any(
+                    tensor.dtype != torch.uint8
+                    or not tensor.is_contiguous()
+                    or tensor.numel() < (end - start) * layout.layer_token_bytes[layer]
+                    for tensor, start, end in zip(
+                        tensors[-1], starts, ends, strict=True
+                    )
+                ):
+                    raise ValueError(
+                        "C8 checkpoint packet has the wrong dtype "
+                        "or insufficient capacity"
+                    )
+            samples = [row[0] for row in tensors]
+            rows = [
+                [
+                    int(
+                        lmc_ops.get_device_ptr(
+                            t.data_ptr(), t.numel() * t.element_size()
+                        )
+                    )
+                    for t in row
+                ]
+                for row in tensors
+            ]
+        if any(not pointer for row in rows for pointer in row):
+            raise ValueError("Checkpoint CPU destination is not registered")
+        device_slots = self._slot_mapping_on_kv_device(slots, self.store_stream)
+        c8_plan = None
+        if layout.indexer_c8:
+            c8_plan = self._get_or_create_sparse_destination_plan(
+                kvcaches_ref=caches,
+                kv_group=group,
+                slot_mapping_ref=device_slots,
+                sparse_kv_format=layout.kv_format.value,
+                sparse_k_hidden_dims=layout.k_hidden_dims,
+                sparse_v_hidden_dims=layout.v_hidden_dims,
+                sparse_dsa_hidden_dims=layout.dsa_hidden_dims,
+                expected_device=layout.kv_device,
+            )
+        states = (
+            list(c8_plan.states)
+            if c8_plan is not None
+            else [
+                prepare_sparse_direct_layer_state(
+                    sample,
+                    caches[layer],
+                    device_slots,
+                    self._layerwise_token_major(group),
+                    layout.vllm_two_major,
+                    layout.kv_format.value,
+                    layout.k_hidden_dims,
+                    layout.v_hidden_dims,
+                    layout.dsa_hidden_dims,
+                    len(slots),
+                )
+                for layer, sample in enumerate(samples)
+            ]
+        )
+        offsets = torch.tensor(
+            [a - base for a in starts], dtype=torch.int32, pin_memory=True
+        )
+        sizes = torch.tensor(
+            [b - a for a, b in zip(starts, ends, strict=True)],
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        pointers = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
+        with self._stream_context_or_null(self.store_stream):
+            offsets_npu = offsets.to(self.kv_device, non_blocking=True)
+            sizes_npu = sizes.to(self.kv_device, non_blocking=True)
+            pointers_npu = pointers.to(self.kv_device, non_blocking=True)
+        return PreparedGroupCapture(
+            states,
+            tensors,
+            device_slots,
+            pointers_npu,
+            offsets_npu,
+            sizes_npu,
+            (offsets, sizes, pointers, slots),
+            rows,
+            len(slots),
+            self._sparse_lmc_host_interleaved(group),
+            0,
+            [],
+            getattr(self, "enable_npu_transfer_validation", True),
+            c8_group=c8_plan.c8_group if c8_plan is not None else None,
+            c8_chunk_capacity=max(b - a for a, b in zip(starts, ends, strict=True))
+            if c8_plan is not None
+            else 0,
+        )
+
+    def enqueue_group_capture(self, plan: PreparedGroupCapture) -> Any:
+        """Enqueue D2H behind producer work; caller retains plan until done."""
+        current = torch.npu.current_stream()
+        with self._stream_context_or_null(self.store_stream):
+            self.store_stream.wait_stream(current)
+            if plan.c8_group is not None:
+                lmc_ops.indexer_c8_group_transfer_prepared(
+                    plan.c8_group,
+                    plan.pointers,
+                    plan.offsets,
+                    plan.sizes,
+                    plan.slots,
+                    plan.c8_chunk_capacity,
+                    True,
+                )
+            else:
+                lmc_ops.dense_mla_dsa_group_direct_kv_transfer_prepared(
+                    plan.states,
+                    plan.slots,
+                    plan.pointers,
+                    plan.offsets,
+                    plan.sizes,
+                    plan.total_tokens,
+                    plan.interleaved,
+                    plan.validate,
+                    plan.fixed_chunk_size,
+                )
+            event = torch.npu.Event()
+            event.record(self.store_stream)
+        if plan.validate:
+            self._sparse_direct_validated_layers.update(plan.validation_keys)
+        return event
+
+    def _lmc_plane_num_tokens(
+        self,
+        lmc_tensor: torch.Tensor,
+        kv_group: Optional[int] = None,
+        layer_id: int = 0,
+    ) -> int:
+        fmt = self._fmt_for(kv_group)
+        layout = self._layout_for(kv_group)
+        if layout is not None and layout.indexer_c8:
+            width = layout.layer_token_bytes[layer_id]
+            if lmc_tensor.numel() % width:
+                raise ValueError("Indexer packet does not contain complete tokens")
+            return lmc_tensor.numel() // width
+        k_hidden = layout.k_hidden_dims if layout else self.k_hidden_dims
+        v_hidden = layout.v_hidden_dims if layout else self.v_hidden_dims
+        dsa_hidden = layout.dsa_hidden_dims if layout else self.dsa_hidden_dims
+        if fmt in (
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.DSA_KV,
+            KVCacheFormat.MLA_LATENT,
+            KVCacheFormat.DSA_INDEX,
+        ):
+            plane = k_hidden + v_hidden
+            if fmt == KVCacheFormat.DSA_KV:
+                plane += dsa_hidden
+            assert plane > 0, (
+                "MLA/DSA hidden dims must be initialized before sparse retrieve."
+            )
+            return lmc_tensor.numel() // plane
+        if lmc_tensor.ndim >= 3:
+            return int(lmc_tensor.shape[0])
+        per_token = 2 * self.hidden_dim_size
+        assert per_token > 0, (
+            "hidden_dim_size must be positive for GQA sparse retrieve."
+        )
+        return lmc_tensor.numel() // per_token
+
+    def _expected_memory_format(self, kv_group: Optional[int] = None) -> MemoryFormat:
+        fmt = self._fmt_for(kv_group)
+        if fmt in (
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.MLA_LATENT,
+        ):
+            return MemoryFormat.KV_MLA_LATENT_FMT
+        if fmt == KVCacheFormat.DSA_INDEX:
+            return MemoryFormat.KV_DSA_INDEX_FMT
+        if fmt == KVCacheFormat.DSA_KV:
+            return MemoryFormat.KV_MLA_LATENT_FMT
+        return MemoryFormat.KV_T2D
+
+    def _fmt_for(self, kv_group: Optional[int]) -> KVCacheFormat:
+        """Resolve the KV format for a group (defaults to current/mirrored)."""
+        if kv_group is None:
+            kv_group = self._current_kv_group
+        layout = self._group_layouts.get(kv_group)
+        if layout is not None:
+            return layout.kv_format
+        return self.kv_format
+
+    def _layout_for(self, kv_group: Optional[int]) -> Optional[_GroupLayout]:
+        """Return the layout for a group if initialized, else None."""
+        if kv_group is None:
+            kv_group = self._current_kv_group
+        return self._group_layouts.get(kv_group)
+
+    def get_num_layers(self, kv_group: int = 0) -> Optional[int]:
+        """Return the authoritative layer count of a KV group.
+
+        The count comes from the registered group caches captured at layout
+        initialization (e.g. 79 for latent, 22 for indexer under
+        dsa_two_groups). This is stable across interleaved per-group calls,
+        unlike the mirrored ``self.num_layers``.
+
+        Args:
+            kv_group: The KV group index.
+
+        Returns:
+            The group's layer count, or None when the group layout has not
+            been initialized yet (callers fall back to legacy resolution).
+        """
+        layouts = getattr(self, "_group_layouts", None)
+        if not layouts:
+            return None
+        layout = layouts.get(kv_group)
+        if layout is None or layout.num_layers <= 0:
+            return None
+        return layout.num_layers
+
+    def get_layer_indices(self, kv_group: int = 0) -> Optional[tuple[int, ...]]:
+        """Return the group-local layer indices of a KV group.
+
+        Args:
+            kv_group: The KV group index.
+
+        Returns:
+            The group-local layer index tuple, or None when the group layout
+            has not been initialized yet.
+        """
+        layouts = getattr(self, "_group_layouts", None)
+        if not layouts:
+            return None
+        layout = layouts.get(kv_group)
+        if layout is None or not layout.layer_indices:
+            return None
+        return layout.layer_indices
+
+    def _expected_group_layers(self, kv_group: Optional[int]) -> int:
+        """Resolve the per-group transfer row count for invariant checks.
+
+        Prefers the authoritative layout cardinality and falls back to the
+        mirrored instance count (legacy single-group contract) when the
+        layout has not been initialized.
+        """
+        if kv_group is None:
+            kv_group = getattr(self, "_current_kv_group", 0)
+        group_layers = self.get_num_layers(kv_group)
+        if group_layers is not None:
+            return group_layers
+        if self.dsa_two_groups:
+            raise RuntimeError(
+                "DSA transfer cannot resolve layer cardinality before the "
+                f"kv_group={kv_group} layout is initialized"
+            )
+        return self.num_layers
+
+    def set_layerwise_staging_concurrency(self, n: int) -> None:
+        """Size per-group staging pools for concurrent layerwise transfers."""
+        n = max(1, int(n))
+        if n <= self._layerwise_staging_concurrency:
+            return
+        self._layerwise_staging_concurrency = n
+        for kv_group, layout in self._group_layouts.items():
+            if layout.gpu_buffer_allocator is None:
+                continue
+            if layout.gpu_buffer_allocator.allocator.num_active_allocations > 0:
+                logger.warning(
+                    "Cannot grow staging pool for kv_group=%s while %d "
+                    "buffers are still in use",
+                    kv_group,
+                    layout.gpu_buffer_allocator.allocator.num_active_allocations,
+                )
+                continue
+            per_slot = layout.staging_bytes_per_slot
+            if per_slot <= 0:
+                continue
+            new_size = per_slot * self._layerwise_staging_pool_slots()
+            self._assign_group_gpu_allocator(new_size, layout)
+
+    def _layerwise_staging_pool_slots(self) -> int:
+        if not self.dsa_two_groups:
+            return 1
+        return max(1, self._layerwise_staging_concurrency)
+
+    def _layerwise_staging_num_tokens(self, cache_max_tokens: int) -> int:
+        """Token count for sizing the layerwise GPU staging pool.
+
+        ``cache_max_tokens`` comes from the paged KV tensor shape
+        (num_blocks * block_size), i.e. the vLLM block-pool capacity. That
+        capacity is shared across MLA latent and DSA indexer groups in
+        two-group mode, and in any case exceeds what a single layerwise
+        store/retrieve transfer holds (LMCache chunks). Size staging for
+        transfer headroom, not full pool capacity.
+        """
+        if not self.dsa_two_groups or self.lmcache_chunk_size <= 0:
+            return cache_max_tokens
+
+        max_seq_tokens = self.max_staging_tokens
+        if max_seq_tokens <= 0:
+            # Non-vLLM paths (unit tests, benchmarks) may omit max_model_len.
+            max_seq_tokens = self.lmcache_chunk_size * 512
+        staging_tokens = min(cache_max_tokens, max_seq_tokens)
+        return max(staging_tokens, self.lmcache_chunk_size)
+
+    def _staging_token_cap(self) -> int:
+        """Max tokens the layerwise GPU staging pool must cover per transfer."""
+        if not self.dsa_two_groups or self.lmcache_chunk_size <= 0:
+            return 0
+        max_seq_tokens = self.max_staging_tokens
+        if max_seq_tokens <= 0:
+            max_seq_tokens = self.lmcache_chunk_size * 512
+        return max(max_seq_tokens, self.lmcache_chunk_size)
+
+    def _check_staging_transfer_tokens(self, num_tokens: int, kv_group: int) -> None:
+        cap = self._staging_token_cap()
+        if cap <= 0 or num_tokens <= cap:
+            return
+        raise ValueError(
+            f"Layerwise transfer needs {num_tokens} staging tokens for "
+            f"kv_group={kv_group}, but the staging cap is {cap} "
+            f"(max_model_len={self.max_staging_tokens}). "
+            "Increase vLLM max_model_len or reduce tokens stored per forward."
+        )
+
+    def _check_layerwise_transfer_invariants(
+        self,
+        *,
+        operation: str,
+        kv_group: int,
+        slot_mapping_full: torch.Tensor,
+        kvcaches_ref: list,
+    ) -> None:
+        """Fail before the NPU kernel if per-group transfer metadata is invalid."""
+        if not self.dsa_two_groups or kv_group not in (0, 1):
+            return
+        kvcaches_len = len(kvcaches_ref) if kvcaches_ref is not None else 0
+        expected_layers = self._expected_group_layers(kv_group)
+        if kvcaches_len != expected_layers:
+            message = (
+                f"{operation} layerwise transfer has mismatched layer counts: "
+                f"kv_group={kv_group} expected_group_layers={expected_layers} "
+                f"kvcaches_len={kvcaches_len}"
+            )
+            logger.error(
+                "%s. Refusing to continue before memory_objs[layer_id] access.",
+                message,
+            )
+            raise RuntimeError(message)
+        if not getattr(self, "enable_npu_transfer_validation", True):
+            return
+        if slot_mapping_full is None or slot_mapping_full.numel() == 0:
+            return
+        if slot_mapping_full.device.type != "cpu":
+            # Avoid a host/device sync in the layerwise hot path. Cold compact
+            # validates its existing CPU mapping before copying it to the NPU.
+            return
+        if kvcaches_len == 0:
+            return
+
+        first_layer = kvcaches_ref[0]
+        first_tensor = (
+            first_layer[0]
+            if isinstance(first_layer, (list, tuple)) and first_layer
+            else first_layer
+        )
+        shape = list(first_tensor.shape) if first_tensor is not None else []
+        capacity = shape[0] * shape[1] if len(shape) >= 2 else 0
+        if capacity <= 0:
+            return
+
+        slot_min_tensor, slot_max_tensor = torch.aminmax(slot_mapping_full)
+        slot_min = int(slot_min_tensor.item())
+        slot_max = int(slot_max_tensor.item())
+        if slot_min < 0 or slot_max >= capacity:
+            message = (
+                f"{operation} layerwise transfer slot mapping is out of range: "
+                f"kv_group={kv_group} slot_min={slot_min} slot_max={slot_max} "
+                f"kvcaches_capacity={capacity} kvcaches_shape={shape} "
+                f"expected_group_layers={expected_layers} "
+                f"kvcaches_len={kvcaches_len}"
+            )
+            logger.error(message)
+            raise ValueError(message)
+
+    def validate_layerwise_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        kvcaches: list,
+        *,
+        kv_group: int,
+    ) -> None:
+        """Validate a CPU slot map before cold-compact NPU submission."""
+        if not getattr(self, "enable_npu_transfer_validation", False):
+            return
+        if slot_mapping.device.type != "cpu":
+            raise ValueError("NPU transfer validation requires a CPU slot mapping")
+        self._check_layerwise_transfer_invariants(
+            operation="retrieve",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping,
+            kvcaches_ref=kvcaches,
+        )
+
+    def _allocate_layerwise_staging_buffer(
+        self,
+        *,
+        num_tokens: int,
+        kv_group: int,
+        layout: _GroupLayout,
+        expected_fmt: MemoryFormat,
+    ) -> tuple[Optional[MemoryObj], torch.Tensor]:
+        """Return (pool_obj_or_none, staging_tensor) for a layerwise transfer."""
+        self._check_staging_transfer_tokens(num_tokens, kv_group)
+
+        gpu_buffer_allocator = layout.gpu_buffer_allocator
+        assert gpu_buffer_allocator is not None, (
+            f"GPU staging pool for kv_group={kv_group} is not initialized."
+        )
+        buffer_shape = self.get_shape(num_tokens, kv_group)
+        tmp_gpu_buffer_obj = gpu_buffer_allocator.allocate(
+            buffer_shape, layout.storage_dtype or self.dtype, expected_fmt
+        )
+        assert tmp_gpu_buffer_obj is not None, (
+            "Failed to allocate NPU buffer in NPUConnector"
+        )
+        assert tmp_gpu_buffer_obj.tensor is not None
+        return tmp_gpu_buffer_obj, tmp_gpu_buffer_obj.tensor
+
+    def _prepare_c8_staging_packets(
+        self,
+        tensors: List[torch.Tensor],
+        staging: torch.Tensor,
+        sizes: List[int],
+        stream: Any,
+        from_npu: bool,
+        token_bytes: int = 130,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Keep compact planar packets intact through the optional GPU staging pool."""
+        views = []
+        offset = 0
+        with self._stream_context_or_null(stream):
+            for tensor, tokens in zip(tensors, sizes, strict=True):
+                size = tokens * token_bytes
+                if (
+                    tensor.dtype != torch.uint8
+                    or not tensor.is_contiguous()
+                    or tensor.numel() < size
+                ):
+                    raise ValueError(
+                        "C8 staging requires complete contiguous byte packets"
+                    )
+                view = staging.narrow(0, offset, size)
+                if not from_npu:
+                    view.copy_(tensor.view(-1)[:size], non_blocking=True)
+                views.append(view)
+                offset += size
+            pointers = torch.tensor(
+                [view.data_ptr() for view in views],
+                dtype=torch.int64,
+                device=staging.device,
+            )
+            staging.record_stream(stream)
+        return views, pointers
+
+    @classmethod
+    def from_metadata(
+        cls,
+        metadata: LMCacheMetadata,
+        use_gpu: bool = False,
+        device: Optional[torch.device] = None,
+        layout_hints: Optional[LayoutHints] = None,
+    ) -> "VLLMPagedMemLayerwiseNPUConnector":
+        if getattr(metadata, "indexer_c8_layout", None) is not None and not all(
+            hasattr(lmc_ops, name)
+            for name in (
+                "IndexerC8State",
+                "IndexerC8GroupState",
+                "indexer_c8_transfer_prepared",
+                "indexer_c8_group_transfer_prepared",
+            )
+        ):
+            raise RuntimeError(
+                "Indexer C8 requires rebuilding the LMCache-Ascend native extension"
+            )
+        if (
+            getattr(metadata, "indexer_hbm_block_map", None) is not None
+            and getattr(lmc_ops, "INDEXER_C8_BLOCK_MAP_ABI", 0) < 1
+        ):
+            raise RuntimeError(
+                "Paired-bank C8 requires rebuilding the LMCache-Ascend native extension"
+            )
+        num_layers = metadata.kv_shape[0]
+        chunk_size = metadata.kv_shape[2]
+        num_kv_head = metadata.kv_shape[3]
+        head_size = metadata.kv_shape[4]
+        hidden_dim_size = num_kv_head * head_size
+        max_staging_tokens = int(getattr(metadata, "max_model_len", 0) or 0)
+        return cls(
+            hidden_dim_size=hidden_dim_size,
+            num_layers=num_layers,
+            use_gpu=use_gpu,
+            chunk_size=chunk_size,
+            dtype=metadata.kv_dtype,
+            device=device,
+            use_mla=metadata.use_mla,
+            layout_hints=layout_hints,
+            max_staging_tokens=max_staging_tokens,
+            indexer_c8_layout=getattr(metadata, "indexer_c8_layout", None),
+            indexer_hbm_block_map=getattr(metadata, "indexer_hbm_block_map", None),
+            worker_id=metadata.worker_id,
+        )
+
+    def _assign_group_gpu_allocator(
+        self, gpu_buffer_size: int, layout: _GroupLayout
+    ) -> None:
+        """Create a per-kv_group GPU staging allocator.
+
+        Two-group forwards may keep latent and indexer store generators alive
+        at the same time, each holding a staging allocation for the whole
+        layer loop. Do not share one pool across groups.
+        """
+        layout.gpu_buffer_allocator = GPUMemoryAllocator(
+            gpu_buffer_size, device=self.device
+        )
+        self.gpu_buffer_allocator = layout.gpu_buffer_allocator
+
+    def _lazy_initialize_buffer(
+        self,
+        kv_caches,
+        kv_group: int = 0,
+        init_staging: Optional[bool] = None,
+    ) -> _GroupLayout:
+        """
+        Lazily initialize per-kv_group format metadata and GPU buffer allocator.
+
+        In two-group MLA+DSA mode the same connector instance handles both
+        kv_group=0 (latent) and kv_group=1 (indexer); each group is detected
+        and allocated independently on its first call instead of the first
+        group pinning a single ``self.kv_format`` for both.
+        """
+        if init_staging is None:
+            init_staging = self.use_gpu
+
+        self._current_kv_group = kv_group
+        layout = self._group_layouts.get(kv_group)
+        if layout is None:
+            layout = _GroupLayout()
+            layout.indexer_c8 = (
+                kv_group == 1 and getattr(self, "indexer_c8_layout", None) is not None
+            )
+            layout.storage_dtype = torch.uint8 if layout.indexer_c8 else self.dtype
+            # Both groups need the two-group hint: kv_group=0 is MLA_LATENT
+            # and kv_group=1 is DSA_INDEX. Without it, equal latent/PE widths
+            # can be mistaken for ordinary SEPARATE_KV at TP=8-like shapes.
+            detect_two_groups = getattr(self, "dsa_two_groups", False)
+            layout.kv_format = (
+                KVCacheFormat.DSA_INDEX
+                if layout.indexer_c8
+                else KVCacheFormat.detect(
+                    kv_caches,
+                    use_mla=self.use_mla,
+                    dsa_two_groups=detect_two_groups,
+                )
+            )
+            if layout.kv_format == KVCacheFormat.UNDEFINED:
                 raise ValueError(
                     "Undefined KV cache format detected. "
                     "Unable to determine the format of input kv_caches."
                 )
 
-            logger.info(f"Detected KV cache format: {self.kv_format.name}")
-
+            if layout.kv_format not in (
+                KVCacheFormat.MLA_LATENT,
+                KVCacheFormat.DSA_INDEX,
+            ):
+                logger.info(
+                    "Detected KV cache format (kv_group=%d): %s",
+                    kv_group,
+                    layout.kv_format.name,
+                )
+            self._reset_sparse_direct_layer_states()
             first_layer_cache = kv_caches[0]
 
-            if self.kv_format == KVCacheFormat.SEPARATE_KV:
+            # Authoritative per-group cardinality: the registered group caches
+            # are the runtime truth of how many layer rows this group
+            # transfers (GLM-5.2: latent=79, indexer=22). The mirrored
+            # instance self.num_layers is last-wins across interleaved group
+            # calls, so per-group readers must use layout.num_layers.
+            layout.num_layers = len(kv_caches)
+            layout.layer_indices = tuple(range(len(kv_caches)))
+
+            if layout.kv_format == KVCacheFormat.SEPARATE_KV:
                 key_tensor = first_layer_cache[0]
                 value_tensor = first_layer_cache[1]
-
                 assert key_tensor.shape == value_tensor.shape, (
                     f"Key and Value tensors must have identical shapes, "
                     f"got key={key_tensor.shape}, value={value_tensor.shape}"
                 )
-
-                k_cache_shape_per_layer = key_tensor.shape
-                self.vllm_two_major = False
-
-            elif self.kv_format == KVCacheFormat.MERGED_KV:
+                layout.kv_device = key_tensor.device
+                layout.vllm_two_major = False
+                layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
+                layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
+            elif layout.kv_format == KVCacheFormat.MLA_KV:
+                key_tensor, value_tensor = first_layer_cache
+                layout.kv_device = key_tensor.device
+                layout.vllm_two_major = False
+                layout.kv_lora_rank = key_tensor.shape[-1]
+                layout.qk_rope_head_dim = value_tensor.shape[-1]
+                layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
+                layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
+            elif layout.kv_format == KVCacheFormat.MLA_LATENT:
+                # Two-group latent: (k_nope, k_pe) -> same dim structure as MLA_KV
+                key_tensor, value_tensor = first_layer_cache
+                layout.kv_device = key_tensor.device
+                layout.vllm_two_major = False
+                layout.kv_lora_rank = key_tensor.shape[-1]
+                layout.qk_rope_head_dim = value_tensor.shape[-1]
+                layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
+                layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
+            elif layout.kv_format == KVCacheFormat.DSA_INDEX:
+                # Two-group indexer: (indexer_k,) -> single tensor, single plane
+                indexer_tensor = first_layer_cache[0]
+                layout.kv_device = indexer_tensor.device
+                layout.vllm_two_major = False
+                layout.dsa_head_dim = indexer_tensor.shape[-1]
+                layout.dsa_hidden_dims = (
+                    indexer_tensor.shape[-2] * indexer_tensor.shape[-1]
+                )
+                if layout.indexer_c8:
+                    policy = self.indexer_c8_layout
+                    if policy.c8_layers and len(policy.c8_layers) != len(kv_caches):
+                        raise ValueError(
+                            "Indexer cache owners disagree with precision policy"
+                        )
+                    bf16_blocks = {
+                        layer[0].shape[0] for i, layer in enumerate(kv_caches)
+                        if not policy.is_c8(i)
+                    }
+                    if len(bf16_blocks) > 1:
+                        raise ValueError("Mixed indexer layers disagree on logical block capacity")
+                    logical_blocks = next(iter(bf16_blocks)) if bf16_blocks else first_layer_cache[0].shape[0]
+                    if logical_blocks <= 0:
+                        raise ValueError("Indexer cache must contain physical blocks")
+                    factors = []
+                    for i, layer in enumerate(kv_caches):
+                        key = layer[0]
+                        quantized = policy.is_c8(i)
+                        factor = key.shape[0] // logical_blocks
+                        if (
+                            len(layer) != (2 if quantized else 1)
+                            or key.dtype != (torch.int8 if quantized else self.dtype)
+                            or key.ndim != 4
+                            or key.shape[1:] != (128, 1, 128)
+                            or factor not in ((1, 2) if quantized else (1,))
+                            or key.shape[0] != logical_blocks * factor
+                        ):
+                            raise ValueError("Indexer cache disagrees with its per-layer precision policy")
+                        if quantized and (
+                            layer[1].dtype != torch.float16
+                            or layer[1].shape != (*key.shape[:3], 1)
+                            or layer[1].device != key.device
+                        ):
+                            raise ValueError("C8 indexer requires paired FP16 scales in PA_BSND")
+                        factors.append(factor)
+                    mapping = getattr(self, "indexer_hbm_block_map", None)
+                    if mapping is not None:
+                        if len(mapping) != logical_blocks or any(
+                            factor != 1 for factor in factors
+                        ):
+                            raise ValueError(
+                                "Paired-bank map disagrees with registered HBM capacity"
+                            )
+                        layout.block_map_cpu = torch.tensor(mapping, dtype=torch.int64)
+                        layout.block_map_device = layout.block_map_cpu.to(
+                            device=layout.kv_device, dtype=torch.int32
+                        )
+                    layout.layer_slot_factors = tuple(factors)
+                    layout.layer_token_bytes = tuple(policy.token_bytes_for(i) for i in range(len(kv_caches)))
+                    # Capacity of the reusable staging pool; packet lengths
+                    # remain per-layer and do not acquire this padding.
+                    layout.dsa_hidden_dims = max(layout.layer_token_bytes)
+                # Map onto MLA_KV kernel: k=dsa, v=0
+                layout.k_hidden_dims = layout.dsa_hidden_dims
+                layout.v_hidden_dims = 0
+            elif layout.kv_format == KVCacheFormat.DSA_KV:
+                key_tensor, value_tensor, dsa_tensor = first_layer_cache
+                layout.kv_device = key_tensor.device
+                layout.vllm_two_major = False
+                layout.kv_lora_rank = key_tensor.shape[-1]
+                layout.qk_rope_head_dim = value_tensor.shape[-1]
+                layout.dsa_head_dim = dsa_tensor.shape[-1]
+                layout.k_hidden_dims = key_tensor.shape[-2] * key_tensor.shape[-1]
+                layout.v_hidden_dims = value_tensor.shape[-2] * value_tensor.shape[-1]
+                layout.dsa_hidden_dims = dsa_tensor.shape[-2] * dsa_tensor.shape[-1]
+            elif layout.kv_format == KVCacheFormat.MERGED_KV:
                 assert (
                     first_layer_cache.shape[0] == 2 or first_layer_cache.shape[1] == 2
                 ), (
@@ -1186,34 +7340,184 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "[num_layers, num_blocks, 2, block_size, num_heads, head_size]"
                     f"Got shape: {first_layer_cache.shape}"
                 )
-
-                self.vllm_two_major = first_layer_cache.shape[0] == 2
-
-                if self.vllm_two_major:
-                    # Flash Attention: [2, num_blocks, block_size, num_heads, head_size]
-                    k_cache_shape_per_layer = first_layer_cache[0].shape
+                layout.kv_device = first_layer_cache.device
+                layout.vllm_two_major = first_layer_cache.shape[0] == 2
+                if layout.vllm_two_major:
+                    head_tensor = first_layer_cache[0]
                 else:
-                    # Flash Infer: [num_blocks, 2, block_size, num_heads, head_size]
-                    k_cache_shape_per_layer = first_layer_cache[:, 0].shape
+                    head_tensor = first_layer_cache[:, 0]
+                head_elems = head_tensor.shape[-2] * head_tensor.shape[-1]
+                layout.k_hidden_dims = head_elems
+                layout.v_hidden_dims = head_elems
             else:
-                raise ValueError(f"Unsupported KV cache format: {self.kv_format}")
+                raise ValueError(f"Unsupported KV cache format: {layout.kv_format}")
 
-            max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
+            if layout.kv_format in (
+                KVCacheFormat.MLA_LATENT,
+                KVCacheFormat.DSA_INDEX,
+            ):
+                layer_tensors = tuple(first_layer_cache)
+                planes = [
+                    {
+                        "shape": tuple(tensor.shape[2:]),
+                        "stride": tuple(tensor.stride()[2:]),
+                        "dtype": str(tensor.dtype),
+                        "token_stride_bytes": int(
+                            tensor.stride(1) * tensor.element_size()
+                        ),
+                        "token_bytes": int(
+                            tensor.numel()
+                            // (tensor.shape[0] * tensor.shape[1])
+                            * tensor.element_size()
+                        ),
+                    }
+                    for tensor in layer_tensors
+                ]
+                payload = {
+                    "format": layout.kv_format.name,
+                    "layers": layout.num_layers,
+                    "chunk_size": self.lmcache_chunk_size,
+                    "planes": planes,
+                    "page_bytes": (
+                        sum(plane["token_bytes"] for plane in planes)
+                        * self.lmcache_chunk_size
+                        * layout.num_layers
+                    ),
+                }
+                if layout.indexer_c8:
+                    payload["layer_token_bytes"] = layout.layer_token_bytes
+                    payload["layer_slot_factors"] = layout.layer_slot_factors
+                    if layout.block_map_cpu is not None:
+                        payload["hbm_addressing"] = "paired_bank_v1"
+                    payload["page_bytes"] = (
+                        sum(layout.layer_token_bytes) * self.lmcache_chunk_size
+                    )
+                encoded = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":")
+                )
+                layout.layout_signature = hashlib.blake2b(
+                    encoded.encode(), digest_size=8
+                ).hexdigest()
+                logger.info(
+                    "LMCache NPU payload layout: "
+                    "signature=%s kv_group=%d schema=%s",
+                    layout.layout_signature,
+                    kv_group,
+                    payload,
+                )
+            self._group_layouts[kv_group] = layout
+
+        # Mirror into instance attributes for backward-compatible readers.
+        self._mirror_layout(layout)
+
+        if init_staging and layout.gpu_buffer_allocator is None:
+            logger.info(f"Lazily initializing GPU buffer (kv_group={kv_group}).")
+            first_layer_cache = kv_caches[0]
+
+            if layout.kv_format == KVCacheFormat.SEPARATE_KV:
+                key_tensor = first_layer_cache[0]
+                k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = first_layer_cache[1].shape
+                num_elements = key_tensor.numel() * 2
+                max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
+            elif layout.kv_format == KVCacheFormat.MLA_KV:
+                key_tensor, value_tensor = first_layer_cache
+                k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = value_tensor.shape
+                max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
+                num_elements = max_tokens * (
+                    layout.k_hidden_dims + layout.v_hidden_dims
+                )
+            elif layout.kv_format == KVCacheFormat.MLA_LATENT:
+                key_tensor, value_tensor = first_layer_cache
+                k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = value_tensor.shape
+                max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
+                num_elements = max_tokens * (
+                    layout.k_hidden_dims + layout.v_hidden_dims
+                )
+            elif layout.kv_format == KVCacheFormat.DSA_INDEX:
+                indexer_tensor = first_layer_cache[0]
+                k_cache_shape_per_layer = indexer_tensor.shape
+                v_cache_shape_per_layer = indexer_tensor.shape
+                max_tokens = indexer_tensor.shape[0] * indexer_tensor.shape[1]
+                num_elements = max_tokens * layout.dsa_hidden_dims
+            elif layout.kv_format == KVCacheFormat.DSA_KV:
+                key_tensor, value_tensor, dsa_tensor = first_layer_cache
+                k_cache_shape_per_layer = key_tensor.shape
+                v_cache_shape_per_layer = value_tensor.shape
+                max_tokens = key_tensor.shape[0] * key_tensor.shape[1]
+                num_elements = max_tokens * (
+                    layout.k_hidden_dims + layout.v_hidden_dims + layout.dsa_hidden_dims
+                )
+            else:
+                if layout.vllm_two_major:
+                    k_cache_shape_per_layer = first_layer_cache[0].shape
+                    v_cache_shape_per_layer = first_layer_cache[1].shape
+                else:
+                    k_cache_shape_per_layer = first_layer_cache[:, 0].shape
+                    v_cache_shape_per_layer = first_layer_cache[:, 1].shape
+                num_elements = k_cache_shape_per_layer.numel() * 2
+                max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
+
+            staging_tokens = self._layerwise_staging_num_tokens(max_tokens)
+            if staging_tokens != max_tokens:
+                plane_elems = num_elements // max_tokens
+                num_elements = staging_tokens * plane_elems
+
+            pool_slots = self._layerwise_staging_pool_slots()
+            per_slot_bytes = num_elements * layout.storage_dtype.itemsize
+            layout.staging_bytes_per_slot = per_slot_bytes
+            gpu_buffer_size = per_slot_bytes * pool_slots
 
             logger.info(
                 f"Lazily initializing GPU buffer:\n"
-                f"  - Format: {self.kv_format.name}\n"
+                f"  - Format: {layout.kv_format.name}\n"
                 f"  - Key cache shape per layer: {k_cache_shape_per_layer}\n"
-                f"  - Max tokens: {max_tokens}"
+                f"  - Value cache shape per layer: {v_cache_shape_per_layer}\n"
+                f"  - Pool max tokens: {max_tokens}\n"
+                f"  - Staging tokens: {staging_tokens}\n"
+                f"  - Staging pool slots: {pool_slots}\n"
+                f"  - k_hidden_dims={layout.k_hidden_dims} "
+                f"v_hidden_dims={layout.v_hidden_dims} "
+                f"dsa_hidden_dims={layout.dsa_hidden_dims}\n"
+                f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024):.2f} MB"
             )
 
-            num_elements_key = k_cache_shape_per_layer.numel()
-            num_elements = num_elements_key * 2
-            gpu_buffer_size = num_elements * self.element_size
+            self._assign_group_gpu_allocator(gpu_buffer_size, layout)
+            if self.dsa_two_groups:
+                logger.info(
+                    "dsa_two_groups: per-group NPU staging pool "
+                    f"(kv_group={kv_group}, cap={staging_tokens} tokens, "
+                    f"slots={pool_slots}, "
+                    f"{gpu_buffer_size / (1024 * 1024):.2f} MB)"
+                )
 
-            self.gpu_buffer_allocator = GPUMemoryAllocator(
-                gpu_buffer_size, device=self.device
-            )
+        return layout
+
+    def get_shape(self, num_tokens: int, kv_group: Optional[int] = None) -> torch.Size:
+        if kv_group is None:
+            kv_group = self._current_kv_group
+        layout = self._group_layouts.get(kv_group)
+        fmt = layout.kv_format if layout is not None else self.kv_format
+        k_hidden = layout.k_hidden_dims if layout is not None else self.k_hidden_dims
+        v_hidden = layout.v_hidden_dims if layout is not None else self.v_hidden_dims
+        dsa_hidden = (
+            layout.dsa_hidden_dims if layout is not None else self.dsa_hidden_dims
+        )
+        if fmt == KVCacheFormat.MLA_KV:
+            plane_elems = k_hidden + v_hidden
+            return torch.Size([num_tokens * plane_elems])
+        if fmt == KVCacheFormat.MLA_LATENT:
+            plane_elems = k_hidden + v_hidden
+            return torch.Size([num_tokens * plane_elems])
+        if fmt == KVCacheFormat.DSA_INDEX:
+            plane_elems = dsa_hidden
+            return torch.Size([num_tokens * plane_elems])
+        if fmt == KVCacheFormat.DSA_KV:
+            plane_elems = k_hidden + v_hidden + dsa_hidden
+            return torch.Size([num_tokens * plane_elems])
+        return torch.Size([num_tokens, 2, self.hidden_dim_size])
 
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
         """
@@ -1236,7 +7540,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
 
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
@@ -1249,95 +7554,1641 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        kv_group = kwargs.get("kv_group", 0)
+        req_id = kwargs.get("req_id")
+        layout = self._lazy_initialize_buffer_with_staging(
+            kvcaches_snapshot,
+            kv_group=kv_group,
+            init_staging=False,
+        )
+        is_mla_dsa = self._is_mla_dsa_format(kv_group)
+        dense_direct = is_mla_dsa and not _DENSE_DIRECT_LOAD_DISABLE
+        readiness_out = kwargs.get("_dense_load_readiness_out")
+        defer_dense_waits = readiness_out is not None
+        if defer_dense_waits and (
+            not dense_direct
+            or not sync
+            or not isinstance(readiness_out, list)
+            or readiness_out
+        ):
+            raise ValueError("Invalid deferred dense-load readiness request.")
+        deferred_layerwise_get = bool(
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("deferred_layerwise_get", False)
+        )
+        deferred_dense_direct_get = deferred_layerwise_get and dense_direct
+        if (
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+            and not dense_direct
+        ):
+            raise RuntimeError("Layerwise prefill DMA requires dense direct load")
+        prefill_dma = bool(
+            deferred_dense_direct_get
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+        )
+        prefill_packet = prefill_dma and layout.indexer_c8
+        if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
+            raise RuntimeError(
+                "LMCache-Ascend must be rebuilt for layerwise prefill DMA"
+            )
+        if prefill_dma and layout.kv_format not in (
+            KVCacheFormat.MLA_LATENT, KVCacheFormat.DSA_INDEX
+        ):
+            raise ValueError("Layerwise prefill DMA requires two-group DSA KV")
+        layerwise_prefill_bank_count = 2
+        if getattr(self, "_layerwise_prefill_dma", False):
+            layerwise_prefill_bank_count = int(
+                kwargs.get("layerwise_prefill_bank_count", 2) or 2
+            )
+        if prefill_dma and (
+            len(kwargs["prefill_dma_block_ids_by_bank"]) != layerwise_prefill_bank_count
+        ):
+            raise ValueError("Prefill DMA bank maps disagree with the rotation depth")
+        if deferred_dense_direct_get:
+            self._set_layerwise_prefill_bank_count(
+                kv_group,
+                layerwise_prefill_bank_count,
+            )
+            layerwise_prefill_generation = (
+                self._layerwise_prefill_transfer_generation(kv_group)
+            )
+        else:
+            layerwise_prefill_generation = None
 
-        slot_mapping_chunks = []
-        for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
-
-        # TODO(Jiayi): Optimize away this `cat`
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-
-        num_tokens = len(slot_mapping_full)
+        if not dense_direct:
+            if is_mla_dsa and not self.use_gpu:
+                raise ValueError(
+                    "MLA/DSA layerwise transfer requires use_gpu=True with a "
+                    "staging buffer when dense direct load is disabled."
+                )
+            if self.use_gpu and layout.gpu_buffer_allocator is None:
+                layout = self._lazy_initialize_buffer_with_staging(
+                    kvcaches_snapshot,
+                    kv_group=kv_group,
+                    init_staging=True,
+                )
 
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
-
         for start, end in zip(starts, ends, strict=False):
             chunk_size = end - start
-            chunk_sizes.append(chunk_size)
             chunk_offsets.append(current_offset)
+            chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
-        if self.use_gpu:
-            buffer_shape = self.get_shape(num_tokens)
-            assert self.gpu_buffer_allocator is not None
-            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+        slot_mappings = {} if deferred_layerwise_get and not prefill_dma else None
+        if prefill_dma:
+            slot_mapping_chunks = ()
+            slot_mapping_full = torch.empty(0, dtype=torch.long)
+        elif not getattr(self, "_layerwise_prefill_dma", False):
+            slot_mapping_chunks = [
+                slot_mapping[start:end]
+                for start, end in zip(starts, ends, strict=False)
+            ]
+            slot_mapping_full = (
+                slot_mapping_chunks[0]
+                if len(slot_mapping_chunks) == 1
+                else torch.cat(slot_mapping_chunks, dim=0)
             )
-            assert tmp_gpu_buffer_obj is not None, (
-                "Failed to allocate NPU buffer in NPUConnector"
+        else:
+            slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
+                slot_mappings, slot_mapping, starts, ends
             )
-            assert tmp_gpu_buffer_obj.tensor is not None
 
-        current_stream = torch.cuda.current_stream()
-
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = yield
-            if sync:
-                current_stream.wait_stream(self.load_stream)
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id - 1}")
-            # memobj -> gpu_buffer -> kvcaches
-            with torch.cuda.stream(self.load_stream):
-                if self.use_gpu:
-                    cpu_tensors = []
-                    for memory_obj in memory_objs_layer:
-                        assert memory_obj.tensor is not None
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
-                        cpu_tensors.append(memory_obj.tensor)
-
-                    # Fused transfer: N H2D memcpy + 1 scatter kernel
-                    lmc_ops.batched_fused_single_layer_kv_transfer(
-                        cpu_tensors,  # CPU memory objects
-                        tmp_gpu_buffer_obj.tensor,  # GPU staging buffer
-                        self.kvcaches[layer_id],
-                        slot_mapping_full,
-                        chunk_offsets,  # offset for each chunk
-                        chunk_sizes,  # size for each chunk
-                        False,  # to_gpu
-                        self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                        True,  # token_major
-                        self.vllm_two_major,
+        num_tokens = (
+            sum(chunk_sizes) if prefill_dma else len(slot_mapping_full)
+        )
+        self._check_layerwise_transfer_invariants(
+            operation="retrieve",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping_full,
+            kvcaches_ref=kvcaches_snapshot,
+        )
+        # Snapshot per-group values so interleaved per-group generators
+        # do not race on the mirrored instance attributes.
+        kv_format_value = layout.kv_format.value
+        vllm_two_major = layout.vllm_two_major
+        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
+            layout.k_hidden_dims,
+            layout.v_hidden_dims,
+            layout.dsa_hidden_dims,
+        )
+        token_major = self._layerwise_token_major(kv_group)
+        expected_fmt = self._expected_memory_format(kv_group)
+        dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
+        cached_chunk_dev_ptrs = kwargs.get("cached_chunk_dev_ptrs")
+        chunk_offsets_npu: Optional[torch.Tensor] = None
+        chunk_sizes_npu: Optional[torch.Tensor] = None
+        dense_fixed_chunk_size = 0
+        c8_chunk_capacity = max(chunk_sizes) if layout.indexer_c8 else 0
+        dma_plans = None
+        dma_req_id = kwargs.get("req_id") if prefill_dma else None
+        bound_loads = None
+        plan_cache = source_cache = None
+        reuse_debug = prefill_dma and not prefill_packet and prefill_reuse_debug_enabled(
+            getattr(self, "_prefill_worker_id", -1)
+        )
+        if reuse_debug:
+            plan_mode = "full"
+            debug_map_drops = 0
+            debug_reused = debug_rebuilt = debug_layers = 0
+            debug_submit_ms = 0.0
+            debug_layer_count = min(2, self._expected_group_layers(kv_group))
+        if prefill_dma and not prefill_packet:
+            if isinstance(dma_req_id, str) and dma_req_id:
+                bound_loads = self._prefill_dma_bound_loads.setdefault(dma_req_id, {})
+                if not hasattr(self, "_prefill_dma_plan_cache"):
+                    self._prefill_dma_plan_cache = {}
+                    self._prefill_dma_source_cache = {}
+                plan_cache = self._prefill_dma_plan_cache.setdefault(dma_req_id, {})
+                source_cache = self._prefill_dma_source_cache.setdefault(dma_req_id, {})
+            dma_plans = _prefill_dma_plans(
+                kwargs["prefill_dma_block_ids_by_bank"],
+                int(kwargs["prefill_dma_block_size"]),
+                starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "load",
+                self.prefill_dma_cycles[kv_group],
+                plan_cache=plan_cache,
+            )
+            if plan_cache is not None:
+                if reuse_debug:
+                    reused_plans = sum(
+                        plan_cache[(kv_group, bank)].reused_chunks > 0
+                        for bank in range(len(dma_plans))
                     )
+                    plan_mode = (
+                        "full" if reused_plans == 0 else
+                        "reuse" if reused_plans == len(dma_plans) else "mix"
+                    )
+                for bank in range(len(dma_plans)):
+                    if plan_cache[(kv_group, bank)].mapping_changed:
+                        for cache_key in tuple(bound_loads):
+                            if cache_key[0] == kv_group and cache_key[2] == bank:
+                                bound_loads.pop(cache_key)
+                                if reuse_debug:
+                                    debug_map_drops += 1
+        if (dense_direct or layout.indexer_c8) and not prefill_dma:
+            (
+                dense_fixed_chunk_size,
+                chunk_offsets_npu,
+                chunk_sizes_npu,
+            ) = self._prepare_dense_direct_chunk_metadata(
+                chunk_offsets,
+                chunk_sizes,
+                total_tokens=num_tokens,
+                kv_group=kv_group,
+            )
+            if defer_dense_waits:
+                self.load_stream.wait_stream(torch.cuda.current_stream())
+            slot_mapping_full = self._slot_mapping_on_kv_device(
+                slot_mapping_full, self.load_stream
+            )
+            destination_plan = self._get_or_create_sparse_destination_plan(
+                kvcaches_ref=kvcaches_snapshot,
+                kv_group=kv_group,
+                slot_mapping_ref=slot_mapping_full,
+                sparse_kv_format=kv_format_value,
+                sparse_k_hidden_dims=k_hidden_dims,
+                sparse_v_hidden_dims=v_hidden_dims,
+                sparse_dsa_hidden_dims=dsa_hidden_dims,
+                expected_device=layout.kv_device,
+            )
+        else:
+            destination_plan = None
+        pointer_stream_kwargs = (
+            {"stream": self.load_stream} if defer_dense_waits else {}
+        )
 
+        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
+        if self.use_gpu and not dense_direct:
+            tmp_gpu_buffer_obj, staging_tensor = (
+                self._allocate_layerwise_staging_buffer(
+                    num_tokens=num_tokens,
+                    kv_group=kv_group,
+                    layout=layout,
+                    expected_fmt=expected_fmt,
+                )
+            )
+
+        prefill_packets = None
+        if prefill_packet:
+            packet_sources = kwargs.get("prefill_c8_memory_objs")
+            if packet_sources is None:
+                raise ValueError("Banked mixed-C8 load requires preprepared per-layer sources")
+            packet_sources = tuple(
+                tuple(_layer_source_memory_objs(row, layer_id))
+                for layer_id, row in enumerate(packet_sources)
+            )
+            prefill_packets = self._prepare_prefill_c8_packets(
+                layout=layout, kvcaches=kvcaches_snapshot, memory_objs=packet_sources,
+                block_ids_by_bank=kwargs["prefill_dma_block_ids_by_bank"],
+                block_size=int(kwargs["prefill_dma_block_size"]), starts=starts, ends=ends,
+                transfer_stream=self.load_stream,
+            )
+        deferred_load_submitted = False
+        deferred_load_completed = False
+        try:
+            validated_page_ids: set[int] = set()
+            for layer_id in range(self._expected_group_layers(kv_group)):
+                layer_payload = yield
+                if layerwise_prefill_generation is not None:
+                    self._check_layerwise_prefill_transfer_generation(
+                        kv_group,
+                        layerwise_prefill_generation,
+                    )
+                layer_request = None
+                if (
+                    deferred_layerwise_get
+                    and isinstance(layer_payload, dict)
+                    and "memory_objs" in layer_payload
+                ):
+                    memory_objs_layer = layer_payload["memory_objs"]
+                    layer_request = layer_payload.get("layer_request")
                 else:
-                    for start, end, memory_obj in zip(
-                        starts, ends, memory_objs_layer, strict=False
-                    ):
-                        assert memory_obj.tensor is not None
-
-                        lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
-                            self.kvcaches[layer_id],
-                            slot_mapping[start:end],
-                            False,
-                            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                            True,
-                            self.vllm_two_major,
+                    memory_objs_layer = layer_payload
+                if prefill_dma:
+                    # Both bank plans were built from CPU slot maps before
+                    # forward; do not slice/cat device maps in this callback.
+                    layer_slot_mapping_chunks = slot_mapping_chunks
+                    layer_slot_mapping_full = slot_mapping_full
+                    new_mapping = False
+                elif layer_request is None:
+                    # D-side loads use one immutable map. Reuse the exact tensor
+                    # prepared (and, if needed, copied to the NPU) above: the
+                    # deferred-load stream dependency and layer-0 record_stream
+                    # cover that tensor, not new per-layer torch.cat results.
+                    layer_slot_mapping_chunks = slot_mapping_chunks
+                    layer_slot_mapping_full = slot_mapping_full
+                    new_mapping = False
+                else:
+                    # P-node bank switches still select their explicit mapping.
+                    layer_slot_mapping, layer_slot_mapping_base = (
+                        _resolve_layerwise_slot_mapping(layer_request, slot_mapping)
+                    )
+                    (
+                        layer_slot_mapping_chunks,
+                        layer_slot_mapping_full,
+                        new_mapping,
+                    ) = _cached_layerwise_slot_mapping(
+                        slot_mappings, layer_slot_mapping, starts, ends,
+                        layer_slot_mapping_base,
+                    )
+                if new_mapping and len(layer_slot_mapping_full) != num_tokens:
+                    raise RuntimeError(
+                        "Layerwise retrieve changed transfer token count: "
+                        f"layer={layer_id}, expected={num_tokens}, "
+                        f"actual={len(layer_slot_mapping_full)}"
+                    )
+                if new_mapping:
+                    self._check_layerwise_transfer_invariants(
+                        operation="retrieve",
+                        kv_group=kv_group,
+                        slot_mapping_full=layer_slot_mapping_full,
+                        kvcaches_ref=kvcaches_snapshot,
+                    )
+                source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
+                if prefill_packet and tuple(map(id, source_objs)) != tuple(map(
+                    id, _layer_source_memory_objs(packet_sources[layer_id], layer_id)
+                )):
+                    raise RuntimeError("Banked C8 source changed after packet preparation")
+                if deferred_dense_direct_get and req_id is not None:
+                    owners = self._layerwise_prefill_load_owners.setdefault(
+                        str(req_id), {}
+                    )
+                    for source_obj in source_objs:
+                        identity = id(source_obj)
+                        if identity in owners:
+                            continue
+                        if not source_obj.is_valid():
+                            raise RuntimeError(
+                                "Layerwise prefill source MemoryObj is invalid "
+                                f"before DMA submission: req_id={req_id}, "
+                                f"layer={layer_id}"
+                            )
+                        source_obj.ref_count_up()
+                        owners[identity] = source_obj
+                page_checks: tuple[MemoryObj, ...] = ()
+                format_sources = source_objs
+                if isinstance(memory_objs_layer, LayerPageSource):
+                    page_checks = tuple(
+                        page
+                        for page in memory_objs_layer.pages
+                        if id(page) not in validated_page_ids
+                    )
+                    format_sources = (*page_checks, *memory_objs_layer.suffix)
+                if any(obj.metadata.fmt != expected_fmt for obj in format_sources):
+                    raise ValueError(f"Expected memory format {expected_fmt}.")
+                validated_page_ids.update(map(id, page_checks))
+                if getattr(self, "kv_trace", None) is not None and not prefill_dma:
+                    self.trace_cpu_kv("D_CPU",
+                                      req_id, kv_group, starts, ends, (source_objs,),
+                                      mirror=not self._layerwise_prefill_dma,
+                                      layer_ids=(layer_id,))
+                pointer_first = dense_direct and bool(source_objs)
+                if prefill_dma:
+                    cpu_tensors = []
+                elif pointer_first:
+                    cpu_tensors = [_layer_memory_tensor(source_objs[0], layer_id)]
+                else:
+                    cpu_tensors = _layer_source_tensors(
+                        memory_objs_layer, layer_id, expected_fmt
+                    )
+                # Ordinary paths need the active compute stream per layer.
+                # Deferred DMA fences bank reuse separately at H2D submission.
+                current_stream = (
+                    self.load_stream
+                    if defer_dense_waits or prefill_dma
+                    else torch.cuda.current_stream()
+                )
+                if sync and not defer_dense_waits and not deferred_dense_direct_get:
+                    current_stream.wait_stream(self.load_stream)
+                if layer_id > 0 and logger.isEnabledFor(10):
+                    logger.debug("Finished loading layer %d", layer_id - 1)
+                # memobj -> gpu_buffer -> kvcaches
+                if prefill_dma:
+                    assert prefill_packets is not None or dma_plans is not None
+                    diagnose_bank_load = (
+                        layer_id < 2 and prefill_start_timing_enabled()
+                    )
+                    if diagnose_bank_load:
+                        bank_load_started = time.perf_counter()
+                    bank = self._layerwise_prefill_bank(layer_id, kv_group)
+                    bank_stream = self._layerwise_prefill_dma_stream(
+                        kv_group, bank
+                    )
+                    bank_tails = getattr(
+                        self, "_layerwise_prefill_bank_tail_events", {}
+                    )
+                    previous_tail = bank_tails.get((kv_group, bank))
+                    previous_tail_pending = None
+                    if diagnose_bank_load:
+                        previous_tail_pending = bool(
+                            previous_tail is not None
+                            and not previous_tail[1].query()
                         )
-                logger.debug(f"Finished loading layer {layer_id}")
+                        bind_started = time.perf_counter()
+                    if reuse_debug and layer_id < debug_layer_count:
+                        debug_submit_started = time.perf_counter()
+                    bind_ms = 0.0
+                    if not prefill_packet:
+                        source_metadata = None
+                        if source_cache is not None:
+                            source_key = (kv_group, layer_id)
+                            source_metadata = prepare_source_addresses(
+                                source_objs, starts, ends,
+                                lambda obj, layer_id=layer_id: (
+                                    int(obj.layer_data_ptr(layer_id))
+                                    if isinstance(obj, LayerPageMemoryObj)
+                                    else int(obj.data_ptr)
+                                ),
+                                lambda obj, layer_id=layer_id: self._lmc_plane_num_tokens(
+                                    _layer_memory_tensor(obj, layer_id), kv_group
+                                ),
+                                source_cache.get(source_key),
+                            )
+                            source_cache[source_key] = source_metadata
+                        bound = bind_incremental_copy_addresses(
+                            dma_plans[bank], source_objs, starts, ends,
+                            [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
+                            self.checkpoint_plane_widths(kv_group),
+                            int(kvcaches_snapshot[layer_id][0].element_size()),
+                            lambda obj, layer_id=layer_id: (
+                                int(obj.layer_data_ptr(layer_id))
+                                if isinstance(obj, LayerPageMemoryObj)
+                                else int(obj.data_ptr)
+                            ),
+                            lambda obj, layer_id=layer_id: self._lmc_plane_num_tokens(
+                                _layer_memory_tensor(obj, layer_id), kv_group
+                            ),
+                            (
+                                bound_loads.get((kv_group, layer_id, bank))
+                                if bound_loads is not None else None
+                            ),
+                            slot_prefix_unchanged=bound_loads is not None,
+                            source_metadata=source_metadata,
+                            reuse_rows_in_place=bound_loads is not None,
+                        )
+                        if bound_loads is not None:
+                            bound_loads[(kv_group, layer_id, bank)] = bound
+                        copies = bound.rows
+                        if diagnose_bank_load:
+                            bind_ms = (time.perf_counter() - bind_started) * 1000
+                        if reuse_debug and layer_id < debug_layer_count:
+                            debug_reused += bound.reused_chunks
+                            debug_rebuilt += len(source_objs) - bound.reused_chunks
+                            debug_layers += 1
+                    # Attention already queued the exact last-use event on
+                    # this bank FIFO, on every TP rank. Do not snapshot the
+                    # current compute stream here: it can include N's FFN or
+                    # N+1's normalization. Fixed layer-to-bank assignment means
+                    # even the first B loads inherit the previous chunk's saves
+                    # and final-access handoffs on their own FIFO. No all-bank
+                    # producer join is needed. Cross-process CPU sources are
+                    # fenced separately before shared-handle publication.
+                    if layer_id >= layerwise_prefill_bank_count:
+                        self._require_layerwise_prefill_bank_use(
+                            layer_id - layerwise_prefill_bank_count, kv_group, bank,
+                        )
+                    with torch.npu.stream(bank_stream):
+                        deferred_load_submitted = True
+                        overlap = getattr(self, "prefill_overlap_recorder", None)
+                        overlap_dma = (
+                            overlap.start_interval(
+                                "load", bank_stream, kv_group, bank, layer_id,
+                            ) if overlap is not None else None
+                        )
+                        if diagnose_bank_load:
+                            native_enqueue_started = time.perf_counter()
+                        if prefill_packet:
+                            self._submit_prefill_c8_packet(
+                                prefill_packets, layer_id, bank, bank_stream, False,
+                            )
+                        else:
+                            lmc_ops.layerwise_prefill_dma_copy(copies, False)
+                        if overlap is not None:
+                            overlap.end_interval(overlap_dma, bank_stream)
+                        if diagnose_bank_load:
+                            native_enqueue_ms = (
+                                time.perf_counter() - native_enqueue_started
+                            ) * 1000
+                    if diagnose_bank_load:
+                        event_record_started = time.perf_counter()
+                    load_done_event = torch.npu.Event()
+                    load_done_event.record(bank_stream)
+                    if reuse_debug and layer_id < debug_layer_count:
+                        debug_submit_ms += (
+                            time.perf_counter() - debug_submit_started
+                        ) * 1000
+                    if diagnose_bank_load:
+                        event_record_ms = (
+                            time.perf_counter() - event_record_started
+                        ) * 1000
+                    if req_id is not None:
+                        self._layerwise_prefill_load_request_events.setdefault(
+                            str(req_id), []
+                        ).append(load_done_event)
+                    _, _, _, load_done = self._layerwise_prefill_transfer_state()
+                    load_done.setdefault((kv_group, layer_id), {})[
+                        str(req_id) if req_id is not None else None
+                    ] = (
+                        layerwise_prefill_generation, load_done_event,
+                    )
+                    fence_debug = getattr(self, "fence_debug", None)
+                    if fence_debug is not None:
+                        fence_debug.loaded(str(req_id), kv_group, layer_id, bank,
+                                           load_done_event)
+                        fence_debug.wait("p_load", kv_group, layer_id,
+                                         load_done_event, req=req_id, bank=bank)
+                    audit = getattr(self, "prefill_audit", None)
+                    if audit is not None:
+                        audit.load(kv_group, layer_id, bank,
+                                   layerwise_prefill_generation, id(load_done_event))
+                    if getattr(self, "kv_trace", None) is not None:
+                        self.enqueue_load_kv_trace(
+                            req_id, kv_group, starts, ends, source_objs,
+                            layer_id, load_done_event,
+                        )
+                    if diagnose_bank_load:
+                        prefill_start_timing_log(
+                            logger,
+                            "first_bank_load_submit",
+                            bank_load_started,
+                            kv_group=kv_group,
+                            layer_id=layer_id,
+                            bank=bank,
+                            bind_ms=round(bind_ms, 3),
+                            native_enqueue_ms=round(native_enqueue_ms, 3),
+                            event_record_ms=round(event_record_ms, 3),
+                            previous_tail_pending=previous_tail_pending,
+                            previous_tail_layer=(
+                                previous_tail[2]
+                                if previous_tail is not None else None
+                            ),
+                        )
+                    if reuse_debug and layer_id + 1 == debug_layer_count:
+                        prefill_reuse_debug_log(
+                            self._prefill_worker_id,
+                            "dma",
+                            req_id=dma_req_id or "",
+                            p=int(ends[-1]) if ends else 0,
+                            g=kv_group,
+                            n=len(starts),
+                            l=debug_layers,
+                            x=f"{debug_reused}/{debug_rebuilt}",
+                            map_drop=debug_map_drops,
+                            plan=plan_mode,
+                            ms=debug_submit_ms,
+                        )
+                elif dense_direct or layout.indexer_c8:
+                    if deferred_dense_direct_get:
+                        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+                        _, _, save_done, _ = (
+                            self._layerwise_prefill_transfer_state()
+                        )
+                        previous_save = save_done.get(
+                            (kv_group, bank, int(layer_id))
+                        )
+                        if (
+                            previous_save is not None
+                            and previous_save[0] == layerwise_prefill_generation
+                        ):
+                            with self._stream_context_or_null(self.load_stream):
+                                self.load_stream.wait_event(previous_save[1])
+                    if layout.indexer_c8 and staging_tensor is not None:
+                        _, chunk_ptrs_npu = self._prepare_c8_staging_packets(
+                            cpu_tensors,
+                            staging_tensor,
+                            chunk_sizes,
+                            self.load_stream,
+                            False,
+                            layout.layer_token_bytes[layer_id],
+                        )
+                    elif pointer_first:
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id,
+                            cpu_tensors,
+                            cached_chunk_ptrs_npu,
+                            expected_num_chunks=len(source_objs),
+                            cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                            source_objs=source_objs,
+                            **pointer_stream_kwargs,
+                        )
+                    else:
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id,
+                            cpu_tensors,
+                            cached_chunk_ptrs_npu,
+                            cached_chunk_dev_ptrs=cached_chunk_dev_ptrs,
+                            **pointer_stream_kwargs,
+                        )
+                    assert chunk_offsets_npu is not None
+                    assert chunk_sizes_npu is not None
+                    if deferred_dense_direct_get:
+                        # The direct op may enqueue work before raising.  Its
+                        # close/error path must therefore conservatively fence
+                        # the load stream once launch starts.
+                        deferred_load_submitted = True
+                    self._run_dense_direct_kv_transfer_layer(
+                        kvcaches_ref=kvcaches_snapshot,
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        transfer_stream=self.load_stream,
+                        current_stream=current_stream,
+                        slot_mapping_full=layer_slot_mapping_full,
+                        chunk_ptrs_npu=chunk_ptrs_npu,
+                        chunk_offsets_npu=chunk_offsets_npu,
+                        chunk_sizes_npu=chunk_sizes_npu,
+                        total_tokens=num_tokens,
+                        fixed_chunk_size=dense_fixed_chunk_size,
+                        dense_kv_format=kv_format_value,
+                        dense_token_major=token_major,
+                        dense_vllm_two_major=vllm_two_major,
+                        dense_k_hidden_dims=k_hidden_dims,
+                        dense_v_hidden_dims=v_hidden_dims,
+                        dense_dsa_hidden_dims=dsa_hidden_dims,
+                        dense_host_interleaved=dense_host_interleaved,
+                        layer_tensors=cpu_tensors,
+                        direction=False,
+                        destination_plan=destination_plan,
+                        c8_chunk_capacity=c8_chunk_capacity,
+                        defer_consumer_wait=deferred_dense_direct_get,
+                    )
+                    if deferred_dense_direct_get:
+                        load_done_event = torch.npu.Event()
+                        load_done_event.record(self.load_stream)
+                        if req_id is not None:
+                            self._layerwise_prefill_load_request_events.setdefault(
+                                str(req_id), []
+                            ).append(load_done_event)
+                        _, _, _, load_done = (
+                            self._layerwise_prefill_transfer_state()
+                        )
+                        self._check_layerwise_prefill_transfer_generation(
+                            kv_group,
+                            layerwise_prefill_generation,
+                        )
+                        load_done.setdefault((kv_group, layer_id), {})[
+                            str(req_id) if req_id is not None else None
+                        ] = (
+                            layerwise_prefill_generation,
+                            load_done_event,
+                        )
+                        fence_debug = getattr(self, "fence_debug", None)
+                        if fence_debug is not None:
+                            fence_debug.loaded(
+                                str(req_id), kv_group, layer_id, bank,
+                                load_done_event,
+                            )
+                            fence_debug.wait(
+                                "p_load", kv_group, layer_id, load_done_event,
+                                req=req_id, bank=bank,
+                            )
+                else:
+                    # D-node and non-P-node requests retain the existing
+                    # single-layer paged-copy wrapper below.
+                    with torch.cuda.stream(self.load_stream):
+                        if self.use_gpu:
+                            # Fused transfer: N H2D memcpy + 1 scatter kernel
+                            batched_fused_single_layer_kv_transfer(
+                                cpu_tensors,  # CPU memory objects
+                                staging_tensor,  # GPU staging buffer
+                                kvcaches_snapshot[layer_id],
+                                layer_slot_mapping_full,
+                                chunk_offsets,  # offset for each chunk
+                                chunk_sizes,  # size for each chunk
+                                False,  # to_gpu
+                                kv_format_value,
+                                token_major,
+                                vllm_two_major,
+                                k_hidden_dims,
+                                v_hidden_dims,
+                                dsa_hidden_dims,
+                            )
+
+                        else:
+                            for mapping_chunk, tensor in zip(
+                                layer_slot_mapping_chunks,
+                                cpu_tensors,
+                                strict=False,
+                            ):
+                                lmc_ops.single_layer_kv_transfer(
+                                    tensor,
+                                    kvcaches_snapshot[layer_id],
+                                    mapping_chunk,
+                                    False,
+                                    kv_format_value,
+                                    token_major,
+                                    vllm_two_major,
+                                    k_hidden_dims,
+                                    v_hidden_dims,
+                                    dsa_hidden_dims,
+                                )
+                        if logger.isEnabledFor(10):
+                            logger.debug("Finished loading layer %d", layer_id)
+                    fence_debug = getattr(self, "fence_debug", None)
+                    if fence_debug is not None:
+                        fence_debug.wait("d_load", kv_group, layer_id,
+                                         self.load_stream, req=req_id)
+                    continue
+                if logger.isEnabledFor(10):
+                    logger.debug("Finished loading layer %d", layer_id)
+            if defer_dense_waits:
+                readiness_out.append(self.record_dense_load_readiness())
+            yield
+
+            # The deferred outer LMCache generator resumes this terminal gate
+            # only at the last-layer entry.  Request-owned source leases keep
+            # the host MemoryObjs alive after this callback, so no host fence
+            # is needed here.  Each layer consumer orders itself after its
+            # bank event; request teardown fences the exact events before
+            # releasing the lease.
+            if deferred_dense_direct_get and deferred_load_submitted:
+                final_load_sync_started = (
+                    time.perf_counter() if prefill_start_timing_enabled() else 0.0
+                )
+                # Request-owned source leases make a host fence unnecessary on
+                # the compute path.  Each layer's consumer stream waits on its
+                # bank event; request teardown fences the bank streams after
+                # the scheduler retires the request.  Keep the old fallback
+                # only for callers that did not provide a request id.
+                if req_id is None:
+                    if prefill_dma:
+                        self._synchronize_layerwise_prefill_dma_streams(kv_group)
+                    else:
+                        self.load_stream.synchronize()
+                if final_load_sync_started:
+                    prefill_start_timing_log(
+                        logger, "final_load_source_sync", final_load_sync_started,
+                        kv_group=kv_group, tokens=num_tokens,
+                    )
+            elif sync and not defer_dense_waits:
+                current_stream.wait_stream(self.load_stream)
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+                tmp_gpu_buffer_obj = None
+            deferred_load_completed = True
+            yield
+        except GeneratorExit:
+            # Closing a suspended generator with installed completion events
+            # needs only the normal request teardown, not a fallback fence.
+            raise
+        except BaseException:
+            if (
+                deferred_dense_direct_get
+                and deferred_load_submitted
+                and not deferred_load_completed
+                and req_id is not None
+            ):
+                self._retain_unfenced_layerwise_prefill_load(
+                    str(req_id), kv_group, bank if prefill_dma else None,
+                    bank_stream if prefill_dma else self.load_stream,
+                )
+            raise
+        finally:
+            if (
+                deferred_dense_direct_get
+                and deferred_load_submitted
+                and not deferred_load_completed
+                and req_id is None
+            ):
+                if prefill_dma:
+                    self._synchronize_layerwise_prefill_dma_streams(kv_group)
+                else:
+                    self.load_stream.synchronize()
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+
+    def _batched_to_gpu_head_token_wise_prepared(
+        self,
+        transfer_kwargs: dict[str, Any],
+    ):
+        """Sparse warm path with request source and destination state resolved."""
+        source: PreparedSparseSource = transfer_kwargs["prepared_sparse_source"]
+        kvcaches_snapshot = transfer_kwargs["kvcaches"]
+        slot_mapping = transfer_kwargs["slot_mapping"]
+
+        kv_group = int(transfer_kwargs.get("kv_group", 0))
+        req_id = transfer_kwargs.get("req_id")
+        frontier = int(transfer_kwargs.get("lmcache_cached_tokens", 0) or 0)
+        diagnostics = transfer_kwargs.get("_cold_perf_breakdown")
+        if not serving_perf_enabled() or not isinstance(diagnostics, dict):
+            diagnostics = None
+        # Warm layers execute at token frequency. Coarse perf logging must not
+        # collect several wall/CPU clocks and allocate rounded fields per layer.
+        perf_enabled = serving_perf_detailed_enabled()
+        submit_count = 0
+        submit_sum_s = submit_max_s = 0.0
+        submit_max_layer = -1
+        submit_thread_cpu_ns = 0
+        layout_started = time.perf_counter() if diagnostics is not None else 0.0
+        layout = self._group_layouts.get(kv_group)
+        layout_cache_hit = layout is not None
+        if layout is None:
+            layout = self._lazy_initialize_buffer_with_staging(
+                kvcaches_snapshot,
+                kv_group=kv_group,
+                init_staging=False,
+            )
+        if diagnostics is not None:
+            diagnostics["layout_cache_hit"] = layout_cache_hit
+            diagnostics["layout_resolve_ms"] = round(
+                (time.perf_counter() - layout_started) * 1000, 3
+            )
+            cached_idx = getattr(self, "_layerwise_sparse_idx_cache", None)
+            diagnostics["selection_index_cached_tokens_before"] = (
+                int(cached_idx.shape[0]) if cached_idx is not None else 0
+            )
+
+        sparse_k_hidden_dims = layout.k_hidden_dims
+        sparse_v_hidden_dims = layout.v_hidden_dims
+        sparse_dsa_hidden_dims = layout.dsa_hidden_dims
+        sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        sparse_kv_format = layout.kv_format.value
+        chunk_size = self.lmcache_chunk_size
+        content_diag_enabled = (
+            kv_group == 0 and npu_content_diagnostics_enabled()
+        )
+        chunk_token_counts = source.chunk_token_counts
+        if (
+            getattr(source, "validated_chunk_size", None) != chunk_size
+            and chunk_token_counts
+            and (
+                any(count != chunk_size for count in chunk_token_counts[:-1])
+                or chunk_token_counts[-1] > chunk_size
+            )
+        ):
+            raise ValueError(
+                "Prepared sparse source requires full non-tail chunks and one "
+                f"optional tail of at most {chunk_size} tokens: "
+                f"coverage={chunk_token_counts}"
+            )
+
+        destination_plan = self._get_or_create_sparse_destination_plan(
+            kvcaches_ref=kvcaches_snapshot,
+            kv_group=kv_group,
+            slot_mapping_ref=slot_mapping,
+            sparse_kv_format=sparse_kv_format,
+            sparse_k_hidden_dims=sparse_k_hidden_dims,
+            sparse_v_hidden_dims=sparse_v_hidden_dims,
+            sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+            expected_device=layout.kv_device,
+            diagnostics=diagnostics,
+            registered_destination_layout=transfer_kwargs.get(
+                "registered_destination_layout"
+            ),
+        )
+
+        start_layer = int(transfer_kwargs.get("prepared_start_layer", 0))
+        if not 0 <= start_layer < len(source.layers):
+            raise ValueError("prepared_start_layer is outside the source")
+        for layer_id in range(start_layer, len(source.layers)):
+            source_layer = source.layers[layer_id]
+            sparse_request = yield
+            submit_started = time.perf_counter() if perf_enabled else 0.0
+            submit_thread_started = time.thread_time_ns() if perf_enabled else 0
+
+            (
+                selected_token_idx,
+                token_start_index,
+                target_slot_mapping,
+                _payload_event,
+                selected_token_counts,
+            ) = self._unpack_sparse_dynamic_request(sparse_request)
+            unpack_done = time.perf_counter() if perf_enabled else 0.0
+            # The producer, this transfer, and its consumer are submitted to
+            # the same current stream, so stream order replaces the event wait.
+            # A cold bootstrap carries no selection (the indexer selects only
+            # after the prefix is resident), so the TOPK bound must not
+            # truncate its implicit dense payload.
+            selected_token_idx, has_explicit_sparse_selection = (
+                self._normalize_sparse_selection(
+                    selected_token_idx,
+                    target_slot_mapping,
+                )
+            )
+            normalize_done = time.perf_counter() if perf_enabled else 0.0
+
+            if target_slot_mapping is not None:
+                slot_mapping_packed, selected_token_idx, selected_token_counts = (
+                    self._pack_sparse_explicit_slot_inputs(
+                        selected_token_idx,
+                        target_slot_mapping,
+                        selected_token_counts,
+                    )
+                )
+            else:
+                slot_mapping_packed, selected_token_idx = (
+                    self._pack_sparse_layer_inputs(
+                        slot_mapping,
+                        selected_token_idx,
+                        token_start_index,
+                    )
+                )
+                selected_token_counts = None
+            pack_done = time.perf_counter() if perf_enabled else 0.0
+            slot_mapping_packed, selected_token_idx = (
+                self._maybe_limit_sparse_transfer_inputs(
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    has_explicit_sparse_selection=has_explicit_sparse_selection,
+                    selected_token_counts=selected_token_counts,
+                )
+            )
+            limit_done = time.perf_counter() if perf_enabled else 0.0
+
+            deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
+            capture_content = _should_capture_deep_payload(
+                enabled=_mtp_dw_deep_diag_enabled(),
+                # Prepared indexer loads use their request-owned slot mapping
+                # rather than SFA's explicit latent target mapping.
+                explicit_payload=selected_token_idx is not None,
+                committed_end=frontier,
+                req_id=req_id,
+                kv_group=kv_group,
+                seen=deep_seen,
+            )
+
+            if content_diag_enabled and layer_id in (0, self.num_layers // 2):
+                diagnostic_source_tensors = list(source_layer.tensors)
+                for memory_obj in (
+                    source_layer.memory_objs
+                    if not diagnostic_source_tensors
+                    else ()
+                ):
+                    diagnostic_source_tensors.append(
+                        _layer_memory_tensor(memory_obj, layer_id)
+                    )
+                register_group0_source_probe(
+                    req_id=req_id,
+                    layer_id=layer_id,
+                    num_layers=self.num_layers,
+                    source_chunks=diagnostic_source_tensors,
+                    selected_tokens=selected_token_idx,
+                    selected_count=selected_token_counts,
+                    chunk_size=chunk_size,
+                    total_tokens=source.total_tokens,
+                    token_major=self._layerwise_token_major(kv_group),
+                    layer_cache=kvcaches_snapshot[layer_id],
+                )
+            diagnostic_done = time.perf_counter() if perf_enabled else 0.0
+            if layout.indexer_c8:
+                self._run_c8_indexer_bootstrap(
+                    destination_plan, source_layer.chunk_ptrs_npu, layer_id,
+                    slot_mapping_packed, source.total_tokens, chunk_size,
+                    has_explicit_sparse_selection,
+                )
+            else:
+                self._run_prepared_sparse_direct_kv_transfer_layer(
+                    plan=destination_plan,
+                    chunk_ptrs_npu=source_layer.chunk_ptrs_npu,
+                    layer_id=layer_id,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=source.total_tokens,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    selected_token_counts=selected_token_counts,
+                )
+            if (getattr(self, "kv_trace", None) is not None
+                    and has_explicit_sparse_selection):
+                self.trace_selected_kv(req_id, kv_group, layer_id,
+                    kvcaches_snapshot[layer_id], slot_mapping_packed,
+                    selected_token_idx, selected_token_counts, source.total_tokens)
+            fence_debug = getattr(self, "fence_debug", None)
+            if fence_debug is not None:
+                fence_debug.wait("d_load", kv_group, layer_id,
+                                 torch.npu.current_stream(), req=req_id)
+            if perf_enabled:
+                native_done = time.perf_counter()
+                submit_elapsed = native_done - submit_started
+                submit_count += 1
+                submit_sum_s += submit_elapsed
+                if submit_elapsed > submit_max_s:
+                    submit_max_s = submit_elapsed
+                    submit_max_layer = layer_id
+                submit_thread_cpu_ns += (
+                    time.thread_time_ns() - submit_thread_started
+                )
+                if submit_elapsed * 1000 >= _COLD_PERF_SLOW_MS:
+                    _log_cold_perf_slow(
+                        "prepared_sparse_layer_slow",
+                        submit_started,
+                        submit_thread_started,
+                        req_id=req_id or "unspecified",
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        unpack_ms=round((unpack_done - submit_started) * 1000, 3),
+                        normalize_ms=round((normalize_done - unpack_done) * 1000, 3),
+                        pack_ms=round((pack_done - normalize_done) * 1000, 3),
+                        limit_ms=round((limit_done - pack_done) * 1000, 3),
+                        diagnostic_ms=round((diagnostic_done - limit_done) * 1000, 3),
+                        native_submit_ms=round(
+                            (native_done - diagnostic_done) * 1000, 3
+                        ),
+                    )
+            if capture_content and layer_id == 0:
+                source_tensors = list(source_layer.tensors)
+                for memory_obj in (
+                    source_layer.memory_objs if not source_tensors else ()
+                ):
+                    source_tensors.append(
+                        _layer_memory_tensor(memory_obj, layer_id)
+                    )
+                source_chunk_ranges = []
+                for chunk_index, tensor in enumerate(source_tensors):
+                    range_start = chunk_index * chunk_size
+                    range_end = min(
+                        range_start + chunk_size, source.total_tokens
+                    )
+                    source_chunk_ranges.append(
+                        {
+                            "start": range_start,
+                            "end": range_end,
+                            "fingerprint": _bounded_tensor_fingerprint(tensor),
+                        }
+                    )
+                content_probe = _sparse_content_probe(
+                    cpu_tensors=source_tensors,
+                    layer_cache=kvcaches_snapshot[layer_id],
+                    selected_token_idx=selected_token_idx,
+                    target_slots=slot_mapping_packed,
+                    chunk_size=chunk_size,
+                    token_major=self._layerwise_token_major(kv_group),
+                )
+                _mtp_dw_event(
+                    "deep",
+                    event="content_transfer",
+                    req=str(req_id),
+                    kv_group=kv_group,
+                    frontier=frontier,
+                    layer=layer_id,
+                    content_path="prepared",
+                    source_chunk_ranges=source_chunk_ranges,
+                    content_probe=content_probe,
+                )
+                _remember_bounded_key(
+                    deep_seen,
+                    (str(req_id), int(kv_group), int(frontier)),
+                )
+                self._mtp_dw_deep_diag_seen = deep_seen
+
+        if perf_enabled and submit_sum_s * 1000 >= _COLD_PERF_SLOW_MS:
+            serving_perf_log(
+                logger,
+                "prepared_sparse_submit_summary",
+                req_id=req_id or "unspecified",
+                kv_group=kv_group,
+                layers=submit_count,
+                tokens=source.total_tokens,
+                sum_ms=round(submit_sum_s * 1000, 3),
+                max_ms=round(submit_max_s * 1000, 3),
+                max_layer_id=submit_max_layer,
+                thread_cpu_ms=round(submit_thread_cpu_ns / 1_000_000, 3),
+            )
+        yield
         yield
 
-        # synchronize the last layer
-        if sync:
-            current_stream.wait_stream(self.load_stream)
+    def batched_to_gpu_head_token_wise(self, **kwargs):
+        """
+        Sparse layerwise retrieve: scatter selected KV tokens from CPU pinned
+        memory objects into paged NPU KV via direct NPU read (no staging).
+        """
+        if kwargs.get("materialize_only", False):
+            # Preserve the layerwise generator protocol while deliberately
+            # skipping every CPU-to-NPU payload. The cache engine still
+            # resolves, owns, and seals the complete CPU latent source.
+            kvcaches = kwargs.get("kvcaches")
+            num_layers = len(kvcaches) if kvcaches is not None else self.num_layers
+            for _ in range(num_layers):
+                yield
+            yield
+            yield
+            return
+        if kwargs.get("prepared_sparse_source") is not None:
+            yield from self._batched_to_gpu_head_token_wise_prepared(kwargs)
+            return
+        diagnostics = kwargs.get("_cold_perf_breakdown")
+        if not isinstance(diagnostics, dict):
+            diagnostics = None
+        connector_init_started = (
+            time.perf_counter() if diagnostics is not None else 0.0
+        )
+        self.initialize_kvcaches_ptr(**kwargs)
+        if diagnostics is not None:
+            diagnostics["connector_init_ms"] = round(
+                (time.perf_counter() - connector_init_started) * 1000, 3
+            )
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        kv_group = kwargs.get("kv_group", 0)
+        layout_cache_hit = kv_group in self._group_layouts
+        layout_started = time.perf_counter() if diagnostics is not None else 0.0
+        layout = self._lazy_initialize_buffer_with_staging(
+            kvcaches_snapshot,
+            kv_group=kv_group,
+            init_staging=False,
+        )
+        if diagnostics is not None:
+            diagnostics["layout_cache_hit"] = layout_cache_hit
+            diagnostics["layout_resolve_ms"] = round(
+                (time.perf_counter() - layout_started) * 1000, 3
+            )
+            cached_idx = getattr(self, "_layerwise_sparse_idx_cache", None)
+            diagnostics["selection_index_cached_tokens_before"] = (
+                int(cached_idx.shape[0]) if cached_idx is not None else 0
+            )
 
-        # free the buffer memory
-        if self.use_gpu and tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        if "sync" not in kwargs:
+            raise ValueError("'sync' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        cached_tensors_by_layer: Optional[List[List[torch.Tensor]]] = kwargs.get(
+            "cached_tensors"
+        )
+        cached_memory_objs_by_layer: Optional[List[List[MemoryObj]]] = kwargs.get(
+            "cached_memory_objs"
+        )
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]] = kwargs.get(
+            "cached_chunk_ptrs_npu"
+        )
+        lmcache_cached_tokens: int = int(kwargs.get("lmcache_cached_tokens", 0) or 0)
+
+        load_stream_idx = self.load_stream_idx
+        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
+
+        chunk_size = self.lmcache_chunk_size
+
+        # Snapshot per-group values for the kernel so interleaved per-group
+        # generators do not race on the mirrored instance attributes.
+        sparse_k_hidden_dims, sparse_v_hidden_dims, sparse_dsa_hidden_dims = (
+            layout.k_hidden_dims,
+            layout.v_hidden_dims,
+            layout.dsa_hidden_dims,
+        )
+        sparse_token_major = self._layerwise_token_major(kv_group)
+        sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        sparse_kv_format = layout.kv_format.value
+        sparse_vllm_two_major = layout.vllm_two_major
+        content_diag_enabled = (
+            kv_group == 0 and npu_content_diagnostics_enabled()
+        )
+        bootstrap_destination_plan = None
+        if self._is_mla_dsa_format(kv_group):
+            bootstrap_destination_plan = self._get_or_create_sparse_destination_plan(
+                kvcaches_ref=kvcaches_snapshot,
+                kv_group=kv_group,
+                slot_mapping_ref=slot_mapping,
+                sparse_kv_format=sparse_kv_format,
+                sparse_k_hidden_dims=sparse_k_hidden_dims,
+                sparse_v_hidden_dims=sparse_v_hidden_dims,
+                sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                expected_device=layout.kv_device,
+                diagnostics=diagnostics,
+            )
+        for layer_id in range(
+            self._expected_group_layers(kv_group)
+        ):
+            sparse_request = yield
+            # The generator is resumed from vLLM's attention path; refresh the
+            # active compute stream per layer before ordering load -> compute.
+            current_stream = (
+                torch.npu.current_stream()
+                if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
+                else torch.cuda.current_stream()
+            )
+            load_stream = self.load_stream_list[load_stream_idx]
+            deep_diag_enabled = _mtp_dw_deep_diag_enabled()
+            diagnostics_enabled = _mtp_dw_diag_enabled()
+            req_id = kwargs.get("req_id")
+            explicit_sparse_payload = isinstance(sparse_request, dict)
+            target_slot_mapping = None
+            payload_event = None
+            if explicit_sparse_payload:
+                memory_objs_layer = sparse_request["memory_objs_layer"]
+                dynamic_request = sparse_request
+            elif isinstance(sparse_request, tuple):
+                if len(sparse_request) == 4:
+                    (
+                        memory_objs_layer,
+                        selected_token_idx,
+                        token_start_index,
+                        target_slot_mapping,
+                    ) = sparse_request
+                    dynamic_request = (
+                        selected_token_idx,
+                        token_start_index,
+                        target_slot_mapping,
+                    )
+                elif len(sparse_request) == 3:
+                    (
+                        memory_objs_layer,
+                        selected_token_idx,
+                        token_start_index,
+                    ) = sparse_request
+                    dynamic_request = (selected_token_idx, token_start_index)
+                else:
+                    raise ValueError(
+                        "Sparse connector payload tuple must have 3 or 4 items"
+                    )
+            else:
+                memory_objs_layer = sparse_request
+                dynamic_request = None
+
+            (
+                selected_token_idx,
+                token_start_index,
+                target_slot_mapping,
+                payload_event,
+                selected_token_counts,
+            ) = self._unpack_sparse_dynamic_request(dynamic_request)
+            explicit_sparse_payload = target_slot_mapping is not None
+            # A cold bootstrap arrives with no selection: the indexer can only
+            # select after the full prefix is resident, so its payload is the
+            # implicit dense arange. The TOPK bound must never truncate it.
+            selected_token_idx, has_explicit_sparse_selection = (
+                self._normalize_sparse_selection(
+                    selected_token_idx,
+                    target_slot_mapping,
+                )
+            )
+            deep_seen = {}
+            capture_deep_payload = False
+            if deep_diag_enabled:
+                deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
+                capture_deep_payload = _should_capture_deep_payload(
+                    enabled=True,
+                    explicit_payload=explicit_sparse_payload,
+                    committed_end=lmcache_cached_tokens,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    seen=deep_seen,
+                )
+
+            # selected_token_idx/target_slot_mapping may be device tensors
+            # produced by vLLM's remap path. Packing below is their first
+            # connector-side consumer, so wait before packing.
+            if payload_event is not None:
+                _wait_payload_events(current_stream, payload_event)
+
+            if explicit_sparse_payload:
+                slot_mapping_packed, selected_token_idx, selected_token_counts = (
+                    self._pack_sparse_explicit_slot_inputs(
+                        selected_token_idx,
+                        target_slot_mapping,
+                        selected_token_counts,
+                    )
+                )
+            else:
+                slot_mapping_packed, selected_token_idx = (
+                    self._pack_sparse_layer_inputs(
+                        slot_mapping,
+                        selected_token_idx,
+                        token_start_index,
+                    )
+                )
+            slot_mapping_packed, selected_token_idx = (
+                self._maybe_limit_sparse_transfer_inputs(
+                    slot_mapping_packed,
+                    selected_token_idx,
+                    has_explicit_sparse_selection=has_explicit_sparse_selection,
+                    selected_token_counts=selected_token_counts,
+                )
+            )
+
+            layer_cached_tensors = (
+                cached_tensors_by_layer[layer_id]
+                if cached_tensors_by_layer is not None
+                and layer_id < len(cached_tensors_by_layer)
+                and cached_tensors_by_layer[layer_id]
+                else None
+            )
+            pointer_first = False
+            if layer_cached_tensors is not None:
+                cpu_tensors = layer_cached_tensors
+            else:
+                layer_memory_objs = (
+                    cached_memory_objs_by_layer[layer_id]
+                    if cached_memory_objs_by_layer is not None
+                    and layer_id < len(cached_memory_objs_by_layer)
+                    and cached_memory_objs_by_layer[layer_id]
+                    else _layer_source_memory_objs(memory_objs_layer, layer_id)
+                )
+                cached_layer_ptrs = (
+                    cached_chunk_ptrs_npu[layer_id]
+                    if cached_chunk_ptrs_npu is not None
+                    and layer_id < len(cached_chunk_ptrs_npu)
+                    else None
+                )
+                pointer_first = (
+                    lmcache_cached_tokens > 0
+                    and bool(layer_memory_objs)
+                    and not diagnostics_enabled
+                    and cached_layer_ptrs is not None
+                    and cached_layer_ptrs.numel() == len(layer_memory_objs)
+                )
+                source_objs = (
+                    layer_memory_objs[:1] if pointer_first else layer_memory_objs
+                )
+                cpu_tensors = []
+                for memory_obj in source_objs:
+                    cpu_tensors.append(
+                        _layer_memory_tensor(memory_obj, layer_id)
+                    )
+
+            if not cpu_tensors:
+                continue
+
+            source_chunk_count = (
+                len(layer_memory_objs)
+                if layer_cached_tensors is None
+                else len(cpu_tensors)
+            )
+            if pointer_first:
+                chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                    layer_id,
+                    cpu_tensors,
+                    cached_chunk_ptrs_npu,
+                    expected_num_chunks=source_chunk_count,
+                )
+            else:
+                chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                    layer_id,
+                    cpu_tensors,
+                    cached_chunk_ptrs_npu,
+                )
+            total_tokens = (
+                lmcache_cached_tokens
+                if lmcache_cached_tokens > 0
+                else self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group, layer_id
+                )
+            )
+            if layout.indexer_c8:
+                self._run_c8_indexer_bootstrap(
+                    bootstrap_destination_plan, chunk_ptrs_npu, layer_id,
+                    slot_mapping_packed, total_tokens, chunk_size,
+                    has_explicit_sparse_selection,
+                )
+            elif (
+                bootstrap_destination_plan is not None
+                and self._active_sparse_load_join is None
+            ):
+                self._run_prepared_sparse_direct_kv_transfer_layer(
+                    plan=bootstrap_destination_plan,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    layer_id=layer_id,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    selected_token_counts=selected_token_counts,
+                )
+            else:
+                self._run_sparse_direct_kv_transfer_layer(
+                    kvcaches_ref=kvcaches_snapshot,
+                    kv_group=kv_group,
+                    layer_id=layer_id,
+                    load_stream=load_stream,
+                    load_stream_idx=load_stream_idx,
+                    current_stream=current_stream,
+                    slot_mapping_packed=slot_mapping_packed,
+                    selected_token_idx=selected_token_idx,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    chunk_ptrs_npu=chunk_ptrs_npu,
+                    sparse_kv_format=sparse_kv_format,
+                    sparse_token_major=sparse_token_major,
+                    sparse_vllm_two_major=sparse_vllm_two_major,
+                    sparse_k_hidden_dims=sparse_k_hidden_dims,
+                    sparse_v_hidden_dims=sparse_v_hidden_dims,
+                    sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
+                    sparse_host_interleaved=sparse_host_interleaved,
+                    layer_tensors=cpu_tensors,
+                    slot_mapping_ref=(
+                        slot_mapping_packed
+                        if explicit_sparse_payload
+                        else slot_mapping
+                    ),
+                    cpu_tensors=cpu_tensors,
+                    selected_token_counts=selected_token_counts,
+                    req_id=req_id,
+                    trace_explicit=has_explicit_sparse_selection,
+                )
+            if content_diag_enabled and layer_id in (0, self.num_layers // 2):
+                diagnostic_cpu_tensors = cpu_tensors
+                if pointer_first:
+                    diagnostic_cpu_tensors = [
+                        _layer_memory_tensor(memory_obj, layer_id)
+                        for memory_obj in layer_memory_objs
+                    ]
+                register_group0_source_probe(
+                    req_id=req_id,
+                    layer_id=layer_id,
+                    num_layers=self.num_layers,
+                    source_chunks=diagnostic_cpu_tensors,
+                    selected_tokens=selected_token_idx,
+                    selected_count=selected_token_counts,
+                    chunk_size=chunk_size,
+                    total_tokens=total_tokens,
+                    token_major=sparse_token_major,
+                    layer_cache=kvcaches_snapshot[layer_id],
+                )
+            capture_content_probe = (
+                deep_diag_enabled
+                and layer_id == 0
+                and selected_token_idx is not None
+                and selected_token_idx.numel() > 0
+                and _should_capture_deep_payload(
+                    enabled=True,
+                    explicit_payload=True,
+                    committed_end=lmcache_cached_tokens,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    seen=deep_seen,
+                )
+            )
+            if capture_content_probe and layer_id == 0:
+                source_chunk_ranges = []
+                for chunk_index, tensor in enumerate(cpu_tensors):
+                    range_start = chunk_index * chunk_size
+                    range_end = min(
+                        range_start + chunk_size, total_tokens
+                    )
+                    source_chunk_ranges.append(
+                        {
+                            "start": range_start,
+                            "end": range_end,
+                            "fingerprint": _bounded_tensor_fingerprint(tensor),
+                        }
+                    )
+                content_probe = _sparse_content_probe(
+                    cpu_tensors=cpu_tensors,
+                    layer_cache=kvcaches_snapshot[layer_id],
+                    selected_token_idx=selected_token_idx,
+                    target_slots=slot_mapping_packed,
+                    chunk_size=chunk_size,
+                    token_major=sparse_token_major,
+                )
+                _mtp_dw_event(
+                    "deep",
+                    event="content_transfer",
+                    req=str(req_id),
+                    kv_group=kv_group,
+                    frontier=lmcache_cached_tokens,
+                    layer=layer_id,
+                    content_path="normal",
+                    source_chunk_ranges=source_chunk_ranges,
+                    content_probe=content_probe,
+                )
+                _remember_bounded_key(
+                    deep_seen,
+                    (str(req_id), int(kv_group), int(lmcache_cached_tokens)),
+                )
+                self._mtp_dw_deep_diag_seen = deep_seen
+            elif deep_diag_enabled and layer_id == 0:
+                _mtp_dw_event(
+                    "deep",
+                    event="content_skip",
+                    req=str(req_id),
+                    kv_group=kv_group,
+                    frontier=lmcache_cached_tokens,
+                    layer=layer_id,
+                    content_path="normal",
+                    reason=(
+                        "no_selected_tokens"
+                        if selected_token_idx is None
+                        or selected_token_idx.numel() == 0
+                        else "already_seen"
+                    ),
+                )
+            deep_diag = None
+            if capture_deep_payload:
+                deep_key = (str(req_id), int(kv_group), int(lmcache_cached_tokens))
+                try:
+                    selected_values = [
+                        int(value)
+                        for value in selected_token_idx.detach()
+                        .reshape(-1)[:_MTP_DW_CHECKSUM_LIMIT]
+                        .to(device="cpu")
+                        .tolist()
+                    ]
+                    slot_values = [
+                        int(value)
+                        for value in slot_mapping_packed.detach()
+                        .reshape(-1)[:_MTP_DW_CHECKSUM_LIMIT]
+                        .to(device="cpu")
+                        .tolist()
+                    ]
+                    deep_diag = {
+                        "deep_key": deep_key,
+                        "deep_seen": deep_seen,
+                        "selected_values": selected_values,
+                        "slot_values": slot_values,
+                        "conflicts": _conflicting_duplicate_target_slots(
+                            selected_values, slot_values
+                        ),
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "[MTP_DW] deep transfer diagnostic unavailable: %s",
+                        exc,
+                    )
+            if _mtp_dw_diag_enabled() and layer_id == 0:
+                actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group, layer_id
+                )
+                diag_selected = selected_token_idx.detach().cpu().reshape(-1)
+                selected_count = int(diag_selected.numel())
+                selected_min = (
+                    int(diag_selected.min()) if selected_count else None
+                )
+                selected_max = (
+                    int(diag_selected.max()) if selected_count else None
+                )
+                slot_count = int(slot_mapping_packed.numel())
+                selected_oob = bool(
+                    selected_count
+                    and (selected_min < 0 or selected_max >= actual_cpu_tokens)
+                )
+                slot_selected_match = selected_count == slot_count
+                raw_window = os.environ.get(
+                    "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
+                )
+                try:
+                    window_size = max(int(raw_window), 0)
+                except ValueError:
+                    window_size = 0
+                diag_key = (
+                    kwargs.get("req_id"),
+                    kv_group,
+                    lmcache_cached_tokens,
+                )
+                seen_retrieves = getattr(
+                    self, "_mtp_dw_diag_seen_retrieves", None
+                )
+                if seen_retrieves is None:
+                    seen_retrieves = set()
+                    self._mtp_dw_diag_seen_retrieves = seen_retrieves
+                first_for_frontier = diag_key not in seen_retrieves
+                seen_retrieves.add(diag_key)
+                if first_for_frontier or selected_oob or not slot_selected_match:
+                    _mtp_dw_event(
+                        "retrieve",
+                        req=kwargs.get("req_id"),
+                        frontier=lmcache_cached_tokens,
+                        window_start=(
+                            max(0, lmcache_cached_tokens - window_size)
+                            if window_size
+                            else None
+                        ),
+                        window_end=lmcache_cached_tokens,
+                        kv_group=kv_group,
+                        actual_cpu_tokens=actual_cpu_tokens,
+                        kernel_total_tokens=total_tokens,
+                        selected_count=selected_count,
+                        selected_min=selected_min,
+                        selected_max=selected_max,
+                        selected_sample=diag_selected[:8].tolist(),
+                        slot_count=slot_count,
+                        selected_oob=selected_oob,
+                        slot_selected_match=slot_selected_match,
+                    )
+                if selected_oob or not slot_selected_match:
+                    _mtp_dw_event(
+                        "fail",
+                        req=kwargs.get("req_id"),
+                        frontier=lmcache_cached_tokens,
+                        invariant="retrieve_bounds",
+                        kv_group=kv_group,
+                        actual_cpu_tokens=actual_cpu_tokens,
+                        selected_count=selected_count,
+                        selected_min=selected_min,
+                        selected_max=selected_max,
+                        slot_count=slot_count,
+                        selected_oob=selected_oob,
+                        slot_selected_match=slot_selected_match,
+                    )
+            if deep_diag is not None:
+                selected_values = deep_diag["selected_values"]
+                slot_values = deep_diag["slot_values"]
+                conflicts = deep_diag["conflicts"]
+                actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group, layer_id
+                )
+                raw_window = os.environ.get(
+                    "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
+                )
+                try:
+                    window_size = max(int(raw_window), 0)
+                except ValueError:
+                    window_size = 0
+                _mtp_dw_event(
+                    "deep",
+                    event="transfer_payload",
+                    req=str(req_id),
+                    worker_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
+                    tp_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
+                    tp_world=int(os.environ.get("WORLD_SIZE", "1") or 1),
+                    kv_group=kv_group,
+                    frontier=lmcache_cached_tokens,
+                    window_start=(
+                        max(0, lmcache_cached_tokens - window_size)
+                        if window_size
+                        else None
+                    ),
+                    window_end=lmcache_cached_tokens,
+                    layer=layer_id,
+                    kernel="sparse_direct_kv_transfer",
+                    selected_count=int(selected_token_idx.numel()),
+                    payload_count=int(selected_token_idx.numel()),
+                    selection_sample=selected_values[:8],
+                    selection_checksum=_bounded_stable_int_checksum(
+                        selected_values
+                    ),
+                    slot_count=int(slot_mapping_packed.numel()),
+                    target_physical_count=int(slot_mapping_packed.numel()),
+                    target_slot_sample=slot_values[:8],
+                    target_slot_checksum=_bounded_stable_int_checksum(slot_values),
+                    checksum_scope="first32",
+                    sample_scope="first8",
+                    conflict_check_scope="first32",
+                    chunk_size=chunk_size,
+                    chunk_count=len(cpu_tensors),
+                    actual_cpu_tokens=actual_cpu_tokens,
+                    kernel_total_tokens=total_tokens,
+                    kv_format=sparse_kv_format,
+                    token_major=sparse_token_major,
+                    host_interleaved=sparse_host_interleaved,
+                    count_match=(
+                        int(selected_token_idx.numel())
+                        == int(slot_mapping_packed.numel())
+                    ),
+                    conflicting_duplicate_slots=conflicts,
+                )
+                _remember_bounded_key(
+                    deep_diag["deep_seen"], deep_diag["deep_key"]
+                )
+                self._mtp_dw_deep_diag_seen = deep_diag["deep_seen"]
+                if conflicts:
+                    _mtp_dw_event(
+                        "fail",
+                        event="transfer_payload",
+                        req=str(req_id),
+                        kv_group=kv_group,
+                        frontier=lmcache_cached_tokens,
+                        invariant="conflicting_duplicate_target_slots",
+                        conflicting_duplicate_slots=conflicts,
+                    )
+
+        yield
 
         yield
 
@@ -1351,13 +9202,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
         This function is a generator that moves the KV cache from the paged GPU
         memory to the memory objects. The first iteration will prepare some
-        related metadata and initiate the transfer in the first layer. In each
-        of the following iterations, it will first wait until the storing of
-        previous layer finishes, and then initiate string the KV cache of the
-        current layer one. The storing process of the KV cache is paged GPU
-        memory -> GPU buffer -> memory objects. The last iteration simply waits
-        for the last layer to finish.
-        In total, this the generator will yield num_layers + 1 times.
+        related metadata and initiate the transfer in the first layer. Normal
+        callers preserve the legacy per-layer wait. Deferred layerwise-prefill
+        callers rotate physical KV banks, overlap D2H with later layer compute,
+        and report a source layer complete when its bank is about to be reused.
+        The storing process is paged GPU memory -> GPU buffer -> memory objects.
+        Deferred callers may need multiple drain iterations for the remaining
+        bank events after the last layer.
 
         :param memory_objs: The memory objects to store the KV cache. The first
             dimension is the number of layers, and the second dimension is the
@@ -1372,7 +9223,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
@@ -1383,92 +9235,805 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("'sync' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        sync: bool = kwargs["sync"]
+        slot_mapping_base = int(kwargs.get("slot_mapping_base", 0))
+        if slot_mapping_base < 0:
+            raise ValueError(
+                f"slot_mapping_base must be non-negative, got {slot_mapping_base}"
+            )
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        kv_group = kwargs.get("kv_group", 0)
+        layout = self._lazy_initialize_buffer_with_staging(
+            kvcaches_snapshot,
+            kv_group=kv_group,
+            init_staging=False,
+        )
+        is_mla_dsa = self._is_mla_dsa_format(kv_group)
+        dense_direct = is_mla_dsa and not _DENSE_DIRECT_STORE_DISABLE
 
-        slot_mapping_chunks = []
-        for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
-
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-
-        num_tokens = len(slot_mapping_full)
+        if not dense_direct:
+            if is_mla_dsa and not self.use_gpu:
+                raise ValueError(
+                    "MLA/DSA layerwise transfer requires use_gpu=True with a "
+                    "staging buffer when dense direct store is disabled."
+                )
+            if self.use_gpu and layout.gpu_buffer_allocator is None:
+                layout = self._lazy_initialize_buffer_with_staging(
+                    kvcaches_snapshot,
+                    kv_group=kv_group,
+                    init_staging=True,
+                )
 
         chunk_offsets = []
         chunk_sizes = []
         current_offset = 0
-
         for start, end in zip(starts, ends, strict=False):
             chunk_size = end - start
-            chunk_sizes.append(chunk_size)
             chunk_offsets.append(current_offset)
+            chunk_sizes.append(chunk_size)
             current_offset += chunk_size
 
-        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
-        if self.use_gpu:
-            buffer_shape = self.get_shape(num_tokens)
-            assert self.gpu_buffer_allocator is not None
-            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+        deferred_layerwise_put = bool(
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("deferred_layerwise_put", False)
+        )
+        # P-node prefill DMA records one completion event per physical bank.
+        # The caller can publish the CPU objects before the host observes the
+        # final event; same-process H2D and remote page puts consume those
+        # events as dependencies.  Non-DMA/fallback paths retain the old
+        # synchronous drain because their staging buffer is reused.
+        async_layerwise_store = bool(
+            deferred_layerwise_put
+            and kwargs.get("layerwise_prefill_async_store", False)
+        )
+        prefill_dma = bool(
+            deferred_layerwise_put and dense_direct
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+        )
+        async_layerwise_store = async_layerwise_store and prefill_dma
+        if (
+            getattr(self, "_layerwise_prefill_dma", False)
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+            and not dense_direct
+        ):
+            raise RuntimeError("Layerwise prefill DMA requires dense direct store")
+        prefill_packet = prefill_dma and layout.indexer_c8
+        if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
+            raise RuntimeError(
+                "LMCache-Ascend must be rebuilt for layerwise prefill DMA"
             )
-            assert tmp_gpu_buffer_obj is not None, (
-                "Failed to allocate NPU buffer in NPUConnector"
-            )
-            assert tmp_gpu_buffer_obj.tensor is not None
-
-        current_stream = torch.cuda.current_stream()
-
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = memory_objs[layer_id]
-            # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
-                self.store_stream.wait_stream(current_stream)
-
-                if self.use_gpu:
-                    cpu_tensors = []
-                    for memory_obj in memory_objs_layer:
-                        assert memory_obj.tensor is not None
-                        cpu_tensors.append(memory_obj.tensor)
-
-                    # Fused transfer: 1 scatter kernel + N D2H memcpy
-                    lmc_ops.batched_fused_single_layer_kv_transfer(
-                        cpu_tensors,
-                        tmp_gpu_buffer_obj.tensor,
-                        self.kvcaches[layer_id],
-                        slot_mapping_full,
-                        chunk_offsets,
-                        chunk_sizes,
-                        True,  # from_gpu
-                        self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                        True,  # token_major
-                        self.vllm_two_major,
+        if prefill_dma and layout.kv_format not in (
+            KVCacheFormat.MLA_LATENT, KVCacheFormat.DSA_INDEX
+        ):
+            raise ValueError("Layerwise prefill DMA requires two-group DSA KV")
+        slot_mappings = {} if deferred_layerwise_put and not prefill_dma else None
+        if prefill_dma:
+            slot_mapping_chunks = ()
+            slot_mapping_full = torch.empty(0, dtype=torch.long)
+        elif not getattr(self, "_layerwise_prefill_dma", False):
+            slot_mapping_chunks = []
+            for start, end in zip(starts, ends, strict=False):
+                local_start = start - slot_mapping_base
+                local_end = end - slot_mapping_base
+                if (
+                    local_start < 0
+                    or local_end < local_start
+                    or local_end > len(slot_mapping)
+                ):
+                    raise ValueError(
+                        "Layerwise store chunk is outside the provided slot-mapping "
+                        "window: "
+                        f"chunk=[{start}, {end}), base={slot_mapping_base}, "
+                        f"mapping_tokens={len(slot_mapping)}, "
+                        f"local_chunk=[{local_start}, {local_end})"
                     )
+                slot_mapping_chunks.append(slot_mapping[local_start:local_end])
+
+            slot_mapping_full = (
+                slot_mapping_chunks[0]
+                if len(slot_mapping_chunks) == 1
+                else torch.cat(slot_mapping_chunks, dim=0)
+            )
+
+        else:
+            slot_mapping_chunks, slot_mapping_full, _ = _cached_layerwise_slot_mapping(
+                slot_mappings, slot_mapping, starts, ends, slot_mapping_base
+            )
+
+        num_tokens = (
+            sum(chunk_sizes) if prefill_dma else len(slot_mapping_full)
+        )
+        self._check_layerwise_transfer_invariants(
+            operation="store",
+            kv_group=kv_group,
+            slot_mapping_full=slot_mapping_full,
+            kvcaches_ref=kvcaches_snapshot,
+        )
+        if (dense_direct or layout.indexer_c8) and not prefill_dma:
+            slot_mapping_full = self._slot_mapping_on_kv_device(
+                slot_mapping_full, self.store_stream
+            )
+
+        # Snapshot per-group values so interleaved per-group generators
+        # do not race on the mirrored instance attributes.
+        kv_format_value = layout.kv_format.value
+        vllm_two_major = layout.vllm_two_major
+        k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
+            layout.k_hidden_dims,
+            layout.v_hidden_dims,
+            layout.dsa_hidden_dims,
+        )
+        token_major = self._layerwise_token_major(kv_group)
+        expected_fmt = self._expected_memory_format(kv_group)
+        dense_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
+        chunk_offsets_npu: Optional[torch.Tensor] = None
+        chunk_sizes_npu: Optional[torch.Tensor] = None
+        dense_fixed_chunk_size = 0
+        c8_chunk_capacity = max(chunk_sizes) if layout.indexer_c8 else 0
+        dma_plans = None
+        if prefill_dma and not prefill_packet:
+            dma_plans = _prefill_dma_plans(
+                kwargs["prefill_dma_block_ids_by_bank"],
+                int(kwargs["prefill_dma_block_size"]),
+                starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "store",
+                self.prefill_dma_cycles[kv_group],
+            )
+        if (dense_direct or layout.indexer_c8) and not prefill_dma:
+            (
+                dense_fixed_chunk_size,
+                chunk_offsets_npu,
+                chunk_sizes_npu,
+            ) = self._prepare_dense_direct_chunk_metadata(
+                chunk_offsets,
+                chunk_sizes,
+                total_tokens=num_tokens,
+                kv_group=kv_group,
+            )
+        expected_layers = self._expected_group_layers(kv_group)
+        if len(memory_objs) != expected_layers:
+            logger.error(
+                "NPU layerwise store received wrong memory object layer count: "
+                "kv_group=%s memory_layers=%d expected=%d chunk_count=%d "
+                "starts=%s ends=%s fmt=%s kvcaches_layers=%d",
+                kv_group,
+                len(memory_objs),
+                expected_layers,
+                len(starts),
+                starts,
+                ends,
+                expected_fmt,
+                len(kvcaches_snapshot),
+            )
+            raise RuntimeError(
+                "NPU layerwise store memory object layer count mismatch: "
+                f"got {len(memory_objs)}, expected {expected_layers}"
+            )
+        if len(kvcaches_snapshot) < expected_layers:
+            logger.error(
+                "NPU layerwise store has fewer kv cache layers than expected: "
+                "kv_group=%s kvcaches_layers=%d expected=%d fmt=%s",
+                kv_group,
+                len(kvcaches_snapshot),
+                expected_layers,
+                expected_fmt,
+            )
+            raise RuntimeError(
+                "NPU layerwise store kv cache layer count mismatch: "
+                f"got {len(kvcaches_snapshot)}, expected {expected_layers}"
+            )
+
+        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
+        staging_tensor: Optional[torch.Tensor] = None
+        if self.use_gpu and not dense_direct:
+            tmp_gpu_buffer_obj, staging_tensor = (
+                self._allocate_layerwise_staging_buffer(
+                    num_tokens=num_tokens,
+                    kv_group=kv_group,
+                    layout=layout,
+                    expected_fmt=expected_fmt,
+                )
+            )
+
+        ordinary_store = not getattr(self, "_layerwise_prefill_dma", False)
+        if ordinary_store:
+            # Keep D's original stream snapshot for the whole store generator.
+            current_stream = torch.npu.current_stream()
+
+        def log_completed_store_layer(layer_id: int) -> None:
+            if not (_mtp_dw_deep_diag_enabled() and layer_id == 0):
+                return
+            store_req_id = kwargs.get("req_id")
+            if store_req_id is None:
+                return
+            if async_layerwise_store:
+                # Async publication protects device/remote consumers with this
+                # bank event. A host fingerprint must explicitly observe it too.
+                diagnostic_bank = layer_id % source_bank_count
+                last_store_events[diagnostic_bank].synchronize()
+            store_tensors = [
+                _layer_memory_tensor(memory_obj, layer_id)
+                for memory_obj in memory_objs[layer_id]
+            ]
+            chunk_ranges = []
+            for chunk_index, tensor in enumerate(store_tensors):
+                range_start = (
+                    int(starts[chunk_index])
+                    if chunk_index < len(starts)
+                    else None
+                )
+                range_end = (
+                    int(ends[chunk_index])
+                    if chunk_index < len(ends)
+                    else None
+                )
+                chunk_ranges.append(
+                    {
+                        "start": range_start,
+                        "end": range_end,
+                        "fingerprint": _bounded_tensor_fingerprint(tensor),
+                    }
+                )
+            _mtp_dw_event(
+                "deep",
+                event="content_store",
+                req=str(store_req_id),
+                kv_group=kv_group,
+                layer=layer_id,
+                window_start=kwargs.get("decode_window_start"),
+                window_end=kwargs.get("decode_window_end"),
+                chunk_ranges=chunk_ranges,
+            )
+
+        store_transfer_pending = False
+        try:
+            layerwise_prefill_bank_count = 2
+            if not ordinary_store:
+                layerwise_prefill_bank_count = int(
+                    kwargs.get("layerwise_prefill_bank_count", 2) or 2
+                )
+            if layerwise_prefill_bank_count <= 0:
+                raise ValueError(
+                    "layerwise_prefill_bank_count must be positive"
+                )
+            if prefill_dma and (
+                len(kwargs["prefill_dma_block_ids_by_bank"])
+                != layerwise_prefill_bank_count
+            ):
+                raise ValueError(
+                    "Prefill DMA bank maps disagree with the rotation depth"
+                )
+            # The fallback path reuses one staging tensor for every layer, so
+            # it cannot safely pipeline multiple source banks. Keep its
+            # original one-layer fence; the MLA/DSA direct path has no shared
+            # staging tensor and can use the configured bank rotation.
+            source_bank_count = (
+                layerwise_prefill_bank_count if dense_direct else 1
+            )
+            if deferred_layerwise_put and dense_direct:
+                self._set_layerwise_prefill_bank_count(
+                    kv_group,
+                    source_bank_count,
+                )
+                layerwise_prefill_generation = (
+                    self._layerwise_prefill_transfer_generation(kv_group)
+                )
+            else:
+                layerwise_prefill_generation = None
+
+            # Deferred P-node saves are resumed from the latency-sensitive
+            # pre-HCOM callback. Prepare either DMA address rows or the legacy
+            # dense-direct native states before the generator's priming yield.
+            deferred_dense_layer_tensors: Optional[List[List[torch.Tensor]]] = None
+            deferred_dense_chunk_dev_ptrs: List[List[int]] = []
+            deferred_dense_chunk_ptrs_npu: List[Optional[torch.Tensor]] = []
+            deferred_dense_layer_states: List[Any] = []
+            deferred_dense_validation_keys: List[tuple] = []
+            deferred_dma_copies: List[List[tuple[int, int, int]]] = []
+            prefill_packets = None
+            if deferred_layerwise_put and dense_direct:
+                if prefill_packet:
+                    prefill_packets = self._prepare_prefill_c8_packets(
+                        layout=layout, kvcaches=kvcaches_snapshot, memory_objs=memory_objs,
+                        block_ids_by_bank=kwargs["prefill_dma_block_ids_by_bank"],
+                        block_size=int(kwargs["prefill_dma_block_size"]), starts=starts, ends=ends,
+                        transfer_stream=self.store_stream,
+                    )
+                elif prefill_dma:
+                    assert dma_plans is not None
+                    widths = self.checkpoint_plane_widths(kv_group)
+                    # Layer pages already expose their physical layout and
+                    # valid token count.  Do not materialize one tensor view
+                    # per layer just to obtain a pointer for memcpy.
+                    first_layer = memory_objs[0]
+                    host_chunk_tokens = []
+                    for memory_obj in first_layer:
+                        if isinstance(memory_obj, LayerPageMemoryObj):
+                            host_chunk_tokens.append(int(memory_obj.valid_tokens))
+                        else:
+                            tensor = _layer_memory_tensor(memory_obj, 0)
+                            host_chunk_tokens.append(
+                                self._lmc_plane_num_tokens(tensor, kv_group)
+                            )
+                    for layer_id, memory_objs_layer in enumerate(memory_objs):
+                        host_ptrs = []
+                        for chunk_index, memory_obj in enumerate(memory_objs_layer):
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                            host_ptrs.append(
+                                _layer_memory_host_ptr(memory_obj, layer_id)
+                            )
+                        if len(host_ptrs) != len(starts):
+                            raise ValueError(
+                                "Dense direct layerwise store chunk count mismatch: "
+                                f"layer={layer_id}, pointers={len(host_ptrs)}, "
+                                f"ranges={len(starts)}"
+                            )
+                        deferred_dma_copies.append(bind_copy_addresses(
+                            dma_plans[layer_id % source_bank_count],
+                            host_ptrs,
+                            [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
+                            chunk_sizes, widths,
+                            int(kvcaches_snapshot[layer_id][0].element_size()),
+                            device_to_host=True,
+                            host_chunk_tokens=host_chunk_tokens,
+                        ))
                 else:
-                    for start, end, memory_obj in zip(
-                        starts, ends, memory_objs_layer, strict=False
-                    ):
-                        assert memory_obj.tensor is not None
+                    deferred_dense_layer_tensors = []
+                    for layer_id, memory_objs_layer in enumerate(memory_objs):
+                        layer_tensors = []
+                        for chunk_index, memory_obj in enumerate(memory_objs_layer):
+                            tensor = _layer_memory_tensor(memory_obj, layer_id)
+                            if tensor is None:
+                                raise ValueError(
+                                    "Dense direct layerwise store received a "
+                                    "MemoryObj without a tensor at "
+                                    f"layer={layer_id}, chunk={chunk_index}."
+                                )
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                            layer_tensors.append(tensor)
+                        if len(layer_tensors) != len(starts):
+                            raise ValueError(
+                                "Dense direct layerwise store chunk count mismatch: "
+                                f"layer={layer_id}, tensors={len(layer_tensors)}, "
+                                f"ranges={len(starts)}"
+                            )
+                        deferred_dense_layer_tensors.append(layer_tensors)
 
-                        lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
-                            self.kvcaches[layer_id],
-                            slot_mapping[start:end],
-                            True,
-                            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                            True,
-                            self.vllm_two_major,
+                if not prefill_dma:
+                    self.append_sparse_chunk_ptr_cache_for_layers(
+                        memory_objs,
+                        deferred_dense_chunk_dev_ptrs,
+                        deferred_dense_chunk_ptrs_npu,
+                        kv_group=kv_group,
+                    )
+                    assert chunk_offsets_npu is not None
+                    assert chunk_sizes_npu is not None
+                for layer_id, layer_tensors in enumerate(
+                    deferred_dense_layer_tensors if not prefill_dma else ()
+                ):
+                    chunk_ptrs_npu = deferred_dense_chunk_ptrs_npu[layer_id]
+                    if chunk_ptrs_npu is None:
+                        raise RuntimeError(
+                            "Dense direct layerwise store pointer row was not "
+                            f"prepared for layer {layer_id}."
                         )
-                logger.debug(f"Finished offloading layer {layer_id}")
-            yield
+                    source_signature = self._dense_direct_pointer_cache_signature(
+                        chunk_ptrs_npu=chunk_ptrs_npu,
+                        chunk_offsets_npu=chunk_offsets_npu,
+                        chunk_sizes_npu=chunk_sizes_npu,
+                        slot_mapping_ref=slot_mapping_full,
+                        source_layout_ref=(
+                            layer_tensors[0] if layer_tensors else None
+                        ),
+                        total_tokens=num_tokens,
+                        fixed_chunk_size=dense_fixed_chunk_size,
+                        dense_kv_format=kv_format_value,
+                        dense_token_major=token_major,
+                        dense_vllm_two_major=vllm_two_major,
+                        dense_k_hidden_dims=k_hidden_dims,
+                        dense_v_hidden_dims=v_hidden_dims,
+                        dense_dsa_hidden_dims=dsa_hidden_dims,
+                        direction=True,
+                    )
+                    layer_state, validation_key = (
+                        self._get_or_create_sparse_direct_layer_state(
+                            kvcaches_ref=kvcaches_snapshot,
+                            kv_group=kv_group,
+                            layer_id=layer_id,
+                            layer_tensors=layer_tensors,
+                            slot_mapping_ref=slot_mapping_full,
+                            total_tokens=num_tokens,
+                            sparse_kv_format=kv_format_value,
+                            sparse_token_major=token_major,
+                            sparse_vllm_two_major=vllm_two_major,
+                            sparse_k_hidden_dims=k_hidden_dims,
+                            sparse_v_hidden_dims=v_hidden_dims,
+                            sparse_dsa_hidden_dims=dsa_hidden_dims,
+                            source_signature=source_signature,
+                            return_key=True,
+                        )
+                    )
+                    if layer_state is None or validation_key is None:
+                        raise RuntimeError(
+                            "Dense direct layerwise store state preparation "
+                            f"failed for layer {layer_id}."
+                        )
+                    deferred_dense_layer_states.append(layer_state)
+                    deferred_dense_validation_keys.append(validation_key)
+            last_store_event = None
+            last_store_events: dict[int, Any] = {}
+            layer_request = None
+            if deferred_layerwise_put:
+                layer_request = yield None
+            for layer_id in range(expected_layers):
+                if layerwise_prefill_generation is not None:
+                    self._check_layerwise_prefill_transfer_generation(
+                        kv_group,
+                        layerwise_prefill_generation,
+                    )
+                # Non-DMA layerwise stores still capture the callback stream
+                # per layer to avoid a stale first-layer stream. Prefill DMA
+                # already has the earlier final-access event on its bank FIFO.
+                if not ordinary_store and not prefill_dma:
+                    current_stream = torch.npu.current_stream()
+                bank = layer_id % source_bank_count
 
-            if sync:
-                self.store_stream.synchronize()
+                if prefill_dma:
+                    # The raw-address plan already selects the physical bank.
+                    layer_slot_mapping_chunks = slot_mapping_chunks
+                    layer_slot_mapping_full = slot_mapping_full
+                    new_mapping = False
+                elif layer_request is None:
+                    # Ordinary stores keep one mapping for every layer. Reuse
+                    # its prepared device tensor, including CPU-to-NPU copies.
+                    layer_slot_mapping_chunks = slot_mapping_chunks
+                    layer_slot_mapping_full = slot_mapping_full
+                    new_mapping = False
+                else:
+                    # Only explicit P-node bank switches need another mapping.
+                    layer_slot_mapping, layer_slot_mapping_base = (
+                        _resolve_layerwise_slot_mapping(
+                            layer_request, slot_mapping, slot_mapping_base
+                        )
+                    )
+                    (
+                        layer_slot_mapping_chunks,
+                        layer_slot_mapping_full,
+                        new_mapping,
+                    ) = _cached_layerwise_slot_mapping(
+                        slot_mappings, layer_slot_mapping, starts, ends,
+                        layer_slot_mapping_base,
+                    )
+                if new_mapping and len(layer_slot_mapping_full) != num_tokens:
+                    raise RuntimeError(
+                        "Layerwise store changed transfer token count: "
+                        f"layer={layer_id}, expected={num_tokens}, "
+                        f"actual={len(layer_slot_mapping_full)}"
+                    )
+                if new_mapping:
+                    self._check_layerwise_transfer_invariants(
+                        operation="store",
+                        kv_group=kv_group,
+                        slot_mapping_full=layer_slot_mapping_full,
+                        kvcaches_ref=kvcaches_snapshot,
+                    )
+                memory_objs_layer = memory_objs[layer_id]
+                # kvcaches -> gpu_buffer -> memobj
+                # Mark before launching so exception cleanup also fences a
+                # partially enqueued transfer.
+                store_transfer_pending = True
+                bank_stream = None
+                if prefill_dma:
+                    bank_stream = self._layerwise_prefill_dma_stream(
+                        kv_group, bank
+                    )
+                    self._require_layerwise_prefill_bank_use(
+                        layer_id, kv_group, bank,
+                    )
+                    with torch.npu.stream(bank_stream):
+                        # The final-access event is already ahead of us on
+                        # the bank FIFO; do not wait for later compute here.
+                        overlap = getattr(self, "prefill_overlap_recorder", None)
+                        overlap_dma = (
+                            overlap.start_interval(
+                                "save", bank_stream, kv_group, bank, layer_id,
+                            ) if overlap is not None else None
+                        )
+                        if prefill_packet:
+                            self._submit_prefill_c8_packet(
+                                prefill_packets, layer_id, bank, bank_stream, True,
+                            )
+                        else:
+                            lmc_ops.layerwise_prefill_dma_copy(
+                                deferred_dma_copies[layer_id], True
+                            )
+                        if overlap is not None:
+                            overlap.end_interval(overlap_dma, bank_stream)
+                elif dense_direct or layout.indexer_c8:
+                    staged_views = None
+                    if deferred_layerwise_put:
+                        assert deferred_dense_layer_tensors is not None
+                        cpu_tensors = deferred_dense_layer_tensors[layer_id]
+                        chunk_ptrs_npu = deferred_dense_chunk_ptrs_npu[layer_id]
+                        if (
+                            chunk_ptrs_npu is None
+                            or chunk_ptrs_npu.numel() != len(cpu_tensors)
+                        ):
+                            raise RuntimeError(
+                                "Dense direct layerwise store pointer row was "
+                                "not completely prepared before the transfer "
+                                f"window at layer {layer_id}."
+                            )
+                    elif ordinary_store:
+                        cpu_tensors = [
+                            _layer_memory_tensor(memory_obj, layer_id)
+                            for memory_obj in memory_objs_layer
+                        ]
+                        for memory_obj in memory_objs_layer:
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id, cpu_tensors,
+                        )
+                    else:
+                        cpu_tensors = []
+                        for memory_obj in memory_objs_layer:
+                            if memory_obj.metadata.fmt != expected_fmt:
+                                raise ValueError(
+                                    f"Expected memory format {expected_fmt}, "
+                                    f"got {memory_obj.metadata.fmt}."
+                                )
+                            # Merged pages only expose a tensor for a specific
+                            # layer; this accessor also rejects invalid storage.
+                            cpu_tensors.append(
+                                _layer_memory_tensor(memory_obj, layer_id)
+                            )
+                        chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
+                            layer_id,
+                            cpu_tensors,
+                        )
+                    if layout.indexer_c8 and staging_tensor is not None:
+                        staged_views, chunk_ptrs_npu = self._prepare_c8_staging_packets(
+                            cpu_tensors, staging_tensor, chunk_sizes, self.store_stream,
+                            True, layout.layer_token_bytes[layer_id],
+                        )
+                    assert chunk_offsets_npu is not None
+                    assert chunk_sizes_npu is not None
+                    self._run_dense_direct_kv_transfer_layer(
+                        kvcaches_ref=kvcaches_snapshot,
+                        kv_group=kv_group,
+                        layer_id=layer_id,
+                        transfer_stream=self.store_stream,
+                        current_stream=current_stream,
+                        slot_mapping_full=layer_slot_mapping_full,
+                        chunk_ptrs_npu=chunk_ptrs_npu,
+                        chunk_offsets_npu=chunk_offsets_npu,
+                        chunk_sizes_npu=chunk_sizes_npu,
+                        total_tokens=num_tokens,
+                        fixed_chunk_size=dense_fixed_chunk_size,
+                        dense_kv_format=kv_format_value,
+                        dense_token_major=token_major,
+                        dense_vllm_two_major=vllm_two_major,
+                        dense_k_hidden_dims=k_hidden_dims,
+                        dense_v_hidden_dims=v_hidden_dims,
+                        dense_dsa_hidden_dims=dsa_hidden_dims,
+                        dense_host_interleaved=dense_host_interleaved,
+                        layer_tensors=cpu_tensors,
+                        direction=True,
+                        c8_chunk_capacity=c8_chunk_capacity,
+                        defer_consumer_wait=deferred_layerwise_put,
+                        require_prepared_state=deferred_layerwise_put,
+                        prepared_layer_state=(
+                            deferred_dense_layer_states[layer_id]
+                            if deferred_layerwise_put
+                            else None
+                        ),
+                        prepared_validation_key=(
+                            deferred_dense_validation_keys[layer_id]
+                            if deferred_layerwise_put
+                            else None
+                        ),
+                    )
+                    if staged_views is not None:
+                        with self._stream_context_or_null(self.store_stream):
+                            for target, view in zip(
+                                cpu_tensors, staged_views, strict=True
+                            ):
+                                target.view(-1)[: view.numel()].copy_(
+                                    view, non_blocking=True
+                                )
+                    logger.debug("Finished offloading layer %d", layer_id)
+                else:
+                    # Preserve the ordinary paged transfer path for D nodes
+                    # and for requests that did not opt into the P-node
+                    # layerwise DMA protocol.  This wrapper dispatches the
+                    # existing single-layer paged-copy kernels.
+                    with torch.npu.stream(self.store_stream):
+                        self.store_stream.wait_stream(current_stream)
+                        if self.use_gpu:
+                            cpu_tensors = [
+                                _layer_memory_tensor(memory_obj, layer_id)
+                                for memory_obj in memory_objs_layer
+                            ]
 
-        # free the buffer memory
-        if self.use_gpu and tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
-        yield
+                            # Fused transfer: 1 scatter kernel + N D2H memcpy
+                            batched_fused_single_layer_kv_transfer(
+                                cpu_tensors,
+                                staging_tensor,
+                                kvcaches_snapshot[layer_id],
+                                layer_slot_mapping_full,
+                                chunk_offsets,
+                                chunk_sizes,
+                                True,  # from_gpu
+                                kv_format_value,
+                                token_major,
+                                vllm_two_major,
+                                k_hidden_dims,
+                                v_hidden_dims,
+                                dsa_hidden_dims,
+                            )
+                        else:
+                            mappings = (
+                                (slot_mapping[start:end] for start, end in
+                                 zip(starts, ends, strict=False))
+                                if ordinary_store else layer_slot_mapping_chunks
+                            )
+                            for mapping_chunk, memory_obj in zip(
+                                mappings, memory_objs_layer, strict=False,
+                            ):
+                                lmc_ops.single_layer_kv_transfer(
+                                    _layer_memory_tensor(memory_obj, layer_id),
+                                    kvcaches_snapshot[layer_id],
+                                    mapping_chunk,
+                                    True,
+                                    kv_format_value,
+                                    token_major,
+                                    vllm_two_major,
+                                    k_hidden_dims,
+                                    v_hidden_dims,
+                                    dsa_hidden_dims,
+                                )
+                        logger.debug("Finished offloading layer %d", layer_id)
+                if deferred_layerwise_put:
+                    bank_done_event = torch.npu.Event()
+                    event_stream = (
+                        bank_stream if prefill_dma else self.store_stream
+                    )
+                    bank_done_event.record(event_stream)
+                    last_store_event = bank_done_event
+                    if prefill_dma:
+                        last_store_events[bank] = bank_done_event
+                    if dense_direct:
+                        _, _, save_done, _ = (
+                            self._layerwise_prefill_transfer_state()
+                        )
+                        self._check_layerwise_prefill_transfer_generation(
+                            kv_group,
+                            layerwise_prefill_generation,
+                        )
+                        save_done[(kv_group, bank, layer_id)] = (
+                            layerwise_prefill_generation,
+                            bank_done_event,
+                        )
+                        bank_tails = getattr(
+                            self, "_layerwise_prefill_bank_tail_events", None
+                        )
+                        if bank_tails is None:
+                            bank_tails = {}
+                            self._layerwise_prefill_bank_tail_events = (
+                                bank_tails
+                            )
+                        bank_tails[(kv_group, bank)] = (
+                            layerwise_prefill_generation,
+                            bank_done_event,
+                            layer_id,
+                            kwargs.get("req_id"),
+                        )
+                        fence_debug = getattr(self, "fence_debug", None)
+                        if fence_debug is not None:
+                            fence_debug.wait("p_save", kv_group, layer_id,
+                                             bank_done_event,
+                                             req=kwargs.get("req_id"), bank=bank)
+                        audit = getattr(self, "prefill_audit", None)
+                        if audit is not None and prefill_dma:
+                            audit.save(
+                                kv_group, layer_id, bank,
+                                layerwise_prefill_generation, id(bank_done_event),
+                            )
+                    else:
+                        # The fallback path owns only one reusable staging
+                        # tensor and has no compute-entry bank protocol.
+                        # Preserve its legacy fence before the next layer.
+                        current_stream.wait_event(bank_done_event)
+                if deferred_layerwise_put:
+                    # Bank reuse is already fenced on the device. Do not
+                    # block Python here to publish an older CPU destination:
+                    # that delays submission of this layer's TP collective.
+                    # All destination objects remain owned by memory_objs.
+                    layer_request = yield None
+                else:
+                    yield
+                    # Legacy store_layer publishes the CPU objects immediately
+                    # after this generator advances.
+                    self.store_stream.synchronize()
+                    store_transfer_pending = False
+                    log_completed_store_layer(layer_id)
+
+            if deferred_layerwise_put:
+                # The P-node DMA path keeps one completion event per bank for
+                # remote consumers and lets the host continue when async
+                # store is enabled. Legacy paths retain their store-stream
+                # behavior.
+                if async_layerwise_store and last_store_events:
+                    req_id = kwargs.get("req_id")
+                    if req_id is not None:
+                        pending_events = getattr(
+                            self,
+                            "_layerwise_prefill_async_store_events",
+                            None,
+                        )
+                        if pending_events is None:
+                            pending_events = {}
+                            self._layerwise_prefill_async_store_events = (
+                                pending_events
+                            )
+                        pending_events.setdefault(str(req_id), {})[
+                            int(kv_group)
+                        ] = tuple(
+                            last_store_events[bank]
+                            for bank in sorted(last_store_events)
+                        )
+                if last_store_event is not None and not async_layerwise_store:
+                    store_publish_sync_started = (
+                        time.perf_counter()
+                        if prefill_start_timing_enabled() else 0.0
+                    )
+                    if prefill_dma:
+                        for bank in sorted(last_store_events):
+                            last_store_events[bank].synchronize()
+                    else:
+                        last_store_event.synchronize()
+                    if store_publish_sync_started:
+                        prefill_start_timing_log(
+                            logger, "store_publish_sync", store_publish_sync_started,
+                            kv_group=kv_group, tokens=num_tokens,
+                            layers=expected_layers,
+                        )
+                        self._flush_prefill_first_bank_timing_events()
+                store_transfer_pending = False
+                for completed_layer in range(expected_layers):
+                    log_completed_store_layer(completed_layer)
+                    yield completed_layer
+
+            # free the buffer memory
+            if self.use_gpu and tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+                tmp_gpu_buffer_obj = None
+            if not deferred_layerwise_put:
+                yield None
+        finally:
+            if store_transfer_pending and not ordinary_store:
+                if prefill_dma:
+                    self._synchronize_layerwise_prefill_dma_streams(kv_group)
+                else:
+                    self.store_stream.synchronize()
+            if (
+                self.use_gpu
+                and tmp_gpu_buffer_obj is not None
+                and tmp_gpu_buffer_obj.is_valid()
+            ):
+                if ordinary_store:
+                    self.store_stream.synchronize()
+                tmp_gpu_buffer_obj.ref_count_down()
 
 
 class SGLangNPUConnector(SGLangGPUConnector):
@@ -1495,6 +10060,9 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
     ):
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
+
+    def _expected_memory_format(self) -> MemoryFormat:
+        return MemoryFormat.KV_T2D
 
     def _lazy_initialize_buffer(self, kv_caches):
         """
@@ -1578,7 +10146,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
                 "GPU buffer allocator should be initialized"
             )
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                buffer_shape, self.dtype, self._expected_memory_format()
             )
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate GPU buffer in GPUConnector"
@@ -1589,8 +10157,8 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id - 1}")
+            if layer_id > 0 and logger.isEnabledFor(10):
+                logger.debug("Finished loading layer %d", layer_id - 1)
 
             current_layer_kv = (self.kvcaches[0][layer_id], self.kvcaches[1][layer_id])
 
@@ -1629,7 +10197,8 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
         if self.use_gpu:
             tmp_gpu_buffer_obj.ref_count_down()
 
-        logger.debug(f"Finished loading layer {layer_id}")
+        if logger.isEnabledFor(10):
+            logger.debug("Finished loading layer %d", layer_id)
         yield
 
     @_lmcache_nvtx_annotate
@@ -1693,7 +10262,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
                 "GPU buffer allocator should be initialized"
             )
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                buffer_shape, self.dtype, self._expected_memory_format()
             )
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate GPU buffer in GPUConnector"
@@ -1742,7 +10311,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
                     )
 
             yield
-            logger.debug(f"Finished offloading layer {layer_id}")
+            logger.debug("Finished offloading layer %d", layer_id)
 
         # free the buffer memory
         if self.use_gpu:
