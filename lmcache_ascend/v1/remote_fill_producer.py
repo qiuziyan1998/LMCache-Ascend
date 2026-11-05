@@ -37,6 +37,7 @@ from lmcache.v1.remote_fill import (
     ResultCode,
     StatusRequest,
     TerminalOutcome,
+    TransactionState,
     content_digest,
     destination_descriptor_digest,
     manifest_digest,
@@ -223,6 +224,9 @@ class RemoteFillWindowResult:
     native_ended_monotonic: float = 0.0
     submitted_bytes: int = 0
     existing_pages: int = 0
+    response_code: str = ""
+    response_message: str = ""
+    response_state: TransactionState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +296,7 @@ class RemoteFillProducerMetrics:
             "cached_prefix_hole",
             "direct_destination_hole",
             "probe_control_unavailable",
+            "probe_rejected",
             "probe_result_invalid",
             "reserve_control_unavailable",
             "reservation_rejected",
@@ -598,6 +603,9 @@ class RemoteFillProducerSession:
         # Local fallback is not evidence that D closed the transaction. Keep
         # cleanup retryable through request release, including a lost OPEN ACK.
         self.remote_cleanup_pending = False
+        self._checked_failed_coverage = False
+        self._retired_outcome: tuple[str, bool] | None = None
+        self._abort_draining = False
         self.fatal_restart_required = False
         self.prearm_control_unknown = False
         self.d_local_end_open = 0
@@ -771,6 +779,14 @@ class RemoteFillProducerSession:
                 reserve_seconds=reserve_seconds,
             )
         reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
+        # Early refusals create no window and legitimately have no page results.
+        # Refusals WITH results still participate in the FINISH manifest below.
+        if not reserved.page_results and not self._accepted(reserved):
+            self.direct_viable = False
+            return self._abandoned_window(
+                window_id, "probe rejected", response=reserved,
+                reserve_seconds=reserve_seconds,
+            )
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
@@ -780,6 +796,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "probe result invalid",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
             )
         self.window_manifests.append((window_id, digest))
@@ -793,6 +810,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "cached-prefix hole",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
                 existing_pages=existing_pages,
             )
@@ -888,6 +906,12 @@ class RemoteFillProducerSession:
             )
         reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
         descriptors = reserved.descriptors
+        if not reserved.page_results and not self._accepted(reserved):
+            self.direct_viable = False
+            return self._abandoned_window(
+                window_id, "reservation rejected", response=reserved,
+                reserve_seconds=reserve_seconds,
+            )
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
@@ -897,6 +921,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "reservation result invalid",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
             )
         self.window_manifests.append((window_id, digest))
@@ -905,6 +930,7 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "reservation rejected",
+                response=reserved,
                 reserve_seconds=reserve_seconds,
             )
         existing_pages = sum(item is PageDisposition.EXISTING for item in dispositions)
@@ -1179,9 +1205,11 @@ class RemoteFillProducerSession:
                 )
             )
             report_succeeded = reported.code is ResultCode.OK
+        except RemoteFillFatalError:
+            raise
         except Exception:
             try:
-                report_succeeded = self._resolve_ambiguous_report(
+                report_succeeded, reported = self._resolve_ambiguous_report(
                     window_id=window_id,
                     native_transfer_attempt_id=attempt_id,
                     native_return_code=return_code,
@@ -1203,6 +1231,9 @@ class RemoteFillProducerSession:
             direct_satisfied,
             True,
             reason="" if direct_satisfied else "native transfer failed",
+            response_state=(
+                reported.transaction_state if not direct_satisfied else None
+            ),
             reserve_seconds=reserve_seconds,
             arm_seconds=arm_seconds,
             source_event_wait_seconds=source_event_wait_seconds,
@@ -1279,7 +1310,7 @@ class RemoteFillProducerSession:
         native_return_code: int,
         completed_bytes: int,
         expected_bytes: int,
-    ) -> bool:
+    ) -> tuple[bool, RemoteFillResponse]:
         """Resolve a lost completion reply from exact destination state."""
 
         response = self._execute(
@@ -1302,12 +1333,12 @@ class RemoteFillProducerSession:
             reported_success
             and window.native_state is DestinationNativeState.TERMINAL_SUCCESS
         ):
-            return True
+            return True, response
         if (
             not reported_success
             and window.native_state is DestinationNativeState.TERMINAL_FAILURE
         ):
-            return False
+            return False, response
         raise RuntimeError("STATUS does not match the reported terminal result")
 
     def finish(
@@ -1327,6 +1358,13 @@ class RemoteFillProducerSession:
         elif persistent_common_end < required_store_end:
             self._try_abort_cleanup("prefiller persistence failed")
             outcome = TerminalOutcome.PERSISTENCE_FAILED.value
+        elif self._retired_outcome is not None:
+            # D may already have pruned the cancellation tombstone. Only this
+            # request's ordinary persistence frontier authorizes the handoff.
+            self._try_abort_cleanup("confirm early direct retirement")
+            if self.remote_cleanup_pending and self._abort_draining:
+                self._wait_for_abort_drain()
+            outcome, direct_satisfied = self._retired_outcome
         elif not self.opened or self.prearm_control_unknown:
             self._try_abort_cleanup("prefiller pre-arm control state is unknown")
             outcome = TerminalOutcome.PERSISTENT_ONLY.value
@@ -1357,12 +1395,17 @@ class RemoteFillProducerSession:
                 if response.fatal_restart_required:
                     outcome = TerminalOutcome.FATAL_RESTART.value
                 elif response.terminal_outcome is None:
-                    raise RuntimeError(
-                        "remote-fill FINISH returned no terminal outcome: "
-                        f"code={response.code.value} "
-                        f"state={response.transaction_state} "
-                        f"message={response.message!r}"
-                    )
+                    if response.code is not ResultCode.NOT_FOUND:
+                        raise RuntimeError(
+                            "remote-fill FINISH returned no terminal outcome: "
+                            f"code={response.code.value} "
+                            f"state={response.transaction_state} "
+                            f"message={response.message!r}"
+                        )
+                    # D may have expired the idle transaction and pruned its
+                    # tombstone while P finished the required persistent stores.
+                    self.remote_cleanup_pending = False
+                    outcome = TerminalOutcome.PERSISTENT_ONLY.value
                 else:
                     outcome, direct_satisfied = self._classify_terminal(
                         response
@@ -1473,6 +1516,60 @@ class RemoteFillProducerSession:
             return outcome, True
         return outcome, False
 
+    def retire_failed_window(
+        self, decoder_state: TransactionState | None, accepted_end: int,
+    ) -> None:
+        """Called on the ordered producer job, only after a permanent failure."""
+        if (
+            self.direct_viable or not self.remote_cleanup_pending
+            or self.fatal_restart_required or self._checked_failed_coverage
+        ):
+            return
+        self._checked_failed_coverage = True
+        if not self.prearm_control_unknown and decoder_state is not TransactionState.DIRECT_ABANDONED:
+            if not self.opened or accepted_end <= 0:
+                return
+            try:
+                status = self._execute(StatusRequest(common=self._common(), window_id=-1))
+            except RemoteFillFatalError:
+                raise
+            except Exception:
+                return  # Preserve FINISH and its ordinary recovery.
+            if status.code not in (ResultCode.OK, ResultCode.TERMINAL):
+                return
+            if status.terminal_outcome is not None:
+                self._retired_outcome = self._classify_terminal(status)
+                self.remote_cleanup_pending = False
+                return
+            if status.transaction_state is TransactionState.ACTIVE:
+                windows = status.windows
+                window_ids = {w.window_id for w in windows}
+                limits = getattr(self.client, "limits", None) or ProtocolLimits()
+                if (
+                    len(windows) != len(self.window_manifests)
+                    or len(window_ids) != len(windows)
+                    or window_ids != {i for i, _ in self.window_manifests}
+                    or any(
+                        not 0 <= w.page_count <= limits.max_control_pages_per_window
+                        or w.fatal_restart_required
+                        or w.native_state in (
+                            DestinationNativeState.ARMED, DestinationNativeState.FATAL_UNKNOWN
+                        )
+                        for w in windows
+                    )
+                ):
+                    return
+                chunk = self.static_spec.chunk_size
+                required = ((accepted_end + chunk - 1) // chunk) * (
+                    2 if self.static_spec.shared_group1 else 1
+                )
+                if sum(w.page_count for w in windows) >= required:
+                    return  # A redundant refusal can still produce LOCAL_FULL.
+            elif status.transaction_state is not TransactionState.DIRECT_ABANDONED:
+                return
+        self._retired_outcome = (TerminalOutcome.PERSISTENT_ONLY.value, False)
+        self._try_abort_cleanup("direct coverage abandoned")
+
     def abort(self, reason: str) -> RemoteFillResponse | None:
         """Confirm remote cleanup, even after a local fallback was finalized.
 
@@ -1489,18 +1586,30 @@ class RemoteFillProducerSession:
         if not self.remote_cleanup_pending:
             return None
         response = self._execute(AbortRequest(common=self._common(), reason=reason))
-        confirmed = response.code in (
-            ResultCode.TERMINAL,
-            ResultCode.NOT_FOUND,
-            ResultCode.STALE_ENGINE_EPOCH,
-            ResultCode.STALE_CACHE_GENERATION,
-        ) or response.terminal_outcome is not None
-        if not confirmed and response.code not in (ResultCode.OK, ResultCode.ACCEPTED):
-            raise RuntimeError("remote-fill ABORT has not confirmed remote cleanup")
-        self.remote_cleanup_pending = not confirmed
+        self._observe_cleanup(response)
         self.direct_viable = False
         self.closed = True
         return response
+
+    def _observe_cleanup(self, response: RemoteFillResponse) -> None:
+        if response.transaction_state is TransactionState.ABORT_REQUESTED:
+            self._abort_draining = True
+        # A closed service can return bare TERMINAL while its armed pages
+        # remain quarantined. Only a transaction result can settle that drain.
+        confirmed = (
+            response.terminal_outcome is not None
+            or (response.code is ResultCode.TERMINAL and not self._abort_draining)
+            or response.code in (
+                ResultCode.NOT_FOUND, ResultCode.STALE_ENGINE_EPOCH, ResultCode.STALE_CACHE_GENERATION
+            )
+        )
+        if not confirmed and response.code not in (ResultCode.OK, ResultCode.ACCEPTED):
+            raise RuntimeError("remote-fill ABORT has not confirmed remote cleanup")
+        if self._retired_outcome is not None and response.terminal_outcome in (
+            TerminalOutcome.LOCAL_FULL, TerminalOutcome.PERSISTENT_ONLY,
+        ):
+            self._retired_outcome = self._classify_terminal(response)
+        self.remote_cleanup_pending = not confirmed
 
     def close(self) -> None:
         """Close drained resources; raise on fatal state and retain prepared owners."""
@@ -1512,11 +1621,34 @@ class RemoteFillProducerSession:
                 "cannot close an ambiguous armed remote-fill transaction"
             )
         self._try_abort_cleanup("prefiller session closed")
+        if self.remote_cleanup_pending and self._abort_draining:
+            self._wait_for_abort_drain()
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
         self._prepared_sources.clear()
         self.closed = True
+
+    def _wait_for_abort_drain(self) -> None:
+        # Acknowledged cancellation can precede the last native report.
+        # Keep the client and source owners until D confirms a terminal state.
+        deadline = time.monotonic() + self.native_hard_timeout_seconds
+        delay = 0.05
+        while self.remote_cleanup_pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.fatal_restart_required = True
+                raise RemoteFillFatalError("decoder still draining after native deadline")
+            time.sleep(min(delay, remaining))
+            try:
+                self._observe_cleanup(self._execute(
+                    StatusRequest(common=self._common(), window_id=-1)
+                ))
+            except RemoteFillFatalError:
+                raise
+            except Exception:
+                pass  # Retain ownership through a lost or invalid reply.
+            delay = min(1.0, delay * 2)
 
     def _try_abort_cleanup(self, reason: str) -> RemoteFillResponse | None:
         """Bounded best effort; D's idle lease handles a disconnected owner."""
@@ -1665,6 +1797,8 @@ class RemoteFillProducerSession:
         window_id: int,
         reason: str,
         armed: bool = False,
+        *,
+        response: RemoteFillResponse | None = None,
         **metrics: Any,
     ) -> RemoteFillWindowResult:
         return RemoteFillWindowResult(
@@ -1672,6 +1806,8 @@ class RemoteFillProducerSession:
             direct_satisfied=False,
             armed=armed,
             reason=reason,
+            response_code=response.code.value if response is not None else "",
+            response_message=response.message if response is not None else "",
+            response_state=response.transaction_state if response is not None else None,
             **metrics,
         )
-

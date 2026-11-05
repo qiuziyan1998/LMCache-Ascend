@@ -13,7 +13,7 @@ worker unhealthy marking without retaining its engine.
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
@@ -95,6 +95,8 @@ class ProducerRequestState:
     session: Optional[RemoteFillProducerSession] = None
     futures: deque[Future] = field(default_factory=deque)
     last_future: Optional[Future] = None
+    retirement: Optional[Future] = None
+    retirement_enqueue_failed: bool = False
     next_window_id: int = 0
     source_generation: int = 0
     probe_end: int = 0
@@ -137,6 +139,7 @@ class RemoteFillCoordinator:
         self.storage_manager = storage_manager
         self._fatal_reporter = WeakMethod(fatal_reporter)
         self._session_lock = threading.RLock()
+        self.retiring: dict[int, tuple[str, ProducerRequestState]] = {}
 
     def configure(
         self,
@@ -181,16 +184,36 @@ class RemoteFillCoordinator:
         deadline = time.perf_counter() + (
             float(self.config.remote_fill_native_hard_timeout_ms) / 1000.0
         )
-        for state in states:
-            while state.futures:
-                future = state.futures.popleft()
+        # Detached attempts still own their cleanup on request-ID replacement.
+        owned = {id(state): state for state in states}
+        owned.update((key, state) for key, (_, state) in self.retiring.items())
+        first_job_error = None
+        for state in owned.values():
+            if state.retirement is not None:
                 try:
-                    future.result(timeout=max(0.0, deadline - time.perf_counter()))
+                    state.retirement.result(timeout=max(0.0, deadline - time.perf_counter()))
                 except FutureTimeoutError as error:
                     self._latch_fatal(state)
-                    raise RemoteFillFatalError(
-                        "remote-fill producer shutdown exceeded its hard deadline"
-                    ) from error
+                    raise RemoteFillFatalError("remote retirement did not drain") from error
+                continue
+            if state.retirement_enqueue_failed:
+                # Shutdown owns the fallback when the pool rejected submission.
+                self._retire(self.retiring[id(state)][0], state, deadline=deadline)
+                state.retirement = Future()
+                state.retirement.set_result(None)
+                continue
+            while state.futures:
+                self._wait_until_deadline(state, state.futures[0], deadline)
+                try:
+                    state.futures.popleft().result()
+                except RemoteFillFatalError:
+                    self._latch_fatal(state)
+                    raise
+                except Exception as error:
+                    # A completed job can fail before ARM. Close the remaining
+                    # sessions before propagating the original failure.
+                    if first_job_error is None:
+                        first_job_error = error
             if (
                 state.terminal is not None and state.terminal.outcome == "FATAL_RESTART"
             ) or getattr(state.session, "fatal_restart_required", False):
@@ -199,11 +222,17 @@ class RemoteFillCoordinator:
                     "cannot close fatal remote-fill producer state"
                 )
             if state.session is not None:
-                state.session.close()
+                self._close_session(state)
+        self.retiring.clear()
         executor = getattr(self, "_executor", None)
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
             self._executor = None
+        if first_job_error is not None:
+            try:
+                raise first_job_error
+            finally:
+                del first_job_error  # Break the traceback cycle with cyclic GC off.
 
     def metrics_snapshot(self) -> dict[str, Any]:
         """Return enabled-path producer aggregates without request identities."""
@@ -276,7 +305,10 @@ class RemoteFillCoordinator:
             allocation = result.reason in (
                 "direct destination hole",
                 "reservation rejected",
+                "probe rejected",
                 "producer backpressure",
+            ) and result.response_code in (
+                "", "RESOURCE_EXHAUSTED", "RESERVATION_REJECTED",
             )
             metrics.abandon(result.reason, allocation=allocation)
             if result.armed or result.reason == "native transfer failed":
@@ -301,6 +333,8 @@ class RemoteFillCoordinator:
                 action=("PAIRED_RESTART_REQUIRED" if fatal else "PERSISTENT_ONLY"),
                 transfer_id=(handoff.transfer_id if handoff is not None else None),
                 reason=str(result.reason),
+                response_code=result.response_code,
+                response_message=result.response_message,
                 memory_safety_uncertain=fatal,
                 severity="critical" if fatal else "warning",
             )
@@ -662,6 +696,31 @@ class RemoteFillCoordinator:
             state.active_counted = True
         return session
 
+    def _retire_refused_tail(self, state: ProducerRequestState, accepted_end: int) -> None:
+        """A caller-side refusal can race previously admitted window jobs."""
+        previous = state.last_future
+        if previous is None:
+            return
+
+        def abandon() -> None:
+            previous.result()
+            if state.session is not None:
+                state.session.direct_viable = False
+                try:
+                    state.session.retire_failed_window(None, accepted_end)
+                except RemoteFillFatalError:
+                    self._latch_fatal(state)
+                    raise
+
+        try:
+            job = self._executor.submit(abandon)
+        except RuntimeError:
+            # Original ownership and FINISH/release remain intact.
+            logger.warning("Could not enqueue RemoteFill abandonment", exc_info=True)
+            return
+        # last_future identifies the last job that actually borrowed sources.
+        state.futures.append(job)
+
     def submit_probe(
         self,
         req_id: str,
@@ -671,6 +730,7 @@ class RemoteFillCoordinator:
         *,
         maximum: int,
         context: ProducerSessionContext,
+        accepted_end: int = 0,
         source_factory: Callable[[tuple[ControlPage, ...]], DirectPushSourcePlan]
         | None = None,
     ) -> None:
@@ -702,6 +762,7 @@ class RemoteFillCoordinator:
         if not self._acquire_queue_capacity(state, 0):
             state.disabled_reason = "producer_backpressure"
             metrics.abandon("producer backpressure", allocation=True)
+            self._retire_refused_tail(state, accepted_end)
             return
         if metrics.timing_enabled:
             metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
@@ -844,6 +905,7 @@ class RemoteFillCoordinator:
                             reason=result.reason,
                         )
                     if not result.direct_satisfied:
+                        session.retire_failed_window(result.response_state, accepted_end)
                         break
                 return tuple(results)
             except RemoteFillFatalError:
@@ -877,6 +939,7 @@ class RemoteFillCoordinator:
         control_pages: tuple[ControlPage, ...],
         maximum: int,
         context: ProducerSessionContext,
+        accepted_end: int = 0,
     ) -> None:
         if maximum <= 0:
             state.disabled_reason = "invalid_control_page_limit"
@@ -918,6 +981,7 @@ class RemoteFillCoordinator:
                     reason="producer_backpressure",
                     bytes=byte_count,
                 )
+            self._retire_refused_tail(state, accepted_end)
             return
         if metrics.timing_enabled:
             metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
@@ -1068,6 +1132,7 @@ class RemoteFillCoordinator:
                             ),
                         )
                     if not result.direct_satisfied:
+                        session.retire_failed_window(result.response_state, accepted_end)
                         break
                 return tuple(results)
             except Exception as error:
@@ -1131,6 +1196,8 @@ class RemoteFillCoordinator:
         if state.terminal is not None:
             return state.terminal
         self.wait(state)
+        if state.retirement is not None:
+            return None
         if serving_perf_enabled():
             serving_perf_log(
                 logger,
@@ -1231,7 +1298,81 @@ class RemoteFillCoordinator:
             )
         return terminal
 
+    def filter_finished(
+        self, candidates: set[str], stores: dict, *, block: bool = False
+    ) -> set[str]:
+        """Poll only finish candidates and attempts for which we owe retirement."""
+        for req_id in candidates:
+            state = getattr(stores.get(req_id), "remote_fill", None)
+            if state is not None and (
+                state.futures or (state.session and state.session.remote_cleanup_pending)
+            ):
+                self.retiring[id(state)] = (req_id, state)
+
+        if not self.retiring:
+            return candidates
+        ready = set(candidates)
+        for key, (req_id, state) in tuple(self.retiring.items()):
+            current = getattr(stores.get(req_id), "remote_fill", None) is state
+            if current:
+                ready.discard(req_id)
+            if state.retirement is None:
+                # Remember the attempt before submission so a rejected submission
+                # remains owned. No RPC or Future.result() on the model thread.
+                state.disabled_reason = state.disabled_reason or "request_finished"
+                try:
+                    state.retirement = self._executor.submit(self._retire, req_id, state)
+                except RuntimeError:
+                    # Keep the owner for shutdown and allow one retry. A broken
+                    # executor must surface a failure instead of polling forever.
+                    already_failed = state.retirement_enqueue_failed
+                    state.retirement_enqueue_failed = True
+                    if block or already_failed:
+                        raise
+                    logger.warning("Could not enqueue RemoteFill retirement", exc_info=True)
+                    continue
+            if block or state.retirement.done():
+                state.retirement.result()
+                del self.retiring[key]
+                if current:
+                    ready.add(req_id)
+        return ready
+
+    def _wait_until_deadline(
+        self, state: ProducerRequestState, future: Future, deadline: float
+    ) -> None:
+        if not future.done():
+            wait((future,), timeout=max(0, deadline - time.perf_counter()))
+            if not future.done():
+                self._latch_fatal(state)
+                raise RemoteFillFatalError("remote-fill producer shutdown exceeded its hard deadline")
+
+    def _retire(
+        self, req_id: str, state: ProducerRequestState, *, deadline: float | None = None
+    ) -> None:
+        # Earlier queued jobs may still own buffers even if a later wrapper
+        # was cancelled. Observe each original job before dropping the session.
+        while state.futures:
+            future = state.futures[0]
+            if deadline is not None:
+                self._wait_until_deadline(state, future, deadline)
+            try:
+                future.result()
+            except RemoteFillFatalError:
+                self._latch_fatal(state)
+                raise
+            except Exception:
+                logger.warning("RemoteFill job failed during retirement", exc_info=True)
+            state.futures.popleft()
+        if state.terminal is not None and state.terminal.outcome == "FATAL_RESTART":
+            self._latch_fatal(state)
+            raise RemoteFillFatalError("cannot retire fatal remote-fill request state")
+        self._release_drained(req_id, state)
+
     def wait(self, state: ProducerRequestState) -> None:
+        if state.retirement is not None:
+            state.retirement.result()
+            return
         try:
             while state.futures:
                 state.futures.popleft().result()
@@ -1248,12 +1389,29 @@ class RemoteFillCoordinator:
         ) or getattr(state.session, "fatal_restart_required", False):
             self._latch_fatal(state)
             raise RemoteFillFatalError("cannot release fatal remote-fill request state")
+        if state.retirement is not None:
+            if not persistent_ready or not state.retirement.done():
+                return False
+            state.retirement.result()
+            return True
         if (
-            not persistent_ready
+            state.retirement_enqueue_failed
+            or not persistent_ready
             or state.futures
             or (state.last_future is not None and not state.last_future.done())
         ):
             return False
+        self._release_drained(req_id, state)
+        return True
+
+    def _close_session(self, state: ProducerRequestState) -> None:
+        try:
+            state.session.close()
+        except RemoteFillFatalError:
+            self._latch_fatal(state)
+            raise
+
+    def _release_drained(self, req_id: str, state: ProducerRequestState) -> None:
         if state.session is not None:
             if state.terminal is None or state.session.remote_cleanup_pending:
                 try:
@@ -1276,7 +1434,7 @@ class RemoteFillCoordinator:
                         req_id,
                         exc_info=True,
                     )
-            state.session.close()
+            self._close_session(state)
             if serving_perf_enabled():
                 serving_perf_log(
                     logger,
@@ -1295,7 +1453,6 @@ class RemoteFillCoordinator:
                 metrics.add_gauge("active_transactions", -1)
                 state.active_counted = False
             metrics.add_bytes("discarded_bytes", state.submitted_bytes)
-        return True
 
     def drain_terminal_results(
         self,

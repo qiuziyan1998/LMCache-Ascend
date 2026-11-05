@@ -716,6 +716,7 @@ class AscendRemoteFillPageLifecycle:
         self._chunk_hash_type = chunk_hash_type
         self._chunk_hash_bytes = chunk_hash_bytes
         self._pin_pages = pin_pages
+        self._quarantined_pages: list[LayerPageMemoryObj] = []
 
     @property
     def direct_groups(self) -> tuple[int, ...]:
@@ -893,7 +894,7 @@ class AscendRemoteFillPageLifecycle:
                 )
                 if group_pages is None or len(group_pages) != len(indices):
                     if group_pages:
-                        self._release_unpinned(group_pages)
+                        self._release_allocated(group_pages, pinned=False)
                     raise MemoryError("remote-fill hidden page allocation failed")
                 allocated.update(zip(indices, group_pages, strict=True))
             if diagnose:
@@ -1345,21 +1346,22 @@ class AscendRemoteFillPageLifecycle:
     def _shared_key_tags(key: CacheEngineKey) -> tuple:
         return tuple(tag for tag in (key.tags or ()) if tag[0] != "dsa_idx")
 
-    @staticmethod
-    def _release_unpinned(pages: Sequence[LayerPageMemoryObj]) -> None:
-        for page in pages:
-            page.ref_count_down()
-
-    @staticmethod
     def _release_allocated(
+        self,
         pages: Sequence[LayerPageMemoryObj],
         *,
         pinned: bool,
     ) -> None:
-        for page in pages:
-            if pinned:
-                page.unpin()
-            page.ref_count_down()
+        try:
+            for page in pages:
+                if pinned:
+                    page.unpin()
+                page.ref_count_down()
+        except Exception as error:
+            self._quarantined_pages.extend(pages)
+            raise UnsafePageLifecycleError(
+                "remote-fill allocation rollback did not complete"
+            ) from error
 
 
 class DecoderRemoteFillServiceHost:

@@ -1601,8 +1601,13 @@ def test_lazy_prefix_reservation_faults_never_write(fault):
             gc.enable()
 
 
-def test_lazy_prefix_native_failure_releases_sources_with_gc_disabled():
+@pytest.mark.parametrize("lost_report", [False, True])
+def test_lazy_prefix_native_failure_releases_sources_with_gc_disabled(lost_report):
     h = _PrefixRepairHarness(present=(0,))
+
+    if lost_report:
+        for _ in range(2):
+            h.client._transport.drop_next_reply(OperationKind.REPORT_TRANSFER_COMPLETE)
 
     def fail_native(**kwargs):
         future = Future()
@@ -1628,6 +1633,10 @@ def test_lazy_prefix_native_failure_releases_sources_with_gc_disabled():
             activation_factory=lambda _: None,
         )
         assert not result.direct_satisfied
+        h.session.retire_failed_window(result.response_state, accepted_end=0)
+        assert h.events[-1] == "AbortRequest"
+        assert h.events.count("StatusRequest") == int(lost_report)
+        assert h.state.metrics_snapshot().active_transactions == 0
         assert not h.finish().direct_satisfied
         assert not h.hidden
         assert all(ref() is None for ref in h.source_refs)
@@ -1670,8 +1679,13 @@ def test_probe_hole_latches_persistent_only_without_arm() -> None:
 
 
 @pytest.mark.parametrize("operation", ("probe", "transfer"))
+@pytest.mark.parametrize("code", (
+    ResultCode.RESOURCE_EXHAUSTED, ResultCode.RESERVATION_REJECTED,
+    ResultCode.WINDOW_CONFLICT,
+))
 def test_early_rejected_window_is_excluded_from_finish_manifest(
     operation: str,
+    code: ResultCode,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _ScriptedClient(
@@ -1684,7 +1698,7 @@ def test_early_rejected_window_is_excluded_from_finish_manifest(
         if isinstance(request, ReserveWindowRequest):
             client.requests.append(request)
             return client._response(
-                request, ResultCode.WINDOW_CONFLICT, message="window rejected"
+                request, code, message="window rejected"
             )
         if isinstance(request, FinishRequest):
             assert request.final_manifest_digest == transaction_manifest_digest(
@@ -1724,16 +1738,21 @@ def test_early_rejected_window_is_excluded_from_finish_manifest(
 
     assert not result.direct_satisfied
     assert result.reason == (
-        "probe result invalid"
+        "probe rejected"
         if operation == "probe"
-        else "reservation result invalid"
+        else "reservation rejected"
     )
+    assert result.response_code == code.value
+    assert result.response_message == "window rejected"
+    assert not session.prearm_control_unknown
     assert session.window_manifests == []
     assert terminal.outcome == "PERSISTENT_ONLY"
 
 
+@pytest.mark.parametrize("operation", ("probe", "transfer"))
 def test_malformed_accepted_reservation_aborts_unknown_control_state(
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     client = _ScriptedClient(
         reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.EXISTING)
@@ -1748,22 +1767,54 @@ def test_malformed_accepted_reservation_aborts_unknown_control_state(
         return execute(request)
 
     monkeypatch.setattr(client, "execute", malformed_success)
-    result = session.probe_window(
-        window_id=0,
-        source_generation=44,
-        control_pages=_pages(),
-    )
+    args = dict(window_id=0, source_generation=44, control_pages=_pages())
+    if operation == "probe":
+        result = session.probe_window(**args)
+    else:
+        result = session.transfer_window(
+            **args, source_plan=_source_plan(),
+            submitter=lambda **_kw: pytest.fail("invalid success must not submit"),
+            activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+        )
     terminal = session.finish(
         required_store_end=1024,
         persistent_common_end=1024,
     )
 
     assert not result.direct_satisfied
+    assert result.reason == ("probe result invalid" if operation == "probe"
+                             else "reservation result invalid")
+    assert result.response_code == "OK"
     assert session.prearm_control_unknown
     assert session.window_manifests == []
     assert terminal.outcome == "PERSISTENT_ONLY"
     assert any(isinstance(item, AbortRequest) for item in client.requests)
     assert not any(isinstance(item, FinishRequest) for item in client.requests)
+
+
+@pytest.mark.parametrize("operation", ("probe", "transfer"))
+def test_rejected_prepared_window_remains_in_finish_manifest(operation):
+    client = _ScriptedClient(
+        reserve_dispositions=(PageDisposition.EXISTING, PageDisposition.MISSING)
+    )
+    session = _session(client)
+    args = dict(window_id=0, source_generation=44, control_pages=_pages())
+    if operation == "probe":
+        result = session.probe_window(**args)
+    else:
+        result = session.transfer_window(
+            **args, source_plan=_source_plan(),
+            submitter=lambda **_kw: pytest.fail("refused window must not submit"),
+            activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
+        )
+    session.finish(required_store_end=1024, persistent_common_end=1024)
+    finish = next(item for item in client.requests if isinstance(item, FinishRequest))
+    assert session.window_manifests == [(0, manifest_digest(_pages()))]
+    assert finish.final_manifest_digest == transaction_manifest_digest(
+        session.manifest_digest_seed, tuple(session.window_manifests), 1024, 0
+    )
+    assert result.response_code == "RESERVATION_REJECTED"
+    assert not any(isinstance(item, ArmWindowRequest) for item in client.requests)
 
 
 def test_wrong_destination_dp_binding_is_rejected_before_arm() -> None:
@@ -3197,6 +3248,9 @@ def test_terminal_window_preserves_all_evidence(monkeypatch, return_code, mode):
         "native_ended_monotonic": 91.007,
         "submitted_bytes": 64,
         "existing_pages": 1,
+        "response_code": "",
+        "response_message": "",
+        "response_state": None,
     }
     assert session.direct_viable is (return_code == 0)
     assert len(reads) == (2 if mode == "0" else 8)
@@ -3264,6 +3318,57 @@ def _queued_batch():
         group_ends={0: 1024, 1: 1024},
         ranges=((0, 1024), (0, 1024)), ready_events=(object(),),
     )
+
+
+@pytest.mark.parametrize("code", (
+    ResultCode.RESOURCE_EXHAUSTED, ResultCode.RESERVATION_REJECTED,
+    ResultCode.WINDOW_CONFLICT,
+))
+def test_coordinator_logs_decoder_refusal_without_changing_circuit_policy(
+    monkeypatch, caplog, code,
+):
+    import json
+
+    engine, coordinator = _queued_coordinator()
+    coordinator.config.remote_fill_circuit_breaker_enabled = True
+    coordinator.config.remote_fill_circuit_breaker_failure_threshold = 3
+    coordinator.config.remote_fill_circuit_breaker_cooldown_sec = 60
+    client = _ScriptedClient(
+        reserve_dispositions=(), reject_on=ReserveWindowRequest,
+    )
+    execute = client.execute
+
+    def reply(request):
+        response = execute(request)
+        return msgspec.structs.replace(response, code=code) if isinstance(
+            request, ReserveWindowRequest
+        ) else response
+
+    monkeypatch.setattr(client, "execute", reply)
+    session = _session(client)
+    monkeypatch.setattr(coordinator, "_create_session", lambda *_args: session)
+    state = ProducerRequestState(handoff=_handoff())
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(coordinator, "_executor", executor, raising=False)
+        with caplog.at_level(logging.WARNING):
+            coordinator.submit_probe(
+                "request", state, _pages(), 1024, maximum=2, context=None,
+            )
+            coordinator.wait(state)
+    records = [json.loads(record.message.split("] ", 1)[1])
+               for record in caplog.records
+               if "LMCACHE_REMOTE_FILL_DIAGNOSTIC" in record.message]
+    assert len(records) == 1
+    assert records[0]["stage"] == "window_terminal"
+    assert records[0]["response_code"] == code.value
+    assert records[0]["response_message"] == "injected rejection"
+    assert records[0]["reason"] == state.disabled_reason == "probe rejected"
+    assert coordinator._circuit_failures == 1
+    assert coordinator._circuit_allows()
+    assert coordinator.metrics_snapshot()["allocation_rejection_total"] == (
+        {} if code is ResultCode.WINDOW_CONFLICT else {"probe_rejected": 1}
+    )
+    assert engine.storage_manager is coordinator.storage_manager
 
 
 @pytest.mark.parametrize("operation", ["probe", "batch"])
@@ -3819,3 +3924,400 @@ def test_coordinator_repeated_finish_drop_releases_sources_without_gc():
     finally:
         if was_enabled:
             gc.enable()
+
+@pytest.mark.parametrize("initially_done", [False, True])
+def test_finished_request_retires_remote_fill_after_single_notification(initially_done):
+    import ast
+    from pathlib import Path
+    from threading import Lock
+
+    h = _PrefixRepairHarness()
+    h.state.limits = msgspec.structs.replace(h.state.limits, max_active_transactions=1)
+    window = h.session.transfer_window(
+        window_id=0, source_generation=44, control_pages=h.pages[:1],
+        source_plan=h.make_plan(h.pages[:1]), preparer=h.prepare,
+        submitter=h.submit, activation_factory=lambda _: None,
+    )
+    assert window.direct_satisfied
+    future = Future()
+    if initially_done:
+        future.set_result(None)
+    remote = ProducerRequestState(session=h.session, handoff=h.handoff, last_future=future)
+    remote.futures.append(future)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(blocking_timeout_secs=1)
+    finished_put = Future()
+    finished_put.set_result(None)
+    engine._direct_retry_args = {}
+    engine._direct_store_states = {"r": _DirectStoreRequestState(
+        remote_fill=remote, futures=deque([finished_put]),
+    )}
+    engine.is_store_async = True
+    engine._pending_store_reqs = {}
+    engine._reported_finished_store_ids = set()
+    engine._deferred_finished_req_ids = set()
+    engine._store_lock = Lock()
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    released = []
+    adapter = SimpleNamespace(lmcache_engine=engine, store_async=True,
+                              _unfenced_live_stores={},
+                              _release_finished_worker_requests=released.extend,
+                              _drop_worker_retrieve_state=lambda _: None)
+    import lmcache
+    from types import MethodType
+    from typing import Optional
+
+    def load_method(path, name):
+        node = next(n for n in ast.walk(ast.parse(path.read_text(encoding="utf8")))
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+        node.decorator_list = []
+        ns = {"Optional": Optional, "serving_perf_enabled": lambda: False}
+        exec(compile(ast.Module([node], []), str(path), "exec"), ns)
+        return MethodType(ns[name], adapter)
+
+    # Exercise both worker entry points on CPU without loading vLLM/NPU plugins.
+    adapter._finalize_worker_requests_after_store = load_method(
+        Path(__file__).parents[2] / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py",
+        "_finalize_worker_requests_after_store",
+    )
+    poll = load_method(Path(lmcache.__file__).parent / "integration/vllm/vllm_v1_adapter.py",
+                       "get_finished")
+    adapter._late_finished_sending = set()
+    adapter._drain_dsa_cold_load_futures = lambda: None
+    coordinator = _coordinator(engine)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        try:
+            ack, _ = poll({"r"})
+            if not initially_done:
+                assert not ack and not released and h.hidden
+        finally:
+            if not future.done():
+                future.set_result(None)
+        deadline = time.monotonic() + 2
+        while not ack and time.monotonic() < deadline:
+            ack, _ = poll(set())
+            time.sleep(0.001)
+        assert ack == {"r"} and released == ["r"]
+        assert not engine._direct_store_states and not h.hidden
+        assert h.state.metrics_snapshot().active_transactions == 0
+        assert poll(set()) == (None, None)
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+@pytest.mark.parametrize("covered", [False, True])
+def test_failure_only_retirement_preserves_redundant_window(groups, covered):
+    h = _PrefixRepairHarness(groups)
+    first = h.pages if covered else h.pages[:len(groups)]
+
+    def send(index, pages):
+        return h.session.transfer_window(
+            window_id=index, source_generation=44, control_pages=pages,
+            source_plan=h.make_plan(pages), preparer=h.prepare,
+            submitter=h.submit, activation_factory=lambda _: None,
+        )
+
+    assert send(0, first).direct_satisfied
+    assert "StatusRequest" not in h.events and "AbortRequest" not in h.events
+    refused = send(1, h.pages)
+    assert refused.response_code == "WINDOW_CONFLICT"
+    h.session.retire_failed_window(refused.response_state, 6)
+    h.session.retire_failed_window(refused.response_state, 6)
+    assert h.events.count("StatusRequest") == 1
+    assert h.events.count("AbortRequest") == int(not covered)
+    assert h.state.metrics_snapshot().active_transactions == int(covered)
+    h.now += 301
+    h.state.run_maintenance()
+    if not covered:
+        status = h.client.execute(StatusRequest(common=h.session._common(), window_id=-1))
+        assert status.code is ResultCode.NOT_FOUND  # D actually pruned the tombstone.
+    assert h.finish().direct_satisfied == covered
+    assert h.events.count("FinishRequest") == int(covered)
+
+
+@pytest.mark.parametrize("failure", ["lost-abort", "persistence", "bad-status", "unknown-bound"])
+def test_early_retirement_recovery_and_persistence(failure):
+    h = _PrefixRepairHarness()
+    h.session.transfer_window(
+        window_id=0, source_generation=44, control_pages=h.pages[:1],
+        source_plan=h.make_plan(h.pages[:1]), preparer=h.prepare,
+        submitter=h.submit, activation_factory=lambda _: None,
+    )
+    h.session.direct_viable = False
+    def execute(request):
+        if failure == "lost-abort" and isinstance(request, AbortRequest):
+            raise TimeoutError("undelivered")
+        response = h.execute(request)
+        if failure == "bad-status" and isinstance(request, StatusRequest):
+            return msgspec.structs.replace(response, windows=())
+        return response
+    h.session.client = SimpleNamespace(execute=execute)
+    h.session.retire_failed_window(None, 0 if failure == "unknown-bound" else 6)
+    assert bool(h.state.metrics_snapshot().active_transactions) == (failure != "persistence")
+    h.session.client = SimpleNamespace(execute=h.execute)
+    terminal = h.session.finish(required_store_end=6, final_partial_valid_tokens=2,
+                                persistent_common_end=0 if failure == "persistence" else 6)
+    assert terminal.outcome == ("PERSISTENCE_FAILED" if failure == "persistence" else "PERSISTENT_ONLY")
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_retirement_submission_retry_and_request_id_replacement():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=2000)
+    coordinator = _coordinator(engine)
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    original = ProducerRequestState(session=h.session, handoff=h.handoff)
+    pending = Future()
+    original.futures.append(pending)
+    stores = {"r": _DirectStoreRequestState(remote_fill=original)}
+    coordinator._executor = Mock()
+    coordinator._executor.submit.side_effect = RuntimeError("rejected")
+    assert not coordinator.filter_finished({"r"}, stores)
+    assert not coordinator.release("r", original, persistent_ready=True)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        assert not coordinator.filter_finished(set(), stores)
+        replacement = ProducerRequestState()
+        stores["r"] = _DirectStoreRequestState(remote_fill=replacement)
+        pending.set_exception(ValueError("ordinary job failure"))
+        # Preemption or shutdown must wait for the old owner, even if detached.
+        coordinator.wait(original)
+        assert not coordinator.filter_finished(set(), stores)
+        assert coordinator.filter_finished({"r"}, stores) == {"r"}
+        assert stores["r"].remote_fill is replacement
+    assert h.events.count("AbortRequest") == 1
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_foreground_backpressure_orders_cleanup_without_borrowing_refused_sources():
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace()
+    coordinator = _coordinator(engine)
+    previous = Future()
+    state = ProducerRequestState(session=h.session, handoff=h.handoff, last_future=previous)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        coordinator._retire_refused_tail(state, 6)
+        assert state.last_future is previous
+        assert h.state.metrics_snapshot().active_transactions == 1
+        previous.set_result(None)
+        coordinator.wait(state)
+    assert h.events[-2:] == ["StatusRequest", "AbortRequest"]
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("operation", ["close", "finish"])
+def test_confirmed_abort_draining_or_quarantine(terminal, operation):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    def execute(request):
+        if isinstance(request, AbortRequest):
+            response = h.execute(request)
+            return msgspec.structs.replace(response, code=ResultCode.ACCEPTED,
+                transaction_state=TransactionState.ABORT_REQUESTED, terminal_outcome=None)
+        if isinstance(request, StatusRequest) and not terminal:
+            raise TimeoutError("no terminal evidence")
+        return h.execute(request)
+
+    h.session.client = SimpleNamespace(execute=execute)
+    h.session.native_hard_timeout_seconds = 0.02
+    h.session._prepared_sources[1] = object()
+    h.session.direct_viable = False
+    h.session.retire_failed_window(TransactionState.DIRECT_ABANDONED, 0)
+    assert h.session.remote_cleanup_pending
+    action = h.session.close if operation == "close" else h.finish
+    if terminal:
+        result = action()
+        assert not h.session.remote_cleanup_pending
+        if operation == "finish":
+            assert result.outcome == "PERSISTENT_ONLY"
+        h.session.close()
+        assert not h.session._prepared_sources
+    else:
+        with pytest.raises(RemoteFillFatalError, match="still draining"):
+            action()
+        assert h.session.fatal_restart_required and h.session._prepared_sources
+
+
+def test_six_active_slots_readmit_before_persistence():
+    h = _PrefixRepairHarness()
+    h.state.limits = msgspec.structs.replace(h.state.limits, max_active_transactions=6)
+
+    def session(index):
+        return RemoteFillProducerSession(
+            request_id=str(index), handoff=replace(h.handoff, transfer_id=f"t-{index}"),
+            static_spec=h.session.static_spec, client=h.client, secret=_SECRET,
+            planned_window_count_hint=1, required_store_end_hint=6,
+        )
+
+    owners = [session(i) for i in range(6)]
+    assert all(owner.open() for owner in owners)
+    assert not session(6).open()
+    owners[0].direct_viable = False
+    owners[0].retire_failed_window(None, 6)
+    assert h.state.metrics_snapshot().active_transactions == 5
+    assert session(7).open()
+    assert owners[0].finish(required_store_end=6, persistent_common_end=0).outcome == "PERSISTENCE_FAILED"
+
+
+@pytest.mark.parametrize("blocking_finish", [False, True])
+def test_shutdown_drains_detached_attempt_after_enqueue_rejection(blocking_finish):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=2000)
+    coordinator = _coordinator(engine)
+    broken_pool = coordinator._executor = Mock()
+    broken_pool.submit.side_effect = RuntimeError("rejected")
+    original = ProducerRequestState(session=h.session, handoff=h.handoff)
+    failed = Future()
+    failed.set_exception(ValueError("failed before native submission"))
+    original.futures.append(failed)
+    stores = {"r": _DirectStoreRequestState(remote_fill=original)}
+    if blocking_finish:
+        with pytest.raises(RuntimeError, match="rejected"):
+            coordinator.filter_finished({"r"}, stores, block=True)
+    else:
+        assert not coordinator.filter_finished({"r"}, stores)
+    coordinator.close(())
+    coordinator.close((original,))
+    broken_pool.shutdown.assert_called_once()
+    assert not coordinator.retiring and not original.futures
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_refused_duplicate_followed_by_decoder_lease_and_tombstone_expiry():
+    h = _PrefixRepairHarness()
+    args = dict(source_generation=44, control_pages=h.pages, preparer=h.prepare,
+                submitter=h.submit, activation_factory=lambda _: None)
+    assert h.session.transfer_window(window_id=0, source_plan=h.make_plan(h.pages),
+                                     **args).direct_satisfied
+    refused = h.session.transfer_window(window_id=1, source_plan=h.make_plan(h.pages), **args)
+    assert refused.response_code == "WINDOW_CONFLICT"
+    h.session.retire_failed_window(refused.response_state, 6)
+    assert "AbortRequest" not in h.events  # Full coverage still had a chance to publish.
+    h.now += 1801
+    h.state.run_maintenance()
+    h.now += 301
+    h.state.run_maintenance()
+    terminal = h.finish()
+    assert terminal.outcome == "PERSISTENT_ONLY" and not terminal.direct_satisfied
+    assert not h.session.remote_cleanup_pending
+
+
+@pytest.mark.parametrize("entry", ["release", "shutdown"])
+def test_abort_drain_deadline_reaches_paired_restart_latch(entry):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    def execute(request):
+        if isinstance(request, StatusRequest):
+            raise TimeoutError("native report unavailable")
+        return msgspec.structs.replace(h.execute(request), code=ResultCode.ACCEPTED,
+            transaction_state=TransactionState.ABORT_REQUESTED, terminal_outcome=None)
+    h.session.client = SimpleNamespace(execute=execute)
+    h.session.native_hard_timeout_seconds = 0.001
+    h.session._prepared_sources[1] = object()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._remote_fill_fatal_transfers = ()
+    engine.mark_init_failed = Mock()
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=1000)
+    coordinator = _coordinator(engine)
+    state = ProducerRequestState(session=h.session, handoff=h.handoff)
+    with pytest.raises(RemoteFillFatalError, match="still draining"):
+        if entry == "shutdown":
+            coordinator.close([state])
+        else:
+            coordinator.release("r", state, persistent_ready=True)
+    assert engine._remote_fill_fatal_transfers == (h.handoff.transfer_id,)
+    assert engine.mark_init_failed.call_count == 1 and h.session._prepared_sources
+
+
+def test_shutdown_deadline_retains_original_pending_window():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._remote_fill_fatal_transfers = ()
+    engine.mark_init_failed = Mock()
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=1)
+    coordinator = _coordinator(engine)
+    original = Future()
+    state = ProducerRequestState(handoff=_handoff(), futures=deque([original]))
+    with pytest.raises(RemoteFillFatalError, match="hard deadline"):
+        coordinator.close([state])
+    assert engine._remote_fill_fatal_transfers == (state.handoff.transfer_id,)
+    assert list(state.futures) == [original] and not original.done()
+
+
+@pytest.mark.parametrize("abort_ack", ["received", "lost", "legacy-closed"])
+def test_service_shutdown_cannot_acknowledge_a_draining_native_window(abort_ack):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    reserved = h.execute(ReserveWindowRequest(common=h.session._common(), window_id=0,
+        source_generation=44, manifest_digest=manifest_digest(h.pages), control_pages=h.pages))
+    armed = h.execute(ArmWindowRequest(common=h.session._common(), window_id=0,
+        native_transfer_attempt_id=reserved.native_transfer_attempt_id,
+        destination_descriptor_digest=reserved.destination_descriptor_digest,
+        manifest_digest=manifest_digest(h.pages)))
+    assert armed.code is ResultCode.OK
+    h.session.native_hard_timeout_seconds = 0.01
+    h.session._prepared_sources[1] = object()
+    if abort_ack == "lost":
+        for _ in range(2):
+            h.client._transport.drop_next_reply(OperationKind.ABORT)
+        with pytest.raises(ReplyLostError):
+            h.session.abort("cancel")
+    else:
+        assert h.session.abort("cancel").transaction_state is TransactionState.ABORT_REQUESTED
+    assert h.state.shutdown() == (h.handoff.transfer_id,)
+    if abort_ack == "legacy-closed":
+        def bare_terminal(request):
+            return msgspec.structs.replace(h.execute(request), code=ResultCode.TERMINAL,
+                terminal_outcome=None, transaction_state=None, fatal_restart_required=False)
+        h.session.client = SimpleNamespace(execute=bare_terminal)
+    with pytest.raises(RemoteFillFatalError, match="still draining|fatal|unknown terminal state"):
+        h.session.close()
+    assert h.session.remote_cleanup_pending and h.session._prepared_sources
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_shutdown_drains_live_sessions_after_failed_window(cancelled):
+    from concurrent.futures import CancelledError
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=1000)
+    coordinator = _coordinator(engine)
+    h = _PrefixRepairHarness()
+    other = RemoteFillProducerSession(
+        request_id="other", handoff=replace(h.handoff, transfer_id="other-transfer"),
+        static_spec=h.session.static_spec, client=h.client, secret=_SECRET,
+        planned_window_count_hint=1, required_store_end_hint=6,
+    )
+    assert h.session.open() and other.open()
+    job = Future()
+    if cancelled:
+        assert job.cancel()
+    else:
+        job.set_exception(ValueError("pre-arm failure"))
+    states = [ProducerRequestState(session=s, handoff=s.handoff) for s in (h.session, other)]
+    states[0].futures.append(job)
+    with pytest.raises(CancelledError if cancelled else ValueError):
+        coordinator.close(states)
+    assert h.state.metrics_snapshot().active_transactions == 0
+    assert not h.session.remote_cleanup_pending and not other.remote_cleanup_pending
+
+
+def test_explicit_fatal_report_never_waits_for_status():
+    h = _PrefixRepairHarness()
+    def stop_after_copy(**kwargs):
+        result = h.submit(**kwargs)
+        assert h.state.shutdown() == (h.handoff.transfer_id,)
+        return result
+
+    with pytest.raises(RemoteFillFatalError):
+        h.session.transfer_window(
+            window_id=0, source_generation=44, control_pages=h.pages,
+            source_plan=h.make_plan(h.pages), preparer=h.prepare,
+            submitter=stop_after_copy, activation_factory=lambda _: None,
+        )
+    assert h.session.fatal_restart_required and h.session._prepared_sources
+    assert h.events.count("ReportTransferCompleteRequest") == 1
+    assert "StatusRequest" not in h.events

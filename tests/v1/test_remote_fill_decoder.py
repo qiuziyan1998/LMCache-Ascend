@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import Mock, patch
 import logging
+import weakref
 
 # Third Party
 from lmcache.v1.cache_engine import LMCacheEngine
@@ -2314,3 +2315,27 @@ def test_unequal_group_pages_allocate_and_publish_exact_bytes():
     for call in local.allocations:
         for page in call["pages"]:
             assert page.refs == 1 and page.pins == 0
+
+@pytest.mark.parametrize("short_batch", [False, True])
+def test_failed_prepare_rollback_retains_uncertain_page(short_batch):
+    local = _FakeLocalBackend()
+    allocate = local.batched_allocate_layer_pages
+    refs = []
+
+    def failing_allocation(*args, **kwargs):
+        pages = allocate(*args, **kwargs)
+        pages[0].ref_failures = 1
+        refs.append(weakref.ref(pages[0]))
+        if short_batch:
+            return pages[:1]
+        pages[0].size += 1
+        return pages
+
+    local.batched_allocate_layer_pages = failing_allocation
+    lifecycle = _lifecycle(local, direct_groups=(0,))
+    controls = tuple(_control_page(chunk, 0) for chunk in (0, 1))
+    with pytest.raises(UnsafePageLifecycleError):
+        lifecycle.prepare_pages("transfer", 0, controls, True)
+    local.allocations.clear()
+    assert refs[0]() is not None
+    assert any(page is refs[0]() for page in lifecycle._quarantined_pages)

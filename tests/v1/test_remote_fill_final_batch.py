@@ -9,6 +9,7 @@ from asyncio import CancelledError
 from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Condition
+from unittest.mock import Mock
 from types import SimpleNamespace
 import ctypes
 import gc
@@ -232,6 +233,7 @@ def fixture(
         request_id="r",
         probe_window=lambda **kw: RemoteFillWindowResult(kw["window_id"], True, False),
         transfer_window=transfer,
+        retire_failed_window=Mock(),
     )
 
     def persist(batch, retry):
