@@ -2094,10 +2094,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         pending_store_events_by_request = getattr(
             self, "_layerwise_prefill_async_store_events", {}
         )
+        failed_stores = getattr(self, "_layerwise_prefill_unfenced_stores", {})
         selected = tuple(
-            pending_store_events_by_request if req_ids is None else req_ids
+            dict.fromkeys((*pending_store_events_by_request, *failed_stores))
+            if req_ids is None else req_ids
         )
         for req_id in selected:
+            failed = failed_stores.get(req_id)
+            if failed is not None:
+                # A failed generator can already be exhausted, so closing it
+                # again cannot fence its DMA. Keep independent stream/owner
+                # state until a later cleanup fence actually succeeds.
+                for stream in failed["streams"].values():
+                    stream.synchronize()
+                for identity, owner in list(failed["owners"].items()):
+                    owner.ref_count_down()
+                    failed["owners"].pop(identity)
+                failed_stores.pop(req_id, None)
             pending_events = pending_store_events_by_request.get(req_id)
             if pending_events is None:
                 continue
@@ -2110,6 +2123,30 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # A failed fence must leave every event registered for retry and
             # prevent the caller from proceeding with request cleanup/reuse.
             pending_store_events_by_request.pop(req_id, None)
+
+    def _retain_unfenced_layerwise_prefill_store(
+        self, req_id: str, streams: Iterable[Any], owners: Iterable[MemoryObj],
+        resources: tuple[Any, ...],
+    ) -> None:
+        """Quarantine unfinished D2H destinations after a cleanup fence fails.
+
+        Missing request IDs remain recoverable by the all-request store drain.
+        """
+        failed = getattr(self, "_layerwise_prefill_unfenced_stores", None)
+        if failed is None:
+            failed = self._layerwise_prefill_unfenced_stores = {}
+        entry = failed.setdefault(str(req_id), {
+            "streams": {}, "owners": {}, "resources": [],
+        })
+        for stream in streams:
+            entry["streams"][id(stream)] = stream
+        for owner in owners:
+            if id(owner) not in entry["owners"]:
+                owner.ref_count_up()
+                entry["owners"][id(owner)] = owner
+        # MemoryObj.__del__ can free an allocation even with nonzero refs.
+        # Retain the Python objects too, including C8 pointer/slot tensors.
+        entry["resources"].append(resources)
 
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
@@ -10081,9 +10118,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         finally:
             if store_transfer_pending and not ordinary_store:
                 if prefill_dma:
-                    self._synchronize_layerwise_prefill_dma_streams(kv_group)
+                    pending_streams = tuple({
+                        id(stream): stream
+                        for (group, _), stream in getattr(
+                            self, "_layerwise_prefill_dma_streams", {}
+                        ).items() if group == kv_group
+                    }.values())
                 else:
-                    self.store_stream.synchronize()
+                    pending_streams = (self.store_stream,)
+                try:
+                    for stream in pending_streams:
+                        stream.synchronize()
+                except BaseException:
+                    pending_owners = [
+                        obj for layer_objs in memory_objs for obj in layer_objs
+                    ]
+                    if tmp_gpu_buffer_obj is not None:
+                        pending_owners.append(tmp_gpu_buffer_obj)
+                    self._retain_unfenced_layerwise_prefill_store(
+                        str(kwargs.get("req_id", "unspecified")),
+                        pending_streams, pending_owners,
+                        (kvcaches_snapshot, prefill_packets),
+                    )
+                    raise
             if (
                 self.use_gpu
                 and tmp_gpu_buffer_obj is not None
