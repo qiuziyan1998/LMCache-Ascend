@@ -2099,6 +2099,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dict.fromkeys((*pending_store_events_by_request, *failed_stores))
             if req_ids is None else req_ids
         )
+        fence_debug = getattr(self, "fence_debug", None)
         for req_id in selected:
             failed = failed_stores.get(req_id)
             if failed is not None:
@@ -2106,7 +2107,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # again cannot fence its DMA. Keep independent stream/owner
                 # state until a later cleanup fence actually succeeds.
                 for stream in failed["streams"].values():
-                    stream.synchronize()
+                    if fence_debug is None:
+                        stream.synchronize()
+                    else:
+                        fence_debug.observe_existing(stream, stage="store_recovery",
+                                                     target="stream", req=req_id)
                 for identity, owner in list(failed["owners"].items()):
                     owner.ref_count_down()
                     failed["owners"].pop(identity)
@@ -2117,9 +2122,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for completion in pending_events.values():
                 if isinstance(completion, (tuple, list)):
                     for event in completion:
-                        event.synchronize()
+                        if fence_debug is None:
+                            event.synchronize()
+                        else:
+                            fence_debug.observe_existing(event, stage="store_finish",
+                                                         req=req_id)
                 else:
-                    completion.synchronize()
+                    if fence_debug is None:
+                        completion.synchronize()
+                    else:
+                        fence_debug.observe_existing(completion, stage="store_finish",
+                                                     req=req_id)
             # A failed fence must leave every event registered for retry and
             # prevent the caller from proceeding with request cleanup/reuse.
             pending_store_events_by_request.pop(req_id, None)
@@ -2151,13 +2164,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
         unfenced = getattr(self, "_layerwise_prefill_unfenced_loads", None)
+        fence_debug = getattr(self, "fence_debug", None)
         failed_streams = unfenced.get(req_id) if unfenced else None
         if failed_streams:
             # A native call or Event.record may fail after enqueuing reads.
             # Earlier events cannot fence those reads. Keep both this latch
             # and every request owner if any fallback fence is unsuccessful.
             for stream in failed_streams.values():
-                stream.synchronize()
+                if fence_debug is None:
+                    stream.synchronize()
+                else:
+                    fence_debug.observe_existing(stream, stage="load_recovery",
+                                                 target="stream", req=req_id)
             unfenced.pop(req_id, None)
         self.wait_for_layerwise_prefill_stores((req_id,))
         load_events_by_request = getattr(
@@ -2170,7 +2188,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         load_events = load_events_by_request.get(req_id)
         if load_events:
             for event in load_events:
-                event.synchronize()
+                if fence_debug is None:
+                    event.synchronize()
+                else:
+                    fence_debug.observe_existing(event, stage="load_finish", req=req_id)
             load_events_by_request.pop(req_id, None)
         load_owners = getattr(self, "_layerwise_prefill_load_owners", {}).get(req_id)
         if load_owners:
@@ -2181,6 +2202,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._prefill_dma_bound_loads.pop(req_id, None)
         getattr(self, "_prefill_dma_plan_cache", {}).pop(req_id, None)
         getattr(self, "_prefill_dma_source_cache", {}).pop(req_id, None)
+        if fence_debug is not None and fence_debug.trace is not None:
+            fence_debug.trace.forget_request(req_id)
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
@@ -2434,6 +2457,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             fence_debug.before_sfa(
                 kv_group, layer_id, self._layerwise_prefill_bank(layer_id, kv_group),
                 torch.npu.current_stream,
+                event_factory=(torch.npu.Event if fence_debug.trace is not None else None),
             )
 
     def synchronize_prefill_vup_output(self, layer_id: int, kv_group: int) -> None:
@@ -2467,10 +2491,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         bank = self._layerwise_prefill_bank(layer_id, kv_group)
         fence_debug = getattr(self, "fence_debug", None)
         if fence_debug is not None:
-            fence_debug.wait("p_use", kv_group, layer_id, event)
+            if fence_debug.trace is not None:
+                fence_debug.trace_record(
+                    "use", event, torch.npu.current_stream(), group=kv_group,
+                    layer=layer_id, bank=bank, generation=generation,
+                )
+            fence_debug.wait("p_use", kv_group, layer_id, event, bank=bank)
         dma_stream = self._layerwise_prefill_dma_stream(kv_group, bank)
         dma_stream.wait_event(event)
         if fence_debug is not None:
+            fence_debug.trace_join(dma_stream, event)
             fence_debug.after_use_wait(
                 kv_group, layer_id, bank, torch.npu.current_stream, dma_stream,
             )
@@ -3175,12 +3205,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if kv_group is None or group == int(kv_group)
         )
         seen: set[int] = set()
+        fence_debug = getattr(self, "fence_debug", None)
         for stream in selected:
             identity = id(stream)
             if identity in seen:
                 continue
             seen.add(identity)
-            stream.synchronize()
+            if fence_debug is None:
+                stream.synchronize()
+            else:
+                fence_debug.observe_existing(stream, stage="bank_cleanup",
+                                             target="stream", group=kv_group)
 
     def _flush_prefill_first_bank_timing_events(self) -> None:
         """Read completed diagnostic events without introducing a new fence."""
@@ -3220,7 +3255,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         for event in events:
             if not event.query():
-                event.synchronize()
+                fence_debug = getattr(self, "fence_debug", None)
+                if fence_debug is None:
+                    event.synchronize()
+                else:
+                    fence_debug.observe_existing(event, stage="source_publication",
+                                                 group=kv_group)
 
     def wait_for_layerwise_prefill_load(
         self,
@@ -3273,8 +3313,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             fence_debug.before_read(kv_group, int(layer_id), bank, events)
         # Do not collapse these waits to the last bank event. Every request
         # keeps its own handoff, independent of batch/submission order.
-        for event in events.values():
+        for req_id, event in events.items():
             current_stream.wait_event(event)
+            if fence_debug is not None:
+                fence_debug.trace_join(
+                    current_stream, event, kind="load", req=req_id,
+                    group=kv_group, layer=layer_id, bank=bank,
+                    generation=generation,
+                )
         waited_event = next(reversed(events.values())) if events else None
         if not events:
             previous_tail = getattr(
@@ -3283,6 +3329,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if previous_tail is not None and previous_tail[0] == generation:
                 waited_event = previous_tail[1]
                 current_stream.wait_event(waited_event)
+                if fence_debug is not None:
+                    fence_debug.trace_join(
+                        current_stream, waited_event, kind="save",
+                        group=kv_group, layer=previous_tail[2], bank=bank,
+                        req=previous_tail[3], generation=previous_tail[0],
+                    )
         audit = getattr(self, "prefill_audit", None)
         if audit is not None:
             audit.wait(kv_group, int(layer_id), bank, generation,
@@ -5156,7 +5208,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             _sparse_h2d_python_stage(join, "native_return")
             fence_debug = getattr(self, "fence_debug", None)
             if fence_debug is not None:
-                fence_debug.wait("d_load", kv_group, layer_id, load_stream, req=req_id)
+                fence_debug.wait("d_load", kv_group, layer_id, load_stream, req=req_id,
+                                 target="stream")
             if (getattr(self, "kv_trace", None) is not None
                     and req_id and trace_explicit):
                 self.trace_selected_kv(req_id, kv_group, layer_id,
@@ -5693,7 +5746,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 current_stream.wait_stream(transfer_stream)
             fence_debug = getattr(self, "fence_debug", None)
             if fence_debug is not None and not direction:
-                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
+                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream,
+                                 target="stream")
             return
 
         if destination_plan is not None:
@@ -5720,7 +5774,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 current_stream.wait_stream(transfer_stream)
             fence_debug = getattr(self, "fence_debug", None)
             if fence_debug is not None and not direction:
-                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
+                fence_debug.wait("d_load", kv_group, layer_id, transfer_stream,
+                                 target="stream")
             return
 
         if prepared_layer_state is not None:
@@ -5817,7 +5872,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             current_stream.wait_stream(transfer_stream)
         fence_debug = getattr(self, "fence_debug", None)
         if fence_debug is not None and not direction:
-            fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
+            fence_debug.wait("d_load", kv_group, layer_id, transfer_stream,
+                                 target="stream")
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
         return (
@@ -8125,6 +8181,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                     fence_debug = getattr(self, "fence_debug", None)
                     if fence_debug is not None:
+                        fence_debug.trace_record(
+                            "load", load_done_event, bank_stream,
+                            req=req_id, group=kv_group, layer=layer_id, bank=bank,
+                            generation=layerwise_prefill_generation,
+                        )
                         fence_debug.loaded(str(req_id), kv_group, layer_id, bank,
                                            load_done_event)
                         fence_debug.wait("p_load", kv_group, layer_id,
@@ -8265,6 +8326,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                         fence_debug = getattr(self, "fence_debug", None)
                         if fence_debug is not None:
+                            fence_debug.trace_record(
+                                "load", load_done_event, self.load_stream,
+                                req=req_id, group=kv_group, layer=layer_id,
+                                bank=bank, generation=layerwise_prefill_generation,
+                            )
                             fence_debug.loaded(
                                 str(req_id), kv_group, layer_id, bank,
                                 load_done_event,
@@ -8318,7 +8384,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     fence_debug = getattr(self, "fence_debug", None)
                     if fence_debug is not None:
                         fence_debug.wait("d_load", kv_group, layer_id,
-                                         self.load_stream, req=req_id)
+                                         self.load_stream, req=req_id, target="stream")
                     continue
                 if logger.isEnabledFor(10):
                     logger.debug("Finished loading layer %d", layer_id)
@@ -8587,7 +8653,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             fence_debug = getattr(self, "fence_debug", None)
             if fence_debug is not None:
                 fence_debug.wait("d_load", kv_group, layer_id,
-                                 torch.npu.current_stream(), req=req_id)
+                                 torch.npu.current_stream(), req=req_id, target="stream")
             if perf_enabled:
                 native_done = time.perf_counter()
                 submit_elapsed = native_done - submit_started
@@ -10035,6 +10101,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         )
                         fence_debug = getattr(self, "fence_debug", None)
                         if fence_debug is not None:
+                            fence_debug.trace_record(
+                                "save", bank_done_event, event_stream,
+                                req=kwargs.get("req_id"), group=kv_group,
+                                layer=layer_id, bank=bank,
+                                generation=layerwise_prefill_generation,
+                            )
                             fence_debug.wait("p_save", kv_group, layer_id,
                                              bank_done_event,
                                              req=kwargs.get("req_id"), bank=bank)
@@ -10094,7 +10166,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                     if prefill_dma:
                         for bank in sorted(last_store_events):
-                            last_store_events[bank].synchronize()
+                            fence_debug = getattr(self, "fence_debug", None)
+                            if fence_debug is None:
+                                last_store_events[bank].synchronize()
+                            else:
+                                fence_debug.observe_existing(
+                                    last_store_events[bank], stage="store_publish",
+                                    group=kv_group, bank=bank, req=kwargs.get("req_id"),
+                                )
                     else:
                         last_store_event.synchronize()
                     if store_publish_sync_started:
@@ -10128,7 +10207,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     pending_streams = (self.store_stream,)
                 try:
                     for stream in pending_streams:
-                        stream.synchronize()
+                        fence_debug = getattr(self, "fence_debug", None)
+                        if fence_debug is None:
+                            stream.synchronize()
+                        else:
+                            fence_debug.observe_existing(
+                                stream, stage="store_cleanup", target="stream",
+                                group=kv_group, req=kwargs.get("req_id"),
+                            )
                 except BaseException:
                     pending_owners = [
                         obj for layer_objs in memory_objs for obj in layer_objs
