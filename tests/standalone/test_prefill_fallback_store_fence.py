@@ -45,7 +45,7 @@ class Queue:
         raise error
 
 
-def publish(*, mixed=False, asynchronous=True, trace=None, hash_enabled=False):
+def publish(*, mixed=False, asynchronous=True):
     """Execute the actual page-mode branch, including its flat-object fallback."""
     path = Path(__file__).resolve().parents[2] / "lmcache_ascend/v1/cache_engine.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -62,13 +62,6 @@ def publish(*, mixed=False, asynchronous=True, trace=None, hash_enabled=False):
         and node.test.id == "page_first_store"
         and isinstance(node.body[0], ast.Assign)
         and node.body[0].targets[0].id == "async_pages"
-    )
-    hash_block = next(
-        node
-        for node in ast.walk(store)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test)
-        == "self._force_layerwise_prefill_store and kv_hash_enabled()"
     )
     flat = [[Object() for _ in range(2)] for _ in range(3)]
     if mixed:
@@ -107,19 +100,7 @@ def publish(*, mixed=False, asynchronous=True, trace=None, hash_enabled=False):
             batched_put_layerwise_objects=fenced_put,
         ),
         _track_sync_store_futures=lambda futures, **kw: required.extend(futures),
-        hash_calls=[],
-        trace_calls=[],
     )
-    engine.gpu_connector = NS(
-        enqueue_store_kv_trace=lambda *args: engine.trace_calls.append(args)
-    )
-    engine.config.chunk_size = 256
-    hash_ready = NS(cpu_hash_fence=True)
-
-    def hash_submit(*args, **kwargs):
-        engine.hash_calls.append((args, kwargs))
-        return hash_ready
-
     namespace = dict(
         self=engine,
         memory_objs=flat,
@@ -136,30 +117,16 @@ def publish(*, mixed=False, asynchronous=True, trace=None, hash_enabled=False):
         kv_group=0,
         starts=[0, 256],
         ends=[256, 512],
-        store_debug=trace is not None,
-        prefill_store_debug_log=lambda *args, **kwargs: trace.append((args, kwargs)),
-        kv_hash_enabled=lambda: hash_enabled,
-        submit_kv_hash=hash_submit,
     )
     exec(
         compile(
-            ast.Module(body=[hash_block, block], type_ignores=[]), str(path), "exec"
+            ast.Module(body=[block], type_ignores=[]), str(path), "exec"
         ),
         namespace,
     )
     return engine, flat, fences, unfenced_reads, fenced_puts, required
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_real_store_passes_hash_ready_to_background_writer(mixed):
-    engine, _, fences, _, puts, _ = publish(mixed=mixed, hash_enabled=True)
-    assert len(engine.hash_calls) == 1
-    assert engine.hash_calls[0][1]["producer_events"] == fences
-    assert engine.trace_calls[0][-1] == fences
-    for _, _, options in puts:
-        events = options["producer_events"]
-        assert events[:-1] == fences
-        assert events[-1].cpu_hash_fence is True
 
 
 @pytest.mark.parametrize("mixed", [False, True])
@@ -184,27 +151,12 @@ def test_synchronous_fallback_keeps_the_existing_ordinary_put():
     assert not puts
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("mixed", [False, True])
-def test_diagnostics_report_actual_storage_type_and_fences(mixed, asynchronous):
-    trace = []
-    _, _, fences, reads, _, _ = publish(
-        mixed=mixed, asynchronous=asynchronous, trace=trace
-    )
-    assert [args[0] for args, _ in trace] == (
-        ["page_put", "flat_put"] if mixed else ["flat_put"]
-    )
-    for args, fields in trace:
-        assert args[1:] == ("consumer", 0)
-        assert fields["async_d2h"] == asynchronous
-        assert fields["events"] == len(fences)
-    assert reads == ([] if asynchronous else [-1] * (3 if mixed else 6))
 
 
 @pytest.mark.parametrize(
     "bulk_ok,single_ok", [(True, True), (False, True), (False, False)]
 )
-def test_allocation_logs_distinguish_bulk_retry_from_actual_single_page_failure(
+def test_bulk_allocation_retries_single_pages_before_fallback(
     bulk_ok, single_ok
 ):
     path = Path(__file__).resolve().parents[2] / "lmcache_ascend/v1/cache_engine.py"
@@ -262,14 +214,7 @@ def test_allocation_logs_distinguish_bulk_retry_from_actual_single_page_failure(
     prefix = ast.For(target=loop.target, iter=loop.iter, body=loop.body[:4], orelse=[])
     module = ast.fix_missing_locations(ast.Module(body=[bulk, prefix], type_ignores=[]))
     exec(compile(module, str(path), "exec"), runtime)
-    stages = [args[0] for args, _ in trace]
-    assert stages == (
-        []
-        if bulk_ok
-        else ["bulk_retry"]
-        if single_ok
-        else ["bulk_retry", "page_single_none"]
-    )
+    assert trace == []
     assert runtime["legacy_suffix"] is (not bulk_ok and not single_ok)
     assert len(allocations) == (1 if bulk_ok else 2)
     if not bulk_ok:
@@ -277,8 +222,7 @@ def test_allocation_logs_distinguish_bulk_retry_from_actual_single_page_failure(
 
 
 @pytest.mark.parametrize("failed", [False, True])
-@pytest.mark.parametrize("enabled", [False, True])
-def test_terminal_marker_follows_existing_persistence_barriers(enabled, failed):
+def test_batch_finish_preserves_persistence_barriers(failed):
     path = (
         Path(__file__).resolve().parents[2]
         / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py"
@@ -297,13 +241,7 @@ def test_terminal_marker_follows_existing_persistence_barriers(enabled, failed):
         if failed:
             raise TimeoutError("pending remote put")
 
-    runtime = dict(
-        prefill_store_debug_enabled=lambda: enabled,
-        kv_hash_enabled=lambda: False,
-        get_tensor_model_parallel_rank=lambda: 0,
-        prefill_store_debug_log=lambda stage, *args, **kwargs: trace.append(stage),
-        prefill_store_debug_finish=lambda req: trace.append("persist_done"),
-    )
+    runtime = {}
     exec(
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), runtime
     )
@@ -332,12 +270,7 @@ def test_terminal_marker_follows_existing_persistence_barriers(enabled, failed):
     if failed:
         with pytest.raises(TimeoutError, match="pending remote put"):
             run()
-        assert "persist_done" not in trace
-        assert ("persist_error" in trace) == enabled
+        assert trace == ["submit", "poll"]
     else:
         run()
-        assert trace == (
-            (["persist_begin"] if enabled else [])
-            + ["submit", "poll", "wait", "adopt", "finish"]
-            + (["persist_done"] if enabled else [])
-        )
+        assert trace == ["submit", "poll", "wait", "adopt", "finish"]

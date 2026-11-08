@@ -2,7 +2,6 @@
 # Standard
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from functools import partial
 import os
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -14,13 +13,6 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
 )
 from lmcache.integration.vllm.preemption_checkpoint import CheckpointResult, CheckpointRestoreMiss
 from lmcache.logging import init_logger
-from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
-from lmcache.v1.prefill_store_debug import (
-    prefill_store_debug_enabled,
-    prefill_store_debug_finish,
-    prefill_store_debug_log,
-)
-from lmcache.v1.prefill_kv_hash import finish_kv_hash, kv_hash_enabled
 from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.prefill_admission import PrefillAdmissionBudget
 from vllm.config import VllmConfig
@@ -32,22 +24,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.forward_context import is_forward_context_available
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
 import torch
-
-# First Party
-from lmcache_ascend.v1.content_diagnostics import (
-    log_npu_content_diagnostic_event,
-    npu_content_diagnostics_enabled,
-)
-from lmcache_ascend.v1.npu_connector.prefill_overlap import (
-    AclEventTimer,
-    PrefillOverlapRecorder,
-    request_spans,
-)
 from lmcache_ascend.v1.remote_fill_producer import parse_remote_fill_handoff
 
 if TYPE_CHECKING:
@@ -314,75 +294,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._prefill_admission_last_report: Optional[dict] = None
         self._prefill_admission_report_time = 0.0
         self._prefill_admission_wait_logged: set[str] = set()
-        self._decode_snapshot_enabled = (
-            os.getenv("LMCACHE_DECODE_KV_SNAPSHOT", "0").strip().lower()
-            in ("1", "true", "yes", "on")
-            and (
-                self.kv_role == "kv_consumer"
-                or (self.kv_role == "kv_both"
-                    and getattr(self.config, "pd_role", None) == "receiver")
-            )
-        )
-        # Read once. Disabled workers never import the snapshot code, read back
-        # tensors, record events, or create files. P ignores this D-only switch.
-        self._decode_kv_snapshot_dir = (
-            os.path.join(
-                os.path.dirname(os.path.dirname(os.path.realpath(ascend_envs.__file__))),
-                "decode-kv-snapshots",
-            )
-            if role == KVConnectorRole.WORKER
-            and os.getenv("LMCACHE_DECODE_KV_SNAPSHOT", "0").strip().lower()
-            in ("1", "true", "yes", "on")
-            and (
-                self.kv_role == "kv_consumer"
-                or (self.kv_role == "kv_both"
-                    and getattr(self.config, "pd_role", None) == "receiver")
-            ) else ""
-        )
-        self._decode_kv_snapshot_metadata = (
-            dict(tp_rank=get_tensor_model_parallel_rank(),
-                 tp_size=vllm_config.parallel_config.tensor_parallel_size,
-                 dp_rank=vllm_config.parallel_config.data_parallel_index,
-                 model=vllm_config.model_config.model)
-            if self._decode_kv_snapshot_dir else None
-        )
-        if self._decode_kv_snapshot_dir:
-            from lmcache_ascend.v1.decode_snapshot_metadata import capture_runtime
-
-            self._decode_kv_snapshot_metadata["runtime"] = capture_runtime(
-                vllm_config, self.config
-            )
-            logger.info(
-                "[D_KV_SNAPSHOT] enabled dir=%s boundary=cold_receive_complete "
-                "full_raw=1 copies_per_request=1",
-                self._decode_kv_snapshot_dir,
-            )
         self._force_layerwise_prefill_store = bool(
             self.use_layerwise
             and os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip()
             .lower() == "true"
         )
-        self._prefill_overlap_enabled = bool(
-            self._force_layerwise_prefill_store
-            and ascend_envs.VLLM_ASCEND_PREFILL_OVERLAP_STATS
-        )
-        self._prefill_overlap_recorder = None
-        if self._prefill_overlap_enabled and role == KVConnectorRole.WORKER:
-            device = torch.npu.current_device()
-            self._prefill_overlap_recorder = PrefillOverlapRecorder(
-                partial(torch.npu.Event, enable_timing=True),
-                logger.info,
-                elapsed_time=AclEventTimer(),
-                worker=dict(
-                    tp_rank=get_tensor_model_parallel_rank(),
-                    dp_rank=int(vllm_config.parallel_config.data_parallel_index),
-                ),
-                initialize_thread=partial(torch.npu.set_device, device),
-            )
-            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
-                self._prefill_overlap_recorder
-            )
         get_extra = getattr(self.config, "get_extra_config_value", None)
         _validate_remote_fill_sleep_mode(self.config, vllm_config)
         self._remote_store_requested = bool(
@@ -503,54 +420,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         metadata = super()._build_request_meta(
             tracker, load_spec, is_sparse_decode=is_sparse_decode,
         )
-        if (
-            getattr(self, "_decode_snapshot_enabled", False)
-            and metadata is not None
-            and load_spec is not None
-            and getattr(load_spec, "dsa_cold_compact_load", False)
-        ):
-            from lmcache_ascend.v1.decode_snapshot_metadata import capture_request
-
-            request = self._unfinished_requests.get(tracker.req_id)
-            metadata.decode_snapshot_request = capture_request(request)
-        if (
-            metadata is not None
-            and getattr(self, "_prefill_overlap_enabled", False)
-            and not is_sparse_decode
-        ):
-            request = self._unfinished_requests.get(tracker.req_id)
-            if request is not None:
-                start = int(request.num_computed_tokens)
-                end = min(len(tracker.token_ids), int(tracker.prompt_len))
-                if start < end:
-                    metadata.prefill_overlap_span = (start, end)
         return metadata
-
-    def _save_dsa_cold_load_snapshot(self, plan: Any, state: Any) -> None:
-        """Archive both received groups before publishing this D load as ready."""
-        # The base load joins the native receive futures and retains the sources.
-        # Wait its final existing fence before reading NPU destinations.
-        # This only delays this D request's readiness publication.
-        self._synchronize_dsa_cold_dense_readiness(state.dense_load_readiness)
-        self.lmcache_engine.gpu_connector.save_decode_kv_snapshot(
-            self._decode_kv_snapshot_dir,
-            plan["request"].req_id,
-            plan["tokens"],
-            state.prepared_sparse_sources.get(0),
-            plan["indexer_kvcaches"],
-            plan["indexer_slots_cpu"],
-            dict(
-                self._decode_kv_snapshot_metadata,
-                layer_names=[
-                    list(self._latent_layer_names),
-                    list(self._indexer_layer_names),
-                ],
-                capture_boundary="cold_receive_complete_before_first_decode",
-                replay_request=getattr(
-                    plan["request"], "decode_snapshot_request", None
-                ),
-            ),
-        )
 
     def start_load_kv(
         self,
@@ -558,17 +428,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         **kwargs: Any,
     ) -> None:
         """Start loads and arm a real producer-event handoff when required."""
-
-        recorder = getattr(self, "_prefill_overlap_recorder", None)
-        if recorder is not None:
-            requests = self._parent._get_connector_metadata().requests
-            recorder.begin_step(request_spans(
-                requests, forward_context.attn_metadata,
-            ))
-            self._prefill_overlap_step_active = recorder.active is not None
-            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
-                recorder if self._prefill_overlap_step_active else None
-            )
         if getattr(self, "_force_layerwise_prefill_store", False):
             self.lmcache_engine.poll_layerwise_prefill_puts()
         if (
@@ -584,12 +443,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request.request_configs,
                     group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
                 )
-        try:
-            super().start_load_kv(forward_context, **kwargs)
-        except BaseException:
-            if recorder is not None:
-                recorder.finish_step("incomplete")
-            raise
+        super().start_load_kv(forward_context, **kwargs)
         if forward_context.attn_metadata is None or not self.config.dsa_two_groups:
             return
         requests = self._direct_prefill_requests() or []
@@ -609,16 +463,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     def wait_for_save(self) -> None:
         """Seal timing events after all ordinary bank submissions, without a fence."""
-        recorder = getattr(self, "_prefill_overlap_recorder", None)
-        try:
-            super().wait_for_save()
-        except BaseException:
-            if recorder is not None:
-                recorder.finish_step("incomplete")
-            raise
-        else:
-            if recorder is not None:
-                recorder.finish_step()
+        super().wait_for_save()
 
     def capture_live_source_event_handoff(
         self,
@@ -805,20 +650,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             entry[1].append((req_id, fence))
 
         completed: list[str] = []
-        perf_enabled = serving_perf_enabled()
-        content_enabled = npu_content_diagnostics_enabled()
-        time_fence = perf_enabled or content_enabled
         for event, requests in by_event.values():
-            ready_before_publish = (
-                self._query_source_ready_event(event)
-                if content_enabled
-                else None
-            )
-            started = time.perf_counter() if time_fence else 0.0
             # This is an event-local producer fence.  It does not drain
             # unrelated NPU streams or invoke torch.npu.synchronize().
             event.synchronize()
-            wait_ms = (time.perf_counter() - started) * 1000 if time_fence else 0.0
             req_ids = [req_id for req_id, _ in requests]
             finalize_readiness = getattr(
                 self.lmcache_engine, "finalize_live_source_readiness", None
@@ -826,29 +661,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if callable(finalize_readiness):
                 finalize_readiness(req_ids)
             for req_id, fence in requests:
-                if perf_enabled:
-                    serving_perf_log(
-                        logger,
-                        "live_source_ready_fence",
-                        req_id=req_id,
-                        event_source=fence.event_source,
-                        ready_at_finalize=fence.ready_at_finalize,
-                        ready_before_publish=ready_before_publish,
-                        wait_ms=round(wait_ms, 3),
-                        fence_scope="producer_event",
-                    )
-                if content_enabled:
-                    log_npu_content_diagnostic_event(
-                        "group1_source_ready_fence",
-                        req_id=req_id,
-                        event_source=fence.event_source,
-                        ready_at_finalize=fence.ready_at_finalize,
-                        ready_before_publish=ready_before_publish,
-                        ready_after_fence=True,
-                        wait_ms=round(wait_ms, 3),
-                        query_precedes_device_readback=True,
-                        fence_scope="producer_event",
-                    )
                 completed.append(req_id)
         for req_id in completed:
             fences.pop(req_id, None)
@@ -1138,21 +950,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     "no producer NPU event",
                     request.req_id,
                 )
-                if serving_perf_enabled():
-                    serving_perf_log(
-                        logger,
-                        "live_source_missing_producer_event",
-                        req_id=request.req_id,
-                        event_source=source_ready_event_source,
-                        action="persistent_only",
-                    )
-                log_npu_content_diagnostic_event(
-                    "group1_source_missing_producer_event",
-                    req_id=request.req_id,
-                    event_source=source_ready_event_source,
-                    action="persistent_only",
-                    fallback_event_created=False,
-                )
                 live_source = False
             if live_source:
                 live_groups = (
@@ -1177,14 +974,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 live_groups = ()
             finalized_live = False
             if live_source and request.is_last_prefill:
-                ready_at_finalize = (
-                    LMCacheAscendConnectorV1Impl._query_source_ready_event(
-                        source_ready_event
-                    )
-                    if source_ready_event is not None
-                    and npu_content_diagnostics_enabled()
-                    else None
-                )
+                ready_at_finalize = None
                 finalized_live = self.lmcache_engine.finalize_live_source_descriptor(
                     request.req_id,
                     len(live_token_ids),
@@ -1277,20 +1067,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     and request.request_id not in self._prefill_admission_wait_logged
                 ):
                     self._prefill_admission_wait_logged.add(request.request_id)
-                    logger.info(
-                        "[P_CPU_ADMISSION] req=%s action=%s %s",
-                        request.request_id,
-                        "reject" if error else "wait",
-                        details,
-                    )
                 return None
             if details:
                 self._prefill_admission_wait_logged.discard(request.request_id)
-                logger.info(
-                    "[P_CPU_ADMISSION] req=%s action=admit %s",
-                    request.request_id,
-                    details,
-                )
         return super().get_num_new_matched_tokens(request, num_computed_tokens)
 
     def has_pending_control(self) -> bool:
@@ -1382,29 +1161,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             self.lmcache_engine.drain_remote_fill_terminal_results()
         )
         admission = self._build_prefill_admission_report()
-        if serving_perf_enabled():
-            for req_id, descriptor in descriptors.items():
-                serving_perf_log(
-                    logger,
-                    "live_source_worker_emit",
-                    req_id=req_id,
-                    tp_rank=descriptor.get("tp_rank"),
-                    dp_rank=descriptor.get("dp_rank"),
-                    segments=len(descriptor.get("segments", ())),
-                    compact_layers=len(
-                        descriptor.get("compact_layout", {}).get("layers", ())
-                    ),
-                    compact_runs=len(
-                        descriptor.get("compact_layout", {}).get("runs", ())
-                    ),
-                    latent_layers=len(
-                        descriptor.get("latent_layout", {}).get("layers", ())
-                    ),
-                    latent_pages=len(
-                        descriptor.get("latent_layout", {}).get("pages", ())
-                    ),
-                    group_byte_totals=descriptor.get("group_byte_totals"),
-                )
         return (
             LiveSourceWorkerMetadata(
                 {req_id: [descriptor] for req_id, descriptor in descriptors.items()},
@@ -1428,21 +1184,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             for result in metadata.checkpoint_results:
                 self.accept_preemption_result(result)
             for req_id, descriptors in metadata.descriptors.items():
-                active = req_id in active_req_ids
                 tracked = req_id in self._unfinished_requests
-                if serving_perf_enabled():
-                    serving_perf_log(
-                        logger,
-                        "live_source_scheduler_ingest",
-                        req_id=req_id,
-                        active=active,
-                        tracked=tracked,
-                        descriptor_count=len(descriptors),
-                        ranks=[
-                            [item.get("tp_rank"), item.get("dp_rank")]
-                            for item in descriptors
-                        ],
-                    )
                 # The final prefiller token may set the request status to
                 # finished before this worker metadata is consumed.  The
                 # scheduler still calls request_finished() later in the same
@@ -1522,14 +1264,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             for request in metadata.requests
             if request.is_last_prefill and not request.is_sparse_decode
         )
-        store_debug = (
-            prefill_store_debug_enabled() and get_tensor_model_parallel_rank() == 0
-        )
-        if store_debug:
-            for request in final_requests:
-                prefill_store_debug_log(
-                    "persist_begin", request.req_id, end=len(request.token_ids)
-                )
         try:
             # Both groups' CPU pages now exist. Start the independent D-cache
             # fill BEFORE waiting for Mooncake puts, not after that barrier.
@@ -1543,15 +1277,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             # Only legacy/non-page fallback puts land in this set. Normal
             # Mooncake CPU-page puts use the bounded asynchronous queue above.
             self.lmcache_engine.wait_for_pending_sync_stores()
-        except Exception as error:
-            if store_debug:
-                for request in metadata.requests:
-                    prefill_store_debug_log(
-                        "persist_error",
-                        request.req_id,
-                        error=True,
-                        status=type(error).__name__,
-                    )
+        except Exception:
             raise
         finally:
             completed = self._completed_layerwise_stores
@@ -1577,16 +1303,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 persistence_fenced=True,
                 tokens=request.token_ids,
             )
-            if store_debug:
-                prefill_store_debug_finish(request.req_id)
-            if kv_hash_enabled() and get_tensor_model_parallel_rank() == 0:
-                finish_kv_hash(request.req_id)
-            if kv_hash_enabled():
-                trace = getattr(
-                    self.lmcache_engine.gpu_connector, "finish_kv_trace", None
-                )
-                if callable(trace):
-                    trace(request.req_id)
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
         if getattr(self, "_force_layerwise_prefill_store", False):
@@ -1606,7 +1322,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         direct_ready_events = dict(
             getattr(self, "_latest_direct_source_ready_events", {})
         )
-        observed_direct_layers = set(self._direct_store_observed_layers)
         expected_direct_layers = set(self._latent_layer_names)
         if self.config.dsa_two_groups:
             expected_direct_layers.update(self._indexer_layer_names)
@@ -1624,14 +1339,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._latest_live_source_ready_event_source = "missing"
         getattr(self, "_latest_direct_source_ready_events", {}).clear()
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
-            perf_enabled = serving_perf_enabled()
-            pending_sync_started = time.perf_counter() if perf_enabled else 0.0
             try:
                 self.lmcache_engine.wait_for_pending_sync_stores()
-                if perf_enabled:
-                    pending_sync_wait_ms = (
-                        time.perf_counter() - pending_sync_started
-                    ) * 1000
             finally:
                 completed = self._completed_layerwise_stores
                 self._completed_layerwise_stores = {}
@@ -1641,8 +1350,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if hasattr(metadata, "_live_source_event_handoff"):
                 delattr(metadata, "_live_source_event_handoff")
             expected_targets = self._producer_fence_handoff_targets(requests)
-            expected_ids = {req_id for req_id, _ in expected_targets}
-            handoff_status = "absent"
             if (
                 expected_targets
                 and isinstance(handoff, tuple)
@@ -1657,52 +1364,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 # The request/frontier-matched event causally joins preceding
                 # cache writes on this forward stream, including callbacks.
                 source_ready_events = (source_ready_event,)
-                handoff_status = "adopted"
-            elif not expected_targets:
-                handoff_status = "not_armed"
-            elif handoff is not None and not (
-                isinstance(handoff, tuple) and len(handoff) == 2
-            ):
-                handoff_status = "malformed"
-            elif isinstance(handoff, tuple) and handoff[0] != expected_targets:
-                handoff_status = "target_mismatch"
-            elif isinstance(handoff, tuple) and handoff[1] is None:
-                handoff_status = "missing_event"
-            if perf_enabled:
-                for request in requests:
-                    remote_fill_eligible = bool(
-                        getattr(request, "_lmcache_remote_fill_qualified", False)
-                    )
-                    if request.req_id not in expected_ids and not remote_fill_eligible:
-                        continue
-                    serving_perf_log(
-                        logger,
-                        "remote_fill_producer_fence_decision",
-                        req_id=request.req_id,
-                        pending_sync_wait_ms=round(pending_sync_wait_ms, 3),
-                        handoff_status=handoff_status,
-                        expected_layer_count=len(expected_direct_layers),
-                        observed_layer_count=len(
-                            expected_direct_layers & observed_direct_layers
-                        ),
-                        event_layer_count=len(
-                            expected_direct_layers & direct_ready_events.keys()
-                        ),
-                        callback_fence_complete=bool(
-                            expected_direct_layers
-                            and expected_direct_layers.issubset(direct_ready_events)
-                        ),
-                        complete_fence_count=len(source_ready_events),
-                        source_event_present=source_ready_event is not None,
-                        event_source=source_ready_event_source,
-                        accepted_store_end=len(request.token_ids),
-                        submission_mode=getattr(
-                            self.config,
-                            "remote_fill_submission_mode",
-                            "final_deferred",
-                        ),
-                        remote_fill_eligible=remote_fill_eligible,
-                    )
             request_ids = {request.req_id for request in requests}
             adopted_requests = set()
             for (req_id, _), result in completed.items():
@@ -1965,17 +1626,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 return_params = _remote_fill_response_params(
                     params, remote_fill_result, return_params
                 )
-                if serving_perf_enabled():
-                    serving_perf_log(
-                        logger,
-                        "remote_fill_scheduler_attach",
-                        req_id=request.request_id,
-                        outcome=remote_fill_result.get("outcome"),
-                        persistent_common_end=remote_fill_result.get(
-                            "persistent_common_end"
-                        ),
-                        required_store_end=remote_fill_result.get("required_store_end"),
-                    )
             else:
                 logger.warning(
                     "Remote-fill result identity mismatch for request %s; "
@@ -2015,28 +1665,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             params["ascend_live_split_source_v1"] = {
                 "descriptors": descriptors
             }
-            if serving_perf_enabled():
-                serving_perf_log(
-                    logger,
-                    "live_source_attach",
-                    req_id=request.request_id,
-                    attached=True,
-                    descriptor_count=len(descriptors),
-                )
-        elif isinstance(params, dict) and params.get("request_live_split", False):
-            if serving_perf_enabled():
-                serving_perf_log(
-                    logger,
-                    "live_source_attach",
-                    req_id=request.request_id,
-                    attached=False,
-                    descriptor_count=len(descriptors or ()),
-                    reason=(
-                        "missing_or_incomplete_descriptor"
-                        if not descriptors
-                        else "request_not_eligible"
-                    ),
-                )
         if (
             isinstance(return_params, dict)
             and isinstance(params, dict)
@@ -2084,8 +1712,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 previous_latent_future,
                 live_state,
             )
-            if self._decode_kv_snapshot_dir:
-                self._save_dsa_cold_load_snapshot(plan, state)
             return state
         owners = []
         try:
@@ -2113,8 +1739,6 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 None,
                 live_state,
             )
-            if self._decode_kv_snapshot_dir:
-                self._save_dsa_cold_load_snapshot(plan, state)
             return state
         except BaseException as error:
             gate = plan["latent_shared_ready"]

@@ -39,7 +39,6 @@ from lmcache.v1.remote_fill.mooncake_transport import (
     direct_push_owner_ranges,
     validate_direct_push_source_ranges,
 )
-from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 
 from lmcache_ascend.v1.direct_store_plan import (
     DirectPageBatch,
@@ -281,14 +280,6 @@ class RemoteFillCoordinator:
             metrics.abandon(result.reason, allocation=allocation)
             if result.armed or result.reason == "native transfer failed":
                 metrics.failure(result.reason)
-            if serving_perf_enabled():
-                serving_perf_log(
-                    logger,
-                    "remote_fill_direct_abandoned",
-                    reason=result.reason,
-                    armed=bool(result.armed),
-                    fatal_restart_required=bool(result.fatal_restart_required),
-                )
             fatal = bool(result.fatal_restart_required)
             handoff = state.handoff
             log_remote_fill_diagnostic(
@@ -398,15 +389,6 @@ class RemoteFillCoordinator:
         state.source_generation = secrets.randbits(63) or 1
         metrics.add_gauge("direct_viable", 1)
         state.viable_counted = True
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "remote_fill_producer_decision",
-                req_id=req_id,
-                enabled=True,
-                destination_dp_rank=handoff.destination_dp_rank,
-                destination_tp_size=handoff.destination_tp_size,
-            )
         return True
 
     def _circuit_allows(self) -> bool:
@@ -833,16 +815,6 @@ class RemoteFillCoordinator:
                         ):
                             self._record_failure()
                     self._record_window_metrics(state, result)
-                    if serving_perf_enabled():
-                        serving_perf_log(
-                            logger,
-                            "remote_fill_probe_complete",
-                            req_id=session.request_id,
-                            window_id=window_id,
-                            page_count=len(control_pages),
-                            direct_satisfied=result.direct_satisfied,
-                            reason=result.reason,
-                        )
                     if not result.direct_satisfied:
                         break
                 return tuple(results)
@@ -910,14 +882,6 @@ class RemoteFillCoordinator:
             )
             metrics = self.get_metrics()
             metrics.abandon("producer backpressure", allocation=True)
-            if serving_perf_enabled():
-                serving_perf_log(
-                    logger,
-                    "remote_fill_batch_skipped",
-                    req_id=batch.req_id,
-                    reason="producer_backpressure",
-                    bytes=byte_count,
-                )
             return
         if metrics.timing_enabled:
             metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
@@ -942,14 +906,6 @@ class RemoteFillCoordinator:
             )
             self._record_failure()
             return
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "remote_fill_source_ready",
-                req_id=batch.req_id,
-                page_count=len(control_pages),
-                bytes=byte_count,
-            )
         executor = getattr(self, "_executor", None)
         if executor is None:
             try:
@@ -1004,9 +960,6 @@ class RemoteFillCoordinator:
                 windows = zip(control_windows, source_plans, strict=True)
                 for window_offset, (window_pages, source_plan) in enumerate(windows):
                     window_id = first_window_id + window_offset
-                    chunk_start = min(page.chunk_start for page in window_pages)
-                    chunk_end = max(page.chunk_end for page in window_pages)
-                    window_tokens = chunk_end - chunk_start
                     result = session.transfer_window(
                         window_id=window_id,
                         source_generation=source_generation,
@@ -1025,48 +978,6 @@ class RemoteFillCoordinator:
                         ):
                             self._record_failure()
                     self._record_window_metrics(state, result)
-                    if serving_perf_enabled():
-                        serving_perf_log(
-                            logger,
-                            "remote_fill_window_complete",
-                            req_id=batch.req_id,
-                            transfer_id=state.handoff.transfer_id,
-                            window_id=window_id,
-                            page_count=len(window_pages),
-                            chunk_start=chunk_start,
-                            chunk_end=chunk_end,
-                            window_tokens=window_tokens,
-                            full_window=(
-                                window_tokens
-                                == int(self.config.remote_fill_window_tokens)
-                            ),
-                            bytes=sum(page.expected_bytes for page in window_pages),
-                            armed=result.armed,
-                            direct_satisfied=result.direct_satisfied,
-                            reason=result.reason,
-                            reserve_ms=round(result.reserve_seconds * 1000, 3),
-                            arm_ms=round(result.arm_seconds * 1000, 3),
-                            source_event_wait_ms=round(
-                                result.source_event_wait_seconds * 1000, 3
-                            ),
-                            source_fences_ready_monotonic_ms=round(
-                                result.source_fences_ready_monotonic * 1000, 3
-                            ),
-                            source_registration_ms=round(
-                                result.source_registration_seconds * 1000, 3
-                            ),
-                            native_slot_wait_ms=round(
-                                result.native_slot_wait_seconds * 1000, 3
-                            ),
-                            native_ms=round(result.native_seconds * 1000, 3),
-                            report_ms=round(result.report_seconds * 1000, 3),
-                            native_started_monotonic_ms=round(
-                                result.native_started_monotonic * 1000, 3
-                            ),
-                            native_ended_monotonic_ms=round(
-                                result.native_ended_monotonic * 1000, 3
-                            ),
-                        )
                     if not result.direct_satisfied:
                         break
                 return tuple(results)
@@ -1076,13 +987,6 @@ class RemoteFillCoordinator:
                     metrics = self.get_metrics()
                     metrics.failure("fatal restart")
                     metrics.abandon("fatal restart")
-                    if serving_perf_enabled():
-                        serving_perf_log(
-                            logger,
-                            "remote_fill_fatal_restart",
-                            req_id=batch.req_id,
-                            phase="native_or_control_terminal",
-                        )
                     raise
                 state.disabled_reason = type(error).__name__
                 if state.session is not None:
@@ -1131,15 +1035,6 @@ class RemoteFillCoordinator:
         if state.terminal is not None:
             return state.terminal
         self.wait(state)
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "remote_fill_persistent_complete",
-                req_id=req_id,
-                transfer_id=state.handoff.transfer_id,
-                persistent_common_end=persistent_common_end,
-                required_store_end=required_store_end,
-            )
         finish_control_seconds = 0.0
         metrics = self.get_metrics()
         try:
@@ -1206,29 +1101,11 @@ class RemoteFillCoordinator:
                 reason=state.disabled_reason or terminal.outcome,
                 severity="warning",
             )
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "remote_fill_producer_terminal",
-                req_id=req_id,
-                transfer_id=state.handoff.transfer_id,
-                outcome=terminal.outcome,
-                direct_satisfied=terminal.direct_satisfied,
-                persistent_common_end=persistent_common_end,
-                required_store_end=required_store_end,
-                finish_control_ms=round(finish_control_seconds * 1000, 3),
-            )
         completed = getattr(self, "_completed_results", None)
         if completed is None:
             completed = {}
             self._completed_results = completed
         completed[req_id] = terminal
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "remote_fill_producer_metrics_snapshot",
-                metrics=metrics.snapshot(),
-            )
         return terminal
 
     def wait(self, state: ProducerRequestState) -> None:
@@ -1258,13 +1135,6 @@ class RemoteFillCoordinator:
             if state.terminal is None:
                 try:
                     state.session.abort("prefiller released request before FINISH")
-                    if serving_perf_enabled():
-                        serving_perf_log(
-                            logger,
-                            "remote_fill_abort",
-                            req_id=req_id,
-                            reason="request_released_before_finish",
-                        )
                 except RemoteFillFatalError:
                     self._latch_fatal(state)
                     raise
@@ -1275,13 +1145,6 @@ class RemoteFillCoordinator:
                         exc_info=True,
                     )
             state.session.close()
-            if serving_perf_enabled():
-                serving_perf_log(
-                    logger,
-                    "remote_fill_release",
-                    req_id=req_id,
-                    terminal=state.terminal is not None,
-                )
         if state.metrics_started and state.terminal is None:
             metrics = self.get_metrics()
             metrics.finish_attempt("ABORTED", "request aborted")

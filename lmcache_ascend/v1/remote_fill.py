@@ -10,17 +10,12 @@ import logging
 import os
 import secrets
 from threading import Event, Lock, Thread
-import time
 from time import monotonic
 from typing import Any, Protocol
 
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.serving_perf import (
-    serving_perf_enabled,
-    serving_perf_log,
-)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.memory_management import (
@@ -49,7 +44,6 @@ from lmcache.v1.remote_fill import (
     RemoteFillStateCore,
     ReservedPageView,
     UnsafePageLifecycleError,
-    content_digest,
     log_remote_fill_diagnostic,
 )
 from lmcache.v1.rpc.zmq_transport import ZmqRouterServerTransport
@@ -690,20 +684,12 @@ class AscendRemoteFillPageLifecycle:
         Raises:
             ValueError: If page metadata is not canonical or layout-compatible.
         """
-
-        diagnose = serving_perf_enabled()
-        prepare_started = monotonic() if diagnose else 0.0
-        prepare_thread_started = time.thread_time_ns() if diagnose else 0
-        validation_ms = classify_ms = capacity_ms = reclaim_ms = 0.0
-        allocation_ms = pin_ms = 0.0
         del window_id
         keys = tuple(self._validate_control_page(page) for page in pages)
         selectors = tuple((page.kv_group, page.chunk_index) for page in pages)
         if len(set(keys)) != len(keys) or len(set(selectors)) != len(selectors):
             raise ValueError("remote-fill page manifest contains duplicate pages")
         self._validate_window_groups(pages, keys)
-        if diagnose:
-            validation_ms = (monotonic() - prepare_started) * 1000
         results: list[PreparedPage | None] = [None] * len(pages)
 
         def finalize_results() -> tuple[PreparedPage, ...]:
@@ -738,32 +724,6 @@ class AscendRemoteFillPageLifecycle:
 
         def finish_results() -> tuple[PreparedPage, ...]:
             prepared = finalize_results()
-            elapsed_ms = (monotonic() - prepare_started) * 1000
-            if diagnose and elapsed_ms >= 100.0:
-                serving_perf_log(
-                    logger,
-                    "remote_fill_page_prepare_slow",
-                    transfer_id=transfer_id,
-                    pages=len(pages),
-                    missing=len(missing_indices),
-                    allocated=sum(
-                        result.disposition is PageDisposition.ALLOCATED
-                        for result in prepared
-                    ),
-                    requested_bytes=requested_bytes,
-                    elapsed_ms=round(elapsed_ms, 3),
-                    thread_cpu_ms=round(
-                        (time.thread_time_ns() - prepare_thread_started)
-                        / 1_000_000,
-                        3,
-                    ),
-                    validate_ms=round(validation_ms, 3),
-                    classify_ms=round(classify_ms, 3),
-                    capacity_ms=round(capacity_ms, 3),
-                    reclaim_ms=round(reclaim_ms, 3),
-                    allocation_ms=round(allocation_ms, 3),
-                    pin_ms=round(pin_ms, 3),
-                )
             return prepared
 
         def classify_pages() -> list[int]:
@@ -778,40 +738,25 @@ class AscendRemoteFillPageLifecycle:
                 if disposition is PageDisposition.MISSING:
                     missing.append(index)
             return missing
-
-        classify_started = monotonic() if diagnose else 0.0
         missing_indices = classify_pages()
-        if diagnose:
-            classify_ms = (monotonic() - classify_started) * 1000
 
         requested_bytes = 0
         if not reserve_missing:
             return finish_results()
         requested_bytes = sum(pages[index].expected_bytes for index in missing_indices)
-        capacity_started = monotonic() if diagnose else 0.0
         if requested_bytes and not self._capacity_available(requested_bytes):
             if self._capacity_reclaimer is None:
-                if diagnose:
-                    capacity_ms = (monotonic() - capacity_started) * 1000
                 return finish_results()
-            reclaim_started = monotonic() if diagnose else 0.0
             reclaimed = self._capacity_reclaimer(requested_bytes)
-            if diagnose:
-                reclaim_ms = (monotonic() - reclaim_started) * 1000
             missing_indices = classify_pages()
             requested_bytes = sum(
                 pages[index].expected_bytes for index in missing_indices
             )
             if not reclaimed or not self._capacity_available(requested_bytes):
-                if diagnose:
-                    capacity_ms = (monotonic() - capacity_started) * 1000
                 return finish_results()
-        if diagnose:
-            capacity_ms = (monotonic() - capacity_started) * 1000 - reclaim_ms
 
         allocated: dict[int, LayerPageMemoryObj] = {}
         pinned = False
-        allocation_started = monotonic() if diagnose else 0.0
         try:
             for kv_group in self._direct_groups:
                 indices = [
@@ -839,14 +784,9 @@ class AscendRemoteFillPageLifecycle:
                         self._release_unpinned(group_pages)
                     raise MemoryError("remote-fill hidden page allocation failed")
                 allocated.update(zip(indices, group_pages, strict=True))
-            if diagnose:
-                allocation_ms = (monotonic() - allocation_started) * 1000
             allocated_pages = list(allocated.values())
-            pin_started = monotonic() if diagnose else 0.0
             if allocated_pages and not self._pin_pages(allocated_pages):
                 raise MemoryError("remote-fill hidden page pin failed")
-            if diagnose:
-                pin_ms = (monotonic() - pin_started) * 1000
             pinned = bool(allocated_pages)
             for index, page in allocated.items():
                 control = pages[index]
@@ -985,12 +925,6 @@ class AscendRemoteFillPageLifecycle:
                 "elapsed_ms": round((monotonic() - commit_started) * 1000, 3),
             }
             _log_remote_fill_event("remote_fill_local_commit", **payload)
-            serving_perf_log(
-                logger,
-                "remote_fill_local_commit",
-                transfer_id=transfer_id,
-                **payload,
-            )
 
         required_by_group = self._validate_required_prefix(
             required_pages,
@@ -1086,25 +1020,6 @@ class AscendRemoteFillPageLifecycle:
         retention_trace_id = getattr(result, "retention_trace_id", None)
         if isinstance(retention_trace_id, int):
             diagnostic_fields["retention_trace_id"] = retention_trace_id
-        if serving_perf_enabled():
-            try:
-                diagnostic_fields["required_key_digest"] = content_digest(
-                    tuple(
-                        tuple(
-                            key.to_string()
-                            for key in required_by_group[group]
-                        )
-                        for group in self._direct_groups
-                    )
-                )
-            except Exception:
-                # Publication and ownership transfer are already complete;
-                # observability must never turn that success into a failure.
-                diagnostic_fields["key_digest_error"] = True
-                logger.warning(
-                    "Failed to fingerprint remote-fill commit keys",
-                    exc_info=True,
-                )
         log_commit(
             committed=True,
             error=False,

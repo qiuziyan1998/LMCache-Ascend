@@ -649,6 +649,7 @@ class Simulation:
             "wait_for_layerwise_prefill_load",
             "layerwise_prefill_store_fences",
             "wait_for_layerwise_prefill_source_publication",
+            "wait_for_layerwise_prefill_stores",
             "release_layerwise_prefill_dma_cache",
             "_retain_unfenced_layerwise_prefill_load",
             "_run_sparse_direct_kv_transfer_layer",

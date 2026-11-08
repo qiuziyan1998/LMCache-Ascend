@@ -13,7 +13,6 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.serving_perf import serving_perf_enabled
 from lmcache.v1.remote_fill import (
     PROTOCOL_VERSION,
     AbortRequest,
@@ -319,7 +318,7 @@ class RemoteFillProducerMetrics:
     )
 
     def __init__(self) -> None:
-        self.timing_enabled = serving_perf_enabled()
+        self.timing_enabled = False
         self._lock = Lock()
         self._attempts: dict[tuple[str, str], int] = {}
         self._started_total = 0
@@ -739,8 +738,6 @@ class RemoteFillProducerSession:
         if not self.direct_viable or not self.open():
             return self._abandoned_window(window_id, "open rejected")
         digest = manifest_digest(control_pages)
-        perf_enabled = serving_perf_enabled()
-        reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(
                 ReserveWindowRequest(
@@ -755,9 +752,7 @@ class RemoteFillProducerSession:
         except RemoteFillFatalError:
             raise
         except Exception:
-            reserve_seconds = (
-                time.perf_counter() - reserve_started if perf_enabled else 0.0
-            )
+            reserve_seconds = 0.0
             self.prearm_control_unknown = True
             self.direct_viable = False
             return self._abandoned_window(
@@ -765,7 +760,7 @@ class RemoteFillProducerSession:
                 "probe control unavailable",
                 reserve_seconds=reserve_seconds,
             )
-        reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
+        reserve_seconds = 0.0
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
@@ -855,8 +850,6 @@ class RemoteFillProducerSession:
                 self.direct_viable = False
                 return self._abandoned_window(window_id, "source preparation failed")
         digest = manifest_digest(control_pages)
-        perf_enabled = serving_perf_enabled()
-        reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(
                 ReserveWindowRequest(
@@ -871,9 +864,7 @@ class RemoteFillProducerSession:
         except RemoteFillFatalError:
             raise
         except Exception:
-            reserve_seconds = (
-                time.perf_counter() - reserve_started if perf_enabled else 0.0
-            )
+            reserve_seconds = 0.0
             self.prearm_control_unknown = True
             self.direct_viable = False
             return self._abandoned_window(
@@ -881,7 +872,7 @@ class RemoteFillProducerSession:
                 "reserve control unavailable",
                 reserve_seconds=reserve_seconds,
             )
-        reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
+        reserve_seconds = 0.0
         descriptors = reserved.descriptors
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
@@ -978,8 +969,6 @@ class RemoteFillProducerSession:
                 reserve_seconds=reserve_seconds,
                 existing_pages=existing_pages,
             )
-
-        arm_started = time.perf_counter() if perf_enabled else 0.0
         try:
             armed = self._execute(
                 ArmWindowRequest(
@@ -1004,7 +993,7 @@ class RemoteFillProducerSession:
                     "ARM_WINDOW acknowledgement is ambiguous and STATUS "
                     "could not prove the armed attempt"
                 ) from status_error
-        arm_seconds = time.perf_counter() - arm_started if perf_enabled else 0.0
+        arm_seconds = 0.0
         if armed.code is not ResultCode.OK:
             self.direct_viable = False
             return self._abandoned_window(
@@ -1161,7 +1150,6 @@ class RemoteFillProducerSession:
             future = None
 
         report_succeeded: bool
-        report_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reported = self._execute(
                 ReportTransferCompleteRequest(
@@ -1189,7 +1177,7 @@ class RemoteFillProducerSession:
                     "terminal native report is ambiguous and STATUS could not "
                     "prove the reported result"
                 ) from status_error
-        report_seconds = time.perf_counter() - report_started if perf_enabled else 0.0
+        report_seconds = 0.0
         direct_satisfied = return_code == 0 and report_succeeded
         if not direct_satisfied:
             self.direct_viable = False

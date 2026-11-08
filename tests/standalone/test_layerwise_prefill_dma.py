@@ -295,32 +295,6 @@ def _reuse_debug_connector(enabled, *, npu=None, copy_hook=None, layers=2):
     return submit, logs, copies
 
 
-def test_reuse_debug_aggregates_actual_bind_and_fixed_map_drops_once_per_group():
-    submit, logs, _ = _reuse_debug_connector(True)
-    submit(2)
-    submit(3)
-    submit(4)
-    submit(4)
-    submit(4, block_ids=(1, 0, 2, 3))
-
-    assert len(logs) == 5
-    assert [fields["x"] for _, _, fields in logs] == [
-        "0/4", "4/2", "6/2", "8/0", "0/8"
-    ]
-    assert [fields["map_drop"] for _, _, fields in logs] == [
-        0, 0, 0, 0, 2
-    ]
-    assert [fields["p"] for _, _, fields in logs] == [8, 12, 16, 16, 16]
-    assert [fields["plan"] for _, _, fields in logs] == [
-        "full", "reuse", "reuse", "reuse", "full"
-    ]
-    assert all(
-        rank == 1 and stage == "dma" and fields["l"] == 2
-        and fields["g"] == 0
-        for rank, stage, fields in logs
-    )
-    assert all(fields["ms"] >= 0 for _, _, fields in logs)
-    assert all(abs(fields["ms"] - 2.0) < 1e-6 for _, _, fields in logs)
 
 
 def test_reuse_debug_disabled_does_not_emit_or_change_dma_rows():
@@ -338,33 +312,6 @@ def test_reuse_debug_disabled_does_not_emit_or_change_dma_rows():
     assert logs == []
 
 
-def test_hash_probe_borrows_p_load_event_after_dma_submission():
-    events = []
-
-    class Event:
-        def record(self, stream):
-            self.recorded = True
-
-        def synchronize(self):
-            raise AssertionError("serving thread must not wait for debug hashes")
-
-    npu = NS(Event=Event, current_stream=lambda: None,
-             stream=lambda stream: nullcontext())
-    submit, _, copies = _reuse_debug_connector(False, npu=npu)
-    obj = submit.connector
-    obj.kv_trace = object()
-    obj.trace_cpu_kv = lambda *a, **kw: pytest.fail("P CPU hash ran on serving thread")
-
-    def enqueue(req, group, starts, ends, owners, layer, ready):
-        assert len(copies) == layer + 1
-        assert ready.recorded
-        registered = obj._layerwise_prefill_transfer_state()[3]
-        assert ready is registered[(group, layer)]["request"][1]
-        events.append(ready)
-
-    obj.enqueue_load_kv_trace = enqueue
-    submit(2)
-    assert len(events) == 2
 
 
 def _assert_plan_equal(actual, expected):
@@ -617,8 +564,7 @@ def test_changed_bank_map_invalidates_only_its_bound_rows():
     cache = obj._prefill_dma_bound_loads["request"]
     bank_one = {key: value for key, value in cache.items() if key[2] == 1}
     submit(2, block_ids_by_bank=((1, 0, 2, 3), (0, 1, 2, 3)))
-    assert logs[-1][2]["map_drop"] == 1
-    assert logs[-1][2]["plan"] == "mix"
+    assert logs == []
     for key, value in bank_one.items():
         assert cache[key].rows is value.rows
 
@@ -633,8 +579,7 @@ def test_invalid_second_bank_preserves_first_bank_invalidation_for_retry():
         submit(2, block_ids_by_bank=((1, 0, 2, 3), (9, 1, 2, 3)))
     assert cache[(0, 0)] is first_bank
     submit(2, block_ids_by_bank=((1, 0, 2, 3), (0, 1, 2, 3)))
-    assert logs[-1][2]["map_drop"] == 1
-    assert logs[-1][2]["plan"] == "mix"
+    assert logs == []
 
 
 def test_request_release_and_generation_reset_clear_incremental_metadata():
