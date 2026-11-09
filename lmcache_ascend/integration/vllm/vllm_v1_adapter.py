@@ -1545,6 +1545,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         releasable_req_ids = (
             finished_sending if self.store_async else finished_req_ids
         )
+        coordinator = getattr(self.lmcache_engine, "_remote_fill_coordinator", None)
+        if coordinator is not None and (releasable_req_ids or coordinator.retiring):
+            releasable_req_ids = coordinator.filter_finished(
+                releasable_req_ids, self.lmcache_engine._direct_store_states,
+                block=not self.store_async,
+            )
+            if self.store_async:
+                finished_sending = releasable_req_ids
         if releasable_req_ids:
             self._release_finished_worker_requests(releasable_req_ids)
             self.lmcache_engine.drop_direct_store_states(releasable_req_ids)

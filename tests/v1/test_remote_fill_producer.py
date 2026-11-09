@@ -3,7 +3,7 @@
 
 # Standard
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import asdict, replace
 from threading import Condition, Event, RLock
 from types import SimpleNamespace
@@ -1601,8 +1601,13 @@ def test_lazy_prefix_reservation_faults_never_write(fault):
             gc.enable()
 
 
-def test_lazy_prefix_native_failure_releases_sources_with_gc_disabled():
+@pytest.mark.parametrize("lost_report", [False, True])
+def test_lazy_prefix_native_failure_releases_sources_with_gc_disabled(lost_report):
     h = _PrefixRepairHarness(present=(0,))
+
+    if lost_report:
+        for _ in range(2):
+            h.client._transport.drop_next_reply(OperationKind.REPORT_TRANSFER_COMPLETE)
 
     def fail_native(**kwargs):
         future = Future()
@@ -1628,6 +1633,10 @@ def test_lazy_prefix_native_failure_releases_sources_with_gc_disabled():
             activation_factory=lambda _: None,
         )
         assert not result.direct_satisfied
+        h.session.retire_failed_window(result.response_state, accepted_end=0)
+        assert h.events[-1] == "AbortRequest"
+        assert h.events.count("StatusRequest") == int(lost_report)
+        assert h.state.metrics_snapshot().active_transactions == 0
         assert not h.finish().direct_satisfied
         assert not h.hidden
         assert all(ref() is None for ref in h.source_refs)
@@ -3241,6 +3250,7 @@ def test_terminal_window_preserves_all_evidence(monkeypatch, return_code, mode):
         "existing_pages": 1,
         "response_code": "",
         "response_message": "",
+        "response_state": None,
     }
     assert session.direct_viable is (return_code == 0)
     assert len(reads) == (2 if mode == "0" else 8)
@@ -4480,3 +4490,814 @@ def test_destination_circuit_gauge_expires_when_another_destination_is_admitted(
     assert coordinator._circuit_allows(b)
     assert b.circuit.failures == 2  # A closed circuit still accumulates failures.
     assert coordinator.metrics_snapshot()["gauges"]["circuit_breaker_state"] == 0
+
+@pytest.mark.parametrize("initially_done", [False, True])
+def test_finished_request_retires_remote_fill_after_single_notification(initially_done):
+    import ast
+    from pathlib import Path
+    from threading import Lock
+
+    h = _PrefixRepairHarness()
+    h.state.limits = msgspec.structs.replace(h.state.limits, max_active_transactions=1)
+    window = h.session.transfer_window(
+        window_id=0, source_generation=44, control_pages=h.pages[:1],
+        source_plan=h.make_plan(h.pages[:1]), preparer=h.prepare,
+        submitter=h.submit, activation_factory=lambda _: None,
+    )
+    assert window.direct_satisfied
+    future = Future()
+    if initially_done:
+        future.set_result(None)
+    remote = ProducerRequestState(session=h.session, handoff=h.handoff, last_future=future)
+    remote.futures.append(future)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(blocking_timeout_secs=1)
+    finished_put = Future()
+    finished_put.set_result(None)
+    engine._direct_retry_args = {}
+    engine._direct_store_states = {"r": _DirectStoreRequestState(
+        remote_fill=remote, futures=deque([finished_put]),
+    )}
+    engine.is_store_async = True
+    engine._pending_store_reqs = {}
+    engine._reported_finished_store_ids = set()
+    engine._deferred_finished_req_ids = set()
+    engine._store_lock = Lock()
+    engine._live_source_builders = {}
+    engine._completed_live_sources = {}
+    released = []
+    adapter = SimpleNamespace(lmcache_engine=engine, store_async=True,
+                              _unfenced_live_stores={},
+                              _release_finished_worker_requests=released.extend,
+                              _drop_worker_retrieve_state=lambda _: None)
+    import lmcache
+    from types import MethodType
+    from typing import Optional
+
+    def load_method(path, name):
+        node = next(n for n in ast.walk(ast.parse(path.read_text(encoding="utf8")))
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+        node.decorator_list = []
+        ns = {"Optional": Optional, "serving_perf_enabled": lambda: False}
+        exec(compile(ast.Module([node], []), str(path), "exec"), ns)
+        return MethodType(ns[name], adapter)
+
+    # Exercise both worker entry points on CPU without loading vLLM/NPU plugins.
+    adapter._finalize_worker_requests_after_store = load_method(
+        Path(__file__).parents[2] / "lmcache_ascend/integration/vllm/vllm_v1_adapter.py",
+        "_finalize_worker_requests_after_store",
+    )
+    poll = load_method(Path(lmcache.__file__).parent / "integration/vllm/vllm_v1_adapter.py",
+                       "get_finished")
+    adapter._late_finished_sending = set()
+    adapter._drain_dsa_cold_load_futures = lambda: None
+    coordinator = _coordinator(engine)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        try:
+            ack, _ = poll({"r"})
+            if not initially_done:
+                assert not ack and not released and h.hidden
+        finally:
+            if not future.done():
+                future.set_result(None)
+        deadline = time.monotonic() + 2
+        while not ack and time.monotonic() < deadline:
+            ack, _ = poll(set())
+            time.sleep(0.001)
+        assert ack == {"r"} and released == ["r"]
+        assert not engine._direct_store_states and not h.hidden
+        assert h.state.metrics_snapshot().active_transactions == 0
+        assert poll(set()) == (None, None)
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+@pytest.mark.parametrize("covered", [False, True])
+def test_failure_only_retirement_preserves_redundant_window(groups, covered):
+    h = _PrefixRepairHarness(groups)
+    first = h.pages if covered else h.pages[:len(groups)]
+
+    def send(index, pages):
+        return h.session.transfer_window(
+            window_id=index, source_generation=44, control_pages=pages,
+            source_plan=h.make_plan(pages), preparer=h.prepare,
+            submitter=h.submit, activation_factory=lambda _: None,
+        )
+
+    assert send(0, first).direct_satisfied
+    assert "StatusRequest" not in h.events and "AbortRequest" not in h.events
+    refused = send(1, h.pages)
+    assert refused.response_code == "WINDOW_CONFLICT"
+    h.session.retire_failed_window(refused.response_state, 6)
+    h.session.retire_failed_window(refused.response_state, 6)
+    assert h.events.count("StatusRequest") == 1
+    assert h.events.count("AbortRequest") == int(not covered)
+    assert h.state.metrics_snapshot().active_transactions == int(covered)
+    h.now += 301
+    h.state.run_maintenance()
+    if not covered:
+        status = h.client.execute(StatusRequest(common=h.session._common(), window_id=-1))
+        assert status.code is ResultCode.NOT_FOUND  # D actually pruned the tombstone.
+    assert h.finish().direct_satisfied == covered
+    assert h.events.count("FinishRequest") == int(covered)
+
+
+@pytest.mark.parametrize("failure", ["lost-abort", "persistence", "bad-status", "unknown-bound"])
+def test_early_retirement_recovery_and_persistence(failure):
+    h = _PrefixRepairHarness()
+    h.session.transfer_window(
+        window_id=0, source_generation=44, control_pages=h.pages[:1],
+        source_plan=h.make_plan(h.pages[:1]), preparer=h.prepare,
+        submitter=h.submit, activation_factory=lambda _: None,
+    )
+    h.session.direct_viable = False
+    def execute(request):
+        if failure == "lost-abort" and isinstance(request, AbortRequest):
+            raise TimeoutError("undelivered")
+        response = h.execute(request)
+        if failure == "bad-status" and isinstance(request, StatusRequest):
+            return msgspec.structs.replace(response, windows=())
+        return response
+    h.session.client = SimpleNamespace(execute=execute)
+    h.session.retire_failed_window(None, 0 if failure == "unknown-bound" else 6)
+    assert bool(h.state.metrics_snapshot().active_transactions) == (failure != "persistence")
+    h.session.client = SimpleNamespace(execute=h.execute)
+    terminal = h.session.finish(required_store_end=6, final_partial_valid_tokens=2,
+                                persistent_common_end=0 if failure == "persistence" else 6)
+    assert terminal.outcome == ("PERSISTENCE_FAILED" if failure == "persistence" else "PERSISTENT_ONLY")
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+@pytest.mark.parametrize("retire", [False, True])
+def test_cleanup_runs_on_completion_without_blocking_pool_or_waiting_for_poll(retire):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=2000)
+    coordinator = _coordinator(engine)
+    started, complete = Event(), Event()
+    remote = ProducerRequestState(session=h.session, handoff=h.handoff)
+    stores = {"r": _DirectStoreRequestState(remote_fill=remote)}
+
+    def transfer():
+        started.set()
+        assert complete.wait(3)
+
+    with ThreadPoolExecutor(max_workers=2) as coordinator._executor:
+        try:
+            remote.last_future = coordinator._executor.submit(transfer)
+            remote.futures.append(remote.last_future)
+            assert started.wait(1)
+            if retire:
+                assert not coordinator.filter_finished({"r"}, stores)
+                completion = remote.retirement
+            else:
+                coordinator._retire_refused_tail(remote, 6)
+                completion = remote.futures[-1]
+                assert not coordinator.retiring
+            coordinator._executor.submit(lambda: None).result(timeout=0.5)
+            assert not completion.done()
+            assert h.state.metrics_snapshot().active_transactions == 1
+        finally:
+            complete.set()
+        # No model-side poll or coordinator.wait() is needed to release D's slot.
+        completion.result(timeout=1)
+        assert h.state.metrics_snapshot().active_transactions == 0
+        assert h.events.count("AbortRequest") == 1
+        if retire:
+            assert coordinator.filter_finished(set(), stores) == {"r"}
+        else:
+            coordinator.wait(remote)
+
+
+def _cleanup_case(dependencies=(), *, last=None):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=1000)
+    engine._remote_fill_fatal_transfers = ()
+    engine.mark_init_failed = Mock()
+    coordinator = _coordinator(engine)
+    state = ProducerRequestState(session=h.session, handoff=h.handoff,
+                                 futures=deque(dependencies), last_future=last)
+    return h, engine, coordinator, state, {"r": _DirectStoreRequestState(remote_fill=state)}
+
+
+@pytest.mark.parametrize("mode", ["empty", "done", "inline", "concurrent", "cancelled-tail"])
+def test_cleanup_dependency_registration_and_single_submission(mode):
+    class InlineFuture(Future):
+        def add_done_callback(self, callback):
+            self.set_result(None)
+            return super().add_done_callback(callback)
+
+    dependencies = [] if mode == "empty" else [
+        InlineFuture() if mode == "inline" else Future() for _ in range(4)
+    ]
+    if mode == "done":
+        for future in dependencies:
+            future.set_result(None)
+    if mode == "cancelled-tail":
+        dependencies[-1].cancel()
+    h, engine, coordinator, state, stores = _cleanup_case(
+        dependencies, last=dependencies[-1] if dependencies else None,
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        coordinator._executor = SimpleNamespace(submit=Mock(wraps=pool.submit))
+        coordinator.filter_finished({"r"}, stores)
+        completion = state.retirement
+        assert not completion.cancel()
+        if mode in ("concurrent", "cancelled-tail"):
+            assert not completion.done() and not coordinator._executor.submit.called
+            assert not coordinator.filter_finished({"r"}, stores)
+            assert completion is state.retirement
+            assert "AbortRequest" not in h.events
+            with ThreadPoolExecutor(max_workers=4) as finishers:
+                list(finishers.map(lambda f: f.set_result(None),
+                                  [f for f in dependencies if not f.done()]))
+        completion.result(timeout=1)
+        assert coordinator._executor.submit.call_count == 1
+        assert h.events.count("AbortRequest") == 1
+        assert h.state.metrics_snapshot().active_transactions == 0
+        assert not coordinator._cleanup_jobs
+
+
+@pytest.mark.parametrize("action", ["wait", "poll", "close"])
+def test_cleanup_detached_request_and_refusal_predecessor(action):
+    dependency = Future()
+    h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        coordinator._retire_refused_tail(state, 6)
+        refusal = state.futures[-1]
+        assert not coordinator.filter_finished({"r"}, stores)
+        stores["r"] = _DirectStoreRequestState(remote_fill=ProducerRequestState())
+        dependency.set_result(None)
+        if action == "close":
+            coordinator.close(())
+        elif action == "wait":
+            coordinator.wait(state)
+        else:
+            state.retirement.result(timeout=1)
+        assert refusal.done() and state.retirement.done()
+        assert not coordinator.filter_finished(set(), stores)
+        assert coordinator.filter_finished({"r"}, stores) == {"r"}
+        assert h.events.count("AbortRequest") == 1
+        assert h.state.metrics_snapshot().active_transactions == 0
+
+
+@pytest.mark.parametrize("retire", [False, True])
+@pytest.mark.parametrize("failure", ["once", "twice", "cancelled", "enqueue-then-raise", "callback"])
+def test_cleanup_submission_failure_notification_and_shutdown_recovery(retire, failure):
+    dependency = Future()
+    h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+    submitted = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempts = []
+
+        def submit(fn):
+            attempts.append(fn)
+            if failure == "once" and len(attempts) == 1:
+                raise RuntimeError("rejected")
+            if failure in ("twice", "enqueue-then-raise"):
+                raise RuntimeError("rejected")
+            if failure == "cancelled":
+                future = Future()
+                future.cancel()
+                return future
+            if failure == "callback":
+                class BrokenFuture(Future):
+                    def add_done_callback(self, callback):
+                        raise MemoryError("task callback registration")
+                return BrokenFuture()
+            future = pool.submit(fn)
+            submitted.append(future)
+            return future
+
+        coordinator._executor = SimpleNamespace(submit=submit, shutdown=lambda **kw: None)
+        if retire:
+            assert not coordinator.filter_finished({"r"}, stores)
+            completion = state.retirement
+        else:
+            coordinator._retire_refused_tail(state, 6)
+            completion = state.futures[-1]
+        dependency.set_result(None)
+        if failure == "once":
+            completion.result(timeout=1)
+            assert len(attempts) == 2
+        else:
+            error_type = (CancelledError if failure == "cancelled" else
+                          MemoryError if failure == "callback" else RuntimeError)
+            with pytest.raises(error_type):
+                completion.result(timeout=1)
+            assert h.state.metrics_snapshot().active_transactions == 1
+            assert coordinator._cleanup_jobs
+            coordinator.close((state,))
+            if failure == "enqueue-then-raise":
+                # Queued copies that were not returned by submit must be revoked.
+                list(pool.map(lambda fn: fn(), attempts))
+            coordinator.close((state,))
+        assert h.events.count("AbortRequest") == 1
+        assert h.state.metrics_snapshot().active_transactions == 0
+        assert not coordinator._cleanup_jobs
+
+
+@pytest.mark.parametrize("retire", [False, True])
+def test_cleanup_deadline_quarantines_late_callbacks(retire):
+    dependency = Future()
+    h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+    engine.config.remote_fill_native_hard_timeout_ms = 1
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        coordinator._executor = SimpleNamespace(submit=Mock(wraps=pool.submit), shutdown=lambda **kw: None)
+        if retire:
+            assert not coordinator.filter_finished({"r"}, stores)
+        else:
+            coordinator._retire_refused_tail(state, 6)
+        with pytest.raises(RemoteFillFatalError, match="hard deadline"):
+            coordinator.close(())
+        dependency.set_result(None)
+        with pytest.raises(RemoteFillFatalError):
+            coordinator.close(())
+        assert not coordinator._executor.submit.called
+        assert engine._remote_fill_fatal_transfers == (h.handoff.transfer_id,)
+        assert coordinator._cleanup_jobs and not h.session.closed
+        assert "AbortRequest" not in h.events
+        with pytest.raises(RuntimeError, match="closing"):
+            coordinator._start_cleanup(state, req_id="r")
+
+
+@pytest.mark.parametrize("retire", [False, True])
+def test_cleanup_original_fatal_future_is_retained_even_outside_deque(retire):
+    original = Future()
+    h, engine, coordinator, state, stores = _cleanup_case(last=original)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        if retire:
+            # Session cleanup is pending even though an earlier drain popped it.
+            assert not coordinator.filter_finished({"r"}, stores)
+            completion = state.retirement
+        else:
+            coordinator._retire_refused_tail(state, 6)
+            completion = state.futures[-1]
+        original.set_exception(RemoteFillFatalError("unknown native completion"))
+        with pytest.raises(RemoteFillFatalError, match="unknown native"):
+            completion.result(timeout=1)
+        with pytest.raises(RemoteFillFatalError):
+            coordinator.close(())
+        assert engine._remote_fill_fatal_transfers == (h.handoff.transfer_id,)
+        assert coordinator._cleanup_jobs and not h.session.closed
+        assert "AbortRequest" not in h.events
+
+
+@pytest.mark.parametrize("retire", [False, True])
+def test_cleanup_callbacks_do_not_retain_completed_records_with_gc_disabled(retire):
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(20):
+            dependency = Future()
+            h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+            with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+                if retire:
+                    assert not coordinator.filter_finished({"r"}, stores)
+                    completion = state.retirement
+                else:
+                    coordinator._retire_refused_tail(state, 6)
+                    completion = state.futures[-1]
+                record_ref = weakref.ref(next(iter(coordinator._cleanup_jobs.values())))
+                dependency.set_result(None)
+                completion.result(timeout=1)
+                if retire:
+                    assert coordinator.filter_finished(set(), stores) == {"r"}
+                else:
+                    coordinator.wait(state)
+            # Retaining dependency/result futures must not retain their callbacks' owners.
+            assert record_ref() is None
+            assert not coordinator._cleanup_jobs
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("drain", [False, True])
+def test_cleanup_callback_registration_failure_keeps_original_dependencies(drain):
+    class BrokenFuture(Future):
+        def add_done_callback(self, callback):
+            raise MemoryError("callback registration")
+
+    first, broken = Future(), BrokenFuture()
+    h, engine, coordinator, state, stores = _cleanup_case([first, broken], last=broken)
+    engine.config.remote_fill_native_hard_timeout_ms = 5
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        with pytest.raises(MemoryError, match="callback registration"):
+            coordinator.filter_finished({"r"}, stores)
+        assert not first.done() and not broken.done()
+        if drain:
+            first.set_result(None)
+            broken.set_result(None)
+            coordinator.close(())
+            assert h.state.metrics_snapshot().active_transactions == 0
+        else:
+            with pytest.raises(RemoteFillFatalError, match="hard deadline"):
+                coordinator.close(())
+            first.set_result(None)
+            broken.set_result(None)
+            with pytest.raises(RemoteFillFatalError, match="quarantined"):
+                coordinator.close(())
+            assert "AbortRequest" not in h.events and coordinator._cleanup_jobs
+
+
+def test_cleanup_registration_racing_shutdown_keeps_executor_available():
+    attaching, attach = Event(), Event()
+
+    class PausedFuture(Future):
+        def add_done_callback(self, callback):
+            attaching.set()
+            assert attach.wait(2)
+            return super().add_done_callback(callback)
+
+    dependency = PausedFuture()
+    h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        with ThreadPoolExecutor(max_workers=2) as callers:
+            registering = callers.submit(coordinator._start_cleanup, state, req_id="r")
+            try:
+                assert attaching.wait(1)
+                closing = callers.submit(coordinator.close, ())
+                dependency.set_result(None)
+            finally:
+                attach.set()
+            registering.result(timeout=1).result(timeout=1)
+            closing.result(timeout=1)
+        assert h.events.count("AbortRequest") == 1
+        assert not coordinator._cleanup_jobs
+
+
+def test_cleanup_submit_raises_after_action_started_does_not_retry_or_release_early():
+    dependency = Future()
+    h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+    entered, release = Event(), Event()
+    abort = h.session.abort
+
+    def delayed_abort(reason):
+        entered.set()
+        assert release.wait(2)
+        return abort(reason)
+
+    h.session.abort = delayed_abort
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempts = []
+
+        def submit(fn):
+            attempts.append(pool.submit(fn))
+            assert entered.wait(1)
+            raise RuntimeError("thread start failed after enqueue")
+
+        coordinator._executor = SimpleNamespace(submit=submit, shutdown=lambda **kw: None)
+        assert not coordinator.filter_finished({"r"}, stores)
+        try:
+            dependency.set_result(None)
+            assert len(attempts) == 1
+            assert not state.retirement.done()
+            assert h.state.metrics_snapshot().active_transactions == 1
+        finally:
+            release.set()
+        state.retirement.result(timeout=1)
+        assert h.events.count("AbortRequest") == 1
+        assert not coordinator._cleanup_jobs
+
+
+def test_final_retirement_releases_failed_refusal_record_and_error_frames_without_gc():
+    class Owner:
+        pass
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        dependency = Future()
+        h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+        owner = Owner()
+        owner_ref = weakref.ref(owner)
+        state.prefix_source = (owner,)
+        with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+            coordinator._retire_refused_tail(state, 6)
+            refused_ref = weakref.ref(next(iter(coordinator._cleanup_jobs.values())))
+            dependency.set_exception(ValueError("ordinary pre-arm failure"))
+            refusal = state.futures[-1]
+            with pytest.raises(ValueError):
+                refusal.result(timeout=1)
+            coordinator.filter_finished({"r"}, stores)
+            state.retirement.result(timeout=1)
+            coordinator.filter_finished(set(), stores)
+        assert not coordinator._cleanup_jobs
+        assert refused_ref() is None
+        del owner, state, stores
+        # Even externally retained failed futures must not retain retired sources.
+        assert owner_ref() is None
+        assert isinstance(dependency.exception(), ValueError)
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("failure", ["logger", "formatter"])
+def test_cleanup_failure_notification_survives_diagnostic_failure(monkeypatch, failure):
+    dependency = Future()
+    h, engine, coordinator, state, stores = _cleanup_case([dependency], last=dependency)
+    coordinator._executor = Mock()
+    coordinator._executor.submit.side_effect = RuntimeError("executor rejected")
+    assert not coordinator.filter_finished({"r"}, stores)
+    with monkeypatch.context() as patch:
+        if failure == "logger":
+            patch.setattr(coordinator_module.logger, "warning", Mock(side_effect=OSError("log sink failed")))
+        else:
+            patch.setattr(coordinator_module.traceback, "format_exception", Mock(side_effect=MemoryError("format failed")))
+        dependency.set_result(None)
+        assert state.retirement.done(), "diagnostics must not strand the cleanup promise"
+    with pytest.raises(RuntimeError, match="executor rejected"):
+        state.retirement.result()
+    assert coordinator._executor.submit.call_count == 2
+    coordinator.close(())
+    assert not coordinator._cleanup_jobs
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_cleanup_publication_failure_notifies_owned_record():
+    class NoAppend(deque):
+        def append(self, value):
+            raise MemoryError("future deque allocation failed")
+
+    dependency = Future()
+    dependency.set_result(None)
+    h, engine, coordinator, state, stores = _cleanup_case(last=dependency)
+    state.futures = NoAppend([dependency])
+    coordinator._executor = Mock()
+    with pytest.raises(MemoryError, match="deque allocation"):
+        coordinator._retire_refused_tail(state, 6)
+    job, = coordinator._cleanup_jobs.values()
+    record_ref = weakref.ref(job)
+    assert job.completion.done(), "published cleanup owner must receive the failure"
+    assert isinstance(job.completion.exception(), MemoryError)
+    coordinator._executor.submit.assert_not_called()
+    del job
+    coordinator.close(())
+    assert not coordinator._cleanup_jobs
+    assert record_ref() is None
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_retirement_submission_retry_and_request_id_replacement():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=2000)
+    coordinator = _coordinator(engine)
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    original = ProducerRequestState(session=h.session, handoff=h.handoff)
+    pending = Future()
+    original.futures.append(pending)
+    stores = {"r": _DirectStoreRequestState(remote_fill=original)}
+    coordinator._executor = Mock()
+    coordinator._executor.submit.side_effect = RuntimeError("rejected")
+    assert not coordinator.filter_finished({"r"}, stores)
+    assert not coordinator.release("r", original, persistent_ready=True)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        assert not coordinator.filter_finished(set(), stores)
+        replacement = ProducerRequestState()
+        stores["r"] = _DirectStoreRequestState(remote_fill=replacement)
+        pending.set_exception(ValueError("ordinary job failure"))
+        # Preemption or shutdown must wait for the old owner, even if detached.
+        coordinator.wait(original)
+        assert not coordinator.filter_finished(set(), stores)
+        assert coordinator.filter_finished({"r"}, stores) == {"r"}
+        assert stores["r"].remote_fill is replacement
+    assert h.events.count("AbortRequest") == 1
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_foreground_backpressure_orders_cleanup_without_borrowing_refused_sources():
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace()
+    coordinator = _coordinator(engine)
+    previous = Future()
+    state = ProducerRequestState(session=h.session, handoff=h.handoff, last_future=previous)
+    with ThreadPoolExecutor(max_workers=1) as coordinator._executor:
+        coordinator._retire_refused_tail(state, 6)
+        assert state.last_future is previous
+        assert h.state.metrics_snapshot().active_transactions == 1
+        previous.set_result(None)
+        coordinator.wait(state)
+    assert h.events[-2:] == ["StatusRequest", "AbortRequest"]
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("operation", ["close", "finish"])
+def test_confirmed_abort_draining_or_quarantine(terminal, operation):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    def execute(request):
+        if isinstance(request, AbortRequest):
+            response = h.execute(request)
+            return msgspec.structs.replace(response, code=ResultCode.ACCEPTED,
+                transaction_state=TransactionState.ABORT_REQUESTED, terminal_outcome=None)
+        if isinstance(request, StatusRequest) and not terminal:
+            raise TimeoutError("no terminal evidence")
+        return h.execute(request)
+
+    h.session.client = SimpleNamespace(execute=execute)
+    h.session.native_hard_timeout_seconds = 0.02
+    h.session._prepared_sources[1] = object()
+    h.session.direct_viable = False
+    h.session.retire_failed_window(TransactionState.DIRECT_ABANDONED, 0)
+    assert h.session.remote_cleanup_pending
+    action = h.session.close if operation == "close" else h.finish
+    if terminal:
+        result = action()
+        assert not h.session.remote_cleanup_pending
+        if operation == "finish":
+            assert result.outcome == "PERSISTENT_ONLY"
+        h.session.close()
+        assert not h.session._prepared_sources
+    else:
+        with pytest.raises(RemoteFillFatalError, match="still draining"):
+            action()
+        assert h.session.fatal_restart_required and h.session._prepared_sources
+
+
+def test_six_active_slots_readmit_before_persistence():
+    h = _PrefixRepairHarness()
+    h.state.limits = msgspec.structs.replace(h.state.limits, max_active_transactions=6)
+
+    def session(index):
+        return RemoteFillProducerSession(
+            request_id=str(index), handoff=replace(h.handoff, transfer_id=f"t-{index}"),
+            static_spec=h.session.static_spec, client=h.client, secret=_SECRET,
+            planned_window_count_hint=1, required_store_end_hint=6,
+        )
+
+    owners = [session(i) for i in range(6)]
+    assert all(owner.open() for owner in owners)
+    assert not session(6).open()
+    owners[0].direct_viable = False
+    owners[0].retire_failed_window(None, 6)
+    assert h.state.metrics_snapshot().active_transactions == 5
+    assert session(7).open()
+    assert owners[0].finish(required_store_end=6, persistent_common_end=0).outcome == "PERSISTENCE_FAILED"
+
+
+@pytest.mark.parametrize("blocking_finish", [False, True])
+def test_shutdown_drains_detached_attempt_after_enqueue_rejection(blocking_finish):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=2000)
+    coordinator = _coordinator(engine)
+    broken_pool = coordinator._executor = Mock()
+    broken_pool.submit.side_effect = RuntimeError("rejected")
+    original = ProducerRequestState(session=h.session, handoff=h.handoff)
+    failed = Future()
+    failed.set_exception(ValueError("failed before native submission"))
+    original.futures.append(failed)
+    stores = {"r": _DirectStoreRequestState(remote_fill=original)}
+    # Both bounded attempts now happen without requiring another model poll.
+    with pytest.raises(RuntimeError, match="rejected"):
+        coordinator.filter_finished({"r"}, stores, block=blocking_finish)
+    assert broken_pool.submit.call_count == 2
+    coordinator.close(())
+    coordinator.close((original,))
+    broken_pool.shutdown.assert_called_once()
+    assert not coordinator.retiring and not original.futures
+    assert h.state.metrics_snapshot().active_transactions == 0
+
+
+def test_refused_duplicate_followed_by_decoder_lease_and_tombstone_expiry():
+    h = _PrefixRepairHarness()
+    args = dict(source_generation=44, control_pages=h.pages, preparer=h.prepare,
+                submitter=h.submit, activation_factory=lambda _: None)
+    assert h.session.transfer_window(window_id=0, source_plan=h.make_plan(h.pages),
+                                     **args).direct_satisfied
+    refused = h.session.transfer_window(window_id=1, source_plan=h.make_plan(h.pages), **args)
+    assert refused.response_code == "WINDOW_CONFLICT"
+    h.session.retire_failed_window(refused.response_state, 6)
+    assert "AbortRequest" not in h.events  # Full coverage still had a chance to publish.
+    h.now += 1801
+    h.state.run_maintenance()
+    h.now += 301
+    h.state.run_maintenance()
+    terminal = h.finish()
+    assert terminal.outcome == "PERSISTENT_ONLY" and not terminal.direct_satisfied
+    assert not h.session.remote_cleanup_pending
+
+
+@pytest.mark.parametrize("entry", ["release", "shutdown"])
+def test_abort_drain_deadline_reaches_paired_restart_latch(entry):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    def execute(request):
+        if isinstance(request, StatusRequest):
+            raise TimeoutError("native report unavailable")
+        return msgspec.structs.replace(h.execute(request), code=ResultCode.ACCEPTED,
+            transaction_state=TransactionState.ABORT_REQUESTED, terminal_outcome=None)
+    h.session.client = SimpleNamespace(execute=execute)
+    h.session.native_hard_timeout_seconds = 0.001
+    h.session._prepared_sources[1] = object()
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._remote_fill_fatal_transfers = ()
+    engine.mark_init_failed = Mock()
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=1000)
+    coordinator = _coordinator(engine)
+    state = ProducerRequestState(session=h.session, handoff=h.handoff)
+    with pytest.raises(RemoteFillFatalError, match="still draining"):
+        if entry == "shutdown":
+            coordinator.close([state])
+        else:
+            coordinator.release("r", state, persistent_ready=True)
+    assert engine._remote_fill_fatal_transfers == (h.handoff.transfer_id,)
+    assert engine.mark_init_failed.call_count == 1 and h.session._prepared_sources
+
+
+def test_shutdown_deadline_retains_original_pending_window():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._remote_fill_fatal_transfers = ()
+    engine.mark_init_failed = Mock()
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=1)
+    coordinator = _coordinator(engine)
+    original = Future()
+    state = ProducerRequestState(handoff=_handoff(), futures=deque([original]))
+    with pytest.raises(RemoteFillFatalError, match="hard deadline"):
+        coordinator.close([state])
+    assert engine._remote_fill_fatal_transfers == (state.handoff.transfer_id,)
+    assert list(state.futures) == [original] and not original.done()
+
+
+@pytest.mark.parametrize("abort_ack", ["received", "lost", "legacy-closed"])
+def test_service_shutdown_cannot_acknowledge_a_draining_native_window(abort_ack):
+    h = _PrefixRepairHarness()
+    assert h.session.open()
+    reserved = h.execute(ReserveWindowRequest(common=h.session._common(), window_id=0,
+        source_generation=44, manifest_digest=manifest_digest(h.pages), control_pages=h.pages))
+    armed = h.execute(ArmWindowRequest(common=h.session._common(), window_id=0,
+        native_transfer_attempt_id=reserved.native_transfer_attempt_id,
+        destination_descriptor_digest=reserved.destination_descriptor_digest,
+        manifest_digest=manifest_digest(h.pages)))
+    assert armed.code is ResultCode.OK
+    h.session.native_hard_timeout_seconds = 0.01
+    h.session._prepared_sources[1] = object()
+    if abort_ack == "lost":
+        for _ in range(2):
+            h.client._transport.drop_next_reply(OperationKind.ABORT)
+        with pytest.raises(ReplyLostError):
+            h.session.abort("cancel")
+    else:
+        assert h.session.abort("cancel").transaction_state is TransactionState.ABORT_REQUESTED
+    assert h.state.shutdown() == (h.handoff.transfer_id,)
+    if abort_ack == "legacy-closed":
+        def bare_terminal(request):
+            return msgspec.structs.replace(h.execute(request), code=ResultCode.TERMINAL,
+                terminal_outcome=None, transaction_state=None, fatal_restart_required=False)
+        h.session.client = SimpleNamespace(execute=bare_terminal)
+    with pytest.raises(RemoteFillFatalError, match="still draining|fatal|unknown terminal state"):
+        h.session.close()
+    assert h.session.remote_cleanup_pending and h.session._prepared_sources
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_shutdown_drains_live_sessions_after_failed_window(cancelled):
+    from concurrent.futures import CancelledError
+
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(remote_fill_native_hard_timeout_ms=1000)
+    coordinator = _coordinator(engine)
+    h = _PrefixRepairHarness()
+    other = RemoteFillProducerSession(
+        request_id="other", handoff=replace(h.handoff, transfer_id="other-transfer"),
+        static_spec=h.session.static_spec, client=h.client, secret=_SECRET,
+        planned_window_count_hint=1, required_store_end_hint=6,
+    )
+    assert h.session.open() and other.open()
+    job = Future()
+    if cancelled:
+        assert job.cancel()
+    else:
+        job.set_exception(ValueError("pre-arm failure"))
+    states = [ProducerRequestState(session=s, handoff=s.handoff) for s in (h.session, other)]
+    states[0].futures.append(job)
+    with pytest.raises(CancelledError if cancelled else ValueError):
+        coordinator.close(states)
+    assert h.state.metrics_snapshot().active_transactions == 0
+    assert not h.session.remote_cleanup_pending and not other.remote_cleanup_pending
+
+
+def test_explicit_fatal_report_never_waits_for_status():
+    h = _PrefixRepairHarness()
+    def stop_after_copy(**kwargs):
+        result = h.submit(**kwargs)
+        assert h.state.shutdown() == (h.handoff.transfer_id,)
+        return result
+
+    with pytest.raises(RemoteFillFatalError):
+        h.session.transfer_window(
+            window_id=0, source_generation=44, control_pages=h.pages,
+            source_plan=h.make_plan(h.pages), preparer=h.prepare,
+            submitter=stop_after_copy, activation_factory=lambda _: None,
+        )
+    assert h.session.fatal_restart_required and h.session._prepared_sources
+    assert h.events.count("ReportTransferCompleteRequest") == 1
+    assert "StatusRequest" not in h.events

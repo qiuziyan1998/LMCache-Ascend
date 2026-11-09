@@ -1051,6 +1051,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             maximum=self._remote_fill_pages_per_window(),
             context=self._remote_fill_session_context(),
             source_factory=source_factory,
+            accepted_end=state.accepted_store_end or 0,
         )
 
     def _remote_fill_prefix_source_plan(
@@ -1130,6 +1131,13 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             state.remote_fill,
             batch,
             required_store_end_hint,
+            # Banked group ends come from the stored slice of ReqMeta.token_ids.
+            # They bound accepted prompt coverage independently of the OPEN hint.
+            accepted_end=(
+                batch.ranges[-1][1]
+                if batch.ranges and getattr(self, "_force_layerwise_prefill_store", False)
+                else state.accepted_store_end or 0
+            ),
             control_pages=control_pages,
             maximum=self._remote_fill_pages_per_window(),
             context=self._remote_fill_session_context(),
@@ -4197,6 +4205,10 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                     lease.release()
             state = self._direct_store_states.get(req_id)
             if state is not None:
+                # Successful persistent puts may have notified get_finished_stores
+                # while their receipts still await the request's ordinary drain.
+                if state.futures and state.remote_fill and state.remote_fill.retirement:
+                    self.wait_for_direct_stores((req_id,))
                 releasable = not state.futures and not state.pending_keys
                 if state.remote_fill is not None:
                     releasable = self._get_remote_fill_coordinator().release(
