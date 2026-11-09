@@ -3271,12 +3271,6 @@ class AscendLMCacheEngine(LMCacheEngine):
             state = self._direct_store_states.get(req_id)
             if state is None:
                 continue
-            started = None
-            remote_wait_started = (
-                started
-                if state.remote_fill is not None and state.remote_fill.metrics_started
-                else None
-            )
             outstanding = len(state.futures)
             failed: list[tuple[Future, tuple[Any, ...], Exception]] = []
             completed: list[tuple[tuple[Any, ...], Optional[Exception]]] = []
@@ -3391,17 +3385,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
             # The same source owners may also be retained by the optional
             # remote-fill sink. Drain it before vLLM can release NPU blocks.
-            metrics = (
-                self._get_remote_fill_coordinator().get_metrics()
-                if remote_wait_started is not None
-                else None
-            )
             self._wait_remote_fill_windows(state)
-            if metrics is not None:
-                metrics.observe(
-                    "final_wait_seconds",
-                    time.perf_counter() - remote_wait_started,
-                )
             waited.add(req_id)
         return waited
 

@@ -7105,7 +7105,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 pointer_first = (
                     lmcache_cached_tokens > 0
                     and bool(layer_memory_objs)
-                    and True
                     and cached_layer_ptrs is not None
                     and cached_layer_ptrs.numel() == len(layer_memory_objs)
                 )
