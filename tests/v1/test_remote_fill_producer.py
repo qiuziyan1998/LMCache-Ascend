@@ -4049,6 +4049,7 @@ def test_banked_manifest_registers_all_reused_pages_in_one_job(groups, reused):
     assert state.remote_fill.manifest_end == 10
     assert not released  # Unfinished job still owns every source lease.
     jobs.drain()
+    assert "StatusRequest" not in h.events and "AbortRequest" not in h.events
     coordinator._release_queue_capacity(state.remote_fill, 0)
     engine.finish_layerwise_prefill_store(
         "prefix", None, required_store_end=10, persistence_fenced=True,
@@ -4081,6 +4082,31 @@ def test_banked_manifest_real_hole_stops_before_suffix_native_io(groups):
     assert not h.transferred and "ArmWindowRequest" not in h.events
     assert sorted(released) == list(groups)
     assert state.remote_fill.queued_bytes == state.remote_fill.queued_windows == 0
+
+
+@pytest.mark.parametrize("groups", [(0,), (0, 1)])
+def test_banked_manifest_hole_retires_before_persistent_handoff(groups):
+    engine, state, h, jobs, metadata, released = _banked_manifest_engine(groups, d_missing=True)
+    engine._force_layerwise_prefill_store = True
+    state.committed_end = {0: 0, 1: 0}
+    engine.submit_layerwise_prefill_fills(("prefix",), request_metadata=metadata)
+    jobs.drain()
+    assert h.events.count("AbortRequest") == 1
+    assert "StatusRequest" not in h.events  # D already reported DIRECT_ABANDONED.
+    assert h.state.metrics_snapshot().active_transactions == 0
+    assert not h.transferred and "ArmWindowRequest" not in h.events
+    assert sorted(released) == list(groups)
+    assert state.remote_fill.terminal is None
+    with pytest.raises(RuntimeError, match="persistence is incomplete"):
+        engine.finish_layerwise_prefill_store(
+            "prefix", None, required_store_end=10, persistence_fenced=True,
+        )
+    state.committed_end = {0: 10, 1: 10}
+    engine.finish_layerwise_prefill_store(
+        "prefix", None, required_store_end=10, persistence_fenced=True,
+    )
+    assert state.remote_fill.terminal.outcome == "PERSISTENT_ONLY"
+    assert h.events.count("AbortRequest") == 1
 
 
 @pytest.mark.parametrize("passive", [False, True])
