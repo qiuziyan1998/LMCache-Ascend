@@ -493,9 +493,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         return True
 
     def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
+        # Receiver engines disable direct publication. Keep their local prefill
+        # on the layerwise writer so both groups become a prepared CPU source.
+        # Use the role on all TP ranks; passive sender engines are also disabled.
         if (
             getattr(self, "_force_layerwise_prefill_store", False)
             or not getattr(self, "_direct_store_requested", False)
+            or getattr(self.config, "pd_role", None) == "receiver"
             or self.kv_role == "kv_consumer"
             or self.lmcache_engine is None
             or self._parent._connector_metadata is None
