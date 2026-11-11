@@ -892,6 +892,30 @@ class AscendRemoteFillPageLifecycle:
                     full_tokens=self._layout.chunk_size,
                     eviction=False,
                 )
+                if (
+                    group_pages is None or len(group_pages) != len(indices)
+                ) and self._capacity_reclaimer is not None:
+                    # The window already passed the capacity gate, so a shortfall
+                    # here is a race with normal allocations. Reclaim once and
+                    # retry before abandoning the whole transaction.
+                    if group_pages:
+                        self._release_allocated(group_pages, pinned=False)
+                    self._capacity_reclaimer(
+                        sum(pages[index].expected_bytes for index in indices)
+                    )
+                    group_pages = self._local.batched_allocate_layer_pages(
+                        page_shapes,
+                        [group_layout.dtype] * len(page_shapes),
+                        len(indices),
+                        self._layout.num_layers_for_group(kv_group),
+                        group_layout.fmt,
+                        busy_loop=False,
+                        valid_tokens=[
+                            pages[index].valid_tokens for index in indices
+                        ],
+                        full_tokens=self._layout.chunk_size,
+                        eviction=False,
+                    )
                 if group_pages is None or len(group_pages) != len(indices):
                     if group_pages:
                         self._release_allocated(group_pages, pinned=False)

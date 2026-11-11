@@ -4321,3 +4321,37 @@ def test_explicit_fatal_report_never_waits_for_status():
     assert h.session.fatal_restart_required and h.session._prepared_sources
     assert h.events.count("ReportTransferCompleteRequest") == 1
     assert "StatusRequest" not in h.events
+
+
+def _selector_page(kv_group: int, chunk_index: int) -> ControlPage:
+    start = chunk_index * 1024
+    return ControlPage(
+        canonical_key=f"selector-key-{kv_group}-{chunk_index}",
+        kv_group=kv_group,
+        chunk_index=chunk_index,
+        chunk_start=start,
+        chunk_end=start + 1024,
+        valid_tokens=1024,
+        destination_tp_rank=0,
+        expected_bytes=128,
+        layer_count=79,
+        layout_tag="payload-v3",
+    )
+
+
+def test_selector_dedupe_drops_pages_admitted_by_an_earlier_window():
+    state = ProducerRequestState()
+    batch = (_selector_page(0, 0), _selector_page(0, 1), _selector_page(0, 1))
+
+    first = RemoteFillCoordinator._dedupe_control_pages(state, batch)
+    assert [page.chunk_index for page in first] == [0, 1]
+
+    RemoteFillCoordinator._register_window_selectors(state, 7, (first,))
+    assert state.submitted_selectors == {(0, 0): 7, (0, 1): 7}
+    assert state.window_selectors == {7: ((0, 0), (0, 1))}
+
+    second = RemoteFillCoordinator._dedupe_control_pages(
+        state,
+        (_selector_page(0, 1), _selector_page(0, 2)),
+    )
+    assert [page.chunk_index for page in second] == [2]

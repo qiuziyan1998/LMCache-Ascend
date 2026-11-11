@@ -114,6 +114,14 @@ class ProducerRequestState:
     viable_counted: bool = False
     active_counted: bool = False
     submitted_bytes: int = 0
+    # Selectors already admitted by an earlier window of this transaction.
+    # The destination rejects a selector registered by another window, and a
+    # single rejection abandons the whole transaction, so re-submission must be
+    # filtered here before windows are formed.
+    submitted_selectors: dict[tuple[int, int], int] = field(default_factory=dict)
+    window_selectors: dict[int, tuple[tuple[int, int], ...]] = field(
+        default_factory=dict
+    )
     persistent_started_at: float = 0.0
     # Full dense mappings only; borrowed until the existing request drain.
     prefix_source: tuple[dict[int, list], dict[int, Any]] | None = field(
@@ -721,6 +729,46 @@ class RemoteFillCoordinator:
         # last_future identifies the last job that actually borrowed sources.
         state.futures.append(job)
 
+    @staticmethod
+    def _dedupe_control_pages(
+        state: ProducerRequestState,
+        pages: tuple[ControlPage, ...],
+    ) -> tuple[ControlPage, ...]:
+        """Drop pages already admitted by an earlier window of this transaction.
+
+        A rejected window aborts the whole transaction, so every selector that
+        is still registered here belongs to a window that landed. Submitting it
+        again only produces a destination WINDOW_CONFLICT, which would discard
+        every window transferred so far.
+        """
+
+        seen: set[tuple[int, int]] = set()
+        kept: list[ControlPage] = []
+        for page in pages:
+            selector = (page.kv_group, page.chunk_index)
+            if selector in state.submitted_selectors or selector in seen:
+                continue
+            seen.add(selector)
+            kept.append(page)
+        return tuple(kept)
+
+    @staticmethod
+    def _register_window_selectors(
+        state: ProducerRequestState,
+        first_window_id: int,
+        control_windows: tuple[tuple[ControlPage, ...], ...],
+    ) -> None:
+        """Record the selectors owned by each newly formed window."""
+
+        for offset, window_pages in enumerate(control_windows):
+            window_id = first_window_id + offset
+            selectors = tuple(
+                (page.kv_group, page.chunk_index) for page in window_pages
+            )
+            state.window_selectors[window_id] = selectors
+            for selector in selectors:
+                state.submitted_selectors[selector] = window_id
+
     def submit_probe(
         self,
         req_id: str,
@@ -754,6 +802,9 @@ class RemoteFillCoordinator:
                 self._record_failure()
                 return
             self._executor = executor
+        pages = self._dedupe_control_pages(state, pages)
+        if not pages:
+            return
         control_windows = tuple(
             pages[offset : offset + maximum] for offset in range(0, len(pages), maximum)
         )
@@ -768,6 +819,7 @@ class RemoteFillCoordinator:
             metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
         first_window_id = state.next_window_id
         state.next_window_id += len(control_windows)
+        self._register_window_selectors(state, first_window_id, control_windows)
         previous = state.last_future
 
         def run() -> Any:
@@ -951,6 +1003,19 @@ class RemoteFillCoordinator:
             )
             self.get_metrics().abandon("invalid control page limit", allocation=True)
             return
+        original_page_count = len(control_pages)
+        control_pages = self._dedupe_control_pages(state, control_pages)
+        deduped = len(control_pages) != original_page_count
+        if not control_pages:
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "remote_fill_batch_skipped",
+                    req_id=batch.req_id,
+                    reason="duplicate_selectors",
+                    bytes=0,
+                )
+            return
         control_windows = tuple(
             control_pages[offset : offset + maximum]
             for offset in range(0, len(control_pages), maximum)
@@ -989,7 +1054,7 @@ class RemoteFillCoordinator:
             source_plans = tuple(
                 build_remote_fill_source_plan(
                     batch
-                    if len(control_windows) == 1
+                    if len(control_windows) == 1 and not deduped
                     else select_remote_fill_batch_pages(batch, pages)
                 )
                 for pages in control_windows
@@ -1036,6 +1101,7 @@ class RemoteFillCoordinator:
             self._executor = executor
         first_window_id = state.next_window_id
         state.next_window_id += len(control_windows)
+        self._register_window_selectors(state, first_window_id, control_windows)
         source_generation = state.source_generation
         previous = state.last_future
 
@@ -1240,6 +1306,18 @@ class RemoteFillCoordinator:
         if terminal.outcome == "FATAL_RESTART":
             self._latch_fatal(state)
         state.terminal = terminal
+        logger.info(
+            "[LMCACHE_REMOTE_FILL] remote_fill_tx_terminal transfer_id=%s req_id=%s "
+            "direct_satisfied=%s reason=%s submitted_bytes=%d windows_submitted=%d "
+            "session_opened=%s",
+            state.handoff.transfer_id,
+            req_id,
+            terminal.direct_satisfied,
+            state.disabled_reason or terminal.outcome,
+            state.submitted_bytes,
+            len(state.window_selectors),
+            state.session is not None,
+        )
         if metrics.timing_enabled and state.persistent_started_at:
             metrics.observe(
                 "persistent_seconds",
