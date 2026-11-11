@@ -6142,6 +6142,41 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             else 0,
         )
 
+    def prepare_dcp_group_capture(
+        self, pages: list[Any], starts: list[int], ends: list[int],
+        layout: Any, rank: int, *, kvcaches: list, memory_objs: Any = None,
+        capture_start: int = 0,
+    ) -> Any:
+        """Prepare owned Group-0 stripes into existing canonical CPU pages."""
+        from lmcache_ascend.v1.npu_connector.dcp_capture import prepare_dcp_capture
+
+        expected = self._expected_memory_format(0)
+        if len(kvcaches) != self._expected_group_layers(0):
+            raise ValueError("DCP capture layer count mismatch")
+        objects = pages if memory_objs is None else [page for row in memory_objs for page in row]
+        seen = set()
+        for page in objects:
+            if id(page) in seen:
+                continue
+            seen.add(id(page))
+            if page.metadata.fmt != expected:
+                raise ValueError("DCP capture CPU memory format differs")
+            raw = page.raw_data if isinstance(page, LayerPageMemoryObj) else page.tensor
+            if raw is None or not lmc_ops.get_device_ptr(raw.data_ptr(), raw.numel() * raw.element_size()):
+                raise ValueError("DCP capture CPU destination is not registered")
+        return prepare_dcp_capture(pages, starts, ends, kvcaches, layout, rank,
+                                   memory_objs=memory_objs, capture_start=capture_start)
+
+    def enqueue_dcp_group_capture(self, plan: Any) -> Any:
+        """Submit prepared shard copies; the caller retains the plan until fenced."""
+        current = torch.npu.current_stream()
+        with self._stream_context_or_null(self.store_stream):
+            self.store_stream.wait_stream(current)
+            lmc_ops.layerwise_prefill_dma_copy(plan.copies, True)
+            event = torch.npu.Event()
+            event.record(self.store_stream)
+        return event
+
     def enqueue_group_capture(self, plan: PreparedGroupCapture) -> Any:
         """Enqueue D2H behind producer work; caller retains plan until done."""
         current = torch.npu.current_stream()

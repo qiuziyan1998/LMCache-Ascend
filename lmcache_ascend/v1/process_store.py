@@ -161,6 +161,8 @@ def _reserve(
         location=engine.store_location,
         transfer_spec=kwargs.get("transfer_spec"),
     )
+    if kwargs.get("dcp_write_participants") is not None:
+        payload["participants"] = kwargs["dcp_write_participants"]
     future = engine.storage_process.client.request(
         "reserve_write",
         payload,

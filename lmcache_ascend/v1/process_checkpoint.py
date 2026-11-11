@@ -52,6 +52,7 @@ class _Reservation:
     cleanup_future: Any = None
     resume_on: Any = None
     cancel_deadline: float = 0.0
+    cooperative_pending: bool = False
 
 
 class _CheckpointControls:
@@ -130,7 +131,12 @@ class ProcessCheckpointWorker(CheckpointWorker):
         block_size: int,
         prefix_state: Any = None,
     ) -> None:
-        """Only TP0 reserves/captures; every rank still owns its restore holds."""
+        """Capture replicated KV on TP0, or contribute the local DCP shard."""
+        if getattr(spec, "dcp_write_layout", None) is not None:
+            from lmcache_ascend.v1.dcp_checkpoint import capture_checkpoint
+
+            capture_checkpoint(self, spec, caches, block_size, prefix_state)
+            return
         if not self.writer:
             return
         key = (spec.req_id, spec.generation)
@@ -361,6 +367,8 @@ class ProcessCheckpointWorker(CheckpointWorker):
             payload.update(
                 source_operation=source, source_lease_id=source["manifest"].lease_id
             )
+        if getattr(spec, "dcp_write_layout", None) is not None:
+            payload["participants"] = self.engine.dcp_write_group.sessions
         future = self.client.request(
             "reserve_write",
             payload,
@@ -369,10 +377,20 @@ class ProcessCheckpointWorker(CheckpointWorker):
             load_generation=spec.generation,
             purpose="checkpoint_capture",
         )
-        state = _Reservation(future, job)
+        state = _Reservation(
+            future, job, cooperative_pending=getattr(spec, "dcp_write_layout", None) is not None,
+        )
         with self._lock:
             self.reservations[spec.req_id, spec.generation] = state
         result = future.result(self.timeout)
+        if state.cooperative_pending and result.status == "BUSY":
+            # No peer has received an export yet. Reconcile the original
+            # operation before treating admission pressure as a safe miss.
+            result = cancel_unadmitted_operation(self.client, future, self.timeout)
+            if result.status == "CANCELLED_NOT_STARTED":
+                with self._lock:
+                    self.reservations.pop((spec.req_id, spec.generation), None)
+                raise MemoryError("Cooperative checkpoint reservation was not admitted")
         if result.status == "COMPLETED" and result.value.get("status") == "SKIPPED":
             self._ack_released(future.identity, no_leases=True)
             raise MemoryError("Checkpoint capture refused while cache is frozen")
@@ -636,7 +654,7 @@ class ProcessCheckpointWorker(CheckpointWorker):
         if state is None:
             CheckpointWorker._release(job)
             return
-        if job.quarantined:
+        if job.quarantined or state.cooperative_pending:
             return
         if state.released:
             self._ack_released(state.future.identity)

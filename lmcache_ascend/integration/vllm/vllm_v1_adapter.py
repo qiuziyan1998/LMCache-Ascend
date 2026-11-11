@@ -269,6 +269,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 else {}
             ),
         )
+        if role == KVConnectorRole.WORKER and getattr(self, "_dsa_dcp_size", None):
+            from vllm.distributed.parallel_state import get_tp_group
+            from lmcache_ascend.v1.dcp_write_group import DcpWriteGroup
+
+            self.lmcache_engine.dcp_write_group = DcpWriteGroup(
+                get_tp_group(), float(self.config.blocking_timeout_secs),
+            )
         checkpoint_worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
         if checkpoint_worker is not None:
             checkpoint_worker.configure_capacity(self._decode_window_save_window_size, self._lmcache_chunk_size)
@@ -363,6 +370,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             and self.store_async
             and not self._direct_store_requested
             and not self._force_layerwise_prefill_store
+            and not getattr(self, "_dsa_dcp_size", None)
         ):
             raise ValueError(
                 "Layerwise storing is not supported with async store"
@@ -532,6 +540,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         if (
             (self._direct_store_requested or self._force_layerwise_prefill_store)
+            and not getattr(self, "_dsa_dcp_size", None)
             and completed
             and result is not None
             and result.committed_end > 0
@@ -683,6 +692,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         **kwargs: Any,
     ) -> None:
         """Use one direct page submission after all required layers are ready."""
+        if getattr(self, "_dsa_dcp_size", None):
+            # The cooperative writer joins all layers/ranks at wait_for_save.
+            # DCP decoder caches have no rotating P banks to overwrite here.
+            return
         requests = self._direct_prefill_requests()
         if requests is None:
             super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
@@ -1275,7 +1288,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 tokens=request.token_ids,
             )
 
+    def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
+        if getattr(self, "_dsa_dcp_size", None):
+            from lmcache_ascend.v1.dcp_save import save_batch
+
+            save_batch(self, save_context)
+            return
+        super()._wait_for_save_impl(save_context)
+
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        if getattr(self, "_dsa_dcp_size", None):
+            if getattr(self.lmcache_engine, "_process_store_writes", None):
+                # Base wait_for_save must not mark its final fence complete or
+                # acknowledge HBM reuse after an uncertain cooperative capture.
+                raise RuntimeError("DCP save ownership remains unresolved")
+            return  # Cooperative captures/publication settled in the boundary above.
         if getattr(self, "_force_layerwise_prefill_store", False):
             self._finish_layerwise_prefill_batch()
             return
@@ -1977,8 +2004,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             and config.get_extra_config_value("save_only_first_rank", True)
             and not vllm_config.cache_config.enable_prefix_caching
             and load_mode_supported
-            and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size
-            == parallel.decode_context_parallel_size == 1
+            and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size == 1
+            and (parallel.decode_context_parallel_size == 1 or (
+                config.pd_role == "receiver" and config.decoder_storage_mode == "process"
+                and config.enable_async_loading and config.local_cpu
+                and config.shared_cpu_cache_strict
+                and parallel.decode_context_parallel_size == parallel.tensor_parallel_size
+                and parallel.decode_context_parallel_size in (2, 4, 8)
+            ))
             and (spec is None or (
                 spec.method in ("mtp", "deepseek_mtp") and spec.num_speculative_tokens == 1
                 and not spec.parallel_drafting and not spec.disable_padded_drafter_batch
@@ -1988,7 +2021,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "decode_preemption_checkpoint requires the two-group shared-CPU "
                 "kv_both server with async stores, cold-compact loading, "
                 "persistent_direct_hbm on a receiver or CPU loading standalone, "
-                "PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding"
+                "PP/PCP=1 with DCP=1 or cooperative DCP=TP process storage, "
+                "and ordinary or one-token padded MTP decoding"
             )
         if not callable(getattr(type(self._parent), "handle_preemptions_with_metadata", None)):
             raise ValueError("decode_preemption_checkpoint requires the dynamic LMCache checkpoint connector")
@@ -2002,5 +2036,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             # Lazy worker-only import; the scheduler must not initialize NPU ops.
             from lmcache_ascend import c_ops
 
-            if not hasattr(c_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared"):
+            if not hasattr(c_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared") or (
+                parallel.decode_context_parallel_size > 1
+                and not hasattr(c_ops, "layerwise_prefill_dma_copy")
+            ):
                 raise ValueError("Rebuild LMCache-Ascend native extension before enabling decode_preemption_checkpoint")

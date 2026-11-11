@@ -98,7 +98,7 @@ def init_api(config):
     )
     kv = NS(
         kv_cache_groups=[
-            NS(layer_names=["model.layers.0.self_attn.attn"]),
+            NS(layer_names=["model.layers.0.self_attn.attn"], kv_cache_spec=NS()),
             NS(
                 layer_names=["model.layers.0.self_attn.indexer.k_cache"],
                 kv_cache_spec=NS(cache_sparse_c8=False),
@@ -145,6 +145,22 @@ def test_invalid_checkpoint_config_is_rejected_before_services_start():
     with pytest.raises(ValueError, match="requires"):
         cls(vllm, Role.SCHEDULER, parent)
     assert calls == []
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_cooperative_checkpoint_validator_preserves_process_requirements(world):
+    config, vllm, parent = configs()
+    config.decoder_storage_mode = "process"
+    config.enable_async_loading = config.local_cpu = config.shared_cpu_cache_strict = True
+    vllm.parallel_config.decode_context_parallel_size = world
+    vllm.parallel_config.tensor_parallel_size = world
+    cls, _, _ = init_api(config)
+    owner = cls.func.__new__(cls.func)
+    owner.kv_role, owner._parent, owner._role = "kv_both", parent, Role.SCHEDULER
+    owner._validate_preemption_checkpoint_setup(config, vllm)
+    config.decoder_storage_mode = "local"
+    with pytest.raises(ValueError, match="cooperative DCP"):
+        owner._validate_preemption_checkpoint_setup(config, vllm)
 
 
 def test_scheduler_does_not_import_native_ops():

@@ -395,6 +395,20 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
         purpose = value.get("purpose", "store")
         if purpose not in ("store", "checkpoint"):
             raise StorageFailedSafe("Unknown CPU write purpose")
+        participants = value.get("participants", (identity.client_session,))
+        if not isinstance(participants, (tuple, list)) or not participants or any(
+            not isinstance(session, str) for session in participants
+        ):
+            raise StorageFailedSafe("Invalid CPU write participants")
+        participants = tuple(participants)
+        if len(participants) > 1 and (
+            identity.client_session != "worker-0"
+            or len(participants) != len(set(participants))
+            or set(participants) != self._workers
+        ):
+            raise StorageFailedSafe("Cooperative CPU writes require the complete registered worker group")
+        if len(participants) == 1 and participants != (identity.client_session,):
+            raise StorageFailedSafe("CPU write participant differs from its owner")
         reservation_id = secrets.token_hex(16)
         reservation = _WriteReservation(
             identity,
@@ -424,7 +438,7 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 lease = self.registry.add_lease(
                     identity,
                     objects,
-                    participants=(identity.client_session,),
+                    participants=participants,
                     producer_holds=3,
                     release=lambda owned: self._release_shared_retrieve_objs(
                         list(owned), unpin=False

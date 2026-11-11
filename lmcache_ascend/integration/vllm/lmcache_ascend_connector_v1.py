@@ -69,10 +69,6 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
         ):
             return None
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
-            if config.decode_preemption_checkpoint:
-                raise ValueError("Decoder DCP checkpoint capture requires cooperative shard writers")
-            if transfer.kv_role != "kv_consumer":
-                raise ValueError("Decoder DCP currently requires kv_consumer until shard-aware saving is available")
             strict_override = config.get_extra_config_value("shared_cpu_cache_strict", None)
             if (
                 config.decoder_storage_mode != "process" or not config.enable_async_loading
