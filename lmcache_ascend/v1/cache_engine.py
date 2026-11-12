@@ -1391,32 +1391,80 @@ class AscendLMCacheEngine(LMCacheEngine):
             min(state.committed_end.get(group, 0) for group in (0, 1)),
         )
 
-    def _prepare_layerwise_remote_fill_prefix(
+    @staticmethod
+    def _layerwise_ranges_contiguous(
+        ranges: Iterable[tuple[int, int]],
+    ) -> bool:
+        """Return whether the stored ranges form one contiguous interval."""
+
+        previous_end: Optional[int] = None
+        for start, end in sorted(ranges):
+            if end <= start:
+                return False
+            if previous_end is not None and start != previous_end:
+                return False
+            previous_end = end
+        return True
+
+    @staticmethod
+    def _layerwise_prefix_cover(
+        ranges: Iterable[tuple[int, int]],
+        required_store_end: int,
+        chunk_size: int,
+    ) -> tuple[int, tuple[tuple[int, int], ...]]:
+        """Return the prefix probe end and the ranges still uncovered.
+
+        ``prefix_end`` is the chunk-aligned start of the first stored range.
+        Probing ``[0, prefix_end)`` plus the stored ranges must cover the whole
+        request. A negative prefix end reports an unaligned first range; a
+        non-empty gap list reports ranges that neither side can cover.
+        """
+
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(set(ranges)):
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        if not merged:
+            return required_store_end, ()
+        first_start = merged[0][0]
+        if first_start % chunk_size:
+            return -1, ()
+        gaps: list[tuple[int, int]] = []
+        cursor = first_start
+        for start, end in merged:
+            if start > cursor:
+                gaps.append((cursor, start))
+                cursor = start
+            cursor = max(cursor, end)
+        if cursor < required_store_end:
+            gaps.append((cursor, required_store_end))
+        return first_start, tuple(gaps)
+
+    def _schedule_layerwise_prefix_probe(
         self,
         req_id: str,
         tokens: list[int],
         request_configs: Optional[dict],
         state: _DirectStoreRequestState,
+        prefix_end: int,
     ) -> None:
-        """Probe cached prefix pages before finishing a layerwise transfer.
+        """Register ``[probe_end, prefix_end)`` with pointer-free probes."""
 
-        Layerwise CPU fills only carry pages produced by the current prefill.
-        When the request reuses a prefix, those pages start after token zero
-        and the normal direct-prefill probe path is bypassed.  Rebuild the
-        canonical prefix plan and register the prefix with the same pointer-
-        free probe protocol.  Missing pages are deliberately not fabricated:
-        the transaction will fall back unless a later source-repair path is
-        explicitly available.
-        """
         remote = state.remote_fill
-        if remote is None or remote.handoff is None or not tokens:
+        if remote is None or remote.handoff is None:
             return
-        if not state.layerwise_remote_ranges:
-            return
-        first_start = min(start for start, _ in state.layerwise_remote_ranges)
         chunk_size = int(self.config.chunk_size)
-        prefix_end = first_start // chunk_size * chunk_size
-        if prefix_end <= remote.probe_end:
+        if prefix_end <= 0 or prefix_end <= remote.probe_end:
+            return
+        if prefix_end % chunk_size:
+            remote.disabled_reason = "layerwise_prefix_unaligned"
+            return
+        if len(tokens) < prefix_end:
+            remote.disabled_reason = "layerwise_prefix_tokens_unavailable"
             return
         plans = self._remote_fill_prefix_plans(
             tokens, request_configs, prefix_end
@@ -1434,7 +1482,44 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._schedule_remote_fill_probe_pages(
             req_id, state, pages, len(tokens)
         )
-        remote.probe_end = prefix_end
+        if not remote.disabled_reason:
+            remote.probe_end = prefix_end
+
+    def _prepare_layerwise_remote_fill_prefix(
+        self,
+        req_id: str,
+        tokens: list[int],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+        required_store_end: int,
+    ) -> None:
+        """Validate coverage and register a reused prefix before FINISH."""
+
+        remote = state.remote_fill
+        if remote is None or remote.handoff is None or not tokens:
+            return
+        prefix_end, gaps = self._layerwise_prefix_cover(
+            state.layerwise_remote_ranges,
+            required_store_end,
+            int(self.config.chunk_size),
+        )
+        if prefix_end < 0:
+            remote.disabled_reason = "layerwise_prefix_unaligned"
+            return
+        if gaps:
+            remote.disabled_reason = "layerwise_remote_range_gap"
+            logger.warning(
+                "Layerwise RemoteFill coverage gap: req_id=%s required=%d "
+                "prefix_end=%d gaps=%s",
+                req_id,
+                required_store_end,
+                prefix_end,
+                gaps,
+            )
+            return
+        self._schedule_layerwise_prefix_probe(
+            req_id, tokens, request_configs, state, prefix_end
+        )
 
     def _wait_direct_backpressure(self) -> None:
         limit = self._store_queue_maxsize or 2
@@ -1863,6 +1948,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def _queue_layerwise_cpu_fill(
         self,
         req_id: str,
+        tokens: list[int],
         request_configs: Optional[dict],
         kv_group: int,
         keys: list,
@@ -1894,6 +1980,22 @@ class AscendLMCacheEngine(LMCacheEngine):
         groups = self._layerwise_cpu_fill_sources.setdefault(req_id, {})
         if kv_group in groups:
             raise RuntimeError("Duplicate CPU fill group in one prefill batch")
+        if not state.layerwise_remote_ranges and starts:
+            first_start = starts[0]
+            if first_start > 0 and len(tokens) >= first_start:
+                token_list = (
+                    tokens if isinstance(tokens, list) else tokens.tolist()
+                )
+                # Register the reused prefix before the fill batch is queued so
+                # a destination hole fails the transaction before any payload
+                # is transferred.
+                self._schedule_layerwise_prefix_probe(
+                    req_id,
+                    token_list,
+                    request_configs,
+                    state,
+                    first_start,
+                )
         lease = LayerwiseCPUFillLease(tuple(pages))
         try:
             owners = tuple({
@@ -1912,7 +2014,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ranges=tuple(zip(starts, ends, strict=True)),
                 ready_events=fences,
             )
-            state.layerwise_remote_ranges.extend(batch.ranges)
+            for item in batch.ranges:
+                if item not in state.layerwise_remote_ranges:
+                    state.layerwise_remote_ranges.append(item)
             groups[kv_group] = (batch, lease)
         except BaseException:
             lease.release()
@@ -1938,6 +2042,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                 batches = [batch for batch, _ in groups.values()]
                 if any(batch.ranges != batches[0].ranges for batch in batches[1:]):
                     state.remote_fill.disabled_reason = "banked_prefill_unpaired_pages"
+                    continue
+                if state.remote_fill.disabled_reason:
+                    continue
+                if not self._layerwise_ranges_contiguous(
+                    state.layerwise_remote_ranges
+                ):
+                    state.remote_fill.disabled_reason = "banked_prefill_range_gap"
+                    logger.warning(
+                        "Layerwise RemoteFill ranges are not contiguous: "
+                        "req_id=%s ranges=%s",
+                        req_id,
+                        state.layerwise_remote_ranges,
+                    )
                     continue
                 events = tuple({
                     id(event): event
@@ -2022,7 +2139,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         if not state.remote_fill.disabled_reason:
             self._prepare_layerwise_remote_fill_prefix(
-                req_id, tokens, request_configs, state
+                req_id, tokens, request_configs, state, required_store_end
             )
         self._finish_remote_fill(req_id, state, required_store_end)
 
@@ -7713,7 +7830,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         and self.config.enable_remote_lmcache_store
                     ):
                         self._queue_layerwise_cpu_fill(
-                            req_id, request_configs, kv_group,
+                            req_id, tokens, request_configs, kv_group,
                             keys[0], memory_objs[0], starts, ends,
                         )
                     if page_store:

@@ -370,7 +370,7 @@ def test_layerwise_finish_probes_cached_prefix_before_remote_fill_finish():
     )
 
     f.engine._prepare_layerwise_remote_fill_prefix(
-        "r", list(range(2048)), None, f.state
+        "r", list(range(2048)), None, f.state, 2048
     )
 
     assert len(captured) == 1
@@ -379,9 +379,78 @@ def test_layerwise_finish_probes_cached_prefix_before_remote_fill_finish():
     assert required_end == 2048
     assert [(page.chunk_start, page.chunk_end, page.kv_group) for page in pages] == [
         (0, 1024, 0),
-        (0, 1024, 1),
     ]
     assert f.state.remote_fill.probe_end == 1024
+
+
+def test_layerwise_finish_probes_every_direct_group():
+    f = fixture(prefix=0, groups=(0, 1))
+    f.state.layerwise_remote_ranges = [(1024, 2048)]
+    captured = []
+    f.engine._schedule_remote_fill_probe_pages = (
+        lambda req_id, state, pages, required_end: captured.append(
+            (req_id, pages, required_end)
+        )
+    )
+
+    f.engine._prepare_layerwise_remote_fill_prefix(
+        "r", list(range(2048)), None, f.state, 2048
+    )
+
+    assert len(captured) == 1
+    assert [
+        (page.chunk_start, page.chunk_end, page.kv_group)
+        for page in captured[0][1]
+    ] == [(0, 1024, 0), (0, 1024, 1)]
+
+
+def test_layerwise_prefix_cover_reports_internal_gap():
+    prefix_end, gaps = AscendLMCacheEngine._layerwise_prefix_cover(
+        [(0, 1024), (2048, 3072)], 3072, 1024
+    )
+    assert prefix_end == 0
+    assert gaps == ((1024, 2048),)
+
+
+def test_layerwise_prefix_cover_reports_tail_gap():
+    prefix_end, gaps = AscendLMCacheEngine._layerwise_prefix_cover(
+        [(1024, 2048)], 3072, 1024
+    )
+    assert prefix_end == 1024
+    assert gaps == ((2048, 3072),)
+
+
+def test_layerwise_prefix_cover_rejects_unaligned_start():
+    prefix_end, gaps = AscendLMCacheEngine._layerwise_prefix_cover(
+        [(1536, 2560)], 2560, 1024
+    )
+    assert prefix_end == -1
+    assert gaps == ()
+
+
+def test_layerwise_finish_marks_coverage_gap_as_disabled():
+    f = fixture(prefix=0)
+    f.state.layerwise_remote_ranges = [(0, 1024), (2048, 3072)]
+    called = []
+    f.engine._schedule_remote_fill_probe_pages = (
+        lambda *args: called.append(args)
+    )
+
+    f.engine._prepare_layerwise_remote_fill_prefix(
+        "r", list(range(3072)), None, f.state, 3072
+    )
+
+    assert not called
+    assert f.state.remote_fill.disabled_reason == "layerwise_remote_range_gap"
+
+
+def test_layerwise_ranges_contiguous_detects_gap():
+    assert AscendLMCacheEngine._layerwise_ranges_contiguous(
+        [(0, 1024), (1024, 2048)]
+    )
+    assert not AscendLMCacheEngine._layerwise_ranges_contiguous(
+        [(0, 1024), (2048, 3072)]
+    )
 
 
 @pytest.mark.parametrize("groups", [(0,), (0, 1)])
