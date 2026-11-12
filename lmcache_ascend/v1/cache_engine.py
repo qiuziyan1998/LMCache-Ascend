@@ -6489,11 +6489,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
             mem_obj_generator = None
 
-            # Calculate total KV size for logging
-            sum(
-                obj.get_size() for obj in pending_store_release.values()
-            )
-
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             cache_chunk_indices: Optional[List[int]] = None
@@ -8850,20 +8845,19 @@ class AscendLMCacheEngine(LMCacheEngine):
                     ) = _shared_sparse_request(sparse_request)
                     if prepare_only:
                         raise ValueError("Duplicate shared sparse prepare request")
-                if direct_group1_load:
-                    pass
-                elif sparse_payload is not None:
-                    sparse_payload["memory_objs_layer"] = source
-                    ensure_mem_obj_consumer().send(sparse_payload)
-                else:
-                    ensure_mem_obj_consumer().send(
-                        (
-                            source,
-                            selected_tokens,
-                            token_start_index,
-                            target_slot_mapping,
+                if not direct_group1_load:
+                    if sparse_payload is not None:
+                        sparse_payload["memory_objs_layer"] = source
+                        ensure_mem_obj_consumer().send(sparse_payload)
+                    else:
+                        ensure_mem_obj_consumer().send(
+                            (
+                                source,
+                                selected_tokens,
+                                token_start_index,
+                                target_slot_mapping,
+                            )
                         )
-                    )
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
             if defer_finish:

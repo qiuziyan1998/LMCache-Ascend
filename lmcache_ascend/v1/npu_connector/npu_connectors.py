@@ -6891,7 +6891,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 )
                 selected_token_counts = None
-            slot_mapping_packed, selected_token_idx = (slot_mapping_packed, selected_token_idx)
             if layout.indexer_c8:
                 self._run_c8_indexer_bootstrap(
                     destination_plan, source_layer.chunk_ptrs_npu, layer_id,
@@ -7076,7 +7075,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         token_start_index,
                     )
                 )
-            slot_mapping_packed, selected_token_idx = (slot_mapping_packed, selected_token_idx)
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
@@ -7446,9 +7444,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if ordinary_store:
             # Keep D's original stream snapshot for the whole store generator.
             current_stream = torch.npu.current_stream()
-
-        def log_completed_store_layer(layer_id: int) -> None:
-            return
 
         store_transfer_pending = False
         try:
@@ -7912,7 +7907,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     # after this generator advances.
                     self.store_stream.synchronize()
                     store_transfer_pending = False
-                    log_completed_store_layer(layer_id)
 
             if deferred_layerwise_put:
                 # The P-node DMA path keeps one completion event per bank for
@@ -7946,7 +7940,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         last_store_event.synchronize()
                 store_transfer_pending = False
                 for completed_layer in range(expected_layers):
-                    log_completed_store_layer(completed_layer)
                     yield completed_layer
 
             # free the buffer memory

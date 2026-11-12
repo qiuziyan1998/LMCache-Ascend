@@ -99,7 +99,6 @@ class ProducerRequestState:
     probe_end: int = 0
     queued_bytes: int = 0
     queued_windows: int = 0
-    oldest_enqueued_at: float = 0.0
     backlog_logged: bool = False
     terminal: Optional[RemoteFillTerminalResult] = None
     disabled_reason: str = ""
@@ -111,7 +110,6 @@ class ProducerRequestState:
     viable_counted: bool = False
     active_counted: bool = False
     submitted_bytes: int = 0
-    persistent_started_at: float = 0.0
     # Full dense mappings only; borrowed until the existing request drain.
     prefix_source: tuple[dict[int, list], dict[int, Any]] | None = field(
         default=None, repr=False
@@ -248,27 +246,9 @@ class RemoteFillCoordinator:
         result: Any,
     ) -> None:
         metrics = self.get_metrics()
-        if metrics.timing_enabled:
-            metrics.observe("reserve_seconds", float(result.reserve_seconds))
-            metrics.observe("arm_seconds", float(result.arm_seconds))
         metrics.existing_pages(int(result.existing_pages))
         submitted_bytes = int(result.submitted_bytes)
         if submitted_bytes:
-            if metrics.timing_enabled:
-                metrics.observe(
-                    "source_event_wait_seconds",
-                    float(result.source_event_wait_seconds),
-                )
-                metrics.observe(
-                    "source_registration_seconds",
-                    float(result.source_registration_seconds),
-                )
-                metrics.observe(
-                    "native_slot_wait_seconds",
-                    float(result.native_slot_wait_seconds),
-                )
-                metrics.observe("native_seconds", float(result.native_seconds))
-                metrics.observe("report_seconds", float(result.report_seconds))
             metrics.add_bytes("submitted_bytes", submitted_bytes)
             state.submitted_bytes += submitted_bytes
         if not result.direct_satisfied:
@@ -503,8 +483,6 @@ class RemoteFillCoordinator:
             state.queued_windows += windows
             state.queued_bytes += byte_count
             metrics = self.get_metrics()
-            if windows and state.queued_windows == 1 and metrics.timing_enabled:
-                state.oldest_enqueued_at = time.perf_counter()
             self._queued_bytes = global_bytes + byte_count
             metrics.add_gauge("inflight_windows", windows)
             metrics.add_gauge("inflight_bytes", byte_count)
@@ -523,8 +501,6 @@ class RemoteFillCoordinator:
         with condition:
             state.queued_windows = max(0, state.queued_windows - windows)
             state.queued_bytes = max(0, state.queued_bytes - byte_count)
-            if state.queued_windows == 0:
-                state.oldest_enqueued_at = 0.0
             self._queued_bytes = max(
                 0,
                 int(getattr(self, "_queued_bytes", 0)) - byte_count,
@@ -680,13 +656,10 @@ class RemoteFillCoordinator:
             pages[offset : offset + maximum] for offset in range(0, len(pages), maximum)
         )
         metrics = self.get_metrics()
-        queued_at = time.perf_counter() if metrics.timing_enabled else 0.0
         if not self._acquire_queue_capacity(state, 0):
             state.disabled_reason = "producer_backpressure"
             metrics.abandon("producer backpressure", allocation=True)
             return
-        if metrics.timing_enabled:
-            metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
         first_window_id = state.next_window_id
         state.next_window_id += len(control_windows)
         previous = state.last_future
@@ -871,7 +844,6 @@ class RemoteFillCoordinator:
             self.config.remote_fill_max_bytes_per_request
         )
         metrics = self.get_metrics()
-        queued_at = time.perf_counter() if metrics.timing_enabled else 0.0
         if request_oversized or not self._acquire_queue_capacity(state, byte_count):
             state.disabled_reason = "producer_backpressure"
             self._log_prearm_failure(
@@ -883,8 +855,6 @@ class RemoteFillCoordinator:
             metrics = self.get_metrics()
             metrics.abandon("producer backpressure", allocation=True)
             return
-        if metrics.timing_enabled:
-            metrics.observe("queue_wait_seconds", time.perf_counter() - queued_at)
         try:
             source_plans = tuple(
                 build_remote_fill_source_plan(
@@ -1035,7 +1005,6 @@ class RemoteFillCoordinator:
         if state.terminal is not None:
             return state.terminal
         self.wait(state)
-        finish_control_seconds = 0.0
         metrics = self.get_metrics()
         try:
             if state.session is None:
@@ -1046,33 +1015,19 @@ class RemoteFillCoordinator:
                     required_store_end=required_store_end,
                 )
             else:
-                finish_started = time.perf_counter() if metrics.timing_enabled else 0.0
-                try:
-                    terminal = state.session.finish(
-                        required_store_end=required_store_end,
-                        persistent_common_end=persistent_common_end,
-                        final_partial_valid_tokens=(
-                            required_store_end % int(self.config.chunk_size)
-                        ),
-                    )
-                finally:
-                    if metrics.timing_enabled:
-                        finish_control_seconds = time.perf_counter() - finish_started
-                        metrics.observe(
-                            "finish_control_seconds",
-                            finish_control_seconds,
-                        )
+                terminal = state.session.finish(
+                    required_store_end=required_store_end,
+                    persistent_common_end=persistent_common_end,
+                    final_partial_valid_tokens=(
+                        required_store_end % int(self.config.chunk_size)
+                    ),
+                )
         except RemoteFillFatalError:
             self._latch_fatal(state)
             raise
         if terminal.outcome == "FATAL_RESTART":
             self._latch_fatal(state)
         state.terminal = terminal
-        if metrics.timing_enabled and state.persistent_started_at:
-            metrics.observe(
-                "persistent_seconds",
-                time.perf_counter() - state.persistent_started_at,
-            )
         metrics.finish_attempt(
             terminal.outcome,
             state.disabled_reason or "none",
