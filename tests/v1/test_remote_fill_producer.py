@@ -110,14 +110,12 @@ def _coordinator(engine):
 def test_finish_skips_disabled_snapshot_but_keeps_terminal_accounting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(coordinator_module, "serving_perf_enabled", lambda: False)
     accounting = []
 
     def forbidden() -> None:
         raise AssertionError("disabled producer snapshot")
 
     metrics = SimpleNamespace(
-        timing_enabled=False,
         finish_attempt=lambda *args: accounting.append(("finish", args)),
         add_gauge=lambda *args: accounting.append(("gauge", args)),
         add_bytes=lambda *args: accounting.append(("bytes", args)),
@@ -173,7 +171,7 @@ def test_probe_keeps_results_and_capacity_with_optional_perf(
     engine = SimpleNamespace(
         _executor=SimpleNamespace(submit=submit),
         _remote_fill_pages_per_window=lambda: 2,
-        get_metrics=lambda: SimpleNamespace(timing_enabled=False),
+        get_metrics=lambda: SimpleNamespace(),
         _acquire_queue_capacity=lambda *args: True,
         _release_queue_capacity=lambda *args: calls.append(("release", args)),
         _record_window_metrics=lambda *args: calls.append(("metrics", args)),
@@ -831,13 +829,10 @@ def test_transfer_arms_only_allocated_descriptor_subset() -> None:
     assert result.direct_satisfied and result.armed
     assert result.submitted_bytes == 64
     assert result.existing_pages == 1
-    assert result.reserve_seconds >= 0
-    assert result.arm_seconds >= 0
     assert result.source_event_wait_seconds == pytest.approx(0.002)
     assert result.source_registration_seconds == pytest.approx(0.001)
     assert result.native_slot_wait_seconds == pytest.approx(0.003)
     assert result.native_seconds == pytest.approx(0.001)
-    assert result.report_seconds >= 0
     assert result.native_started_monotonic == 10.0
     assert result.native_ended_monotonic == 10.001
     assert submitted[0][0] == _SESSION
@@ -2261,16 +2256,9 @@ def test_malformed_handoff_is_visible_and_uses_persistent_fallback(caplog) -> No
     assert '"action":"PERSISTENT_ONLY"' in caplog.text
 
 
-def test_producer_metrics_are_bounded_and_pointer_free(monkeypatch) -> None:
-    monkeypatch.setenv("PD_SERVING_PERF", "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
+def test_producer_metrics_are_bounded_and_pointer_free() -> None:
     metrics = RemoteFillProducerMetrics()
     metrics.start_attempt()
-    metrics.observe("reserve_seconds", 0.25)
-    metrics.observe("arm_seconds", 0.01)
-    metrics.observe("native_slot_wait_seconds", 0.02)
-    metrics.observe("report_seconds", 0.03)
-    metrics.observe("finish_control_seconds", 0.04)
     metrics.add_gauge("inflight_windows", 1)
     metrics.add_bytes("submitted_bytes", 192)
     metrics.existing_pages(1)
@@ -2282,28 +2270,19 @@ def test_producer_metrics_are_bounded_and_pointer_free(monkeypatch) -> None:
     assert snapshot["started_total"] == 1
     assert snapshot["attempts_total"]["LOCAL_FULL:none"] == 1
     assert snapshot["direct_abandoned_total"] == {"other": 1}
-    assert snapshot["timers"]["reserve_seconds"]["total_seconds"] == 0.25
-    assert snapshot["timers"]["arm_seconds"]["total_seconds"] == 0.01
-    assert snapshot["timers"]["native_slot_wait_seconds"]["total_seconds"] == 0.02
-    assert snapshot["timers"]["report_seconds"]["total_seconds"] == 0.03
-    assert snapshot["timers"]["finish_control_seconds"]["total_seconds"] == 0.04
+    assert "timers" not in snapshot
     assert snapshot["bytes"]["submitted_bytes"] == 192
     assert "0x1234" not in rendered
     assert "request-specific" not in rendered
 
 
-@pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
-def test_producer_duration_gate_preserves_operational_counters(monkeypatch, mode):
-    monkeypatch.setenv("PD_SERVING_PERF", mode)
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode.strip().lower())
+def test_producer_preserves_operational_counters():
     metrics = RemoteFillProducerMetrics()
     metrics.start_attempt()
-    metrics.observe("reserve_seconds", 0.25)
     metrics.add_gauge("inflight_bytes", 64)
     metrics.add_bytes("submitted_bytes", 64)
     metrics.finish_attempt("PERSISTENT_ONLY", "producer_backpressure")
     snapshot = metrics.snapshot()
-    assert snapshot["timers"]["reserve_seconds"]["count"] == (mode != "0")
     assert snapshot["started_total"] == 1
     assert snapshot["bytes"]["submitted_bytes"] == 64
     assert snapshot["gauges"]["inflight_bytes"] == 64
@@ -2312,11 +2291,9 @@ def test_producer_duration_gate_preserves_operational_counters(monkeypatch, mode
 
 @pytest.mark.parametrize("operation", ["probe", "transfer"])
 @pytest.mark.parametrize("reserve_fails", [False, True])
-def test_disabled_producer_control_timing_reads_no_clocks(
+def test_producer_control_reads_no_diagnostic_clocks(
     monkeypatch, operation, reserve_fails
 ):
-    monkeypatch.setenv("PD_SERVING_PERF", "0")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "0")
     monkeypatch.setattr(
         producer_module,
         "time",
@@ -2344,14 +2321,11 @@ def test_disabled_producer_control_timing_reads_no_clocks(
             submitter=lambda **_kw: pytest.fail("no native submission expected"),
             activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
         )
-    assert result.reserve_seconds == 0.0
+    assert "reserve_seconds" not in asdict(result)
     assert result.direct_satisfied is (not reserve_fails)
 
 
-@pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
-def test_producer_timing_keeps_native_deadline(monkeypatch, mode):
-    monkeypatch.setenv("PD_SERVING_PERF", mode)
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode.strip().lower())
+def test_producer_keeps_native_deadline(monkeypatch):
     clock_reads = []
 
     def clock():
@@ -2385,23 +2359,13 @@ def test_producer_timing_keeps_native_deadline(monkeypatch, mode):
     assert timeouts == [119.75]
     assert result.direct_satisfied and result.armed
     assert result.submitted_bytes == 64
-    if mode == "0":
-        assert len(clock_reads) == 2  # Only the native ownership deadline.
-        assert (
-            result.reserve_seconds == result.arm_seconds == result.report_seconds == 0.0
-        )
-    else:
-        assert result.reserve_seconds > 0
-        assert result.arm_seconds > 0
-        assert result.report_seconds > 0
+    assert len(clock_reads) == 2  # Only the native ownership deadline.
     assert any(
         isinstance(item, ReportTransferCompleteRequest) for item in client.requests
     )
 
 
-def test_disabled_queue_timing_preserves_capacity_accounting(monkeypatch):
-    monkeypatch.setenv("PD_SERVING_PERF", "0")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "0")
+def test_queue_capacity_accounting_reads_no_diagnostic_clocks(monkeypatch):
     monkeypatch.setattr(
         coordinator_module,
         "time",
@@ -2416,13 +2380,12 @@ def test_disabled_queue_timing_preserves_capacity_accounting(monkeypatch):
     state = _DirectStoreRequestState()
     assert _coordinator(engine)._acquire_queue_capacity(_producer_state(state), 60)
     assert not _coordinator(engine)._acquire_queue_capacity(_producer_state(state), 50)
-    assert state.remote_fill.oldest_enqueued_at == 0.0
     _coordinator(engine)._release_queue_capacity(_producer_state(state), 60)
     assert state.remote_fill.queued_windows == state.remote_fill.queued_bytes == 0
     snapshot = engine.remote_fill_producer_metrics_snapshot()
     assert snapshot["gauges"]["inflight_windows"] == 0
     assert snapshot["gauges"]["inflight_bytes"] == 0
-    assert snapshot["timers"]["queue_wait_seconds"]["count"] == 0
+    assert "timers" not in snapshot
 
 
 def test_global_producer_inflight_bytes_are_bounded_across_requests() -> None:
@@ -2945,7 +2908,6 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
             final=False,
             slot_mapping_base=1024,
         )
-    assert caplog.text.count('"decision":"defer_nonfinal"') == 1
     assert len(state.remote_fill.deferred_batches) == 2
     assert state.remote_fill.deferred_pages == 4
     assert state.remote_fill.deferred_bytes == 256
@@ -2981,16 +2943,10 @@ def test_nonfinal_missing_fence_retains_windowed_sources(
         (1024, 2048),
     )
     assert scheduled[0].ready_events == (event,)
-    assert '"decision":"defer_nonfinal"' in caplog.text
-    assert caplog.text.count('"decision":"retain_deferred_sources"') == 2
-    assert '"decision":"release_deferred_sources"' in caplog.text
-    assert '"reason":"complete_request_matched_fence"' in caplog.text
 
 
 @pytest.mark.parametrize("return_code", [0, -1])
-@pytest.mark.parametrize("mode", ["0", "1", "detail", "device"])
-def test_terminal_window_preserves_all_evidence(monkeypatch, return_code, mode):
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode)
+def test_terminal_window_preserves_all_evidence(monkeypatch, return_code):
     reads = []
 
     def clock():
@@ -3032,28 +2988,24 @@ def test_terminal_window_preserves_all_evidence(monkeypatch, return_code, mode):
         submitter=submitter,
         activation_factory=lambda attempt: SimpleNamespace(attempt=attempt),
     )
-    optional_duration = 0.0 if mode == "0" else 0.25
     assert asdict(result) == {
         "window_id": 0,
         "direct_satisfied": return_code == 0,
         "armed": True,
         "fatal_restart_required": False,
         "reason": "" if return_code == 0 else "native transfer failed",
-        "reserve_seconds": optional_duration,
-        "arm_seconds": optional_duration,
         "source_event_wait_seconds": 0.002,
         "source_fences_ready_monotonic": 90.0,
         "source_registration_seconds": 0.003,
         "native_slot_wait_seconds": 0.004,
         "native_seconds": 0.007,
-        "report_seconds": optional_duration,
         "native_started_monotonic": 91.0,
         "native_ended_monotonic": 91.007,
         "submitted_bytes": 64,
         "existing_pages": 1,
     }
     assert session.direct_viable is (return_code == 0)
-    assert len(reads) == (2 if mode == "0" else 8)
+    assert len(reads) == 2
 
 
 def test_coordinator_fatal_report_is_immediate_and_weak(monkeypatch):

@@ -13,7 +13,6 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.serving_perf import serving_perf_enabled
 from lmcache.v1.remote_fill import (
     PROTOCOL_VERSION,
     AbortRequest,
@@ -211,14 +210,11 @@ class RemoteFillWindowResult:
     armed: bool
     fatal_restart_required: bool = False
     reason: str = ""
-    reserve_seconds: float = 0.0
-    arm_seconds: float = 0.0
     source_event_wait_seconds: float = 0.0
     source_fences_ready_monotonic: float = 0.0
     source_registration_seconds: float = 0.0
     native_slot_wait_seconds: float = 0.0
     native_seconds: float = 0.0
-    report_seconds: float = 0.0
     native_started_monotonic: float = 0.0
     native_ended_monotonic: float = 0.0
     submitted_bytes: int = 0
@@ -251,30 +247,14 @@ class RemoteFillFatalError(RuntimeError):
 
 
 class RemoteFillProducerMetrics:
-    """Low-cardinality producer counters with opt-in duration metrics.
+    """Low-cardinality producer counters.
 
     The object is created lazily after a request has supplied a valid remote-
     fill handoff. It intentionally accepts only fixed metric names and bounded
     outcome/reason values; request IDs, transfer IDs, keys, and pointers never
-    enter the aggregate. Duration collection follows the cold-start performance
-    knob selected when this metrics object is created.
+    enter the aggregate.
     """
 
-    _TIMERS = frozenset(
-        {
-            "queue_wait_seconds",
-            "reserve_seconds",
-            "arm_seconds",
-            "source_event_wait_seconds",
-            "source_registration_seconds",
-            "native_slot_wait_seconds",
-            "native_seconds",
-            "report_seconds",
-            "persistent_seconds",
-            "finish_control_seconds",
-            "final_wait_seconds",
-        }
-    )
     _GAUGES = frozenset(
         {
             "active_transactions",
@@ -319,16 +299,12 @@ class RemoteFillProducerMetrics:
     )
 
     def __init__(self) -> None:
-        self.timing_enabled = serving_perf_enabled()
         self._lock = Lock()
         self._attempts: dict[tuple[str, str], int] = {}
         self._started_total = 0
         self._abandoned: dict[str, int] = {}
         self._failures: dict[str, int] = {}
         self._allocation_rejections: dict[str, int] = {}
-        self._timers: dict[str, list[float | int]] = {
-            name: [0, 0.0, 0.0] for name in self._TIMERS
-        }
         self._gauges = {name: 0 for name in self._GAUGES}
         self._bytes = {name: 0 for name in self._BYTE_KINDS}
         self._same_key_existing_total = 0
@@ -369,16 +345,6 @@ class RemoteFillProducerMetrics:
         bounded = self._reason(reason)
         with self._lock:
             self._failures[bounded] = self._failures.get(bounded, 0) + 1
-
-    def observe(self, name: str, seconds: float) -> None:
-        """Record a nonnegative duration for a predefined timer."""
-        if not self.timing_enabled or name not in self._TIMERS or seconds < 0:
-            return
-        with self._lock:
-            values = self._timers[name]
-            values[0] = int(values[0]) + 1
-            values[1] = float(values[1]) + seconds
-            values[2] = max(float(values[2]), seconds)
 
     def add_gauge(self, name: str, delta: int) -> None:
         """Adjust a predefined nonnegative gauge by ``delta``."""
@@ -423,14 +389,6 @@ class RemoteFillProducerMetrics:
                 "allocation_rejection_total": dict(
                     sorted(self._allocation_rejections.items())
                 ),
-                "timers": {
-                    name: {
-                        "count": int(values[0]),
-                        "total_seconds": float(values[1]),
-                        "max_seconds": float(values[2]),
-                    }
-                    for name, values in sorted(self._timers.items())
-                },
                 "gauges": dict(sorted(self._gauges.items())),
                 "bytes": dict(sorted(self._bytes.items())),
                 "same_key_existing_total": self._same_key_existing_total,
@@ -739,8 +697,6 @@ class RemoteFillProducerSession:
         if not self.direct_viable or not self.open():
             return self._abandoned_window(window_id, "open rejected")
         digest = manifest_digest(control_pages)
-        perf_enabled = serving_perf_enabled()
-        reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(
                 ReserveWindowRequest(
@@ -755,17 +711,12 @@ class RemoteFillProducerSession:
         except RemoteFillFatalError:
             raise
         except Exception:
-            reserve_seconds = (
-                time.perf_counter() - reserve_started if perf_enabled else 0.0
-            )
             self.prearm_control_unknown = True
             self.direct_viable = False
             return self._abandoned_window(
                 window_id,
                 "probe control unavailable",
-                reserve_seconds=reserve_seconds,
             )
-        reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
         except ValueError:
@@ -775,7 +726,6 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "probe result invalid",
-                reserve_seconds=reserve_seconds,
             )
         self.window_manifests.append((window_id, digest))
         existing_pages = sum(item is PageDisposition.EXISTING for item in dispositions)
@@ -788,14 +738,12 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "cached-prefix hole",
-                reserve_seconds=reserve_seconds,
                 existing_pages=existing_pages,
             )
         return RemoteFillWindowResult(
             window_id,
             True,
             False,
-            reserve_seconds=reserve_seconds,
             existing_pages=existing_pages,
         )
 
@@ -855,8 +803,6 @@ class RemoteFillProducerSession:
                 self.direct_viable = False
                 return self._abandoned_window(window_id, "source preparation failed")
         digest = manifest_digest(control_pages)
-        perf_enabled = serving_perf_enabled()
-        reserve_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reserved = self._execute(
                 ReserveWindowRequest(
@@ -871,17 +817,12 @@ class RemoteFillProducerSession:
         except RemoteFillFatalError:
             raise
         except Exception:
-            reserve_seconds = (
-                time.perf_counter() - reserve_started if perf_enabled else 0.0
-            )
             self.prearm_control_unknown = True
             self.direct_viable = False
             return self._abandoned_window(
                 window_id,
                 "reserve control unavailable",
-                reserve_seconds=reserve_seconds,
             )
-        reserve_seconds = time.perf_counter() - reserve_started if perf_enabled else 0.0
         descriptors = reserved.descriptors
         try:
             dispositions = self._validate_page_results(control_pages, reserved)
@@ -892,7 +833,6 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "reservation result invalid",
-                reserve_seconds=reserve_seconds,
             )
         self.window_manifests.append((window_id, digest))
         if reserved.code is not ResultCode.OK:
@@ -900,7 +840,6 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "reservation rejected",
-                reserve_seconds=reserve_seconds,
             )
         existing_pages = sum(item is PageDisposition.EXISTING for item in dispositions)
         if any(item is PageDisposition.MISSING for item in dispositions):
@@ -908,7 +847,6 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "direct destination hole",
-                reserve_seconds=reserve_seconds,
                 existing_pages=existing_pages,
             )
         if not descriptors:
@@ -916,7 +854,6 @@ class RemoteFillProducerSession:
                 window_id,
                 True,
                 False,
-                reserve_seconds=reserve_seconds,
                 existing_pages=existing_pages,
             )
         try:
@@ -975,11 +912,8 @@ class RemoteFillProducerSession:
             return self._abandoned_window(
                 window_id,
                 "descriptor validation failed",
-                reserve_seconds=reserve_seconds,
                 existing_pages=existing_pages,
             )
-
-        arm_started = time.perf_counter() if perf_enabled else 0.0
         try:
             armed = self._execute(
                 ArmWindowRequest(
@@ -1004,14 +938,11 @@ class RemoteFillProducerSession:
                     "ARM_WINDOW acknowledgement is ambiguous and STATUS "
                     "could not prove the armed attempt"
                 ) from status_error
-        arm_seconds = time.perf_counter() - arm_started if perf_enabled else 0.0
         if armed.code is not ResultCode.OK:
             self.direct_viable = False
             return self._abandoned_window(
                 window_id,
                 "arm rejected",
-                reserve_seconds=reserve_seconds,
-                arm_seconds=arm_seconds,
                 existing_pages=existing_pages,
             )
 
@@ -1161,7 +1092,6 @@ class RemoteFillProducerSession:
             future = None
 
         report_succeeded: bool
-        report_started = time.perf_counter() if perf_enabled else 0.0
         try:
             reported = self._execute(
                 ReportTransferCompleteRequest(
@@ -1189,7 +1119,6 @@ class RemoteFillProducerSession:
                     "terminal native report is ambiguous and STATUS could not "
                     "prove the reported result"
                 ) from status_error
-        report_seconds = time.perf_counter() - report_started if perf_enabled else 0.0
         direct_satisfied = return_code == 0 and report_succeeded
         if not direct_satisfied:
             self.direct_viable = False
@@ -1198,14 +1127,11 @@ class RemoteFillProducerSession:
             direct_satisfied,
             True,
             reason="" if direct_satisfied else "native transfer failed",
-            reserve_seconds=reserve_seconds,
-            arm_seconds=arm_seconds,
             source_event_wait_seconds=source_event_wait_seconds,
             source_fences_ready_monotonic=source_fences_ready_monotonic,
             source_registration_seconds=source_registration_seconds,
             native_slot_wait_seconds=native_slot_wait_seconds,
             native_seconds=native_seconds,
-            report_seconds=report_seconds,
             native_started_monotonic=native_started_monotonic,
             native_ended_monotonic=native_ended_monotonic,
             submitted_bytes=submitted_bytes,

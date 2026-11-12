@@ -28,7 +28,6 @@ from lmcache.v1.remote_fill import (
     ReservedPageView,
     ResultCode,
     UnsafePageLifecycleError,
-    content_digest,
 )
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch
 from lmcache.v1.storage_backend.local_cpu_backend import (
@@ -1048,8 +1047,6 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     caplog,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("PD_SERVING_PERF", "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(local)
     controls = tuple(
@@ -1086,24 +1083,6 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
         for page in call["pages"]:
             assert page.refs == 1
             assert page.pins == 0
-    group0 = tuple(
-        CacheEngineKey.from_string(controls[index].canonical_key)
-        for index in range(0, len(controls), 2)
-    )
-    group1 = tuple(
-        CacheEngineKey.from_string(controls[index].canonical_key)
-        for index in range(1, len(controls), 2)
-    )
-    expected_digest = content_digest(
-        (
-            tuple(key.to_string() for key in group0),
-            tuple(key.to_string() for key in group1),
-        )
-    )
-    assert '"inserted_keys":4' in caplog.text
-    assert '"existing_keys":0' in caplog.text
-    assert '"retention_trace_id":17' in caplog.text
-    assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 
 def test_group0_only_lifecycle_allocates_and_commits_no_group1_pages() -> None:

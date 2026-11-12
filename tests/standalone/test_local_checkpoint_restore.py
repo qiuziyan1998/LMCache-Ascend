@@ -166,6 +166,7 @@ def adapter(calls):
         Base,
     )
     obj = cls()
+    obj._decode_kv_snapshot_dir = ""
     obj._lmcache_chunk_size = 4
     obj.config = NS(pd_role="receiver")
     obj.lmcache_engine = NS(
