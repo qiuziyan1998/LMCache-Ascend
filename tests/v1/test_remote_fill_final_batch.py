@@ -359,6 +359,31 @@ def test_disabled_repair_keeps_normal_remote_fill_without_retaining_prefix(repai
     assert not f.state.remote_fill.disabled_reason
 
 
+def test_layerwise_finish_probes_cached_prefix_before_remote_fill_finish():
+    f = fixture(prefix=0)
+    f.state.layerwise_remote_ranges = [(1024, 2048)]
+    captured = []
+    f.engine._schedule_remote_fill_probe_pages = (
+        lambda req_id, state, pages, required_end: captured.append(
+            (req_id, pages, required_end)
+        )
+    )
+
+    f.engine._prepare_layerwise_remote_fill_prefix(
+        "r", list(range(2048)), None, f.state
+    )
+
+    assert len(captured) == 1
+    req_id, pages, required_end = captured[0]
+    assert req_id == "r"
+    assert required_end == 2048
+    assert [(page.chunk_start, page.chunk_end, page.kv_group) for page in pages] == [
+        (0, 1024, 0),
+        (0, 1024, 1),
+    ]
+    assert f.state.remote_fill.probe_end == 1024
+
+
 @pytest.mark.parametrize("groups", [(0,), (0, 1)])
 @pytest.mark.parametrize("tail_tokens", [1, 68, 1023])
 def test_final_call_coalesces_tail_with_full_pages_under_two_job_limit(

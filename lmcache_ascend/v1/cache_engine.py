@@ -258,6 +258,10 @@ class _DirectStoreRequestState:
     source_ready_token_end: int = 0
     source_ready_events: tuple[Any, ...] = ()
     source_ready_events_token_end: int = 0
+    # Ranges submitted by the layerwise RemoteFill path.  The ordinary direct
+    # path derives its prefix frontier from the request plan; layerwise fills
+    # are assembled from CPU pages, so retain their ranges explicitly.
+    layerwise_remote_ranges: list[tuple[int, int]] = field(default_factory=list)
     finalized: bool = False
     remote_fill: Optional[ProducerRequestState] = None
 
@@ -1387,6 +1391,51 @@ class AscendLMCacheEngine(LMCacheEngine):
             min(state.committed_end.get(group, 0) for group in (0, 1)),
         )
 
+    def _prepare_layerwise_remote_fill_prefix(
+        self,
+        req_id: str,
+        tokens: list[int],
+        request_configs: Optional[dict],
+        state: _DirectStoreRequestState,
+    ) -> None:
+        """Probe cached prefix pages before finishing a layerwise transfer.
+
+        Layerwise CPU fills only carry pages produced by the current prefill.
+        When the request reuses a prefix, those pages start after token zero
+        and the normal direct-prefill probe path is bypassed.  Rebuild the
+        canonical prefix plan and register the prefix with the same pointer-
+        free probe protocol.  Missing pages are deliberately not fabricated:
+        the transaction will fall back unless a later source-repair path is
+        explicitly available.
+        """
+        remote = state.remote_fill
+        if remote is None or remote.handoff is None or not tokens:
+            return
+        if not state.layerwise_remote_ranges:
+            return
+        first_start = min(start for start, _ in state.layerwise_remote_ranges)
+        chunk_size = int(self.config.chunk_size)
+        prefix_end = first_start // chunk_size * chunk_size
+        if prefix_end <= remote.probe_end:
+            return
+        plans = self._remote_fill_prefix_plans(
+            tokens, request_configs, prefix_end
+        )
+        pages = self._remote_fill_probe_control_pages(
+            plans, remote.probe_end, prefix_end
+        )
+        expected_pages = (
+            (prefix_end - remote.probe_end) // chunk_size
+            * len(self._remote_fill_direct_groups())
+        )
+        if len(pages) != expected_pages:
+            remote.disabled_reason = "incomplete_layerwise_prefix_plan"
+            return
+        self._schedule_remote_fill_probe_pages(
+            req_id, state, pages, len(tokens)
+        )
+        remote.probe_end = prefix_end
+
     def _wait_direct_backpressure(self) -> None:
         limit = self._store_queue_maxsize or 2
         while len(self._direct_store_jobs) >= limit:
@@ -1863,6 +1912,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ranges=tuple(zip(starts, ends, strict=True)),
                 ready_events=fences,
             )
+            state.layerwise_remote_ranges.extend(batch.ranges)
             groups[kv_group] = (batch, lease)
         except BaseException:
             lease.release()
@@ -1969,6 +2019,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         if state.remote_fill.last_future is None and state.remote_fill.session is None:
             state.remote_fill.disabled_reason = (
                 state.remote_fill.disabled_reason or "layerwise_prefill_persistent_only"
+            )
+        if not state.remote_fill.disabled_reason:
+            self._prepare_layerwise_remote_fill_prefix(
+                req_id, tokens, request_configs, state
             )
         self._finish_remote_fill(req_id, state, required_store_end)
 
