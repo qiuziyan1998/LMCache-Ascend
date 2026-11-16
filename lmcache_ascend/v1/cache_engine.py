@@ -993,6 +993,8 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> bool:
         if not bool(getattr(self.config, "enable_remote_lmcache_store", False)):
             return False
+        if not bool(getattr(self.config, "remote_fill_enabled", True)):
+            return False
         if state.remote_fill is None:
             if (
                 not isinstance(request_configs, Mapping)
@@ -10651,6 +10653,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         if self._remote_fill_decoder_initialized:
             return
         if not bool(self.config.enable_remote_lmcache_store):
+            return
+        if not bool(getattr(self.config, "remote_fill_enabled", True)):
             return
         if self.metadata.role == "scheduler" or self.config.pd_role == "sender":
             return

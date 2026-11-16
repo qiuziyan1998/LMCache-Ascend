@@ -2436,6 +2436,41 @@ def test_disabled_engine_path_creates_no_remote_work() -> None:
     assert not hasattr(engine, "_remote_fill_client_factory")
 
 
+def test_runtime_kill_switch_creates_no_remote_work() -> None:
+    state = _DirectStoreRequestState()
+    engine = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_remote_lmcache_store=True,
+            remote_fill_enabled=False,
+        )
+    )
+
+    enabled = AscendLMCacheEngine._remote_fill_prepare_request(
+        engine,
+        "request",
+        {"lmcache.remote_fill": asdict(_handoff())},
+        state,
+    )
+
+    assert enabled is False
+    assert state.remote_fill is None
+    assert not hasattr(engine, "_remote_fill_coordinator")
+
+
+def test_runtime_kill_switch_skips_decoder_runtime_startup() -> None:
+    engine = object.__new__(AscendLMCacheEngine)
+    engine.config = SimpleNamespace(
+        enable_remote_lmcache_store=True,
+        remote_fill_enabled=False,
+    )
+    engine._remote_fill_decoder_initialized = False
+
+    AscendLMCacheEngine._initialize_decoder_remote_fill(engine)
+
+    assert engine._remote_fill_decoder_initialized is False
+    assert getattr(engine, "_remote_fill_runtime", None) is None
+
+
 def test_malformed_handoff_is_visible_and_uses_persistent_fallback(caplog) -> None:
     state = _DirectStoreRequestState()
     engine = object.__new__(AscendLMCacheEngine)
