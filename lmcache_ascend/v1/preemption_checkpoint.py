@@ -223,8 +223,19 @@ class CheckpointWorker:
                                     for g in (group, 1)
                                     if g not in candidate
                                 }
+                                fixed_slots = getattr(
+                                    self.engine,
+                                    "checkpoint_uses_fixed_slots",
+                                    lambda: False,
+                                )()
                                 if not self.engine.reclaim_checkpoint_capacity(
-                                    end - cursor, missing
+                                    end - cursor,
+                                    missing,
+                                    **(
+                                        {"allocation_purpose": "checkpoint"}
+                                        if fixed_slots
+                                        else {}
+                                    ),
                                 ):
                                     raise
                                 page, _ = self._allocate_fragment(
@@ -234,6 +245,13 @@ class CheckpointWorker:
                     except MemoryError:
                         for _, _, page in candidate.values():
                             page.ref_count_down()
+                        if getattr(
+                            self.engine, "checkpoint_uses_fixed_slots", lambda: False
+                        )():
+                            # A shorter tail costs the same slot. Preserve any
+                            # completed chunks and stop after the one reclaim.
+                            end = cursor
+                            break
                         end = cursor + (end - cursor) // 2
                         continue
                     except BaseException:

@@ -28,6 +28,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.page_slot_pool import PageSlotPool
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.mooncake_layout import (
     MOONCAKE_VALID_TOKENS_TAG,
@@ -277,6 +278,16 @@ def _publish_prom_remote_fill(snapshot: Mapping[str, int] | None) -> None:
 
 class RemoteFillLocalBackend(Protocol):
     """Public LocalCPU operations required by remote fill."""
+
+    @property
+    def fixed_slots_enabled(self) -> bool:
+        """Whether admission must check each group's shared fixed-slot capacity."""
+
+    def get_page_slot_pool(self) -> PageSlotPool:
+        """Return the runtime fixed-slot pool when enabled."""
+
+    def reclaim_layer_page_slots(self, counts: Mapping[int, int]) -> bool:
+        """Reclaim only the groups needed by ordinary incoming pages."""
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         """Return whether ``key`` is currently committed."""
@@ -837,6 +848,21 @@ class AscendRemoteFillPageLifecycle:
                     missing.append(index)
             return missing
 
+        slot_pool = (
+            self._local.get_page_slot_pool()
+            if getattr(self._local, "fixed_slots_enabled", False)
+            else None
+        )
+
+        def allocation_bytes(indices: list[int]) -> int:
+            # Wire lengths remain logical. Admission charges full physical slots.
+            return sum(
+                slot_pool.specs[pages[index].kv_group].slot_bytes
+                if slot_pool is not None
+                else pages[index].expected_bytes
+                for index in indices
+            )
+
         classify_started = monotonic() if diagnose else 0.0
         missing_indices = classify_pages()
         if diagnose:
@@ -845,7 +871,7 @@ class AscendRemoteFillPageLifecycle:
         requested_bytes = 0
         if not reserve_missing:
             return finish_results()
-        requested_bytes = sum(pages[index].expected_bytes for index in missing_indices)
+        requested_bytes = allocation_bytes(missing_indices)
         capacity_started = monotonic() if diagnose else 0.0
         if requested_bytes and not self._capacity_available(requested_bytes):
             if self._capacity_reclaimer is None:
@@ -857,15 +883,26 @@ class AscendRemoteFillPageLifecycle:
             if diagnose:
                 reclaim_ms = (monotonic() - reclaim_started) * 1000
             missing_indices = classify_pages()
-            requested_bytes = sum(
-                pages[index].expected_bytes for index in missing_indices
-            )
+            requested_bytes = allocation_bytes(missing_indices)
             if not reclaimed or not self._capacity_available(requested_bytes):
                 if diagnose:
                     capacity_ms = (monotonic() - capacity_started) * 1000
                 return finish_results()
         if diagnose:
             capacity_ms = (monotonic() - capacity_started) * 1000 - reclaim_ms
+
+        if slot_pool is not None:
+            counts = {
+                group: sum(pages[index].kv_group == group for index in missing_indices)
+                for group in self._direct_groups
+            }
+            if any(slot_pool.shortages(counts, "cache").values()):
+                if not self._local.reclaim_layer_page_slots(counts):
+                    return finish_results()
+                missing_indices = classify_pages()
+                requested_bytes = allocation_bytes(missing_indices)
+                if not self._capacity_available(requested_bytes):
+                    return finish_results()
 
         allocated: dict[int, LayerPageMemoryObj] = {}
         pinned = False

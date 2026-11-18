@@ -539,6 +539,28 @@ def test_smaller_final_fragment_uses_fragmented_space_without_discarding_progres
     store.close()
 
 
+def test_fixed_slot_capture_does_not_retry_smaller_tails(api, monkeypatch):
+    engine = fake_engine()
+    engine.checkpoint_uses_fixed_slots = lambda: True
+    original = engine.allocate_checkpoint_fragment
+    attempts, reclaims = [], []
+
+    def allocate(group, tokens, caches=None):
+        attempts.append((group, tokens))
+        if len(attempts) >= 3:
+            raise MemoryError("slot quota")
+        return original(group, tokens, caches)
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = lambda n, g, **kw: reclaims.append(kw) or False
+    store, _, _ = start_capture(api, monkeypatch, engine, prefix=0)
+    assert [(r.status, r.end) for r in store.poll()] == [("captured", 4)]
+    assert attempts == [(0, 4), (1, 4), (0, 4)]
+    assert reclaims == [{"allocation_purpose": "checkpoint"}]
+    store.close()
+    assert all(p.refs == 0 for p in engine.allocated)
+
+
 def test_repeated_preemption_reuses_local_group0_and_recaptures_resident_group1(
     api, monkeypatch
 ):
