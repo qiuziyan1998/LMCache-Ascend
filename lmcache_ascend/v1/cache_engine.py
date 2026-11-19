@@ -7665,21 +7665,34 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                         tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
                     )
             finally:
-                if mem_obj_generator is not None:
-                    close_fn = getattr(mem_obj_generator, "close", None)
-                    if close_fn is not None:
-                        try:
-                            close_fn()
-                        except (GeneratorExit, RuntimeError, ValueError):
-                            pass
-                self._remove_pending_layerwise_store_objs(
-                    cached_memory_objs,
-                    pending_store_release,
-                )
-                for mem_obj in list(pending_store_release.values()):
-                    if mem_obj.is_valid():
-                        mem_obj.ref_count_down()
-                pending_store_release.clear()
+                try:
+                    if mem_obj_generator is not None:
+                        close_fn = getattr(mem_obj_generator, "close", None)
+                        if close_fn is not None:
+                            try:
+                                close_fn()
+                            except (GeneratorExit, RuntimeError, ValueError):
+                                pass
+                    self._remove_pending_layerwise_store_objs(
+                        cached_memory_objs,
+                        pending_store_release,
+                    )
+                    for mem_obj in list(pending_store_release.values()):
+                        if mem_obj.is_valid():
+                            mem_obj.ref_count_down()
+                    pending_store_release.clear()
+                finally:
+                    # This store result owns a temporary pointer-list identity.
+                    # It is not the request's retrieve cache, so the retrieve
+                    # release path never sees it; drop the connector registry
+                    # ownership here on success, failure and generator.close().
+                    # The result's tensor views still own their backing
+                    # storage, so consumers can keep reading them.
+                    release_ptrs = getattr(
+                        self.gpu_connector, "release_sparse_chunk_ptr_cache", None
+                    )
+                    if callable(release_ptrs) and cached_chunk_ptrs_npu is not None:
+                        release_ptrs(cached_chunk_ptrs_npu)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`

@@ -3322,10 +3322,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if not tables:
             return
         identity = id(cached_chunk_ptrs_npu)
-        for key in tuple(tables):
-            key_identity = key[0] if isinstance(key, tuple) else key
-            if key_identity == identity:
-                tables.pop(key, None)
+        # The registry is flat: one int key for a whole-group table plus one
+        # (identity, layer_id) key per layer row. Remove the known keys
+        # directly instead of scanning every live request's entries:
+        #   - O(layers) instead of O(total entries in the process)
+        #   - no "dictionary changed size during iteration" when another
+        #     request appends while this one is released
+        tables.pop(identity, None)
+        for layer_id in range(len(cached_chunk_ptrs_npu)):
+            tables.pop((identity, layer_id), None)
 
     def _layer_page_pointer_rows(
         self,
@@ -8909,6 +8914,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
 
         store_transfer_pending = False
+        # Declared before the try so the finally block can drop the registry
+        # entry of a fallback pointer table even when preparation fails before
+        # the table is populated.
+        deferred_dense_chunk_ptrs_npu: List[Optional[torch.Tensor]] = []
         try:
             layerwise_prefill_bank_count = 2
             layerwise_prefill_bank_offset = 0
@@ -8946,7 +8955,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # dense-direct native states before the generator's priming yield.
             deferred_dense_layer_tensors: Optional[List[List[torch.Tensor]]] = None
             deferred_dense_chunk_dev_ptrs: List[List[int]] = []
-            deferred_dense_chunk_ptrs_npu: List[Optional[torch.Tensor]] = []
             deferred_dense_layer_states: List[Any] = []
             deferred_dense_validation_keys: List[tuple] = []
             deferred_dma_copies: List[List[tuple[int, int, int]]] = []
@@ -9433,6 +9441,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._synchronize_layerwise_prefill_dma_streams(kv_group)
                 else:
                     self.store_stream.synchronize()
+            if deferred_dense_chunk_ptrs_npu:
+                # Native readers of this fallback table were fenced above.
+                # The table belongs to this transfer generator, so drop its
+                # registry entry here; otherwise every deferred non-raw-DMA
+                # store leaves one behind.
+                self.release_sparse_chunk_ptr_cache(deferred_dense_chunk_ptrs_npu)
             if (
                 self.use_gpu
                 and tmp_gpu_buffer_obj is not None
