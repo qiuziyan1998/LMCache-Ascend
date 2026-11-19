@@ -56,9 +56,9 @@ def scheduler_adapter(api):
         kv_resume_checkpoint=(1, 12, 11),
     )
     request.is_finished = lambda: request.status == "finished"
-    pending = control.PendingCheckpoint(
-        control.CaptureSpec("r", 1, 0, 13, 3, ((1,), (2,)), prefix_end=3), "ready", 11
-    )
+    capture = control.CaptureSpec("r", 1, 0, 13, 3, ((1,), (2,)), prefix_end=3)
+    pending = control.PendingCheckpoint(capture, "persisting", end=11)
+    assert pending.accept(control.CheckpointResult("r", 1, "ready", 11))
     adapter._preemption_checkpoints = {"r": pending}
     adapter._checkpoint_restore_attempts = {"r": (1, 7)}
     adapter._unfinished_requests = {"r": request}
@@ -105,6 +105,8 @@ def promote(request, retry=True):
     )
     scheduler = cls()
     scheduler.connector = object()
+    scheduler._log_request_transition = lambda *args, **kwargs: None
+    scheduler._dsa_dcp = False
     scheduler.recompute_kv_load_failures = False
     scheduler.finished_recving_kv_req_ids = {"r"}
     scheduler.failed_recving_kv_req_ids = set()
@@ -405,6 +407,22 @@ def test_cancel_after_miss_still_releases_owners_without_claiming_ready(api):
     assert not hasattr(request, "kv_resume_checkpoint_retry")
     assert adapter._checkpoint_restore_releases == [("r", 1, 7)]
     assert pending.restore_miss is None
+
+
+def test_receiver_declines_a_shorter_checkpoint_after_receive_retirement(api):
+    adapter, request, pending, _ = scheduler_adapter(api)
+    adapter.config.pd_role = "receiver"
+    adapter._cold_perf_lookup_started = {}
+    adapter.accept_preemption_result(
+        api[0].CheckpointResult("r", 1, "restore_miss", 8, load_generation=7)
+    )
+    adapter.update_connector_output(receipt({"r"}))
+    promote(request)
+    adapter.lookup_client.lookup_cache = lambda **kw: 8
+    assert pending.end == 8
+    assert adapter.get_num_new_matched_tokens(request, 0) == 0
+    assert request.min_kv_prefix_tokens == 11
+    assert request.request_id not in adapter.load_specs
 
 
 def test_successful_shorter_restore_becomes_ready_without_replaying_old_miss(api):
