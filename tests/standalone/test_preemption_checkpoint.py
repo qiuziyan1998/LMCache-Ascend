@@ -6,6 +6,7 @@ Run with --confcutdir=tests/standalone to avoid the NPU bootstrap.
 
 import gc
 import importlib.util
+import logging
 from pathlib import Path
 import sys
 import threading
@@ -37,6 +38,9 @@ def api(monkeypatch):
         "UnknownDMA", (RuntimeError,), {}
     )
     monkeypatch.setitem(sys.modules, native.__name__, native)
+    log_module = ModuleType("lmcache.logging")
+    log_module.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, log_module.__name__, log_module)
 
     def load(name, path):
         spec = importlib.util.spec_from_file_location(name, path)

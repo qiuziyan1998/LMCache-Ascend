@@ -11096,15 +11096,32 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
     def load_checkpoint_page(
-        self, key: CacheEngineKey, group: int, tokens: int, req_id: str
+        self, key: CacheEngineKey, group: int, tokens: int, req_id: str,
+        *, generation: int | None = None,
     ) -> Any:
         """Load a canonical checkpoint page, retaining unknown native destinations."""
         try:
             page, _ = self.allocate_checkpoint_fragment(group, tokens)
-        except MemoryError:
-            if not self.reclaim_checkpoint_capacity(tokens, {group: None}):
+        except MemoryError as error:
+            logger.info(
+                "[CHECKPOINT_WORKSPACE] op=reload req=%s generation=%s group=%d "
+                "phase=remote_page tokens=%d event=refused free_slots_observed=%s",
+                req_id, generation, group, tokens,
+                getattr(error, "free_slots_observed", None),
+            )
+            reclaimed = self.reclaim_checkpoint_capacity(tokens, {group: None})
+            logger.info(
+                "[CHECKPOINT_WORKSPACE] op=reload req=%s generation=%s group=%d "
+                "phase=remote_page event=reclaim success=%s",
+                req_id, generation, group, reclaimed,
+            )
+            if not reclaimed:
                 raise
             page, _ = self.allocate_checkpoint_fragment(group, tokens)
+            logger.info(
+                "[CHECKPOINT_WORKSPACE] op=reload req=%s generation=%s group=%d "
+                "phase=remote_page event=retry success=True", req_id, generation, group,
+            )
         try:
             self.storage_manager.batched_get_external_pages(
                 [key],
@@ -11430,7 +11447,12 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ),
             )
             if not pages:
-                raise MemoryError("Checkpoint CPU staging allocation refused")
+                error = MemoryError("Checkpoint CPU staging allocation refused")
+                if getattr(local, "fixed_slots_enabled", False):
+                    error.free_slots_observed = local.get_page_slot_pool().snapshot()[group][
+                        "free_slots"
+                    ]
+                raise error
             return pages[0], widths
 
         return allocate

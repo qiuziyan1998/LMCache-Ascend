@@ -64,7 +64,7 @@ def deployment(api, monkeypatch):
         result.set_result(None)
         return result
 
-    def get(key, group, tokens, req_id):
+    def get(key, group, tokens, req_id, *, generation=None):
         engine.gets.append(key)
         if key not in engine.remote:
             return None
@@ -643,6 +643,65 @@ def test_spill_and_normalize_have_independent_single_reclaim_budgets(
         assert len(reclaims) == 1
 
 
+@pytest.mark.parametrize("evictable", [1, 2])
+@pytest.mark.parametrize("operation", ["restore", "spill"])
+def test_fixed_slot_boundary_reclaims_for_prefix_and_output(deployment, evictable, operation):
+    engine, create, _ = deployment
+    store = create()
+    record = store.local.records["r", 1]
+    original_allocate = engine.allocate_checkpoint_fragment
+    available, reclaimed, workspace = 0, [], []
+    engine.checkpoint_uses_fixed_slots = lambda: True
+    engine.get_checkpoint_prefix = lambda *args, **kw: None
+
+    def allocate(group, tokens):
+        nonlocal available
+        if group == 0 and len(workspace) < 2:
+            if available == 0:
+                raise MemoryError("no same-group slot")
+            available -= 1
+            result = original_allocate(group, tokens)
+            workspace.append(result[0])
+            return result
+        return original_allocate(group, tokens)
+
+    def prefix(tokens, group, configs):
+        length = len(tokens) % engine.config.chunk_size
+        page, _ = allocate(group, length)
+        fill(page, len(tokens) - length, group)
+        return page
+
+    def reclaim(tokens, groups):
+        nonlocal available
+        reclaimed.append(groups)
+        if len(reclaimed) > evictable:
+            return False
+        available += 1
+        return True
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.load_checkpoint_prefix = prefix
+    engine.reclaim_checkpoint_capacity = reclaim
+
+    def run():
+        if operation == "restore":
+            _, owners = store.local.normalize("r", 1, list(range(11)), None)
+            for page in owners:
+                page.ref_count_down()
+        else:
+            assert store.local._spill(record, record.groups)
+
+    if evictable == 1:
+        miss = sys.modules["lmcache.integration.vllm.preemption_checkpoint"].CheckpointRestoreMiss
+        with pytest.raises(miss if operation == "restore" else MemoryError):
+            run()
+    else:
+        run()
+    assert reclaimed == [{0: None}, {0: None}]
+    assert len(workspace) == evictable
+    assert workspace[0].refs == 0  # Retained prefix released on either outcome.
+
+
 def test_repreemption_holds_nonresident_latent_until_new_retention(deployment, api):
     from types import SimpleNamespace as NS
 
@@ -714,7 +773,7 @@ def test_restore_allocation_failure_is_a_safe_miss(deployment):
     for key in tuple(engine.backend.pages):
         engine.backend.evict(key)
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise MemoryError("full")
 
     engine.load_checkpoint_page = fail

@@ -336,7 +336,7 @@ class CheckpointWritebackStore(LocalCheckpointStore):
         remote = [[], []]
         chunk = int(self.engine.config.chunk_size)
         base = manifest.prefix_end // chunk * chunk
-        reserve = self._allocation_retry()
+        reserve = self._allocation_retry("spill", *manifest.identity)
         tokens = list(manifest.tokens)  # TokenDatabase accepts lists, not tuples.
         chunk_plan = {}
 
@@ -479,6 +479,7 @@ class CheckpointWritebackStore(LocalCheckpointStore):
                                     group,
                                     descriptor.end - descriptor.start,
                                     manifest.identity[0],
+                                    generation=manifest.identity[1],
                                 )
                             except MemoryError:
                                 # No device work; retain the shorter paired proof.

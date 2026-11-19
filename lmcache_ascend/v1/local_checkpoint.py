@@ -7,6 +7,12 @@ from threading import Lock
 from typing import Any
 
 from lmcache.integration.vllm.preemption_checkpoint import CheckpointRestoreMiss
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+# A canonical boundary can need a retained prefix and a new output at once.
+_WORKSPACE_RECLAIMS_PER_GROUP = 2
 
 
 def clear_failure_tracebacks(error: BaseException) -> None:
@@ -158,6 +164,7 @@ class LocalCheckpointStore:
                     ),
                     group,
                     manifest.prefix_end - base,
+                    "prefix",
                 )
                 selected.insert(
                     0,
@@ -172,6 +179,7 @@ class LocalCheckpointStore:
                 lambda: self.engine.allocate_checkpoint_fragment(group, end - start),
                 group,
                 end - start,
+                "output",
             )
             self._assemble(page, widths, selected, start, end)
             return page
@@ -214,7 +222,7 @@ class LocalCheckpointStore:
             raise ValueError("Local checkpoint generation/history is unavailable")
         common, groups = self.acquire(manifest, len(tokens))
         owners: list[Any] = []
-        reserve = self._allocation_retry()
+        reserve = self._allocation_retry("restore", req_id, generation)
         covered = manifest.prefix_end
 
         try:
@@ -313,21 +321,58 @@ class LocalCheckpointStore:
 
         return select
 
-    def _allocation_retry(self) -> Callable[[Callable[[], Any], int, int], Any]:
-        """Give one operation a private, single-reclaim allocation budget."""
-        reclaimed = False
+    def _allocation_retry(
+        self, operation: str, req_id: str, generation: int
+    ) -> Callable[[Callable[[], Any], int, int, str], Any]:
+        """Retry each refused allocation once, with an operation-local scan cap."""
+        fixed_slots = getattr(self.engine, "checkpoint_uses_fixed_slots", lambda: False)()
+        remaining = {0: _WORKSPACE_RECLAIMS_PER_GROUP, 1: _WORKSPACE_RECLAIMS_PER_GROUP}
+        legacy_budget = 1
 
-        def reserve(factory: Callable[[], Any], group: int, count: int) -> Any:
-            nonlocal reclaimed
+        def reserve(
+            factory: Callable[[], Any], group: int, tokens: int, phase: str
+        ) -> Any:
+            nonlocal legacy_budget
             try:
                 return factory()
-            except MemoryError:
-                if reclaimed:
+            except MemoryError as error:
+                detail = (operation, req_id, generation, group, phase, tokens)
+                logger.info(
+                    "[CHECKPOINT_WORKSPACE] op=%s req=%s generation=%d group=%d "
+                    "phase=%s tokens=%d event=refused free_slots_observed=%s",
+                    *detail, getattr(error, "free_slots_observed", None),
+                )
+                budget = remaining[group] if fixed_slots else legacy_budget
+                if budget == 0:
+                    logger.info(
+                        "[CHECKPOINT_WORKSPACE] op=%s req=%s generation=%d group=%d "
+                        "phase=%s tokens=%d event=budget_exhausted", *detail,
+                    )
                     raise
-                reclaimed = True
-                if not self.engine.reclaim_checkpoint_capacity(count, {group: None}):
+                if fixed_slots:
+                    remaining[group] -= 1
+                else:
+                    legacy_budget -= 1
+                reclaimed = self.engine.reclaim_checkpoint_capacity(tokens, {group: None})
+                logger.info(
+                    "[CHECKPOINT_WORKSPACE] op=%s req=%s generation=%d group=%d "
+                    "phase=%s tokens=%d event=reclaim success=%s", *detail, reclaimed,
+                )
+                if not reclaimed:
                     raise
-                return factory()
+                try:
+                    result = factory()
+                except MemoryError:
+                    logger.info(
+                        "[CHECKPOINT_WORKSPACE] op=%s req=%s generation=%d group=%d "
+                        "phase=%s tokens=%d event=retry success=False", *detail,
+                    )
+                    raise
+                logger.info(
+                    "[CHECKPOINT_WORKSPACE] op=%s req=%s generation=%d group=%d "
+                    "phase=%s tokens=%d event=retry success=True", *detail,
+                )
+                return result
 
         return reserve
 
