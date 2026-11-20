@@ -375,9 +375,11 @@ def prepare_source_addresses(
             owners, identities, starts, ends, previous.table, keep, 0, 0
         )
     suffix = owners[keep:]
-    columns = torch.tensor(
-        [list(map(host_ptr, suffix)), list(map(host_tokens, suffix))],
-        dtype=torch.long,
+    columns = torch.stack(
+        (
+            _ptrs_to_int64_tensor(list(map(host_ptr, suffix))),
+            torch.tensor(list(map(host_tokens, suffix)), dtype=torch.long),
+        )
     )
     table, copied = _append_cpu_columns(
         previous.table if keep else None, keep, columns
@@ -555,6 +557,21 @@ def plan_bundle_copies(slots, chunk_sizes, bundle_tokens) -> DmaPlan:
     )
 
 
+def _ptrs_to_int64_tensor(ptrs) -> torch.Tensor:
+    if isinstance(ptrs, torch.Tensor):
+        return (
+            ptrs.view(torch.int64)
+            if ptrs.dtype == torch.uint64
+            else ptrs.to(dtype=torch.long)
+        )
+    sign_bit = 1 << 63
+    mod_64 = 1 << 64
+    vals = [int(v) for v in ptrs]
+    if any(v >= sign_bit for v in vals):
+        vals = [v - mod_64 if v >= sign_bit else v for v in vals]
+    return torch.tensor(vals, dtype=torch.long)
+
+
 def bind_copy_addresses(
     plan,
     host_ptrs,
@@ -567,8 +584,8 @@ def bind_copy_addresses(
     host_chunk_tokens=None,
 ):
     """Broadcast segments x planes, returning native (dst, src, bytes) rows."""
-    host = torch.as_tensor(host_ptrs, dtype=torch.long)
-    npu = torch.as_tensor(npu_ptrs, dtype=torch.long)
+    host = _ptrs_to_int64_tensor(host_ptrs)
+    npu = _ptrs_to_int64_tensor(npu_ptrs)
     widths = torch.as_tensor(plane_widths, dtype=torch.long)
     sizes = torch.as_tensor(chunk_sizes, dtype=torch.long)
     physical = torch.as_tensor(
@@ -591,4 +608,9 @@ def bind_copy_addresses(
     device = npu[None, :] + plan.slot[:, None] * byte_width[None, :]
     size = plan.tokens[:, None] * byte_width[None, :]
     dst, src = (cpu, device) if device_to_host else (device, cpu)
-    return torch.stack((dst, src, size), dim=-1).reshape(-1, 3).tolist()
+    return (
+        torch.stack((dst, src, size), dim=-1)
+        .reshape(-1, 3)
+        .view(torch.uint64)
+        .tolist()
+    )

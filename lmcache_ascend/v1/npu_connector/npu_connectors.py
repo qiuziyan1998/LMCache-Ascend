@@ -922,7 +922,18 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 self.num_layers, dtype=torch.int64, device="cpu"
             )
 
-        self.kv_cache_pointers.numpy()[:] = pointers_list
+        sign_bit = 1 << 63
+        mod_64 = 1 << 64
+        self.kv_cache_pointers.copy_(
+            torch.tensor(
+                [
+                    int(p) - mod_64 if int(p) >= sign_bit else int(p)
+                    for p in pointers_list
+                ],
+                dtype=torch.int64,
+                device="cpu",
+            )
+        )
 
         self.kv_cache_pointers_on_gpu[idx] = torch.empty(
             self.kv_cache_pointers.shape, dtype=torch.int64, device=self.kvcaches_device
@@ -2346,6 +2357,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             deferred = self._deferred_sparse_pointer_caches = {}
         deferred[id(cached_chunk_ptrs_npu)] = cached_chunk_ptrs_npu
 
+    def prepare_layerwise_prefill_group0_skip(self, **kwargs) -> None:
+        """Initialize Group-0 layout/banks when Selected KV skips Group-0 DMA."""
+        self.initialize_kvcaches_ptr(**kwargs)
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        if kvcaches_snapshot is not None:
+            self._lazy_initialize_buffer_with_staging(
+                kvcaches_snapshot,
+                kv_group=0,
+                init_staging=False,
+            )
+        bank_count = 2
+        if getattr(self, "_layerwise_prefill_dma", False):
+            bank_count = int(kwargs.get("layerwise_prefill_bank_count", 2) or 2)
+        self._set_layerwise_prefill_bank_count(0, bank_count)
+
     def materialize_sparse_chunk_ptr_cache(
         self,
         cached_chunk_dev_ptrs: List[List[int]],
@@ -2371,12 +2397,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
         if defer_copy:
             table = self.stage_dense_load_tensor(
-                torch.tensor(cached_chunk_dev_ptrs, dtype=torch.long),
+                self._dva_to_int64_tensor(cached_chunk_dev_ptrs),
                 dtype=torch.long,
             )
         else:
-            table = torch.tensor(
-                cached_chunk_dev_ptrs, dtype=torch.long, device=self.kv_device
+            table = self._dva_to_int64_tensor(
+                cached_chunk_dev_ptrs,
+                device=(
+                    getattr(self, "kv_device", None)
+                    or getattr(self, "device", None)
+                ),
             )
         tables = getattr(self, "_layerwise_pointer_tables", None)
         if tables is None:
@@ -2388,6 +2418,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         }
         cached_chunk_ptrs_npu[:] = list(table.unbind(0))
         self._deferred_sparse_pointer_caches.pop(id(cached_chunk_ptrs_npu))
+
+    @staticmethod
+    def _dva_to_int64_tensor(
+        rows: Any, device: Any = None, *, pin_memory: bool = False
+    ) -> torch.Tensor:
+        sign_bit = 1 << 63
+        mod_64 = 1 << 64
+        if rows and isinstance(rows[0], (list, tuple)):
+            if any(int(v) >= sign_bit for r in rows for v in r):
+                rows = [
+                    [
+                        int(v) - mod_64 if int(v) >= sign_bit else int(v)
+                        for v in r
+                    ]
+                    for r in rows
+                ]
+        elif any(int(v) >= sign_bit for v in rows):
+            rows = [
+                int(v) - mod_64 if int(v) >= sign_bit else int(v) for v in rows
+            ]
+        if device is not None:
+            return torch.tensor(rows, dtype=torch.long, device=device)
+        if pin_memory:
+            return torch.tensor(rows, dtype=torch.long, pin_memory=True)
+        return torch.tensor(rows, dtype=torch.long)
 
     def append_sparse_chunk_ptr_cache_for_layer(
         self,
@@ -2445,8 +2500,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
             return
 
-        new_ptrs_npu = torch.tensor(
-            new_dev_ptrs, dtype=torch.long, device=self.kv_device
+        target_device = getattr(self, "kv_device", None) or getattr(
+            self, "device", None
+        )
+        new_ptrs_npu = self._dva_to_int64_tensor(
+            new_dev_ptrs, device=target_device
         )
         existing = cached_chunk_ptrs_npu[layer_id]
         tables = getattr(self, "_layerwise_pointer_tables", None)
@@ -2511,8 +2569,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         updated_ptrs_npu = None
         if cached_chunk_ptrs_npu is not None:
-            new_ptrs_npu = torch.tensor(
-                new_dev_ptrs, dtype=torch.long, device=self.kv_device
+            target_device = getattr(self, "kv_device", None) or getattr(
+                self, "device", None
+            )
+            new_ptrs_npu = self._dva_to_int64_tensor(
+                new_dev_ptrs, device=target_device
             )
             existing = (
                 cached_chunk_ptrs_npu[layer_id]
@@ -2744,7 +2805,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             table = state["table"]
             if suffix_count:
-                suffix_cpu = torch.as_tensor(staged_rows, dtype=torch.long)
+                suffix_cpu = self._dva_to_int64_tensor(staged_rows)
                 if defer_copy and table.device.type != "cpu":
                     suffix_device = self.stage_dense_load_tensor(
                         suffix_cpu, dtype=torch.long
@@ -2791,12 +2852,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if cached_chunk_ptrs_npu is not None:
             if defer_copy:
                 pointer_table = self.stage_dense_load_tensor(
-                    torch.tensor(complete_rows, dtype=torch.long),
+                    self._dva_to_int64_tensor(complete_rows),
                     dtype=torch.long,
                 )
             else:
-                pointer_table = torch.tensor(
-                    complete_rows, dtype=torch.long, device=self.kv_device
+                target_device = getattr(self, "kv_device", None) or getattr(
+                    self, "device", None
+                )
+                pointer_table = self._dva_to_int64_tensor(
+                    complete_rows, device=target_device
                 )
             # The row views retain the table storage after this function returns.
             row_views = list(pointer_table.unbind(0))
@@ -4105,8 +4169,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 for chunk_index, source in enumerate(pointer_sources)
             ]
         with self._stream_context_or_null(stream):
-            chunk_ptrs_npu = torch.tensor(
-                dev_ptrs, dtype=torch.long, device=self.kv_device
+            target_device = getattr(self, "kv_device", None) or getattr(
+                self, "device", None
+            )
+            chunk_ptrs_npu = self._dva_to_int64_tensor(
+                dev_ptrs, device=target_device
             )
         if cached_chunk_dev_ptrs is not None:
             while len(cached_chunk_dev_ptrs) <= layer_id:
@@ -4332,9 +4399,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     layer[0], layer[1] if len(layer) == 2 else None,
                     layout.layer_slot_factors[layer_id],
                 )
-                prepared.append((state,
-                    torch.tensor(pointers, dtype=torch.long, device=layout.kv_device),
-                    *metadata))
+                prepared.append(
+                    (
+                        state,
+                        self._dva_to_int64_tensor(
+                            pointers, device=layout.kv_device
+                        ),
+                        *metadata,
+                    )
+                )
             ready = torch.npu.Event()
             ready.record(transfer_stream)
         for bank in range(len(block_ids_by_bank)):
@@ -5444,7 +5517,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dtype=torch.int32,
             pin_memory=True,
         )
-        pointers = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
+        pointers = self._dva_to_int64_tensor(rows, pin_memory=True)
         with self._stream_context_or_null(self.store_stream):
             offsets_npu = offsets.to(self.kv_device, non_blocking=True)
             sizes_npu = sizes.to(self.kv_device, non_blocking=True)
@@ -5827,9 +5900,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     view.copy_(tensor.view(-1)[:size], non_blocking=True)
                 views.append(view)
                 offset += size
-            pointers = torch.tensor(
+            pointers = self._dva_to_int64_tensor(
                 [view.data_ptr() for view in views],
-                dtype=torch.int64,
                 device=staging.device,
             )
             staging.record_stream(stream)
@@ -8049,7 +8121,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if not deferred_layerwise_put:
                 yield None
         finally:
-            if store_transfer_pending and not ordinary_store:
+            if store_transfer_pending:
                 if prefill_dma:
                     pending_streams = tuple({
                         id(stream): stream
@@ -8064,10 +8136,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         stream.synchronize()
                 except BaseException:
                     pending_owners = [
-                        obj for layer_objs in memory_objs for obj in layer_objs
+                        obj
+                        for lid, layer_objs in enumerate(memory_objs)
+                        for obj in _layer_source_memory_objs(layer_objs, lid)
                     ]
                     if tmp_gpu_buffer_obj is not None:
                         pending_owners.append(tmp_gpu_buffer_obj)
+                        tmp_gpu_buffer_obj = None
                     self._retain_unfenced_layerwise_prefill_store(
                         str(kwargs.get("req_id", "unspecified")),
                         pending_streams, pending_owners,
@@ -8085,8 +8160,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 and tmp_gpu_buffer_obj is not None
                 and tmp_gpu_buffer_obj.is_valid()
             ):
-                if ordinary_store:
-                    self.store_stream.synchronize()
                 tmp_gpu_buffer_obj.ref_count_down()
 
 
