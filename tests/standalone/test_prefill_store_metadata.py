@@ -139,6 +139,7 @@ def _engine():
     engine._is_passive = lambda: False
     engine.is_frozen = lambda: False
     engine.storage_manager = object()
+    engine._shared_local_cpu_backend = lambda: None
     engine.gpu_connector = object()
     engine._get_req_id = lambda kwargs: kwargs["req_id"]
     engine._log_kvcache_for_check = lambda **kwargs: None
@@ -268,6 +269,43 @@ def test_decoder_flat_partial_store_restores_logical_valid_tokens():
     assert [[obj.metadata.valid_tokens for obj in chunk] for chunk in allocated] == [
         [4, 4], [2, 2],
     ]
+
+
+def test_fixed_slot_store_failure_never_falls_back_to_single_layer_allocations():
+    engine, Cache = _engine()
+    engine.store_layer.__func__.__globals__["mooncake_layer_pages_enabled"] = (
+        lambda config: True
+    )
+    engine._layerwise_chunk_fully_stored = lambda *a, **kw: False
+    attempts = []
+    local = NS(
+        fixed_slots_enabled=True,
+        batched_allocate_layer_pages=lambda *a, **kw: attempts.append(kw) or None,
+    )
+    engine._shared_local_cpu_backend = lambda: local
+    engine.gpu_connector = NS(get_shape=lambda *a, **kw: torch.Size([4]))
+    engine.storage_manager = NS(
+        supports_batched_put_layer_pages=lambda location: True,
+        batched_allocate=lambda *a, **kw: pytest.fail("legacy single-layer allocation"),
+    )
+    with pytest.raises(RuntimeError, match="CPU cache is full"):
+        next(_store(engine, Cache(), list(range(6))))
+    assert len(attempts) == 2  # One batch, then one page with bounded reclamation.
+
+
+def test_automatic_fixed_slots_reject_store_without_page_publication():
+    engine, Cache = _engine()
+    engine.store_layer.__func__.__globals__["mooncake_layer_pages_enabled"] = (
+        lambda config: True
+    )
+    engine._shared_local_cpu_backend = lambda: NS(fixed_slots_enabled=True)
+    engine.storage_manager = NS(
+        supports_batched_put_layer_pages=lambda location: False,
+        batched_allocate=lambda *a, **kw: pytest.fail("legacy single-layer allocation"),
+    )
+    # No explicit counts: the active allocator determines fixed-slot admission.
+    with pytest.raises(ValueError, match="requires all-layer page publication"):
+        next(_store(engine, Cache(), list(range(6))))
 
 
 def test_default_store_planner_keeps_legacy_iterable_and_frontier_contract():

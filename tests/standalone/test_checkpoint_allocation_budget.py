@@ -96,6 +96,28 @@ def test_single_missing_group_does_not_request_capacity_for_the_other():
     assert not engine.reclaim_checkpoint_capacity(8, {})
 
 
+def test_fixed_slots_reclaim_group_counts_and_label_allocation_purposes():
+    engine, local, calls = engine_fixture(False)
+    local.fixed_slots_enabled = True
+    reclaimed, purposes = [], []
+    local.reclaim_layer_page_slots = lambda counts, **kw: (
+        reclaimed.append((counts, kw)) or True
+    )
+    local.batched_allocate_layer_pages = lambda *args, **kw: (
+        purposes.append(kw["allocation_purpose"]) or [object()]
+    )
+    assert engine.reclaim_checkpoint_capacity(
+        1, {0: None}, allocation_purpose="checkpoint"
+    )
+    assert reclaimed == [
+        ({0: 1}, dict(allocation_purpose="checkpoint", max_scan_entries=4096))
+    ]
+    engine.prepare_checkpoint_allocator(0)(1)
+    engine.allocate_checkpoint_fragment(1, 1)
+    assert purposes == ["checkpoint", "workspace"]
+    assert not calls  # Never use total-free-byte reclamation in fixed-slot mode.
+
+
 def test_allocation_remains_single_attempt_without_implicit_eviction_or_wait():
     engine, local, calls = engine_fixture(False)
     attempts = []
