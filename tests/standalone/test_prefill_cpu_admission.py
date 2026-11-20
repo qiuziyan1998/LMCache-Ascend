@@ -14,6 +14,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 LM = ROOT.parent / "LMCache"
+if not LM.is_dir():
+    LM = ROOT.parent / "LMCache-NPU"
 spec = importlib.util.spec_from_file_location(
     "admission_connector_tested", LM / "lmcache/v1/prefill_admission.py"
 )
@@ -130,6 +132,12 @@ def initialize_reports(obj):
     )
 
 
+def test_fixed_slot_admission_uses_the_allocator_pair_charge():
+    obj, pool, _ = implementation()
+    pool["page_bytes"] = 4096
+    assert obj._build_prefill_admission_report()[0]["page_bytes"] == 4096
+
+
 def test_no_lookup_or_pinning_before_allocator_bootstrap_or_when_third_does_not_fit():
     obj, _, _ = implementation()
     assert obj.has_pending_control()
@@ -231,11 +239,12 @@ def test_capacity_metadata_does_not_change_model_or_bank_code():
 def test_oversize_error_ends_only_the_request_in_real_scheduler_method():
     path = ROOT.parent / "vllm/vllm/v1/core/sched/scheduler.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    fn = next(
+    methods = [
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_reject_kv_admission_error"
-    )
+        if isinstance(n, ast.FunctionDef)
+        and n.name in ("_reject_kv_admission_error", "_finish_kv_admission_error")
+    ]
     future = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
     )
@@ -246,7 +255,7 @@ def test_oversize_error_ends_only_the_request_in_real_scheduler_method():
     )
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[future, fn], type_ignores=[])),
+            ast.fix_missing_locations(ast.Module(body=[future, *methods], type_ignores=[])),
             str(path),
             "exec",
         ),
@@ -254,11 +263,12 @@ def test_oversize_error_ends_only_the_request_in_real_scheduler_method():
     )
     finishes = []
     sched = NS(finish_requests=lambda *args: finishes.append(args))
+    sched._finish_kv_admission_error = ns["_finish_kv_admission_error"].__get__(sched)
     req = request("oversized")
-    assert not ns[fn.name](sched, req)
+    assert not ns["_reject_kv_admission_error"](sched, req)
     req.kv_admission_error, req.client_index = "not enough CPU capacity", 0
     req.get_finished_reason = lambda: "error"
-    assert ns[fn.name](sched, req)
+    assert ns["_reject_kv_admission_error"](sched, req)
     assert finishes == [("oversized", "error")]
     assert sched._dsa_admission_errors[0][1].stop_reason == req.kv_admission_error
 

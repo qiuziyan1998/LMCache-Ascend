@@ -6163,8 +6163,9 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
 
         prev_key = 0
         kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
+        page_layout = mooncake_layer_pages_enabled(self.config)
         page_store = bool(
-            mooncake_layer_pages_enabled(self.config)
+            page_layout
             and self.storage_manager.supports_batched_put_layer_pages(
                 self.store_location
             )
@@ -6184,7 +6185,13 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             else [page_shape]
         )
         page_dtypes = [kv_dtype] * len(page_shapes)
-        local = self._shared_local_cpu_backend() if page_store else None
+        local = self._shared_local_cpu_backend() if page_layout else None
+        fixed_slots = bool(getattr(local, "fixed_slots_enabled", False))
+        if not page_store and (
+            fixed_slots
+            or self.config.get_extra_config_value("local_cpu.fixed_slot_counts", None)
+        ):
+            raise ValueError("Fixed-slot store requires all-layer page publication")
         memory_format = self._memory_format_for_kv_group(kv_group)
         force_store_wait = self.config.get_extra_config_value(
             "force_store_wait", False
@@ -6334,7 +6341,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                 )
             ):
                 continue
-            if memory_objs_multi_layer is None:
+            if memory_objs_multi_layer is None and not fixed_slots:
                 if mixed_indexer:
                     memory_objs_multi_layer = []
                     try:
@@ -9694,12 +9701,22 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         return int(envelope.error_details["base"]), owners
 
     def reclaim_checkpoint_capacity(
-        self, tokens: int, group_caches: dict[int, Optional[list]]
+        self,
+        tokens: int,
+        group_caches: dict[int, Optional[list]],
+        *,
+        allocation_purpose: str = "workspace",
     ) -> bool:
         """Reclaim once for the missing staging groups, without allocation or waits."""
         local = self._shared_local_cpu_backend()
         if local is None or tokens <= 0 or not group_caches:
             return False
+        if getattr(local, "fixed_slots_enabled", False):
+            return local.reclaim_layer_page_slots(
+                {group: 1 for group in group_caches},
+                allocation_purpose=allocation_purpose,
+                max_scan_entries=_CHECKPOINT_RECLAIM_SCAN_ENTRIES,
+            )
         allocator = local.get_memory_allocator()
         round_size = getattr(
             getattr(allocator, "address_manager", None), "compute_aligned_size", None
@@ -9739,15 +9756,22 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         self, group: int, tokens: int, caches: Optional[list] = None
     ) -> tuple[LayerPageMemoryObj, tuple[int, ...]]:
         """Allocate registered capture storage without eviction or busy retry."""
-        return self.prepare_checkpoint_allocator(group, caches)(tokens)
+        return self.prepare_checkpoint_allocator(
+            group, caches, allocation_purpose="workspace"
+        )(tokens)
 
     def prepare_checkpoint_allocator(
-        self, group: int, caches: Optional[list] = None
+        self,
+        group: int,
+        caches: Optional[list] = None,
+        *,
+        allocation_purpose: str = "checkpoint",
     ) -> Callable[[int], tuple[LayerPageMemoryObj, tuple[int, ...]]]:
-        """Prepare group invariants for one capture; allocate exact sizes on demand.
+        """Prepare group invariants and allocate logical fragments on demand.
 
         The caller keeps this allocator within one capture, never across cache
-        reconfiguration. Allocation failure does not reclaim, spin or wait.
+        reconfiguration. Fixed slots charge a full chunk shared by capture and
+        workspace operations. Allocation failure does not reclaim, spin or wait.
         """
         if not self.save_only_first_rank or not self.save_indexer_only_first_rank:
             raise ValueError("Checkpoint requires replicated MLA group writer ownership")
@@ -9773,15 +9797,32 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                 if mixed else [self.gpu_connector.get_shape(tokens, kv_group=group)]
             )
             pages = local.batched_allocate_layer_pages(
-                shapes, [dtype] * len(shapes), 1, layers, fmt,
-                busy_loop=False, eviction=False,
-                valid_tokens=tokens, full_tokens=tokens,
+                shapes,
+                [dtype] * len(shapes),
+                1,
+                layers,
+                fmt,
+                busy_loop=False,
+                eviction=False,
+                valid_tokens=tokens,
+                full_tokens=tokens,
+                **(
+                    {"allocation_purpose": allocation_purpose}
+                    if getattr(local, "fixed_slots_enabled", False)
+                    else {}
+                ),
             )
             if not pages:
                 raise MemoryError("Checkpoint CPU staging allocation refused")
             return pages[0], widths
 
         return allocate
+
+    def checkpoint_uses_fixed_slots(self) -> bool:
+        """Whether shorter capture fragments still cost a full fixed slot."""
+        return bool(
+            getattr(self._shared_local_cpu_backend(), "fixed_slots_enabled", False)
+        )
 
     def get_checkpoint_prefix(
         self, key: CacheEngineKey, group: int, tokens: int, *, with_widths: bool = True

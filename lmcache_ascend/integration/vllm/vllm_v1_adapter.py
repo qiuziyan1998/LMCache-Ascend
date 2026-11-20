@@ -1134,22 +1134,25 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     "Layerwise prefill admission requires LocalCPUBackend"
                 )
             pool = backend.get_prefill_admission_capacity()
-            # Include alignment for the ordinary per-layer allocation fallback,
-            # not only the smaller alignment overhead of merged pages.
-            allocator = backend.get_memory_allocator()
-            alignment = int(getattr(allocator, "align_bytes", 4096))
-            shapes, dtypes = metadata.get_shapes(), metadata.get_dtypes()
-            layer_counts = metadata.runtime_kv_group_layer_counts
-            if layer_counts is None:
-                raise RuntimeError(
-                    "Layerwise prefill admission requires resolved KV groups"
+            if "page_bytes" in pool:
+                page_bytes = pool["page_bytes"]
+            else:
+                # Include alignment for the ordinary per-layer allocation fallback,
+                # not only the smaller alignment overhead of merged pages.
+                allocator = backend.get_memory_allocator()
+                alignment = int(getattr(allocator, "align_bytes", 4096))
+                shapes, dtypes = metadata.get_shapes(), metadata.get_dtypes()
+                layer_counts = metadata.runtime_kv_group_layer_counts
+                if layer_counts is None:
+                    raise RuntimeError(
+                        "Layerwise prefill admission requires resolved KV groups"
+                    )
+                page_bytes = sum(
+                    int(shape.numel()) * dtype.itemsize + alignment * layers
+                    for shape, dtype, layers in zip(
+                        shapes, dtypes, layer_counts, strict=True
+                    )
                 )
-            page_bytes = sum(
-                int(shape.numel()) * dtype.itemsize + alignment * layers
-                for shape, dtype, layers in zip(
-                    shapes, dtypes, layer_counts, strict=True
-                )
-            )
         coordinator = getattr(self, "_cold_load_coordinator", None)
         pending = {
             state.req_id

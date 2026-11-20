@@ -134,6 +134,8 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             raise ValueError(
                 "Storage source identity disagrees with registered workers"
             )
+        if self.checkpoint_retire_executor is not None and self.checkpoint_backend().fixed_slots_enabled:
+            self.checkpoint_store.validate_capacity()
         self._initialize_decoder_remote_fill()
 
     def checkpoint_plane_widths(self, group: int) -> tuple[Any, ...]:
@@ -164,6 +166,8 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
         group: int,
         tokens: int,
         caches: Any = None,
+        *,
+        allocation_purpose: str = "workspace",
     ) -> tuple[Any, tuple[Any, ...]]:
         """Reserve an exact registered page without eviction or native device access."""
         if caches is not None or tokens <= 0:
@@ -194,18 +198,24 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
             eviction=False,
             valid_tokens=tokens,
             full_tokens=tokens,
+            **({"allocation_purpose": allocation_purpose} if getattr(local, "fixed_slots_enabled", False) else {}),
         )
         if not pages:
             raise MemoryError("Checkpoint CPU staging allocation refused")
         return pages[0], self.checkpoint_plane_widths(group)
 
     def reclaim_checkpoint_capacity(
-        self, tokens: int, group_caches: dict[int, Any]
+        self, tokens: int, group_caches: dict[int, Any], *, allocation_purpose: str = "workspace"
     ) -> bool:
         """Use the allocator's actual aligned page budget and bounded reclaim path."""
         if tokens <= 0 or not group_caches:
             return False
         local = self.checkpoint_backend()
+        if getattr(local, "fixed_slots_enabled", False):
+            return local.reclaim_layer_page_slots(
+                dict.fromkeys(group_caches, 1), allocation_purpose=allocation_purpose,
+                max_scan_entries=4096,
+            )
         allocator = local.get_memory_allocator()
         aligned = getattr(
             getattr(allocator, "address_manager", None), "compute_aligned_size", None
@@ -824,11 +834,15 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 raise StorageFailedSafe("Checkpoint older latent source is unavailable")
             for page in pages:
                 self.validate_checkpoint_page(0, page)
-        cursor, reclaimed = base, False
+        fixed_slots = getattr(self.checkpoint_backend(), "fixed_slots_enabled", False)
+        purpose = {"allocation_purpose": "checkpoint"} if fixed_slots else {}
+        remaining_reclaims = 2 if fixed_slots else 1
+        cursor = base
         while cursor < end:
             desired_end = min(
                 end, (cursor // self.config.chunk_size + 1) * self.config.chunk_size
             )
+            reclaimed_chunk = False
             stop = desired_end
             while stop > cursor:
                 candidate = {}
@@ -839,27 +853,31 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                             continue
                         try:
                             page, _ = self.allocate_checkpoint_fragment(
-                                group, stop - start
+                                group, stop - start, **purpose
                             )
                         except MemoryError:
-                            if reclaimed:
+                            if not remaining_reclaims or reclaimed_chunk:
                                 raise
-                            reclaimed = True
+                            remaining_reclaims -= 1
+                            reclaimed_chunk = True
                             missing = {
                                 g: None for g in (group, 1) if g not in candidate
                             }
                             if not self.reclaim_checkpoint_capacity(
-                                stop - cursor, missing
+                                stop - cursor, missing, **purpose
                             ):
                                 raise
                             page, _ = self.allocate_checkpoint_fragment(
-                                group, stop - start
+                                group, stop - start, **purpose
                             )
                         candidate[group] = (start, stop, page)
                 except MemoryError:
                     self._release_shared_retrieve_objs(
                         [page for _, _, page in candidate.values()], unpin=False
                     )
+                    if fixed_slots:
+                        stop = cursor
+                        break
                     stop = cursor + (stop - cursor) // 2
                     continue
                 except BaseException:
@@ -943,6 +961,8 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                     else []
                 )
                 if pages is None:
+                    if getattr(self.checkpoint_backend(), "fixed_slots_enabled", False):
+                        raise StorageFailedSafe("Fixed CPU page slots exhausted", details={"store_refused": True})
                     raise StorageFailedSafe(
                         "Layer page allocation refused", details={"fallback": "layers"}
                     )

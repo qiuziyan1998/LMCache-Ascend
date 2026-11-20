@@ -146,6 +146,8 @@ class CPUBackendFactory:
 
     def bind_layout(self, metadata: Any) -> None:
         """Bind the startup transport once and reuse full metadata on recreation."""
+        if self.defer_layout and self._local_backend is not None:
+            self._local_backend.bind_deferred_page_slots(metadata)
         if self._remote_backend is not None and self.defer_layout:
             self._remote_backend.bind_layout(metadata)
         self._layout_metadata = metadata
@@ -251,7 +253,7 @@ def create_storage_runtime(runtime_config: dict[str, Any]) -> Any:
         if int(config.max_local_cpu_size * 1024**3) > stat.f_bavail * stat.f_frsize:
             raise MemoryError("Configured decoder CPU slab does not fit /dev/shm")
     PrometheusLogger.GetOrCreate(metadata, config=config)
-    local = LocalCPUBackend(config, metadata, dst_device="cpu")
+    local = LocalCPUBackend(config, metadata, dst_device="cpu", defer_fixed_slots=True)
     manager = None
     native_io = None
     try:
