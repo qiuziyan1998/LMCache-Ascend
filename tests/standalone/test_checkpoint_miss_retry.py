@@ -253,8 +253,8 @@ def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kin
         if kind == "miss"
         else ValueError("bad layout")
     )
-    entry = (7, Future(), request, [101, 102], 0, Future())
-    assert adapter._fail_completed_cold_load("r", entry, None, error, False)
+    entry = (7, Future(), request, [101, 102], Future())
+    assert adapter._fail_completed_cold_load("r", entry, None, error)
     assert "unpin" in calls
     if kind == "miss":
         assert "fence" not in calls  # No restore device work was submitted.

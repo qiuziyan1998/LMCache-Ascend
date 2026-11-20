@@ -131,7 +131,7 @@ def test_aborted_cold_load_eventually_acknowledges_send_after_all_owners_retire(
             lmcache_cached_tokens=100,
         )
     )
-    coordinator.futures["r"] = (1, latent, request, {7}, 0.0, indexer)
+    coordinator.futures["r"] = (1, latent, request, {7}, indexer)
     assert adapter.get_finished({"r"}) == (None, None)
     if failed:
         latent.set_exception(ValueError("missing latent pages"))

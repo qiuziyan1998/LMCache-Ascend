@@ -2,30 +2,16 @@
 # Standard
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from functools import wraps
 from itertools import pairwise
-from threading import Condition, Thread, get_ident
-from typing import Any, Generator, List, Optional, Sequence, Set, Union
+from typing import Any, Generator, Iterable, List, Optional, Sequence, Set, Union
 import hashlib
 import json
 import os
-import sys
-import time
-import traceback
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.serving_perf import (
-    prefill_reuse_debug_enabled,
-    prefill_reuse_debug_log,
-    prefill_start_timing_enabled,
-    prefill_start_timing_log,
-    serving_perf_detailed_enabled,
-    serving_perf_enabled,
-    serving_perf_log,
-)
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.gpu_connectors import (
     SGLangGPUConnector,
@@ -47,12 +33,6 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.metadata import LMCacheMetadata
 import torch
-
-# First Party
-from lmcache_ascend.v1.content_diagnostics import (
-    npu_content_diagnostics_enabled,
-    register_group0_source_probe,
-)
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.layerwise_dma import (
     BoundCopyPrefix,
@@ -81,7 +61,6 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
-_COLD_PERF_SLOW_MS = 100.0
 
 
 @dataclass
@@ -103,22 +82,6 @@ class PreparedGroupCapture:
     validate: bool
     c8_group: Any = None
     c8_chunk_capacity: int = 0
-
-
-def _log_cold_perf_slow(
-    event: str, started: float, thread_started: int, **fields: Any
-) -> None:
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    if elapsed_ms >= _COLD_PERF_SLOW_MS:
-        serving_perf_log(
-            logger,
-            event,
-            elapsed_ms=round(elapsed_ms, 3),
-            thread_cpu_ms=round(
-                (time.thread_time_ns() - thread_started) / 1_000_000, 3
-            ),
-            **fields,
-        )
 
 
 def _layer_memory_tensor(memory_obj: MemoryObj, layer_id: int) -> torch.Tensor:
@@ -347,21 +310,20 @@ def _prefill_dma_plans(
     cycle,
     plan_cache: Optional[dict[tuple[int, int], IncrementalDmaPlan]] = None,
 ) -> tuple:
-    """Plan both P-node banks once, before entering the model forward.
+    """Plan all P-node banks once, before entering the model forward.
 
     Cycle tables were built from the registered allocator layout at startup.
     Only segment boundaries are indexed; no token scan or D2H sync is needed.
     """
-    started = time.perf_counter() if prefill_start_timing_enabled() else 0.0
-    if len(block_ids_by_bank) != 2:
-        raise ValueError("Layerwise prefill DMA requires two bank block maps")
+    if not block_ids_by_bank:
+        raise ValueError("Layerwise prefill DMA requires bank block maps")
     if (not kvcaches[0][0].is_contiguous()
             or not kvcaches[0][-1].is_contiguous()):
         raise ValueError("Layerwise prefill DMA requires contiguous NPU planes")
     capacity = int(kvcaches[0][0].shape[0]) * int(kvcaches[0][0].shape[1])
     plans = []
     pending_states = {}
-    for bank in range(2):
+    for bank in range(len(block_ids_by_bank)):
         if plan_cache is None:
             plan = cycle.plan_block_id_ranges(
                 block_ids_by_bank[bank], block_size, starts, ends, slot_mapping_base
@@ -385,12 +347,6 @@ def _prefill_dma_plans(
         # Commit both maps together so a failed second bank cannot hide the
         # first bank's mapping change from bound-address invalidation on retry.
         plan_cache.update(pending_states)
-    if started:
-        prefill_start_timing_log(
-            logger, "dma_plan", started, direction=direction,
-            kv_group=kv_group, tokens=sum(chunk_sizes),
-            segments_by_bank=[len(plans[0]), len(plans[1])],
-        )
     return tuple(plans)
 
 
@@ -400,194 +356,6 @@ def _payload_event_list(payload_event: Any) -> list[Any]:
     if isinstance(payload_event, (list, tuple)):
         return [event for event in payload_event if event is not None]
     return [payload_event]
-
-
-def _mtp_dw_diag_enabled() -> bool:
-    return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
-
-
-def _mtp_dw_deep_diag_enabled() -> bool:
-    return _mtp_dw_diag_enabled() and os.environ.get(
-        "VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"
-    ) == "1"
-
-
-def _mtp_dw_event(stage: str, **fields: Any) -> None:
-    if not _mtp_dw_diag_enabled():
-        return
-    payload = {
-        "schema": 1,
-        "stage": stage,
-        "owner": "lmcache_ascend_retrieve",
-    }
-    payload.update(fields)
-    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
-
-
-_MTP_DW_DEEP_SEEN_LIMIT = 256
-_MTP_DW_CHECKSUM_LIMIT = 32
-_MTP_DW_UINT64_MASK = (1 << 64) - 1
-
-
-def _bounded_stable_int_checksum(values: Any) -> int:
-    """Match vLLM Ascend's checksum over the first 32 integers."""
-    prefix = list(values[:_MTP_DW_CHECKSUM_LIMIT])
-    checksum = 0xCBF29CE484222325
-    for value in prefix:
-        checksum ^= int(value) & _MTP_DW_UINT64_MASK
-        checksum = (checksum * 0x100000001B3) & _MTP_DW_UINT64_MASK
-    checksum ^= len(prefix)
-    return checksum
-
-
-def _bounded_tensor_fingerprint(tensor: torch.Tensor) -> int:
-    """Return a layout-preserving checksum over a bounded tensor byte prefix."""
-    raw = (
-        tensor.detach()
-        .contiguous()
-        .to(device="cpu")
-        .view(torch.uint8)
-        .reshape(-1)
-    )
-    return _bounded_stable_int_checksum(raw.tolist())
-
-
-def _sparse_content_probe(
-    *,
-    cpu_tensors: List[torch.Tensor],
-    layer_cache: Any,
-    selected_token_idx: torch.Tensor,
-    target_slots: torch.Tensor,
-    chunk_size: int,
-    token_major: bool,
-) -> dict[str, Any]:
-    """Compare sampled stacked CPU planes with their scattered NPU slots.
-
-    MLA/DSA sparse CPU chunks are stacked by plane. The probe is diagnostics
-    only and intentionally supports that production layout; token-major layouts
-    are reported as unsupported rather than interpreted heuristically.
-    """
-    if token_major:
-        return {"supported": False, "reason": "token_major"}
-    planes = (
-        tuple(layer_cache)
-        if isinstance(layer_cache, (tuple, list))
-        else (layer_cache,)
-    )
-    if not planes or not all(isinstance(plane, torch.Tensor) for plane in planes):
-        return {"supported": False, "reason": "invalid_layer_cache"}
-    if any(plane.ndim < 2 for plane in planes):
-        return {"supported": False, "reason": "unexpected_plane_rank"}
-
-    slot_capacity = int(planes[0].shape[0]) * int(planes[0].shape[1])
-    flat_planes = []
-    for plane in planes:
-        if int(plane.shape[0]) * int(plane.shape[1]) != slot_capacity:
-            return {"supported": False, "reason": "plane_slot_capacity_mismatch"}
-        flat_planes.append(plane.reshape(slot_capacity, -1))
-    plane_widths = [int(plane.shape[1]) for plane in flat_planes]
-    record_width = sum(plane_widths)
-    if record_width <= 0 or chunk_size <= 0:
-        return {"supported": False, "reason": "invalid_dimensions"}
-
-    selected = selected_token_idx.detach().reshape(-1).to(device="cpu").tolist()
-    slots = target_slots.detach().reshape(-1).to(device="cpu").tolist()
-    pairs: list[dict[str, Any]] = []
-    for source_token, target_slot in zip(selected[:2], slots[:2], strict=False):
-        source_token = int(source_token)
-        target_slot = int(target_slot)
-        chunk_index, local_token = divmod(source_token, chunk_size)
-        if chunk_index < 0 or chunk_index >= len(cpu_tensors):
-            return {"supported": False, "reason": "source_chunk_oob"}
-        cpu_chunk = cpu_tensors[chunk_index].detach().reshape(-1)
-        if int(cpu_chunk.numel()) % record_width:
-            return {"supported": False, "reason": "cpu_chunk_layout_mismatch"}
-        chunk_tokens = int(cpu_chunk.numel()) // record_width
-        if (
-            local_token >= chunk_tokens
-            or target_slot < 0
-            or target_slot >= slot_capacity
-        ):
-            return {"supported": False, "reason": "sample_index_oob"}
-        plane_offset = 0
-        plane_checksums = []
-        for plane_index, width in enumerate(plane_widths):
-            source_start = plane_offset + local_token * width
-            source = cpu_chunk[source_start : source_start + width]
-            target = flat_planes[plane_index][target_slot]
-            source_checksum = _bounded_tensor_fingerprint(source)
-            target_checksum = _bounded_tensor_fingerprint(target)
-            plane_checksums.append(
-                {
-                    "plane": plane_index,
-                    "source_checksum": source_checksum,
-                    "target_checksum": target_checksum,
-                    "match": source_checksum == target_checksum,
-                }
-            )
-            plane_offset += chunk_tokens * width
-        pairs.append(
-            {
-                "source_token": source_token,
-                "target_slot": target_slot,
-                "planes": plane_checksums,
-            }
-        )
-    return {
-        "supported": True,
-        "pairs": pairs,
-        "all_match": all(
-            plane["match"] for pair in pairs for plane in pair["planes"]
-        ),
-    }
-
-
-def _remember_bounded_key(seen: dict[Any, None], key: Any) -> None:
-    """Remember a diagnostic key without retaining unbounded request state."""
-    seen[key] = None
-    while len(seen) > _MTP_DW_DEEP_SEEN_LIMIT:
-        del seen[next(iter(seen))]
-
-
-def _should_capture_deep_payload(
-    *,
-    enabled: bool,
-    explicit_payload: bool,
-    committed_end: int,
-    req_id: Any,
-    kv_group: int,
-    seen: dict[Any, None],
-) -> bool:
-    """Select the first successful committed payload for a request and group."""
-    if (
-        not enabled
-        or not explicit_payload
-        or committed_end <= 0
-        or req_id is None
-    ):
-        return False
-    return (str(req_id), int(kv_group), int(committed_end)) not in seen
-
-
-def _conflicting_duplicate_target_slots(
-    selected_values: list[int],
-    slot_values: list[int],
-    limit: int = 8,
-) -> list[dict[str, int]]:
-    """Report bounded cases where one target slot has different sources."""
-    seen: dict[int, int] = {}
-    conflicts: list[dict[str, int]] = []
-    for selected, slot in zip(selected_values, slot_values, strict=False):
-        selected = int(selected)
-        slot = int(slot)
-        previous = seen.setdefault(slot, selected)
-        if previous != selected:
-            conflicts.append(
-                {"slot": slot, "first_selected": previous, "selected": selected}
-            )
-            if len(conflicts) >= limit:
-                break
-    return conflicts
 
 
 _SPARSE_DIRECT_RECORD_STREAM = os.getenv(
@@ -608,19 +376,8 @@ _DENSE_DIRECT_STORE_DISABLE = _DENSE_DIRECT_DISABLE or os.getenv(
 _DENSE_DIRECT_GROUP_STORE_DISABLE = os.getenv(
     "LMCACHE_ASCEND_DENSE_DIRECT_GROUP_STORE_DISABLE", "0"
 ).lower() in ("1", "true", "yes", "on")
-_SPARSE_TRANSFER_TOPK = max(
-    0, int(os.getenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "0"))
-)
 
 _SPARSE_DESTINATION_PLAN_CACHE_SIZE = 2
-_SPARSE_H2D_STALL_TIMEOUT_ENV = "LMCACHE_COLD_PERF_SPARSE_H2D_STALL_SECONDS"
-
-
-def _sparse_h2d_stall_timeout() -> float:
-    try:
-        return max(1.0, float(os.getenv(_SPARSE_H2D_STALL_TIMEOUT_ENV, "30")))
-    except ValueError:
-        return 30.0
 
 
 def _wait_payload_events(stream: Any, payload_event: Any) -> None:
@@ -1810,144 +1567,14 @@ class _SparseDestinationPlan:
         self.states = states
         self.binding = binding
         self.c8_group = None
-
-
-class _SparseH2DStallWatchdog:
-    """Report a sparse host submission that exceeds its deadline."""
-
-    def __init__(self, timeout: float) -> None:
-        self._timeout = timeout
-        self._condition = Condition()
-        self._host_state: Optional[dict[str, Any]] = None
-        self._reported = False
-        Thread(
-            target=self._run,
-            name="lmcache-sparse-h2d-watchdog",
-            daemon=True,
-        ).start()
-
-    def begin_host(self, **fields: Any) -> Optional[dict[str, Any]]:
-        started = time.perf_counter()
-        state = {
-            "_started": started,
-            "_deadline": started + self._timeout,
-            "_thread_id": get_ident(),
-            "pending_stage": "entry",
-            "timeout_seconds": self._timeout,
-            **fields,
-        }
-        with self._condition:
-            if self._reported:
-                return None
-            self._host_state = state
-            self._condition.notify()
-        return state
-
-    def update_host(self, state: Optional[dict[str, Any]], stage: str) -> None:
-        if state is not None and self._host_state is state:
-            state["pending_stage"] = stage
-
-    def end_host(self, state: Optional[dict[str, Any]]) -> None:
-        if state is None:
-            return
-        with self._condition:
-            if self._host_state is state:
-                self._host_state = None
-                self._condition.notify()
-
-    def _run(self) -> None:
-        while True:
-            with self._condition:
-                while self._host_state is None or self._reported:
-                    self._condition.wait()
-                state = self._host_state
-                remaining = state["_deadline"] - time.perf_counter()
-                if remaining > 0:
-                    self._condition.wait(remaining)
-                    continue
-                frame = sys._current_frames().get(state["_thread_id"])
-                fields = {key: value for key, value in state.items() if key[0] != "_"}
-                fields["python_thread_id"] = state["_thread_id"]
-                self._host_state = None
-                self._reported = True
-                started = state["_started"]
-            stack = traceback.extract_stack(frame)[-16:] if frame is not None else ()
-            serving_perf_log(
-                logger,
-                "sparse_h2d_python_stall",
-                started=started,
-                python_stack=[
-                    {
-                        "file": item.filename,
-                        "line": item.lineno,
-                        "function": item.name,
-                        "code": item.line,
-                    }
-                    for item in stack
-                ],
-                **fields,
-            )
-
-
 class _SparseLoadJoin:
     """One layer/group fan-out from a compute stream to load streams."""
 
-    __slots__ = (
-        "compute_stream",
-        "host_state",
-        "used_stream_indices",
-        "watchdog",
-    )
+    __slots__ = ("compute_stream", "used_stream_indices")
 
-    def __init__(
-        self,
-        compute_stream: Any,
-        watchdog: Optional[_SparseH2DStallWatchdog] = None,
-    ) -> None:
+    def __init__(self, compute_stream: Any) -> None:
         self.compute_stream = compute_stream
-        self.host_state: Optional[dict[str, Any]] = None
         self.used_stream_indices: set[int] = set()
-        self.watchdog = watchdog
-
-
-def _trace_sparse_h2d_python(func):
-    """Arm one cold-perf-only Python stack watchdog around sparse submission."""
-
-    @wraps(func)
-    def wrapped(self, *args, **kwargs):
-        join = getattr(self, "_active_sparse_load_join", None)
-        watchdog = getattr(join, "watchdog", None)
-        if watchdog is None:
-            return func(self, *args, **kwargs)
-        try:
-            state = watchdog.begin_host(
-                req_id=kwargs.get("req_id"),
-                kv_group=kwargs.get("kv_group"),
-                layer=kwargs.get("layer_id"),
-                load_stream_index=kwargs.get("load_stream_idx"),
-            )
-        except Exception:
-            return func(self, *args, **kwargs)
-        join.host_state = state
-        try:
-            return func(self, *args, **kwargs)
-        finally:
-            try:
-                watchdog.end_host(state)
-            except Exception:
-                pass
-            join.host_state = None
-
-    return wrapped
-
-
-def _sparse_h2d_python_stage(join: Optional[_SparseLoadJoin], stage: str) -> None:
-    if join is None or join.host_state is None:
-        return
-    try:
-        join.watchdog.update_host(join.host_state, stage)
-    except Exception:
-        pass
 
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
@@ -1990,6 +1617,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip().lower() == "true"
         )
+        configured_bank_count = 2
+        if self._layerwise_prefill_dma:
+            from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
+            configured_bank_count = layerwise_prefill_bank_count()
         self.load_stream_num = 4
         self.load_stream_list = [
             torch.cuda.Stream() for __ in range(self.load_stream_num)
@@ -1999,15 +1631,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             torch.npu.Event() for _ in range(self.load_stream_num)
         ]
         self._active_sparse_load_join: Optional[_SparseLoadJoin] = None
-        self._sparse_h2d_stall_watchdog: Optional[_SparseH2DStallWatchdog] = None
-        if _SPARSE_TRANSFER_TOPK:
-            logger.warning(
-                "Limiting each sparse LMCache transfer to the first %d "
-                "explicitly selected tokens for debugging; implicit dense "
-                "bootstrap ignores this limit and vLLM's sparse-attention "
-                "width is unchanged",
-                _SPARSE_TRANSFER_TOPK,
-            )
 
         self.lmcache_chunk_size = int(kwargs.get("chunk_size", 0))
         self.dsa_two_groups = kwargs.get("dsa_two_groups", False)
@@ -2064,7 +1687,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # (when there is no load for the layer that is about to use it).
         # Keep the state per KV group: latent and indexer own independent
         # physical banks even though they share the connector streams.
-        self._layerwise_prefill_bank_counts: dict[int, int] = {}
+        self._layerwise_prefill_bank_counts: dict[int, int] = (
+            dict.fromkeys((0, 1), configured_bank_count)
+            if self._layerwise_prefill_dma else {}
+        )
         self._layerwise_prefill_transfer_generations: dict[int, int] = {}
         # Raw layerwise-prefill DMA uses one FIFO stream per physical bank and
         # KV group.  Save/load operations for a bank must share this stream:
@@ -2084,7 +1710,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             tuple[int, int, int], tuple[int, Any]
         ] = {}
         self._layerwise_prefill_load_done_events: dict[
-            tuple, tuple[int, Any]
+            tuple[int, int], dict[Optional[str], tuple[int, Any]]
         ] = {}
         self._prefill_dma_bound_loads: dict[
             str, dict[tuple[int, int, int], BoundCopyPrefix]
@@ -2124,6 +1750,72 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             failed = self._layerwise_prefill_unfenced_loads = {}
         failed.setdefault(str(req_id), {})[(kv_group, bank, id(stream))] = stream
 
+    def wait_for_layerwise_prefill_stores(
+        self, req_ids: Optional[Iterable[str]] = None
+    ) -> None:
+        """Fence request D2H reads before publication or NPU block reuse.
+
+        Reallocated physical blocks can move to another bank stream, so the
+        old bank's FIFO alone cannot protect their outstanding reads. Waiting
+        here retains CPU pages and DMA bindings for a preempted request.
+        """
+        pending_store_events_by_request = getattr(
+            self, "_layerwise_prefill_async_store_events", {}
+        )
+        failed_stores = getattr(self, "_layerwise_prefill_unfenced_stores", {})
+        selected = tuple(
+            dict.fromkeys((*pending_store_events_by_request, *failed_stores))
+            if req_ids is None else req_ids
+        )
+        for req_id in selected:
+            failed = failed_stores.get(req_id)
+            if failed is not None:
+                # A failed generator can already be exhausted, so closing it
+                # again cannot fence its DMA. Keep independent stream/owner
+                # state until a later cleanup fence actually succeeds.
+                for stream in failed["streams"].values():
+                    stream.synchronize()
+                for identity, owner in list(failed["owners"].items()):
+                    owner.ref_count_down()
+                    failed["owners"].pop(identity)
+                failed_stores.pop(req_id, None)
+            pending_events = pending_store_events_by_request.get(req_id)
+            if pending_events is None:
+                continue
+            for completion in pending_events.values():
+                if isinstance(completion, (tuple, list)):
+                    for event in completion:
+                        event.synchronize()
+                else:
+                    completion.synchronize()
+            # A failed fence must leave every event registered for retry and
+            # prevent the caller from proceeding with request cleanup/reuse.
+            pending_store_events_by_request.pop(req_id, None)
+
+    def _retain_unfenced_layerwise_prefill_store(
+        self, req_id: str, streams: Iterable[Any], owners: Iterable[MemoryObj],
+        resources: tuple[Any, ...],
+    ) -> None:
+        """Quarantine unfinished D2H destinations after a cleanup fence fails.
+
+        Missing request IDs remain recoverable by the all-request store drain.
+        """
+        failed = getattr(self, "_layerwise_prefill_unfenced_stores", None)
+        if failed is None:
+            failed = self._layerwise_prefill_unfenced_stores = {}
+        entry = failed.setdefault(str(req_id), {
+            "streams": {}, "owners": {}, "resources": [],
+        })
+        for stream in streams:
+            entry["streams"][id(stream)] = stream
+        for owner in owners:
+            if id(owner) not in entry["owners"]:
+                owner.ref_count_up()
+                entry["owners"][id(owner)] = owner
+        # MemoryObj.__del__ can free an allocation even with nonzero refs.
+        # Retain the Python objects too, including C8 pointer/slot tensors.
+        entry["resources"].append(resources)
+
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
         unfenced = getattr(self, "_layerwise_prefill_unfenced_loads", None)
@@ -2135,18 +1827,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for stream in failed_streams.values():
                 stream.synchronize()
             unfenced.pop(req_id, None)
-        pending_store_events_by_request = getattr(
-            self, "_layerwise_prefill_async_store_events", {}
-        )
-        pending_events = pending_store_events_by_request.get(req_id)
-        if pending_events:
-            for completion in pending_events.values():
-                if isinstance(completion, (tuple, list)):
-                    for event in completion:
-                        event.synchronize()
-                else:
-                    completion.synchronize()
-            pending_store_events_by_request.pop(req_id, None)
+        self.wait_for_layerwise_prefill_stores((req_id,))
         load_events_by_request = getattr(
             self, "_layerwise_prefill_load_request_events", {}
         )
@@ -2213,27 +1894,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         return staged
 
-    def _get_sparse_h2d_stall_watchdog(
-        self,
-    ) -> Optional[_SparseH2DStallWatchdog]:
-        if not serving_perf_enabled():
-            return None
-        watchdog = getattr(self, "_sparse_h2d_stall_watchdog", None)
-        if watchdog is None:
-            try:
-                watchdog = _SparseH2DStallWatchdog(_sparse_h2d_stall_timeout())
-            except Exception:
-                return None
-            self._sparse_h2d_stall_watchdog = watchdog
-        return watchdog
-
     def layerwise_prefill_store_fences(self, kv_group: int) -> tuple[Any, ...]:
-        """Borrow the current generation's two bank-tail D2H events.
+        """Borrow the current generation's bank-tail D2H events.
 
         Call only after draining ``batched_from_gpu`` for the entire KV group.
         Each returned event is recorded after the last save DMA submitted on
         one physical bank stream.  Because operations on each bank stream are
-        ordered, the two tail events fence every earlier save DMA for this
+        ordered, the tail events fence every earlier save DMA for this
         chunk while avoiding a host-side synchronization.  Empty means
         unavailable.
         """
@@ -2241,17 +1908,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         generation = generations.get(kv_group)
         if generation is None:
             return ()
-        save_done = getattr(self, "_layerwise_prefill_save_done_events", {})
-        latest_by_bank: dict[int, tuple[int, Any]] = {}
-        for (group, bank, layer), (epoch, event) in save_done.items():
-            if group != kv_group or epoch != generation:
-                continue
-            previous = latest_by_bank.get(bank)
-            if previous is None or layer >= previous[0]:
-                latest_by_bank[bank] = (layer, event)
-        return tuple(
-            latest_by_bank[bank][1] for bank in sorted(latest_by_bank)
+        # Layer ordinals are not a submission clock. A later request/chunk
+        # can start overwriting a bank while an older higher-layer entry is
+        # still retained. Selecting max(layer) from the per-layer registry
+        # can therefore return an already-completed event from an older save.
+        # This registry is updated after every actual D2H submission, in FIFO
+        # order, and its immutable events fence all preceding bank writes.
+        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
+        events = tuple(
+            record[1]
+            for (group, _bank), record in sorted(tails.items())
+            if group == kv_group and record[0] == generation
         )
+        return events
 
     def _layerwise_prefill_transfer_state(
         self,
@@ -2259,16 +1928,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dict[int, int],
         dict[int, int],
         dict[tuple[int, int, int], tuple[int, Any]],
-        dict[tuple, tuple[int, Any]],
+        dict[tuple[int, int], dict[Optional[str], tuple[int, Any]]],
     ]:
         """Return lazily initialized state used by P-node bank hand-offs.
 
         ``save_done`` is keyed by ``(kv_group, bank, layer_id)`` for
-        publication and teardown.  Raw layerwise-prefill DMA keys loads by
-        ``(kv_group, layer_id, bank)`` because chunk phases can rotate one
-        logical layer between the two physical banks.  The per-bank FIFO
-        streams carry save/load ordering; consumers wait only for the load
-        events for banks used by the current batch.
+        publication and teardown. Loads are keyed by ``(kv_group, layer_id)``
+        and then request ID. All requests select the same bank for a layer,
+        but each retains its own completion event. Per-bank FIFO streams
+        carry save/load ordering; consumers join every request's load.
         """
         bank_counts = getattr(self, "_layerwise_prefill_bank_counts", None)
         if bank_counts is None:
@@ -2381,11 +2049,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         layer_id: int,
         kv_group: int,
-        bank_offset: int = 0,
     ) -> int:
         bank_counts, _, _, _ = self._layerwise_prefill_transfer_state()
         bank_count = bank_counts.get(kv_group, 2)
-        return (int(layer_id) + int(bank_offset)) % bank_count
+        return int(layer_id) % bank_count
 
     def _layerwise_prefill_dma_stream(
         self,
@@ -2415,7 +2082,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self,
         layer_id: int,
         kv_group: int,
-        bank_offsets: tuple[int, ...],
         event: Any,
     ) -> None:
         """Queue final-compute-access waits before a P bank's next DMA.
@@ -2431,13 +2097,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         uses = getattr(self, "_layerwise_prefill_bank_use_events", None)
         if uses is None:
             uses = self._layerwise_prefill_bank_use_events = {}
-        banks = {
-            self._layerwise_prefill_bank(layer_id, kv_group, offset)
-            for offset in bank_offsets
-        }
-        for bank in banks:
-            self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
-            uses[(kv_group, bank)] = (generation, layer_id, event)
+        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        dma_stream = self._layerwise_prefill_dma_stream(kv_group, bank)
+        dma_stream.wait_event(event)
+        uses[(kv_group, bank)] = (generation, layer_id, event)
 
     def _require_layerwise_prefill_bank_use(
         self, layer_id: int, kv_group: int, bank: int,
@@ -2474,24 +2137,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             seen.add(identity)
             stream.synchronize()
 
-    def _flush_prefill_first_bank_timing_events(self) -> None:
-        """Read completed diagnostic events without introducing a new fence."""
-        pending = getattr(self, "_prefill_first_bank_timing_events", None)
-        if not pending:
-            return
-        remaining = []
-        for start_event, end_event, fields in pending:
-            if not end_event.query():
-                remaining.append((start_event, end_event, fields))
-                continue
-            device_ms = round(start_event.elapsed_time(end_event), 3)
-            prefill_start_timing_log(
-                logger, "first_bank_wait_device", time.perf_counter(),
-                elapsed_ms=device_ms, device_wait_ms=device_ms,
-                scope="device_event", **fields,
-            )
-        self._prefill_first_bank_timing_events = remaining
-
     def wait_for_layerwise_prefill_source_publication(self, kv_group: int) -> None:
         """Make prior CPU writes visible before rank0 shares handles with TP peers.
 
@@ -2504,7 +2149,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         generation = self._layerwise_prefill_transfer_generation(kv_group)
         tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
         events = tuple(
-            record[1] for bank in range(2)
+            record[1] for bank in range(
+                self._layerwise_prefill_transfer_state()[0].get(kv_group, 2)
+            )
             if (record := tails.get((kv_group, bank))) is not None
             and record[0] == generation
         )
@@ -2512,128 +2159,50 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if not event.query():
                 event.synchronize()
 
-    def _prepare_layerwise_prefill_source_readiness(self, kv_group: int) -> None:
-        """Fence prior CPU producers before a new banked load is submitted.
-
-        Early LocalCPU publication can expose pages whose D2H is still on the
-        opposite FIFO after a request's phase changes. Snapshot prior save tails
-        for the active generation before enqueueing new loads; immutable
-        event dependencies cannot include these new waits and form a cycle.
-        Same-bank readiness is already guaranteed by FIFO order. Passive ranks
-        without saves have no tails and incur no additional stream work.
-        """
-        generation = self._layerwise_prefill_transfer_generation(kv_group)
-        tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
-        producers = tuple(
-            (bank, record[1])
-            for bank in range(2)
-            if (record := tails.get((kv_group, bank))) is not None
-            and record[0] == generation
-        )
-        for bank in range(2):
-            for source_bank, event in producers:
-                if source_bank != bank:
-                    self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
-
     def wait_for_layerwise_prefill_load(
         self,
         layer_id: int,
         kv_group: int,
-        bank_offset: Optional[int] = None,
+        model_layer_id: Optional[int] = None,
+        request_ids: Optional[tuple[str, ...]] = None,
     ) -> None:
-        """Order a layer consumer after its asynchronous P-node bank hand-off.
+        """Join each request's load event before accessing the fixed layer bank.
 
-        With raw layerwise DMA, a completed load is already ordered after the
-        preceding save for its bank by the bank FIFO stream.  Join only that
-        load completion on the compute stream.  The old dense-direct fallback
-        retains its save fence because it has no bank FIFO stream; the raw DMA
-        path never joins a store event here.
+        Every request uses group-local layer_id % bank_count. Events remain
+        separate by request even when their transfers share the same FIFO.
+        A batch with no loads still waits for this bank's prior save tail.
+        No host synchronization is introduced.
         """
-        _, generations, _, load_done = (
-            self._layerwise_prefill_transfer_state()
-        )
+        _, generations, _, load_done = self._layerwise_prefill_transfer_state()
         generation = generations.setdefault(int(kv_group), 0)
         current_stream = torch.npu.current_stream()
-        selected_banks = (
-            (
-                self._layerwise_prefill_bank(
-                    layer_id, kv_group, int(bank_offset)
-                ),
+        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        row = load_done.pop((kv_group, int(layer_id)), {})
+        if request_ids is not None and set(row) - set(request_ids):
+            raise RuntimeError(
+                "Prefill load events belong to requests outside this batch: "
+                f"group={kv_group}, layer={layer_id}"
             )
-            if bank_offset is not None
-            else tuple(
-                range(
-                    self._layerwise_prefill_transfer_state()[0].get(
-                        int(kv_group), 2
-                    )
+        events = {}
+        for req_id, (event_generation, event) in row.items():
+            if event_generation != generation:
+                raise RuntimeError(
+                    "Stale prefill request load event: "
+                    f"req={req_id}, group={kv_group}, layer={layer_id}"
                 )
-            )
-        )
-        bank = selected_banks[0] if len(selected_banks) == 1 else None
-        bank_streams = getattr(self, "_layerwise_prefill_dma_streams", {})
-        bank_fifo_active = any(
-            (int(kv_group), selected_bank) in bank_streams
-            for selected_bank in selected_banks
-        )
-        # Profile mode records every layer's device-side dependency.  The
-        # first actual lightning-indexer ordinal is model-dependent (GLM52 is
-        # ordinal 3), so restricting this to layer 0 hides the real boundary.
-        diagnose_first_bank = prefill_start_timing_enabled()
-        if diagnose_first_bank:
-            wait_started = time.perf_counter()
-            device_wait_start = torch.npu.Event(enable_timing=True)
-            device_wait_end = torch.npu.Event(enable_timing=True)
-            device_wait_start.record(current_stream)
-        load_records: list[tuple[int, Any]] = []
-        # Raw DMA records are keyed by physical bank.  Waiting on every bank
-        # used by the current batch is required when requests are at different
-        # chunk phases; the final event on each bank FIFO fences all loads for
-        # that bank without a host-side query or synchronization.
-        for selected_bank in selected_banks:
-            load_record = load_done.pop(
-                (kv_group, int(layer_id), selected_bank), None
-            )
-            if load_record is None:
-                # Legacy dense-direct records retain the old two-field key.
-                load_record = load_done.pop((kv_group, int(layer_id)), None)
-            if load_record is not None and load_record[0] == generation:
-                load_records.append((selected_bank, load_record[1]))
-                current_stream.wait_event(load_record[1])
-
-        if not load_records:
-            # A cache miss or a non-deferred layer has no load_done record. If
-            # the selected bank was used by the previous chunk, join its tail
-            # event before the layer can overwrite that bank. This is a device
-            # dependency only; no host synchronize is introduced.
-            bank_tails = getattr(
+            events[req_id] = event
+        # Do not collapse these waits to the last bank event. Every request
+        # keeps its own handoff, independent of batch/submission order.
+        for req_id, event in events.items():
+            current_stream.wait_event(event)
+        waited_event = next(reversed(events.values())) if events else None
+        if not events:
+            previous_tail = getattr(
                 self, "_layerwise_prefill_bank_tail_events", {}
-            )
-            for selected_bank in selected_banks:
-                previous_tail = bank_tails.get((kv_group, selected_bank))
-                if previous_tail is None or previous_tail[0] != generation:
-                    continue
-                current_stream.wait_event(previous_tail[1])
-        if diagnose_first_bank:
-            device_wait_end.record(current_stream)
-            fields = dict(
-                kv_group=kv_group,
-                layer_id=layer_id,
-                bank=bank,
-                bank_offset=bank_offset,
-                load_event_pending=any(not event.query() for _, event in load_records),
-                save_event=(
-                    not load_records and not bank_fifo_active
-                ),
-                load_event=bool(load_records),
-            )
-            pending = getattr(self, "_prefill_first_bank_timing_events", None)
-            if pending is None:
-                pending = []
-                self._prefill_first_bank_timing_events = pending
-            pending.append((device_wait_start, device_wait_end, fields))
-            prefill_start_timing_log(
-                logger, "first_bank_wait_enqueue", wait_started, **fields,
-            )
+            ).get((kv_group, bank))
+            if previous_tail is not None and previous_tail[0] == generation:
+                waited_event = previous_tail[1]
+                current_stream.wait_event(waited_event)
 
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
@@ -2650,7 +2219,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")
             else torch.cuda.current_stream()
         )
-        join = _SparseLoadJoin(compute_stream, self._get_sparse_h2d_stall_watchdog())
+        join = _SparseLoadJoin(compute_stream, )
         self._active_sparse_load_join = join
         try:
             yield
@@ -2991,9 +2560,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: Optional[int] = None,
     ) -> None:
         """Atomically refresh every layer pointer row with one H2D copy."""
-        diagnose = serving_perf_enabled()
-        started = time.perf_counter() if diagnose else 0.0
-        thread_started = time.thread_time_ns() if diagnose else 0
         if not new_sources_by_layer:
             return
         # The caller passes exactly this group's layer rows; use that length
@@ -3019,11 +2585,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         if suffix_counts.pop() == 0:
             return
-
-        rows_started = time.perf_counter() if diagnose else 0.0
         staged_rows = self._layer_page_pointer_rows(new_sources_by_layer)
-        rows_ms = (time.perf_counter() - rows_started) * 1000 if diagnose else 0.0
-        row_source = "page" if staged_rows is not None else "layerwise"
         if staged_rows is None:
             staged_rows = [
                 [
@@ -3039,26 +2601,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
                 for layer_id, layer_sources in enumerate(new_sources_by_layer)
             ]
-        publish_started = time.perf_counter() if diagnose else 0.0
         self._append_sparse_chunk_ptr_rows(
             staged_rows,
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
             defer_copy=defer_copy,
         )
-        if diagnose:
-            _log_cold_perf_slow(
-                "sparse_pointer_cache_append_slow",
-                started,
-                thread_started,
-                layers=self.num_layers,
-                chunks=len(staged_rows[0]),
-                row_source=row_source,
-                rows_ms=round(rows_ms, 3),
-                publish_ms=round(
-                    (time.perf_counter() - publish_started) * 1000, 3
-                ),
-            )
 
     def prepare_sparse_page_ptr_cache_for_layers(
         self,
@@ -3104,9 +2652,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 defer_copy=defer_copy,
             )
         num_layers = len(staged_rows)
-        diagnose = serving_perf_enabled()
-        started = time.perf_counter() if diagnose else 0.0
-        thread_started = time.thread_time_ns() if diagnose else 0
         prefix_counts = {
             len(cached_chunk_dev_ptrs[layer_id])
             if layer_id < len(cached_chunk_dev_ptrs)
@@ -3137,15 +2682,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
             return
-
-        table_ms = unbind_ms = 0.0
         if cached_chunk_ptrs_npu is not None:
             tables = getattr(self, "_layerwise_pointer_tables", None)
             if tables is None:
                 tables = self._layerwise_pointer_tables = {}
             table_key = id(cached_chunk_ptrs_npu)
             state = tables.get(table_key)
-            table_started = time.perf_counter() if diagnose else 0.0
 
             if state is None:
                 device = next(
@@ -3217,18 +2759,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             cached_chunk_ptrs_npu[:] = [
                 table[layer_id, :new_count] for layer_id in range(num_layers)
             ]
-            if diagnose:
-                table_ms = (time.perf_counter() - table_started) * 1000
-        if diagnose:
-            _log_cold_perf_slow(
-                "sparse_pointer_table_publish_slow",
-                started,
-                thread_started,
-                layers=self.num_layers,
-                chunks=new_count,
-                table_h2d_submit_ms=round(table_ms, 3),
-                unbind_ms=round(unbind_ms, 3),
-            )
 
     def _append_sparse_chunk_ptr_rows_legacy(
         self,
@@ -3240,9 +2770,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         """Append complete host rows and refresh their shared NPU table."""
         num_layers = len(staged_rows)
-        diagnose = serving_perf_enabled()
-        started = time.perf_counter() if diagnose else 0.0
-        thread_started = time.thread_time_ns() if diagnose else 0
         prefix_counts = {
             len(cached_chunk_dev_ptrs[layer_id])
             if layer_id < len(cached_chunk_dev_ptrs)
@@ -3261,7 +2788,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for layer_id in range(num_layers)
         ]
         row_views = None
-        table_started = time.perf_counter() if diagnose else 0.0
         if cached_chunk_ptrs_npu is not None:
             if defer_copy:
                 pointer_table = self.stage_dense_load_tensor(
@@ -3272,15 +2798,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 pointer_table = torch.tensor(
                     complete_rows, dtype=torch.long, device=self.kv_device
                 )
-            table_ms = (time.perf_counter() - table_started) * 1000 if diagnose else 0.0
-            unbind_started = time.perf_counter() if diagnose else 0.0
             # The row views retain the table storage after this function returns.
             row_views = list(pointer_table.unbind(0))
-            unbind_ms = (
-                (time.perf_counter() - unbind_started) * 1000 if diagnose else 0.0
-            )
-        else:
-            table_ms = unbind_ms = 0.0
 
         if not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
@@ -3296,16 +2815,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if cached_chunk_ptrs_npu is not None:
                 assert row_views is not None
                 cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
-        if diagnose:
-            _log_cold_perf_slow(
-                "sparse_pointer_table_publish_slow",
-                started,
-                thread_started,
-                layers=self.num_layers,
-                chunks=len(complete_rows[0]),
-                table_h2d_submit_ms=round(table_ms, 3),
-                unbind_ms=round(unbind_ms, 3),
-            )
 
 
     def release_sparse_chunk_ptr_cache(
@@ -3339,9 +2848,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ],
     ) -> Optional[list[list[int]]]:
         """Resolve a homogeneous layer-page batch once per physical page."""
-        diagnose = serving_perf_enabled()
-        started = time.perf_counter() if diagnose else 0.0
-        thread_started = time.thread_time_ns() if diagnose else 0
         if not sources_by_layer or not all(
             isinstance(source, LayerPageSource)
             and source.layer_id == layer_id
@@ -3403,8 +2909,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ):
                 return None
             compatible_layout = page_layout
-
-        validation_ms = (time.perf_counter() - started) * 1000 if diagnose else 0.0
         result = [[] for _ in range(page_layers)]
         for chunk_index, page in enumerate(pages):
             base = self._resolve_registered_cpu_source_device_ptr(
@@ -3427,18 +2931,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
                 for index, suffix in enumerate(source.suffix)
             )
-        if diagnose:
-            _log_cold_perf_slow(
-                "sparse_page_pointer_rows_slow",
-                started,
-                thread_started,
-                layers=self.num_layers,
-                pages=len(pages),
-                validation_ms=round(validation_ms, 3),
-                pointer_resolve_ms=round(
-                    (time.perf_counter() - started) * 1000 - validation_ms, 3
-                ),
-            )
         return result
 
     def _resolve_registered_cpu_source_device_ptr(
@@ -3450,9 +2942,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         source: str,
         required_bytes: Optional[int] = None,
     ) -> int:
-        diagnose = serving_perf_enabled()
-        started = time.perf_counter() if diagnose else 0.0
-        thread_started = time.thread_time_ns() if diagnose else 0
         host_ptr = int(
             source_obj.data_ptr()
             if isinstance(source_obj, torch.Tensor)
@@ -3473,17 +2962,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dev_ptr = lmc_ops.get_device_ptr(host_ptr, required_bytes)
         else:
             dev_ptr = lmc_ops.get_device_ptr(host_ptr)
-        if diagnose:
-            _log_cold_perf_slow(
-                "sparse_get_device_ptr_slow",
-                started,
-                thread_started,
-                source=source,
-                layer_id=layer_id,
-                chunk_index=chunk_index,
-                required_bytes=(required_bytes if validate_span else None),
-                found=bool(dev_ptr),
-            )
         if dev_ptr is None or int(dev_ptr) == 0:
             raise RuntimeError(
                 "Ascend sparse pointer-cache install failed: CPU tensor is not "
@@ -3676,11 +3154,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_v_hidden_dims: int,
         sparse_dsa_hidden_dims: int,
         expected_device: Optional[torch.device],
-        diagnostics: Optional[dict[str, Any]] = None,
         registered_destination_layout: Optional[_SparseDestinationLayout] = None,
     ) -> _SparseDestinationPlan:
         """Resolve process-invariant native states for one destination group."""
-        resolve_started = time.perf_counter() if diagnostics is not None else 0.0
         if expected_device is None:
             raise RuntimeError(f"kv_group={kv_group} has no initialized NPU device")
         num_layers = len(kvcaches_ref)
@@ -3747,11 +3223,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     kvcaches_ref, signature, plan.states, binding
                 )
             plans[kv_group] = plan
-            if diagnostics is not None:
-                diagnostics["destination_plan_cache_hit"] = True
-                diagnostics["destination_plan_resolve_ms"] = round(
-                    (time.perf_counter() - resolve_started) * 1000, 3
-                )
             return plan
 
         states = (
@@ -3796,11 +3267,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         plans[kv_group] = plan
         while len(plans) > _SPARSE_DESTINATION_PLAN_CACHE_SIZE:
             del plans[next(iter(plans))]
-        if diagnostics is not None:
-            diagnostics["destination_plan_cache_hit"] = False
-            diagnostics["destination_plan_resolve_ms"] = round(
-                (time.perf_counter() - resolve_started) * 1000, 3
-            )
         return plan
 
     def _sparse_direct_state_key(
@@ -4300,38 +3766,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 tmp_gpu_buffer_obj.ref_count_down()
 
     @staticmethod
-    def _limit_sparse_transfer_inputs(
-        slot_mapping_packed: torch.Tensor,
-        selected_token_idx: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (
-            not _SPARSE_TRANSFER_TOPK
-            or _SPARSE_TRANSFER_TOPK >= selected_token_idx.numel()
-        ):
-            return slot_mapping_packed, selected_token_idx
-        return (
-            slot_mapping_packed[:_SPARSE_TRANSFER_TOPK],
-            selected_token_idx[:_SPARSE_TRANSFER_TOPK],
-        )
-
-    @classmethod
-    def _maybe_limit_sparse_transfer_inputs(
-        cls,
-        slot_mapping_packed: torch.Tensor,
-        selected_token_idx: torch.Tensor,
-        *,
-        has_explicit_sparse_selection: bool,
-        selected_token_counts: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply the debug TOPK bound only to simple explicit selections."""
-        if not has_explicit_sparse_selection or selected_token_counts is not None:
-            return slot_mapping_packed, selected_token_idx
-        return cls._limit_sparse_transfer_inputs(
-            slot_mapping_packed,
-            selected_token_idx,
-        )
-
-    @staticmethod
     def _validate_sparse_fixed_chunk_coverage(
         chunk_count: int,
         chunk_size: int,
@@ -4345,7 +3779,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"chunk_size={chunk_size}, total_tokens={total_tokens}"
             )
 
-    @_trace_sparse_h2d_python
     def _run_sparse_direct_kv_transfer_layer(
         self,
         *,
@@ -4373,15 +3806,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         payload_event: Optional[Any] = None,
         selected_token_counts: Optional[torch.Tensor] = None,
         req_id: Optional[str] = None,
-    ) -> str:
+        ) -> str:
         join = getattr(self, "_active_sparse_load_join", None)
-        _sparse_h2d_python_stage(join, "input_metadata")
         num_sparse = int(selected_token_idx.numel())
         if num_sparse == 0 or total_tokens <= 0 or chunk_ptrs_npu.numel() == 0:
             return "none"
         chunk_count = int(chunk_ptrs_npu.numel())
         chunk_size_int = int(chunk_size)
-        _sparse_h2d_python_stage(join, "validate_coverage")
         self._validate_sparse_fixed_chunk_coverage(
             chunk_count, chunk_size_int, int(total_tokens)
         )
@@ -4393,7 +3824,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         resolve_slot_mapping = (
             slot_mapping_ref if slot_mapping_ref is not None else slot_mapping_packed
         )
-        _sparse_h2d_python_stage(join, "pointer_signature")
         runtime_source_signature = self._sparse_direct_pointer_cache_signature(
             chunk_ptrs_npu=chunk_ptrs_npu,
             slot_mapping_ref=resolve_slot_mapping,
@@ -4407,8 +3837,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
         )
-
-        _sparse_h2d_python_stage(join, "resolve_layer_state")
         layer_state, validate_key = self._get_or_create_sparse_direct_layer_state(
             kvcaches_ref=kvcaches_ref,
             kv_group=kv_group,
@@ -4427,9 +3855,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         if validate_key is None:
             validate_key = (kv_group, layer_id)
-
-        # The custom kernel consumes these raw pointers asynchronously.
-        _sparse_h2d_python_stage(join, "record_stream_ownership")
         slot_mapping_packed.record_stream(load_stream)
         selected_token_idx.record_stream(load_stream)
         chunk_ptrs_npu.record_stream(load_stream)
@@ -4440,17 +3865,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if self.load_stream_list[load_stream_idx] is not load_stream:
                 raise RuntimeError("sparse load stream index does not match its stream")
             join.used_stream_indices.add(load_stream_idx)
-        _sparse_h2d_python_stage(join, "load_stream_context")
         with torch.cuda.stream(load_stream):
-            _sparse_h2d_python_stage(join, "load_stream_dependency")
             load_stream.wait_stream(current_stream)
             if layer_state is not None:
-                _sparse_h2d_python_stage(join, "validation_decision")
                 validate_inputs = (
                     getattr(self, "enable_npu_transfer_validation", True)
                     and validate_key not in self._sparse_direct_validated_layers
                 )
-                _sparse_h2d_python_stage(join, "native_fast_submit")
                 sparse_mla_dsa_batched_direct_kv_transfer_fast(
                     layer_state,
                     slot_mapping_packed,
@@ -4466,9 +3887,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._sparse_direct_validated_layers.add(validate_key)
                 kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer_fast"
             else:
-                _sparse_h2d_python_stage(join, "fallback_input_check")
                 assert cpu_tensors is not None and len(cpu_tensors) > 0
-                _sparse_h2d_python_stage(join, "native_fallback_submit")
                 sparse_mla_dsa_batched_direct_kv_transfer(
                     cpu_tensors,
                     kvcaches_ref[layer_id],
@@ -4487,7 +3906,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     selected_token_counts,
                 )
                 kernel_name = "sparse_mla_dsa_batched_direct_kv_transfer"
-            _sparse_h2d_python_stage(join, "native_return")
 
         if join is None:
             current_stream.wait_stream(load_stream)
@@ -4833,8 +4251,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("Uniform-C8 banked prefill needs an explicit logical capacity")
         if getattr(self, "indexer_hbm_block_map", None) is not None:
             raise ValueError("Banked prefill requires BF16 logical IDs, not a paired map")
-        if len(block_ids_by_bank) != 2 or block_size != 128:
-            raise ValueError("Banked C8 requires two logical bank maps with 128-token blocks")
+        if not block_ids_by_bank or block_size != 128:
+            raise ValueError(
+                "Banked C8 requires logical bank maps with 128-token blocks"
+            )
         if any(factor != (2 if self.indexer_c8_layout.is_c8(i) else 1)
                for i, factor in enumerate(layout.layer_slot_factors)):
             raise ValueError("Banked mixed-C8 requires factor-2 INT8 and factor-1 BF16 views")
@@ -4917,7 +4337,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     *metadata))
             ready = torch.npu.Event()
             ready.record(transfer_stream)
-        for bank in range(2):
+        for bank in range(len(block_ids_by_bank)):
             self._layerwise_prefill_dma_stream(1, bank).wait_event(ready)
         return prepared
 
@@ -6910,14 +6330,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ):
             raise ValueError("Layerwise prefill DMA requires two-group DSA KV")
         layerwise_prefill_bank_count = 2
-        layerwise_prefill_bank_offset = 0
         if getattr(self, "_layerwise_prefill_dma", False):
             layerwise_prefill_bank_count = int(
                 kwargs.get("layerwise_prefill_bank_count", 2) or 2
             )
-            layerwise_prefill_bank_offset = int(
-                kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-            ) & 1
+        if prefill_dma and (
+            len(kwargs["prefill_dma_block_ids_by_bank"]) != layerwise_prefill_bank_count
+        ):
+            raise ValueError("Prefill DMA bank maps disagree with the rotation depth")
         if deferred_dense_direct_get:
             self._set_layerwise_prefill_bank_count(
                 kv_group,
@@ -7001,15 +6421,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dma_req_id = kwargs.get("req_id") if prefill_dma else None
         bound_loads = None
         plan_cache = source_cache = None
-        plan_mode = "full"
-        reuse_debug = prefill_dma and not prefill_packet and prefill_reuse_debug_enabled(
-            getattr(self, "_prefill_worker_id", -1)
-        )
-        if reuse_debug:
-            debug_phase_drops = debug_map_drops = 0
-            debug_reused = debug_rebuilt = debug_layers = 0
-            debug_submit_ms = 0.0
-            debug_layer_count = min(2, self._expected_group_layers(kv_group))
         if prefill_dma and not prefill_packet:
             if isinstance(dma_req_id, str) and dma_req_id:
                 bound_loads = self._prefill_dma_bound_loads.setdefault(dma_req_id, {})
@@ -7026,17 +6437,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 plan_cache=plan_cache,
             )
             if plan_cache is not None:
-                reused_plans = sum(
-                    plan_cache[(kv_group, bank)].reused_chunks > 0 for bank in range(2)
-                )
-                plan_mode = ("full", "mix", "reuse")[reused_plans]
-                for bank in range(2):
+                for bank in range(len(dma_plans)):
                     if plan_cache[(kv_group, bank)].mapping_changed:
                         for cache_key in tuple(bound_loads):
                             if cache_key[0] == kv_group and cache_key[2] == bank:
                                 bound_loads.pop(cache_key)
-                                if reuse_debug:
-                                    debug_map_drops += 1
         if (dense_direct or layout.indexer_c8) and not prefill_dma:
             (
                 dense_fixed_chunk_size,
@@ -7096,8 +6501,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 block_size=int(kwargs["prefill_dma_block_size"]), starts=starts, ends=ends,
                 transfer_stream=self.load_stream,
             )
-        if prefill_dma:
-            self._prepare_layerwise_prefill_source_readiness(kv_group)
         deferred_load_submitted = False
         deferred_load_completed = False
         try:
@@ -7215,31 +6618,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # memobj -> gpu_buffer -> kvcaches
                 if prefill_dma:
                     assert prefill_packets is not None or dma_plans is not None
-                    diagnose_bank_load = (
-                        layer_id < 2 and prefill_start_timing_enabled()
-                    )
-                    if diagnose_bank_load:
-                        bank_load_started = time.perf_counter()
-                    bank = self._layerwise_prefill_bank(
-                        layer_id, kv_group, layerwise_prefill_bank_offset
-                    )
+                    bank = self._layerwise_prefill_bank(layer_id, kv_group)
                     bank_stream = self._layerwise_prefill_dma_stream(
                         kv_group, bank
                     )
-                    bank_tails = getattr(
-                        self, "_layerwise_prefill_bank_tail_events", {}
-                    )
-                    previous_tail = bank_tails.get((kv_group, bank))
-                    previous_tail_pending = None
-                    if diagnose_bank_load:
-                        previous_tail_pending = bool(
-                            previous_tail is not None
-                            and not previous_tail[1].query()
-                        )
-                        bind_started = time.perf_counter()
-                    if reuse_debug and layer_id < debug_layer_count:
-                        debug_submit_started = time.perf_counter()
-                    bind_ms = 0.0
                     if not prefill_packet:
                         source_metadata = None
                         if source_cache is not None:
@@ -7281,92 +6663,41 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         if bound_loads is not None:
                             bound_loads[(kv_group, layer_id, bank)] = bound
                         copies = bound.rows
-                        if diagnose_bank_load:
-                            bind_ms = (time.perf_counter() - bind_started) * 1000
-                        if reuse_debug and layer_id < debug_layer_count:
-                            debug_reused += bound.reused_chunks
-                            debug_rebuilt += len(source_objs) - bound.reused_chunks
-                            debug_layers += 1
                     # Attention already queued the exact last-use event on
                     # this bank FIFO, on every TP rank. Do not snapshot the
                     # current compute stream here: it can include N's FFN or
-                    # N+1's normalization. Initial L0/L1 loads also inherit the
-                    # previous chunk's tail handoff from the same bank FIFO.
+                    # N+1's normalization. Fixed layer-to-bank assignment means
+                    # even the first B loads inherit the previous chunk's saves
+                    # and final-access handoffs on their own FIFO. No all-bank
+                    # producer join is needed. Cross-process CPU sources are
+                    # fenced separately before shared-handle publication.
                     if layer_id >= layerwise_prefill_bank_count:
                         self._require_layerwise_prefill_bank_use(
                             layer_id - layerwise_prefill_bank_count, kv_group, bank,
                         )
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
-                        if diagnose_bank_load:
-                            native_enqueue_started = time.perf_counter()
                         if prefill_packet:
                             self._submit_prefill_c8_packet(
                                 prefill_packets, layer_id, bank, bank_stream, False,
                             )
                         else:
                             lmc_ops.layerwise_prefill_dma_copy(copies, False)
-                        if diagnose_bank_load:
-                            native_enqueue_ms = (
-                                time.perf_counter() - native_enqueue_started
-                            ) * 1000
-                    if diagnose_bank_load:
-                        event_record_started = time.perf_counter()
                     load_done_event = torch.npu.Event()
                     load_done_event.record(bank_stream)
-                    if reuse_debug and layer_id < debug_layer_count:
-                        debug_submit_ms += (
-                            time.perf_counter() - debug_submit_started
-                        ) * 1000
-                    if diagnose_bank_load:
-                        event_record_ms = (
-                            time.perf_counter() - event_record_started
-                        ) * 1000
                     if req_id is not None:
                         self._layerwise_prefill_load_request_events.setdefault(
                             str(req_id), []
                         ).append(load_done_event)
                     _, _, _, load_done = self._layerwise_prefill_transfer_state()
-                    load_done[(kv_group, layer_id, bank)] = (
+                    load_done.setdefault((kv_group, layer_id), {})[
+                        str(req_id) if req_id is not None else None
+                    ] = (
                         layerwise_prefill_generation, load_done_event,
                     )
-                    if diagnose_bank_load:
-                        prefill_start_timing_log(
-                            logger,
-                            "first_bank_load_submit",
-                            bank_load_started,
-                            kv_group=kv_group,
-                            layer_id=layer_id,
-                            bank=bank,
-                            bank_offset=layerwise_prefill_bank_offset,
-                            bind_ms=round(bind_ms, 3),
-                            native_enqueue_ms=round(native_enqueue_ms, 3),
-                            event_record_ms=round(event_record_ms, 3),
-                            previous_tail_pending=previous_tail_pending,
-                            previous_tail_layer=(
-                                previous_tail[2]
-                                if previous_tail is not None else None
-                            ),
-                        )
-                    if reuse_debug and layer_id + 1 == debug_layer_count:
-                        prefill_reuse_debug_log(
-                            self._prefill_worker_id,
-                            "dma",
-                            req_id=dma_req_id or "",
-                            p=int(ends[-1]) if ends else 0,
-                            g=kv_group,
-                            n=len(starts),
-                            l=debug_layers,
-                            x=f"{debug_reused}/{debug_rebuilt}",
-                            drop=f"{debug_phase_drops}/{debug_map_drops}",
-                            plan=plan_mode,
-                            ms=debug_submit_ms,
-                        )
                 elif dense_direct or layout.indexer_c8:
                     if deferred_dense_direct_get:
-                        bank = self._layerwise_prefill_bank(
-                            layer_id, kv_group, layerwise_prefill_bank_offset
-                        )
+                        bank = self._layerwise_prefill_bank(layer_id, kv_group)
                         _, _, save_done, _ = (
                             self._layerwise_prefill_transfer_state()
                         )
@@ -7452,7 +6783,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             kv_group,
                             layerwise_prefill_generation,
                         )
-                        load_done[(kv_group, layer_id)] = (
+                        load_done.setdefault((kv_group, layer_id), {})[
+                            str(req_id) if req_id is not None else None
+                        ] = (
                             layerwise_prefill_generation,
                             load_done_event,
                         )
@@ -7512,9 +6845,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # bank event; request teardown fences the exact events before
             # releasing the lease.
             if deferred_dense_direct_get and deferred_load_submitted:
-                final_load_sync_started = (
-                    time.perf_counter() if prefill_start_timing_enabled() else 0.0
-                )
                 # Request-owned source leases make a host fence unnecessary on
                 # the compute path.  Each layer's consumer stream waits on its
                 # bank event; request teardown fences the bank streams after
@@ -7525,11 +6855,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         self._synchronize_layerwise_prefill_dma_streams(kv_group)
                     else:
                         self.load_stream.synchronize()
-                if final_load_sync_started:
-                    prefill_start_timing_log(
-                        logger, "final_load_source_sync", final_load_sync_started,
-                        kv_group=kv_group, tokens=num_tokens,
-                    )
             elif sync and not defer_dense_waits:
                 current_stream.wait_stream(self.load_stream)
             if tmp_gpu_buffer_obj is not None:
@@ -7577,35 +6902,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping = transfer_kwargs["slot_mapping"]
 
         kv_group = int(transfer_kwargs.get("kv_group", 0))
-        req_id = transfer_kwargs.get("req_id")
-        frontier = int(transfer_kwargs.get("lmcache_cached_tokens", 0) or 0)
-        diagnostics = transfer_kwargs.get("_cold_perf_breakdown")
-        if not serving_perf_enabled() or not isinstance(diagnostics, dict):
-            diagnostics = None
-        # Warm layers execute at token frequency. Coarse perf logging must not
-        # collect several wall/CPU clocks and allocate rounded fields per layer.
-        perf_enabled = serving_perf_detailed_enabled()
-        submit_count = 0
-        submit_sum_s = submit_max_s = 0.0
-        submit_max_layer = -1
-        submit_thread_cpu_ns = 0
-        layout_started = time.perf_counter() if diagnostics is not None else 0.0
         layout = self._group_layouts.get(kv_group)
-        layout_cache_hit = layout is not None
         if layout is None:
             layout = self._lazy_initialize_buffer_with_staging(
                 kvcaches_snapshot,
                 kv_group=kv_group,
                 init_staging=False,
-            )
-        if diagnostics is not None:
-            diagnostics["layout_cache_hit"] = layout_cache_hit
-            diagnostics["layout_resolve_ms"] = round(
-                (time.perf_counter() - layout_started) * 1000, 3
-            )
-            cached_idx = getattr(self, "_layerwise_sparse_idx_cache", None)
-            diagnostics["selection_index_cached_tokens_before"] = (
-                int(cached_idx.shape[0]) if cached_idx is not None else 0
             )
 
         sparse_k_hidden_dims = layout.k_hidden_dims
@@ -7614,9 +6916,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         chunk_size = self.lmcache_chunk_size
-        content_diag_enabled = (
-            kv_group == 0 and npu_content_diagnostics_enabled()
-        )
         chunk_token_counts = source.chunk_token_counts
         if (
             getattr(source, "validated_chunk_size", None) != chunk_size
@@ -7641,7 +6940,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             sparse_v_hidden_dims=sparse_v_hidden_dims,
             sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
             expected_device=layout.kv_device,
-            diagnostics=diagnostics,
             registered_destination_layout=transfer_kwargs.get(
                 "registered_destination_layout"
             ),
@@ -7653,8 +6951,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         for layer_id in range(start_layer, len(source.layers)):
             source_layer = source.layers[layer_id]
             sparse_request = yield
-            submit_started = time.perf_counter() if perf_enabled else 0.0
-            submit_thread_started = time.thread_time_ns() if perf_enabled else 0
 
             (
                 selected_token_idx,
@@ -7663,7 +6959,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 _payload_event,
                 selected_token_counts,
             ) = self._unpack_sparse_dynamic_request(sparse_request)
-            unpack_done = time.perf_counter() if perf_enabled else 0.0
             # The producer, this transfer, and its consumer are submitted to
             # the same current stream, so stream order replaces the event wait.
             # A cold bootstrap carries no selection (the indexer selects only
@@ -7675,7 +6970,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     target_slot_mapping,
                 )
             )
-            normalize_done = time.perf_counter() if perf_enabled else 0.0
 
             if target_slot_mapping is not None:
                 slot_mapping_packed, selected_token_idx, selected_token_counts = (
@@ -7694,52 +6988,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     )
                 )
                 selected_token_counts = None
-            pack_done = time.perf_counter() if perf_enabled else 0.0
-            slot_mapping_packed, selected_token_idx = (
-                self._maybe_limit_sparse_transfer_inputs(
-                    slot_mapping_packed,
-                    selected_token_idx,
-                    has_explicit_sparse_selection=has_explicit_sparse_selection,
-                    selected_token_counts=selected_token_counts,
-                )
-            )
-            limit_done = time.perf_counter() if perf_enabled else 0.0
-
-            deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
-            capture_content = _should_capture_deep_payload(
-                enabled=_mtp_dw_deep_diag_enabled(),
-                # Prepared indexer loads use their request-owned slot mapping
-                # rather than SFA's explicit latent target mapping.
-                explicit_payload=selected_token_idx is not None,
-                committed_end=frontier,
-                req_id=req_id,
-                kv_group=kv_group,
-                seen=deep_seen,
-            )
-
-            if content_diag_enabled and layer_id in (0, self.num_layers // 2):
-                diagnostic_source_tensors = list(source_layer.tensors)
-                for memory_obj in (
-                    source_layer.memory_objs
-                    if not diagnostic_source_tensors
-                    else ()
-                ):
-                    diagnostic_source_tensors.append(
-                        _layer_memory_tensor(memory_obj, layer_id)
-                    )
-                register_group0_source_probe(
-                    req_id=req_id,
-                    layer_id=layer_id,
-                    num_layers=self.num_layers,
-                    source_chunks=diagnostic_source_tensors,
-                    selected_tokens=selected_token_idx,
-                    selected_count=selected_token_counts,
-                    chunk_size=chunk_size,
-                    total_tokens=source.total_tokens,
-                    token_major=self._layerwise_token_major(kv_group),
-                    layer_cache=kvcaches_snapshot[layer_id],
-                )
-            diagnostic_done = time.perf_counter() if perf_enabled else 0.0
             if layout.indexer_c8:
                 self._run_c8_indexer_bootstrap(
                     destination_plan, source_layer.chunk_ptrs_npu, layer_id,
@@ -7758,93 +7006,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     sparse_host_interleaved=sparse_host_interleaved,
                     selected_token_counts=selected_token_counts,
                 )
-            if perf_enabled:
-                native_done = time.perf_counter()
-                submit_elapsed = native_done - submit_started
-                submit_count += 1
-                submit_sum_s += submit_elapsed
-                if submit_elapsed > submit_max_s:
-                    submit_max_s = submit_elapsed
-                    submit_max_layer = layer_id
-                submit_thread_cpu_ns += (
-                    time.thread_time_ns() - submit_thread_started
-                )
-                if submit_elapsed * 1000 >= _COLD_PERF_SLOW_MS:
-                    _log_cold_perf_slow(
-                        "prepared_sparse_layer_slow",
-                        submit_started,
-                        submit_thread_started,
-                        req_id=req_id or "unspecified",
-                        kv_group=kv_group,
-                        layer_id=layer_id,
-                        unpack_ms=round((unpack_done - submit_started) * 1000, 3),
-                        normalize_ms=round((normalize_done - unpack_done) * 1000, 3),
-                        pack_ms=round((pack_done - normalize_done) * 1000, 3),
-                        limit_ms=round((limit_done - pack_done) * 1000, 3),
-                        diagnostic_ms=round((diagnostic_done - limit_done) * 1000, 3),
-                        native_submit_ms=round(
-                            (native_done - diagnostic_done) * 1000, 3
-                        ),
-                    )
-            if capture_content and layer_id == 0:
-                source_tensors = list(source_layer.tensors)
-                for memory_obj in (
-                    source_layer.memory_objs if not source_tensors else ()
-                ):
-                    source_tensors.append(
-                        _layer_memory_tensor(memory_obj, layer_id)
-                    )
-                source_chunk_ranges = []
-                for chunk_index, tensor in enumerate(source_tensors):
-                    range_start = chunk_index * chunk_size
-                    range_end = min(
-                        range_start + chunk_size, source.total_tokens
-                    )
-                    source_chunk_ranges.append(
-                        {
-                            "start": range_start,
-                            "end": range_end,
-                            "fingerprint": _bounded_tensor_fingerprint(tensor),
-                        }
-                    )
-                content_probe = _sparse_content_probe(
-                    cpu_tensors=source_tensors,
-                    layer_cache=kvcaches_snapshot[layer_id],
-                    selected_token_idx=selected_token_idx,
-                    target_slots=slot_mapping_packed,
-                    chunk_size=chunk_size,
-                    token_major=self._layerwise_token_major(kv_group),
-                )
-                _mtp_dw_event(
-                    "deep",
-                    event="content_transfer",
-                    req=str(req_id),
-                    kv_group=kv_group,
-                    frontier=frontier,
-                    layer=layer_id,
-                    content_path="prepared",
-                    source_chunk_ranges=source_chunk_ranges,
-                    content_probe=content_probe,
-                )
-                _remember_bounded_key(
-                    deep_seen,
-                    (str(req_id), int(kv_group), int(frontier)),
-                )
-                self._mtp_dw_deep_diag_seen = deep_seen
-
-        if perf_enabled and submit_sum_s * 1000 >= _COLD_PERF_SLOW_MS:
-            serving_perf_log(
-                logger,
-                "prepared_sparse_submit_summary",
-                req_id=req_id or "unspecified",
-                kv_group=kv_group,
-                layers=submit_count,
-                tokens=source.total_tokens,
-                sum_ms=round(submit_sum_s * 1000, 3),
-                max_ms=round(submit_max_s * 1000, 3),
-                max_layer_id=submit_max_layer,
-                thread_cpu_ms=round(submit_thread_cpu_ns / 1_000_000, 3),
-            )
         yield
         yield
 
@@ -7867,38 +7028,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if kwargs.get("prepared_sparse_source") is not None:
             yield from self._batched_to_gpu_head_token_wise_prepared(kwargs)
             return
-        diagnostics = kwargs.get("_cold_perf_breakdown")
-        if not isinstance(diagnostics, dict):
-            diagnostics = None
-        connector_init_started = (
-            time.perf_counter() if diagnostics is not None else 0.0
-        )
         self.initialize_kvcaches_ptr(**kwargs)
-        if diagnostics is not None:
-            diagnostics["connector_init_ms"] = round(
-                (time.perf_counter() - connector_init_started) * 1000, 3
-            )
         kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
         assert kvcaches_snapshot is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
         kv_group = kwargs.get("kv_group", 0)
-        layout_cache_hit = kv_group in self._group_layouts
-        layout_started = time.perf_counter() if diagnostics is not None else 0.0
         layout = self._lazy_initialize_buffer_with_staging(
             kvcaches_snapshot,
             kv_group=kv_group,
             init_staging=False,
         )
-        if diagnostics is not None:
-            diagnostics["layout_cache_hit"] = layout_cache_hit
-            diagnostics["layout_resolve_ms"] = round(
-                (time.perf_counter() - layout_started) * 1000, 3
-            )
-            cached_idx = getattr(self, "_layerwise_sparse_idx_cache", None)
-            diagnostics["selection_index_cached_tokens_before"] = (
-                int(cached_idx.shape[0]) if cached_idx is not None else 0
-            )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -7933,9 +7073,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sparse_host_interleaved = self._sparse_lmc_host_interleaved(kv_group)
         sparse_kv_format = layout.kv_format.value
         sparse_vllm_two_major = layout.vllm_two_major
-        content_diag_enabled = (
-            kv_group == 0 and npu_content_diagnostics_enabled()
-        )
         bootstrap_destination_plan = None
         if self._is_mla_dsa_format(kv_group):
             bootstrap_destination_plan = self._get_or_create_sparse_destination_plan(
@@ -7947,8 +7084,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 sparse_v_hidden_dims=sparse_v_hidden_dims,
                 sparse_dsa_hidden_dims=sparse_dsa_hidden_dims,
                 expected_device=layout.kv_device,
-                diagnostics=diagnostics,
-            )
+                )
         for layer_id in range(
             self._expected_group_layers(kv_group)
         ):
@@ -7961,8 +7097,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 else torch.cuda.current_stream()
             )
             load_stream = self.load_stream_list[load_stream_idx]
-            deep_diag_enabled = _mtp_dw_deep_diag_enabled()
-            diagnostics_enabled = _mtp_dw_diag_enabled()
             req_id = kwargs.get("req_id")
             explicit_sparse_payload = isinstance(sparse_request, dict)
             target_slot_mapping = None
@@ -8015,18 +7149,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     target_slot_mapping,
                 )
             )
-            deep_seen = {}
-            capture_deep_payload = False
-            if deep_diag_enabled:
-                deep_seen = getattr(self, "_mtp_dw_deep_diag_seen", None) or {}
-                capture_deep_payload = _should_capture_deep_payload(
-                    enabled=True,
-                    explicit_payload=explicit_sparse_payload,
-                    committed_end=lmcache_cached_tokens,
-                    req_id=req_id,
-                    kv_group=kv_group,
-                    seen=deep_seen,
-                )
 
             # selected_token_idx/target_slot_mapping may be device tensors
             # produced by vLLM's remap path. Packing below is their first
@@ -8050,14 +7172,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         token_start_index,
                     )
                 )
-            slot_mapping_packed, selected_token_idx = (
-                self._maybe_limit_sparse_transfer_inputs(
-                    slot_mapping_packed,
-                    selected_token_idx,
-                    has_explicit_sparse_selection=has_explicit_sparse_selection,
-                    selected_token_counts=selected_token_counts,
-                )
-            )
 
             layer_cached_tensors = (
                 cached_tensors_by_layer[layer_id]
@@ -8086,7 +7200,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 pointer_first = (
                     lmcache_cached_tokens > 0
                     and bool(layer_memory_objs)
-                    and not diagnostics_enabled
                     and cached_layer_ptrs is not None
                     and cached_layer_ptrs.numel() == len(layer_memory_objs)
                 )
@@ -8177,271 +7290,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors=cpu_tensors,
                     selected_token_counts=selected_token_counts,
                     req_id=req_id,
-                )
-            if content_diag_enabled and layer_id in (0, self.num_layers // 2):
-                diagnostic_cpu_tensors = cpu_tensors
-                if pointer_first:
-                    diagnostic_cpu_tensors = [
-                        _layer_memory_tensor(memory_obj, layer_id)
-                        for memory_obj in layer_memory_objs
-                    ]
-                register_group0_source_probe(
-                    req_id=req_id,
-                    layer_id=layer_id,
-                    num_layers=self.num_layers,
-                    source_chunks=diagnostic_cpu_tensors,
-                    selected_tokens=selected_token_idx,
-                    selected_count=selected_token_counts,
-                    chunk_size=chunk_size,
-                    total_tokens=total_tokens,
-                    token_major=sparse_token_major,
-                    layer_cache=kvcaches_snapshot[layer_id],
-                )
-            capture_content_probe = (
-                deep_diag_enabled
-                and layer_id == 0
-                and selected_token_idx is not None
-                and selected_token_idx.numel() > 0
-                and _should_capture_deep_payload(
-                    enabled=True,
-                    explicit_payload=True,
-                    committed_end=lmcache_cached_tokens,
-                    req_id=req_id,
-                    kv_group=kv_group,
-                    seen=deep_seen,
-                )
-            )
-            if capture_content_probe and layer_id == 0:
-                source_chunk_ranges = []
-                for chunk_index, tensor in enumerate(cpu_tensors):
-                    range_start = chunk_index * chunk_size
-                    range_end = min(
-                        range_start + chunk_size, total_tokens
-                    )
-                    source_chunk_ranges.append(
-                        {
-                            "start": range_start,
-                            "end": range_end,
-                            "fingerprint": _bounded_tensor_fingerprint(tensor),
-                        }
-                    )
-                content_probe = _sparse_content_probe(
-                    cpu_tensors=cpu_tensors,
-                    layer_cache=kvcaches_snapshot[layer_id],
-                    selected_token_idx=selected_token_idx,
-                    target_slots=slot_mapping_packed,
-                    chunk_size=chunk_size,
-                    token_major=sparse_token_major,
-                )
-                _mtp_dw_event(
-                    "deep",
-                    event="content_transfer",
-                    req=str(req_id),
-                    kv_group=kv_group,
-                    frontier=lmcache_cached_tokens,
-                    layer=layer_id,
-                    content_path="normal",
-                    source_chunk_ranges=source_chunk_ranges,
-                    content_probe=content_probe,
-                )
-                _remember_bounded_key(
-                    deep_seen,
-                    (str(req_id), int(kv_group), int(lmcache_cached_tokens)),
-                )
-                self._mtp_dw_deep_diag_seen = deep_seen
-            elif deep_diag_enabled and layer_id == 0:
-                _mtp_dw_event(
-                    "deep",
-                    event="content_skip",
-                    req=str(req_id),
-                    kv_group=kv_group,
-                    frontier=lmcache_cached_tokens,
-                    layer=layer_id,
-                    content_path="normal",
-                    reason=(
-                        "no_selected_tokens"
-                        if selected_token_idx is None
-                        or selected_token_idx.numel() == 0
-                        else "already_seen"
-                    ),
-                )
-            deep_diag = None
-            if capture_deep_payload:
-                deep_key = (str(req_id), int(kv_group), int(lmcache_cached_tokens))
-                try:
-                    selected_values = [
-                        int(value)
-                        for value in selected_token_idx.detach()
-                        .reshape(-1)[:_MTP_DW_CHECKSUM_LIMIT]
-                        .to(device="cpu")
-                        .tolist()
-                    ]
-                    slot_values = [
-                        int(value)
-                        for value in slot_mapping_packed.detach()
-                        .reshape(-1)[:_MTP_DW_CHECKSUM_LIMIT]
-                        .to(device="cpu")
-                        .tolist()
-                    ]
-                    deep_diag = {
-                        "deep_key": deep_key,
-                        "deep_seen": deep_seen,
-                        "selected_values": selected_values,
-                        "slot_values": slot_values,
-                        "conflicts": _conflicting_duplicate_target_slots(
-                            selected_values, slot_values
-                        ),
-                    }
-                except Exception as exc:
-                    logger.warning(
-                        "[MTP_DW] deep transfer diagnostic unavailable: %s",
-                        exc,
-                    )
-            if _mtp_dw_diag_enabled() and layer_id == 0:
-                actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group, layer_id
-                )
-                diag_selected = selected_token_idx.detach().cpu().reshape(-1)
-                selected_count = int(diag_selected.numel())
-                selected_min = (
-                    int(diag_selected.min()) if selected_count else None
-                )
-                selected_max = (
-                    int(diag_selected.max()) if selected_count else None
-                )
-                slot_count = int(slot_mapping_packed.numel())
-                selected_oob = bool(
-                    selected_count
-                    and (selected_min < 0 or selected_max >= actual_cpu_tokens)
-                )
-                slot_selected_match = selected_count == slot_count
-                raw_window = os.environ.get(
-                    "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
-                )
-                try:
-                    window_size = max(int(raw_window), 0)
-                except ValueError:
-                    window_size = 0
-                diag_key = (
-                    kwargs.get("req_id"),
-                    kv_group,
-                    lmcache_cached_tokens,
-                )
-                seen_retrieves = getattr(
-                    self, "_mtp_dw_diag_seen_retrieves", None
-                )
-                if seen_retrieves is None:
-                    seen_retrieves = set()
-                    self._mtp_dw_diag_seen_retrieves = seen_retrieves
-                first_for_frontier = diag_key not in seen_retrieves
-                seen_retrieves.add(diag_key)
-                if first_for_frontier or selected_oob or not slot_selected_match:
-                    _mtp_dw_event(
-                        "retrieve",
-                        req=kwargs.get("req_id"),
-                        frontier=lmcache_cached_tokens,
-                        window_start=(
-                            max(0, lmcache_cached_tokens - window_size)
-                            if window_size
-                            else None
-                        ),
-                        window_end=lmcache_cached_tokens,
-                        kv_group=kv_group,
-                        actual_cpu_tokens=actual_cpu_tokens,
-                        kernel_total_tokens=total_tokens,
-                        selected_count=selected_count,
-                        selected_min=selected_min,
-                        selected_max=selected_max,
-                        selected_sample=diag_selected[:8].tolist(),
-                        slot_count=slot_count,
-                        selected_oob=selected_oob,
-                        slot_selected_match=slot_selected_match,
-                    )
-                if selected_oob or not slot_selected_match:
-                    _mtp_dw_event(
-                        "fail",
-                        req=kwargs.get("req_id"),
-                        frontier=lmcache_cached_tokens,
-                        invariant="retrieve_bounds",
-                        kv_group=kv_group,
-                        actual_cpu_tokens=actual_cpu_tokens,
-                        selected_count=selected_count,
-                        selected_min=selected_min,
-                        selected_max=selected_max,
-                        slot_count=slot_count,
-                        selected_oob=selected_oob,
-                        slot_selected_match=slot_selected_match,
-                    )
-            if deep_diag is not None:
-                selected_values = deep_diag["selected_values"]
-                slot_values = deep_diag["slot_values"]
-                conflicts = deep_diag["conflicts"]
-                actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group, layer_id
-                )
-                raw_window = os.environ.get(
-                    "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
-                )
-                try:
-                    window_size = max(int(raw_window), 0)
-                except ValueError:
-                    window_size = 0
-                _mtp_dw_event(
-                    "deep",
-                    event="transfer_payload",
-                    req=str(req_id),
-                    worker_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
-                    tp_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
-                    tp_world=int(os.environ.get("WORLD_SIZE", "1") or 1),
-                    kv_group=kv_group,
-                    frontier=lmcache_cached_tokens,
-                    window_start=(
-                        max(0, lmcache_cached_tokens - window_size)
-                        if window_size
-                        else None
-                    ),
-                    window_end=lmcache_cached_tokens,
-                    layer=layer_id,
-                    kernel="sparse_direct_kv_transfer",
-                    selected_count=int(selected_token_idx.numel()),
-                    payload_count=int(selected_token_idx.numel()),
-                    selection_sample=selected_values[:8],
-                    selection_checksum=_bounded_stable_int_checksum(
-                        selected_values
-                    ),
-                    slot_count=int(slot_mapping_packed.numel()),
-                    target_physical_count=int(slot_mapping_packed.numel()),
-                    target_slot_sample=slot_values[:8],
-                    target_slot_checksum=_bounded_stable_int_checksum(slot_values),
-                    checksum_scope="first32",
-                    sample_scope="first8",
-                    conflict_check_scope="first32",
-                    chunk_size=chunk_size,
-                    chunk_count=len(cpu_tensors),
-                    actual_cpu_tokens=actual_cpu_tokens,
-                    kernel_total_tokens=total_tokens,
-                    kv_format=sparse_kv_format,
-                    token_major=sparse_token_major,
-                    host_interleaved=sparse_host_interleaved,
-                    count_match=(
-                        int(selected_token_idx.numel())
-                        == int(slot_mapping_packed.numel())
-                    ),
-                    conflicting_duplicate_slots=conflicts,
-                )
-                _remember_bounded_key(
-                    deep_diag["deep_seen"], deep_diag["deep_key"]
-                )
-                self._mtp_dw_deep_diag_seen = deep_diag["deep_seen"]
-                if conflicts:
-                    _mtp_dw_event(
-                        "fail",
-                        event="transfer_payload",
-                        req=str(req_id),
-                        kv_group=kv_group,
-                        frontier=lmcache_cached_tokens,
-                        invariant="conflicting_duplicate_target_slots",
-                        conflicting_duplicate_slots=conflicts,
                     )
 
         yield
@@ -8694,53 +7542,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             # Keep D's original stream snapshot for the whole store generator.
             current_stream = torch.npu.current_stream()
 
-        def log_completed_store_layer(layer_id: int) -> None:
-            if not (_mtp_dw_deep_diag_enabled() and layer_id == 0):
-                return
-            store_req_id = kwargs.get("req_id")
-            if store_req_id is None:
-                return
-            if async_layerwise_store:
-                # Async publication protects device/remote consumers with this
-                # bank event. A host fingerprint must explicitly observe it too.
-                diagnostic_bank = (
-                    layer_id + layerwise_prefill_bank_offset
-                ) % source_bank_count
-                last_store_events[diagnostic_bank].synchronize()
-            store_tensors = [
-                _layer_memory_tensor(memory_obj, layer_id)
-                for memory_obj in memory_objs[layer_id]
-            ]
-            chunk_ranges = []
-            for chunk_index, tensor in enumerate(store_tensors):
-                range_start = (
-                    int(starts[chunk_index])
-                    if chunk_index < len(starts)
-                    else None
-                )
-                range_end = (
-                    int(ends[chunk_index])
-                    if chunk_index < len(ends)
-                    else None
-                )
-                chunk_ranges.append(
-                    {
-                        "start": range_start,
-                        "end": range_end,
-                        "fingerprint": _bounded_tensor_fingerprint(tensor),
-                    }
-                )
-            _mtp_dw_event(
-                "deep",
-                event="content_store",
-                req=str(store_req_id),
-                kv_group=kv_group,
-                layer=layer_id,
-                window_start=kwargs.get("decode_window_start"),
-                window_end=kwargs.get("decode_window_end"),
-                chunk_ranges=chunk_ranges,
-            )
-
         store_transfer_pending = False
         # Declared before the try so the finally block can drop the registry
         # entry of a fallback pointer table even when preparation fails before
@@ -8748,17 +7549,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         deferred_dense_chunk_ptrs_npu: List[Optional[torch.Tensor]] = []
         try:
             layerwise_prefill_bank_count = 2
-            layerwise_prefill_bank_offset = 0
             if not ordinary_store:
                 layerwise_prefill_bank_count = int(
                     kwargs.get("layerwise_prefill_bank_count", 2) or 2
                 )
-                layerwise_prefill_bank_offset = int(
-                    kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-                ) & 1
             if layerwise_prefill_bank_count <= 0:
                 raise ValueError(
                     "layerwise_prefill_bank_count must be positive"
+                )
+            if prefill_dma and (
+                len(kwargs["prefill_dma_block_ids_by_bank"])
+                != layerwise_prefill_bank_count
+            ):
+                raise ValueError(
+                    "Prefill DMA bank maps disagree with the rotation depth"
                 )
             # The fallback path reuses one staging tensor for every layer, so
             # it cannot safely pipeline multiple source banks. Keep its
@@ -8829,9 +7633,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 f"ranges={len(starts)}"
                             )
                         deferred_dma_copies.append(bind_copy_addresses(
-                            dma_plans[
-                                (layer_id + layerwise_prefill_bank_offset) % 2
-                            ],
+                            dma_plans[layer_id % source_bank_count],
                             host_ptrs,
                             [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
                             chunk_sizes, widths,
@@ -8942,9 +7744,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 # already has the earlier final-access event on its bank FIFO.
                 if not ordinary_store and not prefill_dma:
                     current_stream = torch.npu.current_stream()
-                bank = (
-                    layer_id + layerwise_prefill_bank_offset
-                ) % source_bank_count
+                bank = layer_id % source_bank_count
 
                 if prefill_dma:
                     # The raw-address plan already selects the physical bank.
@@ -8999,8 +7799,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         layer_id, kv_group, bank,
                     )
                     with torch.npu.stream(bank_stream):
-                        # The final-access event is already ahead of us on
-                        # the bank FIFO; do not wait for later compute here.
                         if prefill_packet:
                             self._submit_prefill_c8_packet(
                                 prefill_packets, layer_id, bank, bank_stream, True,
@@ -9209,7 +8007,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     # after this generator advances.
                     self.store_stream.synchronize()
                     store_transfer_pending = False
-                    log_completed_store_layer(layer_id)
 
             if deferred_layerwise_put:
                 # The P-node DMA path keeps one completion event per bank for
@@ -9236,25 +8033,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             for bank in sorted(last_store_events)
                         )
                 if last_store_event is not None and not async_layerwise_store:
-                    store_publish_sync_started = (
-                        time.perf_counter()
-                        if prefill_start_timing_enabled() else 0.0
-                    )
                     if prefill_dma:
                         for bank in sorted(last_store_events):
                             last_store_events[bank].synchronize()
                     else:
                         last_store_event.synchronize()
-                    if store_publish_sync_started:
-                        prefill_start_timing_log(
-                            logger, "store_publish_sync", store_publish_sync_started,
-                            kv_group=kv_group, tokens=num_tokens,
-                            layers=expected_layers,
-                        )
-                        self._flush_prefill_first_bank_timing_events()
                 store_transfer_pending = False
                 for completed_layer in range(expected_layers):
-                    log_completed_store_layer(completed_layer)
                     yield completed_layer
 
             # free the buffer memory
@@ -9266,9 +8051,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         finally:
             if store_transfer_pending and not ordinary_store:
                 if prefill_dma:
-                    self._synchronize_layerwise_prefill_dma_streams(kv_group)
+                    pending_streams = tuple({
+                        id(stream): stream
+                        for (group, _), stream in getattr(
+                            self, "_layerwise_prefill_dma_streams", {}
+                        ).items() if group == kv_group
+                    }.values())
                 else:
-                    self.store_stream.synchronize()
+                    pending_streams = (self.store_stream,)
+                try:
+                    for stream in pending_streams:
+                        stream.synchronize()
+                except BaseException:
+                    pending_owners = [
+                        obj for layer_objs in memory_objs for obj in layer_objs
+                    ]
+                    if tmp_gpu_buffer_obj is not None:
+                        pending_owners.append(tmp_gpu_buffer_obj)
+                    self._retain_unfenced_layerwise_prefill_store(
+                        str(kwargs.get("req_id", "unspecified")),
+                        pending_streams, pending_owners,
+                        (kvcaches_snapshot, prefill_packets),
+                    )
+                    raise
             if deferred_dense_chunk_ptrs_npu:
                 # Native readers of this fallback table were fenced above.
                 # The table belongs to this transfer generator, so drop its

@@ -29,7 +29,6 @@ from lmcache.v1.remote_fill import (
     ReservedPageView,
     ResultCode,
     UnsafePageLifecycleError,
-    content_digest,
 )
 from lmcache.v1.shared_cpu_cache import SharedHandleBatch
 from lmcache.v1.storage_backend.local_cpu_backend import (
@@ -151,7 +150,7 @@ def test_c8_asymmetric_tp_requires_validated_packet(policy, invalid):
     assert remote_fill_tp_independent(config, metadata) is (invalid is None)
 
 
-def test_post_init_emits_startup_stage_timings() -> None:
+def test_post_init_initializes_base_reader_then_remote_fill() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.metadata = SimpleNamespace(worker_id=1)
     engine.config = SimpleNamespace(
@@ -162,42 +161,30 @@ def test_post_init_emits_startup_stage_timings() -> None:
     engine._direct_store_enabled = False
     engine._group1_external_page_reader = None
     engine._is_passive = Mock(return_value=True)
-    engine._initialize_decoder_remote_fill = Mock()
+    stages = []
+    engine._initialize_decoder_remote_fill = Mock(
+        side_effect=lambda: stages.append("remote_fill")
+    )
     reader = object()
 
+    def create_reader(*args, **kwargs):
+        stages.append("reader")
+        return reader
+
     with (
-        patch.object(LMCacheEngine, "post_init"),
-        patch(
-            "lmcache_ascend.v1.cache_engine.serving_perf_enabled",
-            return_value=True,
+        patch.object(
+            LMCacheEngine, "post_init", side_effect=lambda: stages.append("base")
         ),
-        patch(
-            "lmcache_ascend.v1.cache_engine.serving_perf_now",
-            side_effect=[1.0, 2.0, 3.0],
-        ),
-        patch("lmcache_ascend.v1.cache_engine.serving_perf_log") as perf_log,
         patch(
             "lmcache_ascend.v1.cache_engine.RemoteExternalPageReader",
-            return_value=reader,
+            side_effect=create_reader,
         ),
     ):
         engine.post_init()
 
     assert engine._group1_external_page_reader is reader
     engine._initialize_decoder_remote_fill.assert_called_once_with()
-    assert [call.args[1] for call in perf_log.call_args_list] == [
-        "lmcache_base_post_init_start",
-        "lmcache_base_post_init_complete",
-        "group1_external_reader_init_start",
-        "group1_external_reader_init_complete",
-        "remote_fill_decoder_init_start",
-        "remote_fill_decoder_init_complete",
-    ]
-    assert [
-        call.kwargs.get("started")
-        for call in perf_log.call_args_list
-        if call.args[1].endswith("_complete")
-    ] == [1.0, 2.0, 3.0]
+    assert stages == ["base", "reader", "remote_fill"]
 
 
 @dataclass
@@ -1052,8 +1039,6 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     caplog,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("PD_SERVING_PERF", "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(local)
     controls = tuple(
@@ -1090,24 +1075,6 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
         for page in call["pages"]:
             assert page.refs == 1
             assert page.pins == 0
-    group0 = tuple(
-        CacheEngineKey.from_string(controls[index].canonical_key)
-        for index in range(0, len(controls), 2)
-    )
-    group1 = tuple(
-        CacheEngineKey.from_string(controls[index].canonical_key)
-        for index in range(1, len(controls), 2)
-    )
-    expected_digest = content_digest(
-        (
-            tuple(key.to_string() for key in group0),
-            tuple(key.to_string() for key in group1),
-        )
-    )
-    assert '"inserted_keys":4' in caplog.text
-    assert '"existing_keys":0' in caplog.text
-    assert '"retention_trace_id":17' in caplog.text
-    assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 
 def test_group0_only_lifecycle_allocates_and_commits_no_group1_pages() -> None:
