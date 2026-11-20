@@ -211,6 +211,9 @@ class _LiveSourceReadyFence:
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     supports_preemption_checkpoint = True
 
+    def _engine_supports_omitted_prefix_tokens_all_modes(self) -> bool:
+        return True
+
     def _record_dsa_cold_dense_load_readiness(
         self, state, readiness=None, additional_owners=()
     ):
@@ -1026,6 +1029,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
                     source_ready_events=source_ready_events,
+                    prefill_chunk_hashes=getattr(
+                        request, "prefill_chunk_hashes", None
+                    ),
+                    prefill_chunk_offsets=getattr(
+                        request, "prefill_chunk_offsets", None
+                    ),
                     prefix_slot_mappings=(
                         {
                             group: (
@@ -1302,6 +1311,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 required_store_end=len(request.token_ids),
                 persistence_fenced=True,
                 tokens=request.token_ids,
+                prefill_chunk_hashes=getattr(
+                    request, "prefill_chunk_hashes", None
+                ),
+                prefill_chunk_offsets=getattr(
+                    request, "prefill_chunk_offsets", None
+                ),
             )
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
@@ -1480,6 +1495,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                             final=True,
                             slot_mapping_base=mapping_base,
                             accepted_store_end=len(request.token_ids),
+                            prefill_chunk_hashes=getattr(
+                                request, "prefill_chunk_hashes", None
+                            ),
+                            prefill_chunk_offsets=getattr(
+                                request, "prefill_chunk_offsets", None
+                            ),
                         )
                     except Exception as error:
                         self._handle_save_request_error(request, error)

@@ -272,7 +272,8 @@ def plan_block_id_ranges_incremental(
     *, slot_capacity=None,
 ):
     """Plan only new ranges or a grown tail for one physical bank."""
-    starts, ends = tuple(starts), tuple(ends)
+    starts = starts if type(starts) is tuple else tuple(starts)
+    ends = ends if type(ends) is tuple else tuple(ends)
     if len(starts) != len(ends) or block_size <= 0:
         raise ValueError("Invalid incremental DMA ranges or block size")
     used_blocks = (
@@ -356,8 +357,9 @@ def prepare_source_addresses(
     source_objs, starts, ends, host_ptr, host_tokens, previous=None
 ):
     """Resolve new source metadata independently of physical destination banks."""
-    starts, ends = tuple(starts), tuple(ends)
-    owners = tuple(source_objs)
+    starts = starts if type(starts) is tuple else tuple(starts)
+    ends = ends if type(ends) is tuple else tuple(ends)
+    owners = source_objs if type(source_objs) is tuple else tuple(source_objs)
     if len(owners) != len(starts) or len(starts) != len(ends):
         raise ValueError("DMA source metadata differs from ranges")
     identities = tuple(map(id, owners))
@@ -421,8 +423,10 @@ def bind_incremental_copy_addresses(
     reuse_rows_in_place: bool = False,
 ) -> BoundCopyPrefix:
     """Keep stable rows; replace a grown tail and bind newly appended chunks."""
-    npu_ptrs = tuple(npu_ptrs)
-    plane_widths = tuple(plane_widths)
+    npu_ptrs = npu_ptrs if type(npu_ptrs) is tuple else tuple(npu_ptrs)
+    plane_widths = (
+        plane_widths if type(plane_widths) is tuple else tuple(plane_widths)
+    )
     old_count = len(previous.owners) if previous is not None else 0
     compatible = bool(
         slot_prefix_unchanged
@@ -438,12 +442,15 @@ def bind_incremental_copy_addresses(
     )
     if source_metadata is not None:
         starts, ends = source_metadata.starts, source_metadata.ends
+    else:
+        starts = starts if type(starts) is tuple else tuple(starts)
+        ends = ends if type(ends) is tuple else tuple(ends)
     stable_before_tail = bool(
         compatible
         and old_count > 0
         and current_ids[: old_count - 1] == previous.owner_ids[: old_count - 1]
-        and tuple(starts[: old_count - 1]) == previous.starts[: old_count - 1]
-        and tuple(ends[: old_count - 1]) == previous.ends[: old_count - 1]
+        and starts[: old_count - 1] == previous.starts[: old_count - 1]
+        and ends[: old_count - 1] == previous.ends[: old_count - 1]
     )
     tail_unchanged = (
         bool(
@@ -458,7 +465,9 @@ def bind_incremental_copy_addresses(
     begin_chunk = (
         old_count if tail_unchanged else old_count - 1 if stable_before_tail else 0
     )
-    first_segment = int(torch.searchsorted(plan.chunk, begin_chunk))
+    first_segment = (
+        int(torch.searchsorted(plan.chunk, begin_chunk)) if begin_chunk else 0
+    )
     if begin_chunk and previous is not None:
         if begin_chunk == old_count:
             previous_segments = len(previous.rows) // len(plane_widths)
@@ -470,23 +479,29 @@ def bind_incremental_copy_addresses(
             ))
     else:
         previous_segments = 0
-    suffix_plan = DmaPlan(
-        plan.chunk[first_segment:] - begin_chunk,
-        plan.slot[first_segment:],
-        plan.chunk_token[first_segment:],
-        plan.tokens[first_segment:],
+    suffix_plan = (
+        plan
+        if first_segment == 0 and begin_chunk == 0
+        else DmaPlan(
+            plan.chunk[first_segment:] - begin_chunk,
+            plan.slot[first_segment:],
+            plan.chunk_token[first_segment:],
+            plan.tokens[first_segment:],
+        )
     )
-    suffix_objs = source_objs[begin_chunk:]
+    suffix_objs = source_objs if begin_chunk == 0 else source_objs[begin_chunk:]
     suffix_rows = (
         bind_copy_addresses(
             suffix_plan,
             (source_metadata.table[0, begin_chunk:len(source_objs)]
              if source_metadata is not None else list(map(host_ptr, suffix_objs))),
             npu_ptrs,
-            (
-                torch.as_tensor(ends[begin_chunk:])
-                - torch.as_tensor(starts[begin_chunk:])
-            ).tolist(),
+            [
+                end - start
+                for start, end in zip(
+                    starts[begin_chunk:], ends[begin_chunk:], strict=False
+                )
+            ],
             plane_widths,
             element_bytes,
             device_to_host=False,
@@ -512,11 +527,16 @@ def bind_incremental_copy_addresses(
     return BoundCopyPrefix(
         owners=(
             source_metadata.owners
-            if source_metadata is not None else tuple(source_objs)
+            if source_metadata is not None
+            else (
+                source_objs
+                if type(source_objs) is tuple
+                else tuple(source_objs)
+            )
         ),
         owner_ids=current_ids,
-        starts=tuple(starts),
-        ends=tuple(ends),
+        starts=starts,
+        ends=ends,
         npu_ptrs=npu_ptrs,
         plane_widths=plane_widths,
         element_bytes=element_bytes,

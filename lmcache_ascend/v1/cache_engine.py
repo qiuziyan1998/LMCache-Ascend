@@ -6,7 +6,7 @@ LMCacheEngine for Ascend NPU.
 
 # Standard
 from bisect import bisect_right
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from collections import deque
 from concurrent.futures import (
     Future,
@@ -58,6 +58,10 @@ from lmcache.v1.mooncake_layout import (
     mooncake_payload_layout,
 )
 from lmcache.v1.prefill_metadata import PrefillMetadataPlan
+try:
+    from lmcache.v1.prefill_metadata import split_layers_cached
+except ImportError:
+    split_layers_cached = None  # type: ignore[assignment]
 from lmcache.v1.remote_fill import (
     ControlPage,
     log_remote_fill_diagnostic,
@@ -217,6 +221,8 @@ class _DirectStoreRequestState:
     source_ready_events_token_end: int = 0
     finalized: bool = False
     remote_fill: Optional[ProducerRequestState] = None
+    prefill_chunk_hashes: Optional[Sequence[Any]] = None
+    prefill_chunk_offsets: Optional[Sequence[int]] = None
 
 class ThreadSafeEventList:
     """queue.Queue-backed, list-compatible thread-safe buffer for
@@ -302,6 +308,8 @@ class _SparseCacheAppend:
 
 class AscendLMCacheEngine(LMCacheEngine):
     """Ascend NPU variant of ``LMCacheEngine`` with an async store path."""
+
+    _supports_omitted_prefix_tokens_all_modes: bool = True
 
     def __init__(
         self,
@@ -1077,16 +1085,38 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def _remote_fill_prefix_plans(
         self,
-        tokens: list[int],
+        tokens: Sequence[int],
         request_configs: Optional[dict],
         prefix_end: int,
+        *,
+        prefill_chunk_hashes: Optional[Sequence[Any]] = None,
+        prefill_chunk_offsets: Optional[Sequence[int]] = None,
     ) -> dict[int, list[tuple[int, int, CacheEngineKey]]]:
         """Rebuild canonical keys when a full hit has no suffix plan."""
 
         prefix_tokens = tokens[:prefix_end]
+        pre_fn = getattr(self, "_process_tokens_with_precomputed_hashes", None)
+        raw_latent = (
+            pre_fn(
+                prefix_tokens,
+                None,
+                request_configs,
+                0,
+                {
+                    "prefill_chunk_hashes": prefill_chunk_hashes,
+                    "prefill_chunk_offsets": prefill_chunk_offsets,
+                },
+            )
+            if callable(pre_fn)
+            and prefill_chunk_hashes
+            and prefill_chunk_offsets
+            else None
+        )
         latent = list(
-            self.token_database.process_tokens(
-                tokens=prefix_tokens,
+            raw_latent
+            if raw_latent is not None
+            else self.token_database.process_tokens(
+                tokens=prefix_tokens,  # type: ignore[arg-type]
                 request_configs=request_configs,
                 kv_group=0,
             )
@@ -1241,6 +1271,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         mask = torch.zeros(len(tokens), dtype=torch.bool)
         mask[start:] = True
+        state_obj = self._direct_store_states.get(req_id)
         storer = self.store_layer(
             tokens,
             mask=mask,
@@ -1254,6 +1285,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             require_completion=True,
             all_layers_ready=True,
             slot_mapping_base=slot_mapping_base,
+            prefill_chunk_hashes=getattr(
+                state_obj, "prefill_chunk_hashes", None
+            ),
+            prefill_chunk_offsets=getattr(
+                state_obj, "prefill_chunk_offsets", None
+            ),
         )
         self._require_store_completion = True
         try:
@@ -1379,25 +1416,48 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         if base == full_end:
             plan0 = []
-        elif base:
-            plan0 = list(
-                self.token_database.process_tokens_from_prefix(
-                    full_tokens,
-                    prefix_token_count=base,
-                    prefix_hash=state.planned_hash,
-                    request_configs=request_configs,
-                    kv_group=0,
-                )
-            )
         else:
-            base = 0
-            plan0 = list(
-                self.token_database.process_tokens(
-                    tokens=full_tokens,
-                    request_configs=request_configs,
-                    kv_group=0,
-                )
+            pre_fn = getattr(
+                self, "_process_tokens_with_precomputed_hashes", None
             )
+            pre_iter = (
+                pre_fn(
+                    full_tokens,
+                    None,
+                    request_configs,
+                    0,
+                    {
+                        "prefill_chunk_hashes": state.prefill_chunk_hashes,
+                        "prefill_chunk_offsets": state.prefill_chunk_offsets,
+                        "_prefill_skip_tokens": base,
+                    },
+                )
+                if callable(pre_fn)
+                and state.prefill_chunk_hashes
+                and state.prefill_chunk_offsets
+                else None
+            )
+            if pre_iter is not None:
+                plan0 = list(pre_iter)
+            elif base:
+                plan0 = list(
+                    self.token_database.process_tokens_from_prefix(
+                        full_tokens,
+                        prefix_token_count=base,
+                        prefix_hash=state.planned_hash,
+                        request_configs=request_configs,
+                        kv_group=0,
+                    )
+                )
+            else:
+                base = 0
+                plan0 = list(
+                    self.token_database.process_tokens(
+                        tokens=full_tokens,
+                        request_configs=request_configs,
+                        kv_group=0,
+                    )
+                )
         hashes = [key.chunk_hash for _, _, key in plan0]
         offsets = [end - start for start, end, _ in plan0]
         plans = {0: plan0}
@@ -1668,7 +1728,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         *,
         required_store_end: int,
         persistence_fenced: bool = False,
-        tokens: Optional[list[int]] = None,
+        tokens: Optional[Sequence[int]] = None,
+        prefill_chunk_hashes: Optional[Sequence[Any]] = None,
+        prefill_chunk_offsets: Optional[Sequence[int]] = None,
     ) -> None:
         """Publish the terminal handoff after banked layerwise saves.
 
@@ -1701,7 +1763,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         persistent_end = min(state.committed_end.get(group, 0) for group in (0, 1))
         if persistent_end < required_store_end and tokens is not None:
             self._recover_layerwise_prefill_persistence(
-                req_id, tokens, request_configs, state, required_store_end
+                req_id,
+                tokens,
+                request_configs,
+                state,
+                required_store_end,
+                prefill_chunk_hashes=prefill_chunk_hashes,
+                prefill_chunk_offsets=prefill_chunk_offsets,
             )
             persistent_end = min(
                 state.committed_end.get(group, 0) for group in (0, 1)
@@ -1721,10 +1789,13 @@ class AscendLMCacheEngine(LMCacheEngine):
     def _recover_layerwise_prefill_persistence(
         self,
         req_id: str,
-        tokens: list[int],
+        tokens: Sequence[int],
         request_configs: Optional[dict],
         state: _DirectStoreRequestState,
         required_end: int,
+        *,
+        prefill_chunk_hashes: Optional[Sequence[Any]] = None,
+        prefill_chunk_offsets: Optional[Sequence[int]] = None,
     ) -> None:
         """Recover missing request receipts once at final PD handoff.
 
@@ -1737,17 +1808,39 @@ class AscendLMCacheEngine(LMCacheEngine):
         if remote is None:
             raise RuntimeError("Layerwise prefill handoff requires RemoteBackend")
         page_format = mooncake_layer_pages_enabled(self.config)
+        pre_fn = getattr(
+            self, "_process_tokens_with_precomputed_hashes", None
+        )
         for group in (0, 1):
             committed = state.committed_end.get(group, 0)
             if committed >= required_end:
                 continue
-            plan = [
-                (start, end, key)
-                for start, end, key in self.token_database.process_tokens(
-                    tokens=tokens[:required_end],
+            token_slice = tokens[:required_end]
+            raw_iter: Optional[Iterable[tuple[int, int, Any]]] = None
+            if (
+                callable(pre_fn)
+                and prefill_chunk_hashes
+                and prefill_chunk_offsets
+            ):
+                raw_iter = pre_fn(
+                    token_slice,
+                    None,
+                    request_configs,
+                    group,
+                    {
+                        "prefill_chunk_hashes": prefill_chunk_hashes,
+                        "prefill_chunk_offsets": prefill_chunk_offsets,
+                    },
+                )
+            if raw_iter is None:
+                raw_iter = self.token_database.process_tokens(
+                    tokens=token_slice,  # type: ignore[arg-type]
                     request_configs=request_configs,
                     kv_group=group,
                 )
+            plan = [
+                (start, end, key)
+                for start, end, key in raw_iter
                 if end > committed
             ]
             if not plan or plan[0][0] > committed or plan[-1][1] != required_end:
@@ -2438,17 +2531,39 @@ class AscendLMCacheEngine(LMCacheEngine):
             }
         if not group_caches:
             return True
-        plan0 = list(
-            self.token_database.process_tokens_from_prefix(
+        pre_fn = getattr(self, "_process_tokens_with_precomputed_hashes", None)
+        pre_tail = (
+            pre_fn(
                 tokens,
-                prefix_token_count=start,
-                prefix_hash=state.planned_hash,
-                request_configs=request_configs,
-                kv_group=0,
+                None,
+                request_configs,
+                0,
+                {
+                    "prefill_chunk_hashes": state.prefill_chunk_hashes,
+                    "prefill_chunk_offsets": state.prefill_chunk_offsets,
+                    "_prefill_skip_tokens": start,
+                },
             )
-            if start
-            else self.token_database.process_tokens(
-                tokens=tokens, request_configs=request_configs, kv_group=0
+            if callable(pre_fn)
+            and state.prefill_chunk_hashes
+            and state.prefill_chunk_offsets
+            else None
+        )
+        plan0 = list(
+            pre_tail
+            if pre_tail is not None
+            else (
+                self.token_database.process_tokens_from_prefix(
+                    tokens,
+                    prefix_token_count=start,
+                    prefix_hash=state.planned_hash,
+                    request_configs=request_configs,
+                    kv_group=0,
+                )
+                if start
+                else self.token_database.process_tokens(
+                    tokens=tokens, request_configs=request_configs, kv_group=0
+                )
             )
         )
         tail = [item for item in plan0 if item[0] == start and item[1] == len(tokens)]
@@ -2634,7 +2749,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def store_direct_prefill(
         self,
         req_id: str,
-        tokens: list[int],
+        tokens: Sequence[int],
         group_caches: dict[int, list],
         slot_mappings: dict[int, torch.Tensor],
         request_configs: Optional[dict] = None,
@@ -2646,6 +2761,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         source_ready_event_source: str = "missing",
         source_ready_events: tuple[Any, ...] = (),
         prefix_slot_mappings: Optional[dict[int, torch.Tensor]] = None,
+        prefill_chunk_hashes: Optional[Sequence[Any]] = None,
+        prefill_chunk_offsets: Optional[Sequence[int]] = None,
     ) -> bool:
         """Publish newly completed pages and the final tail directly from NPU."""
         if not self._direct_store_enabled or not group_caches:
@@ -2672,6 +2789,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
         state = self._direct_store_states.setdefault(req_id, _DirectStoreRequestState())
+        if prefill_chunk_hashes and prefill_chunk_offsets:
+            if (
+                state.prefill_chunk_hashes is None
+                or len(prefill_chunk_hashes) >= len(state.prefill_chunk_hashes)
+            ):
+                state.prefill_chunk_hashes = prefill_chunk_hashes
+                state.prefill_chunk_offsets = prefill_chunk_offsets
         if (
             state.accepted_store_end is not None
             and accepted_store_end < state.accepted_store_end
@@ -2813,6 +2937,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                         tokens,
                         request_configs,
                         probe_target,
+                        prefill_chunk_hashes=state.prefill_chunk_hashes,
+                        prefill_chunk_offsets=state.prefill_chunk_offsets,
                     )
                     if prefix_plans[0]:
                         state.planned_end = prefix_plans[0][-1][1]
@@ -5067,6 +5193,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         starts: List[int] = []
         ends: List[int] = []
         chunk_keys: List[List[CacheEngineKey]] = []
+        try:
+            _split_fn = split_layers_cached
+        except NameError:
+            _split_fn = None
         for start, end, key in self.token_database.process_tokens_from_prefix(
             tokens,
             prefix_token_count=expected_start,
@@ -5075,7 +5205,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
-            layer_keys = key.split_layers(num_layers)
+            layer_keys = (
+                list(_split_fn(key, num_layers))
+                if _split_fn is not None
+                else key.split_layers(num_layers)
+            )
             if any(
                 layer_key.layer_id != layer_id
                 or layer_key.kv_group != kv_group
@@ -5662,12 +5796,20 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and isinstance(preflight_state, dict)
                 else None
             )
+            try:
+                _split_fn = split_layers_cached
+            except NameError:
+                _split_fn = None
             for candidate_index, (start, end, key) in enumerate(token_results):
                 assert isinstance(key, CacheEngineKey)
                 if new_chunk_plan is not None:
                     new_chunk_plan.append((start, end, key.chunk_hash))
 
-                keys_multi_layer = key.split_layers(num_layers)
+                keys_multi_layer = (
+                    list(_split_fn(key, num_layers))
+                    if _split_fn is not None
+                    else key.split_layers(num_layers)
+                )
                 remote_fill_location = (
                     remote_fill_locations[candidate_index]
                     if remote_fill_locations is not None
@@ -5889,7 +6031,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         self,
         *,
         req_id: str,
-        tokens: Union[torch.Tensor, list[int]],
+        tokens: Union[torch.Tensor, Sequence[int]],
         mask: Optional[torch.Tensor],
         request_configs: Optional[dict],
         kv_group: int,
@@ -5897,6 +6039,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         metadata_cache: Optional[Any] = None,
         num_layers: Optional[int] = None,
         skip_tokens: Optional[int] = None,
+        store_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[
         Union[Iterable[tuple[int, int, CacheEngineKey]], PrefillMetadataPlan],
         int,
@@ -5914,10 +6057,26 @@ class AscendLMCacheEngine(LMCacheEngine):
         caller can also reuse split layer keys; other callers keep an iterable.
         """
         full_tokens = len(tokens)
+        has_precomputed = bool(
+            store_kwargs
+            and store_kwargs.get("prefill_chunk_hashes")
+            and store_kwargs.get("prefill_chunk_offsets")
+        )
+        pre_fn = (
+            getattr(self, "_process_tokens_with_precomputed_hashes", None)
+            if has_precomputed
+            else None
+        )
         if not incremental:
+            if callable(pre_fn) and store_kwargs:
+                pre_non_inc = pre_fn(
+                    tokens, mask, request_configs, kv_group, store_kwargs
+                )
+                if pre_non_inc is not None:
+                    return pre_non_inc, 0, None
             return (
                 self.token_database.process_tokens(
-                    tokens=tokens,
+                    tokens=tokens,  # type: ignore[arg-type]
                     mask=mask,
                     request_configs=request_configs,
                     kv_group=kv_group,
@@ -5999,9 +6158,18 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
         if previous is None:
+            if callable(pre_fn) and store_kwargs:
+                eff_kw = dict(store_kwargs)
+                if mask is None and skip_tokens:
+                    eff_kw["_prefill_skip_tokens"] = int(skip_tokens)
+                pre_init = pre_fn(
+                    tokens, mask, request_configs, kv_group, eff_kw
+                )
+                if pre_init is not None:
+                    return pre_init, 0, None
             return (
                 self.token_database.process_tokens(
-                    tokens=tokens,
+                    tokens=tokens,  # type: ignore[arg-type]
                     mask=mask,
                     request_configs=request_configs,
                     kv_group=kv_group,
@@ -6013,9 +6181,38 @@ class AscendLMCacheEngine(LMCacheEngine):
         previous_end, previous_hash = previous
         if previous_end == full_tokens:
             return iter(()), previous_end, previous
+        if callable(pre_fn) and store_kwargs:
+            chunk_sz = int(self.config.chunk_size)
+            mask_skip = (
+                int(mask.numel() - mask.long().sum().item())
+                if mask is not None
+                else int(skip_tokens or 0)
+            )
+            eff_skip = max(previous_end, mask_skip)
+            if (
+                chunk_sz > 0
+                and eff_skip % chunk_sz == 0
+                and (
+                    mask is None
+                    or (
+                        mask.numel() == full_tokens
+                        and (
+                            eff_skip >= full_tokens
+                            or bool(mask[eff_skip:].all())
+                        )
+                    )
+                )
+            ):
+                eff_kw = dict(store_kwargs)
+                eff_kw["_prefill_skip_tokens"] = eff_skip
+                pre_inc = pre_fn(
+                    tokens, None, request_configs, kv_group, eff_kw
+                )
+                if pre_inc is not None:
+                    return pre_inc, previous_end, previous
         return (
             self.token_database.process_tokens_from_prefix(
-                tokens,
+                tokens,  # type: ignore[arg-type]
                 prefix_token_count=previous_end,
                 prefix_hash=previous_hash,
                 request_configs=request_configs,
@@ -6029,7 +6226,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     @torch.inference_mode()
     def store_layer(
         self,
-        tokens: Union[torch.Tensor, list[int]],
+        tokens: Union[torch.Tensor, Sequence[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
@@ -6241,6 +6438,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ),
                 num_layers=num_layers,
                 skip_tokens=metadata_skip,
+                store_kwargs=kwargs,
             )
         )
         if incremental_prefill:
@@ -6256,6 +6454,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         candidates = (
             metadata_plan.candidates if metadata_plan is not None else token_plan
         )
+        try:
+            _split_fn = split_layers_cached
+        except NameError:
+            _split_fn = None
         for candidate_index, (start, end, key) in enumerate(candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
@@ -6266,11 +6468,14 @@ class AscendLMCacheEngine(LMCacheEngine):
             ):
                 latest_full_frontier = (end, key.chunk_hash)
 
-            keys_multi_layer = (
-                metadata_plan.keys_chunk_major[candidate_index]
-                if metadata_plan is not None
-                else key.split_layers(num_layers)
-            )
+            if metadata_plan is not None:
+                keys_multi_layer = metadata_plan.keys_chunk_major[
+                    candidate_index
+                ]
+            elif _split_fn is not None:
+                keys_multi_layer = list(_split_fn(key, num_layers))
+            else:
+                keys_multi_layer = key.split_layers(num_layers)
             if self._layerwise_put_queue is not None:
                 # A local hit can precede its producer's remote persistence.
                 self._layerwise_put_queue.track_keys(req_id, (key,))
@@ -7025,6 +7230,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                         "hashes": [entry[2] for entry in chunks],
                         "offsets": [end - start for start, end, _ in chunks],
                     }
+                try:
+                    _split_fn = split_layers_cached
+                except NameError:
+                    _split_fn = None
                 for start, end, key in self.token_database.process_tokens(
                     **token_args,
                     request_configs=request_configs,
@@ -7033,7 +7242,11 @@ class AscendLMCacheEngine(LMCacheEngine):
                     assert isinstance(key, CacheEngineKey)
                     starts.append(start)
                     ends.append(end)
-                    keys.append(key.split_layers(num_layers))
+                    keys.append(
+                        list(_split_fn(key, num_layers))
+                        if _split_fn is not None
+                        else key.split_layers(num_layers)
+                    )
                 keys_layer_major = (
                     [list(row) for row in zip(*keys, strict=False)]
                     if keys
