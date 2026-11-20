@@ -114,6 +114,17 @@ determined by the external storage deployment.
 
 ## Validation
 
+In `decoder_storage_mode: process`, the storage service owns checkpoint
+allocation, accepted-token sealing, retention, spill and restore normalization.
+The worker keeps device capture/fencing and shared-page imports. Mooncake I/O
+uses the existing worker transport gateway and registered shared-memory offsets;
+KV payloads are not serialized through IPC and no second ADXL endpoint is added.
+Reservation retains older latent sources until sealing or confirmed cancellation.
+Restore admission and all-worker release acknowledgements use the lifecycle
+channel asynchronously; neither Mooncake spill nor these notifications gates
+local checkpoint readiness. The existing reservation reply and capture fence
+remain required worker dependencies.
+
 Focused CPU tests cover retention budgeting, shared-owner accounting, partial
 accepted tails, mixed-C8 planes, boundary lengths, alternating sources, remote
 eviction, allocator refusal, cancellation, stale notifications, GC-off cleanup,

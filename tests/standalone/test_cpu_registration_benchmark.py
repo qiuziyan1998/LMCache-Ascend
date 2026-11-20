@@ -157,6 +157,74 @@ class RegistrationBenchmarkTests(unittest.TestCase):
             bench.worker(self.args(), 0, [16], ["/a"], True, Mock())
         ops.free_shm_pinned_ptr.assert_called_once_with(123, 16, "/a")
 
+    def test_separate_owner_includes_tp_zero_as_an_independent_reader(self):
+        self.assertEqual(bench.process_roles([0, 1, 2, 3], True),
+                         [(0, True), (0, False), (1, False), (2, False), (3, False)])
+        self.assertEqual(bench.process_roles([0, 1]), [(0, True), (1, False)])
+
+    def test_unknown_native_probe_retains_registered_mapping(self):
+        args = self.args()
+        args.verify_c8 = args.separate_owner = True
+        ops = Mock(__file__="test-extension")
+        ops.attach_shm_pinned_ptr.return_value = 123
+        modules = {"torch": SimpleNamespace(__version__="test", npu=Mock()),
+                   "torch_npu": SimpleNamespace(__version__="test"),
+                   "lmcache_ascend": SimpleNamespace(c_ops=ops)}
+        conn = Mock()
+        with patch.dict(bench.sys.modules, modules), patch.dict(bench.os.environ), \
+                patch.object(bench, "snapshot", return_value={}), \
+                patch.object(bench, "verify_registered_read", side_effect=bench.NativeProbeUnknown("DMA")), \
+                patch.object(bench.os, "_exit", side_effect=SystemExit(2)) as stop, \
+                patch.object(bench, "emit"), self.assertRaises(SystemExit):
+            bench.worker(args, 0, [4096], ["/a"], False, conn)
+        ops.detach_shm_pinned_ptr.assert_not_called()
+        ops.free_shm_pinned_ptr.assert_not_called()
+        conn.send.assert_called_once_with("quarantined")
+        stop.assert_called_once_with(2)
+
+    def test_unknown_reader_quarantines_owner_and_keeps_named_slab(self):
+        args = self.args()
+        args.verify_c8 = args.separate_owner = True
+        args.chunk_bytes, args.devices, args.timeout, args.hold_seconds = 0, [0], 1, 0
+        owner, reader = Mock(), Mock()
+        owner.poll.return_value = reader.poll.return_value = True
+        owner.recv.return_value, reader.recv.return_value = "ready", "quarantined"
+        processes = [Mock(exitcode=0), Mock(exitcode=2)]
+        for process in processes:
+            process.is_alive.return_value = False
+        context = Mock()
+        context.Pipe.side_effect = [(owner, Mock()), (reader, Mock())]
+        context.Process.side_effect = processes
+        with patch.object(bench, "snapshot", return_value={}), \
+                patch.object(bench.os, "sysconf", return_value=1, create=True), \
+                patch.object(bench.mp, "get_context", return_value=context), \
+                patch.object(bench.Path, "unlink") as unlink, \
+                patch.object(bench, "emit"):
+            self.assertFalse(bench.trial(args, 4096))
+        owner.send.assert_called_once_with("quarantine")
+        unlink.assert_not_called()
+
+    def test_parent_pipe_loss_keeps_native_probe_owner_registered(self):
+        args = self.args()
+        args.verify_c8 = args.separate_owner = True
+        ops = Mock(__file__="test-extension")
+        ops.alloc_shm_pinned_ptr.return_value = 123
+        modules = {"torch": SimpleNamespace(__version__="test", npu=Mock()),
+                   "torch_npu": SimpleNamespace(__version__="test"),
+                   "lmcache_ascend": SimpleNamespace(c_ops=ops)}
+        payload, conn = Mock(), Mock()
+        payload.numpy.return_value.tobytes.return_value = b"packet"
+        conn.recv.side_effect = EOFError("parent died")
+        with patch.dict(bench.sys.modules, modules), patch.dict(bench.os.environ), \
+                patch.object(bench, "snapshot", return_value={}), \
+                patch.object(bench, "probe_payload", return_value=payload), \
+                patch.object(bench.ctypes, "memset"), patch.object(bench.ctypes, "memmove"), \
+                patch.object(bench.os, "_exit", side_effect=SystemExit(2)), \
+                patch.object(bench, "emit"), self.assertRaises(SystemExit):
+            bench.worker(args, 0, [4096], ["/a"], True, conn)
+        ops.free_shm_pinned_ptr.assert_not_called()
+        self.assertEqual(conn.send.call_args_list, [call("ready"), call("quarantined")])
+
 
 if __name__ == "__main__":
     unittest.main()
