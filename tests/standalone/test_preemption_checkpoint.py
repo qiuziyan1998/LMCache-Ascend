@@ -6,6 +6,7 @@ Run with --confcutdir=tests/standalone to avoid the NPU bootstrap.
 
 import gc
 import importlib.util
+import logging
 from pathlib import Path
 import sys
 import threading
@@ -37,6 +38,9 @@ def api(monkeypatch):
         "UnknownDMA", (RuntimeError,), {}
     )
     monkeypatch.setitem(sys.modules, native.__name__, native)
+    log_module = ModuleType("lmcache.logging")
+    log_module.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, log_module.__name__, log_module)
 
     def load(name, path):
         spec = importlib.util.spec_from_file_location(name, path)
@@ -303,10 +307,11 @@ def start_capture(
     monkeypatch.setattr(module, "torch", NS(empty=empty, long=torch.long))
     store = module.CheckpointWorker(engine)
     blocks = tuple(range(1, (end + 3) // 4 + 1))
+    chunk_size = engine.config.chunk_size
     spec = control.CaptureSpec(
         "r",
         1,
-        prefix // 4 * 4,
+        prefix // chunk_size * chunk_size,
         end,
         prefix if resident is None else resident,
         (blocks, blocks),
@@ -559,6 +564,111 @@ def test_fixed_slot_capture_does_not_retry_smaller_tails(api, monkeypatch):
     assert reclaims == [{"allocation_purpose": "checkpoint"}]
     store.close()
     assert all(p.refs == 0 for p in engine.allocated)
+
+
+@pytest.mark.parametrize(
+    "free,evictable,end,expected_end,scans,stop_reason",
+    [
+        (0, 2, 1123, 1123, 2, None),
+        (0, 1, 1123, 1024, 2, "reclaim_unsatisfied"),
+        (1, 1, 1123, 1123, 1, None),
+        (2, 0, 1123, 1123, 0, None),
+        (0, 3, 2147, 2048, 2, "capture_budget_exhausted"),
+    ],
+)
+def test_fixed_slot_capture_reclaims_across_chunks(
+    api, monkeypatch, caplog, free, evictable, end, expected_end, scans, stop_reason
+):
+    engine = fake_engine()
+    engine.config.chunk_size = 1024
+    engine.checkpoint_uses_fixed_slots = lambda: True
+    original = engine.allocate_checkpoint_fragment
+    attempts, reclaims = [], []
+
+    def allocate(group, tokens, caches=None):
+        nonlocal free
+        if group == 0:
+            attempts.append(tokens)
+            if free == 0:
+                raise MemoryError("group0 full")
+            free -= 1
+        return original(group, tokens, caches)
+
+    def reclaim(tokens, groups, *, allocation_purpose):
+        nonlocal free, evictable
+        reclaims.append((tokens, set(groups), allocation_purpose))
+        assert free == 0
+        if evictable == 0:
+            return False
+        evictable -= 1
+        free += 1
+        return True
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = reclaim
+    # The incident's 622578 prefix translated by 607 complete chunks.
+    with caplog.at_level("INFO"):
+        store, _, _ = start_capture(api, monkeypatch, engine, prefix=1010, end=end)
+    try:
+        result = store.poll()[0]
+        assert (result.status, result.end) == ("captured", expected_end)
+        expected_reclaims = (1024, 1024) if end == 2147 else (1024, 99)[2 - scans :]
+        assert reclaims == [
+            (tokens, {0, 1}, "checkpoint") for tokens in expected_reclaims
+        ]
+        if end == 1123 and scans == 2:
+            assert attempts == ([14, 14, 99] if stop_reason else [14, 14, 99, 99])
+        if stop_reason:
+            assert "[CHECKPOINT_CAPTURE_TRUNCATED]" in caplog.text
+            assert f"requested_end={end} captured_end={expected_end}" in caplog.text
+            assert f"stop_reason={stop_reason}" in caplog.text
+        elif scans:
+            assert "[CHECKPOINT_CAPTURE_RECOVERED]" in caplog.text
+        publish(api, store, expected_end)
+        assert store.local.available("r", 1, end) == expected_end
+    finally:
+        store.close()
+    assert all(
+        page.refs == int(page in engine.backend.pages.values())
+        for page in engine.allocated
+    )
+
+
+@pytest.mark.parametrize("failed_group", [0, 1])
+def test_fixed_slot_capture_does_not_scan_again_in_same_chunk(
+    api, monkeypatch, caplog, failed_group
+):
+    engine = fake_engine()
+    engine.checkpoint_uses_fixed_slots = lambda: True
+    original = engine.allocate_checkpoint_fragment
+    attempts, reclaims = [], []
+
+    def allocate(group, tokens, caches=None):
+        attempts.append(group)
+        # Simulate a concurrent allocation after reclaim has returned success.
+        if attempts == [0] or group == failed_group:
+            raise MemoryError("slot taken")
+        return original(group, tokens, caches)
+
+    def reclaim(tokens, groups, *, allocation_purpose):
+        reclaims.append(set(groups))
+        return True
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = reclaim
+    store, _, _ = start_capture(api, monkeypatch, engine)
+    try:
+        assert [(r.status, r.end) for r in store.poll()] == [("failed", 0)]
+        assert attempts == ([0, 0] if failed_group == 0 else [0, 0, 1])
+        assert reclaims == [{0, 1}]
+        assert "[CHECKPOINT_CAPTURE_FAILED]" in caplog.text
+        assert "stop_reason=" + (
+            "retry_refused" if failed_group == 0 else "chunk_budget_exhausted"
+        ) in caplog.text
+        assert not engine.calls  # No device work without a usable paired prefix.
+    finally:
+        store.close()
+    assert all(page.refs == 0 for page in engine.allocated)
 
 
 def test_repeated_preemption_reuses_local_group0_and_recaptures_resident_group1(
