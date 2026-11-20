@@ -18,7 +18,7 @@ base_adapter_mod = pytest.importorskip(
 
 
 def _make_adapter(*, store_async: bool, requests=None, kv_role="kv_both"):
-    engine = MagicMock()
+    engine = MagicMock(_remote_fill_coordinator=None)
     metadata = base_adapter_mod.LMCacheConnectorMetadata(requests=requests or [])
     adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
     adapter.store_async = store_async

@@ -807,6 +807,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             maximum=self._remote_fill_pages_per_window(),
             context=self._remote_fill_session_context(),
             source_factory=source_factory,
+            accepted_end=state.accepted_store_end or 0,
         )
 
     def _remote_fill_prefix_source_plan(
@@ -882,6 +883,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.remote_fill,
             batch,
             required_store_end_hint,
+            # Banked group ends come from the stored slice of ReqMeta.token_ids.
+            # They bound accepted prompt coverage independently of the OPEN hint.
+            accepted_end=(
+                batch.ranges[-1][1]
+                if batch.ranges and getattr(self, "_force_layerwise_prefill_store", False)
+                else state.accepted_store_end or 0
+            ),
             control_pages=control_pages,
             maximum=self._remote_fill_pages_per_window(),
             context=self._remote_fill_session_context(),
@@ -3416,6 +3424,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     lease.release()
             state = self._direct_store_states.get(req_id)
             if state is not None:
+                # Successful persistent puts may have notified get_finished_stores
+                # while their receipts still await the request's ordinary drain.
+                if state.futures and state.remote_fill and state.remote_fill.retirement:
+                    self.wait_for_direct_stores((req_id,))
                 releasable = not state.futures and not state.pending_keys
                 if state.remote_fill is not None:
                     releasable = self._get_remote_fill_coordinator().release(
@@ -6894,21 +6906,32 @@ class AscendLMCacheEngine(LMCacheEngine):
                     for mem_obj in submitted_objs:
                         pending_store_release.pop(id(mem_obj), None)
             finally:
-                if mem_obj_generator is not None:
-                    close_fn = getattr(mem_obj_generator, "close", None)
-                    if close_fn is not None:
-                        # Closing the connector fences unfinished D2H writes.
-                        # A failed fence must propagate before destinations
-                        # can be returned to the allocator.
-                        close_fn()
-                self._remove_pending_layerwise_store_objs(
-                    cached_memory_objs,
-                    pending_store_release,
-                )
-                for mem_obj in list(pending_store_release.values()):
-                    if mem_obj.is_valid():
-                        mem_obj.ref_count_down()
-                pending_store_release.clear()
+                try:
+                    if mem_obj_generator is not None:
+                        close_fn = getattr(mem_obj_generator, "close", None)
+                        if close_fn is not None:
+                            # A failed D2H fence must propagate before its
+                            # destinations can return to the allocator.
+                            close_fn()
+                    self._remove_pending_layerwise_store_objs(
+                        cached_memory_objs,
+                        pending_store_release,
+                    )
+                    for mem_obj in list(pending_store_release.values()):
+                        if mem_obj.is_valid():
+                            mem_obj.ref_count_down()
+                    pending_store_release.clear()
+                finally:
+                    # This store result owns a temporary pointer-list identity.
+                    # Drop its registry ownership even if closing the transfer
+                    # fails, without releasing pending destination allocations.
+                    # The result's tensor views still own their backing
+                    # storage, so consumers can keep reading them.
+                    release_ptrs = getattr(
+                        self.gpu_connector, "release_sparse_chunk_ptr_cache", None
+                    )
+                    if callable(release_ptrs) and cached_chunk_ptrs_npu is not None:
+                        release_ptrs(cached_chunk_ptrs_npu)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`

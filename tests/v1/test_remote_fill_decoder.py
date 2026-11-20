@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import Mock, patch
 import logging
+import weakref
 
 # Third Party
 from lmcache.v1.cache_engine import LMCacheEngine
@@ -56,7 +57,10 @@ from lmcache_ascend.v1.remote_fill import (
     remote_fill_tp_independent,
 )
 from lmcache_ascend.v1.remote_fill_producer import RemoteFillFatalError
-from lmcache_ascend.v1.remote_fill_coordinator import ProducerRequestState, RemoteFillCoordinator
+from lmcache_ascend.v1.remote_fill_coordinator import (
+    ProducerRequestState,
+    RemoteFillCoordinator,
+)
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 
 
@@ -146,7 +150,7 @@ def test_c8_asymmetric_tp_requires_validated_packet(policy, invalid):
     assert remote_fill_tp_independent(config, metadata) is (invalid is None)
 
 
-def test_post_init_emits_startup_stage_timings() -> None:
+def test_post_init_initializes_base_reader_then_remote_fill() -> None:
     engine = object.__new__(AscendLMCacheEngine)
     engine.metadata = SimpleNamespace(worker_id=1)
     engine.config = SimpleNamespace(
@@ -157,42 +161,30 @@ def test_post_init_emits_startup_stage_timings() -> None:
     engine._direct_store_enabled = False
     engine._group1_external_page_reader = None
     engine._is_passive = Mock(return_value=True)
-    engine._initialize_decoder_remote_fill = Mock()
+    stages = []
+    engine._initialize_decoder_remote_fill = Mock(
+        side_effect=lambda: stages.append("remote_fill")
+    )
     reader = object()
 
+    def create_reader(*args, **kwargs):
+        stages.append("reader")
+        return reader
+
     with (
-        patch.object(LMCacheEngine, "post_init"),
-        patch(
-            "lmcache_ascend.v1.cache_engine.serving_perf_enabled",
-            return_value=True,
+        patch.object(
+            LMCacheEngine, "post_init", side_effect=lambda: stages.append("base")
         ),
-        patch(
-            "lmcache_ascend.v1.cache_engine.serving_perf_now",
-            side_effect=[1.0, 2.0, 3.0],
-        ),
-        patch("lmcache_ascend.v1.cache_engine.serving_perf_log") as perf_log,
         patch(
             "lmcache_ascend.v1.cache_engine.RemoteExternalPageReader",
-            return_value=reader,
+            side_effect=create_reader,
         ),
     ):
         engine.post_init()
 
     assert engine._group1_external_page_reader is reader
     engine._initialize_decoder_remote_fill.assert_called_once_with()
-    assert [call.args[1] for call in perf_log.call_args_list] == [
-        "lmcache_base_post_init_start",
-        "lmcache_base_post_init_complete",
-        "group1_external_reader_init_start",
-        "group1_external_reader_init_complete",
-        "remote_fill_decoder_init_start",
-        "remote_fill_decoder_init_complete",
-    ]
-    assert [
-        call.kwargs.get("started")
-        for call in perf_log.call_args_list
-        if call.args[1].endswith("_complete")
-    ] == [1.0, 2.0, 3.0]
+    assert stages == ["base", "reader", "remote_fill"]
 
 
 @dataclass
@@ -1879,6 +1871,7 @@ def _config(*, shared: bool) -> SimpleNamespace:
         remote_fill_descriptor_ttl_sec=10,
         remote_fill_native_hard_timeout_ms=120000,
         remote_fill_terminal_record_ttl_sec=300,
+        remote_fill_transaction_idle_timeout_sec=1800,
     )
 
 
@@ -2289,3 +2282,27 @@ def test_unequal_group_pages_allocate_and_publish_exact_bytes():
     for call in local.allocations:
         for page in call["pages"]:
             assert page.refs == 1 and page.pins == 0
+
+@pytest.mark.parametrize("short_batch", [False, True])
+def test_failed_prepare_rollback_retains_uncertain_page(short_batch):
+    local = _FakeLocalBackend()
+    allocate = local.batched_allocate_layer_pages
+    refs = []
+
+    def failing_allocation(*args, **kwargs):
+        pages = allocate(*args, **kwargs)
+        pages[0].ref_failures = 1
+        refs.append(weakref.ref(pages[0]))
+        if short_batch:
+            return pages[:1]
+        pages[0].size += 1
+        return pages
+
+    local.batched_allocate_layer_pages = failing_allocation
+    lifecycle = _lifecycle(local, direct_groups=(0,))
+    controls = tuple(_control_page(chunk, 0) for chunk in (0, 1))
+    with pytest.raises(UnsafePageLifecycleError):
+        lifecycle.prepare_pages("transfer", 0, controls, True)
+    local.allocations.clear()
+    assert refs[0]() is not None
+    assert any(page is refs[0]() for page in lifecycle._quarantined_pages)

@@ -212,6 +212,63 @@ def _log_remote_fill_event(
     )
 
 
+_PROM_REMOTE_FILL_GAUGES: dict[str, Any] | None = None
+
+
+def _prom_remote_fill_gauges() -> dict[str, Any]:
+    """Create fixed-cardinality decoder remote-fill gauges once per process."""
+
+    global _PROM_REMOTE_FILL_GAUGES
+    if _PROM_REMOTE_FILL_GAUGES is not None:
+        return _PROM_REMOTE_FILL_GAUGES
+    gauges: dict[str, Any] = {}
+    try:
+        # Third Party
+        from prometheus_client import Gauge
+    except Exception:
+        _PROM_REMOTE_FILL_GAUGES = gauges
+        return gauges
+    specs = {
+        "active_transactions": "Active remote-fill decoder transactions",
+        "active_windows": "Active remote-fill decoder windows",
+        "active_bytes": "Bytes reserved by active remote-fill decoder transactions",
+        "reserved_bytes_total": "Bytes ever reserved by the remote-fill decoder",
+        "published_bytes_total": "Bytes published by the remote-fill decoder",
+        "discarded_bytes_total": "Bytes discarded by the remote-fill decoder",
+        "capacity_rejections_total": "Remote-fill decoder capacity rejections",
+        "expired_transactions_total": "Remote-fill decoder idle-expired transactions",
+        "terminal_persistent_only_total": (
+            "Remote-fill decoder PERSISTENT_ONLY terminal outcomes"
+        ),
+    }
+    for name, documentation in specs.items():
+        try:
+            gauges[name] = Gauge(
+                f"lmcache:remote_fill_decoder_{name}",
+                documentation,
+            )
+        except Exception:
+            # Duplicate registration must never break the control service.
+            continue
+    _PROM_REMOTE_FILL_GAUGES = gauges
+    return gauges
+
+
+def _publish_prom_remote_fill(snapshot: Mapping[str, int] | None) -> None:
+    """Publish a decoder metrics snapshot to the process Prometheus registry."""
+
+    if not snapshot:
+        return
+    for name, gauge in _prom_remote_fill_gauges().items():
+        value = snapshot.get(name)
+        if value is None:
+            continue
+        try:
+            gauge.set(int(value))
+        except Exception:
+            continue
+
+
 class RemoteFillLocalBackend(Protocol):
     """Public LocalCPU operations required by remote fill."""
 
@@ -653,6 +710,7 @@ class AscendRemoteFillPageLifecycle:
         self._chunk_hash_type = chunk_hash_type
         self._chunk_hash_bytes = chunk_hash_bytes
         self._pin_pages = pin_pages
+        self._quarantined_pages: list[LayerPageMemoryObj] = []
 
     @property
     def direct_groups(self) -> tuple[int, ...]:
@@ -781,7 +839,7 @@ class AscendRemoteFillPageLifecycle:
                 )
                 if group_pages is None or len(group_pages) != len(indices):
                     if group_pages:
-                        self._release_unpinned(group_pages)
+                        self._release_allocated(group_pages, pinned=False)
                     raise MemoryError("remote-fill hidden page allocation failed")
                 allocated.update(zip(indices, group_pages, strict=True))
             allocated_pages = list(allocated.values())
@@ -1203,21 +1261,22 @@ class AscendRemoteFillPageLifecycle:
     def _shared_key_tags(key: CacheEngineKey) -> tuple:
         return tuple(tag for tag in (key.tags or ()) if tag[0] != "dsa_idx")
 
-    @staticmethod
-    def _release_unpinned(pages: Sequence[LayerPageMemoryObj]) -> None:
-        for page in pages:
-            page.ref_count_down()
-
-    @staticmethod
     def _release_allocated(
+        self,
         pages: Sequence[LayerPageMemoryObj],
         *,
         pinned: bool,
     ) -> None:
-        for page in pages:
-            if pinned:
-                page.unpin()
-            page.ref_count_down()
+        try:
+            for page in pages:
+                if pinned:
+                    page.unpin()
+                page.ref_count_down()
+        except Exception as error:
+            self._quarantined_pages.extend(pages)
+            raise UnsafePageLifecycleError(
+                "remote-fill allocation rollback did not complete"
+            ) from error
 
 
 class DecoderRemoteFillServiceHost:
@@ -1250,6 +1309,7 @@ class DecoderRemoteFillServiceHost:
         self._started = False
         self._last_metrics = self._read_metrics()
         self._next_idle_metrics_at = monotonic() + 1.0
+        self._next_prom_metrics_at = 0.0
         self._next_maintenance_at = monotonic() + 0.1
         self._thread = Thread(
             target=self._run,
@@ -1319,6 +1379,7 @@ class DecoderRemoteFillServiceHost:
                 self._emit_metrics_if_changed(
                     force=bool(fatal),
                 )
+                self._publish_metrics_gauges_if_due()
                 if fatal and not self._fatal_reported:
                     self._fatal_reported = True
                     self._fatal_restart(fatal)
@@ -1390,6 +1451,19 @@ class DecoderRemoteFillServiceHost:
             level=logging.DEBUG,
             **changes,
         )
+
+    def _publish_metrics_gauges_if_due(self) -> None:
+        """Publish decoder gauges at one-second resolution, DEBUG-independent."""
+
+        now = monotonic()
+        if now < self._next_prom_metrics_at:
+            return
+        self._next_prom_metrics_at = now + 1.0
+        try:
+            _publish_prom_remote_fill(self._read_metrics())
+        except Exception:
+            # Metrics export must never break the control service.
+            pass
 
 
 @dataclass(slots=True)
@@ -1568,6 +1642,9 @@ def create_decoder_remote_fill_runtime(
             float(config.remote_fill_native_hard_timeout_ms) / 1000.0
         ),
         terminal_record_ttl_sec=float(config.remote_fill_terminal_record_ttl_sec),
+        transaction_idle_timeout_sec=float(
+            config.remote_fill_transaction_idle_timeout_sec
+        ),
     )
     service = RemoteFillService(state, limits)
     bind_endpoint = f"{_format_tcp_host(control_host)}:{control_port}"

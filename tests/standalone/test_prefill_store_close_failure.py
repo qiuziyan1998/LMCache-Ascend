@@ -54,7 +54,8 @@ def _production_cleanup(backend):
     )
     return _compile(
         "cleanup",
-        "self, mem_obj_generator, cached_memory_objs, pending_store_release",
+        "self, mem_obj_generator, cached_memory_objs, pending_store_release, "
+        "cached_chunk_ptrs_npu=None",
         finalizer.finalbody,
     )
 
@@ -97,6 +98,7 @@ def _production_transfer(
         "kwargs = {'req_id': 'request'}\n"
         "kvcaches_snapshot = resources\n"
         "prefill_packets = resources\n"
+        "deferred_dense_chunk_ptrs_npu = []\n"
         "try:\n"
         "    yield\n"
         "    if advance_error:\n"
@@ -131,10 +133,13 @@ class Destination:
 
 def _connector(fence):
     stream = NS(synchronize=fence)
+    released_pointer_caches = []
     return NS(
         use_gpu=False,
         _layerwise_prefill_dma_streams={(0, 0): stream},
         _synchronize_layerwise_prefill_dma_streams=lambda group: fence(),
+        release_sparse_chunk_ptr_cache=released_pointer_caches.append,
+        released_pointer_caches=released_pointer_caches,
     )
 
 
@@ -152,10 +157,12 @@ def test_failed_store_close_propagates_and_keeps_destination(backend, error_type
     connector = _connector(fail_fence)
     transfer = _production_transfer(connector, cached)
     engine = NS(
+        gpu_connector=connector,
         _remove_pending_layerwise_store_objs=lambda *args: removals.append(args)
     )
+    pointer_cache = [object()]
     with pytest.raises(error_type, match="D2H completion unknown"):
-        _production_cleanup(backend)(engine, transfer, cached, pending)
+        _production_cleanup(backend)(engine, transfer, cached, pending, pointer_cache)
 
     # Deferred bytes are deliberately wrong until DMA completes. Recycling this
     # destination now would let a later DMA overwrite a different allocation.
@@ -165,6 +172,9 @@ def test_failed_store_close_propagates_and_keeps_destination(backend, error_type
     assert cached == [[destination]]
     assert not removals
     assert connector._layerwise_prefill_unfenced_stores["request"]["owners"] == pending
+    assert connector.released_pointer_caches == (
+        [pointer_cache] if backend == "ascend" else []
+    )
 
 
 @pytest.mark.parametrize("backend", ["ascend", "base"])
@@ -182,12 +192,18 @@ def test_successful_store_close_finishes_dma_before_destination_release(backend)
     def remove(cached, pending):
         assert destination.value == 37
 
-    engine = NS(_remove_pending_layerwise_store_objs=remove)
-    _production_cleanup(backend)(engine, transfer, [[destination]], pending)
+    engine = NS(gpu_connector=connector, _remove_pending_layerwise_store_objs=remove)
+    pointer_cache = [object()]
+    _production_cleanup(backend)(
+        engine, transfer, [[destination]], pending, pointer_cache
+    )
     assert destination.value == 37
     assert destination.references == 0
     assert not pending
     assert not getattr(connector, "_layerwise_prefill_unfenced_stores", {})
+    assert connector.released_pointer_caches == (
+        [pointer_cache] if backend == "ascend" else []
+    )
 
 
 @pytest.mark.parametrize("backend", ["ascend", "base"])
@@ -220,6 +236,7 @@ def test_failed_advance_survives_exhausted_generator_and_final_reference_drop(
             next(transfer)
         assert destination.references == 2
         engine = NS(
+            gpu_connector=connector,
             _remove_pending_layerwise_store_objs=lambda rows, pending: rows.clear()
         )
         _production_cleanup(backend)(engine, transfer, cached, pending)

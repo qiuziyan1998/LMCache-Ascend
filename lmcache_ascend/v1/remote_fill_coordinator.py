@@ -13,16 +13,17 @@ worker unhealthy marking without retaining its engine.
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
-from weakref import WeakMethod
+from weakref import WeakMethod, ref
 import logging
 import os
 import secrets
 import threading
 import time
+import traceback
 
 from lmcache.v1.remote_fill import (
     ControlPage,
@@ -94,6 +95,7 @@ class ProducerRequestState:
     session: Optional[RemoteFillProducerSession] = None
     futures: deque[Future] = field(default_factory=deque)
     last_future: Optional[Future] = None
+    retirement: Optional[Future] = None
     next_window_id: int = 0
     source_generation: int = 0
     probe_end: int = 0
@@ -116,6 +118,202 @@ class ProducerRequestState:
     )
 
 
+def _cleanup_error(
+    error: BaseException, message: str = "RemoteFill cleanup failed",
+) -> BaseException:
+    """Keep error identity, without retaining callback/worker frames with GC off."""
+    # A queued/capturing log handler must not keep source owners through exc_info.
+    try:
+        logger.warning("%s\n%s", message, "".join(traceback.format_exception(
+            type(error), error, error.__traceback__,
+        )))
+    except Exception:
+        pass  # Diagnostic failure must not replace the original outcome or strand waiters.
+    pending = [error]
+    seen = set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        pending.extend(e for e in (item.__cause__, item.__context__) if e is not None)
+        item.__traceback__ = item.__cause__ = item.__context__ = None
+    return error
+
+
+class _CleanupJob:
+    """One owned cleanup; callbacks never borrow an executor thread to wait."""
+
+    def __init__(
+        self, coordinator: RemoteFillCoordinator, state: ProducerRequestState,
+        req_id: str | None, accepted_end: int | None,
+    ) -> None:
+        self.coordinator = ref(coordinator)
+        self.state = state
+        self.req_id = req_id
+        self.accepted_end = accepted_end
+        self.previous = state.last_future
+        self.dependencies = tuple(dict.fromkeys(
+            (*state.futures, *((self.previous,) if self.previous is not None else ()))
+        ))
+        self.completion = Future()
+        # A consumer cannot cancel cleanup and turn that into release evidence.
+        self.completion.set_running_or_notify_cancel()
+        self.submitted = None
+        self.lock = threading.Lock()
+        self.phase = "WAITING"
+        self.remaining = 0
+        self.ran = False
+        self.signalled = False
+
+    def arm(self) -> None:
+        pending = tuple(future for future in self.dependencies if not future.done())
+        self.remaining = len(pending)
+        weak = ref(self)
+
+        def completed(_future: Future) -> None:
+            job = weak()
+            if job is not None:
+                job.dependency_done()
+
+        # Publication and the full counter precede possibly-inline callbacks.
+        for future in pending:
+            future.add_done_callback(completed)
+        if not pending:
+            self.submit()
+
+    def dependency_done(self) -> None:
+        with self.lock:
+            if self.phase != "WAITING" or self.remaining == 0:
+                return
+            self.remaining -= 1
+            ready = self.remaining == 0
+        if ready:
+            self.submit()
+
+    def submit(self) -> None:
+        with self.lock:
+            if self.phase != "WAITING":
+                return
+            self.phase = "SUBMITTING"
+        coordinator = self.coordinator()
+        for attempt in range(2):
+            try:
+                if coordinator is None:
+                    raise RuntimeError("RemoteFill cleanup coordinator is unavailable")
+                submitted = coordinator._executor.submit(self.run)
+                break
+            except BaseException as error:
+                with self.lock:
+                    running = self.ran or self.phase == "FATAL"
+                if running:
+                    return  # An executor may raise after enqueuing the action.
+                if not isinstance(error, RuntimeError) or attempt:
+                    self.complete(error, submission_failure=True)
+                    return
+        with self.lock:
+            self.submitted = submitted
+            if self.phase == "SUBMITTING":
+                self.phase = "SUBMITTED"
+        weak = ref(self)
+
+        def completed(future: Future) -> None:
+            job = weak()
+            if job is not None:
+                error = CancelledError() if future.cancelled() else future.exception()
+                if error is not None:
+                    job.complete(error, submission_failure=True)
+
+        try:
+            submitted.add_done_callback(completed)
+        except BaseException as error:
+            # Only the cleanup task may be cancelled here, never a native source.
+            if submitted.cancel():
+                self.complete(error, submission_failure=True)
+            elif submitted.done():
+                completed(submitted)
+
+    def execute(self, deadline: float | None = None) -> None:
+        coordinator = self.coordinator()
+        if coordinator is None:
+            raise RuntimeError("RemoteFill cleanup coordinator is unavailable")
+        # Include originals that a previous failed drain removed from the deque.
+        for future in self.dependencies:
+            error = None if future.cancelled() else future.exception()
+            if isinstance(error, RemoteFillFatalError):
+                coordinator._latch_fatal(self.state)
+                raise error
+        if self.req_id is not None:
+            coordinator._retire(self.req_id, self.state, deadline=deadline)
+        else:
+            # All originals are terminal; retain the refusal path's outcome check.
+            self.previous.result()
+            if self.state.session is not None:
+                self.state.session.direct_viable = False
+                try:
+                    self.state.session.retire_failed_window(None, self.accepted_end)
+                except RemoteFillFatalError:
+                    coordinator._latch_fatal(self.state)
+                    raise
+
+    def run(self) -> None:
+        with self.lock:
+            if self.ran or self.phase not in ("SUBMITTING", "SUBMITTED"):
+                return
+            self.ran = True
+        try:
+            self.execute()
+        except BaseException as error:
+            self.complete(error)
+        else:
+            self.complete()
+
+    def complete(
+        self, error: BaseException | None = None, *, submission_failure: bool = False,
+    ) -> None:
+        if error is not None:
+            error = _cleanup_error(error)
+        with self.lock:
+            if self.phase == "FATAL" or (submission_failure and self.ran):
+                return
+            self.phase = "FAILED" if error is not None else "COMPLETED"
+            signal = not self.signalled
+            self.signalled = True
+        if error is None:
+            coordinator = self.coordinator()
+            if coordinator is not None:
+                coordinator._forget_cleanup(self)
+        if signal:
+            if error is None:
+                self.completion.set_result(None)
+            else:
+                self.completion.set_exception(error)
+
+    def recover(self, deadline: float) -> bool:
+        """Shutdown alone may run an action proven not to have started."""
+        with self.lock:
+            if self.phase != "FAILED" or self.ran:
+                return False
+            if self.submitted is not None and not self.submitted.cancelled():
+                return False
+            self.ran = True
+        try:
+            self.execute(deadline)
+        except BaseException as error:
+            self.complete(error)
+            raise
+        self.complete()
+        return True
+
+    def quarantine(self) -> None:
+        with self.lock:
+            self.phase = "FATAL"
+            signal = not self.signalled
+            self.signalled = True
+        if signal:
+            self.completion.set_exception(RemoteFillFatalError("remote cleanup hard deadline expired"))
+
+
 class RemoteFillCoordinator:
     def __init__(
         self,
@@ -134,6 +332,50 @@ class RemoteFillCoordinator:
         self.storage_manager = storage_manager
         self._fatal_reporter = WeakMethod(fatal_reporter)
         self._session_lock = threading.RLock()
+        self.retiring: dict[int, tuple[str, ProducerRequestState]] = {}
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_jobs: dict[Future, _CleanupJob] = {}
+        self._cleanup_closing = False
+
+    def _start_cleanup(
+        self, state: ProducerRequestState, *, req_id: str | None = None,
+        accepted_end: int | None = None,
+    ) -> Future:
+        job = _CleanupJob(self, state, req_id, accepted_end)
+        registered = False
+        try:
+            with self._cleanup_lock:
+                if self._cleanup_closing:
+                    raise RuntimeError("RemoteFill cleanup is closing")
+                self._cleanup_jobs[job.completion] = job
+                registered = True
+                if req_id is None:
+                    state.futures.append(job.completion)
+                else:
+                    state.retirement = job.completion
+        except BaseException as error:
+            try:
+                if registered:
+                    job.complete(error, submission_failure=True)
+            finally:
+                job = None  # The re-raised traceback must not own the failed record.
+            raise
+        try:
+            job.arm()
+        except BaseException as error:
+            # Partial callback registration must also deliver a failure outcome.
+            job.complete(error, submission_failure=True)
+        return job.completion
+
+    def _forget_cleanup(self, job: _CleanupJob) -> None:
+        with self._cleanup_lock:
+            self._cleanup_jobs.pop(job.completion, None)
+            if job.req_id is not None:
+                # Final retirement also settles failed refusal jobs it drained.
+                for dependency in job.dependencies:
+                    previous = self._cleanup_jobs.get(dependency)
+                    if previous is not None and previous.state is job.state and dependency.done():
+                        self._cleanup_jobs.pop(dependency)
 
     def configure(
         self,
@@ -178,16 +420,66 @@ class RemoteFillCoordinator:
         deadline = time.perf_counter() + (
             float(self.config.remote_fill_native_hard_timeout_ms) / 1000.0
         )
-        for state in states:
-            while state.futures:
-                future = state.futures.popleft()
+        with self._cleanup_lock:
+            self._cleanup_closing = True
+            jobs = tuple(self._cleanup_jobs.values())
+        # Detached attempts still own their cleanup on request-ID replacement.
+        owned = {id(state): state for state in states}
+        owned.update((key, state) for key, (_, state) in self.retiring.items())
+        owned.update((id(job.state), job.state) for job in jobs)
+        recovered = set()
+        try:
+            # Keep the executor alive until callbacks have submitted and finished.
+            for job in jobs:
+                self._wait_until_deadline(job.state, job.completion, deadline)
+            for job in jobs:
+                error = job.completion.exception()
+                if job.phase == "FATAL" or isinstance(error, RemoteFillFatalError):
+                    self._latch_fatal(job.state)
+                    if isinstance(error, RemoteFillFatalError):
+                        raise error
+                    raise RemoteFillFatalError("remote cleanup remains quarantined")
+            for job in jobs:
+                retirement = job.state.retirement
+                retired = retirement is not None and retirement.done() and retirement.exception() is None
+                # Registration can fail before every dependency acquired a callback.
+                # Its failed promise does not prove those original jobs have ended.
+                if not retired:
+                    for dependency in job.dependencies:
+                        self._wait_until_deadline(job.state, dependency, deadline)
+                if retired or job.recover(deadline):
+                    recovered.add(job.completion)
+                    self._forget_cleanup(job)
+        except RemoteFillFatalError:
+            for job in jobs:
+                job.quarantine()
+            raise
+        first_job_error = None
+        for state in owned.values():
+            if state.retirement is not None:
+                if state.retirement in recovered:
+                    state.retirement = Future()
+                    state.retirement.set_result(None)
                 try:
-                    future.result(timeout=max(0.0, deadline - time.perf_counter()))
+                    state.retirement.result(timeout=max(0.0, deadline - time.perf_counter()))
                 except FutureTimeoutError as error:
                     self._latch_fatal(state)
-                    raise RemoteFillFatalError(
-                        "remote-fill producer shutdown exceeded its hard deadline"
-                    ) from error
+                    raise RemoteFillFatalError("remote retirement did not drain") from error
+                continue
+            while state.futures:
+                self._wait_until_deadline(state, state.futures[0], deadline)
+                try:
+                    future = state.futures.popleft()
+                    if future not in recovered:
+                        future.result()
+                except RemoteFillFatalError:
+                    self._latch_fatal(state)
+                    raise
+                except Exception as error:
+                    # A completed job can fail before ARM. Close the remaining
+                    # sessions before propagating the original failure.
+                    if first_job_error is None:
+                        first_job_error = error
             if (
                 state.terminal is not None and state.terminal.outcome == "FATAL_RESTART"
             ) or getattr(state.session, "fatal_restart_required", False):
@@ -196,11 +488,19 @@ class RemoteFillCoordinator:
                     "cannot close fatal remote-fill producer state"
                 )
             if state.session is not None:
-                state.session.close()
+                self._close_session(state)
+        self.retiring.clear()
+        with self._cleanup_lock:
+            self._cleanup_jobs.clear()
         executor = getattr(self, "_executor", None)
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
             self._executor = None
+        if first_job_error is not None:
+            try:
+                raise first_job_error
+            finally:
+                del first_job_error  # Break the traceback cycle with cyclic GC off.
 
     def metrics_snapshot(self) -> dict[str, Any]:
         """Return enabled-path producer aggregates without request identities."""
@@ -255,7 +555,10 @@ class RemoteFillCoordinator:
             allocation = result.reason in (
                 "direct destination hole",
                 "reservation rejected",
+                "probe rejected",
                 "producer backpressure",
+            ) and result.response_code in (
+                "", "RESOURCE_EXHAUSTED", "RESERVATION_REJECTED",
             )
             metrics.abandon(result.reason, allocation=allocation)
             if result.armed or result.reason == "native transfer failed":
@@ -272,6 +575,8 @@ class RemoteFillCoordinator:
                 action=("PAIRED_RESTART_REQUIRED" if fatal else "PERSISTENT_ONLY"),
                 transfer_id=(handoff.transfer_id if handoff is not None else None),
                 reason=str(result.reason),
+                response_code=result.response_code,
+                response_message=result.response_message,
                 memory_safety_uncertain=fatal,
                 severity="critical" if fatal else "warning",
             )
@@ -620,6 +925,17 @@ class RemoteFillCoordinator:
             state.active_counted = True
         return session
 
+    def _retire_refused_tail(self, state: ProducerRequestState, accepted_end: int) -> None:
+        """A caller-side refusal can race previously admitted window jobs."""
+        if state.last_future is None:
+            return
+        try:
+            self._start_cleanup(state, accepted_end=accepted_end)
+        except RuntimeError:
+            # Original ownership and FINISH/release remain intact.
+            logger.warning("Could not enqueue RemoteFill abandonment", exc_info=True)
+            return
+
     def submit_probe(
         self,
         req_id: str,
@@ -629,6 +945,7 @@ class RemoteFillCoordinator:
         *,
         maximum: int,
         context: ProducerSessionContext,
+        accepted_end: int = 0,
         source_factory: Callable[[tuple[ControlPage, ...]], DirectPushSourcePlan]
         | None = None,
     ) -> None:
@@ -659,6 +976,7 @@ class RemoteFillCoordinator:
         if not self._acquire_queue_capacity(state, 0):
             state.disabled_reason = "producer_backpressure"
             metrics.abandon("producer backpressure", allocation=True)
+            self._retire_refused_tail(state, accepted_end)
             return
         first_window_id = state.next_window_id
         state.next_window_id += len(control_windows)
@@ -789,6 +1107,7 @@ class RemoteFillCoordinator:
                             self._record_failure()
                     self._record_window_metrics(state, result)
                     if not result.direct_satisfied:
+                        session.retire_failed_window(result.response_state, accepted_end)
                         break
                 return tuple(results)
             except RemoteFillFatalError:
@@ -822,6 +1141,7 @@ class RemoteFillCoordinator:
         control_pages: tuple[ControlPage, ...],
         maximum: int,
         context: ProducerSessionContext,
+        accepted_end: int = 0,
     ) -> None:
         if maximum <= 0:
             state.disabled_reason = "invalid_control_page_limit"
@@ -854,6 +1174,7 @@ class RemoteFillCoordinator:
             )
             metrics = self.get_metrics()
             metrics.abandon("producer backpressure", allocation=True)
+            self._retire_refused_tail(state, accepted_end)
             return
         try:
             source_plans = tuple(
@@ -949,6 +1270,7 @@ class RemoteFillCoordinator:
                             self._record_failure()
                     self._record_window_metrics(state, result)
                     if not result.direct_satisfied:
+                        session.retire_failed_window(result.response_state, accepted_end)
                         break
                 return tuple(results)
             except Exception as error:
@@ -1005,6 +1327,8 @@ class RemoteFillCoordinator:
         if state.terminal is not None:
             return state.terminal
         self.wait(state)
+        if state.retirement is not None:
+            return None
         metrics = self.get_metrics()
         try:
             if state.session is None:
@@ -1063,7 +1387,71 @@ class RemoteFillCoordinator:
         completed[req_id] = terminal
         return terminal
 
+    def filter_finished(
+        self, candidates: set[str], stores: dict, *, block: bool = False
+    ) -> set[str]:
+        """Poll only finish candidates and attempts for which we owe retirement."""
+        for req_id in candidates:
+            state = getattr(stores.get(req_id), "remote_fill", None)
+            if state is not None and (
+                state.futures or (state.session and state.session.remote_cleanup_pending)
+            ):
+                self.retiring[id(state)] = (req_id, state)
+
+        if not self.retiring:
+            return candidates
+        ready = set(candidates)
+        for key, (req_id, state) in tuple(self.retiring.items()):
+            current = getattr(stores.get(req_id), "remote_fill", None) is state
+            if current:
+                ready.discard(req_id)
+            if state.retirement is None:
+                # Remember the attempt before submission so a rejected submission
+                # remains owned. No RPC or Future.result() on the model thread.
+                state.disabled_reason = state.disabled_reason or "request_finished"
+                self._start_cleanup(state, req_id=req_id)
+            if block or state.retirement.done():
+                state.retirement.result()
+                del self.retiring[key]
+                if current:
+                    ready.add(req_id)
+        return ready
+
+    def _wait_until_deadline(
+        self, state: ProducerRequestState, future: Future, deadline: float
+    ) -> None:
+        if not future.done():
+            wait((future,), timeout=max(0, deadline - time.perf_counter()))
+            if not future.done():
+                self._latch_fatal(state)
+                raise RemoteFillFatalError("remote-fill producer shutdown exceeded its hard deadline")
+
+    def _retire(
+        self, req_id: str, state: ProducerRequestState, *, deadline: float | None = None
+    ) -> None:
+        # Earlier queued jobs may still own buffers even if a later wrapper
+        # was cancelled. Observe each original job before dropping the session.
+        while state.futures:
+            future = state.futures[0]
+            if deadline is not None:
+                self._wait_until_deadline(state, future, deadline)
+            try:
+                future.result()
+            except RemoteFillFatalError:
+                self._latch_fatal(state)
+                raise
+            except Exception as error:
+                _cleanup_error(error, "RemoteFill job failed during retirement")
+            state.futures.popleft()
+        if state.terminal is not None and state.terminal.outcome == "FATAL_RESTART":
+            self._latch_fatal(state)
+            raise RemoteFillFatalError("cannot retire fatal remote-fill request state")
+        self._release_drained(req_id, state)
+
     def wait(self, state: ProducerRequestState) -> None:
+        if state.retirement is not None:
+            state.retirement.result()
+            return
         try:
             while state.futures:
                 state.futures.popleft().result()
@@ -1080,16 +1468,34 @@ class RemoteFillCoordinator:
         ) or getattr(state.session, "fatal_restart_required", False):
             self._latch_fatal(state)
             raise RemoteFillFatalError("cannot release fatal remote-fill request state")
+        if state.retirement is not None:
+            if not persistent_ready or not state.retirement.done():
+                return False
+            state.retirement.result()
+            return True
         if (
             not persistent_ready
             or state.futures
             or (state.last_future is not None and not state.last_future.done())
         ):
             return False
+        self._release_drained(req_id, state)
+        return True
+
+    def _close_session(self, state: ProducerRequestState) -> None:
+        try:
+            state.session.close()
+        except RemoteFillFatalError:
+            self._latch_fatal(state)
+            raise
+
+    def _release_drained(self, req_id: str, state: ProducerRequestState) -> None:
         if state.session is not None:
-            if state.terminal is None:
+            if state.terminal is None or state.session.remote_cleanup_pending:
                 try:
-                    state.session.abort("prefiller released request before FINISH")
+                    state.session.abort(
+                        "prefiller released request; confirm remote cleanup"
+                    )
                 except RemoteFillFatalError:
                     self._latch_fatal(state)
                     raise
@@ -1099,7 +1505,7 @@ class RemoteFillCoordinator:
                         req_id,
                         exc_info=True,
                     )
-            state.session.close()
+            self._close_session(state)
         if state.metrics_started and state.terminal is None:
             metrics = self.get_metrics()
             metrics.finish_attempt("ABORTED", "request aborted")
@@ -1111,7 +1517,6 @@ class RemoteFillCoordinator:
                 metrics.add_gauge("active_transactions", -1)
                 state.active_counted = False
             metrics.add_bytes("discarded_bytes", state.submitted_bytes)
-        return True
 
     def drain_terminal_results(
         self,
