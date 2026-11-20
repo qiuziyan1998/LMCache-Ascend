@@ -146,7 +146,7 @@ def adapter(calls):
     class Base:
         def _run_dsa_cold_indexer_load(self, plan, device):
             calls.append(("cpu_tail", plan["token_count"], plan["token_mask"].tolist()))
-            return plan["token_mask"], "completed-cpu-fence", 0.1, 0.02
+            return plan["token_mask"], "completed-cpu-fence"
 
         def _run_dsa_cold_compact_load(self, plan, device, indexer, previous, live):
             calls.append(("ordinary_latent", previous))
@@ -211,6 +211,7 @@ def test_mixed_indexer_only_loads_original_prefix_from_mooncake_and_tail_from_cp
         ("cpu_tail", 7, [False] * 4 + [True] * 7),
     ]
     assert result[0].all() and p["token_mask"].all() and p["token_count"] == 11
+    assert len(result) == 2
     assert result[1] == "completed-cpu-fence"
 
 

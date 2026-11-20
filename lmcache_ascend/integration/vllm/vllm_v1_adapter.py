@@ -1796,9 +1796,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             raise error
         if not agreed:
             raise RuntimeError("Checkpoint prefix failed on another TP rank")
-        result = super()._run_dsa_cold_indexer_load(tail, npu_device_id)
+        _, readiness = super()._run_dsa_cold_indexer_load(tail, npu_device_id)
         # Both the persistent prefix and the CPU tail have reached readiness.
-        return plan["token_mask"], result[1], result[2], result[3]
+        return plan["token_mask"], readiness
 
     def _record_checkpoint_restore_miss(
         self, request: Any, generation: int, error: BaseException
