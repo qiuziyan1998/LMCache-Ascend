@@ -142,7 +142,7 @@ HostRegisteredMemoryManager::halRegisterHostPtr(void *hostPtr,
                                     std::to_string(lockErr))
   }
 
-  this->allocatedMap.emplace(
+  this->allocatedMap.insert_or_assign(
       hostPtr,
       RegisteredMemoryRecord{reinterpret_cast<uintptr_t>(hostPtr),
                              reinterpret_cast<uintptr_t>(devPtr), bufferSize,
@@ -177,6 +177,7 @@ int HostRegisteredMemoryManager::halUnregisterHostPtr(void *hostPtr) {
   auto err = halHostUnregisterEx(reinterpret_cast<void *>(hostPtr),
                                  static_cast<UINT32>(record.device),
                                  HOST_MEM_MAP_DEV_PCIE_TH);
+  this->allocatedMap.erase(hostPtr);
   return static_cast<int>(err);
 }
 
@@ -350,18 +351,15 @@ int get_device() {
 
 void hal_host_unregister_ptr(void *ptr) {
   if (ptr) {
-    int device = get_device();
     auto &hmm = HostRegisteredMemoryManager::GetInstance();
     size_t bufferSize = hmm.getRecordSize(ptr);
-    auto ret = halHostUnregisterEx(reinterpret_cast<void *>(ptr),
-                                   static_cast<UINT32>(device),
-                                   HOST_MEM_MAP_DEV_PCIE_TH);
+    auto ret = hmm.halUnregisterHostPtr(ptr);
     if (ret != 0) {
       std::cout << "Unable to hal host unregister: " << ret << std::endl;
     }
     auto mret = munmap(reinterpret_cast<void *>(ptr), bufferSize);
     if (mret != 0) {
-      std::cout << "Unable to unmap memory: " << ret << std::endl;
+      std::cout << "Unable to unmap memory: " << mret << std::endl;
     }
   }
 }

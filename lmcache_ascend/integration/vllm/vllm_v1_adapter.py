@@ -13,7 +13,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
 )
 from lmcache.integration.vllm.preemption_checkpoint import CheckpointResult, CheckpointRestoreMiss
 from lmcache.logging import init_logger
-from lmcache.v1.cache_engine import LayerwiseStoreResult
+from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
 from lmcache.v1.prefill_admission import PrefillAdmissionBudget
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -210,6 +210,9 @@ class _LiveSourceReadyFence:
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     supports_preemption_checkpoint = True
+
+    def _engine_supports_omitted_prefix_tokens_all_modes(self) -> bool:
+        return hasattr(LMCacheEngine, "_process_tokens_with_precomputed_hashes")
 
     def _record_dsa_cold_dense_load_readiness(
         self, state, readiness=None, additional_owners=()
@@ -463,7 +466,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     def wait_for_save(self) -> None:
         """Seal timing events after all ordinary bank submissions, without a fence."""
-        super().wait_for_save()
+        try:
+            super().wait_for_save()
+        finally:
+            step_fb = getattr(self, "_step_recompute_fallback_req_ids", None)
+            if isinstance(step_fb, set):
+                step_fb.clear()
 
     def capture_live_source_event_handoff(
         self,
@@ -837,13 +845,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         finalized_live_sources = getattr(
             self, "_finalized_live_source_submissions", set()
         )
-        requests = [
-            request
-            for request in requests
-            if request.req_id not in self._unfenced_live_stores
-            and request.req_id not in live_source_ready_fences
-            and request.req_id not in finalized_live_sources
-        ]
+        sync_fb = getattr(self, "_sync_recompute_fallback_from_engine", None)
+        if callable(sync_fb):
+            sync_fb()
+        kept_requests: list[ReqMeta] = []
+        for request in requests:
+            if self._is_fallback_req_id(request.req_id):
+                self._cleanup_fallback_direct_requests((request.req_id,))
+                continue
+            if (
+                request.req_id not in self._unfenced_live_stores
+                and request.req_id not in live_source_ready_fences
+                and request.req_id not in finalized_live_sources
+            ):
+                kept_requests.append(request)
+        requests = kept_requests
         if not requests:
             return
         if not finish_batch and getattr(
@@ -1026,6 +1042,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
                     source_ready_events=source_ready_events,
+                    prefill_chunk_hashes=getattr(
+                        request, "prefill_chunk_hashes", None
+                    ),
+                    prefill_chunk_offsets=getattr(
+                        request, "prefill_chunk_offsets", None
+                    ),
                     prefix_slot_mappings=(
                         {
                             group: (
@@ -1254,21 +1276,99 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             "slot_mapping_npu": slot_mapping_npu,
         }
 
+    def _is_fallback_req_id(self, req_id: str) -> bool:
+        is_fb = getattr(self, "_is_recompute_fallback_request", None)
+        if callable(is_fb):
+            return bool(is_fb(req_id))
+        return req_id in (
+            getattr(self, "_step_recompute_fallback_req_ids", None) or ()
+        ) or req_id in (
+            getattr(self.lmcache_engine, "_recompute_fallback_req_ids", None)
+            or ()
+        )
+
+    def _cleanup_fallback_direct_requests(
+        self, req_ids: Iterable[str]
+    ) -> None:
+        fb_tuple = tuple(dict.fromkeys(req_ids))
+        if not fb_tuple:
+            return
+        unfenced = getattr(self, "_unfenced_live_stores", None)
+        ready_fences = getattr(self, "_live_source_ready_fences", None)
+        finalized_live = getattr(
+            self, "_finalized_live_source_submissions", None
+        )
+        for fb_id in fb_tuple:
+            if isinstance(unfenced, dict):
+                unfenced.pop(fb_id, None)
+            if isinstance(ready_fences, dict):
+                ready_fences.pop(fb_id, None)
+            if isinstance(finalized_live, set):
+                finalized_live.discard(fb_id)
+        self._forget_layerwise_store_results(fb_tuple)
+        eng = self.lmcache_engine
+        if eng is None:
+            return
+        discard_live = getattr(eng, "discard_live_source_descriptor", None)
+        if callable(discard_live):
+            for fb_id in fb_tuple:
+                discard_live(fb_id)
+        direct_states = getattr(eng, "_direct_store_states", None)
+        pending_reqs = getattr(eng, "_pending_store_reqs", None)
+        inflight_fb = tuple(
+            fb_id
+            for fb_id in fb_tuple
+            if (
+                isinstance(direct_states, dict)
+                and (st := direct_states.get(fb_id)) is not None
+                and (
+                    bool(getattr(st, "futures", None))
+                    or bool(getattr(st, "pending_keys", None))
+                    or getattr(st, "remote_fill", None) is not None
+                )
+            )
+            or (isinstance(pending_reqs, dict) and fb_id in pending_reqs)
+        )
+        if inflight_fb:
+            wait_pending = getattr(eng, "wait_for_pending_stores", None)
+            if callable(wait_pending):
+                wait_pending(inflight_fb)
+            else:
+                wait_direct = getattr(eng, "wait_for_direct_stores", None)
+                if callable(wait_direct):
+                    wait_direct(set(inflight_fb))
+        drop_direct = getattr(eng, "drop_direct_store_states", None)
+        if callable(drop_direct):
+            drop_direct(fb_tuple)
+
     def _finish_layerwise_prefill_batch(self) -> None:
         """Fence persistent saves without revisiting the reused NPU banks."""
         if self.kv_role == "kv_consumer" or self.lmcache_engine is None:
             return
+        sync_fb = getattr(self, "_sync_recompute_fallback_from_engine", None)
+        if callable(sync_fb):
+            sync_fb()
         metadata = self._parent._get_connector_metadata()
-        final_requests = tuple(
+        fallback_req_ids = {
+            request.req_id
+            for request in metadata.requests
+            if self._is_fallback_req_id(request.req_id)
+        }
+        active_requests = tuple(
             request
             for request in metadata.requests
+            if request.req_id not in fallback_req_ids
+        )
+        final_requests = tuple(
+            request
+            for request in active_requests
             if request.is_last_prefill and not request.is_sparse_decode
         )
         try:
             # Both groups' CPU pages now exist. Start the independent D-cache
             # fill BEFORE waiting for Mooncake puts, not after that barrier.
             self.lmcache_engine.submit_layerwise_prefill_fills(
-                request.req_id for request in metadata.requests
+                request.req_id for request in active_requests
             )
             self.lmcache_engine.poll_layerwise_prefill_puts(
                 final=bool(final_requests),
@@ -1280,12 +1380,47 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         except Exception:
             raise
         finally:
-            completed = self._completed_layerwise_stores
+            completed = getattr(self, "_completed_layerwise_stores", {})
             self._completed_layerwise_stores = {}
         pending = getattr(self, "_layerwise_local_store_results", None)
         if pending is None:
             pending = self._layerwise_local_store_results = {}
         pending.update(completed)
+        fallback_req_ids.update(
+            req_id
+            for (req_id, _) in completed
+            if self._is_fallback_req_id(req_id)
+        )
+        if fallback_req_ids:
+            fb_tuple = tuple(sorted(fallback_req_ids))
+            poll_puts = getattr(
+                self.lmcache_engine, "poll_layerwise_prefill_puts", None
+            )
+            if callable(poll_puts):
+                poll_puts(final=True, req_ids=fb_tuple)
+            fill_srcs = getattr(
+                self.lmcache_engine, "_layerwise_cpu_fill_sources", None
+            )
+            rel_pages = getattr(
+                self.lmcache_engine, "release_layerwise_prefill_pages", None
+            )
+            for fb_id in fb_tuple:
+                for grp in (0, 1):
+                    pending.pop((fb_id, grp), None)
+                if isinstance(fill_srcs, dict):
+                    groups = fill_srcs.pop(fb_id, None)
+                    if isinstance(groups, dict):
+                        for entry in groups.values():
+                            if (
+                                isinstance(entry, tuple)
+                                and len(entry) >= 2
+                                and hasattr(entry[1], "release")
+                            ):
+                                entry[1].release()
+            self._cleanup_fallback_direct_requests(fb_tuple)
+            if callable(rel_pages):
+                for fb_id in fb_tuple:
+                    rel_pages(fb_id)
         if not final_requests:
             return
         # Local completion is deliberately NOT adopted as persistent progress
@@ -1302,6 +1437,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 required_store_end=len(request.token_ids),
                 persistence_fenced=True,
                 tokens=request.token_ids,
+                prefill_chunk_hashes=getattr(
+                    request, "prefill_chunk_hashes", None
+                ),
+                prefill_chunk_offsets=getattr(
+                    request, "prefill_chunk_offsets", None
+                ),
             )
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
@@ -1344,12 +1485,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             finally:
                 completed = self._completed_layerwise_stores
                 self._completed_layerwise_stores = {}
-            requests = self._direct_prefill_requests() or []
+            sync_fb = getattr(
+                self, "_sync_recompute_fallback_from_engine", None
+            )
+            if callable(sync_fb):
+                sync_fb()
+            all_requests = self._direct_prefill_requests() or []
             metadata = self._parent._get_connector_metadata()
             handoff = getattr(metadata, "_live_source_event_handoff", None)
             if hasattr(metadata, "_live_source_event_handoff"):
                 delattr(metadata, "_live_source_event_handoff")
-            expected_targets = self._producer_fence_handoff_targets(requests)
+            expected_targets = self._producer_fence_handoff_targets(
+                all_requests
+            )
             if (
                 expected_targets
                 and isinstance(handoff, tuple)
@@ -1364,6 +1512,23 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 # The request/frontier-matched event causally joins preceding
                 # cache writes on this forward stream, including callbacks.
                 source_ready_events = (source_ready_event,)
+            meta_requests = getattr(metadata, "requests", None) or ()
+            fallback_req_ids = {
+                req_id
+                for req_id in (
+                    [r.req_id for r in all_requests]
+                    + [r.req_id for r in meta_requests]
+                    + [rid for (rid, _) in completed]
+                )
+                if self._is_fallback_req_id(req_id)
+            }
+            if fallback_req_ids:
+                self._cleanup_fallback_direct_requests(
+                    sorted(fallback_req_ids)
+                )
+            requests = [
+                r for r in all_requests if r.req_id not in fallback_req_ids
+            ]
             request_ids = {request.req_id for request in requests}
             adopted_requests = set()
             for (req_id, _), result in completed.items():
@@ -1480,6 +1645,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                             final=True,
                             slot_mapping_base=mapping_base,
                             accepted_store_end=len(request.token_ids),
+                            prefill_chunk_hashes=getattr(
+                                request, "prefill_chunk_hashes", None
+                            ),
+                            prefill_chunk_offsets=getattr(
+                                request, "prefill_chunk_offsets", None
+                            ),
                         )
                     except Exception as error:
                         self._handle_save_request_error(request, error)
