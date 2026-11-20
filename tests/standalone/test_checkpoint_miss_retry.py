@@ -412,6 +412,7 @@ def test_cancel_after_miss_still_releases_owners_without_claiming_ready(api):
 def test_receiver_declines_a_shorter_checkpoint_after_receive_retirement(api):
     adapter, request, pending, _ = scheduler_adapter(api)
     adapter.config.pd_role = "receiver"
+    adapter.config.decoder_require_kv_prefix = True
     adapter._cold_perf_lookup_started = {}
     adapter.accept_preemption_result(
         api[0].CheckpointResult("r", 1, "restore_miss", 8, load_generation=7)
