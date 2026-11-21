@@ -557,27 +557,43 @@ def test_fixed_slot_capture_does_not_retry_smaller_tails(api, monkeypatch):
         return original(group, tokens, caches)
 
     engine.allocate_checkpoint_fragment = allocate
-    engine.reclaim_checkpoint_capacity = lambda n, g, **kw: reclaims.append(kw) or False
+    engine.reclaim_checkpoint_capacity = (
+        lambda n, g, **kw: reclaims.append((set(g), kw)) or False
+    )
     store, _, _ = start_capture(api, monkeypatch, engine, prefix=0)
     assert [(r.status, r.end) for r in store.poll()] == [("captured", 4)]
     assert attempts == [(0, 4), (1, 4), (0, 4)]
-    assert reclaims == [{"allocation_purpose": "checkpoint"}]
+    assert reclaims == [({0}, {"allocation_purpose": "checkpoint"})]
     store.close()
     assert all(p.refs == 0 for p in engine.allocated)
 
 
 @pytest.mark.parametrize(
-    "free,evictable,end,expected_end,scans,stop_reason",
+    "prefix,free,evictable,end,expected_end,scan_tokens,stop_reason",
     [
-        (0, 2, 1123, 1123, 2, None),
-        (0, 1, 1123, 1024, 2, "reclaim_unsatisfied"),
-        (1, 1, 1123, 1123, 1, None),
-        (2, 0, 1123, 1123, 0, None),
-        (0, 3, 2147, 2048, 2, "capture_budget_exhausted"),
+        # 14:34 sample translated by 607 complete chunks (14 + 99 tokens).
+        (1010, 0, 2, 1123, 1123, (14, 99), None),
+        (1010, 0, 1, 1123, 1024, (14, 99), "reclaim_unsatisfied"),
+        (1010, 1, 1, 1123, 1123, (99,), None),
+        (1010, 2, 0, 1123, 1123, (), None),
+        # 17:24 sample translated by 156 chunks (160444 -> 165120).
+        (700, 1, 5, 5376, 5376, (1024, 1024, 1024, 1024, 256), None),
+        (
+            700, 1, 4, 5376, 5120, (1024, 1024, 1024, 1024, 256), "reclaim_unsatisfied"
+        ),
     ],
 )
 def test_fixed_slot_capture_reclaims_across_chunks(
-    api, monkeypatch, caplog, free, evictable, end, expected_end, scans, stop_reason
+    api,
+    monkeypatch,
+    caplog,
+    prefix,
+    free,
+    evictable,
+    end,
+    expected_end,
+    scan_tokens,
+    stop_reason,
 ):
     engine = fake_engine()
     engine.config.chunk_size = 1024
@@ -606,23 +622,20 @@ def test_fixed_slot_capture_reclaims_across_chunks(
 
     engine.allocate_checkpoint_fragment = allocate
     engine.reclaim_checkpoint_capacity = reclaim
-    # The incident's 622578 prefix translated by 607 complete chunks.
     with caplog.at_level("INFO"):
-        store, _, _ = start_capture(api, monkeypatch, engine, prefix=1010, end=end)
+        store, _, _ = start_capture(api, monkeypatch, engine, prefix=prefix, end=end)
     try:
         result = store.poll()[0]
         assert (result.status, result.end) == ("captured", expected_end)
-        expected_reclaims = (1024, 1024) if end == 2147 else (1024, 99)[2 - scans :]
-        assert reclaims == [
-            (tokens, {0, 1}, "checkpoint") for tokens in expected_reclaims
-        ]
-        if end == 1123 and scans == 2:
+        assert reclaims == [(tokens, {0}, "checkpoint") for tokens in scan_tokens]
+        if scan_tokens == (14, 99):
             assert attempts == ([14, 14, 99] if stop_reason else [14, 14, 99, 99])
         if stop_reason:
             assert "[CHECKPOINT_CAPTURE_TRUNCATED]" in caplog.text
             assert f"requested_end={end} captured_end={expected_end}" in caplog.text
+            assert "failed_group=0" in caplog.text
             assert f"stop_reason={stop_reason}" in caplog.text
-        elif scans:
+        elif scan_tokens:
             assert "[CHECKPOINT_CAPTURE_RECOVERED]" in caplog.text
         publish(api, store, expected_end)
         assert store.local.available("r", 1, end) == expected_end
@@ -634,38 +647,56 @@ def test_fixed_slot_capture_reclaims_across_chunks(
     )
 
 
-@pytest.mark.parametrize("failed_group", [0, 1])
-def test_fixed_slot_capture_does_not_scan_again_in_same_chunk(
-    api, monkeypatch, caplog, failed_group
+@pytest.mark.parametrize(
+    "taken_group,completed_prefix",
+    [(None, False), (0, False), (1, False), (1, True)],
+)
+def test_fixed_slot_capture_retries_each_group_only_once(
+    api, monkeypatch, caplog, taken_group, completed_prefix
 ):
     engine = fake_engine()
     engine.checkpoint_uses_fixed_slots = lambda: True
     original = engine.allocate_checkpoint_fragment
     attempts, reclaims = [], []
+    free = [int(completed_prefix), int(completed_prefix)]
 
     def allocate(group, tokens, caches=None):
         attempts.append(group)
-        # Simulate a concurrent allocation after reclaim has returned success.
-        if attempts == [0] or group == failed_group:
-            raise MemoryError("slot taken")
+        if not free[group]:
+            raise MemoryError("no slot")
+        free[group] -= 1
         return original(group, tokens, caches)
 
     def reclaim(tokens, groups, *, allocation_purpose):
-        reclaims.append(set(groups))
+        (group,) = groups
+        reclaims.append(group)
+        # Simulate another allocation consuming the slot before the retry.
+        if group != taken_group:
+            free[group] += 1
         return True
 
     engine.allocate_checkpoint_fragment = allocate
     engine.reclaim_checkpoint_capacity = reclaim
-    store, _, _ = start_capture(api, monkeypatch, engine)
+    store, _, _ = start_capture(
+        api, monkeypatch, engine, end=8 if completed_prefix else 4
+    )
     try:
-        assert [(r.status, r.end) for r in store.poll()] == [("failed", 0)]
-        assert attempts == ([0, 0] if failed_group == 0 else [0, 0, 1])
-        assert reclaims == [{0, 1}]
-        assert "[CHECKPOINT_CAPTURE_FAILED]" in caplog.text
-        assert "stop_reason=" + (
-            "retry_refused" if failed_group == 0 else "chunk_budget_exhausted"
-        ) in caplog.text
-        assert not engine.calls  # No device work without a usable paired prefix.
+        captured = taken_group is None or completed_prefix
+        expected = ("captured", 4) if captured else ("failed", 0)
+        assert [(r.status, r.end) for r in store.poll()] == [expected]
+        assert attempts == ([0, 1] if completed_prefix else []) + (
+            [0, 0] if taken_group == 0 else [0, 0, 1, 1]
+        )
+        assert reclaims == ([0] if taken_group == 0 else [0, 1])
+        if taken_group is not None:
+            status = "TRUNCATED" if completed_prefix else "FAILED"
+            assert f"[CHECKPOINT_CAPTURE_{status}]" in caplog.text
+            assert f"failed_group={taken_group}" in caplog.text
+            assert "stop_reason=retry_refused" in caplog.text
+            if completed_prefix:
+                assert [p.refs for p in engine.allocated] == [1, 1, 0]
+            else:
+                assert not engine.calls  # No device work for an incomplete pair.
     finally:
         store.close()
     assert all(page.refs == 0 for page in engine.allocated)

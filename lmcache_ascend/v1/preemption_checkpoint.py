@@ -29,9 +29,6 @@ from lmcache_ascend.v1.local_checkpoint import (
 
 logger = init_logger(__name__)
 
-# Capture runs before HBM reuse. Bound hot-cache scans even for long tails.
-_FIXED_SLOT_CAPTURE_RECLAIM_LIMIT = 2
-
 
 def _checkpoint_slots(blocks, start: int, end: int, block_size: int) -> torch.Tensor:
     """Build pinned slots for a validated, nonempty contiguous capture range."""
@@ -202,7 +199,6 @@ class CheckpointWorker:
             fixed_slots = getattr(
                 self.engine, "checkpoint_uses_fixed_slots", lambda: False
             )()
-            reclaim_limit = _FIXED_SLOT_CAPTURE_RECLAIM_LIMIT if fixed_slots else 1
             reclaim_attempts = 0
             stop_reason = None
             cursor = spec.base
@@ -210,7 +206,6 @@ class CheckpointWorker:
                 desired_end = min(
                     spec.end, (cursor // self.chunk_size + 1) * self.chunk_size
                 )
-                reclaimed_chunk = False
                 end = desired_end
                 while end > cursor:
                     candidate = {}
@@ -228,27 +223,24 @@ class CheckpointWorker:
                                     allocators[group], end - start
                                 )
                             except MemoryError:
-                                if reclaim_attempts >= reclaim_limit:
-                                    stop_reason = "capture_budget_exhausted"
-                                    raise
-                                if reclaimed_chunk:
-                                    stop_reason = "chunk_budget_exhausted"
+                                if not fixed_slots and reclaim_attempts:
                                     raise
                                 reclaim_attempts += 1
-                                reclaimed_chunk = True
-                                missing = {
-                                    g: None  # Remaining group layouts are prepared.
-                                    for g in range(group, 2)
-                                }
-                                if not self.engine.reclaim_checkpoint_capacity(
-                                    end - cursor,
-                                    missing,
-                                    **(
-                                        {"allocation_purpose": "checkpoint"}
-                                        if fixed_slots
-                                        else {}
-                                    ),
-                                ):
+                                if fixed_slots:
+                                    # Reclaim only the slot that was refused. Each
+                                    # group/fragment gets one scan and one retry;
+                                    # a later fragment may reclaim again.
+                                    reclaimed = self.engine.reclaim_checkpoint_capacity(
+                                        end - start,
+                                        {group: None},
+                                        allocation_purpose="checkpoint",
+                                    )
+                                else:
+                                    # The variable allocator shares one slab.
+                                    reclaimed = self.engine.reclaim_checkpoint_capacity(
+                                        end - cursor, dict.fromkeys(range(group, 2))
+                                    )
+                                if not reclaimed:
                                     stop_reason = "reclaim_unsatisfied"
                                     raise
                                 try:
@@ -285,7 +277,7 @@ class CheckpointWorker:
                         "[CHECKPOINT_CAPTURE_FAILED] req=%s generation=%d "
                         "requested_end=%d staged_end=%d failed_group=%d "
                         "fragment_start=%d fragment_end=%d reclaim_attempts=%d "
-                        "reclaim_budget=%d stop_reason=%s",
+                        "stop_reason=%s",
                         *key,
                         spec.end,
                         cursor,
@@ -293,27 +285,26 @@ class CheckpointWorker:
                         start,
                         desired_end,
                         reclaim_attempts,
-                        reclaim_limit,
                         stop_reason,
                     )
                 raise MemoryError("Checkpoint CPU staging allocation refused")
             job.captured_end = cursor
             # Admit the entire selected paired prefix before device preparation.
-            for group, fragments in job.fragments.items():
+            for kv_group, fragments in job.fragments.items():
                 starts = [a for a, _, _ in fragments]
                 ends = [b for _, b, _ in fragments]
                 pages = [page for _, _, page in fragments]
-                blocks = spec.blocks[group]
+                blocks = spec.blocks[kv_group]
                 slots = _checkpoint_slots(blocks, starts[0], ends[-1], block_size)
                 device_work_started = True
                 plan = self.engine.gpu_connector.prepare_group_capture(
-                    [pages] * self.engine.num_layers_for_group(group),
+                    [pages] * self.engine.num_layers_for_group(kv_group),
                     starts,
                     ends,
                     slot_mapping=slots,
                     slot_mapping_base=starts[0],
-                    kv_group=group,
-                    kvcaches=caches[group],
+                    kv_group=kv_group,
+                    kvcaches=caches[kv_group],
                 )
                 job.plans.append(plan)
             prepared_at = time.monotonic()
@@ -343,7 +334,7 @@ class CheckpointWorker:
                     "[CHECKPOINT_CAPTURE_TRUNCATED] req=%s generation=%d "
                     "requested_end=%d captured_end=%d short_by=%d failed_group=%d "
                     "fragment_start=%d fragment_end=%d reclaim_attempts=%d "
-                    "reclaim_budget=%d stop_reason=%s",
+                    "stop_reason=%s",
                     *key,
                     spec.end,
                     job.captured_end,
@@ -352,7 +343,6 @@ class CheckpointWorker:
                     start,
                     desired_end,
                     reclaim_attempts,
-                    reclaim_limit,
                     stop_reason,
                 )
             elif fixed_slots and reclaim_attempts:
