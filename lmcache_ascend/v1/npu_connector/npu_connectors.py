@@ -2367,6 +2367,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             deferred = self._deferred_sparse_pointer_caches = {}
         deferred[id(cached_chunk_ptrs_npu)] = cached_chunk_ptrs_npu
 
+    def prepare_layerwise_prefill_group0_skip(self, **kwargs) -> None:
+        """Initialize Group-0 layout/banks when Selected KV skips Group-0 DMA."""
+        self.initialize_kvcaches_ptr(**kwargs)
+        kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
+        if kvcaches_snapshot is not None:
+            self._lazy_initialize_buffer_with_staging(
+                kvcaches_snapshot,
+                kv_group=0,
+                init_staging=False,
+            )
+        bank_count = 2
+        if getattr(self, "_layerwise_prefill_dma", False):
+            bank_count = int(kwargs.get("layerwise_prefill_bank_count", 2) or 2)
+        self._set_layerwise_prefill_bank_count(0, bank_count)
+
     def materialize_sparse_chunk_ptr_cache(
         self,
         cached_chunk_dev_ptrs: List[List[int]],

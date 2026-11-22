@@ -1382,6 +1382,18 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         finally:
             completed = getattr(self, "_completed_layerwise_stores", {})
             self._completed_layerwise_stores = {}
+            prev_pending = getattr(self, "_layerwise_local_store_results", None)
+            if isinstance(prev_pending, dict) and prev_pending:
+                for key, res in completed.items():
+                    old_res = prev_pending.get(key)
+                    old_unv = int(
+                        getattr(old_res, "unverified_prefix_end", 0) or 0
+                    )
+                    if old_unv > int(
+                        getattr(res, "unverified_prefix_end", 0) or 0
+                    ):
+                        res_any: Any = res
+                        res_any.unverified_prefix_end = old_unv
         pending = getattr(self, "_layerwise_local_store_results", None)
         if pending is None:
             pending = self._layerwise_local_store_results = {}

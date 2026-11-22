@@ -202,6 +202,7 @@ class _DirectStoreRequestState:
     pending_keys: set[str] = field(default_factory=set)
     submitted_end: dict[int, int] = field(default_factory=dict)
     committed_end: dict[int, int] = field(default_factory=dict)
+    unverified_prefix_end: dict[int, int] = field(default_factory=dict)
     planned_end: int = 0
     # Hash-chain frontier: int for builtin/64-bit algorithms, raw digest
     # bytes for digest-based algorithms (e.g. sha256_cbor in this vLLM fork).
@@ -374,6 +375,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             str, dict[int, tuple[int, Union[int, bytes]]]
         ] = {}
         self._layerwise_prefill_store_metadata_scopes: dict[str, tuple] = {}
+        self._layerwise_prefill_store_unverified_ends: dict[
+            str, dict[int, int]
+        ] = {}
         self._layerwise_cpu_fill_sources: dict[
             str, dict[int, tuple[_DirectPageBatch, LayerwiseCPUFillLease]]
         ] = {}
@@ -1518,12 +1522,25 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if end > state.planned_end:
                     state.planned_end = end
                     state.planned_hash = chunk_hash
+        prior_committed = state.committed_end.get(group, 0)
+        result_unverified = int(
+            getattr(result, "unverified_prefix_end", 0) or 0
+        )
+        unverified_prefix = max(
+            state.unverified_prefix_end.get(group, 0),
+            result_unverified,
+        )
+        if unverified_prefix > 0:
+            state.unverified_prefix_end[group] = unverified_prefix
+        effective_committed = (
+            prior_committed
+            if unverified_prefix > 0 and prior_committed < unverified_prefix
+            else result.committed_end
+        )
         state.submitted_end[group] = max(
-            state.submitted_end.get(group, 0), result.committed_end
+            state.submitted_end.get(group, 0), effective_committed
         )
-        state.committed_end[group] = max(
-            state.committed_end.get(group, 0), result.committed_end
-        )
+        state.committed_end[group] = max(prior_committed, effective_committed)
 
     def _retain_layerwise_prefill_pages(
         self, req_id: str, memory_objs: Iterable[MemoryObj]
@@ -1555,6 +1572,9 @@ class AscendLMCacheEngine(LMCacheEngine):
             release_dma(req_id)
         self._layerwise_prefill_store_frontiers.pop(req_id, None)
         getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(req_id, None)
+        getattr(self, "_layerwise_prefill_store_unverified_ends", {}).pop(
+            req_id, None
+        )
         with self._engine_state_lock:
             owned = self._layerwise_prefill_page_owners.pop(req_id, None)
         if owned is not None:
@@ -1885,6 +1905,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             state.submitted_end[group] = max(
                 state.submitted_end.get(group, 0), required_end
             )
+            if required_end >= state.unverified_prefix_end.get(group, 0):
+                state.unverified_prefix_end.pop(group, None)
+            unv_by_req = getattr(
+                self, "_layerwise_prefill_store_unverified_ends", None
+            )
+            if isinstance(unv_by_req, dict):
+                req_unv = unv_by_req.get(req_id)
+                if isinstance(req_unv, dict) and required_end >= req_unv.get(
+                    group, 0
+                ):
+                    req_unv.pop(group, None)
+                    if not req_unv:
+                        unv_by_req.pop(req_id, None)
 
     def _republish_layerwise_cpu_chunk(
         self,
@@ -3568,6 +3601,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 getattr(self, "_layerwise_prefill_store_metadata_scopes", {}).pop(
                     req_id, None
                 )
+                getattr(
+                    self, "_layerwise_prefill_store_unverified_ends", {}
+                ).pop(req_id, None)
 
     def direct_store_committed_ends(self, req_id: str) -> dict[int, int]:
         """Return a snapshot of successfully persisted group frontiers."""
@@ -6105,6 +6141,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # scope was stored. Same-length config/MM replacements must
                 # not inherit another scope's committed frontier.
                 self._layerwise_prefill_store_frontiers.pop(req_id, None)
+                getattr(
+                    self, "_layerwise_prefill_store_unverified_ends", {}
+                ).pop(req_id, None)
                 scopes[req_id] = (
                     metadata_cache,
                     self.token_database,
@@ -6127,6 +6166,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                 # shorter prefix.  Discard the stale frontier and rebuild
                 # once; subsequent chunks are incremental again.
                 frontiers.pop(kv_group, None)
+                getattr(
+                    self, "_layerwise_prefill_store_unverified_ends", {}
+                ).get(req_id, {}).pop(kv_group, None)
                 previous = None
 
         if metadata_cache is not None:
@@ -7150,12 +7192,37 @@ class AscendLMCacheEngine(LMCacheEngine):
                     yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        unverified_prefix_skip = int(
+            kwargs.get("_unverified_prefix_skip_tokens", 0) or 0
+        )
+        unverified_map = getattr(
+            self, "_layerwise_prefill_store_unverified_ends", None
+        )
+        if unverified_map is None:
+            unverified_map = {}
+            self._layerwise_prefill_store_unverified_ends = unverified_map
+        prior_unverified = (
+            unverified_map.get(req_id, {}).get(kv_group, 0)
+            if incremental_prefill
+            else 0
+        )
+        effective_unverified = max(prior_unverified, unverified_prefix_skip)
+        if unverified_prefix_skip > 0:
+            requested_end = max(requested_end, unverified_prefix_skip)
+        if effective_unverified > 0:
+            res_any: Any = store_result
+            res_any.unverified_prefix_end = effective_unverified
         if store_complete:
             store_result.committed_end = requested_end
-            if incremental_prefill and latest_full_frontier is not None:
-                self._layerwise_prefill_store_frontiers.setdefault(
-                    req_id, {}
-                )[kv_group] = latest_full_frontier
+            if incremental_prefill:
+                if effective_unverified > 0:
+                    unverified_map.setdefault(req_id, {})[
+                        kv_group
+                    ] = effective_unverified
+                if latest_full_frontier is not None:
+                    self._layerwise_prefill_store_frontiers.setdefault(
+                        req_id, {}
+                    )[kv_group] = latest_full_frontier
         yield store_result
 
     def _retrieve_layer_head_token_wise_shared_passive(
