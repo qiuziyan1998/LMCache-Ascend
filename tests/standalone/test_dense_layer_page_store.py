@@ -274,5 +274,5 @@ def test_store_stream_snapshot_and_early_close_follow_selected_mode(
         snapshots if prefill else snapshots * 2
     )
     gen.close()
-    # Dense D stores retain baseline close semantics; P may have a pending DMA.
-    assert len(syncs) == (2 if prefill else 1)
+    # Both P and ordinary non-prefill stores fence pending DMA on close.
+    assert len(syncs) == 2

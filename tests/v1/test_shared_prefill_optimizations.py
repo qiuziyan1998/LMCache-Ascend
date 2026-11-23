@@ -9,8 +9,10 @@ from typing import Any
 from unittest.mock import patch
 import ast
 import sys
+import threading
 import types
 import unittest
+import warnings
 
 # Third Party
 from lmcache.v1.config import LMCacheEngineConfig
@@ -18,6 +20,7 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.token_database import ChunkedTokenDatabase
 import lmcache.v1.memory_management as _mm
+import numpy as np
 import torch
 
 # First Party
@@ -29,6 +32,7 @@ from lmcache_ascend.v1.npu_connector.layerwise_dma import (
     DmaPlan,
     bind_incremental_copy_addresses,
     prepare_source_addresses,
+    ptrs_to_int64_tensor,
 )
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
@@ -1544,6 +1548,334 @@ class TestAscendSharedPrefillOptimizations(unittest.TestCase):
         with patch.object(LMCacheConnectorV1Impl, "wait_for_save", lambda _s: None):
             impl_sk.wait_for_save()
         self.assertEqual(impl_sk._step_recompute_fallback_req_ids, set())
+
+    def test_ptrs_to_int64_tensor_high_bit_negative_and_pin_memory(self) -> None:
+        eq = self.assertEqual
+        hi_a = 0x8000_0000_0000_0000
+        hi_b = 0xFFFF_FFFF_FFFF_FFE0
+        u64_1d = [0x1000, hi_a, hi_b]
+        u64_2d = [[0x1000, hi_a], [hi_b, 0x2000]]
+        neg_1d = [-32, 0x1000, hi_a]
+        neg_2d = [[-32, 64], [0, -1]]
+        t_u64 = torch.tensor(u64_1d, dtype=torch.uint64)
+
+        for fn in (
+            ptrs_to_int64_tensor,
+            VLLMPagedMemLayerwiseNPUConnector._dva_to_int64_tensor,
+        ):
+            r1 = fn(u64_1d)
+            eq((r1.dtype, r1.view(torch.uint64).tolist()), (torch.int64, u64_1d))
+            r2 = fn(u64_2d)
+            eq((r2.dtype, r2.view(torch.uint64).tolist()), (torch.int64, u64_2d))
+            rn1 = fn(neg_1d)
+            eq(
+                (rn1.dtype, rn1.tolist()),
+                (torch.int64, [-32, 0x1000, hi_a - (1 << 64)]),
+            )
+            rn2 = fn(neg_2d)
+            eq((rn2.dtype, rn2.tolist()), (torch.int64, neg_2d))
+            e1 = fn([])
+            eq((e1.dtype, tuple(e1.shape)), (torch.int64, (0,)))
+            e2 = fn([[], []])
+            eq((e2.dtype, tuple(e2.shape)), (torch.int64, (2, 0)))
+            rt = fn(t_u64)
+            eq((rt.dtype, rt.view(torch.uint64).tolist()), (torch.int64, u64_1d))
+            eq(rt.data_ptr(), t_u64.data_ptr())
+
+        # Verify pin_memory=True path on both uint64 Tensor view and list inputs.
+        pin_calls: list[int] = []
+        orig_tensor = torch.tensor
+
+        def _fake_pin(self_t: torch.Tensor) -> torch.Tensor:
+            pin_calls.append(int(self_t.numel()))
+            return self_t
+
+        def _tensor_spy(*a: Any, **kw: Any) -> torch.Tensor:
+            if kw.pop("pin_memory", False):
+                pin_calls.append(-int(len(a[0]) if a else 0))
+            return orig_tensor(*a, **kw)
+
+        dma_mod = "lmcache_ascend.v1.npu_connector.layerwise_dma"
+        with (
+            patch.object(torch.Tensor, "pin_memory", _fake_pin),
+            patch(f"{dma_mod}.torch.tensor", _tensor_spy),
+        ):
+            p_t = ptrs_to_int64_tensor(t_u64, pin_memory=True)
+            p_l = ptrs_to_int64_tensor(u64_1d, pin_memory=True)
+        eq(p_t.view(torch.uint64).tolist(), u64_1d)
+        eq(p_l.view(torch.uint64).tolist(), u64_1d)
+        eq(pin_calls, [3, -3])
+
+        # Generator, np.ndarray (both pin_memory modes), int32 tensor, CPU pin_memory.
+        np_u64 = np.array(u64_1d, dtype=np.uint64)
+        rg = ptrs_to_int64_tensor(v for v in u64_1d)
+        rn_f = ptrs_to_int64_tensor(np_u64, pin_memory=False)
+        ri32 = ptrs_to_int64_tensor(torch.tensor([1, 2], dtype=torch.int32))
+        eq((rg.dtype, rg.view(torch.uint64).tolist()), (torch.int64, u64_1d))
+        eq((rn_f.dtype, rn_f.view(torch.uint64).tolist()), (torch.int64, u64_1d))
+        eq((ri32.dtype, ri32.tolist()), (torch.int64, [1, 2]))
+
+        cpu_pins: list[int] = []
+
+        def _fake_pin_cnt(self_t: torch.Tensor) -> torch.Tensor:
+            cpu_pins.append(int(self_t.numel()))
+            return self_t
+
+        with (
+            patch.object(torch.Tensor, "pin_memory", _fake_pin_cnt),
+            patch(f"{dma_mod}.torch.tensor", _tensor_spy),
+        ):
+            rn_t = ptrs_to_int64_tensor(np_u64, pin_memory=True)
+            rcpu = ptrs_to_int64_tensor(t_u64, device="cpu", pin_memory=True)
+            rcpu_l = ptrs_to_int64_tensor(u64_1d, device="cpu", pin_memory=True)
+        eq(rn_t.view(torch.uint64).tolist(), u64_1d)
+        eq(rcpu.view(torch.uint64).tolist(), u64_1d)
+        eq(rcpu_l.view(torch.uint64).tolist(), u64_1d)
+        eq(cpu_pins, [3, 3])
+        eq(pin_calls, [3, -3, -3])
+
+        # Multi-threaded concurrency while companion thread emits warnings.
+        orig_filters = list(warnings.filters)
+        errs: list[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                for _ in range(200):
+                    r2 = ptrs_to_int64_tensor(u64_2d)
+                    eq(r2.view(torch.uint64).tolist(), u64_2d)
+                    rn = ptrs_to_int64_tensor(neg_1d)
+                    eq(rn.tolist(), [-32, 0x1000, hi_a - (1 << 64)])
+                    rg_w = ptrs_to_int64_tensor(v for v in u64_1d)
+                    eq(rg_w.view(torch.uint64).tolist(), u64_1d)
+            except BaseException as exc:  # noqa: BLE001
+                errs.append(exc)
+
+        def _warn_loop() -> None:
+            try:
+                for _ in range(200):
+                    warnings.warn("bg", DeprecationWarning, stacklevel=1)
+            except BaseException as exc:  # noqa: BLE001
+                errs.append(exc)
+
+        threads = [threading.Thread(target=_worker) for _ in range(4)]
+        threads.append(threading.Thread(target=_warn_loop))
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        eq(errs, [])
+        eq(list(warnings.filters), orig_filters)
+
+    def test_prepare_prefill_c8_packets_nonaligned_disjoint_and_empty(self) -> None:
+        conn, eq = _conn("cpu"), self.assertEqual
+        prep, banks = _npu_stream("prep"), [_npu_stream("b0"), _npu_stream("b1")]
+        conn.indexer_c8_layout = _N(mixed=True, is_c8=lambda lyr: lyr >= 1)
+        conn._stream_context_or_null = lambda _s: nullcontext()
+        conn._layerwise_prefill_dma_stream = lambda _g, b: banks[b]
+        layout, kvcaches = _c8_caches(4)
+        mixed = _mixed()
+        dva = 0x8000_0000_5000_0000
+        c8_sh = [_SZ([256, 2, 128])] + [_SZ([256, 1, 130])] * 3
+        pages = mixed.batched_allocate_layer_pages(
+            c8_sh, [_U8] * 4, 2, 4, fmt=_F2D, valid_tokens=[256, 256]
+        )
+        assert pages is not None and len(pages) == 2
+        for p in pages:
+            self.addCleanup(p.ref_count_down)
+        dva_calls = 0
+
+        def _get_dva(p: Any, _s: Any) -> int:
+            nonlocal dva_calls
+            dva_calls += 1
+            return int(p) + dva
+
+        fops = _N(
+            IndexerC8State=lambda *a: a,
+            get_device_ptr=_get_dva,
+        )
+        prows = _lps(pages, 4)
+
+        def _ref_slots(
+            bmap: tuple[int, ...], st: tuple[int, ...], en: tuple[int, ...]
+        ) -> list[int]:
+            return [
+                bmap[pos // 128] * 128 + (pos % 128)
+                for s, e in zip(st, en, strict=True)
+                for pos in range(s, e)
+            ]
+
+        def _prep(bb: Any, st: Any, en: Any, mem: Any = prows) -> Any:
+            return conn._prepare_prefill_c8_packets(
+                layout=layout,
+                kvcaches=kvcaches,
+                memory_objs=mem,
+                block_ids_by_bank=bb,
+                block_size=128,
+                starts=st,
+                ends=en,
+                transfer_stream=prep,
+            )
+
+        with _npu_ctx(fops, _npu_stream("compute")):
+            bmaps = ((0, 1, 2), (2, 3, 0))
+            # 1) Contiguous unaligned start (first_off=64) + 2) Non-contiguous ranges.
+            for st, en in (((64, 256), (256, 320)), ((0, 256), (64, 320))):
+                prep_res = _prep(bmaps, st, en)
+                bases = [
+                    int(p.layer_data_ptr(0)) - p.group_prefix_sum[0] for p in pages
+                ]
+                seen_ptrs: set[int] = set()
+                for lid, (_st, ptrs, offs, cnts, maps, fcap) in enumerate(prep_res):
+                    self.assertTrue(ptrs.is_contiguous())
+                    self.assertTrue(offs.is_contiguous())
+                    self.assertTrue(cnts.is_contiguous())
+                    self.assertTrue(all(m.is_contiguous() for m in maps))
+                    self.assertNotIn(ptrs.data_ptr(), seen_ptrs)
+                    seen_ptrs.add(ptrs.data_ptr())
+                    exp_p = [
+                        b + dva + p.group_prefix_sum[lid]
+                        for b, p in zip(bases, pages, strict=True)
+                    ]
+                    eq(ptrs.view(torch.uint64).tolist(), exp_p)
+                    eq(
+                        (offs.tolist(), cnts.tolist(), fcap),
+                        ([0, 256], [256, 256], 256),
+                    )
+                    pad0 = 256 - (en[0] - st[0])
+                    pad1 = 256 - (en[1] - st[1])
+                    for bi, bids in enumerate(bmaps):
+                        r0 = _ref_slots(bids, (st[0],), (en[0],)) + [-1] * pad0
+                        r1 = _ref_slots(bids, (st[1],), (en[1],)) + [-1] * pad1
+                        eq(maps[bi].tolist(), r0 + r1)
+
+            # 3) Empty ranges.
+            p_empty = _prep(bmaps, (), (), [[] for _ in range(4)])
+            eq(len(p_empty), 4)
+            for _st, ptrs, offs, cnts, maps, fcap in p_empty:
+                eq((ptrs.numel(), offs.numel(), cnts.numel(), fcap), (0, 0, 0, 0))
+                eq([m.numel() for m in maps], [0, 0])
+
+            # 4) Negative & out-of-range block IDs on contiguous and disjoint paths.
+            for st, en in (((64, 256), (256, 320)), ((0, 256), (64, 320))):
+                for bad_bb in (((-1, 1, 2), (2, 3, 0)), ((0, 1, 99), (2, 3, 0))):
+                    with self.assertRaisesRegex(
+                        ValueError, "Banked C8 logical slot exceeds registered capacity"
+                    ):
+                        _prep(bad_bb, st, en)
+            eq(dva_calls, 1)
+
+    def test_direct_prefill_skewed_engine_omits_empty_hash_kwargs(self) -> None:
+        calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        class _StrictEngine:
+            def direct_prefill_store_enabled(self) -> bool:
+                return True
+
+            def store_direct_prefill(
+                self,
+                req_id: Any,
+                token_ids: Any,
+                selected: Any,
+                slot_mappings: Any,
+                request_configs: Any,
+                **kw: Any,
+            ) -> None:
+                calls.append(
+                    (
+                        (
+                            req_id,
+                            token_ids,
+                            selected,
+                            slot_mappings,
+                            request_configs,
+                        ),
+                        dict(kw),
+                    )
+                )
+
+            def direct_store_committed_ends(self, _req_id: str) -> dict[int, int]:
+                return {}
+
+            def get_finished_stores(self, req_ids: set[str]) -> set[str]:
+                return set(req_ids)
+
+            def drop_direct_store_states(self, _req_ids: Any) -> None:
+                return None
+
+        impl = LMCacheAscendConnectorV1Impl.__new__(LMCacheAscendConnectorV1Impl)
+        impl.lmcache_engine = _StrictEngine()
+        impl._force_layerwise_prefill_store = False
+        impl._unfenced_live_stores = {}
+        impl._remote_store_requested = False
+        impl.store_async = False
+        impl._is_fallback_req_id = lambda _rid: False
+        impl._direct_group_caches = lambda: {0: [None]}
+        impl._direct_request_inputs = lambda r, gc: (
+            gc,
+            {0: torch.arange(len(r.token_ids))},
+            0,
+        )
+        impl._vllm_config = _N(
+            parallel_config=_N(
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            )
+        )
+        impl._mark_prefill_committed = lambda _r: None
+        impl._release_finished_worker_requests = lambda _ids: None
+
+        req_none = _N(
+            req_id="r-none",
+            token_ids=[1, 2, 3, 4],
+            request_configs={"k": "v"},
+            is_last_prefill=True,
+            is_sparse_decode=False,
+            prefill_chunk_hashes=None,
+            prefill_chunk_offsets=None,
+        )
+        req_with = _N(
+            req_id="r-with",
+            token_ids=[5, 6, 7, 8],
+            request_configs={"k": "v2"},
+            is_last_prefill=True,
+            is_sparse_decode=False,
+            prefill_chunk_hashes=["h0"],
+            prefill_chunk_offsets=[0],
+        )
+        impl._submit_direct_prefill_requests([req_none, req_with])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("prefill_chunk_hashes", calls[0][1])
+        self.assertNotIn("prefill_chunk_offsets", calls[0][1])
+        self.assertEqual(calls[1][1]["prefill_chunk_hashes"], ["h0"])
+        self.assertEqual(calls[1][1]["prefill_chunk_offsets"], [0])
+
+        req_fin_none = _N(
+            req_id="r-fin-none",
+            token_ids=[9, 10],
+            request_configs=None,
+            prefill_chunk_hashes=None,
+            prefill_chunk_offsets=None,
+        )
+        req_fin_with = _N(
+            req_id="r-fin-with",
+            token_ids=[11, 12],
+            request_configs=None,
+            prefill_chunk_hashes=["h1"],
+            prefill_chunk_offsets=[2],
+        )
+        impl._unfenced_live_stores = {
+            "r-fin-none": req_fin_none,
+            "r-fin-with": req_fin_with,
+        }
+        calls.clear()
+        impl._finalize_worker_requests_after_store({"r-fin-none", "r-fin-with"})
+        by_id = {c[0][0]: c[1] for c in calls}
+        self.assertEqual(set(by_id), {"r-fin-none", "r-fin-with"})
+        self.assertNotIn("prefill_chunk_hashes", by_id["r-fin-none"])
+        self.assertNotIn("prefill_chunk_offsets", by_id["r-fin-none"])
+        self.assertEqual(by_id["r-fin-with"]["prefill_chunk_hashes"], ["h1"])
+        self.assertEqual(by_id["r-fin-with"]["prefill_chunk_offsets"], [2])
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ from lmcache_ascend.v1.npu_connector.layerwise_dma import (
     bind_incremental_copy_addresses,
     plan_block_id_ranges_incremental,
     prepare_source_addresses,
+    ptrs_to_int64_tensor,
 )
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
@@ -2405,18 +2406,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("Deferred sparse pointer cache has unexpected NPU rows")
         if not num_chunks:
             return
+        _dva_fn = getattr(self, "_dva_to_int64_tensor", None) or globals().get(
+            "ptrs_to_int64_tensor"
+        )
         if defer_copy:
-            table = self.stage_dense_load_tensor(
-                self._dva_to_int64_tensor(cached_chunk_dev_ptrs),
-                dtype=torch.long,
+            host_table = (
+                _dva_fn(cached_chunk_dev_ptrs)
+                if _dva_fn is not None
+                else torch.tensor(cached_chunk_dev_ptrs, dtype=torch.long)
             )
+            table = self.stage_dense_load_tensor(host_table, dtype=torch.long)
         else:
-            table = self._dva_to_int64_tensor(
-                cached_chunk_dev_ptrs,
-                device=(
-                    getattr(self, "kv_device", None)
-                    or getattr(self, "device", None)
-                ),
+            target_dev = getattr(self, "kv_device", None) or getattr(
+                self, "device", None
+            )
+            table = (
+                _dva_fn(cached_chunk_dev_ptrs, device=target_dev)
+                if _dva_fn is not None
+                else torch.tensor(
+                    cached_chunk_dev_ptrs, dtype=torch.long, device=target_dev
+                )
             )
         tables = getattr(self, "_layerwise_pointer_tables", None)
         if tables is None:
@@ -2433,26 +2442,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def _dva_to_int64_tensor(
         rows: Any, device: Any = None, *, pin_memory: bool = False
     ) -> torch.Tensor:
-        sign_bit = 1 << 63
-        mod_64 = 1 << 64
-        if rows and isinstance(rows[0], (list, tuple)):
-            if any(int(v) >= sign_bit for r in rows for v in r):
-                rows = [
-                    [
-                        int(v) - mod_64 if int(v) >= sign_bit else int(v)
-                        for v in r
-                    ]
-                    for r in rows
-                ]
-        elif any(int(v) >= sign_bit for v in rows):
-            rows = [
-                int(v) - mod_64 if int(v) >= sign_bit else int(v) for v in rows
-            ]
-        if device is not None:
-            return torch.tensor(rows, dtype=torch.long, device=device)
-        if pin_memory:
-            return torch.tensor(rows, dtype=torch.long, pin_memory=True)
-        return torch.tensor(rows, dtype=torch.long)
+        return ptrs_to_int64_tensor(rows, device=device, pin_memory=pin_memory)
+
+    def _can_use_fast_dva_resolver(self) -> bool:
+        """Return True unless a subclass or test instance overrides DVA resolution."""
+        base_cls = globals().get("VLLMPagedMemLayerwiseNPUConnector")
+        return "_resolve_registered_cpu_source_device_ptr" not in getattr(
+            self, "__dict__", ()
+        ) and (
+            base_cls is None
+            or getattr(
+                type(self), "_resolve_registered_cpu_source_device_ptr", None
+            )
+            is getattr(
+                base_cls, "_resolve_registered_cpu_source_device_ptr", None
+            )
+        )
 
     def append_sparse_chunk_ptr_cache_for_layer(
         self,
@@ -2473,21 +2478,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
 
         _row_fn = getattr(self, "_resolve_source_device_ptr_row", None)
-        _base_cls = globals().get("VLLMPagedMemLayerwiseNPUConnector")
-        if (
-            _row_fn is not None
-            and "_resolve_registered_cpu_source_device_ptr"
+        _can_fast = getattr(self, "_can_use_fast_dva_resolver", None)
+        _fast_ok = (
+            _can_fast()
+            if callable(_can_fast)
+            else "_resolve_registered_cpu_source_device_ptr"
             not in getattr(self, "__dict__", ())
-            and (
-                _base_cls is None
-                or getattr(
-                    type(self), "_resolve_registered_cpu_source_device_ptr", None
-                )
-                is getattr(
-                    _base_cls, "_resolve_registered_cpu_source_device_ptr", None
-                )
-            )
-        ):
+        )
+        if _row_fn is not None and _fast_ok:
             new_dev_ptrs = _row_fn(
                 new_sources,
                 layer_id=layer_id,
@@ -2544,8 +2542,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         target_device = getattr(self, "kv_device", None) or getattr(
             self, "device", None
         )
-        new_ptrs_npu = self._dva_to_int64_tensor(
-            new_dev_ptrs, device=target_device
+        _dva_fn = getattr(self, "_dva_to_int64_tensor", None) or globals().get(
+            "ptrs_to_int64_tensor"
+        )
+        new_ptrs_npu = (
+            _dva_fn(new_dev_ptrs, device=target_device)
+            if _dva_fn is not None
+            else torch.tensor(new_dev_ptrs, dtype=torch.long, device=target_device)
         )
         existing = cached_chunk_ptrs_npu[layer_id]
         tables = getattr(self, "_layerwise_pointer_tables", None)
@@ -2601,21 +2604,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             return
 
         _row_fn = getattr(self, "_resolve_source_device_ptr_row", None)
-        _base_cls = globals().get("VLLMPagedMemLayerwiseNPUConnector")
-        if (
-            _row_fn is not None
-            and "_resolve_registered_cpu_source_device_ptr"
+        _can_fast = getattr(self, "_can_use_fast_dva_resolver", None)
+        _fast_ok = (
+            _can_fast()
+            if callable(_can_fast)
+            else "_resolve_registered_cpu_source_device_ptr"
             not in getattr(self, "__dict__", ())
-            and (
-                _base_cls is None
-                or getattr(
-                    type(self), "_resolve_registered_cpu_source_device_ptr", None
-                )
-                is getattr(
-                    _base_cls, "_resolve_registered_cpu_source_device_ptr", None
-                )
-            )
-        ):
+        )
+        if _row_fn is not None and _fast_ok:
             new_dev_ptrs = _row_fn(
                 new_sources,
                 layer_id=layer_id,
@@ -2646,8 +2642,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             target_device = getattr(self, "kv_device", None) or getattr(
                 self, "device", None
             )
-            new_ptrs_npu = self._dva_to_int64_tensor(
-                new_dev_ptrs, device=target_device
+            _dva_fn = getattr(
+                self, "_dva_to_int64_tensor", None
+            ) or globals().get("ptrs_to_int64_tensor")
+            new_ptrs_npu = (
+                _dva_fn(new_dev_ptrs, device=target_device)
+                if _dva_fn is not None
+                else torch.tensor(
+                    new_dev_ptrs, dtype=torch.long, device=target_device
+                )
             )
             existing = (
                 cached_chunk_ptrs_npu[layer_id]
@@ -2723,25 +2726,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         staged_rows = self._layer_page_pointer_rows(new_sources_by_layer)
         if staged_rows is None:
             _row_fn = getattr(self, "_resolve_source_device_ptr_row", None)
-            _base_cls = globals().get("VLLMPagedMemLayerwiseNPUConnector")
-            if (
-                _row_fn is not None
-                and "_resolve_registered_cpu_source_device_ptr"
+            _can_fast = getattr(self, "_can_use_fast_dva_resolver", None)
+            _fast_ok = (
+                _can_fast()
+                if callable(_can_fast)
+                else "_resolve_registered_cpu_source_device_ptr"
                 not in getattr(self, "__dict__", ())
-                and (
-                    _base_cls is None
-                    or getattr(
-                        type(self),
-                        "_resolve_registered_cpu_source_device_ptr",
-                        None,
-                    )
-                    is getattr(
-                        _base_cls,
-                        "_resolve_registered_cpu_source_device_ptr",
-                        None,
-                    )
-                )
-            ):
+            )
+            if _row_fn is not None and _fast_ok:
                 validate_span = bool(
                     getattr(self, "enable_npu_transfer_validation", False)
                 )
@@ -2930,7 +2922,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             table = state["table"]
             if suffix_count:
-                suffix_cpu = self._dva_to_int64_tensor(staged_rows)
+                _dva_fn = getattr(
+                    self, "_dva_to_int64_tensor", None
+                ) or globals().get("ptrs_to_int64_tensor")
+                suffix_cpu = (
+                    _dva_fn(staged_rows)
+                    if _dva_fn is not None
+                    else torch.tensor(staged_rows, dtype=torch.long)
+                )
                 if defer_copy and table.device.type != "cpu":
                     suffix_device = self.stage_dense_load_tensor(
                         suffix_cpu, dtype=torch.long
@@ -2975,17 +2974,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ]
         row_views = None
         if cached_chunk_ptrs_npu is not None:
+            _dva_fn = getattr(
+                self, "_dva_to_int64_tensor", None
+            ) or globals().get("ptrs_to_int64_tensor")
             if defer_copy:
+                host_table = (
+                    _dva_fn(complete_rows)
+                    if _dva_fn is not None
+                    else torch.tensor(complete_rows, dtype=torch.long)
+                )
                 pointer_table = self.stage_dense_load_tensor(
-                    self._dva_to_int64_tensor(complete_rows),
+                    host_table,
                     dtype=torch.long,
                 )
             else:
                 target_device = getattr(self, "kv_device", None) or getattr(
                     self, "device", None
                 )
-                pointer_table = self._dva_to_int64_tensor(
-                    complete_rows, device=target_device
+                pointer_table = (
+                    _dva_fn(complete_rows, device=target_device)
+                    if _dva_fn is not None
+                    else torch.tensor(
+                        complete_rows, dtype=torch.long, device=target_device
+                    )
                 )
             # The row views retain the table storage after this function returns.
             row_views = list(pointer_table.unbind(0))
@@ -3031,6 +3042,48 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             tables.pop((identity, layer_id), None)
         for layer_id in range(len(cached_chunk_ptrs_npu)):
             tables.pop((identity, layer_id), None)
+
+    def _resolve_layer_page_base_dva(
+        self,
+        page: LayerPageMemoryObj,
+        *,
+        chunk_index: int,
+        source: str,
+        connector_id: int,
+        device_key: str,
+        validate_span: bool,
+        slab_memo: dict[int, Optional[tuple[int, int, int]]],
+    ) -> int:
+        """Resolve a LayerPageMemoryObj's base DVA via whole-slab offset or cache."""
+        page_bytes = page.get_size()
+        base_host_ptr = int(page.layer_data_ptr(0)) - page.group_prefix_sum[0]
+        parent_alloc = getattr(page, "parent_allocator", None)
+        if parent_alloc is not None:
+            alloc_key = id(parent_alloc)
+            if alloc_key not in slab_memo:
+                slab_memo[alloc_key] = self._resolve_slab_base_dva(
+                    parent_alloc,
+                    connector_id=connector_id,
+                    device_key=device_key,
+                )
+            slab_info = slab_memo[alloc_key]
+            if slab_info is not None:
+                off = base_host_ptr - slab_info[0]
+                if 0 <= off and page_bytes > 0 and off + page_bytes <= slab_info[1]:
+                    return slab_info[2] + off
+        return self._resolve_cached_obj_dva(
+            page,
+            parent_alloc,
+            False,
+            base_host_ptr,
+            page_bytes,
+            0,
+            chunk_index,
+            source,
+            connector_id,
+            device_key,
+            validate_span,
+        )
 
     def _layer_page_pointer_rows(
         self,
@@ -3149,43 +3202,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slab_memo: dict[int, Optional[tuple[int, int, int]]] = {}
         result = [[] for _ in range(page_layers)]
         for chunk_index, page in enumerate(pages):
-            page_bytes = page.get_size()
-            base_host_ptr = (
-                int(page.layer_data_ptr(0)) - page.group_prefix_sum[0]
+            base = self._resolve_layer_page_base_dva(
+                page,
+                chunk_index=chunk_index,
+                source="append_sparse_chunk_ptr_cache_for_layers_page",
+                connector_id=connector_id,
+                device_key=device_key,
+                validate_span=validate_span,
+                slab_memo=slab_memo,
             )
-            parent_alloc = getattr(page, "parent_allocator", None)
-            base: Optional[int] = None
-            if parent_alloc is not None:
-                alloc_key = id(parent_alloc)
-                if alloc_key not in slab_memo:
-                    slab_memo[alloc_key] = self._resolve_slab_base_dva(
-                        parent_alloc,
-                        connector_id=connector_id,
-                        device_key=device_key,
-                    )
-                slab_info = slab_memo[alloc_key]
-                if slab_info is not None:
-                    off = base_host_ptr - slab_info[0]
-                    if (
-                        0 <= off
-                        and page_bytes > 0
-                        and off + page_bytes <= slab_info[1]
-                    ):
-                        base = slab_info[2] + off
-            if base is None:
-                base = self._resolve_cached_obj_dva(
-                    page,
-                    parent_alloc,
-                    False,
-                    base_host_ptr,
-                    page_bytes,
-                    0,
-                    chunk_index,
-                    "append_sparse_chunk_ptr_cache_for_layers_page",
-                    connector_id,
-                    device_key,
-                    validate_span,
-                )
             for layer_id, row in enumerate(result):
                 row.append(base + page.group_prefix_sum[layer_id])
         for layer_id, source in enumerate(rows):
@@ -4666,8 +4691,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             target_device = getattr(self, "kv_device", None) or getattr(
                 self, "device", None
             )
-            chunk_ptrs_npu = self._dva_to_int64_tensor(
-                dev_ptrs, device=target_device
+            _dva_fn = getattr(
+                self, "_dva_to_int64_tensor", None
+            ) or globals().get("ptrs_to_int64_tensor")
+            chunk_ptrs_npu = (
+                _dva_fn(dev_ptrs, device=target_device)
+                if _dva_fn is not None
+                else torch.tensor(dev_ptrs, dtype=torch.long, device=target_device)
             )
         if cached_chunk_dev_ptrs is not None:
             while len(cached_chunk_dev_ptrs) <= layer_id:
@@ -4844,12 +4874,22 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if end > max_end:
                 max_end = end
             chunk_lengths.append(end - start)
-        if not chunk_lengths:
-            all_positions_cpu = torch.empty(0, dtype=torch.long, device="cpu")
+        total_valid_tokens = sum(chunk_lengths)
+        if not total_valid_tokens:
+            block_indices_cpu = None
+            in_block_offsets_cpu = None
+            first_blk = first_off = end_blk = 0
+            in_block_arange = None
         elif contiguous_ranges:
-            all_positions_cpu = torch.arange(
-                starts[0], ends[-1], dtype=torch.long, device="cpu"
+            start0 = int(starts[0])
+            end_last = int(ends[-1])
+            first_blk, first_off = divmod(start0, block_size)
+            end_blk = (end_last + block_size - 1) // block_size
+            in_block_arange = torch.arange(
+                block_size, dtype=torch.long, device="cpu"
             )
+            block_indices_cpu = None
+            in_block_offsets_cpu = None
         else:
             all_positions_cpu = torch.cat(
                 [
@@ -4857,15 +4897,40 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for start, end in zip(starts, ends, strict=True)
                 ]
             )
-        block_indices_cpu = all_positions_cpu // block_size
-        in_block_offsets_cpu = all_positions_cpu % block_size
-        total_valid_tokens = int(all_positions_cpu.numel())
+            block_indices_cpu = all_positions_cpu // block_size
+            in_block_offsets_cpu = all_positions_cpu % block_size
+            first_blk = first_off = end_blk = 0
+            in_block_arange = None
         flat_valid_slots_by_bank = []
         for blocks in block_ids_by_bank:
             blocks_cpu = torch.as_tensor(blocks, dtype=torch.long, device="cpu")
             if max_end > int(blocks_cpu.numel()) * block_size:
                 raise ValueError("Banked C8 range exceeds logical block table")
-            if total_valid_tokens:
+            if not total_valid_tokens:
+                bank_slots = torch.empty(0, dtype=torch.long, device="cpu")
+            elif contiguous_ranges:
+                used_blocks = blocks_cpu[first_blk:end_blk]
+                if (
+                    int(used_blocks.min()) < 0
+                    or int(used_blocks.max()) * block_size >= logical_capacity
+                ):
+                    raise ValueError(
+                        "Banked C8 logical slot exceeds registered capacity"
+                    )
+                full_block_slots = (
+                    used_blocks.unsqueeze(1) * block_size + in_block_arange
+                ).reshape(-1)
+                bank_slots = (
+                    full_block_slots
+                    if first_off == 0
+                    and int(full_block_slots.numel()) == total_valid_tokens
+                    else full_block_slots[
+                        first_off : first_off + total_valid_tokens
+                    ]
+                )
+            else:
+                assert block_indices_cpu is not None
+                assert in_block_offsets_cpu is not None
                 bank_slots = (
                     blocks_cpu.index_select(0, block_indices_cpu) * block_size
                     + in_block_offsets_cpu
@@ -4877,29 +4942,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     raise ValueError(
                         "Banked C8 logical slot exceeds registered capacity"
                     )
-            else:
-                bank_slots = torch.empty(0, dtype=torch.long, device="cpu")
             flat_valid_slots_by_bank.append(bank_slots)
         tensor_obj_cls = globals().get("TensorMemoryObj")
-        resolve_slab = getattr(self, "_resolve_slab_base_dva", None)
-        resolve_cached = getattr(self, "_resolve_cached_obj_dva", None)
+        resolve_page_base = getattr(self, "_resolve_layer_page_base_dva", None)
         resolve_tensor_ptr = getattr(
             self, "_resolve_tensor_source_device_ptr", None
         )
-        base_cls = globals().get("VLLMPagedMemLayerwiseNPUConnector")
-        use_fast_dva = (
-            resolve_slab is not None
-            and "_resolve_registered_cpu_source_device_ptr"
-            not in getattr(self, "__dict__", ())
+        can_fast = getattr(self, "_can_use_fast_dva_resolver", None)
+        use_fast_dva = bool(
+            resolve_page_base is not None
             and (
-                base_cls is None
-                or getattr(
-                    type(self), "_resolve_registered_cpu_source_device_ptr", None
-                )
-                is getattr(
-                    base_cls, "_resolve_registered_cpu_source_device_ptr", None
-                )
+                can_fast()
+                if callable(can_fast)
+                else "_resolve_registered_cpu_source_device_ptr"
+                not in getattr(self, "__dict__", ())
             )
+        )
+        _dva_fn = getattr(self, "_dva_to_int64_tensor", None) or globals().get(
+            "ptrs_to_int64_tensor"
         )
         validate_span = bool(
             getattr(self, "enable_npu_transfer_validation", False)
@@ -4908,10 +4968,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         device_key = str(
             getattr(self, "kv_device", None) or getattr(self, "device", None)
         )
-        slab_memo = {}
-        page_base_memo = {}
+        slab_memo: dict[int, Optional[tuple[int, int, int]]] = {}
+        page_base_memo: dict[int, int] = {}
         metadata_by_capacity = {}
-        prepared = []
+        layer_entries = []
+        pointers_by_layer = []
         # This snapshot is before model execution, never in a layer callback.
         transfer_stream.wait_stream(torch.npu.current_stream())
         with self._stream_context_or_null(transfer_stream):
@@ -4970,50 +5031,21 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         and obj.group_prefix_sum[layer_id] + packet_bytes
                         <= obj.get_size()
                     ):
+                        assert resolve_page_base is not None
                         page_key = id(obj)
                         base = page_base_memo.get(page_key)
                         if base is None:
-                            page_bytes = obj.get_size()
-                            base_host_ptr = (
-                                int(obj.layer_data_ptr(0))
-                                - obj.group_prefix_sum[0]
+                            base = resolve_page_base(
+                                obj,
+                                chunk_index=chunk_id,
+                                source="_prepare_prefill_c8_packets",
+                                connector_id=connector_id,
+                                device_key=device_key,
+                                validate_span=validate_span,
+                                slab_memo=slab_memo,
                             )
-                            parent_alloc = getattr(obj, "parent_allocator", None)
-                            if parent_alloc is not None:
-                                alloc_key = id(parent_alloc)
-                                if alloc_key not in slab_memo:
-                                    slab_memo[alloc_key] = resolve_slab(
-                                        parent_alloc,
-                                        connector_id=connector_id,
-                                        device_key=device_key,
-                                    )
-                                slab_info = slab_memo[alloc_key]
-                                if slab_info is not None:
-                                    off = base_host_ptr - slab_info[0]
-                                    if (
-                                        0 <= off
-                                        and page_bytes > 0
-                                        and off + page_bytes <= slab_info[1]
-                                    ):
-                                        base = slab_info[2] + off
-                            if base is None and resolve_cached is not None:
-                                base = resolve_cached(
-                                    obj,
-                                    parent_alloc,
-                                    False,
-                                    base_host_ptr,
-                                    page_bytes,
-                                    0,
-                                    chunk_id,
-                                    "_prepare_prefill_c8_packets",
-                                    connector_id,
-                                    device_key,
-                                    validate_span,
-                                )
-                            if base is not None:
-                                page_base_memo[page_key] = base
-                        if base is not None:
-                            ptr_val = base + obj.group_prefix_sum[layer_id]
+                            page_base_memo[page_key] = base
+                        ptr_val = base + obj.group_prefix_sum[layer_id]
                     if ptr_val is None:
                         if use_fast_dva and resolve_tensor_ptr is not None:
                             ptr_val = resolve_tensor_ptr(
@@ -5079,13 +5111,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             if total_valid_tokens:
                                 slots.index_copy_(0, dest_indices_cpu, bank_slots)
                             slots_by_bank.append(slots.to(device=layout.kv_device))
+                    offsets_and_caps = torch.tensor(
+                        [offsets, capacities], dtype=torch.long
+                    ).to(device=layout.kv_device)
                     metadata = (
-                        torch.tensor(offsets, dtype=torch.long).to(
-                            device=layout.kv_device
-                        ),
-                        torch.tensor(capacities, dtype=torch.long).to(
-                            device=layout.kv_device
-                        ),
+                        offsets_and_caps[0],
+                        offsets_and_caps[1],
                         tuple(slots_by_bank),
                         max(capacities, default=0),
                     )
@@ -5094,15 +5125,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     layer[0], layer[1] if len(layer) == 2 else None,
                     layout.layer_slot_factors[layer_id],
                 )
-                prepared.append(
-                    (
-                        state,
-                        self._dva_to_int64_tensor(
-                            pointers, device=layout.kv_device
-                        ),
-                        *metadata,
+                layer_entries.append((state, metadata))
+                pointers_by_layer.append(pointers)
+            if pointers_by_layer:
+                pointer_table = (
+                    _dva_fn(pointers_by_layer, device=layout.kv_device)
+                    if _dva_fn is not None
+                    else torch.tensor(
+                        pointers_by_layer,
+                        dtype=torch.long,
+                        device=layout.kv_device,
                     )
                 )
+                pointer_rows = pointer_table.unbind(0)
+            else:
+                pointer_rows = ()
+            prepared = [
+                (state, ptr_row, *metadata)
+                for (state, metadata), ptr_row in zip(
+                    layer_entries, pointer_rows, strict=True
+                )
+            ]
             ready = torch.npu.Event()
             ready.record(transfer_stream)
         for bank in range(len(block_ids_by_bank)):
@@ -6214,7 +6257,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             dtype=torch.int32,
             pin_memory=True,
         )
-        pointers = self._dva_to_int64_tensor(rows, pin_memory=True)
+        _dva_fn = getattr(self, "_dva_to_int64_tensor", None) or globals().get(
+            "ptrs_to_int64_tensor"
+        )
+        pointers = (
+            _dva_fn(rows, pin_memory=True)
+            if _dva_fn is not None
+            else torch.tensor(rows, dtype=torch.long, pin_memory=True)
+        )
         with self._stream_context_or_null(self.store_stream):
             offsets_npu = offsets.to(self.kv_device, non_blocking=True)
             sizes_npu = sizes.to(self.kv_device, non_blocking=True)
@@ -6552,15 +6602,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         store/retrieve transfer holds (LMCache chunks). Size staging for
         transfer headroom, not full pool capacity.
         """
-        if not self.dsa_two_groups or self.lmcache_chunk_size <= 0:
+        cap = self._staging_token_cap()
+        if cap <= 0:
             return cache_max_tokens
-
-        max_seq_tokens = self.max_staging_tokens
-        if max_seq_tokens <= 0:
-            # Non-vLLM paths (unit tests, benchmarks) may omit max_model_len.
-            max_seq_tokens = self.lmcache_chunk_size * 512
-        staging_tokens = min(cache_max_tokens, max_seq_tokens)
-        return max(staging_tokens, self.lmcache_chunk_size)
+        return max(min(cache_max_tokens, cap), self.lmcache_chunk_size)
 
     def _staging_token_cap(self) -> int:
         """Max tokens the layerwise GPU staging pool must cover per transfer."""
@@ -6714,9 +6759,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     view.copy_(tensor.view(-1)[:size], non_blocking=True)
                 views.append(view)
                 offset += size
-            pointers = self._dva_to_int64_tensor(
-                [view.data_ptr() for view in views],
-                device=staging.device,
+            raw_ptrs = [view.data_ptr() for view in views]
+            _dva_fn = getattr(
+                self, "_dva_to_int64_tensor", None
+            ) or globals().get("ptrs_to_int64_tensor")
+            pointers = (
+                _dva_fn(raw_ptrs, device=staging.device)
+                if _dva_fn is not None
+                else torch.tensor(
+                    raw_ptrs, dtype=torch.long, device=staging.device
+                )
             )
             staging.record_stream(stream)
         return views, pointers
@@ -8964,10 +9016,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for stream in pending_streams:
                         stream.synchronize()
                 except BaseException:
+                    _lsm_fn = globals().get("_layer_source_memory_objs")
                     pending_owners = [
                         obj
                         for lid, layer_objs in enumerate(memory_objs)
-                        for obj in _layer_source_memory_objs(layer_objs, lid)
+                        for obj in (
+                            _lsm_fn(layer_objs, lid)
+                            if _lsm_fn is not None
+                            else layer_objs
+                        )
                     ]
                     if tmp_gpu_buffer_obj is not None:
                         pending_owners.append(tmp_gpu_buffer_obj)

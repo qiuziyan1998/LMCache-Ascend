@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
+import numpy as np
 import torch
 
 
@@ -577,19 +578,86 @@ def plan_bundle_copies(slots, chunk_sizes, bundle_tokens) -> DmaPlan:
     )
 
 
-def _ptrs_to_int64_tensor(ptrs) -> torch.Tensor:
+def _ptrs_to_int64_tensor(
+    ptrs: Any, device: Any = None, *, pin_memory: bool = False
+) -> torch.Tensor:
+    """Convert 1D/2D uint64/int64 pointer sequences into a torch.int64 tensor."""
     if isinstance(ptrs, torch.Tensor):
-        return (
+        out = (
             ptrs.view(torch.int64)
             if ptrs.dtype == torch.uint64
             else ptrs.to(dtype=torch.long)
         )
+        if device is not None:
+            out = out.to(device=device)
+        return (
+            out.pin_memory()
+            if pin_memory and out.device.type == "cpu"
+            else out
+        )
+    if isinstance(ptrs, np.ndarray):
+        if not pin_memory and ptrs.dtype in (np.uint64, np.int64):
+            cpu_tensor = torch.from_numpy(
+                np.ascontiguousarray(ptrs).view(np.int64)
+            ).clone()
+            return (
+                cpu_tensor.to(device=device)
+                if device is not None
+                else cpu_tensor
+            )
+        rows: Any = ptrs.tolist()
+    elif isinstance(ptrs, (list, tuple)):
+        rows = ptrs
+    else:
+        rows = list(ptrs)
+    is_2d = bool(rows) and isinstance(rows[0], (list, tuple))
+    if not pin_memory:
+        try:
+            non_neg = (
+                all(
+                    isinstance(r, (list, tuple)) and min(r, default=0) >= 0
+                    for r in rows
+                )
+                if is_2d
+                else min(rows, default=0) >= 0
+            )
+        except TypeError:
+            non_neg = False
+        if non_neg:
+            try:
+                arr = np.array(rows, dtype=np.uint64, copy=True, order="C")
+            except (OverflowError, TypeError, ValueError):
+                arr = None
+            if arr is not None:
+                cpu_tensor = torch.from_numpy(arr.view(np.int64))
+                return (
+                    cpu_tensor.to(device=device)
+                    if device is not None
+                    else cpu_tensor
+                )
     sign_bit = 1 << 63
     mod_64 = 1 << 64
-    vals = [int(v) for v in ptrs]
-    if any(v >= sign_bit for v in vals):
-        vals = [v - mod_64 if v >= sign_bit else v for v in vals]
-    return torch.tensor(vals, dtype=torch.long)
+    if is_2d:
+        if any(int(v) >= sign_bit for r in rows for v in r):
+            rows = [
+                [int(v) - mod_64 if int(v) >= sign_bit else int(v) for v in r]
+                for r in rows
+            ]
+    elif any(int(v) >= sign_bit for v in rows):
+        rows = [int(v) - mod_64 if int(v) >= sign_bit else int(v) for v in rows]
+    if device is not None:
+        out = torch.tensor(rows, dtype=torch.long, device=device)
+        return (
+            out.pin_memory()
+            if pin_memory and out.device.type == "cpu"
+            else out
+        )
+    if pin_memory:
+        return torch.tensor(rows, dtype=torch.long, pin_memory=True)
+    return torch.tensor(rows, dtype=torch.long)
+
+
+ptrs_to_int64_tensor = _ptrs_to_int64_tensor
 
 
 def bind_copy_addresses(

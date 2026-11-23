@@ -1027,6 +1027,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     # the request-matched forward-context handoff is adopted.
                     # Only _finish_save_batch owns that final causal boundary.
                     direct_final = direct_final and finish_batch
+                pre_hashes = getattr(request, "prefill_chunk_hashes", None)
+                pre_offsets = getattr(request, "prefill_chunk_offsets", None)
                 self.lmcache_engine.store_direct_prefill(
                     request.req_id,
                     request.token_ids,
@@ -1042,11 +1044,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
                     source_ready_events=source_ready_events,
-                    prefill_chunk_hashes=getattr(
-                        request, "prefill_chunk_hashes", None
-                    ),
-                    prefill_chunk_offsets=getattr(
-                        request, "prefill_chunk_offsets", None
+                    **(
+                        {
+                            "prefill_chunk_hashes": pre_hashes,
+                            "prefill_chunk_offsets": pre_offsets,
+                        }
+                        if pre_hashes and pre_offsets
+                        else {}
                     ),
                     prefix_slot_mappings=(
                         {
@@ -1355,12 +1359,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         sync_fb = getattr(self, "_sync_recompute_fallback_from_engine", None)
         if callable(sync_fb):
             sync_fb()
+        is_fb = getattr(self, "_is_fallback_req_id", None)
         metadata = self._parent._get_connector_metadata()
-        fallback_req_ids = {
-            request.req_id
-            for request in metadata.requests
-            if self._is_fallback_req_id(request.req_id)
-        }
+        fallback_req_ids = (
+            {
+                request.req_id
+                for request in metadata.requests
+                if is_fb(request.req_id)
+            }
+            if callable(is_fb)
+            else set()
+        )
         active_requests = tuple(
             request
             for request in metadata.requests
@@ -1405,11 +1414,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if pending is None:
             pending = self._layerwise_local_store_results = {}
         pending.update(completed)
-        fallback_req_ids.update(
-            req_id
-            for (req_id, _) in completed
-            if self._is_fallback_req_id(req_id)
-        )
+        if callable(is_fb):
+            fallback_req_ids.update(
+                req_id for (req_id, _) in completed if is_fb(req_id)
+            )
         if fallback_req_ids:
             fb_tuple = tuple(sorted(fallback_req_ids))
             poll_puts = getattr(
@@ -1436,7 +1444,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                 and hasattr(entry[1], "release")
                             ):
                                 entry[1].release()
-            self._cleanup_fallback_direct_requests(fb_tuple)
+            cleanup_fb = getattr(
+                self, "_cleanup_fallback_direct_requests", None
+            )
+            if callable(cleanup_fb):
+                cleanup_fb(fb_tuple)
             if callable(rel_pages):
                 for fb_id in fb_tuple:
                     rel_pages(fb_id)
@@ -1450,17 +1462,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 result = pending.pop((request.req_id, group), None)
                 if result is not None:
                     self.lmcache_engine.adopt_completed_layerwise_store(result)
+            pre_hashes = getattr(request, "prefill_chunk_hashes", None)
+            pre_offsets = getattr(request, "prefill_chunk_offsets", None)
             self.lmcache_engine.finish_layerwise_prefill_store(
                 request.req_id,
                 request.request_configs,
                 required_store_end=len(request.token_ids),
                 persistence_fenced=True,
                 tokens=request.token_ids,
-                prefill_chunk_hashes=getattr(
-                    request, "prefill_chunk_hashes", None
-                ),
-                prefill_chunk_offsets=getattr(
-                    request, "prefill_chunk_offsets", None
+                **(
+                    {
+                        "prefill_chunk_hashes": pre_hashes,
+                        "prefill_chunk_offsets": pre_offsets,
+                    }
+                    if pre_hashes and pre_offsets
+                    else {}
                 ),
             )
 
@@ -1659,6 +1675,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                                 request, self._direct_group_caches()
                             )
                         )
+                        pre_hashes = getattr(
+                            request, "prefill_chunk_hashes", None
+                        )
+                        pre_offsets = getattr(
+                            request, "prefill_chunk_offsets", None
+                        )
                         self.lmcache_engine.store_direct_prefill(
                             request.req_id,
                             request.token_ids,
@@ -1668,11 +1690,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                             final=True,
                             slot_mapping_base=mapping_base,
                             accepted_store_end=len(request.token_ids),
-                            prefill_chunk_hashes=getattr(
-                                request, "prefill_chunk_hashes", None
-                            ),
-                            prefill_chunk_offsets=getattr(
-                                request, "prefill_chunk_offsets", None
+                            **(
+                                {
+                                    "prefill_chunk_hashes": pre_hashes,
+                                    "prefill_chunk_offsets": pre_offsets,
+                                }
+                                if pre_hashes and pre_offsets
+                                else {}
                             ),
                         )
                     except Exception as error:

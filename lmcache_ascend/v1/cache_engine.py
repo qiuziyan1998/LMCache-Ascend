@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 from urllib.parse import urlsplit
 from weakref import WeakSet, proxy
-import os
+import os  # noqa: F401
 import queue
 import secrets
 import threading
@@ -59,7 +59,9 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.prefill_metadata import PrefillMetadataPlan
 try:
-    from lmcache.v1.prefill_metadata import split_layers_cached
+    from lmcache.v1.prefill_metadata import (
+        split_layers_cached,  # noqa: F401
+    )
 except ImportError:
     split_layers_cached = None  # type: ignore[assignment]
 from lmcache.v1.remote_fill import (
@@ -340,9 +342,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             else None
         )
         self._require_store_completion = False
+        _os = globals().get("os")
         self._force_layerwise_prefill_store = bool(
-            self.config.use_layerwise
-            and os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            getattr(self.config, "use_layerwise", False)
+            and _os is not None
+            and _os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip()
             .lower() == "true"
         )
@@ -1087,6 +1091,26 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._remote_fill_validate_page_pairs(result)
         return result
 
+    def _try_precomputed_token_plan(
+        self,
+        tokens: Sequence[int],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        precomputed_kwargs: Optional[dict[str, Any]],
+    ) -> Optional[Iterable[tuple[int, int, CacheEngineKey]]]:
+        """Try building a chunk plan from validated scheduler hashes, if present."""
+        if not (
+            precomputed_kwargs
+            and precomputed_kwargs.get("prefill_chunk_hashes")
+            and precomputed_kwargs.get("prefill_chunk_offsets")
+        ):
+            return None
+        pre_fn = getattr(self, "_process_tokens_with_precomputed_hashes", None)
+        if not callable(pre_fn):
+            return None
+        return pre_fn(tokens, mask, request_configs, kv_group, precomputed_kwargs)
+
     def _remote_fill_prefix_plans(
         self,
         tokens: Sequence[int],
@@ -1099,22 +1123,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Rebuild canonical keys when a full hit has no suffix plan."""
 
         prefix_tokens = tokens[:prefix_end]
-        pre_fn = getattr(self, "_process_tokens_with_precomputed_hashes", None)
-        raw_latent = (
-            pre_fn(
-                prefix_tokens,
-                None,
-                request_configs,
-                0,
-                {
-                    "prefill_chunk_hashes": prefill_chunk_hashes,
-                    "prefill_chunk_offsets": prefill_chunk_offsets,
-                },
-            )
-            if callable(pre_fn)
-            and prefill_chunk_hashes
-            and prefill_chunk_offsets
-            else None
+        raw_latent = self._try_precomputed_token_plan(
+            prefix_tokens,
+            None,
+            request_configs,
+            0,
+            {
+                "prefill_chunk_hashes": prefill_chunk_hashes,
+                "prefill_chunk_offsets": prefill_chunk_offsets,
+            },
         )
         latent = list(
             raw_latent
@@ -1421,25 +1438,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         if base == full_end:
             plan0 = []
         else:
-            pre_fn = getattr(
-                self, "_process_tokens_with_precomputed_hashes", None
-            )
-            pre_iter = (
-                pre_fn(
-                    full_tokens,
-                    None,
-                    request_configs,
-                    0,
-                    {
-                        "prefill_chunk_hashes": state.prefill_chunk_hashes,
-                        "prefill_chunk_offsets": state.prefill_chunk_offsets,
-                        "_prefill_skip_tokens": base,
-                    },
-                )
-                if callable(pre_fn)
-                and state.prefill_chunk_hashes
-                and state.prefill_chunk_offsets
-                else None
+            pre_iter = self._try_precomputed_token_plan(
+                full_tokens,
+                None,
+                request_configs,
+                0,
+                {
+                    "prefill_chunk_hashes": state.prefill_chunk_hashes,
+                    "prefill_chunk_offsets": state.prefill_chunk_offsets,
+                    "_prefill_skip_tokens": base,
+                },
             )
             if pre_iter is not None:
                 plan0 = list(pre_iter)
@@ -1828,30 +1836,21 @@ class AscendLMCacheEngine(LMCacheEngine):
         if remote is None:
             raise RuntimeError("Layerwise prefill handoff requires RemoteBackend")
         page_format = mooncake_layer_pages_enabled(self.config)
-        pre_fn = getattr(
-            self, "_process_tokens_with_precomputed_hashes", None
-        )
         for group in (0, 1):
             committed = state.committed_end.get(group, 0)
             if committed >= required_end:
                 continue
             token_slice = tokens[:required_end]
-            raw_iter: Optional[Iterable[tuple[int, int, Any]]] = None
-            if (
-                callable(pre_fn)
-                and prefill_chunk_hashes
-                and prefill_chunk_offsets
-            ):
-                raw_iter = pre_fn(
-                    token_slice,
-                    None,
-                    request_configs,
-                    group,
-                    {
-                        "prefill_chunk_hashes": prefill_chunk_hashes,
-                        "prefill_chunk_offsets": prefill_chunk_offsets,
-                    },
-                )
+            raw_iter = self._try_precomputed_token_plan(
+                token_slice,
+                None,
+                request_configs,
+                group,
+                {
+                    "prefill_chunk_hashes": prefill_chunk_hashes,
+                    "prefill_chunk_offsets": prefill_chunk_offsets,
+                },
+            )
             if raw_iter is None:
                 raw_iter = self.token_database.process_tokens(
                     tokens=token_slice,  # type: ignore[arg-type]
@@ -2564,23 +2563,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             }
         if not group_caches:
             return True
-        pre_fn = getattr(self, "_process_tokens_with_precomputed_hashes", None)
-        pre_tail = (
-            pre_fn(
-                tokens,
-                None,
-                request_configs,
-                0,
-                {
-                    "prefill_chunk_hashes": state.prefill_chunk_hashes,
-                    "prefill_chunk_offsets": state.prefill_chunk_offsets,
-                    "_prefill_skip_tokens": start,
-                },
-            )
-            if callable(pre_fn)
-            and state.prefill_chunk_hashes
-            and state.prefill_chunk_offsets
-            else None
+        pre_tail = self._try_precomputed_token_plan(
+            tokens,
+            None,
+            request_configs,
+            0,
+            {
+                "prefill_chunk_hashes": state.prefill_chunk_hashes,
+                "prefill_chunk_offsets": state.prefill_chunk_offsets,
+                "_prefill_skip_tokens": start,
+            },
         )
         plan0 = list(
             pre_tail
@@ -5229,10 +5221,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         starts: List[int] = []
         ends: List[int] = []
         chunk_keys: List[List[CacheEngineKey]] = []
-        try:
-            _split_fn = split_layers_cached
-        except NameError:
-            _split_fn = None
+        _split_fn = globals().get("split_layers_cached")
         for start, end, key in self.token_database.process_tokens_from_prefix(
             tokens,
             prefix_token_count=expected_start,
@@ -5832,10 +5821,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 and isinstance(preflight_state, dict)
                 else None
             )
-            try:
-                _split_fn = split_layers_cached
-            except NameError:
-                _split_fn = None
+            _split_fn = globals().get("split_layers_cached")
             for candidate_index, (start, end, key) in enumerate(token_results):
                 assert isinstance(key, CacheEngineKey)
                 if new_chunk_plan is not None:
@@ -6496,10 +6482,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         candidates = (
             metadata_plan.candidates if metadata_plan is not None else token_plan
         )
-        try:
-            _split_fn = split_layers_cached
-        except NameError:
-            _split_fn = None
+        _split_fn = globals().get("split_layers_cached")
         for candidate_index, (start, end, key) in enumerate(candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
@@ -7297,10 +7280,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         "hashes": [entry[2] for entry in chunks],
                         "offsets": [end - start for start, end, _ in chunks],
                     }
-                try:
-                    _split_fn = split_layers_cached
-                except NameError:
-                    _split_fn = None
+                _split_fn = globals().get("split_layers_cached")
                 for start, end, key in self.token_database.process_tokens(
                     **token_args,
                     request_configs=request_configs,
@@ -10499,20 +10479,28 @@ class AscendLMCacheEngine(LMCacheEngine):
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
 
-        if self._force_layerwise_prefill_store and not (
-            getattr(self, "_retain_unfenced_external_dma", False)
-            or getattr(self, "_unsafe_layerwise_retrieve_sources", None)
-            or getattr(
-                getattr(self, "gpu_connector", None),
-                "_layerwise_prefill_unfenced_stores",
-                None,
+        _quarantine_check = getattr(
+            LMCacheEngine, "_has_unfenced_dma_quarantine", None
+        )
+        has_quarantine = (
+            _quarantine_check(self)
+            if callable(_quarantine_check)
+            else bool(
+                getattr(self, "_retain_unfenced_external_dma", False)
+                or getattr(self, "_unsafe_layerwise_retrieve_sources", None)
+                or getattr(
+                    getattr(self, "gpu_connector", None),
+                    "_layerwise_prefill_unfenced_stores",
+                    None,
+                )
+                or getattr(
+                    getattr(self, "gpu_connector", None),
+                    "_layerwise_prefill_unfenced_loads",
+                    None,
+                )
             )
-            or getattr(
-                getattr(self, "gpu_connector", None),
-                "_layerwise_prefill_unfenced_loads",
-                None,
-            )
-        ):
+        )
+        if self._force_layerwise_prefill_store and not has_quarantine:
             for req_id in tuple(self._layerwise_prefill_page_owners):
                 self.release_layerwise_prefill_pages(req_id)
         super().close()
