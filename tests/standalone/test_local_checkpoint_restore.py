@@ -221,6 +221,7 @@ def test_mixed_indexer_only_loads_original_prefix_from_mooncake_and_tail_from_cp
         ("cpu_tail", 7, [False] * 4 + [True] * 7),
     ]
     assert result[0].all() and p["token_mask"].all() and p["token_count"] == 11
+    assert len(result) == 2
     assert result[1] == "completed-cpu-fence"
 
 

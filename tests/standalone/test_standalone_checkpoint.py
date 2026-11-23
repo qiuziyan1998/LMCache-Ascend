@@ -21,6 +21,9 @@ from test_preemption_checkpoint import api as checkpoint_api
 api = checkpoint_api
 deployment = checkpoint_deployment
 ROOT = Path(__file__).resolve().parents[2]
+LMCACHE_ROOT = ROOT.parent / "LMCache"
+if not LMCACHE_ROOT.is_dir():
+    LMCACHE_ROOT = ROOT.parent / "LMCache-NPU"
 
 
 @pytest.mark.parametrize("ready", [True, False])
@@ -67,9 +70,15 @@ def test_standalone_indexer_waits_for_normalization_then_loads_both_prompt_and_t
 @pytest.mark.parametrize(
     "mode", ["p2p_preferred", "persistent_serial", "persistent_parallel_prefetch"]
 )
-def test_standalone_actual_indexer_loader_preserves_full_mask_and_device_fence(mode):
+@pytest.mark.parametrize("pd_role", [None, "receiver"])
+@pytest.mark.parametrize("prefix_end", [0, 7])
+def test_actual_indexer_loader_preserves_full_mask_and_device_fence(mode, pd_role, prefix_end):
     """Run both adapter implementations; mock only transfer/state collaborators."""
     calls, p = [], plan()
+    p["request"].load_spec.checkpoint_prefix_end = prefix_end
+    prefix_rows = prefix_end // 4 * 4 if pd_role == "receiver" else 0
+    tail_mask = torch.ones(11, dtype=torch.bool)
+    tail_mask[:prefix_rows] = False
     p["planned_at"] = 0
     ready, waiting = Future(), Event()
     objects, tensors = [], []
@@ -80,7 +89,7 @@ def test_standalone_actual_indexer_loader_preserves_full_mask_and_device_fence(m
         clear_group=lambda group: objects.clear(),
     )
     base = implementation(
-        "../LMCache-NPU/lmcache/integration/vllm/vllm_v1_adapter.py",
+        LMCACHE_ROOT / "lmcache/integration/vllm/vllm_v1_adapter.py",
         "LMCacheConnectorV1Impl",
         {"_run_dsa_cold_indexer_load"},
         object,
@@ -96,7 +105,7 @@ def test_standalone_actual_indexer_loader_preserves_full_mask_and_device_fence(m
 
     def retrieve(tokens, mask, **kw):
         assert p["latent_shared_ready"].done()
-        assert tokens == list(range(11)) and mask.all()
+        assert tokens == list(range(11)) and torch.equal(mask, tail_mask)
         assert kw["kv_group"] == 1
         assert torch.equal(kw["slot_mapping"], p["indexer_slots_cpu"])
         calls.append("retrieve")
@@ -112,12 +121,15 @@ def test_standalone_actual_indexer_loader_preserves_full_mask_and_device_fence(m
         event.result(timeout=5)
 
     obj = cls()
-    obj.config = NS(pd_role=None, dsa_group1_load_mode=mode)
+    obj._lmcache_chunk_size = 4
+    obj.config = NS(pd_role=pd_role, dsa_group1_load_mode=mode)
     obj.lmcache_engine = NS(
         gpu_connector=NS(stage_dense_load_tensor=lambda tensor, **kw: tensor),
         supports_dense_sparse_cache_retention=lambda: True,
         retrieve_layer=retrieve,
         prefetch_shared_layer_pages=lambda *a, **kw: calls.append("prefetch"),
+        load_group1_pages_direct=lambda tokens, *a: calls.append(("prefix", len(tokens))),
+        finish_checkpoint_prefix=lambda request, ready: ready,
     )
     obj._dense_load_source_owners = lambda state: ()
     obj._release_dense_load_source_owners = lambda *a, **kw: None
@@ -130,12 +142,16 @@ def test_standalone_actual_indexer_loader_preserves_full_mask_and_device_fence(m
         finally:
             ready.set_result(None)
         result = job.result(3)
+    assert len(result) == 2
     assert result[0] is p["token_mask"] and result[1] is ready
-    assert calls == (
+    expected_calls = (
         ["prefetch", "retrieve"]
         if mode == "persistent_parallel_prefetch"
         else ["retrieve"]
     )
+    if prefix_rows:
+        expected_calls.insert(0, ("prefix", prefix_rows))
+    assert calls == expected_calls
 
 
 @pytest.mark.parametrize("evict", [False, True])
@@ -179,7 +195,7 @@ def test_paired_lookup_activation_does_not_enable_remote_fill(
     role, checkpoint, remote, expected
 ):
     cls = implementation(
-        "../LMCache-NPU/lmcache/v1/cache_engine.py",
+        LMCACHE_ROOT / "lmcache/v1/cache_engine.py",
         "LMCacheEngine",
         {"_remote_fill_pair_lookup_enabled"},
         object,
