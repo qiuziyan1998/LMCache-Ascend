@@ -1834,6 +1834,37 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # Retain the Python objects too, including C8 pointer/slot tensors.
         entry["resources"].append(resources)
 
+    def detach_layerwise_prefill_dma_cache(
+        self, req_id: str
+    ) -> Optional[Any]:
+        """Detach per-request prefill DMA state under a unique retiring key."""
+        if not req_id:
+            return None
+        getattr(self, "_prefill_dma_bound_loads", {}).pop(req_id, None)
+        getattr(self, "_prefill_dma_plan_cache", {}).pop(req_id, None)
+        getattr(self, "_prefill_dma_source_cache", {}).pop(req_id, None)
+        seq = getattr(self, "_detached_prefill_dma_seq", 0) + 1
+        self._detached_prefill_dma_seq = seq
+        detached_key = f"{req_id}#detached#{seq}"
+        moved = False
+        for attr in (
+            "_layerwise_prefill_unfenced_loads",
+            "_layerwise_prefill_unfenced_stores",
+            "_layerwise_prefill_async_store_events",
+            "_layerwise_prefill_load_request_events",
+            "_layerwise_prefill_load_owners",
+        ):
+            mapping = getattr(self, attr, None)
+            if isinstance(mapping, dict) and req_id in mapping:
+                mapping[detached_key] = mapping.pop(req_id)
+                moved = True
+        if not moved:
+            return None
+        cls_rel = getattr(type(self), "release_layerwise_prefill_dma_cache", None)
+        if callable(cls_rel):
+            return lambda: cls_rel(self, detached_key)
+        return lambda: self.release_layerwise_prefill_dma_cache(detached_key)
+
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
         unfenced = getattr(self, "_layerwise_prefill_unfenced_loads", None)

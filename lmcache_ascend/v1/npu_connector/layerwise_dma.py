@@ -637,14 +637,18 @@ def _ptrs_to_int64_tensor(
                 )
     sign_bit = 1 << 63
     mod_64 = 1 << 64
+
+    def _conv_i64(val: Any) -> int:
+        iv = int(val)
+        if iv >= mod_64 or iv < -sign_bit:
+            raise OverflowError("Pointer value out of 64-bit integer range")
+        return iv - mod_64 if iv >= sign_bit else iv
+
     if is_2d:
-        if any(int(v) >= sign_bit for r in rows for v in r):
-            rows = [
-                [int(v) - mod_64 if int(v) >= sign_bit else int(v) for v in r]
-                for r in rows
-            ]
-    elif any(int(v) >= sign_bit for v in rows):
-        rows = [int(v) - mod_64 if int(v) >= sign_bit else int(v) for v in rows]
+        if any(int(v) >= sign_bit or int(v) < -sign_bit for r in rows for v in r):
+            rows = [[_conv_i64(v) for v in r] for r in rows]
+    elif any(int(v) >= sign_bit or int(v) < -sign_bit for v in rows):
+        rows = [_conv_i64(v) for v in rows]
     if device is not None:
         out = torch.tensor(rows, dtype=torch.long, device=device)
         return (

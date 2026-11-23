@@ -1628,6 +1628,11 @@ class TestAscendSharedPrefillOptimizations(unittest.TestCase):
             rn_t = ptrs_to_int64_tensor(np_u64, pin_memory=True)
             rcpu = ptrs_to_int64_tensor(t_u64, device="cpu", pin_memory=True)
             rcpu_l = ptrs_to_int64_tensor(u64_1d, device="cpu", pin_memory=True)
+            for bad in ([1 << 64], [-(1 << 63) - 1]):
+                with self.assertRaises(OverflowError):
+                    ptrs_to_int64_tensor(bad, pin_memory=False)
+                with self.assertRaises(OverflowError):
+                    ptrs_to_int64_tensor(bad, pin_memory=True)
         eq(rn_t.view(torch.uint64).tolist(), u64_1d)
         eq(rcpu.view(torch.uint64).tolist(), u64_1d)
         eq(rcpu_l.view(torch.uint64).tolist(), u64_1d)
@@ -1841,14 +1846,14 @@ class TestAscendSharedPrefillOptimizations(unittest.TestCase):
             is_last_prefill=True,
             is_sparse_decode=False,
             prefill_chunk_hashes=["h0"],
-            prefill_chunk_offsets=[0],
+            prefill_chunk_offsets=[4],
         )
         impl._submit_direct_prefill_requests([req_none, req_with])
         self.assertEqual(len(calls), 2)
         self.assertNotIn("prefill_chunk_hashes", calls[0][1])
         self.assertNotIn("prefill_chunk_offsets", calls[0][1])
         self.assertEqual(calls[1][1]["prefill_chunk_hashes"], ["h0"])
-        self.assertEqual(calls[1][1]["prefill_chunk_offsets"], [0])
+        self.assertEqual(calls[1][1]["prefill_chunk_offsets"], [4])
 
         req_fin_none = _N(
             req_id="r-fin-none",
@@ -1876,6 +1881,56 @@ class TestAscendSharedPrefillOptimizations(unittest.TestCase):
         self.assertNotIn("prefill_chunk_offsets", by_id["r-fin-none"])
         self.assertEqual(by_id["r-fin-with"]["prefill_chunk_hashes"], ["h1"])
         self.assertEqual(by_id["r-fin-with"]["prefill_chunk_offsets"], [2])
+
+    def test_detach_layerwise_prefill_dma_cache_quarantine_and_reuse(
+        self,
+    ) -> None:
+        conn: Any = VLLMPagedMemLayerwiseNPUConnector.__new__(
+            VLLMPagedMemLayerwiseNPUConnector
+        )
+        sync_cnt = [0]
+
+        def _mk_owner() -> Any:
+            own: Any = _N(ref_count=1)
+            own.is_valid = lambda: own.ref_count > 0
+            own.ref_count_down = lambda: setattr(own, "ref_count", own.ref_count - 1)
+            return own
+
+        own_0, own_1 = _mk_owner(), _mk_owner()
+        ev_0: Any = _N(synchronize=lambda: sync_cnt.__setitem__(0, sync_cnt[0] + 1))
+        conn._prefill_dma_bound_loads = {"req_1": ("bound_0",)}
+        conn._prefill_dma_plan_cache = {"req_1": ("plan_0",)}
+        conn._prefill_dma_source_cache = {"req_1": ("src_0",)}
+        conn._layerwise_prefill_unfenced_loads = {}
+        conn._layerwise_prefill_unfenced_stores = {"req_1": ("q_store_0",)}
+        conn._layerwise_prefill_async_store_events = {}
+        conn._layerwise_prefill_load_request_events = {"req_1": [ev_0]}
+        conn._layerwise_prefill_load_owners = {"req_1": {"l0": own_0}}
+        conn.wait_for_layerwise_prefill_stores = (  # type: ignore[method-assign]
+            lambda *_a: None
+        )
+
+        cb = conn.detach_layerwise_prefill_dma_cache("req_1")
+        assert callable(cb)
+        self.assertIsNone(conn.detach_layerwise_prefill_dma_cache("missing"))
+        self.assertNotIn("req_1", conn._prefill_dma_bound_loads)
+        self.assertNotIn("req_1", conn._prefill_dma_plan_cache)
+        self.assertNotIn("req_1", conn._prefill_dma_source_cache)
+        self.assertNotIn("req_1", conn._layerwise_prefill_load_owners)
+        dkeys = [
+            k for k in conn._layerwise_prefill_unfenced_stores if "#detached#" in k
+        ]
+        self.assertEqual(len(dkeys), 1)
+        self.assertEqual((sync_cnt[0], own_0.ref_count), (0, 1))
+
+        # Re-register reused req_1 before detached callback runs.
+        conn._prefill_dma_bound_loads["req_1"] = ("bound_1",)
+        conn._layerwise_prefill_load_owners["req_1"] = {"l0": own_1}
+        conn._layerwise_prefill_unfenced_stores.pop(dkeys[0], None)
+        cb()
+        self.assertEqual((sync_cnt[0], own_0.ref_count, own_1.ref_count), (1, 0, 1))
+        self.assertEqual(conn._prefill_dma_bound_loads["req_1"], ("bound_1",))
+        self.assertIs(conn._layerwise_prefill_load_owners["req_1"]["l0"], own_1)
 
 
 if __name__ == "__main__":
