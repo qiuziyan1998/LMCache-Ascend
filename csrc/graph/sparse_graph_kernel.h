@@ -11,5 +11,5 @@ void launch_sparse_graph_transfer(
     uint8_t *counts, uint8_t *ptrs, uint8_t *limits,
     int32_t chunk_size, int32_t chunks_per_request, int32_t requests,
     int32_t row_width, int32_t count_stride, int32_t k_bytes,
-    int32_t pe_bytes, int64_t destination_slots);
+    int32_t pe_bytes, int64_t destination_slots, int32_t pieces = 1);
 } // namespace lmc

@@ -338,8 +338,14 @@ def sparse_graph_kv_transfer(
     chunk_size: int,
     *,
     max_aiv_cores: int = 0,
+    pieces: int = 1,
 ) -> None:
-    """Capture one two-plane copy; all request-dependent data stays on device."""
+    """Capture a two-plane copy; all request-dependent data stays on device."""
+    if pieces != 1:
+        lmc_ops.sparse_graph_kv_transfer(
+            destination_state, slots, selected, counts, ptrs, limits, chunk_size, max_aiv_cores, pieces
+        )
+        return
     if max_aiv_cores:
         lmc_ops.sparse_graph_kv_transfer(
             destination_state, slots, selected, counts, ptrs, limits, chunk_size, max_aiv_cores

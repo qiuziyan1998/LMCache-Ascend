@@ -754,7 +754,8 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
 void sparse_graph_kv_transfer(
     const SparseDirectDestinationState &state,
     torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
-    torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size, int64_t max_aiv_cores) {
+    torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size, int64_t max_aiv_cores,
+    int64_t pieces) {
   // Host metadata checks run at eager warmup/capture only, never on replay.
   TORCH_CHECK(selected.dim() == 2 && selected.is_contiguous(),
               "Graph selected tokens must be a contiguous matrix");
@@ -768,6 +769,8 @@ void sparse_graph_kv_transfer(
   TORCH_CHECK(requests > 0 && selected.size(1) > 0 &&
                   selected.numel() <= std::numeric_limits<int32_t>::max(),
               "Graph payload exceeds int32 packed addressing");
+  TORCH_CHECK(pieces >= 1 && pieces <= selected.numel(),
+              "Prefetch pieces must be in [1, packed token capacity]");
   TORCH_CHECK((counts.dim() == 1 || (counts.dim() == 2 && counts.size(1) > 0)) &&
                   counts.size(0) == requests && counts.scalar_type() == at::kInt &&
                   counts.stride(0) > 0 && counts.stride(0) <= std::numeric_limits<int32_t>::max(),
@@ -824,7 +827,8 @@ void sparse_graph_kv_transfer(
         slot_ptr, selected_ptr, counts_ptr, ptr_table, limit_ptr,
         static_cast<int32_t>(chunk_size), chunks_per_request,
         static_cast<int32_t>(requests), row_width, count_stride,
-        static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots);
+        static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots,
+        static_cast<int32_t>(pieces));
     return 0;
   });
   cmd.Run();

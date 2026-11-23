@@ -17,6 +17,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("index", [torch.int32, torch.int64])
+@pytest.mark.parametrize("slot", [torch.int32, torch.int64])
+def test_prefetch_pieces_replay_registered_history(index, slot):
+    test_one_capture_replays_live_topk_and_growing_cpu_history(
+        16, (torch.bfloat16, index, slot, True), True, True, pieces=16
+    )
+
+
 @pytest.mark.parametrize("tail", [13, 1024])
 def test_prepared_pairs_multilayer_strided_bind(tail):
     """Real NPU table arithmetic/copies at 1M capacity, without reading KV payload."""
@@ -70,7 +78,7 @@ def test_prepared_pairs_multilayer_strided_bind(tail):
     ],
 )
 def test_one_capture_replays_live_topk_and_growing_cpu_history(
-    request_capacity, payload, incremental, prepared_pairs
+    request_capacity, payload, incremental, prepared_pairs, pieces=1
 ):
     from lmcache.v1.gpu_connector.sparse import (
         PreparedSparseSource,
@@ -166,12 +174,27 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
         transfer = SparseGraphTransfer(
             caches, slots, chunk_size, 1024, request_capacity=request_capacity
         )
-        transfer.load(torch.topk(scores, 4).indices.to(selected_dtype), counts, slots)
+        side = torch.npu.Stream() if pieces > 1 else None
+        fork, done = torch.npu.Event(), torch.npu.Event()
+
+        def load(selected):
+            if side is None:
+                transfer.load(selected, counts, slots)
+                return
+            main = torch.npu.current_stream()
+            fork.record(main)
+            with torch.npu.stream(side):
+                side.wait_event(fork)
+                transfer.load(selected, counts, slots, max_aiv_cores=12, pieces=pieces)
+                done.record(side)
+            main.wait_event(done)
+
+        load(torch.topk(scores, 4).indices.to(selected_dtype))
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             selected = torch.topk(scores, 4).indices.to(selected_dtype)
-            transfer.load(selected, counts, slots)
+            load(selected)
         addresses = (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
         previous = None
         lane_cases = [cases[0]] * request_capacity
@@ -202,6 +225,9 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
                     scores[lane, token] = 10 - rank
             for cache in caches:
                 cache.fill_(-7)
+            if pieces > 1:
+                live = [(step + row) % 5 for row in range(request_capacity)]
+                count_storage[:, 0].copy_(torch.tensor(live, dtype=torch.int32, device=device))
             graph.replay()
             torch.npu.synchronize()
             assert selected.cpu().tolist() == [case[1] for case in lane_cases]
@@ -213,6 +239,7 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
                         value = (
                             -7
                             if sources[lane] is None
+                            or (pieces > 1 and column >= live[lane])
                             or token >= sources[lane].total_tokens
                             else offset + token + plane * 100
                         )
@@ -225,6 +252,7 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
             )
         # Direct native execution also checks negative/huge selections and both
         # negative/too-large destination slots without accessing invalid memory.
+        count_storage[:, 0].fill_(4)
         transfer.bind_batch([cases[3][0]] * request_capacity, 0)
         invalid = torch.tensor(
             [[0, 12, 13, -1]] * request_capacity, dtype=selected_dtype, device=device

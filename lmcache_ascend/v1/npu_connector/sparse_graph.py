@@ -228,8 +228,9 @@ class SparseGraphTransfer:
         slots: torch.Tensor,
         *,
         max_aiv_cores: int = 0,
+        pieces: int = 1,
     ) -> None:
-        """Capture device top-k -> one K/PE copy, without payload preprocessing."""
+        """Capture device top-k to K/PE copies without preprocessing the payload."""
         if (
             selected.shape[0] != self.request_capacity
             or slots.shape != selected.shape
@@ -245,6 +246,7 @@ class SparseGraphTransfer:
             self.valid_tokens,
             self.chunk_size,
             **({"max_aiv_cores": max_aiv_cores} if max_aiv_cores else {}),
+            **({"pieces": pieces} if pieces != 1 else {}),
         )
 
     def clear_source(self) -> None:

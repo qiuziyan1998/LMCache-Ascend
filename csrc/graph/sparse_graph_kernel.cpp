@@ -5,12 +5,13 @@
 namespace {
 template <typename Index, typename Slot> class SparseGraphCopy {
 public:
+  template <bool Sharded>
   __aicore__ inline void Run(
       GM_ADDR k, GM_ADDR pe, GM_ADDR slots, GM_ADDR selected, GM_ADDR counts,
       GM_ADDR ptrs, GM_ADDR limits, int32_t chunk_size,
       int32_t chunks_per_request, int32_t requests, int32_t row_width,
       int32_t count_stride, int32_t k_bytes, int32_t pe_bytes,
-      int64_t destination_slots) {
+      int64_t destination_slots, int32_t piece = 0, int32_t pieces = 1) {
     auto count = reinterpret_cast<__gm__ int32_t *>(counts);
     auto limit = reinterpret_cast<__gm__ int32_t *>(limits);
     auto index = reinterpret_cast<__gm__ Index *>(selected);
@@ -23,9 +24,18 @@ public:
     // Balance actual packed tokens, not the (usually mostly padded) capacity.
     const int32_t cores = AscendC::GetBlockNum();
     const int32_t core = AscendC::GetBlockIdx();
-    const int32_t quotient = total / cores;
-    const int32_t remainder = total % cores;
-    const int32_t begin = core * quotient + (core < remainder ? core : remainder);
+    int32_t offset = 0;
+    int32_t length = total;
+    if (Sharded) {
+      // The graph shape is fixed. Each replay divides only its live misses.
+      const int32_t per_piece = total / pieces;
+      const int32_t extra = total % pieces;
+      offset = piece * per_piece + (piece < extra ? piece : extra);
+      length = per_piece + (piece < extra ? 1 : 0);
+    }
+    const int32_t quotient = length / cores;
+    const int32_t remainder = length % cores;
+    const int32_t begin = offset + core * quotient + (core < remainder ? core : remainder);
     const int32_t end = begin + quotient + (core < remainder ? 1 : 0);
     if (begin == end) {
       return;
@@ -103,12 +113,22 @@ private:
 #define GRAPH_KERNEL(NAME, INDEX, SLOT) \
     extern "C" __global__ __aicore__ void NAME(GRAPH_ARGS) { \
       SparseGraphCopy<INDEX, SLOT> copy; \
-      copy.Run(GRAPH_VALUES); \
+      copy.Run<false>(GRAPH_VALUES); \
     }
 GRAPH_KERNEL(sfa_copy_i32_s32, int32_t, int32_t)
 GRAPH_KERNEL(sfa_copy_i32_s64, int32_t, int64_t)
 GRAPH_KERNEL(sfa_copy_i64_s32, int64_t, int32_t)
 GRAPH_KERNEL(sfa_copy_i64_s64, int64_t, int64_t)
+
+#define PIECE_KERNEL(NAME, INDEX, SLOT) \
+    extern "C" __global__ __aicore__ void NAME(GRAPH_ARGS, int32_t piece, int32_t pieces) { \
+      SparseGraphCopy<INDEX, SLOT> copy; \
+      copy.Run<true>(GRAPH_VALUES, piece, pieces); \
+    }
+PIECE_KERNEL(sfa_copy_piece_i32_s32, int32_t, int32_t)
+PIECE_KERNEL(sfa_copy_piece_i32_s64, int32_t, int64_t)
+PIECE_KERNEL(sfa_copy_piece_i64_s32, int64_t, int32_t)
+PIECE_KERNEL(sfa_copy_piece_i64_s64, int64_t, int64_t)
 
 namespace lmc {
 void launch_sparse_graph_transfer(
@@ -117,7 +137,22 @@ void launch_sparse_graph_transfer(
     uint8_t *counts, uint8_t *ptrs, uint8_t *limits,
     int32_t chunk_size, int32_t chunks_per_request, int32_t requests,
     int32_t row_width, int32_t count_stride, int32_t k_bytes,
-    int32_t pe_bytes, int64_t destination_slots) {
+    int32_t pe_bytes, int64_t destination_slots, int32_t pieces) {
+  if (pieces > 1) {
+    // One torch submission. CANN captures independent, ordered device tasks.
+    for (int32_t piece = 0; piece < pieces; ++piece) {
+      if (selected_int64 && slots_int64) {
+        sfa_copy_piece_i64_s64<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
+      } else if (selected_int64) {
+        sfa_copy_piece_i64_s32<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
+      } else if (slots_int64) {
+        sfa_copy_piece_i32_s64<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
+      } else {
+        sfa_copy_piece_i32_s32<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
+      }
+    }
+    return;
+  }
   if (selected_int64) {
     if (slots_int64) {
       sfa_copy_i64_s64<<<cores, nullptr, stream>>>(GRAPH_VALUES);
@@ -132,5 +167,6 @@ void launch_sparse_graph_transfer(
 }
 } // namespace lmc
 #undef GRAPH_KERNEL
+#undef PIECE_KERNEL
 #undef GRAPH_VALUES
 #undef GRAPH_ARGS

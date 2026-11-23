@@ -211,7 +211,8 @@ def test_graph_transfer_wrapper_preserves_default_native_signature():
     arguments = (object(),) * 6 + (1024,)
     ns[fn.name](*arguments)
     ns[fn.name](*arguments, max_aiv_cores=12)
-    assert native.call_args_list == [mock_call(*arguments), mock_call(*arguments, 12)]
+    ns[fn.name](*arguments, max_aiv_cores=12, pieces=16)
+    assert native.call_args_list == [mock_call(*arguments), mock_call(*arguments, 12), mock_call(*arguments, 12, 16)]
 
 
 def test_tail_growth_and_request_replacement_keep_addresses(transfer_module):
