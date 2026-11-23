@@ -1118,11 +1118,18 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             and now - self._prefill_admission_report_time < 0.25
         ):
             return (dict(previous, retired=()),)
+        unretired_sel_ids: frozenset[str] = frozenset()
         if retired:
             # This is the existing nonblocking readiness query, not a new
             # synchronization. Idle control steps must retire completed owners
             # even when there is no subsequent model batch to trigger cleanup.
             self._drain_dense_load_retirements()
+            selected_src = getattr(self, "selected_kv_source", None)
+            unretired_sel_fn = getattr(
+                selected_src, "unretired_selected_request_ids", None
+            )
+            if callable(unretired_sel_fn):
+                unretired_sel_ids = frozenset(unretired_sel_fn())
         engine = self.lmcache_engine
         metadata = engine.metadata
         rank = metadata.worker_id
@@ -1159,7 +1166,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         pending = {
             state.req_id
             for state in (getattr(coordinator, "retirements", None) or {}).values()
-        }
+        } | unretired_sel_ids
         completed = tuple(sorted(retired - pending))
         retired.difference_update(completed)
         report = dict(
@@ -1611,15 +1618,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
 
     def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
-        if not getattr(self, "_force_layerwise_prefill_store", False):
+        force_store = bool(getattr(self, "_force_layerwise_prefill_store", False))
+        admission_on = bool(getattr(self, "_prefill_admission_enabled", False))
+        if not force_store and not admission_on:
             return super()._release_finished_worker_requests(req_ids)
         req_ids = tuple(req_ids)
-        if req_ids and getattr(self, "_force_layerwise_prefill_store", False):
+        if req_ids and force_store:
             # Cancellation may happen before the normal final-prefill fence.
-            self.lmcache_engine.poll_layerwise_prefill_puts(final=True, req_ids=req_ids)
+            self.lmcache_engine.poll_layerwise_prefill_puts(
+                final=True, req_ids=req_ids
+            )
             self._forget_layerwise_store_results(req_ids)
         super()._release_finished_worker_requests(req_ids)
-        if getattr(self, "_prefill_admission_enabled", False):
+        if admission_on:
             self._prefill_admission_retired.update(req_ids)
 
     def _forget_layerwise_store_results(self, req_ids: Iterable[str]) -> None:
@@ -2018,10 +2029,24 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         from types import MethodType
         from weakref import proxy
 
+        inst_start = self.__dict__.get("start_load_kv")
+        inst_meta = self.__dict__.get("build_connector_worker_meta")
+        inst_stores = self.lmcache_engine.__dict__.get("get_finished_stores")
         self._checkpoint_io_originals = (
-            type(self).start_load_kv,
-            type(self).build_connector_worker_meta,
-            type(self.lmcache_engine).get_finished_stores,
+            type(self).start_load_kv if inst_start is None else inst_start,
+            (
+                type(self).build_connector_worker_meta
+                if inst_meta is None
+                else inst_meta
+            ),
+            (
+                type(self.lmcache_engine).get_finished_stores
+                if inst_stores is None
+                else inst_stores
+            ),
+            inst_start is not None,
+            inst_meta is not None,
+            inst_stores is not None,
         )
         # Weak method receivers avoid new ownership cycles with Python GC off.
         receiver = proxy(self)
@@ -2029,7 +2054,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self.build_connector_worker_meta = MethodType(
             type(self)._checkpoint_worker_meta, receiver
         )
-        self.lmcache_engine.get_finished_stores = MethodType(type(self)._checkpoint_finished_stores, receiver)
+        self.lmcache_engine.get_finished_stores = MethodType(
+            type(self)._checkpoint_finished_stores, receiver
+        )
 
     def _checkpoint_start_load(self, forward_context: Any, **kwargs: Any) -> None:
         worker = self.lmcache_engine.checkpoint_worker
@@ -2040,15 +2067,30 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             worker.release_restore(*release)
         for seal in metadata.preemption_seals:
             worker.seal(seal)
-        self._checkpoint_io_originals[0](self, forward_context, **kwargs)
+        orig_start, _, _, had_inst_start, _, _ = self._checkpoint_io_originals
+        if had_inst_start:
+            orig_start(forward_context, **kwargs)
+        else:
+            orig_start(self, forward_context, **kwargs)
 
     def _checkpoint_finished_stores(self, finished_req_ids: set) -> set:
         for req_id in finished_req_ids:
             self.lmcache_engine.checkpoint_worker.cancel(req_id)
-        return self._checkpoint_io_originals[2](self.lmcache_engine, finished_req_ids)
+        _, _, orig_stores, _, _, had_inst_stores = self._checkpoint_io_originals
+        if had_inst_stores:
+            return orig_stores(finished_req_ids)
+        return orig_stores(self.lmcache_engine, finished_req_ids)
 
     def _checkpoint_worker_meta(self) -> KVConnectorWorkerMetadata | None:
-        metadata = self._checkpoint_io_originals[1](self)
+        (
+            orig_start,
+            orig_meta,
+            orig_stores,
+            had_inst_start,
+            had_inst_meta,
+            had_inst_stores,
+        ) = self._checkpoint_io_originals
+        metadata = orig_meta() if had_inst_meta else orig_meta(self)
         worker = self.lmcache_engine.checkpoint_worker
         results = worker.poll()
         if results:
@@ -2060,10 +2102,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     prefill_admission=metadata.prefill_admission,
                 )
         if not worker.jobs and not worker.restore_owners:
-            # Reveal the original class methods, rather than retaining bound
-            # instance methods/cycles when cyclic GC is disabled.
-            del self.start_load_kv, self.build_connector_worker_meta
-            del self.lmcache_engine.get_finished_stores
+            # Reveal the original class methods (or restore pre-existing
+            # instance hooks), rather than retaining bound checkpoint methods
+            # when cyclic GC is disabled.
+            if had_inst_start:
+                self.start_load_kv = orig_start
+            else:
+                del self.start_load_kv
+            if had_inst_meta:
+                self.build_connector_worker_meta = orig_meta
+            else:
+                del self.build_connector_worker_meta
+            if had_inst_stores:
+                self.lmcache_engine.get_finished_stores = orig_stores
+            else:
+                del self.lmcache_engine.get_finished_stores
             del self._checkpoint_io_originals
         return metadata
 
