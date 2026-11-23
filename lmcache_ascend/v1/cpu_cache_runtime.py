@@ -836,13 +836,12 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                 self.validate_checkpoint_page(0, page)
         fixed_slots = getattr(self.checkpoint_backend(), "fixed_slots_enabled", False)
         purpose = {"allocation_purpose": "checkpoint"} if fixed_slots else {}
-        remaining_reclaims = 2 if fixed_slots else 1
+        slab_reclaimed = False
         cursor = base
         while cursor < end:
             desired_end = min(
                 end, (cursor // self.config.chunk_size + 1) * self.config.chunk_size
             )
-            reclaimed_chunk = False
             stop = desired_end
             while stop > cursor:
                 candidate = {}
@@ -856,15 +855,16 @@ class AscendCPUCacheRuntime(AscendCPUCacheOperations, CPUCacheRuntime):
                                 group, stop - start, **purpose
                             )
                         except MemoryError:
-                            if not remaining_reclaims or reclaimed_chunk:
-                                raise
-                            remaining_reclaims -= 1
-                            reclaimed_chunk = True
-                            missing = {
-                                g: None for g in (group, 1) if g not in candidate
-                            }
+                            if fixed_slots:
+                                tokens, missing = stop - start, {group: None}
+                            else:
+                                if slab_reclaimed:
+                                    raise
+                                slab_reclaimed = True
+                                tokens = stop - cursor
+                                missing = dict.fromkeys(range(group, 2))
                             if not self.reclaim_checkpoint_capacity(
-                                stop - cursor, missing, **purpose
+                                tokens, missing, **purpose
                             ):
                                 raise
                             page, _ = self.allocate_checkpoint_fragment(

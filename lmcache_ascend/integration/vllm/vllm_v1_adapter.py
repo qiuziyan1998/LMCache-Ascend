@@ -345,11 +345,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
         if self._direct_store_requested and self._force_layerwise_prefill_store:
             logger.warning(
-                "[PREFILL_STORE_FALLBACK] Layerwise prefill reuses two KV banks; "
+                "[PREFILL_STORE_FALLBACK] Layerwise prefill reuses %d KV banks; "
                 "ignoring all-layer NPU direct-store/RemoteFill source reads. "
                 "Using per-layer NPU-to-CPU saves before bank reuse and "
                 "persistent remote publication. RemoteFill can send the "
-                "completed CPU pages concurrently with Mooncake persistence."
+                "completed CPU pages concurrently with Mooncake persistence.",
+                self._layerwise_prefill_bank_count,
             )
         if self._direct_store_requested and not self._force_layerwise_prefill_store:
             extra = self.config.extra_config or {}
