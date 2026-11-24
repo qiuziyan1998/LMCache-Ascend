@@ -7,9 +7,11 @@ from typing import Any, Generator, Iterable, List, Optional, Sequence, Set, Unio
 import hashlib
 import json
 import os
+import time
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
+from lmcache.v1.serving_perf import serving_perf_detailed_enabled, serving_perf_log
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
@@ -61,6 +63,24 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+_COLD_PERF_SLOW_MS = 100.0
+
+
+def _log_cold_perf_slow(
+    event: str, started: float, thread_started: int, **fields: Any
+) -> None:
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if elapsed_ms >= _COLD_PERF_SLOW_MS:
+        serving_perf_log(
+            logger,
+            event,
+            elapsed_ms=round(elapsed_ms, 3),
+            thread_cpu_ms=round(
+                (time.thread_time_ns() - thread_started) / 1_000_000, 3
+            ),
+            **fields,
+        )
 
 
 @dataclass
@@ -2560,6 +2580,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: Optional[int] = None,
     ) -> None:
         """Atomically refresh every layer pointer row with one H2D copy."""
+        diagnose = serving_perf_detailed_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
         if not new_sources_by_layer:
             return
         # The caller passes exactly this group's layer rows; use that length
@@ -2585,7 +2608,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             )
         if suffix_counts.pop() == 0:
             return
+
+        rows_started = time.perf_counter() if diagnose else 0.0
         staged_rows = self._layer_page_pointer_rows(new_sources_by_layer)
+        rows_ms = (time.perf_counter() - rows_started) * 1000 if diagnose else 0.0
+        row_source = "page" if staged_rows is not None else "layerwise"
         if staged_rows is None:
             staged_rows = [
                 [
@@ -2601,12 +2628,26 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
                 for layer_id, layer_sources in enumerate(new_sources_by_layer)
             ]
+        publish_started = time.perf_counter() if diagnose else 0.0
         self._append_sparse_chunk_ptr_rows(
             staged_rows,
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
             defer_copy=defer_copy,
         )
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_pointer_cache_append_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                chunks=len(staged_rows[0]),
+                row_source=row_source,
+                rows_ms=round(rows_ms, 3),
+                publish_ms=round(
+                    (time.perf_counter() - publish_started) * 1000, 3
+                ),
+            )
 
     def prepare_sparse_page_ptr_cache_for_layers(
         self,
@@ -2652,6 +2693,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 defer_copy=defer_copy,
             )
         num_layers = len(staged_rows)
+        diagnose = serving_perf_detailed_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
         prefix_counts = {
             len(cached_chunk_dev_ptrs[layer_id])
             if layer_id < len(cached_chunk_dev_ptrs)
@@ -2682,12 +2726,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
             return
+
+        table_ms = unbind_ms = 0.0
         if cached_chunk_ptrs_npu is not None:
             tables = getattr(self, "_layerwise_pointer_tables", None)
             if tables is None:
                 tables = self._layerwise_pointer_tables = {}
             table_key = id(cached_chunk_ptrs_npu)
             state = tables.get(table_key)
+            table_started = time.perf_counter() if diagnose else 0.0
 
             if state is None:
                 device = next(
@@ -2759,6 +2806,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             cached_chunk_ptrs_npu[:] = [
                 table[layer_id, :new_count] for layer_id in range(num_layers)
             ]
+            if diagnose:
+                table_ms = (time.perf_counter() - table_started) * 1000
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_pointer_table_publish_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                chunks=new_count,
+                table_h2d_submit_ms=round(table_ms, 3),
+                unbind_ms=round(unbind_ms, 3),
+            )
 
     def _append_sparse_chunk_ptr_rows_legacy(
         self,
@@ -2770,6 +2829,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         """Append complete host rows and refresh their shared NPU table."""
         num_layers = len(staged_rows)
+        diagnose = serving_perf_detailed_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
         prefix_counts = {
             len(cached_chunk_dev_ptrs[layer_id])
             if layer_id < len(cached_chunk_dev_ptrs)
@@ -2788,6 +2850,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             for layer_id in range(num_layers)
         ]
         row_views = None
+        table_started = time.perf_counter() if diagnose else 0.0
         if cached_chunk_ptrs_npu is not None:
             if defer_copy:
                 pointer_table = self.stage_dense_load_tensor(
@@ -2798,8 +2861,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 pointer_table = torch.tensor(
                     complete_rows, dtype=torch.long, device=self.kv_device
                 )
+            table_ms = (time.perf_counter() - table_started) * 1000 if diagnose else 0.0
+            unbind_started = time.perf_counter() if diagnose else 0.0
             # The row views retain the table storage after this function returns.
             row_views = list(pointer_table.unbind(0))
+            unbind_ms = (
+                (time.perf_counter() - unbind_started) * 1000 if diagnose else 0.0
+            )
+        else:
+            table_ms = unbind_ms = 0.0
 
         if not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
@@ -2815,6 +2885,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if cached_chunk_ptrs_npu is not None:
                 assert row_views is not None
                 cached_chunk_ptrs_npu[layer_id] = row_views[layer_id]
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_pointer_table_publish_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                chunks=len(complete_rows[0]),
+                table_h2d_submit_ms=round(table_ms, 3),
+                unbind_ms=round(unbind_ms, 3),
+            )
 
 
     def release_sparse_chunk_ptr_cache(
@@ -2848,6 +2928,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ],
     ) -> Optional[list[list[int]]]:
         """Resolve a homogeneous layer-page batch once per physical page."""
+        diagnose = serving_perf_detailed_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
         if not sources_by_layer or not all(
             isinstance(source, LayerPageSource)
             and source.layer_id == layer_id
@@ -2909,6 +2992,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             ):
                 return None
             compatible_layout = page_layout
+
+        validation_ms = (time.perf_counter() - started) * 1000 if diagnose else 0.0
         result = [[] for _ in range(page_layers)]
         for chunk_index, page in enumerate(pages):
             base = self._resolve_registered_cpu_source_device_ptr(
@@ -2930,6 +3015,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     source="append_sparse_chunk_ptr_cache_for_layers_suffix",
                 )
                 for index, suffix in enumerate(source.suffix)
+            )
+        if diagnose:
+            _log_cold_perf_slow(
+                "sparse_page_pointer_rows_slow",
+                started,
+                thread_started,
+                layers=self.num_layers,
+                pages=len(pages),
+                validation_ms=round(validation_ms, 3),
+                pointer_resolve_ms=round(
+                    (time.perf_counter() - started) * 1000 - validation_ms, 3
+                ),
             )
         return result
 

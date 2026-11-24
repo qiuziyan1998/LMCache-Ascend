@@ -41,6 +41,11 @@ from lmcache.v1.cache_engine import (
     LayerwiseStoreResult,
     LMCacheEngine,
 )
+from lmcache.v1.serving_perf import (
+    serving_perf_detailed_enabled,
+    serving_perf_log,
+    serving_perf_now,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
@@ -2242,9 +2247,34 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
     ) -> bool:
         builder = self._live_source_builders.pop(req_id, None)
         if builder is None or builder["invalid"]:
+            if serving_perf_detailed_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason=(
+                        "missing_builder" if builder is None else "invalid_builder"
+                    ),
+                )
             return False
         groups = builder["groups"]
         if any(builder["ends"].get(group, 0) != token_count for group in groups):
+            if serving_perf_detailed_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason="incomplete_coverage",
+                    group_ends=builder["ends"],
+                )
             return False
         totals = [0, 0]
         compact_layers = builder["compact_layers"]
@@ -2262,6 +2292,18 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         for segment in builder["segments"]:
             totals[segment["group_id"]] += segment["length"]
         if any(not totals[group] for group in groups):
+            if serving_perf_detailed_enabled():
+                serving_perf_log(
+                    logger,
+                    "live_source_finalize_detail",
+                    req_id=req_id,
+                    token_count=token_count,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    finalized=False,
+                    reason="empty_group",
+                    group_byte_totals=totals,
+                )
             return False
         descriptor = {
             "group_byte_totals": totals,
@@ -2297,6 +2339,22 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                     "pages": builder["latent_pages"],
                 }
         self._completed_live_sources[req_id] = descriptor
+        if serving_perf_detailed_enabled():
+            serving_perf_log(
+                logger,
+                "live_source_finalize_detail",
+                req_id=req_id,
+                token_count=token_count,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                finalized=True,
+                segments=len(builder["segments"]),
+                compact_layers=len(compact_layers or ()),
+                compact_runs=len(builder["compact_runs"]),
+                latent_layers=len(latent_layers or ()),
+                latent_pages=len(builder["latent_pages"]),
+                group_byte_totals=totals,
+            )
         return True
 
     def drain_live_source_descriptors(self) -> dict[str, dict[str, Any]]:
@@ -6490,6 +6548,10 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                 )
             mem_obj_generator = None
 
+            store_perf_enabled = serving_perf_detailed_enabled()
+            if store_perf_enabled:
+                tot_kv_size = sum(obj.get_size() for obj in pending_store_release.values())
+
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             cache_chunk_indices: Optional[List[int]] = None
@@ -6535,6 +6597,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             )
 
             try:
+                t_start = time.perf_counter() if store_perf_enabled else 0.0
                 page_first_store = mooncake_page_layout_enabled(self.config)
                 async_layerwise_store = bool(
                     deferred_layerwise_put
@@ -6575,9 +6638,25 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                         )
                     for _ in range(num_layers):
                         yield
+                    group_started = (
+                        serving_perf_now() if store_perf_enabled else None
+                    )
                     host_pointer_rows, layer_chunk_ptrs_npu = group_store(
                         memory_objs, starts, ends, **kwargs
                     )
+                    if group_started is not None:
+                        serving_perf_log(
+                            logger,
+                            "npu_group_submit_cpu",
+                            started=group_started,
+                            req_id=req_id,
+                            kv_group=kv_group,
+                            chunks=len(starts),
+                            tokens=sum(
+                                end - start
+                                for start, end in zip(starts, ends, strict=True)
+                            ),
+                        )
                     self._append_group_store_tensors(
                         memory_objs,
                         cached_tensors,
@@ -6876,6 +6955,20 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                         )
                     for mem_obj in submitted_objs:
                         pending_store_release.pop(id(mem_obj), None)
+
+                if store_perf_enabled:
+                    tot_time = time.perf_counter() - t_start
+                    logger.info(
+                        "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
+                        "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
+                        req_id,
+                        kv_group,
+                        tot_token_num,
+                        len(tokens),
+                        tot_kv_size / 1024**3,
+                        tot_time * 1000,
+                        tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                    )
             finally:
                 try:
                     if mem_obj_generator is not None:
@@ -6945,6 +7038,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
         req_id = kwargs.get("req_id", "unspecified")
         phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
+        perf_enabled = serving_perf_detailed_enabled()
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         cached_keys = kwargs.get("cached_keys")
         cached_starts = kwargs.get("cached_starts")
@@ -6955,6 +7049,8 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         cached_chunk_ptrs_npu = kwargs.get("cached_chunk_ptrs_npu")
         cached_shared_handles = kwargs.get("cached_shared_handles")
         append = kwargs.get("_sparse_cache_append") or _SparseCacheAppend(kwargs)
+
+        metadata_started = serving_perf_now() if perf_enabled else 0.0
         metadata_warm = bool(
             kwargs.get("_retrieve_metadata_warm")
             and cached_keys
@@ -7011,6 +7107,19 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                     else []
                 )
         required_chunks = len(starts)
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "metadata_prepare",
+                started=metadata_started,
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                layers=num_layers,
+                chunks=required_chunks,
+                rank=self.metadata.worker_id,
+                passive=True,
+            )
         cached_prefix_chunks = self._cached_sparse_prefix_chunks(
             cached_tensors,
             cached_memory_objs,
@@ -7111,9 +7220,20 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             Union[List[MemoryObj], LayerPageSource]
         ] = []
         compact_pages = ()
+        page_view_build_s = 0.0
+        pointer_seal_s = 0.0
+        compact_materialize_started = (
+            serving_perf_now() if perf_enabled else 0.0
+        )
+        compact_materialize_thread_started = (
+            time.thread_time_ns() if perf_enabled else 0
+        )
         legacy_tail_objects = 0
         prepared_compact_ptrs = False
         defer_finish = False
+        prepare_count = dispatch_count = 0
+        prepare_sum_s = prepare_max_s = 0.0
+        dispatch_sum_s = dispatch_max_s = 0.0
 
         try:
             for layer_id in range(num_layers):
@@ -7155,6 +7275,9 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                             )
                         compact_batch = envelope.batch
                         if compact_batch is not None:
+                            page_started = (
+                                serving_perf_now() if perf_enabled else 0.0
+                            )
                             compact_pages = self._make_passive_layer_page_views(
                                 compact_batch,
                                 starts=starts[cached_prefix_chunks:],
@@ -7165,6 +7288,10 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                                 ],
                                 kv_group=kv_group,
                             )
+                            if page_started:
+                                page_view_build_s = (
+                                    serving_perf_now() - page_started
+                                )
                             to_release.extend(compact_pages)
                             prepare_page_ptrs = getattr(
                                 self.gpu_connector,
@@ -7177,6 +7304,9 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                                 and transient_chunk_ptrs_npu is not None
                                 and callable(prepare_page_ptrs)
                             ):
+                                pointer_started = (
+                                    serving_perf_now() if perf_enabled else 0.0
+                                )
                                 prepared_compact_ptrs = bool(
                                     prepare_page_ptrs(
                                         [
@@ -7196,12 +7326,21 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                                         ),
                                     )
                                 )
+                                if pointer_started:
+                                    pointer_seal_s = (
+                                        serving_perf_now() - pointer_started
+                                    )
                         elif len(envelope.handles) != missing_chunks:
                             raise ValueError(
                                 "Sparse shared CPU passive received inconsistent "
                                 f"handle count at layer {layer_id}: "
                                 f"{len(envelope.handles)} != {missing_chunks}"
                             )
+                    prepare_started = (
+                        serving_perf_now()
+                        if perf_enabled
+                        else 0.0
+                    )
                     if not metadata_appended:
                         metadata_appended = True
                         self._fill_retrieve_mask(
@@ -7329,6 +7468,11 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                         cached_prefix_chunks,
                         kv_group=kv_group,
                     )
+                    if perf_enabled:
+                        elapsed_s = serving_perf_now() - prepare_started
+                        prepare_count += 1
+                        prepare_sum_s += elapsed_s
+                        prepare_max_s = max(prepare_max_s, elapsed_s)
 
                 if prepare_only:
                     sparse_request = yield ret_mask
@@ -7342,6 +7486,12 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                     ) = _shared_sparse_request(sparse_request)
                     if prepare_only:
                         raise ValueError("Duplicate shared sparse prepare request")
+
+                dispatch_started = (
+                    serving_perf_now()
+                    if perf_enabled
+                    else 0.0
+                )
                 if sparse_payload is not None:
                     sparse_payload["memory_objs_layer"] = source
                     mem_obj_consumer.send(sparse_payload)
@@ -7354,6 +7504,38 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                             target_slot_mapping,
                         )
                     )
+                if perf_enabled:
+                    elapsed_s = serving_perf_now() - dispatch_started
+                    dispatch_count += 1
+                    dispatch_sum_s += elapsed_s
+                    dispatch_max_s = max(dispatch_max_s, elapsed_s)
+            if perf_enabled:
+                if prepare_count:
+                    serving_perf_log(
+                        logger,
+                        "passive_layer_prepare",
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        rank=self.metadata.worker_id,
+                        count=prepare_count,
+                        sum_ms=round(prepare_sum_s * 1000, 3),
+                        max_ms=round(prepare_max_s * 1000, 3),
+                        elapsed_ms=round(prepare_sum_s * 1000, 3),
+                    )
+                serving_perf_log(
+                    logger,
+                    "npu_layer_submit_cpu",
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    passive=True,
+                    count=dispatch_count,
+                    sum_ms=round(dispatch_sum_s * 1000, 3),
+                    max_ms=round(dispatch_max_s * 1000, 3),
+                    elapsed_ms=round(dispatch_sum_s * 1000, 3),
+                )
             next(mem_obj_consumer)
             if defer_finish:
                 yield ret_mask
@@ -7385,6 +7567,11 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                         f"message={final_envelope.message!r}"
                     )
             if pending_materialized_layers:
+                pointer_started = (
+                    serving_perf_now()
+                    if perf_enabled and compact_pages
+                    else 0.0
+                )
                 self._append_retrieve_group_cache(
                     pending_materialized_layers,
                     cached_memory_objs,
@@ -7398,6 +7585,40 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                         kwargs.get("_defer_sparse_pointer_copy", False)
                     ),
                 )
+                if pointer_started:
+                    pointer_seal_ms = round(
+                        (
+                            pointer_seal_s
+                            + serving_perf_now()
+                            - pointer_started
+                        )
+                        * 1000,
+                        3,
+                    )
+                    serving_perf_log(
+                        logger,
+                        "passive_compact_materialize",
+                        started=pointer_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        rank=self.metadata.worker_id,
+                        physical_pages=len(compact_pages),
+                        logical_entries=missing_chunks
+                        * self._num_layers_for_kv_group(kv_group),
+                        legacy_tail_objects=legacy_tail_objects,
+                        page_view_build_ms=round(page_view_build_s * 1000, 3),
+                        pointer_seal_ms=pointer_seal_ms,
+                        total_materialize_ms=round(
+                            (serving_perf_now() - compact_materialize_started) * 1000,
+                            3,
+                        ),
+                        thread_cpu_ms=round(
+                            (time.thread_time_ns() - compact_materialize_thread_started)
+                            / 1e6,
+                            3,
+                        ),
+                    )
             passive_views_handed_off = (
                 cached_memory_objs is not None and cached_keys is not None
             )
@@ -7552,6 +7773,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             return
 
         kv_group = kwargs.get("kv_group", 0)
+        perf_enabled = serving_perf_detailed_enabled()
         kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
         direct_external_pages = bool(
             kv_group == 1 and kwargs.get("direct_external_pages", False)
@@ -7633,6 +7855,8 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             cached_memory_objs,
             kv_group=kv_group,
         )
+
+        metadata_started = serving_perf_now() if perf_enabled else 0.0
         location, starts, ends, retrieve_keys = self._ensure_retrieve_chunk_metadata(
             tokens=tokens,
             mask=mask,
@@ -7645,6 +7869,23 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         )
         kwargs.pop("_use_cached_retrieve", None)
         required_chunks = len(retrieve_keys[0]) if retrieve_keys else 0
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "metadata_prepare",
+                started=metadata_started,
+                req_id=kwargs.get("req_id", "unspecified"),
+                phase=kwargs.get(
+                    "shared_cpu_phase",
+                    "sparse_decode_bootstrap",
+                ),
+                kv_group=kv_group,
+                layers=len(retrieve_keys),
+                chunks=required_chunks,
+                metadata_mode=kwargs.get("_retrieve_metadata_mode", "unknown"),
+                rank=self.metadata.worker_id,
+                passive=False,
+            )
         if cached_prefix_chunks > required_chunks:
             raise ValueError(
                 "Sparse retrieve cached prefix exceeds current metadata: "
@@ -7912,6 +8153,9 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             and not use_cached_retrieve
             and any(missing_keys)
         ):
+            probe_started = (
+                serving_perf_now() if perf_enabled else 0.0
+            )
             missing_locations: list[tuple[int, int]] = []
             if remote_fill_exact_locations is not None:
                 shared_chunk_locations_layer_major = [
@@ -7975,6 +8219,43 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                             key_location = ""
                         layer_locations.append(key_location)
                     shared_chunk_locations_layer_major.append(layer_locations)
+            if perf_enabled:
+                local_chunks = sum(
+                    location == LOCAL_CPU_BACKEND_NAME
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                remote_chunks = sum(
+                    location == "RemoteBackend"
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                unresolved_chunks = sum(
+                    not location
+                    for locations in shared_chunk_locations_layer_major
+                    for location in locations
+                )
+                serving_perf_log(
+                    logger,
+                    "location_probe",
+                    started=probe_started,
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase",
+                        "sparse_decode_bootstrap",
+                    ),
+                    kv_group=kv_group,
+                    layers=len(missing_keys),
+                    chunks=sum(len(layer) for layer in missing_keys),
+                    missing=unresolved_chunks,
+                    local_chunks=local_chunks,
+                    remote_chunks=remote_chunks,
+                    unresolved_chunks=unresolved_chunks,
+                    sampled=sampled_worker_retrieve,
+                    storage_probe_skipped=(
+                        remote_fill_exact_locations is not None
+                    ),
+                )
             page_first_locations = (
                 self._shared_page_first_common_prefix_plan(
                     shared_chunk_locations_layer_major
@@ -8007,6 +8288,11 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                 record_request_preflight_error()
             else:
                 try:
+                    capacity_started = (
+                        serving_perf_now()
+                        if perf_enabled
+                        else 0.0
+                    )
                     capacity_check: Callable[..., dict[str, Any]] = (
                         self._shared_cpu_runtime_capacity_details
                     )
@@ -8035,6 +8321,29 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                             )
                         ],
                     )
+                    if perf_enabled:
+                        serving_perf_log(
+                            logger,
+                            "capacity_preflight",
+                            started=capacity_started,
+                            req_id=kwargs.get("req_id", "unspecified"),
+                            phase=kwargs.get(
+                                "shared_cpu_phase",
+                                "sparse_decode_bootstrap",
+                            ),
+                            kv_group=kv_group,
+                            fits=capacity_details.get("fits"),
+                            missing_chunks=capacity_details.get(
+                                "missing_chunk_count"
+                            ),
+                            required_bytes=capacity_details.get(
+                                "required_bytes"
+                            ),
+                            available_bytes=capacity_details.get(
+                                "available_after_eviction"
+                            ),
+                            skipped=(remote_fill_exact_locations is not None),
+                        )
                 except Exception:
                     release_local_prefix_layers()
                     raise
@@ -8068,6 +8377,12 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                             and page_chunks
                         ):
                             release_local_prefix_layers()
+                            materialize_started = (
+                                serving_perf_now() if perf_enabled else 0.0
+                            )
+                            materialize_thread_started = (
+                                time.thread_time_ns() if perf_enabled else 0
+                            )
                             (
                                 pre_resolved_shared_mem_layers,
                                 layer_page_chunks,
@@ -8083,6 +8398,26 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                                     remote_fill_exact_locations
                                 ),
                             )
+                            if perf_enabled:
+                                serving_perf_log(
+                                    logger,
+                                    "rank0_page_materialize",
+                                    started=materialize_started,
+                                    req_id=kwargs.get("req_id", "unspecified"),
+                                    kv_group=kv_group,
+                                    pages=layer_page_chunks,
+                                    remote_fill_plan_reused=(
+                                        remote_fill_exact_locations is not None
+                                    ),
+                                    thread_cpu_ms=round(
+                                        (
+                                            time.thread_time_ns()
+                                            - materialize_thread_started
+                                        )
+                                        / 1e6,
+                                        3,
+                                    ),
+                                )
                         elif page_first_locations is not None:
                             prefixes = None
                             if local_prefix_layers:
@@ -8237,6 +8572,16 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             and not use_cached_retrieve
             and cached_prefix_chunks < required_chunks
         ):
+            if perf_enabled:
+                group_cache_started = source_view_started = serving_perf_now()
+                group_cache_thread_started = time.thread_time_ns()
+                handle_batch_ms = handle_cache_append_ms = 0.0
+
+                def elapsed_ms(started: float) -> float:
+                    return round((serving_perf_now() - started) * 1000, 3)
+
+                def thread_cpu_ms(started: int) -> float:
+                    return round((time.thread_time_ns() - started) / 1_000_000, 3)
             try:
                 page_sources = (
                     [
@@ -8256,6 +8601,10 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                     if layer_page_chunks
                     else pre_resolved_shared_mem_layers
                 )
+                if perf_enabled:
+                    source_view_ms = elapsed_ms(source_view_started)
+                    group_cache_append_started = serving_perf_now()
+                    group_cache_append_thread_started = time.thread_time_ns()
                 self._append_retrieve_group_cache(
                     page_sources,
                     cached_memory_objs,
@@ -8267,14 +8616,25 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                         kwargs.get("_defer_sparse_pointer_copy", False)
                     ),
                 )
+                if perf_enabled:
+                    group_cache_append_ms = elapsed_ms(group_cache_append_started)
+                    group_cache_append_thread_cpu_ms = thread_cpu_ms(
+                        group_cache_append_thread_started
+                    )
                 group_cache_prepared = True
                 if publish_shared_handles:
+                    if perf_enabled:
+                        handle_batch_started = serving_perf_now()
                     compact_handle_batch = self._make_shared_handle_batch(
                         pre_resolved_shared_mem_layers,
                         missing_keys,
                         kv_group=kv_group,
                     )
+                    if perf_enabled:
+                        handle_batch_ms = elapsed_ms(handle_batch_started)
                     if compact_handle_batch is not None:
+                        if perf_enabled:
+                            handle_cache_started = serving_perf_now()
                         if cached_memory_objs is None:
                             raise ValueError(
                                 "Compact shared publication requires retained "
@@ -8303,6 +8663,36 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                                 cached_handle_chunks,
                                 kv_group=kv_group,
                             )
+                        # These objects were visible in a storage backend before
+                        # this request pinned them.  They have no producer work
+                        # on store_stream, so fencing it would wait for unrelated
+                        # requests without strengthening publication ordering.
+                        if perf_enabled:
+                            handle_cache_append_ms = elapsed_ms(
+                                handle_cache_started
+                            )
+                if perf_enabled:
+                    serving_perf_log(
+                        logger,
+                        "rank0_group_cache_prepare",
+                        started=group_cache_started,
+                        req_id=kwargs.get("req_id", "unspecified"),
+                        kv_group=kv_group,
+                        chunks=required_chunks - cached_prefix_chunks,
+                        remote_fill_plan_reused=(
+                            remote_fill_exact_locations is not None
+                        ),
+                        source_view_ms=source_view_ms,
+                        group_cache_append_ms=group_cache_append_ms,
+                        group_cache_append_thread_cpu_ms=(
+                            group_cache_append_thread_cpu_ms
+                        ),
+                        handle_batch_ms=handle_batch_ms,
+                        handle_cache_append_ms=handle_cache_append_ms,
+                        total_thread_cpu_ms=thread_cpu_ms(
+                            group_cache_thread_started
+                        ),
+                    )
             except Exception as exc:
                 if not shared_sparse_retrieve:
                     release_pre_resolved_shared_mem_layers()
@@ -8619,6 +9009,8 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                 )
 
         defer_finish = False
+        dispatch_count = 0
+        dispatch_sum_s = dispatch_max_s = 0.0
         try:
             for layer_id in range(num_layers):
                 sparse_request = yield ret_mask
@@ -8857,6 +9249,12 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                     ) = _shared_sparse_request(sparse_request)
                     if prepare_only:
                         raise ValueError("Duplicate shared sparse prepare request")
+
+                dispatch_started = (
+                    serving_perf_now()
+                    if perf_enabled
+                    else 0.0
+                )
                 if not direct_group1_load:
                     if sparse_payload is not None:
                         sparse_payload["memory_objs_layer"] = source
@@ -8870,6 +9268,29 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                                 target_slot_mapping,
                             )
                         )
+                if perf_enabled:
+                    elapsed_s = serving_perf_now() - dispatch_started
+                    dispatch_count += 1
+                    dispatch_sum_s += elapsed_s
+                    dispatch_max_s = max(dispatch_max_s, elapsed_s)
+
+            if perf_enabled:
+                serving_perf_log(
+                    logger,
+                    "npu_layer_submit_cpu",
+                    req_id=kwargs.get("req_id", "unspecified"),
+                    phase=kwargs.get(
+                        "shared_cpu_phase", "sparse_decode_bootstrap"
+                    ),
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    passive=False,
+                    count=dispatch_count,
+                    sum_ms=round(dispatch_sum_s * 1000, 3),
+                    max_ms=round(dispatch_max_s * 1000, 3),
+                    elapsed_ms=round(dispatch_sum_s * 1000, 3),
+                )
+
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
             if defer_finish:

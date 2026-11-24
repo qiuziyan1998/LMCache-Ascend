@@ -20,6 +20,7 @@ from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
 from lmcache.v1.remote_fill import (
+    content_digest,
     ControlPage,
     InProcessRemoteFillTransport,
     NegotiateRequest,
@@ -1042,6 +1043,9 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
     caplog,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("PD_SERVING_PERF", "detail")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "detail")
+    monkeypatch.setattr(logging.getLogger("lmcache_ascend.v1.remote_fill"), "propagate", True)
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(local)
     controls = tuple(
@@ -1078,6 +1082,24 @@ def test_full_and_partial_pages_publish_only_after_exact_atomic_finish(
         for page in call["pages"]:
             assert page.refs == 1
             assert page.pins == 0
+    group0 = tuple(
+        CacheEngineKey.from_string(controls[index].canonical_key)
+        for index in range(0, len(controls), 2)
+    )
+    group1 = tuple(
+        CacheEngineKey.from_string(controls[index].canonical_key)
+        for index in range(1, len(controls), 2)
+    )
+    expected_digest = content_digest(
+        (
+            tuple(key.to_string() for key in group0),
+            tuple(key.to_string() for key in group1),
+        )
+    )
+    assert '"inserted_keys":4' in caplog.text
+    assert '"existing_keys":0' in caplog.text
+    assert '"retention_trace_id":17' in caplog.text
+    assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 
 def test_group0_only_lifecycle_allocates_and_commits_no_group1_pages() -> None:
@@ -1240,6 +1262,32 @@ def test_local_commit_distinguishes_safe_and_unsafe_rollback(
 
     assert local.hot == {}
     lifecycle.release_pages(views, "test cleanup")
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "detail"])
+def test_uncertain_commit_rollback_is_visible_with_warning_threshold(
+    monkeypatch, caplog, mode
+):
+    from lmcache.v1 import serving_perf
+
+    monkeypatch.setattr(serving_perf, "_MODE", mode)
+    log = logging.getLogger("lmcache_ascend.v1.remote_fill")
+    monkeypatch.setattr(log, "propagate", True)
+    caplog.set_level(logging.WARNING, logger=log.name)
+    local = _FakeLocalBackend()
+    lifecycle = _lifecycle(local)
+    controls = (_control_page(0, 0), _control_page(0, 1))
+    prepared = lifecycle.prepare_pages("transfer", 0, controls, True)
+    views = _views(controls, prepared)
+    local.commit_error = LayerPageAdmissionRollbackError("rollback incomplete")
+    with pytest.raises(UnsafePageLifecycleError):
+        lifecycle.commit_pages("transfer", controls, views, _finish(4))
+    assert not local.hot
+    lifecycle.release_pages(views, "test cleanup")
+    rows = [r for r in caplog.records if "remote_fill_local_commit" in r.message]
+    assert len(rows) == 1 and '"rollback_safe":false' in rows[0].message
+    assert '"transfer_id":"transfer"' in rows[0].message
+    assert '"reason":"admission_rollback_incomplete"' in rows[0].message
 
 
 def test_post_commit_release_is_retry_safe_and_fatal() -> None:

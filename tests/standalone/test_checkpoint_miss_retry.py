@@ -95,6 +95,7 @@ def promote(request, retry=True):
         object,
         RequestStatus=statuses,
         SERVING_PERF_ENABLED=False,
+        SERVING_PERF_DETAILED=False,
         logger=NS(warning=lambda *a: None),
     )
     cls = implementation(
@@ -218,13 +219,15 @@ def test_local_eviction_reports_longest_paired_frontier_before_device_work(
     store.close()
 
 
+@pytest.mark.parametrize("perf_enabled", [False, True])
 @pytest.mark.parametrize("kind", ["miss", "bad_data"])
-def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kind):
+def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kind, perf_enabled):
     control = api[0]
     calls = []
+    trace_permits = iter([True])
     logger = NS(
         info=lambda *a: calls.append("info"),
-        exception=lambda *a: calls.append("exception"),
+        error=lambda *a, exc_info: calls.append("exception" if exc_info else "error"),
     )
     base = implementation(
         "../LMCache-NPU/lmcache/integration/vllm/vllm_v1_adapter.py",
@@ -232,6 +235,9 @@ def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kin
         {"_fail_completed_cold_load", "_record_checkpoint_restore_miss"},
         object,
         logger=logger,
+        serving_perf_enabled=lambda: perf_enabled,
+        serving_perf_detailed_enabled=lambda: False,
+        serving_perf_report_due=lambda _: next(trace_permits),
         _clear_terminal_load_tracebacks=lambda *a: calls.append("clear"),
     )
     cls = implementation(
@@ -259,6 +265,7 @@ def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kin
     assert adapter._fail_completed_cold_load("r", entry, None, error)
     assert "unpin" in calls
     if kind == "miss":
+        assert ("info" in calls) == perf_enabled
         assert "fence" not in calls  # No restore device work was submitted.
         assert not adapter._invalid_block_ids and "exception" not in calls
         result = adapter.lmcache_engine.checkpoint_worker.results[0]

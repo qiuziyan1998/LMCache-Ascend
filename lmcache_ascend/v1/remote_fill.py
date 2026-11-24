@@ -16,6 +16,11 @@ from typing import Any, Protocol
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.serving_perf import (
+    serving_perf_detailed_enabled,
+    serving_perf_enabled,
+    serving_perf_log,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.memory_management import (
@@ -33,6 +38,7 @@ from lmcache.v1.mooncake_layout import (
     resolve_remote_fill_identity,
 )
 from lmcache.v1.remote_fill import (
+    content_digest,
     PROTOCOL_VERSION,
     ControlPage,
     FinishRequest,
@@ -200,6 +206,8 @@ def _log_remote_fill_event(
 ) -> None:
     """Emit one low-cardinality decoder lifecycle event."""
 
+    if level < logging.WARNING and not serving_perf_detailed_enabled():
+        return
     if not logger.isEnabledFor(level):
         return
     logger.log(
@@ -1019,14 +1027,26 @@ class AscendRemoteFillPageLifecycle:
             references are released after cache ownership has been acquired.
         """
 
-        commit_started = monotonic()
+        commit_started = monotonic() if serving_perf_enabled() else None
 
         def log_commit(**fields: object) -> None:
-            payload = {
+            failed = bool(fields.get("error")) or not fields.get("committed")
+            if commit_started is not None:
+                fields["elapsed_ms"] = round((monotonic() - commit_started) * 1000, 3)
+            _log_remote_fill_event(
+                "remote_fill_local_commit",
+                level=logging.WARNING if failed else logging.INFO,
+                transfer_id=transfer_id,
                 **fields,
-                "elapsed_ms": round((monotonic() - commit_started) * 1000, 3),
-            }
-            _log_remote_fill_event("remote_fill_local_commit", **payload)
+            )
+            if commit_started is not None and (not failed or serving_perf_detailed_enabled()):
+                serving_perf_log(
+                    logger,
+                    "remote_fill_local_commit",
+                    production=True,
+                    transfer_id=transfer_id,
+                    **fields,
+                )
 
         required_by_group = self._validate_required_prefix(
             required_pages,
@@ -1076,17 +1096,21 @@ class AscendRemoteFillPageLifecycle:
                 committed=False,
                 error=True,
                 rollback_safe=False,
+                reason="admission_rollback_incomplete",
+                error_type=type(error).__name__,
                 required_pairs=len(required_by_group[0]),
                 ready_pages=len(ready),
             )
             raise UnsafePageLifecycleError(
                 "remote-fill LocalCPU admission rollback was incomplete"
             ) from error
-        except Exception:
+        except Exception as error:
             log_commit(
                 committed=False,
                 error=True,
                 rollback_safe=True,
+                reason="admission_failed",
+                error_type=type(error).__name__,
                 required_pairs=len(required_by_group[0]),
                 ready_pages=len(ready),
             )
@@ -1109,12 +1133,18 @@ class AscendRemoteFillPageLifecycle:
                 committed=True,
                 error=True,
                 rollback_safe=False,
+                reason="reservation_release_failed",
+                error_type=type(error).__name__,
                 required_pairs=len(required_by_group[0]),
                 ready_pages=len(ready),
             )
             raise UnsafePageLifecycleError(
                 "remote-fill reservation ownership transfer failed after publish"
             ) from error
+        if commit_started is None or (
+            not serving_perf_detailed_enabled() and monotonic() - commit_started < 0.1
+        ):
+            return True  # All reservation references were already released above.
         diagnostic_fields: dict[str, object] = {
             "inserted_keys": len(result.inserted_keys),
             "existing_keys": len(result.existing_keys),
@@ -1122,6 +1152,25 @@ class AscendRemoteFillPageLifecycle:
         retention_trace_id = getattr(result, "retention_trace_id", None)
         if isinstance(retention_trace_id, int):
             diagnostic_fields["retention_trace_id"] = retention_trace_id
+        if serving_perf_detailed_enabled():
+            try:
+                diagnostic_fields["required_key_digest"] = content_digest(
+                    tuple(
+                        tuple(
+                            key.to_string()
+                            for key in required_by_group[group]
+                        )
+                        for group in self._direct_groups
+                    )
+                )
+            except Exception:
+                # Publication and ownership transfer are already complete;
+                # observability must never turn that success into a failure.
+                diagnostic_fields["key_digest_error"] = True
+                logger.warning(
+                    "Failed to fingerprint remote-fill commit keys",
+                    exc_info=True,
+                )
         log_commit(
             committed=True,
             error=False,
