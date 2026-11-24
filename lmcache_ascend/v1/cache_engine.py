@@ -44,6 +44,7 @@ from lmcache.v1.cache_engine import (
     LMCacheEngine,
 )
 from lmcache.v1.serving_perf import (
+    serving_perf_detailed_enabled,
     serving_perf_enabled,
     serving_perf_log,
     serving_perf_now,
@@ -2501,7 +2502,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
     ) -> bool:
         builder = self._live_source_builders.pop(req_id, None)
         if builder is None or builder["invalid"]:
-            if serving_perf_enabled():
+            if serving_perf_detailed_enabled():
                 serving_perf_log(
                     logger,
                     "live_source_finalize_detail",
@@ -2517,7 +2518,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             return False
         groups = builder["groups"]
         if any(builder["ends"].get(group, 0) != token_count for group in groups):
-            if serving_perf_enabled():
+            if serving_perf_detailed_enabled():
                 serving_perf_log(
                     logger,
                     "live_source_finalize_detail",
@@ -2546,7 +2547,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         for segment in builder["segments"]:
             totals[segment["group_id"]] += segment["length"]
         if any(not totals[group] for group in groups):
-            if serving_perf_enabled():
+            if serving_perf_detailed_enabled():
                 serving_perf_log(
                     logger,
                     "live_source_finalize_detail",
@@ -2613,7 +2614,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                 "tp_rank": tp_rank,
                 "dp_rank": dp_rank,
             }
-        if serving_perf_enabled():
+        if serving_perf_detailed_enabled():
             serving_perf_log(
                 logger,
                 "live_source_finalize_detail",
@@ -7349,7 +7350,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             )
 
             try:
-                store_perf_enabled = serving_perf_enabled()
+                store_perf_enabled = serving_perf_detailed_enabled()
                 t_start = time.perf_counter() if store_perf_enabled else 0.0
                 page_first_store = mooncake_page_layout_enabled(self.config)
                 async_layerwise_store = bool(
@@ -7392,9 +7393,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
                     for _ in range(num_layers):
                         yield
                     group_started = (
-                        serving_perf_now()
-                        if serving_perf_enabled()
-                        else None
+                        serving_perf_now() if serving_perf_detailed_enabled() else None
                     )
                     host_pointer_rows, layer_chunk_ptrs_npu = group_store(
                         memory_objs, starts, ends, **kwargs
@@ -7761,7 +7760,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
         num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
         req_id = kwargs.get("req_id", "unspecified")
         phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         cached_keys = kwargs.get("cached_keys")
         cached_starts = kwargs.get("cached_starts")
@@ -8523,7 +8522,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             return
 
         kv_group = kwargs.get("kv_group", 0)
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         kwargs.setdefault("shared_cpu_phase", "sparse_decode_bootstrap")
         direct_external_pages = bool(
             kv_group == 1 and kwargs.get("direct_external_pages", False)

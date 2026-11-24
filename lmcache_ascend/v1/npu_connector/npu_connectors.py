@@ -2991,7 +2991,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: Optional[int] = None,
     ) -> None:
         """Atomically refresh every layer pointer row with one H2D copy."""
-        diagnose = serving_perf_enabled()
+        diagnose = serving_perf_detailed_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         if not new_sources_by_layer:
@@ -3104,7 +3104,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 defer_copy=defer_copy,
             )
         num_layers = len(staged_rows)
-        diagnose = serving_perf_enabled()
+        diagnose = serving_perf_detailed_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         prefix_counts = {
@@ -3240,7 +3240,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> None:
         """Append complete host rows and refresh their shared NPU table."""
         num_layers = len(staged_rows)
-        diagnose = serving_perf_enabled()
+        diagnose = serving_perf_detailed_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         prefix_counts = {
@@ -3339,7 +3339,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ],
     ) -> Optional[list[list[int]]]:
         """Resolve a homogeneous layer-page batch once per physical page."""
-        diagnose = serving_perf_enabled()
+        diagnose = serving_perf_detailed_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         if not sources_by_layer or not all(

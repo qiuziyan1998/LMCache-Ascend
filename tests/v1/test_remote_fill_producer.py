@@ -3699,7 +3699,9 @@ def test_coordinator_finish_once_exports_partial_terminal_through_ascend_adapter
     )
 
     engine = object.__new__(AscendLMCacheEngine)
-    engine.config = SimpleNamespace(chunk_size=1024)
+    from lmcache.v1.config import LMCacheEngineConfig
+
+    engine.config = LMCacheEngineConfig.from_defaults(chunk_size=1024)
     calls = []
     terminal = RemoteFillTerminalResult(
         transfer_id=_handoff().transfer_id,

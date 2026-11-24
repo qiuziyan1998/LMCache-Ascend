@@ -8,7 +8,7 @@ method ASTs are loaded without importing the NPU extension.
 # Standard
 from collections import OrderedDict
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 import __future__
@@ -30,6 +30,7 @@ def modules(monkeypatch: pytest.MonkeyPatch) -> Any:
     # First Party
     from lmcache.utils import CacheEngineKey
     from lmcache.v1.cache_engine import LayerwiseStoreResult
+    from lmcache.v1.prefill_metadata import PrefillMetadataPlan
     from lmcache.v1.memory_management import (
         LayerPageMemoryObj,
         MemoryFormat,
@@ -40,6 +41,7 @@ def modules(monkeypatch: pytest.MonkeyPatch) -> Any:
     return SimpleNamespace(
         CacheEngineKey=CacheEngineKey,
         LayerwiseStoreResult=LayerwiseStoreResult,
+        PrefillMetadataPlan=PrefillMetadataPlan,
         LayerPageMemoryObj=LayerPageMemoryObj,
         MemoryFormat=MemoryFormat,
         TensorMemoryAllocator=TensorMemoryAllocator,
@@ -70,6 +72,7 @@ def load_store(name: str, modules: Any, page_store: bool) -> Any:
         "mooncake_layer_pages_enabled": lambda config: page_store,
         "mooncake_page_layout_enabled": lambda config: page_store,
         "serving_perf_enabled": lambda: False,
+        "serving_perf_detailed_enabled": lambda: False,
         "assert_layerwise_gpu_connector": lambda connector: None,
     }
     exec(
@@ -108,6 +111,14 @@ def test_flat_store_preserves_full_and_tail_counts_through_backend_close(
     backend.cache_policy = MagicMock()
     backend._record_external_retention_mutation_locked = MagicMock()
     engine = MagicMock()
+    # This fixture exercises the decoder in-process store and its legacy flat fallback.
+    engine.storage_process = None
+    engine._force_layerwise_prefill_store = False
+    engine._layerwise_put_queue = None
+    engine.metadata.indexer_c8_layout = None
+    engine._layerwise_prefill_store_plan = MethodType(
+        load_store("_layerwise_prefill_store_plan", modules, page_store), engine
+    )
     engine.num_layers = layers
     engine._num_layers_for_kv_group.return_value = layers
     engine._num_transfer_layers_for_call.return_value = layers
@@ -141,6 +152,7 @@ def test_flat_store_preserves_full_and_tail_counts_through_backend_close(
     )
     engine.storage_manager.supports_batched_put_layer_pages.return_value = True
     local = engine._shared_local_cpu_backend.return_value
+    local.fixed_slots_enabled = False
     local.batched_allocate_layer_pages.return_value = None
     chunks = [(0, 256), (256, 263), (263, 264)]
     engine.token_database.process_tokens.return_value = [

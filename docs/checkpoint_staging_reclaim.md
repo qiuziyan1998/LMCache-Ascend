@@ -85,7 +85,8 @@ Update LMCache-NPU and LMCache-Ascend together. Existing
 `decode_preemption_checkpoint: true` enables this behavior. No native rebuild or
 vLLM/vLLM-Ascend change is needed for this follow-up.
 
-With `PD_SERVING_PERF=1`, inspect capacity reclamation and checkpoint results:
+Use `PD_SERVING_PERF=1` for slow or unsuccessful capacity reclaim and checkpoint transitions.
+Use `detail` for each reclaim and its capacity snapshot.
 
 ```bash
 grep -nE 'checkpoint_capacity_reclaim|decoder_preemption_checkpoint' D_dp*_port*.log | tail -n 60

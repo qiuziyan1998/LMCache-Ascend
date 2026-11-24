@@ -95,6 +95,7 @@ def promote(request, retry=True):
         object,
         RequestStatus=statuses,
         SERVING_PERF_ENABLED=False,
+        SERVING_PERF_DETAILED=False,
         logger=NS(warning=lambda *a: None),
     )
     cls = implementation(
@@ -224,7 +225,7 @@ def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kin
     calls = []
     logger = NS(
         info=lambda *a: calls.append("info"),
-        exception=lambda *a: calls.append("exception"),
+        error=lambda *a, exc_info: calls.append("exception" if exc_info else "error"),
     )
     base = implementation(
         "../LMCache-NPU/lmcache/integration/vllm/vllm_v1_adapter.py",
@@ -232,6 +233,8 @@ def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kin
         {"_fail_completed_cold_load", "_record_checkpoint_restore_miss"},
         object,
         logger=logger,
+        serving_perf_detailed_enabled=lambda: False,
+        serving_perf_report_due=lambda _: True,
         _clear_terminal_load_tracebacks=lambda *a: calls.append("clear"),
     )
     cls = implementation(
