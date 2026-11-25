@@ -434,10 +434,14 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("lmc_host_interleaved"),
         py::arg("selected_token_counts") = py::none(),
         py::arg("diagnostic_layer_id") = -1);
+  py::class_<SparsePrefetchGate, std::shared_ptr<SparsePrefetchGate>>(m, "SparsePrefetchGate")
+      .def(py::init<const torch::Tensor &>())
+      .def("set_open", &SparsePrefetchGate::set_open);
   m.def("sparse_graph_kv_transfer", &sparse_graph_kv_transfer,
         py::arg("destination_state"), py::arg("slots"), py::arg("selected"),
         py::arg("counts"), py::arg("ptrs"), py::arg("limits"), py::arg("chunk_size"),
-        py::arg("max_aiv_cores") = 0, py::arg("pieces") = 1, py::arg("gate_word") = py::none());
+        py::arg("max_aiv_cores") = 0, py::arg("pieces") = 1, py::arg("gate_word") = py::none(),
+        py::arg("admission") = py::none());
   m.def("set_sparse_graph_prefetch_allowed", &set_sparse_graph_prefetch_allowed,
         py::arg("gate_word"), py::arg("allowed"));
   m.def("dense_mla_dsa_batched_direct_kv_transfer",

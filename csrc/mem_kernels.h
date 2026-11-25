@@ -2,6 +2,8 @@
 #include "kernels/types.h"
 #include "managed_mem.h"
 #include "utils.h"
+#include <acl/acl_rt.h>
+#include <memory>
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -255,13 +257,26 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
     const bool lmc_host_interleaved, const bool validate_inputs = false,
     const c10::optional<torch::Tensor> &selected_token_counts = c10::nullopt);
 
+// A graph key retains this gate until all of its replays have completed.
+class SparsePrefetchGate {
+public:
+  explicit SparsePrefetchGate(const torch::Tensor &word);
+  ~SparsePrefetchGate();
+  SparsePrefetchGate(const SparsePrefetchGate &) = delete;
+  SparsePrefetchGate &operator=(const SparsePrefetchGate &) = delete;
+  void set_open(bool open) const;
+  const torch::Tensor word;
+  aclrtNotify token = nullptr;
+};
+
 // Capture one bounds-aware K/PE copy using replay-time device source tables.
 void sparse_graph_kv_transfer(
     const SparseDirectDestinationState &state,
     torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
     torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size,
     int64_t max_aiv_cores = 0, int64_t pieces = 1,
-    const c10::optional<torch::Tensor> &gate_word = c10::nullopt);
+    const c10::optional<torch::Tensor> &gate_word = c10::nullopt,
+    const std::shared_ptr<SparsePrefetchGate> &admission = nullptr);
 void set_sparse_graph_prefetch_allowed(const torch::Tensor &gate_word, bool allowed);
 
 // Prepared warm path: destination state is process-owned; all request and step

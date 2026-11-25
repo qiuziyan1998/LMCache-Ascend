@@ -774,11 +774,48 @@ void set_sparse_graph_prefetch_allowed(const torch::Tensor &gate_word, bool allo
   cmd.Run();
 }
 
+SparsePrefetchGate::SparsePrefetchGate(const torch::Tensor &word) : word(word) {
+  prefetch_gate_address(word);
+#if LMC_HAS_SFA_STREAM_VALUES
+  const c10::OptionalDeviceGuard guard(device_of(word));
+  auto rc = aclrtCreateNotify(&token, ACL_NOTIFY_DEFAULT);
+  TORCH_CHECK(rc == ACL_SUCCESS, "Creating sparse prefetch Notify failed: ", rc);
+#endif
+}
+
+SparsePrefetchGate::~SparsePrefetchGate() {
+#if LMC_HAS_SFA_STREAM_VALUES
+  if (token != nullptr) {
+    try {
+      const c10::OptionalDeviceGuard guard(device_of(word));
+      auto rc = aclrtDestroyNotify(token);
+      if (rc != ACL_SUCCESS) {
+        TORCH_WARN("Destroying sparse prefetch Notify failed: ", rc);
+      }
+    } catch (const std::exception &error) {
+      TORCH_WARN("Destroying sparse prefetch Notify failed: ", error.what());
+    }
+  }
+#endif
+}
+
+void SparsePrefetchGate::set_open(bool open) const {
+  const c10::OptionalDeviceGuard guard(device_of(word));
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("set_sparse_graph_copy_window");
+  cmd.SetCustomHandler([address = word.data_ptr<int64_t>(), token = token, open, stream]() -> int {
+    return lmc::set_copy_window(address, token, open, stream);
+  });
+  cmd.Run();
+}
+
 void sparse_graph_kv_transfer(
     const SparseDirectDestinationState &state,
     torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
     torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size, int64_t max_aiv_cores,
-    int64_t pieces, const c10::optional<torch::Tensor> &gate_word) {
+    int64_t pieces, const c10::optional<torch::Tensor> &gate_word,
+    const std::shared_ptr<SparsePrefetchGate> &admission) {
   // Host metadata checks run at eager warmup/capture only, never on replay.
   TORCH_CHECK(selected.dim() == 2 && selected.is_contiguous(),
               "Graph selected tokens must be a contiguous matrix");
@@ -825,9 +862,19 @@ void sparse_graph_kv_transfer(
   TORCH_CHECK(!gate_word || gate_word->device() == selected.device(),
               "Prefetch gate and transfer must be on the same NPU");
   void *gate = gate_word ? prefetch_gate_address(*gate_word) : nullptr;
+  aclrtNotify token = nullptr;
+  if (admission) {
+    TORCH_CHECK(!gate_word && admission->word.device() == selected.device(),
+                "A copy window requires its own gate on the transfer device");
+    gate = admission->word.data_ptr<int64_t>();
+    token = admission->token;
+  }
   TORCH_CHECK(max_aiv_cores >= 0 && max_aiv_cores <= std::numeric_limits<uint32_t>::max(),
               "max_aiv_cores must be zero (automatic) or a positive uint32 value");
-  uint32_t cores = direct_aiv_num(static_cast<int32_t>(selected.numel()));
+  // A balanced piece cannot contain more than ceil(capacity / pieces) live
+  // rows. Avoid scheduling blocks with no possible work on a small graph key.
+  const int64_t grid_rows = admission ? 1 + (selected.numel() - 1) / pieces : selected.numel();
+  uint32_t cores = direct_aiv_num(static_cast<int32_t>(grid_rows));
   // Serial retrieval is critical-path work. Only a prefetch caller caps AIVs.
   if (max_aiv_cores > 0) {
     cores = std::min(cores, static_cast<uint32_t>(max_aiv_cores));
@@ -856,7 +903,7 @@ void sparse_graph_kv_transfer(
           static_cast<int32_t>(requests), row_width, count_stride,
           static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots,
           piece, static_cast<int32_t>(pieces));
-    });
+    }, token);
   });
   cmd.Run();
 }

@@ -86,6 +86,10 @@ else()
       int main() {
         (void)sizeof(&aclrtValueWrite);
         (void)sizeof(&aclrtValueWait);
+        (void)sizeof(&aclrtCreateNotify);
+        (void)sizeof(&aclrtDestroyNotify);
+        (void)sizeof(&aclrtRecordNotify);
+        (void)sizeof(&aclrtWaitAndResetNotify);
         return ACL_STREAM_WAIT_VALUE_GEQ;
       }
     ]] LMC_HAS_SFA_STREAM_VALUES)

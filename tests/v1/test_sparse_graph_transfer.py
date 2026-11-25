@@ -199,11 +199,14 @@ def test_aiv_limit_is_per_launch_and_serial_default_is_uncapped(transfer_module,
     transfer.load(selected, counts, slots, max_aiv_cores=12)
     gate = torch.empty(1, dtype=torch.int64)
     transfer.load(selected, counts, slots, max_aiv_cores=12, pieces=4, gate_word=gate)
+    admission = object()
+    transfer.load(selected, counts, slots, pieces=4, admission=admission)
     transfer.load(selected, counts, slots)
     assert [call.kwargs for call in native.call_args_list] == [
         {},
         {"max_aiv_cores": 12},
         {"max_aiv_cores": 12, "pieces": 4, "gate_word": gate},
+        {"pieces": 4, "admission": admission},
         {},
     ]
 
@@ -221,9 +224,12 @@ def test_graph_transfer_wrapper_preserves_default_native_signature():
     ns[fn.name](*arguments, max_aiv_cores=12, pieces=16)
     gate = torch.empty(1, dtype=torch.int64)
     ns[fn.name](*arguments, max_aiv_cores=12, pieces=8, gate_word=gate)
+    admission = object()
+    ns[fn.name](*arguments, pieces=16, admission=admission)
     assert native.call_args_list == [
         mock_call(*arguments), mock_call(*arguments, 12), mock_call(*arguments, 12, 16),
         mock_call(*arguments, 12, 8, gate),
+        mock_call(*arguments, 0, 16, None, admission),
     ]
 
 

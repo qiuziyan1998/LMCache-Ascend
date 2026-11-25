@@ -230,6 +230,7 @@ class SparseGraphTransfer:
         max_aiv_cores: int = 0,
         pieces: int = 1,
         gate_word: torch.Tensor | None = None,
+        admission=None,
     ) -> None:
         """Capture device top-k to K/PE copies without preprocessing the payload."""
         if (
@@ -249,6 +250,7 @@ class SparseGraphTransfer:
             **({"max_aiv_cores": max_aiv_cores} if max_aiv_cores else {}),
             **({"pieces": pieces} if pieces != 1 else {}),
             **({"gate_word": gate_word} if gate_word is not None else {}),
+            **({"admission": admission} if admission is not None else {}),
         )
 
     def clear_source(self) -> None:
