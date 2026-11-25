@@ -25,6 +25,14 @@ def test_prefetch_pieces_replay_registered_history(index, slot):
     )
 
 
+@pytest.mark.parametrize("index", [torch.int32, torch.int64])
+@pytest.mark.parametrize("slot", [torch.int32, torch.int64])
+def test_moe_gate_replays_registered_history(index, slot):
+    test_one_capture_replays_live_topk_and_growing_cpu_history(
+        16, (torch.bfloat16, index, slot, True), True, True, pieces=8, moe_gate=True
+    )
+
+
 @pytest.mark.parametrize("tail", [13, 1024])
 def test_prepared_pairs_multilayer_strided_bind(tail):
     """Real NPU table arithmetic/copies at 1M capacity, without reading KV payload."""
@@ -78,7 +86,7 @@ def test_prepared_pairs_multilayer_strided_bind(tail):
     ],
 )
 def test_one_capture_replays_live_topk_and_growing_cpu_history(
-    request_capacity, payload, incremental, prepared_pairs, pieces=1
+    request_capacity, payload, incremental, prepared_pairs, pieces=1, moe_gate=False
 ):
     from lmcache.v1.gpu_connector.sparse import (
         PreparedSparseSource,
@@ -176,17 +184,35 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
         )
         side = torch.npu.Stream() if pieces > 1 else None
         fork, done = torch.npu.Event(), torch.npu.Event()
+        if moe_gate:
+            from lmcache_ascend.c_ops import set_sparse_graph_prefetch_allowed
+
+            gate_word = torch.empty(1, dtype=torch.int64, device=device)
+            snapshot = tuple(torch.empty_like(cache) for cache in caches)
+        else:
+            gate_word = None
 
         def load(selected):
             if side is None:
                 transfer.load(selected, counts, slots)
                 return
             main = torch.npu.current_stream()
+            # Force the entire copy to wait so the protected main-stream reads
+            # see the original cache. After reopening, the join must expose new KV.
+            if moe_gate:
+                set_sparse_graph_prefetch_allowed(gate_word, False)
             fork.record(main)
             with torch.npu.stream(side):
                 side.wait_event(fork)
-                transfer.load(selected, counts, slots, max_aiv_cores=12, pieces=pieces)
+                transfer.load(
+                    selected, counts, slots, max_aiv_cores=12,
+                    pieces=pieces, gate_word=gate_word,
+                )
                 done.record(side)
+            if moe_gate:
+                for before, cache in zip(snapshot, caches, strict=True):
+                    before.copy_(cache)
+                set_sparse_graph_prefetch_allowed(gate_word, True)
             main.wait_event(done)
 
         load(torch.topk(scores, 4).indices.to(selected_dtype))
@@ -230,6 +256,8 @@ def test_one_capture_replays_live_topk_and_growing_cpu_history(
                 count_storage[:, 0].copy_(torch.tensor(live, dtype=torch.int32, device=device))
             graph.replay()
             torch.npu.synchronize()
+            if moe_gate:
+                assert all(old.eq(-7).all().item() for old in snapshot)
             assert selected.cpu().tolist() == [case[1] for case in lane_cases]
             for plane, cache in enumerate(caches):
                 flat = cache.view(-1, cache.shape[-1])

@@ -260,7 +260,9 @@ void sparse_graph_kv_transfer(
     const SparseDirectDestinationState &state,
     torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
     torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size,
-    int64_t max_aiv_cores = 0, int64_t pieces = 1);
+    int64_t max_aiv_cores = 0, int64_t pieces = 1,
+    const c10::optional<torch::Tensor> &gate_word = c10::nullopt);
+void set_sparse_graph_prefetch_allowed(const torch::Tensor &gate_word, bool allowed);
 
 // Prepared warm path: destination state is process-owned; all request and step
 // inputs are supplied by the decode generator at launch time.

@@ -437,7 +437,9 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("sparse_graph_kv_transfer", &sparse_graph_kv_transfer,
         py::arg("destination_state"), py::arg("slots"), py::arg("selected"),
         py::arg("counts"), py::arg("ptrs"), py::arg("limits"), py::arg("chunk_size"),
-        py::arg("max_aiv_cores") = 0, py::arg("pieces") = 1);
+        py::arg("max_aiv_cores") = 0, py::arg("pieces") = 1, py::arg("gate_word") = py::none());
+  m.def("set_sparse_graph_prefetch_allowed", &set_sparse_graph_prefetch_allowed,
+        py::arg("gate_word"), py::arg("allowed"));
   m.def("dense_mla_dsa_batched_direct_kv_transfer",
         &dense_mla_dsa_batched_direct_kv_transfer_wrapper,
         py::arg("lmc_tensors"), py::arg("vllm_kv_caches"),

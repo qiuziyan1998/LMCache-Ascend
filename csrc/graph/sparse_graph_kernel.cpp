@@ -131,25 +131,22 @@ PIECE_KERNEL(sfa_copy_piece_i64_s32, int64_t, int32_t)
 PIECE_KERNEL(sfa_copy_piece_i64_s64, int64_t, int64_t)
 
 namespace lmc {
-void launch_sparse_graph_transfer(
+void launch_sparse_graph_piece(
     uint32_t cores, void *stream, bool selected_int64, bool slots_int64,
     uint8_t *k, uint8_t *pe, uint8_t *slots, uint8_t *selected,
     uint8_t *counts, uint8_t *ptrs, uint8_t *limits,
     int32_t chunk_size, int32_t chunks_per_request, int32_t requests,
     int32_t row_width, int32_t count_stride, int32_t k_bytes,
-    int32_t pe_bytes, int64_t destination_slots, int32_t pieces) {
+    int32_t pe_bytes, int64_t destination_slots, int32_t piece, int32_t pieces) {
   if (pieces > 1) {
-    // One torch submission. CANN captures independent, ordered device tasks.
-    for (int32_t piece = 0; piece < pieces; ++piece) {
-      if (selected_int64 && slots_int64) {
-        sfa_copy_piece_i64_s64<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
-      } else if (selected_int64) {
-        sfa_copy_piece_i64_s32<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
-      } else if (slots_int64) {
-        sfa_copy_piece_i32_s64<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
-      } else {
-        sfa_copy_piece_i32_s32<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
-      }
+    if (selected_int64 && slots_int64) {
+      sfa_copy_piece_i64_s64<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
+    } else if (selected_int64) {
+      sfa_copy_piece_i64_s32<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
+    } else if (slots_int64) {
+      sfa_copy_piece_i32_s64<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
+    } else {
+      sfa_copy_piece_i32_s32<<<cores, nullptr, stream>>>(GRAPH_VALUES, piece, pieces);
     }
     return;
   }

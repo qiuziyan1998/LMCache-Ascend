@@ -1,5 +1,6 @@
 #include "mem_kernels.h"
 #include "graph/sparse_graph_kernel.h"
+#include "graph/sparse_prefetch_gate.h"
 #include "common/slow_path_diagnostics.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "utils.h"
@@ -751,11 +752,33 @@ void sparse_mla_dsa_batched_direct_kv_transfer_fast(
   cmd.Run();
 }
 
+static void *prefetch_gate_address(const torch::Tensor &word) {
+#if !LMC_HAS_SFA_STREAM_VALUES
+  TORCH_CHECK(false, "Rebuild LMCache-Ascend with CANN stream-value support to use the SFA MoE gate");
+#endif
+  TORCH_CHECK(word.device().is_privateuseone() && word.scalar_type() == at::kLong &&
+                  word.numel() == 1 && word.is_contiguous(),
+              "The SFA prefetch gate must be one int64 on the NPU");
+  return word.data_ptr<int64_t>();
+}
+
+void set_sparse_graph_prefetch_allowed(const torch::Tensor &gate_word, bool allowed) {
+  void *address = prefetch_gate_address(gate_word);
+  const c10::OptionalDeviceGuard guard(device_of(gate_word));
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("set_sparse_graph_prefetch_allowed");
+  cmd.SetCustomHandler([address, allowed, stream]() -> int {
+    return lmc::write_prefetch_gate(address, allowed, stream);
+  });
+  cmd.Run();
+}
+
 void sparse_graph_kv_transfer(
     const SparseDirectDestinationState &state,
     torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
     torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size, int64_t max_aiv_cores,
-    int64_t pieces) {
+    int64_t pieces, const c10::optional<torch::Tensor> &gate_word) {
   // Host metadata checks run at eager warmup/capture only, never on replay.
   TORCH_CHECK(selected.dim() == 2 && selected.is_contiguous(),
               "Graph selected tokens must be a contiguous matrix");
@@ -799,6 +822,9 @@ void sparse_graph_kv_transfer(
                   limits.device() == selected.device(),
               "Graph transfer inputs must be on the same NPU");
   const c10::OptionalDeviceGuard guard(device_of(selected));
+  TORCH_CHECK(!gate_word || gate_word->device() == selected.device(),
+              "Prefetch gate and transfer must be on the same NPU");
+  void *gate = gate_word ? prefetch_gate_address(*gate_word) : nullptr;
   TORCH_CHECK(max_aiv_cores >= 0 && max_aiv_cores <= std::numeric_limits<uint32_t>::max(),
               "max_aiv_cores must be zero (automatic) or a positive uint32 value");
   uint32_t cores = direct_aiv_num(static_cast<int32_t>(selected.numel()));
@@ -822,14 +848,15 @@ void sparse_graph_kv_transfer(
   at_npu::native::OpCommand cmd;
   cmd.Name("sparse_graph_kv_transfer");
   cmd.SetCustomHandler([=]() -> int {
-    lmc::launch_sparse_graph_transfer(
-        cores, stream, index64, slot64, state.vllm_k_ptr, state.vllm_v_ptr,
-        slot_ptr, selected_ptr, counts_ptr, ptr_table, limit_ptr,
-        static_cast<int32_t>(chunk_size), chunks_per_request,
-        static_cast<int32_t>(requests), row_width, count_stride,
-        static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots,
-        static_cast<int32_t>(pieces));
-    return 0;
+    return lmc::submit_sparse_graph_pieces(stream, gate, static_cast<int32_t>(pieces), [&](int32_t piece) {
+      lmc::launch_sparse_graph_piece(
+          cores, stream, index64, slot64, state.vllm_k_ptr, state.vllm_v_ptr,
+          slot_ptr, selected_ptr, counts_ptr, ptr_table, limit_ptr,
+          static_cast<int32_t>(chunk_size), chunks_per_request,
+          static_cast<int32_t>(requests), row_width, count_stride,
+          static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots,
+          piece, static_cast<int32_t>(pieces));
+    });
   });
   cmd.Run();
 }

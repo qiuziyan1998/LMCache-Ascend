@@ -72,6 +72,29 @@ if(DEFINED ENV{USE_MINDSPORE})
 else()
   add_subdirectory(csrc/graph)
   add_subdirectory(csrc)
+  # Use the same ACL runtime as the CANN 8.5.1 capture probe.
+  # Builds with earlier SDKs retain the ordinary sparse transfer.
+  find_library(LMC_ACL_RT acl_rt PATHS "${ASCEND_CANN_PACKAGE_PATH}/lib64"
+               "${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/devlib" NO_DEFAULT_PATH)
+  if(LMC_ACL_RT)
+    include(CheckCXXSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_INCLUDES "${ASCEND_CANN_PACKAGE_PATH}/include")
+    check_cxx_source_compiles([[
+      #include <acl/acl_rt.h>
+      int main() {
+        (void)sizeof(&aclrtValueWrite);
+        (void)sizeof(&aclrtValueWait);
+        return ACL_STREAM_WAIT_VALUE_GEQ;
+      }
+    ]] LMC_HAS_SFA_STREAM_VALUES)
+    cmake_pop_check_state()
+    if(LMC_HAS_SFA_STREAM_VALUES)
+      target_compile_definitions(c_ops PRIVATE LMC_HAS_SFA_STREAM_VALUES=1)
+      target_link_libraries(c_ops PRIVATE "${LMC_ACL_RT}")
+    endif()
+  endif()
   set(TORCH_LIBS_DIR "${TORCH_PATH}/lib")
 
   target_link_options(c_ops PRIVATE
