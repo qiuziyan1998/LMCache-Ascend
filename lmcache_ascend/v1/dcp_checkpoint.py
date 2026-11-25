@@ -30,6 +30,9 @@ def capture_checkpoint(worker, spec, caches, block_size, prefix_state=None):
         spec.resident_start,
         content_digest(spec.request_configs),
     )
+    indexer_owner = getattr(layout, "indexer_owner", 0)
+    if getattr(layout, "allocation_epoch", 0):
+        identity += (layout.allocation_epoch, indexer_owner)
     job = CaptureJob(spec)
     state = None
     error = None
@@ -45,8 +48,8 @@ def capture_checkpoint(worker, spec, caches, block_size, prefix_state=None):
         if not spec.base <= spec.resident_start <= spec.end:
             raise ValueError("Invalid cooperative checkpoint resident frontier")
         tuple(layout.runs(spec.resident_start, spec.end, group.rank))
-        if group.rank == 0:
-            # Group 1 remains fully resident and uses its original slot mapping.
+        if group.rank == indexer_owner:
+            # Only the request owner has the complete Group-1 history.
             if (spec.end + block_size - 1) // block_size > len(spec.blocks[1]) or any(
                 b <= 0
                 for b in spec.blocks[1][
@@ -161,7 +164,7 @@ def capture_checkpoint(worker, spec, caches, block_size, prefix_state=None):
             job.captured_end = int(state.reply["captured_end"])
             worker._begin_capture(job)
             for kv_group, fragments in job.fragments.items():
-                if kv_group == 1 and not worker.writer:
+                if kv_group == 1 and group.rank != indexer_owner:
                     continue
                 starts, ends, pages = map(list, zip(*fragments))
                 connector = worker.engine.gpu_connector

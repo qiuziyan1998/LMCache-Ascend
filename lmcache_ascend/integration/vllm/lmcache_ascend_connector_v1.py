@@ -34,6 +34,8 @@ logger = init_logger(__name__)
 
 class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
     supports_dsa_index_lmcache = True
+    # Both the scheduler wire and this extension's owner-only DMA must match.
+    dcp_indexer_placement_version = 1 if getattr(LMCacheConnectorV1Dynamic, "dcp_indexer_wire_version", 0) == 1 else 0
 
     @classmethod
     def get_dsa_compact_startup_policy(cls, vllm_config: VllmConfig) -> Optional[tuple[int, int]]:
@@ -86,6 +88,9 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
                 raise ValueError("Decoder DCP compact startup policy rejected: " + details)
             return None
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            if (getattr(vllm_config, "_dsa_decoder_indexer_sharding", False)
+                    and config.dsa_group1_load_mode != "persistent_direct_hbm"):
+                raise ValueError("Request-owned DCP indexer requires persistent_direct_hbm")
             strict_override = config.get_extra_config_value("shared_cpu_cache_strict", None)
             if (
                 config.decoder_storage_mode != "process" or not config.enable_async_loading

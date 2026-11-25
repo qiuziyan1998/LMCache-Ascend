@@ -86,6 +86,10 @@ def store_group(engine, request, kv_group, caches, mask, kwargs, *, input_error=
     except Exception as exc:
         signature, error = (), str(exc)
     identity = (request.req_id, kv_group, len(tokens))
+    layout = getattr(request, "dcp_write_layout", None)
+    indexer_owner = getattr(layout, "indexer_owner", 0)
+    if getattr(layout, "allocation_epoch", 0):
+        identity += (layout.allocation_epoch, indexer_owner)
     inputs = group.exchange("store_plan", identity, (signature, error))
     if any(item != inputs[0] for item in inputs) or any(item[1] for item in inputs):
         raise RuntimeError("Cooperative store request/key plans differ across ranks")
@@ -168,7 +172,7 @@ def store_group(engine, request, kv_group, caches, mask, kwargs, *, input_error=
                     memory_objs=objects,
                     capture_start=min(envelope["capture_start"], ends[-1]),
                 )
-            elif group.rank == 0:
+            elif group.rank == indexer_owner:
                 base = kwargs.get("slot_mapping_base", 0)
                 slots = kwargs["slot_mapping"]
                 if starts[0] < base or ends[-1] - base > len(slots):

@@ -58,7 +58,8 @@ def save_batch(adapter: Any, context: dict) -> None:
                                 "DCP save prefix is not the current request source"
                             )
                         options["dcp_prefix_source"] = source
-                    if group == 1:
+                    if group == 1 and (not getattr(request.dcp_write_layout, "allocation_epoch", 0)
+                                       or engine.dcp_write_group.rank == request.dcp_write_layout.indexer_owner):
                         mapping = request.save_indexer_slot_mapping
                         base = request.save_slot_mapping_base
                         if not mapping:

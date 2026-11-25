@@ -9960,6 +9960,7 @@ class AscendLMCacheEngine(AscendCPUCacheOperations, LMCacheEngine):
             "checkpoint_remote_fill",
             "storage_dense_import",
             "storage_source_import",
+            "dcp_owner_resident",
             "storage_store_import",
         ):
             return envelope
