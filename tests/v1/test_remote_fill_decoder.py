@@ -1272,7 +1272,7 @@ def test_uncertain_commit_rollback_is_visible_with_warning_threshold(
 
     monkeypatch.setattr(serving_perf, "_MODE", mode)
     log = logging.getLogger("lmcache_ascend.v1.remote_fill")
-    monkeypatch.setattr(log, "propagate", True)
+    monkeypatch.setattr(log, "handlers", [caplog.handler])
     caplog.set_level(logging.WARNING, logger=log.name)
     local = _FakeLocalBackend()
     lifecycle = _lifecycle(local)
