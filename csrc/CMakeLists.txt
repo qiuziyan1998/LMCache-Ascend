@@ -57,6 +57,9 @@ set(
 
 set(PYMODULE_FILES 
     ${SRC_FILES}
+    graph/sparse_prefetch_gate.cpp
 )
 
+set_property(SOURCE graph/sparse_prefetch_gate.cpp PROPERTY
+  INCLUDE_DIRECTORIES "${ASCEND_CANN_PACKAGE_PATH}/include")
 pybind11_add_module(c_ops ${PYMODULE_FILES})

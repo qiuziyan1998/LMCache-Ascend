@@ -778,7 +778,7 @@ SparsePrefetchGate::SparsePrefetchGate(const torch::Tensor &word) : word(word) {
   prefetch_gate_address(word);
 #if LMC_HAS_SFA_STREAM_VALUES
   const c10::OptionalDeviceGuard guard(device_of(word));
-  auto rc = aclrtCreateNotify(&token, ACL_NOTIFY_DEFAULT);
+  auto rc = lmc::create_copy_notify(&token);
   TORCH_CHECK(rc == ACL_SUCCESS, "Creating sparse prefetch Notify failed: ", rc);
 #endif
 }
@@ -788,7 +788,7 @@ SparsePrefetchGate::~SparsePrefetchGate() {
   if (token != nullptr) {
     try {
       const c10::OptionalDeviceGuard guard(device_of(word));
-      auto rc = aclrtDestroyNotify(token);
+      auto rc = lmc::destroy_copy_notify(token);
       if (rc != ACL_SUCCESS) {
         TORCH_WARN("Destroying sparse prefetch Notify failed: ", rc);
       }

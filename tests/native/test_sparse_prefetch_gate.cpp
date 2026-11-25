@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Host test of the production submission loop, built with the CANN ACL headers.
-// Build from the repository root:
-// c++ -std=c++17 -DLMC_HAS_SFA_STREAM_VALUES=1 -Icsrc -I"$ASCEND_HOME_PATH/include" tests/native/test_sparse_prefetch_gate.cpp -o gate_test
+// Compile this host test together with csrc/graph/sparse_prefetch_gate.cpp using
+// -std=c++17 -DLMC_HAS_SFA_STREAM_VALUES=1 -Icsrc -I"$ASCEND_HOME_PATH/include".
+// Add the torch_npu wheel's include directory to reproduce the framework header order.
+#if __has_include("third_party/acl/inc/acl/acl.h")
+#include "third_party/acl/inc/acl/acl.h"
+#else
+#include <acl/acl_rt.h>
+#endif
 #include "graph/sparse_prefetch_gate.h"
 #ifdef NDEBUG
 #undef NDEBUG
@@ -46,6 +51,17 @@ extern "C" aclError aclrtValueWrite(void *addr, uint64_t value, uint32_t flag, a
 extern "C" aclError aclrtRecordNotify(aclrtNotify n, aclrtStream stream) {
   assert(n == &notify);
   queue(stream).push_back({Give});
+  return ACL_SUCCESS;
+}
+
+extern "C" aclError aclrtCreateNotify(aclrtNotify *n, uint64_t flag) {
+  assert(flag == 0);
+  *n = &notify;
+  return ACL_SUCCESS;
+}
+
+extern "C" aclError aclrtDestroyNotify(aclrtNotify n) {
+  assert(n == &notify);
   return ACL_SUCCESS;
 }
 
@@ -139,6 +155,8 @@ void check_dynamic_windows() {
 }
 
 int main() {
+  aclrtNotify token = nullptr;
+  assert(lmc::create_copy_notify(&token) == ACL_SUCCESS && token == &notify);
   const auto launch = [](int32_t piece) { calls.push_back(piece); };
   assert(lmc::write_prefetch_gate(&word, true, &main_queue) == ACL_SUCCESS && word == 1);
   assert(lmc::write_prefetch_gate(&word, false, &main_queue) == ACL_SUCCESS && word == 0);
@@ -153,5 +171,6 @@ int main() {
   assert(lmc::submit_sparse_graph_pieces(&side_queue, nullptr, 3, launch) == ACL_SUCCESS);
   assert((calls == std::vector<int>{0, 0, 1, 2}));
   check_dynamic_windows();
+  assert(lmc::destroy_copy_notify(token) == ACL_SUCCESS);
   return 0;
 }
