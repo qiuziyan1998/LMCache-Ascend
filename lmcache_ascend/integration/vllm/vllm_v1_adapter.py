@@ -1239,16 +1239,20 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.kv_role == "kv_consumer" or self.lmcache_engine is None:
             return
         metadata = self._parent._get_connector_metadata()
+        publishable = tuple(
+            request for request in metadata.requests
+            if not getattr(request, "incomplete_prefill_load", False)
+        )
         final_requests = tuple(
             request
-            for request in metadata.requests
+            for request in publishable
             if request.is_last_prefill and not request.is_sparse_decode
         )
         try:
             # Both groups' CPU pages now exist. Start the independent D-cache
             # fill BEFORE waiting for Mooncake puts, not after that barrier.
             self.lmcache_engine.submit_layerwise_prefill_fills(
-                (request.req_id for request in metadata.requests),
+                (request.req_id for request in publishable),
                 request_metadata=(
                     (request.req_id, request.token_ids, request.request_configs,
                      lambda request=request:
@@ -1256,7 +1260,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                      if (state := self._worker_retrieve_state.get(request.req_id))
                      is not None and state.prefill_metadata_cache is not None
                      else None)
-                    for request in metadata.requests
+                    for request in publishable
                     if not request.is_sparse_decode
                 ),
             )
