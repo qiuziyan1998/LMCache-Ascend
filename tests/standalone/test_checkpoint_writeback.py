@@ -895,6 +895,22 @@ def test_pressure_monitor_failure_is_reported_not_silent(deployment):
         store.local.fatal = None  # No native work was started in this CPU test.
 
 
+def test_fixed_group_pressure_spills_even_when_total_free_bytes_are_high(deployment):
+    from types import SimpleNamespace as NS
+
+    engine, create, _ = deployment
+    store = create()
+    assert engine.free == 90000
+    engine.backend.fixed_slots_enabled = True
+    engine.backend.get_page_slot_pool = lambda: NS(
+        shortages=lambda counts, purpose: {0: 1, 1: 0}
+    )
+    store.local.wake.set()
+    wait(lambda: bool(store.local.records["r", 1].remote))
+    wait(lambda: store.local.used == 0)
+    assert engine.free == 90000
+
+
 def test_mixed_c8_spill_preserves_per_layer_key_and_scale_planes(deployment):
     from types import SimpleNamespace as NS
 

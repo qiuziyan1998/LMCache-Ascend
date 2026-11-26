@@ -57,7 +57,7 @@ def connector(*, prefill=True):
     ns = {
         "torch": probe,
         "LayerPageSource": type("LayerPageSource", (), {}),
-        "serving_perf_enabled": lambda: False,
+        "serving_perf_detailed_enabled": lambda: False,
         "_layer_source_memory_objs": lambda sources, layer: sources,
         "nullcontext": nullcontext,
     }

@@ -7,24 +7,27 @@ fragments are private until accepted token IDs arrive from EngineCore.
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+import time
 from typing import Any, Callable
 
-from lmcache_ascend.v1.local_checkpoint import (
-    CheckpointPage,
-    LocalCheckpoint,
-    LocalCheckpointStore,
-    clear_failure_tracebacks,
-)
-import time
+import numpy as np
+import torch
 
 from lmcache.integration.vllm.preemption_checkpoint import (
     CaptureSpec,
     CheckpointResult,
     SealSpec,
 )
+from lmcache.logging import init_logger
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
-import torch
-import numpy as np
+from lmcache_ascend.v1.local_checkpoint import (
+    CheckpointPage,
+    LocalCheckpoint,
+    LocalCheckpointStore,
+    clear_failure_tracebacks,
+)
+
+logger = init_logger(__name__)
 
 
 def _checkpoint_slots(blocks, start: int, end: int, block_size: int) -> torch.Tensor:
@@ -52,6 +55,49 @@ def _checkpoint_slots(blocks, start: int, end: int, block_size: int) -> torch.Te
     return storage.view(-1)[offset : offset + end - start]
 
 
+def _checkpoint_slot_mapping(
+    blocks: tuple[int, ...], starts: list[int], ends: list[int], block_size: int
+) -> torch.Tensor:
+    """Expand validated block IDs in bulk, preserving fragment order and pinning."""
+    count = sum(b - a for a, b in zip(starts, ends, strict=True))
+    if count < 64:
+        # For tiny tails, retain the cheaper existing construction.
+        return torch.tensor(
+            [
+                blocks[i // block_size] * block_size + i % block_size
+                for a, b in zip(starts, ends, strict=True)
+                for i in range(a, b)
+            ],
+            dtype=torch.long,
+            pin_memory=True,
+        )
+    slots = np.empty(count, dtype=np.int64)
+    offsets = np.arange(block_size, dtype=np.int64)
+    cursor = 0
+    for start, end in zip(starts, ends, strict=True):
+        count = end - start
+        if not count:
+            continue
+        first, stop = start // block_size, (end + block_size - 1) // block_size
+        ids = np.asarray(blocks[first:stop], dtype=np.int64)
+        if int(ids.max()) * block_size + block_size - 1 > np.iinfo(np.int64).max:
+            # Preserve exact partial-block behavior at the int64 boundary;
+            # NumPy arithmetic must not silently wrap an invalid slot address.
+            values = np.asarray(
+                [
+                    blocks[i // block_size] * block_size + i % block_size
+                    for i in range(start, end)
+                ],
+                dtype=np.int64,
+            )
+        else:
+            values = (ids[:, None] * block_size + offsets).reshape(-1)
+            values = values[start % block_size : start % block_size + count]
+        slots[cursor : cursor + count] = values
+        cursor += count
+    return torch.tensor(slots, dtype=torch.long, pin_memory=True)
+
+
 @dataclass
 class CaptureJob:
     spec: CaptureSpec
@@ -72,7 +118,7 @@ class CaptureJob:
 class CheckpointWorker:
     """Capture synchronously at HBM reuse; publish accepted CPU-owned spans locally."""
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, *, local_store: Any = None) -> None:
         self.engine = engine
         self.jobs: dict[tuple[str, int], CaptureJob] = {}
         self.results: list[CheckpointResult] = []
@@ -83,11 +129,14 @@ class CheckpointWorker:
         self.max_jobs = max(1, int(engine.config.store_async_max_queue_size or 2))
         self.timeout = float(engine.config.blocking_timeout_secs)
         self.chunk_size = int(engine.config.chunk_size)
-        self.local = LocalCheckpointStore(engine)
-        if getattr(engine.config, "decode_checkpoint_writeback", False):
-            from lmcache_ascend.v1.checkpoint_writeback import CheckpointWritebackStore
+        self.local = local_store
+        if self.local is None:
+            if getattr(engine.config, "decode_checkpoint_writeback", False):
+                from lmcache_ascend.v1.checkpoint_writeback import CheckpointWritebackStore
 
-            self.local = CheckpointWritebackStore(engine, self.executor)
+                self.local = CheckpointWritebackStore(engine, self.executor)
+            else:
+                self.local = LocalCheckpointStore(engine)
 
     def begin_restore(self, req_id: str, generation: int, load_generation: int) -> None:
         """Keep release controls active until the scheduler acknowledges every TP."""
@@ -182,73 +231,17 @@ class CheckpointWorker:
             for group in (0, 1):
                 start = spec.resident_start if group == 0 else spec.base
                 blocks = spec.blocks[group]
-                stop = (spec.end + block_size - 1) // block_size
-                if stop > len(blocks) or (
-                    start < spec.end
-                    and any(blocks[i] <= 0 for i in range(start // block_size, stop))
+                if (spec.end + block_size - 1) // block_size > len(blocks) or (
+                    start < spec.end and any(
+                        blocks[i] <= 0
+                        for i in range(
+                            start // block_size,
+                            (spec.end + block_size - 1) // block_size,
+                        )
+                    )
                 ):
                     raise ValueError("Checkpoint source includes released/null blocks")
-            allocators = {
-                group: self.engine.prepare_checkpoint_allocator(group, caches[group])
-                for group in (0, 1)
-                if (spec.resident_start if group == 0 else spec.base) < spec.end
-            }
-            cursor, reclaimed = spec.base, False
-            while cursor < spec.end:
-                desired_end = min(
-                    spec.end, (cursor // self.chunk_size + 1) * self.chunk_size
-                )
-                end = desired_end
-                while end > cursor:
-                    candidate = {}
-                    try:
-                        for group in (0, 1):
-                            start = (
-                                max(cursor, spec.resident_start)
-                                if group == 0
-                                else cursor
-                            )
-                            if start >= end:
-                                continue
-                            try:
-                                page, _ = self._allocate_fragment(
-                                    allocators[group], end - start
-                                )
-                            except MemoryError:
-                                if reclaimed:
-                                    raise
-                                reclaimed = True
-                                missing = {
-                                    g: None  # Both group layouts are already prepared.
-                                    for g in (group, 1)
-                                    if g not in candidate
-                                }
-                                if not self.engine.reclaim_checkpoint_capacity(
-                                    end - cursor, missing
-                                ):
-                                    raise
-                                page, _ = self._allocate_fragment(
-                                    allocators[group], end - start
-                                )
-                            candidate[group] = (start, end, page)
-                    except MemoryError:
-                        for _, _, page in candidate.values():
-                            page.ref_count_down()
-                        end = cursor + (end - cursor) // 2
-                        continue
-                    except BaseException:
-                        for _, _, page in candidate.values():
-                            page.ref_count_down()
-                        raise
-                    for group, fragment in candidate.items():
-                        job.fragments.setdefault(group, []).append(fragment)
-                    cursor = end
-                    break
-                if end != desired_end:
-                    break  # Keep one smaller tail; bound failed-allocation work.
-            if cursor <= spec.prefix_end:
-                raise MemoryError("Checkpoint CPU staging allocation refused")
-            job.captured_end = cursor
+            job.captured_end = self._reserve_fragments(job, caches)
             # Admit the entire selected paired prefix before device preparation.
             for group, fragments in job.fragments.items():
                 starts = [a for a, _, _ in fragments]
@@ -257,6 +250,7 @@ class CheckpointWorker:
                 blocks = spec.blocks[group]
                 slots = _checkpoint_slots(blocks, starts[0], ends[-1], block_size)
                 device_work_started = True
+                self._begin_capture(job)
                 plan = self.engine.gpu_connector.prepare_group_capture(
                     [pages] * self.engine.num_layers_for_group(group),
                     starts,
@@ -275,6 +269,7 @@ class CheckpointWorker:
             # capture. No layer/group payload is read by the host before this.
             events[-1].synchronize()
             captured_at = time.monotonic()
+            self._capture_completed(job)
             job.plans.clear()
             self.jobs[key] = job
             self.results.append(
@@ -449,6 +444,140 @@ class CheckpointWorker:
             close()
         self.executor.shutdown(wait=True)
         self.poll()
+
+    def _reserve_fragments(self, job: CaptureJob, caches: dict[int, list]) -> int:
+        """Reserve paired CPU destinations before preparing device operands."""
+        spec = job.spec
+        key = (spec.req_id, spec.generation)
+        allocators = {
+            group: self.engine.prepare_checkpoint_allocator(group, caches[group])
+            for group in (0, 1)
+            if (spec.resident_start if group == 0 else spec.base) < spec.end
+        }
+        fixed_slots = getattr(
+            self.engine, "checkpoint_uses_fixed_slots", lambda: False
+        )()
+        reclaim_attempts = 0
+        stop_reason = None
+        cursor = spec.base
+        while cursor < spec.end:
+            desired_end = min(
+                spec.end, (cursor // self.chunk_size + 1) * self.chunk_size
+            )
+            end = desired_end
+            while end > cursor:
+                candidate = {}
+                try:
+                    for group in (0, 1):
+                        start = (
+                            max(cursor, spec.resident_start)
+                            if group == 0
+                            else cursor
+                        )
+                        if start >= end:
+                            continue
+                        try:
+                            page, _ = self._allocate_fragment(
+                                allocators[group], end - start
+                            )
+                        except MemoryError:
+                            if not fixed_slots and reclaim_attempts:
+                                raise
+                            reclaim_attempts += 1
+                            if fixed_slots:
+                                # Reclaim only the refused slot. Each fragment/group
+                                # gets one scan and one allocation retry.
+                                reclaimed = self.engine.reclaim_checkpoint_capacity(
+                                    end - start,
+                                    {group: None},
+                                    allocation_purpose="checkpoint",
+                                )
+                            else:
+                                # The variable allocator shares one slab.
+                                reclaimed = self.engine.reclaim_checkpoint_capacity(
+                                    end - cursor, dict.fromkeys(range(group, 2))
+                                )
+                            if not reclaimed:
+                                stop_reason = "reclaim_unsatisfied"
+                                raise
+                            try:
+                                page, _ = self._allocate_fragment(
+                                    allocators[group], end - start
+                                )
+                            except MemoryError:
+                                stop_reason = "retry_refused"
+                                raise
+                        candidate[group] = (start, end, page)
+                except MemoryError:
+                    for _, _, page in candidate.values():
+                        page.ref_count_down()
+                    if fixed_slots:
+                        # A shorter tail costs the same slot. Preserve any
+                        # completed pairs, but do not publish this chunk.
+                        end = cursor
+                        break
+                    end = cursor + (end - cursor) // 2
+                    continue
+                except BaseException:
+                    for _, _, page in candidate.values():
+                        page.ref_count_down()
+                    raise
+                for group, fragment in candidate.items():
+                    job.fragments.setdefault(group, []).append(fragment)
+                cursor = end
+                break
+            if end != desired_end:
+                break  # Keep one smaller tail; bound failed-allocation work.
+        if cursor <= spec.prefix_end:
+            if fixed_slots and stop_reason is not None:
+                logger.warning(
+                    "[CHECKPOINT_CAPTURE_FAILED] req=%s generation=%d "
+                    "requested_end=%d staged_end=%d failed_group=%d "
+                    "fragment_start=%d fragment_end=%d reclaim_attempts=%d "
+                    "stop_reason=%s",
+                    *key,
+                    spec.end,
+                    cursor,
+                    group,
+                    start,
+                    desired_end,
+                    reclaim_attempts,
+                    stop_reason,
+                )
+            raise MemoryError("Checkpoint CPU staging allocation refused")
+        job.captured_end = cursor
+        if fixed_slots and stop_reason is not None:
+            logger.warning(
+                "[CHECKPOINT_CAPTURE_TRUNCATED] req=%s generation=%d "
+                "requested_end=%d captured_end=%d short_by=%d failed_group=%d "
+                "fragment_start=%d fragment_end=%d reclaim_attempts=%d "
+                "stop_reason=%s",
+                *key,
+                spec.end,
+                job.captured_end,
+                spec.end - job.captured_end,
+                group,
+                start,
+                desired_end,
+                reclaim_attempts,
+                stop_reason,
+            )
+        elif fixed_slots and reclaim_attempts:
+            logger.info(
+                "[CHECKPOINT_CAPTURE_RECOVERED] req=%s generation=%d "
+                "requested_end=%d captured_end=%d reclaim_attempts=%d",
+                *key,
+                spec.end,
+                job.captured_end,
+                reclaim_attempts,
+            )
+        return job.captured_end
+
+    def _begin_capture(self, job: CaptureJob) -> None:
+        """Acquire optional external consumer ownership before device preparation."""
+
+    def _capture_completed(self, job: CaptureJob) -> None:
+        """Publish optional external readiness after the final native fence."""
 
     @staticmethod
     def _release(job: CaptureJob) -> None:

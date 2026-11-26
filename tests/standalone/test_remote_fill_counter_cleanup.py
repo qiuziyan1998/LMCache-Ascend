@@ -146,7 +146,7 @@ def test_finish_preserves_terminal_accounting_and_fatal_handling(implementation,
     state.submitted_bytes = 64
     instance.wait = lambda current: calls.append("wait")
     instance._latch_fatal = lambda current: calls.append("fatal")
-    instance.record_success = lambda: calls.append("success")
+    instance.record_success = lambda current: calls.append(("success", current))
     if fatal:
         with pytest.raises(implementation.RemoteFillFatalError):
             instance.finish("request", state, 2176, 2048)
@@ -160,7 +160,7 @@ def test_finish_preserves_terminal_accounting_and_fatal_handling(implementation,
             persistent_common_end=2048,
             final_partial_valid_tokens=128,
         ),
-        "success",
+        ("success", state),
     ]
     assert metrics.snapshot()["attempts_total"] == {"LOCAL_FULL:none": 1}
     assert metrics.snapshot()["bytes"]["published_bytes"] == 64

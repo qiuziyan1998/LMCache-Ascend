@@ -159,7 +159,7 @@ def _mk_eng(cs: int = 128) -> Any:
     e: Any = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
     d = e.__dict__
     d.update(config=cfg, metadata=meta, token_database=ChunkedTokenDatabase(cfg, meta))
-    d.update(num_layers=2, _init_failed=False, _health_monitor=None)
+    d.update(num_layers=2, _init_failed=False, _health_monitor=None, storage_process=None)
     d.update(_layerwise_prefill_store_frontiers={}, _force_layerwise_prefill_store=True)
     d.update(kvcache_check_log_enabled=False, store_location="LocalCPUBackend")
     d.update(_direct_store_states={}, _layerwise_put_queue=None)
@@ -1003,7 +1003,9 @@ class TestAscendSharedPrefillOptimizations(unittest.TestCase):
         impl.lmcache_engine = _N(
             _recompute_fallback_req_ids=set(),
             _layerwise_cpu_fill_sources=fill_srcs,
-            submit_layerwise_prefill_fills=lambda rids: fill_reqs.append(list(rids)),
+            submit_layerwise_prefill_fills=lambda rids, *, request_metadata=(): fill_reqs.append(
+                list(rids)
+            ),
             poll_layerwise_prefill_puts=lambda **kw: poll_calls.append(kw),
             wait_for_pending_sync_stores=lambda: None,
             drop_direct_store_states=lambda rids: dropped_states.append(tuple(rids)),
@@ -1404,6 +1406,7 @@ class TestAscendSharedPrefillOptimizations(unittest.TestCase):
 
         released: list[str] = []
         eng: Any = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
+        eng.storage_process = None
         eng.gpu_connector = c_fail
         eng._store_worker_thread = None
         eng._remote_fill_fatal_transfers = set()

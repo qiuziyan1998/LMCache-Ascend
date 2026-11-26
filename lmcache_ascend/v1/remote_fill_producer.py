@@ -1043,9 +1043,6 @@ class RemoteFillProducerSession:
                     "armed native transfer failed without terminal evidence"
                 ) from error
 
-        expected_bytes = sum(
-            descriptor.destination_length for descriptor in descriptors
-        )
         if native_error is None:
             if not isinstance(native_result, NativeDirectPushResult):
                 self.fatal_restart_required = True
@@ -1076,7 +1073,7 @@ class RemoteFillProducerSession:
             completed_bytes = int(native_result.transferred_bytes)
             if (
                 native_result.native_transfer_attempt_id != attempt_id
-                or completed_bytes != expected_bytes
+                or completed_bytes != submitted_bytes
             ):
                 return_code = -1
                 completed_bytes = 0
@@ -1142,7 +1139,7 @@ class RemoteFillProducerSession:
                     native_transfer_attempt_id=attempt_id,
                     native_return_code=return_code,
                     completed_bytes=completed_bytes,
-                    expected_bytes=expected_bytes,
+                    expected_bytes=submitted_bytes,
                 )
             except Exception as status_error:
                 self.fatal_restart_required = True

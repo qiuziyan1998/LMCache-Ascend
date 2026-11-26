@@ -85,6 +85,7 @@ class TestPrepareLayerwisePrefillGroup0Skip(unittest.TestCase):
     ) -> None:
         released: list[str] = []
         eng: Any = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
+        eng.storage_process = None
         eng._checkpoint_quarantined_owners = None
         eng.checkpoint_worker = None
         eng._failed_sparse_loads = None
@@ -347,6 +348,7 @@ class TestPrepareLayerwisePrefillGroup0Skip(unittest.TestCase):
         gpu_conn.release_sparse_chunk_ptr_cache = lambda *_a: None  # type: ignore[method-assign]
 
         eng: Any = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
+        eng.storage_process = None
         eng.config = cfg
         eng.metadata = meta
         eng.token_database = db

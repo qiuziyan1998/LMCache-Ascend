@@ -121,15 +121,19 @@ class CheckpointWritebackStore(LocalCheckpointStore):
         """Tombstone synchronously; retire idle owners without waiting for I/O."""
         retired = []
         with self.lock:
-            for key in tuple(self.manifests):
-                if key[0] == req_id and (generation is None or key[1] == generation):
-                    self.manifests.pop(key, None)
-                    record = self.records.pop(key, None)
-                    if record is not None:
-                        record.cancelled = True
-                        retired.append(record.groups)
-                        record.groups = [[], []]
-                        record.pages.clear()
+            keys = (
+                ((req_id, generation),)
+                if generation is not None
+                else tuple(k for k in self.manifests if k[0] == req_id)
+            )
+            for key in keys:
+                self.manifests.pop(key, None)
+                record = self.records.pop(key, None)
+                if record is not None:
+                    record.cancelled = True
+                    retired.append(record.groups)
+                    record.groups = [[], []]
+                    record.pages.clear()
         for groups in retired:
             self.executor.submit(self._retire, groups)
         self.wake.set()
@@ -249,7 +253,16 @@ class CheckpointWritebackStore(LocalCheckpointStore):
                     return
             if self.engine.is_frozen():
                 continue
-            free, _ = self.engine.checkpoint_backend().get_allocator_capacity_bytes()
+            backend = self.engine.checkpoint_backend()
+            free, _ = backend.get_allocator_capacity_bytes()
+            slot_pressure = bool(
+                getattr(backend, "fixed_slots_enabled", False)
+                and any(
+                    backend.get_page_slot_pool()
+                    .shortages({0: 1, 1: 1}, "checkpoint")
+                    .values()
+                )
+            )
             credit = (
                 0
                 if free >= self.reserve or time.monotonic() >= credit_until
@@ -262,7 +275,7 @@ class CheckpointWritebackStore(LocalCheckpointStore):
             previous_free = free
             with self.lock:
                 draining = self.used >= self.limit * (0.6 if draining else 0.8)
-                if not draining and free + credit >= self.reserve:
+                if not draining and not slot_pressure and free + credit >= self.reserve:
                     continue
                 record = next(
                     (
@@ -277,7 +290,7 @@ class CheckpointWritebackStore(LocalCheckpointStore):
                 )
                 if record is None:
                     continue
-                groups = [[(s, p) for s, p in g] for g in record.groups]
+                groups = [list(g) for g in record.groups]
                 for g in groups:
                     for _, page in g:
                         page.ref_count_up()

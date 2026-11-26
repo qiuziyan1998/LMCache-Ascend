@@ -57,17 +57,45 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             extra.get("enable_shared_cpu_cache", config.enable_shared_cpu_cache)
             if isinstance(extra, dict) else config.enable_shared_cpu_cache
         )
-        if (
-            transfer is None or transfer.kv_role not in ("kv_consumer", "kv_both")
-            or getattr(transfer, "kv_load_failure_policy", None) != "fail"
-            or getattr(config, "pd_role", None) != "receiver"
-            or getattr(config, "dsa_group1_load_mode", None) not in ("persistent_direct_hbm", "p2p_preferred")
-            or not getattr(config, "enable_dsa_cold_compact_load", False)
-            or vllm_config.cache_config.enable_prefix_caching
-            or not config.enable_sparse_attention or not config.dsa_two_groups
-            or not shared_cpu or not config.use_layerwise
-        ):
+        # Probe the same effective values used at runtime. DCP cannot use the
+        # ordinary full-cache fallback, so report every failed prerequisite
+        # instead of letting the worker turn None into an opaque startup error.
+        requirements = [
+            ("kv_role", getattr(transfer, "kv_role", None), ("kv_consumer", "kv_both")),
+            ("kv_load_failure_policy", getattr(transfer, "kv_load_failure_policy", None), ("fail",)),
+            ("pd_role", getattr(config, "pd_role", None), ("receiver",)),
+            ("dsa_group1_load_mode", getattr(config, "dsa_group1_load_mode", None),
+             ("persistent_direct_hbm", "p2p_preferred")),
+            ("enable_shared_cpu_cache (effective)", bool(shared_cpu), (True,)),
+            ("enable_prefix_caching", bool(getattr(getattr(vllm_config, "cache_config", None),
+                                                 "enable_prefix_caching", False)), (False,)),
+        ]
+        requirements.extend(
+            (name, bool(getattr(config, name, False)), (True,))
+            for name in ("enable_dsa_cold_compact_load", "enable_sparse_attention",
+                         "dsa_two_groups", "use_layerwise")
+        )
+        rejected = [(name, value, allowed) for name, value, allowed in requirements if value not in allowed]
+        if rejected:
+            parallel = getattr(vllm_config, "parallel_config", None)
+            if getattr(parallel, "decode_context_parallel_size", 1) > 1:
+                details = "; ".join(
+                    f"{name}={value!r} (requires {' or '.join(repr(item) for item in allowed)})"
+                    for name, value, allowed in rejected
+                )
+                raise ValueError("Decoder DCP compact startup policy rejected: " + details)
             return None
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            strict_override = config.get_extra_config_value("shared_cpu_cache_strict", None)
+            if (
+                config.decoder_storage_mode != "process" or not config.enable_async_loading
+                or not config.local_cpu or not config.enable_shared_cpu_cache
+                or not config.shared_cpu_cache_strict
+                or (strict_override is not None and not strict_override)
+                or not config.get_extra_config_value("save_only_first_rank", True)
+                or config.chunk_size % vllm_config.cache_config.block_size
+            ):
+                raise ValueError("Decoder DCP requires async process storage with one strict shared CPU source")
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config
@@ -84,8 +112,12 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
     def get_dsa_compact_runtime_policy(self, vllm_config: VllmConfig) -> Optional[tuple[int, int]]:
         engine = self._lmcache_engine
         policy = self._compact_policy_from_config(vllm_config, engine.config)
-        if policy != (getattr(engine, "_dsa_scratch_capacity", None),
-                      getattr(engine, "_dsa_kv_policy_threshold", None)):
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        if (
+            (dcp > 1 and getattr(engine, "_dsa_dcp_size", None) != dcp)
+            or policy != (getattr(engine, "_dsa_scratch_capacity", None),
+                          getattr(engine, "_dsa_kv_policy_threshold", None))
+        ):
             return None
         return policy
 
@@ -176,6 +208,21 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
             allow_empty=allow_empty,
             request_ids=request_ids,
             frontiers=frontiers,
+        )
+
+    def prepare_warm_sparse_graph_step(
+        self,
+        metadata: Any,
+        target_layer_names: tuple[str, ...],
+        request_ids: tuple[str, ...],
+        frontiers: tuple[int, ...],
+    ) -> Any:
+        """Preview a warm worker-local graph step without starting transfers."""
+        prepare = getattr(self._lmcache_engine, "prepare_warm_sparse_graph_step", None)
+        return (
+            prepare(metadata, target_layer_names, request_ids, frontiers)
+            if callable(prepare)
+            else None
         )
 
     def capture_live_source_event_handoff(self, forward_context: Any) -> bool:

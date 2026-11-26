@@ -57,9 +57,13 @@ class LocalCheckpointStore:
     def forget(self, req_id: str, generation: int | None = None) -> None:
         """Discard offers, leaving ordinary LRU responsible for unowned pages."""
         with self.lock:
-            for key in tuple(self.manifests):
-                if key[0] == req_id and (generation is None or key[1] == generation):
-                    del self.manifests[key]
+            keys = (
+                ((req_id, generation),)
+                if generation is not None
+                else tuple(k for k in self.manifests if k[0] == req_id)
+            )
+            for key in keys:
+                self.manifests.pop(key, None)
 
     def manifest(self, req_id: str, generation: int) -> LocalCheckpoint | None:
         with self.lock:

@@ -272,6 +272,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 else {}
             ),
         )
+        if role == KVConnectorRole.WORKER and getattr(self, "_dsa_dcp_size", None):
+            from vllm.distributed.parallel_state import get_tp_group
+            from lmcache_ascend.v1.dcp_write_group import DcpWriteGroup
+
+            self.lmcache_engine.dcp_write_group = DcpWriteGroup(
+                get_tp_group(), float(self.config.blocking_timeout_secs),
+            )
         checkpoint_worker = getattr(self.lmcache_engine, "checkpoint_worker", None)
         if checkpoint_worker is not None:
             checkpoint_worker.configure_capacity(self._decode_window_save_window_size, self._lmcache_chunk_size)
@@ -341,11 +348,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
         if self._direct_store_requested and self._force_layerwise_prefill_store:
             logger.warning(
-                "[PREFILL_STORE_FALLBACK] Layerwise prefill reuses two KV banks; "
+                "[PREFILL_STORE_FALLBACK] Layerwise prefill reuses %d KV banks; "
                 "ignoring all-layer NPU direct-store/RemoteFill source reads. "
                 "Using per-layer NPU-to-CPU saves before bank reuse and "
                 "persistent remote publication. RemoteFill can send the "
-                "completed CPU pages concurrently with Mooncake persistence."
+                "completed CPU pages concurrently with Mooncake persistence.",
+                self._layerwise_prefill_bank_count,
             )
         if self._direct_store_requested and not self._force_layerwise_prefill_store:
             extra = self.config.extra_config or {}
@@ -378,6 +386,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             and self.store_async
             and not self._direct_store_requested
             and not self._force_layerwise_prefill_store
+            and not getattr(self, "_dsa_dcp_size", None)
         ):
             raise ValueError(
                 "Layerwise storing is not supported with async store"
@@ -516,9 +525,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         return True
 
     def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
+        # Receiver engines disable direct publication. Keep their local prefill
+        # on the layerwise writer so both groups become a prepared CPU source.
+        # Use the role on all TP ranks; passive sender engines are also disabled.
         if (
             getattr(self, "_force_layerwise_prefill_store", False)
             or not getattr(self, "_direct_store_requested", False)
+            or getattr(self.config, "pd_role", None) == "receiver"
             or self.kv_role == "kv_consumer"
             or self.lmcache_engine is None
             or self._parent._connector_metadata is None
@@ -563,6 +576,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
         if (
             (self._direct_store_requested or self._force_layerwise_prefill_store)
+            and not getattr(self, "_dsa_dcp_size", None)
             and completed
             and result is not None
             and result.committed_end > 0
@@ -681,6 +695,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         **kwargs: Any,
     ) -> None:
         """Use one direct page submission after all required layers are ready."""
+        if getattr(self, "_dsa_dcp_size", None):
+            # The cooperative writer joins all layers/ranks at wait_for_save.
+            # DCP decoder caches have no rotating P banks to overwrite here.
+            return
         requests = self._direct_prefill_requests()
         if requests is None:
             super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
@@ -1150,22 +1168,25 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     "Layerwise prefill admission requires LocalCPUBackend"
                 )
             pool = backend.get_prefill_admission_capacity()
-            # Include alignment for the ordinary per-layer allocation fallback,
-            # not only the smaller alignment overhead of merged pages.
-            allocator = backend.get_memory_allocator()
-            alignment = int(getattr(allocator, "align_bytes", 4096))
-            shapes, dtypes = metadata.get_shapes(), metadata.get_dtypes()
-            layer_counts = metadata.runtime_kv_group_layer_counts
-            if layer_counts is None:
-                raise RuntimeError(
-                    "Layerwise prefill admission requires resolved KV groups"
+            if "page_bytes" in pool:
+                page_bytes = pool["page_bytes"]
+            else:
+                # Include alignment for the ordinary per-layer allocation fallback,
+                # not only the smaller alignment overhead of merged pages.
+                allocator = backend.get_memory_allocator()
+                alignment = int(getattr(allocator, "align_bytes", 4096))
+                shapes, dtypes = metadata.get_shapes(), metadata.get_dtypes()
+                layer_counts = metadata.runtime_kv_group_layer_counts
+                if layer_counts is None:
+                    raise RuntimeError(
+                        "Layerwise prefill admission requires resolved KV groups"
+                    )
+                page_bytes = sum(
+                    int(shape.numel()) * dtype.itemsize + alignment * layers
+                    for shape, dtype, layers in zip(
+                        shapes, dtypes, layer_counts, strict=True
+                    )
                 )
-            page_bytes = sum(
-                int(shape.numel()) * dtype.itemsize + alignment * layers
-                for shape, dtype, layers in zip(
-                    shapes, dtypes, layer_counts, strict=True
-                )
-            )
         coordinator = getattr(self, "_cold_load_coordinator", None)
         pending = {
             state.req_id
@@ -1380,11 +1401,42 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             for request in active_requests
             if request.is_last_prefill and not request.is_sparse_decode
         )
+        def _fill_metadata_cache(req):
+            state = self._worker_retrieve_state.get(req.req_id)
+            if state is not None and state.prefill_metadata_cache is not None:
+                return self._prefill_metadata_cache_for_request(req, state)
+            pre_hashes = getattr(req, "prefill_chunk_hashes", None)
+            pre_offsets = getattr(req, "prefill_chunk_offsets", None)
+            token_db = getattr(self.lmcache_engine, "token_database", None)
+            if pre_hashes and pre_offsets and token_db is not None:
+                from lmcache.v1.prefill_metadata import PrefillMetadataCache
+
+                cache = PrefillMetadataCache()
+                cache.seed_precomputed_hashes(
+                    token_db,
+                    pre_hashes,
+                    pre_offsets,
+                    request_configs=req.request_configs,
+                )
+                return cache
+            return None
+
+        batch_ok = False
         try:
             # Both groups' CPU pages now exist. Start the independent D-cache
             # fill BEFORE waiting for Mooncake puts, not after that barrier.
             self.lmcache_engine.submit_layerwise_prefill_fills(
-                request.req_id for request in active_requests
+                (request.req_id for request in active_requests),
+                request_metadata=(
+                    (
+                        request.req_id,
+                        request.token_ids,
+                        request.request_configs,
+                        lambda request=request: _fill_metadata_cache(request),
+                    )
+                    for request in active_requests
+                    if not request.is_sparse_decode
+                ),
             )
             self.lmcache_engine.poll_layerwise_prefill_puts(
                 final=bool(final_requests),
@@ -1393,8 +1445,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             # Only legacy/non-page fallback puts land in this set. Normal
             # Mooncake CPU-page puts use the bounded asynchronous queue above.
             self.lmcache_engine.wait_for_pending_sync_stores()
-        except Exception:
-            raise
+            batch_ok = True
         finally:
             completed = getattr(self, "_completed_layerwise_stores", {})
             self._completed_layerwise_stores = {}
@@ -1408,50 +1459,58 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     if old_unv > int(
                         getattr(res, "unverified_prefix_end", 0) or 0
                     ):
-                        res_any: Any = res
-                        res_any.unverified_prefix_end = old_unv
-        pending = getattr(self, "_layerwise_local_store_results", None)
-        if pending is None:
-            pending = self._layerwise_local_store_results = {}
-        pending.update(completed)
-        if callable(is_fb):
-            fallback_req_ids.update(
-                req_id for (req_id, _) in completed if is_fb(req_id)
-            )
-        if fallback_req_ids:
-            fb_tuple = tuple(sorted(fallback_req_ids))
-            poll_puts = getattr(
-                self.lmcache_engine, "poll_layerwise_prefill_puts", None
-            )
-            if callable(poll_puts):
-                poll_puts(final=True, req_ids=fb_tuple)
-            fill_srcs = getattr(
-                self.lmcache_engine, "_layerwise_cpu_fill_sources", None
-            )
-            rel_pages = getattr(
-                self.lmcache_engine, "release_layerwise_prefill_pages", None
-            )
-            for fb_id in fb_tuple:
-                for grp in (0, 1):
-                    pending.pop((fb_id, grp), None)
-                if isinstance(fill_srcs, dict):
-                    groups = fill_srcs.pop(fb_id, None)
-                    if isinstance(groups, dict):
-                        for entry in groups.values():
-                            if (
-                                isinstance(entry, tuple)
-                                and len(entry) >= 2
-                                and hasattr(entry[1], "release")
-                            ):
-                                entry[1].release()
-            cleanup_fb = getattr(
-                self, "_cleanup_fallback_direct_requests", None
-            )
-            if callable(cleanup_fb):
-                cleanup_fb(fb_tuple)
-            if callable(rel_pages):
-                for fb_id in fb_tuple:
-                    rel_pages(fb_id)
+                        setattr(res, "unverified_prefix_end", old_unv)
+            pending = getattr(self, "_layerwise_local_store_results", None)
+            if pending is None:
+                pending = self._layerwise_local_store_results = {}
+            pending.update(completed)
+            if callable(is_fb):
+                fallback_req_ids.update(
+                    req_id for (req_id, _) in completed if is_fb(req_id)
+                )
+            if fallback_req_ids:
+                fb_tuple = tuple(sorted(fallback_req_ids))
+                poll_puts = getattr(
+                    self.lmcache_engine, "poll_layerwise_prefill_puts", None
+                )
+                try:
+                    if callable(poll_puts):
+                        poll_puts(final=True, req_ids=fb_tuple)
+                except Exception:
+                    if batch_ok:
+                        raise
+                finally:
+                    fill_srcs = getattr(
+                        self.lmcache_engine,
+                        "_layerwise_cpu_fill_sources",
+                        None,
+                    )
+                    rel_pages = getattr(
+                        self.lmcache_engine,
+                        "release_layerwise_prefill_pages",
+                        None,
+                    )
+                    for fb_id in fb_tuple:
+                        for grp in (0, 1):
+                            pending.pop((fb_id, grp), None)
+                        if isinstance(fill_srcs, dict):
+                            groups = fill_srcs.pop(fb_id, None)
+                            if isinstance(groups, dict):
+                                for entry in groups.values():
+                                    if (
+                                        isinstance(entry, tuple)
+                                        and len(entry) >= 2
+                                        and hasattr(entry[1], "release")
+                                    ):
+                                        entry[1].release()
+                    cleanup_fb = getattr(
+                        self, "_cleanup_fallback_direct_requests", None
+                    )
+                    if callable(cleanup_fb):
+                        cleanup_fb(fb_tuple)
+                    if callable(rel_pages):
+                        for fb_id in fb_tuple:
+                            rel_pages(fb_id)
         if not final_requests:
             return
         # Local completion is deliberately NOT adopted as persistent progress
@@ -1480,7 +1539,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 ),
             )
 
+    def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
+        if getattr(self, "_dsa_dcp_size", None):
+            from lmcache_ascend.v1.dcp_save import save_batch
+
+            save_batch(self, save_context)
+            return
+        super()._wait_for_save_impl(save_context)
+
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        if getattr(self, "_dsa_dcp_size", None):
+            if getattr(self.lmcache_engine, "_process_store_writes", None):
+                # Base wait_for_save must not mark its final fence complete or
+                # acknowledge HBM reuse after an uncertain cooperative capture.
+                raise RuntimeError("DCP save ownership remains unresolved")
+            return  # Cooperative captures/publication settled in the boundary above.
         if getattr(self, "_force_layerwise_prefill_store", False):
             self._finish_layerwise_prefill_batch()
             return
@@ -1933,7 +2006,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         previous_latent_future: Any = None,
         live_state: Any = None,
     ) -> Any:
-        if not hasattr(plan["request"].load_spec, "checkpoint_generation"):
+        if (getattr(self.lmcache_engine, "storage_process", None) is not None
+                or not hasattr(plan["request"].load_spec, "checkpoint_generation")):
             state = super()._run_dsa_cold_compact_load(
                 plan,
                 npu_device_id,
@@ -1980,7 +2054,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     def _run_dsa_cold_indexer_load(self, plan: Any, npu_device_id: Any) -> Any:
         request = plan["request"]
-        if not hasattr(request.load_spec, "checkpoint_generation"):
+        if (getattr(self.lmcache_engine, "storage_process", None) is not None
+                or not hasattr(request.load_spec, "checkpoint_generation")):
             return super()._run_dsa_cold_indexer_load(plan, npu_device_id)
         if self.config.pd_role is None:
             # Standalone keeps both groups in the ordinary shared-CPU path.
@@ -2014,9 +2089,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             raise error
         if not agreed:
             raise RuntimeError("Checkpoint prefix failed on another TP rank")
-        result = super()._run_dsa_cold_indexer_load(tail, npu_device_id)
+        _, readiness = super()._run_dsa_cold_indexer_load(tail, npu_device_id)
         # Both the persistent prefix and the CPU tail have reached readiness.
-        return plan["token_mask"], result[1], result[2], result[3]
+        return plan["token_mask"], readiness
 
     def _record_checkpoint_restore_miss(
         self, request: Any, generation: int, error: BaseException
@@ -2125,7 +2200,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     metadata.descriptors, metadata.remote_fill_results, results,
                     prefill_admission=metadata.prefill_admission,
                 )
-        if not worker.jobs and not worker.restore_owners:
+        sources_drained = getattr(worker, "sources_drained", None)
+        if (
+            not worker.jobs
+            and not worker.restore_owners
+            and (sources_drained is None or sources_drained())
+        ):
             # Reveal the original class methods (or restore pre-existing
             # instance hooks), rather than retaining bound checkpoint methods
             # when cyclic GC is disabled.
@@ -2181,8 +2261,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             and config.get_extra_config_value("save_only_first_rank", True)
             and not vllm_config.cache_config.enable_prefix_caching
             and load_mode_supported
-            and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size
-            == parallel.decode_context_parallel_size == 1
+            and parallel.pipeline_parallel_size == parallel.prefill_context_parallel_size == 1
+            and (parallel.decode_context_parallel_size == 1 or (
+                config.pd_role == "receiver" and config.decoder_storage_mode == "process"
+                and config.enable_async_loading and config.local_cpu
+                and config.shared_cpu_cache_strict
+                and parallel.decode_context_parallel_size == parallel.tensor_parallel_size
+                and parallel.decode_context_parallel_size in (2, 4, 8)
+            ))
             and (spec is None or (
                 spec.method in ("mtp", "deepseek_mtp") and spec.num_speculative_tokens == 1
                 and not spec.parallel_drafting and not spec.disable_padded_drafter_batch
@@ -2192,7 +2278,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "decode_preemption_checkpoint requires the two-group shared-CPU "
                 "kv_both server with async stores, cold-compact loading, "
                 "persistent_direct_hbm on a receiver or CPU loading standalone, "
-                "PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding"
+                "PP/PCP=1 with DCP=1 or cooperative DCP=TP process storage, "
+                "and ordinary or one-token padded MTP decoding"
             )
         if not callable(getattr(type(self._parent), "handle_preemptions_with_metadata", None)):
             raise ValueError("decode_preemption_checkpoint requires the dynamic LMCache checkpoint connector")
@@ -2206,5 +2293,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             # Lazy worker-only import; the scheduler must not initialize NPU ops.
             from lmcache_ascend import c_ops
 
-            if not hasattr(c_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared"):
+            if not hasattr(c_ops, "dense_mla_dsa_group_direct_kv_transfer_prepared") or (
+                parallel.decode_context_parallel_size > 1
+                and not hasattr(c_ops, "layerwise_prefill_dma_copy")
+            ):
                 raise ValueError("Rebuild LMCache-Ascend native extension before enabling decode_preemption_checkpoint")

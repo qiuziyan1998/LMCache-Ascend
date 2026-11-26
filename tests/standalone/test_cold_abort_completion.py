@@ -51,7 +51,9 @@ def test_aborted_cold_load_eventually_acknowledges_send_after_all_owners_retire(
         ThreadPoolExecutor=ThreadPoolExecutor,
         WeakMethod=WeakMethod,
         serving_perf_enabled=lambda: False,
-        logger=NS(debug=lambda *a, **kw: None, exception=lambda *a, **kw: None),
+        serving_perf_detailed_enabled=lambda: False,
+        serving_perf_report_due=lambda _: True,
+        logger=NS(debug=lambda *a, **kw: None, error=lambda *a, **kw: None),
         _clear_terminal_load_tracebacks=lambda *a: None,
     )
     definitions(

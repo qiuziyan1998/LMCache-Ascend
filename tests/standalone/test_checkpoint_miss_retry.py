@@ -56,9 +56,9 @@ def scheduler_adapter(api):
         kv_resume_checkpoint=(1, 12, 11),
     )
     request.is_finished = lambda: request.status == "finished"
-    pending = control.PendingCheckpoint(
-        control.CaptureSpec("r", 1, 0, 13, 3, ((1,), (2,)), prefix_end=3), "ready", 11
-    )
+    capture = control.CaptureSpec("r", 1, 0, 13, 3, ((1,), (2,)), prefix_end=3)
+    pending = control.PendingCheckpoint(capture, "persisting", end=11)
+    assert pending.accept(control.CheckpointResult("r", 1, "ready", 11))
     adapter._preemption_checkpoints = {"r": pending}
     adapter._checkpoint_restore_attempts = {"r": (1, 7)}
     adapter._unfinished_requests = {"r": request}
@@ -95,6 +95,7 @@ def promote(request, retry=True):
         object,
         RequestStatus=statuses,
         SERVING_PERF_ENABLED=False,
+        SERVING_PERF_DETAILED=False,
         logger=NS(warning=lambda *a: None),
     )
     cls = implementation(
@@ -105,6 +106,8 @@ def promote(request, retry=True):
     )
     scheduler = cls()
     scheduler.connector = object()
+    scheduler._log_request_transition = lambda *args, **kwargs: None
+    scheduler._dsa_dcp = False
     scheduler.recompute_kv_load_failures = False
     scheduler.finished_recving_kv_req_ids = {"r"}
     scheduler.failed_recving_kv_req_ids = set()
@@ -216,13 +219,15 @@ def test_local_eviction_reports_longest_paired_frontier_before_device_work(
     store.close()
 
 
+@pytest.mark.parametrize("perf_enabled", [False, True])
 @pytest.mark.parametrize("kind", ["miss", "bad_data"])
-def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kind):
+def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kind, perf_enabled):
     control = api[0]
     calls = []
+    trace_permits = iter([True])
     logger = NS(
         info=lambda *a: calls.append("info"),
-        exception=lambda *a: calls.append("exception"),
+        error=lambda *a, exc_info: calls.append("exception" if exc_info else "error"),
     )
     base = implementation(
         "../LMCache-NPU/lmcache/integration/vllm/vllm_v1_adapter.py",
@@ -230,6 +235,9 @@ def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kin
         {"_fail_completed_cold_load", "_record_checkpoint_restore_miss"},
         object,
         logger=logger,
+        serving_perf_enabled=lambda: perf_enabled,
+        serving_perf_detailed_enabled=lambda: False,
+        serving_perf_report_due=lambda _: next(trace_permits),
         _clear_terminal_load_tracebacks=lambda *a: calls.append("clear"),
     )
     cls = implementation(
@@ -257,6 +265,7 @@ def test_only_expected_pretransfer_miss_avoids_invalid_blocks_and_stack(api, kin
     assert adapter._fail_completed_cold_load("r", entry, None, error)
     assert "unpin" in calls
     if kind == "miss":
+        assert ("info" in calls) == perf_enabled
         assert "fence" not in calls  # No restore device work was submitted.
         assert not adapter._invalid_block_ids and "exception" not in calls
         result = adapter.lmcache_engine.checkpoint_worker.results[0]
@@ -405,6 +414,23 @@ def test_cancel_after_miss_still_releases_owners_without_claiming_ready(api):
     assert not hasattr(request, "kv_resume_checkpoint_retry")
     assert adapter._checkpoint_restore_releases == [("r", 1, 7)]
     assert pending.restore_miss is None
+
+
+def test_receiver_declines_a_shorter_checkpoint_after_receive_retirement(api):
+    adapter, request, pending, _ = scheduler_adapter(api)
+    adapter.config.pd_role = "receiver"
+    adapter.config.decoder_require_kv_prefix = True
+    adapter._cold_perf_lookup_started = {}
+    adapter.accept_preemption_result(
+        api[0].CheckpointResult("r", 1, "restore_miss", 8, load_generation=7)
+    )
+    adapter.update_connector_output(receipt({"r"}))
+    promote(request)
+    adapter.lookup_client.lookup_cache = lambda **kw: 8
+    assert pending.end == 8
+    assert adapter.get_num_new_matched_tokens(request, 0) == 0
+    assert request.min_kv_prefix_tokens == 11
+    assert request.request_id not in adapter.load_specs
 
 
 def test_successful_shorter_restore_becomes_ready_without_replaying_old_miss(api):

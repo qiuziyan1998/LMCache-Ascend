@@ -6,6 +6,7 @@ Run with --confcutdir=tests/standalone to avoid the NPU bootstrap.
 
 import gc
 import importlib.util
+import logging
 from pathlib import Path
 import sys
 import threading
@@ -37,6 +38,9 @@ def api(monkeypatch):
         "UnknownDMA", (RuntimeError,), {}
     )
     monkeypatch.setitem(sys.modules, native.__name__, native)
+    log_module = ModuleType("lmcache.logging")
+    log_module.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, log_module.__name__, log_module)
 
     def load(name, path):
         spec = importlib.util.spec_from_file_location(name, path)
@@ -303,10 +307,11 @@ def start_capture(
     monkeypatch.setattr(module, "torch", NS(empty=empty, long=torch.long))
     store = module.CheckpointWorker(engine)
     blocks = tuple(range(1, (end + 3) // 4 + 1))
+    chunk_size = engine.config.chunk_size
     spec = control.CaptureSpec(
         "r",
         1,
-        prefix // 4 * 4,
+        prefix // chunk_size * chunk_size,
         end,
         prefix if resident is None else resident,
         (blocks, blocks),
@@ -539,6 +544,164 @@ def test_smaller_final_fragment_uses_fragmented_space_without_discarding_progres
     store.close()
 
 
+def test_fixed_slot_capture_does_not_retry_smaller_tails(api, monkeypatch):
+    engine = fake_engine()
+    engine.checkpoint_uses_fixed_slots = lambda: True
+    original = engine.allocate_checkpoint_fragment
+    attempts, reclaims = [], []
+
+    def allocate(group, tokens, caches=None):
+        attempts.append((group, tokens))
+        if len(attempts) >= 3:
+            raise MemoryError("slot quota")
+        return original(group, tokens, caches)
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = (
+        lambda n, g, **kw: reclaims.append((set(g), kw)) or False
+    )
+    store, _, _ = start_capture(api, monkeypatch, engine, prefix=0)
+    assert [(r.status, r.end) for r in store.poll()] == [("captured", 4)]
+    assert attempts == [(0, 4), (1, 4), (0, 4)]
+    assert reclaims == [({0}, {"allocation_purpose": "checkpoint"})]
+    store.close()
+    assert all(p.refs == 0 for p in engine.allocated)
+
+
+@pytest.mark.parametrize(
+    "prefix,free,evictable,end,expected_end,scan_tokens,stop_reason",
+    [
+        # 14:34 sample translated by 607 complete chunks (14 + 99 tokens).
+        (1010, 0, 2, 1123, 1123, (14, 99), None),
+        (1010, 0, 1, 1123, 1024, (14, 99), "reclaim_unsatisfied"),
+        (1010, 1, 1, 1123, 1123, (99,), None),
+        (1010, 2, 0, 1123, 1123, (), None),
+        # 17:24 sample translated by 156 chunks (160444 -> 165120).
+        (700, 1, 5, 5376, 5376, (1024, 1024, 1024, 1024, 256), None),
+        (
+            700, 1, 4, 5376, 5120, (1024, 1024, 1024, 1024, 256), "reclaim_unsatisfied"
+        ),
+    ],
+)
+def test_fixed_slot_capture_reclaims_across_chunks(
+    api,
+    monkeypatch,
+    caplog,
+    prefix,
+    free,
+    evictable,
+    end,
+    expected_end,
+    scan_tokens,
+    stop_reason,
+):
+    engine = fake_engine()
+    engine.config.chunk_size = 1024
+    engine.checkpoint_uses_fixed_slots = lambda: True
+    original = engine.allocate_checkpoint_fragment
+    attempts, reclaims = [], []
+
+    def allocate(group, tokens, caches=None):
+        nonlocal free
+        if group == 0:
+            attempts.append(tokens)
+            if free == 0:
+                raise MemoryError("group0 full")
+            free -= 1
+        return original(group, tokens, caches)
+
+    def reclaim(tokens, groups, *, allocation_purpose):
+        nonlocal free, evictable
+        reclaims.append((tokens, set(groups), allocation_purpose))
+        assert free == 0
+        if evictable == 0:
+            return False
+        evictable -= 1
+        free += 1
+        return True
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = reclaim
+    with caplog.at_level("INFO"):
+        store, _, _ = start_capture(api, monkeypatch, engine, prefix=prefix, end=end)
+    try:
+        result = store.poll()[0]
+        assert (result.status, result.end) == ("captured", expected_end)
+        assert reclaims == [(tokens, {0}, "checkpoint") for tokens in scan_tokens]
+        if scan_tokens == (14, 99):
+            assert attempts == ([14, 14, 99] if stop_reason else [14, 14, 99, 99])
+        if stop_reason:
+            assert "[CHECKPOINT_CAPTURE_TRUNCATED]" in caplog.text
+            assert f"requested_end={end} captured_end={expected_end}" in caplog.text
+            assert "failed_group=0" in caplog.text
+            assert f"stop_reason={stop_reason}" in caplog.text
+        elif scan_tokens:
+            assert "[CHECKPOINT_CAPTURE_RECOVERED]" in caplog.text
+        publish(api, store, expected_end)
+        assert store.local.available("r", 1, end) == expected_end
+    finally:
+        store.close()
+    assert all(
+        page.refs == int(page in engine.backend.pages.values())
+        for page in engine.allocated
+    )
+
+
+@pytest.mark.parametrize(
+    "taken_group,completed_prefix",
+    [(None, False), (0, False), (1, False), (1, True)],
+)
+def test_fixed_slot_capture_retries_each_group_only_once(
+    api, monkeypatch, caplog, taken_group, completed_prefix
+):
+    engine = fake_engine()
+    engine.checkpoint_uses_fixed_slots = lambda: True
+    original = engine.allocate_checkpoint_fragment
+    attempts, reclaims = [], []
+    free = [int(completed_prefix), int(completed_prefix)]
+
+    def allocate(group, tokens, caches=None):
+        attempts.append(group)
+        if not free[group]:
+            raise MemoryError("no slot")
+        free[group] -= 1
+        return original(group, tokens, caches)
+
+    def reclaim(tokens, groups, *, allocation_purpose):
+        (group,) = groups
+        reclaims.append(group)
+        # Simulate another allocation consuming the slot before the retry.
+        if group != taken_group:
+            free[group] += 1
+        return True
+
+    engine.allocate_checkpoint_fragment = allocate
+    engine.reclaim_checkpoint_capacity = reclaim
+    store, _, _ = start_capture(
+        api, monkeypatch, engine, end=8 if completed_prefix else 4
+    )
+    try:
+        captured = taken_group is None or completed_prefix
+        expected = ("captured", 4) if captured else ("failed", 0)
+        assert [(r.status, r.end) for r in store.poll()] == [expected]
+        assert attempts == ([0, 1] if completed_prefix else []) + (
+            [0, 0] if taken_group == 0 else [0, 0, 1, 1]
+        )
+        assert reclaims == ([0] if taken_group == 0 else [0, 1])
+        if taken_group is not None:
+            status = "TRUNCATED" if completed_prefix else "FAILED"
+            assert f"[CHECKPOINT_CAPTURE_{status}]" in caplog.text
+            assert f"failed_group={taken_group}" in caplog.text
+            assert "stop_reason=retry_refused" in caplog.text
+            if completed_prefix:
+                assert [p.refs for p in engine.allocated] == [1, 1, 0]
+            else:
+                assert not engine.calls  # No device work for an incomplete pair.
+    finally:
+        store.close()
+    assert all(page.refs == 0 for page in engine.allocated)
+
+
 def test_repeated_preemption_reuses_local_group0_and_recaptures_resident_group1(
     api, monkeypatch
 ):
@@ -592,6 +755,106 @@ def test_invalid_block_table_refuses_before_allocation_or_device_work(api, monke
     assert store.poll()[0].status == "failed"
     assert not engine.allocated and not engine.calls
     store.close()
+
+
+@pytest.mark.parametrize("resident", [3, 100003])
+def test_capture_validates_each_covered_block_once(api, monkeypatch, resident):
+    control, module = api
+
+    class CountedBlocks(tuple):
+        def __getitem__(self, index):
+            if isinstance(index, int):
+                self.reads.append(index)
+            return super().__getitem__(index)
+
+    end, block_size = 100003, 128
+    groups = tuple(CountedBlocks(range(1, (end + 127) // 128 + 1)) for _ in range(2))
+    for blocks in groups:
+        blocks.reads = []
+    engine = fake_engine()
+    worker = module.CheckpointWorker(engine)
+
+    def refuse(*args):
+        raise MemoryError("stop after validation")
+
+    monkeypatch.setattr(worker, "_reserve_fragments", refuse)
+    try:
+        worker.capture(
+            control.CaptureSpec("r", 1, 0, end, resident, groups),
+            {0: [1], 1: [2]},
+            block_size,
+        )
+        assert worker.poll()[0].reason == "stop after validation"
+        assert groups[0].reads == (
+            list(range(resident // block_size, len(groups[0])))
+            if resident < end
+            else []
+        )
+        assert groups[1].reads == list(range(len(groups[1])))
+        assert not engine.allocated and not engine.calls
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        ([], []),
+        ([3], [3]),
+        ([1], [13]),
+        ([3, 4, 8], [4, 8, 11]),
+        ([1, 9], [3, 13]),
+        ([3, 128, 256], [128, 256, 513]),
+        ([1, 257], [129, 513]),
+    ],
+)
+def test_bulk_checkpoint_slots_match_exact_fragment_order(api, monkeypatch, ranges):
+    _, module = api
+    starts, ends = ranges
+    blocks, block_size = (9, 2, 17, 4) * 80, 4
+    requested = []
+
+    def tensor(values, **kwargs):
+        requested.append(kwargs.pop("pin_memory"))
+        return torch.tensor(values, **kwargs)
+
+    monkeypatch.setattr(module, "torch", NS(tensor=tensor, long=torch.long))
+    result = module._checkpoint_slot_mapping(blocks, starts, ends, block_size)
+    assert result.tolist() == [
+        blocks[i // block_size] * block_size + i % block_size
+        for a, b in zip(starts, ends, strict=True)
+        for i in range(a, b)
+    ]
+    assert result.dtype == torch.long and result.is_contiguous()
+    assert requested == [True]
+
+
+def test_bulk_checkpoint_slots_do_not_wrap_int64(api, monkeypatch):
+    _, module = api
+    monkeypatch.setattr(
+        module,
+        "torch",
+        NS(
+            long=torch.long,
+            tensor=lambda values, **kw: torch.tensor(values, dtype=kw["dtype"]),
+        ),
+    )
+    limit = (1 << 63) - 1
+    # The final block's valid partial range fits even though its full extent does not.
+    blocks = (limit // 3,)
+    assert module._checkpoint_slot_mapping(blocks, [0], [2], 3).tolist() == [
+        limit - 1,
+        limit,
+    ]
+    with pytest.raises((OverflowError, RuntimeError, ValueError)):
+        module._checkpoint_slot_mapping(blocks, [0], [3], 3)
+    blocks = (1,) * 100 + blocks
+    assert module._checkpoint_slot_mapping(blocks, [0], [302], 3).tolist()[-2:] == [
+        limit - 1,
+        limit,
+    ]
+    with pytest.raises((OverflowError, RuntimeError, ValueError)):
+        module._checkpoint_slot_mapping(blocks, [0], [303], 3)
 
 
 def test_boundary_assembly_reclaims_once_and_keeps_acquired_sources_protected(

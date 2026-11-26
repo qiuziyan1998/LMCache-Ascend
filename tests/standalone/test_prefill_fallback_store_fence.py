@@ -252,10 +252,18 @@ def test_batch_finish_preserves_persistence_barriers(failed):
         is_last_prefill=True,
         is_sparse_decode=False,
     )
+
+    def submit(ids, *, request_metadata):
+        assert list(ids) == [req.req_id]
+        (entry,) = request_metadata
+        assert entry[:3] == (req.req_id, req.token_ids, req.request_configs)
+        assert entry[3]() is None
+        trace.append("submit")
+
     adapter = NS(
         kv_role="kv_producer",
         lmcache_engine=NS(
-            submit_layerwise_prefill_fills=lambda ids: trace.append("submit"),
+            submit_layerwise_prefill_fills=submit,
             poll_layerwise_prefill_puts=poll,
             wait_for_pending_sync_stores=lambda: trace.append("wait"),
             adopt_completed_layerwise_store=lambda result: trace.append("adopt"),
@@ -264,6 +272,7 @@ def test_batch_finish_preserves_persistence_barriers(failed):
             ),
         ),
         _parent=NS(_get_connector_metadata=lambda: NS(requests=[req])),
+        _worker_retrieve_state={},
         _completed_layerwise_stores={("request", 0): object()},
     )
     run = MethodType(runtime[method.name], adapter)
