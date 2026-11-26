@@ -1234,3 +1234,31 @@ def test_decoder_source_publication_never_reads_prefill_events():
     submit.connector._layerwise_prefill_dma = False
     submit.connector._layerwise_prefill_transfer_generation = lambda group: pytest.fail("D event work")
     submit.connector.wait_for_layerwise_prefill_source_publication(1)
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_striped_dma_reads_each_canonical_token_once(world):
+    dma = _load_dma_module()
+    block = 128
+    cycle = dma.DmaCycle.build(4 * block, 1024)
+    for starts, ends in [([0], [1]), ([7, 1024, 2305], [993, 2045, 2459])]:
+        coverage = torch.zeros(ends[-1], dtype=torch.int)
+        for rank in range(world):
+            blocks = list(range(49, 49 - (ends[-1]+world*block-1)//(world*block), -1))
+            previous = None
+            for length in range(1, len(starts)+1):
+                previous = dma.plan_block_id_ranges_incremental(
+                    cycle, blocks, block, starts[:length], ends[:length], previous, shard=(world, rank)
+                )
+            plan = previous.plan
+            for c, slot, offset, count in zip(plan.chunk, plan.slot, plan.chunk_token, plan.tokens):
+                pos = starts[c] + int(offset)
+                assert pos // block % world == rank
+                assert slot == blocks[pos // (world * block)] * block + pos % block
+                assert pos + count <= min(ends[c], (pos // block + 1) * block)
+                coverage[pos:pos + count] += 1
+            assert previous.reused_chunks == len(starts) - 1
+        expected = torch.zeros_like(coverage)
+        for start, end in zip(starts, ends):
+            expected[start:end] = 1
+        torch.testing.assert_close(coverage, expected)

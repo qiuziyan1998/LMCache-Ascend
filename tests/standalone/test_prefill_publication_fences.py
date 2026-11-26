@@ -71,6 +71,7 @@ def connector():
         "    deferred_layerwise_put = prefill_dma = dense_direct = True\n"
         "    layerwise_prefill_generation = (\n"
         "        self._layerwise_prefill_transfer_generation(kv_group))\n"
+        "    dcp_save = None\n"
         "    last_store_events = {}\n"
         "    kwargs = {'req_id': req}\n"
     ).body[0]

@@ -329,6 +329,7 @@ def _prefill_dma_plans(
     direction: str,
     cycle,
     plan_cache: Optional[dict[tuple[int, int], IncrementalDmaPlan]] = None,
+    shard: tuple[int, int] | None = None,
 ) -> tuple:
     """Plan all P-node banks once, before entering the model forward.
 
@@ -346,7 +347,7 @@ def _prefill_dma_plans(
     for bank in range(len(block_ids_by_bank)):
         if plan_cache is None:
             plan = cycle.plan_block_id_ranges(
-                block_ids_by_bank[bank], block_size, starts, ends, slot_mapping_base
+                block_ids_by_bank[bank], block_size, starts, ends, slot_mapping_base, shard=shard,
             )
             exceeds_capacity = bool((plan.slot + plan.tokens > capacity).any())
         else:
@@ -354,7 +355,7 @@ def _prefill_dma_plans(
             state = plan_block_id_ranges_incremental(
                 cycle, block_ids_by_bank[bank], block_size, starts, ends,
                 plan_cache.get(key), slot_mapping_base,
-                slot_capacity=capacity,
+                slot_capacity=capacity, shard=shard,
             )
             exceeds_capacity = state.max_slot_end > capacity
             if not exceeds_capacity:
@@ -6664,7 +6665,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 int(kwargs["prefill_dma_block_size"]),
                 starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "load",
                 self.prefill_dma_cycles[kv_group],
-                plan_cache=plan_cache,
+                plan_cache=plan_cache, shard=kwargs.get("prefill_dma_shard"),
             )
             if plan_cache is not None:
                 for bank in range(len(dma_plans)):
@@ -7730,11 +7731,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         dense_fixed_chunk_size = 0
         c8_chunk_capacity = max(chunk_sizes) if layout.indexer_c8 else 0
         dma_plans = None
+        dcp_save = kwargs.get("prefill_dcp_save")
         if prefill_dma and not prefill_packet:
+            save_banks = kwargs["prefill_dma_block_ids_by_bank"]
+            save_planes = kvcaches_snapshot
+            if dcp_save is not None:
+                workspace, dense_blocks = dcp_save
+                save_banks = (dense_blocks,)
+                save_planes = (workspace.planes,)
             dma_plans = _prefill_dma_plans(
-                kwargs["prefill_dma_block_ids_by_bank"],
-                int(kwargs["prefill_dma_block_size"]),
-                starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "store",
+                save_banks, int(kwargs["prefill_dma_block_size"]),
+                starts, ends, 0, chunk_sizes, kv_group, save_planes, "store",
                 self.prefill_dma_cycles[kv_group],
             )
         if (dense_direct or layout.indexer_c8) and not prefill_dma:
@@ -7872,6 +7879,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 self._lmc_plane_num_tokens(tensor, kv_group)
                             )
                     for layer_id, memory_objs_layer in enumerate(memory_objs):
+                        planes = workspace.planes if dcp_save is not None else kvcaches_snapshot[layer_id]
+                        if dcp_save is not None:
+                            row_bytes = sum(widths) * planes[0].element_size()
                         host_ptrs = []
                         for chunk_index, memory_obj in enumerate(memory_objs_layer):
                             if memory_obj.metadata.fmt != expected_fmt:
@@ -7879,9 +7889,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                     f"Expected memory format {expected_fmt}, "
                                     f"got {memory_obj.metadata.fmt}."
                                 )
-                            host_ptrs.append(
-                                _layer_memory_host_ptr(memory_obj, layer_id)
-                            )
+                            if dcp_save is not None and isinstance(memory_obj, LayerPageMemoryObj):
+                                capacity, remainder = divmod(memory_obj.layer_size_bytes(layer_id), row_bytes)
+                                if remainder or memory_obj.valid_tokens < chunk_sizes[chunk_index]:
+                                    raise ValueError("Invalid canonical Group-0 page extent")
+                                host_chunk_tokens[chunk_index] = capacity
+                            host_ptrs.append(_layer_memory_host_ptr(memory_obj, layer_id))
                         if len(host_ptrs) != len(starts):
                             raise ValueError(
                                 "Dense direct layerwise store chunk count mismatch: "
@@ -7889,9 +7902,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                                 f"ranges={len(starts)}"
                             )
                         deferred_dma_copies.append(bind_copy_addresses(
-                            dma_plans[layer_id % source_bank_count],
+                            dma_plans[layer_id % len(dma_plans)],
                             host_ptrs,
-                            [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
+                            [int(t.data_ptr()) for t in planes],
                             chunk_sizes, widths,
                             int(kvcaches_snapshot[layer_id][0].element_size()),
                             device_to_host=True,
@@ -8217,6 +8230,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         bank_stream if prefill_dma else self.store_stream
                     )
                     bank_done_event.record(event_stream)
+                    if dcp_save is not None:
+                        workspace.save_events[bank] = bank_done_event
                     last_store_event = bank_done_event
                     if prefill_dma:
                         last_store_events[bank] = bank_done_event
@@ -8319,6 +8334,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     for stream in pending_streams:
                         stream.synchronize()
                 except BaseException:
+                    if (failed_save := kwargs.get("prefill_dcp_save")) is not None:
+                        failed_save[0].unfenced = True
                     pending_owners = [
                         obj for layer_objs in memory_objs for obj in layer_objs
                     ]
@@ -8327,7 +8344,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._retain_unfenced_layerwise_prefill_store(
                         str(kwargs.get("req_id", "unspecified")),
                         pending_streams, pending_owners,
-                        (kvcaches_snapshot, prefill_packets),
+                        (kvcaches_snapshot, prefill_packets, kwargs.get("prefill_dcp_save")),
                     )
                     raise
             if deferred_dense_chunk_ptrs_npu:

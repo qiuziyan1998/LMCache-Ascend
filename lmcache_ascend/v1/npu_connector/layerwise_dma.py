@@ -146,7 +146,7 @@ class DmaCycle:
 
     def plan_block_id_ranges(
         self, block_ids, block_size: int, starts, ends, slot_mapping_base=0,
-        *, first_block=0,
+        *, first_block=0, shard=None,
     ):
         """Plan ranges from block IDs without materializing per-token slots."""
         if block_size <= 0:
@@ -154,6 +154,8 @@ class DmaCycle:
         block_ids = torch.as_tensor(block_ids, dtype=torch.long)
         starts = torch.as_tensor(starts, dtype=torch.long)
         ends = torch.as_tensor(ends, dtype=torch.long)
+        if shard is not None and starts.numel() and not block_ids.numel():
+            raise ValueError("Missing sharded prefill block table")
         if block_ids.numel() == 0 or starts.numel() == 0:
             return DmaPlan(
                 torch.empty(0, dtype=torch.long),
@@ -164,6 +166,25 @@ class DmaCycle:
         if bool((starts < slot_mapping_base).any()) or bool((ends <= starts).any()):
             raise ValueError("DMA block-id ranges are invalid")
         logical_end = int(ends[-1]) - slot_mapping_base
+        if shard is not None:
+            world, rank = shard
+            span = world * block_size
+            if (not 0 <= rank < world or slot_mapping_base or int(starts[0]) < first_block * span
+                    or logical_end > (first_block + len(block_ids)) * span):
+                raise ValueError("Invalid Group-0 DMA shard extent")
+            # Intersect owned stripes with actual CPU page intervals, including holes and partial tails.
+            left = (torch.arange(len(block_ids)) + first_block) * span + rank * block_size
+            edges = torch.unique(torch.cat((starts, ends, left, left + block_size)), sorted=True)
+            edges = edges[(edges >= starts[0]) & (edges <= ends[-1])]
+            begin, stop = edges[:-1], edges[1:]
+            chunk = torch.searchsorted(ends, begin, right=True)
+            keep = (begin >= starts[chunk]) & ((begin // block_size) % world == rank)
+            begin, stop, chunk = begin[keep], stop[keep], chunk[keep]
+            physical = block_ids[begin // span - first_block]
+            if (physical <= 0).any():
+                raise ValueError("Sharded prefill DMA addresses an unallocated block")
+            return DmaPlan(chunk, physical * block_size + begin % block_size,
+                           begin - starts[chunk], stop - begin)
         if (int(starts[0]) - slot_mapping_base < first_block * block_size
                 or logical_end > (first_block + block_ids.numel()) * block_size):
             raise ValueError("DMA block IDs do not cover the requested range")
@@ -261,6 +282,7 @@ class IncrementalDmaPlan:
     copied_segments: int
     mapping_changed: bool
     max_slot_end: int
+    shard: tuple[int, int] | None = None
 
     @property
     def plan(self):
@@ -269,21 +291,24 @@ class IncrementalDmaPlan:
 
 def plan_block_id_ranges_incremental(
     cycle, block_ids, block_size, starts, ends, previous=None, slot_mapping_base=0,
-    *, slot_capacity=None,
+    *, slot_capacity=None, shard=None,
 ):
     """Plan only new ranges or a grown tail for one physical bank."""
     starts, ends = tuple(starts), tuple(ends)
     if len(starts) != len(ends) or block_size <= 0:
         raise ValueError("Invalid incremental DMA ranges or block size")
+    if shard is not None and not 0 <= shard[1] < shard[0]:
+        raise ValueError("Invalid prefill DMA rank or world size")
+    span = block_size * (shard[0] if shard else 1)
     used_blocks = (
-        (ends[-1] - slot_mapping_base + block_size - 1) // block_size
+        (ends[-1] - slot_mapping_base + span - 1) // span
         if ends else 0
     )
     blocks = tuple(block_ids[:used_blocks])
     if used_blocks > len(blocks):
         raise ValueError("DMA block IDs do not cover the requested range")
     same_layout = bool(
-        previous is not None and previous.cycle is cycle
+        previous is not None and previous.cycle is cycle and previous.shard == shard
         and previous.block_size == block_size
         and previous.slot_mapping_base == slot_mapping_base
     )
@@ -305,14 +330,14 @@ def plan_block_id_ranges_incremental(
         return IncrementalDmaPlan(
             cycle, block_size, slot_mapping_base, blocks, starts, ends,
             previous.table, previous.segment_count, previous.tail_segment_start,
-            keep_chunks, 0, 0, 0, False, previous.max_slot_end,
+            keep_chunks, 0, 0, 0, False, previous.max_slot_end, shard,
         )
     first_block = (
-        (starts[keep_chunks] - slot_mapping_base) // block_size if starts else 0
+        (starts[keep_chunks] - slot_mapping_base) // span if starts else 0
     )
     suffix = cycle.plan_block_id_ranges(
         blocks[first_block:], block_size, starts[keep_chunks:], ends[keep_chunks:],
-        slot_mapping_base, first_block=first_block,
+        slot_mapping_base, first_block=first_block, shard=shard,
     )
     columns = torch.stack((
         suffix.chunk + keep_chunks, suffix.slot, suffix.chunk_token, suffix.tokens
@@ -336,7 +361,7 @@ def plan_block_id_ranges_incremental(
         cycle, block_size, slot_mapping_base, blocks, starts, ends, table,
         keep_segments + len(suffix), tail, keep_chunks, len(starts) - keep_chunks,
         len(blocks) - first_block, copied, previous is not None and not same_map,
-        max_slot_end,
+        max_slot_end, shard,
     )
 
 
