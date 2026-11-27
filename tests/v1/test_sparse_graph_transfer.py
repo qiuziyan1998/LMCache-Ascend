@@ -201,12 +201,17 @@ def test_aiv_limit_is_per_launch_and_serial_default_is_uncapped(transfer_module,
     transfer.load(selected, counts, slots, max_aiv_cores=12, pieces=4, gate_word=gate)
     admission = object()
     transfer.load(selected, counts, slots, pieces=4, admission=admission)
+    plan = transfer.allocate_copy_plan(4)
+    transfer.load(
+        selected, counts, slots, pieces=4, admission=admission, copy_plan=plan
+    )
     transfer.load(selected, counts, slots)
     assert [call.kwargs for call in native.call_args_list] == [
         {},
         {"max_aiv_cores": 12},
         {"max_aiv_cores": 12, "pieces": 4, "gate_word": gate},
         {"pieces": 4, "admission": admission},
+        {"pieces": 4, "admission": admission, "copy_plan": plan},
         {},
     ]
 
@@ -226,11 +231,32 @@ def test_graph_transfer_wrapper_preserves_default_native_signature():
     ns[fn.name](*arguments, max_aiv_cores=12, pieces=8, gate_word=gate)
     admission = object()
     ns[fn.name](*arguments, pieces=16, admission=admission)
+    plan = object()
+    ns[fn.name](
+        *arguments, max_aiv_cores=20, pieces=16, admission=admission, copy_plan=plan
+    )
     assert native.call_args_list == [
         mock_call(*arguments), mock_call(*arguments, 12), mock_call(*arguments, 12, 16),
         mock_call(*arguments, 12, 8, gate),
         mock_call(*arguments, 0, 16, None, admission),
+        mock_call(*arguments, 20, 16, None, admission, plan),
     ]
+
+
+def test_plan_publisher_uses_live_limits(transfer_module, monkeypatch):
+    module, _ = transfer_module
+    transfer = make_transfer(module, capacity=3)
+    native = Mock()
+    stub = SimpleNamespace(c_ops=SimpleNamespace(publish_sparse_copy_plan=native))
+    monkeypatch.setitem(sys.modules, "lmcache_ascend", stub)
+    raw = torch.empty((3, 16), dtype=torch.int32)[:, 0]
+    dense = torch.empty(3, dtype=torch.int32)
+    plan = transfer.allocate_copy_plan(16)
+    assert plan.shape == (3 + 4 * 16,) and plan.dtype == torch.int32
+    transfer.publish_copy_plan(raw, dense, plan, 4096, 16, 20)
+    native.assert_called_once_with(
+        raw, dense, transfer.valid_tokens, plan, 4096, 16, 20
+    )
 
 
 def test_tail_growth_and_request_replacement_keep_addresses(transfer_module):

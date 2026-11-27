@@ -231,6 +231,7 @@ class SparseGraphTransfer:
         pieces: int = 1,
         gate_word: torch.Tensor | None = None,
         admission=None,
+        copy_plan: torch.Tensor | None = None,
     ) -> None:
         """Capture device top-k to K/PE copies without preprocessing the payload."""
         if (
@@ -251,6 +252,30 @@ class SparseGraphTransfer:
             **({"pieces": pieces} if pieces != 1 else {}),
             **({"gate_word": gate_word} if gate_word is not None else {}),
             **({"admission": admission} if admission is not None else {}),
+            **({"copy_plan": copy_plan} if copy_plan is not None else {}),
+        )
+
+    def allocate_copy_plan(self, pieces: int) -> torch.Tensor:
+        # One prefix per request and four int32 fields per slice. The graph
+        # owns this allocation until every consumer of its indexer has joined.
+        return torch.empty(
+            self.request_capacity + 4 * pieces, dtype=torch.int32, device=self.device
+        )
+
+    def publish_copy_plan(
+        self,
+        counts: torch.Tensor,
+        dense_counts: torch.Tensor,
+        plan: torch.Tensor,
+        row_width: int,
+        pieces: int,
+        max_aiv_cores: int,
+    ) -> None:
+        from lmcache_ascend import c_ops
+
+        c_ops.publish_sparse_copy_plan(
+            counts, dense_counts, self.valid_tokens, plan,
+            row_width, pieces, max_aiv_cores,
         )
 
     def clear_source(self) -> None:

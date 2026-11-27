@@ -810,12 +810,61 @@ void SparsePrefetchGate::set_open(bool open) const {
   cmd.Run();
 }
 
+static uint32_t sparse_copy_cores(int64_t capacity, int64_t pieces, bool admitted, int64_t max_cores) {
+  TORCH_CHECK(max_cores >= 0 && max_cores <= std::numeric_limits<uint32_t>::max(),
+              "max_aiv_cores must be zero (automatic) or a positive uint32 value");
+  const int64_t rows = admitted ? 1 + (capacity - 1) / pieces : capacity;
+  const uint32_t cores = direct_aiv_num(static_cast<int32_t>(rows));
+  return max_cores > 0 ? std::min(cores, static_cast<uint32_t>(max_cores)) : cores;
+}
+
+static void check_copy_plan(const torch::Tensor &plan, const c10::Device &device,
+                            int64_t requests, int64_t pieces) {
+  const int64_t words = requests + lmc::kPieceFields * pieces;
+  TORCH_CHECK(words <= std::numeric_limits<int32_t>::max() && plan.dim() == 1 &&
+              plan.numel() == words && plan.scalar_type() == at::kInt && plan.is_contiguous() &&
+              plan.device() == device && reinterpret_cast<uintptr_t>(plan.data_ptr()) % 64 == 0,
+              "copy plan must be an aligned int32 vector sized for the captured requests and pieces");
+}
+
+void publish_sparse_copy_plan(const torch::Tensor &counts, torch::Tensor &dense_counts,
+                              const torch::Tensor &limits, torch::Tensor &plan,
+                              int64_t row_width, int64_t pieces, int64_t max_aiv_cores) {
+  TORCH_CHECK(counts.device().is_privateuseone() && counts.dim() == 1 && counts.size(0) > 0 &&
+              counts.scalar_type() == at::kInt && counts.stride(0) > 0 &&
+              counts.stride(0) <= std::numeric_limits<int32_t>::max(), "invalid producer miss counts");
+  const int64_t requests = counts.size(0);
+  TORCH_CHECK(row_width > 0 && row_width <= std::numeric_limits<int32_t>::max() / requests &&
+              pieces > 1 && pieces <= requests * row_width, "invalid slice plan dimensions");
+  TORCH_CHECK(dense_counts.device() == counts.device() && dense_counts.sizes() == counts.sizes() &&
+              dense_counts.scalar_type() == at::kInt && dense_counts.is_contiguous() &&
+              reinterpret_cast<uintptr_t>(dense_counts.data_ptr()) % 64 == 0, "invalid counts bridge");
+  TORCH_CHECK(limits.device() == counts.device() && limits.scalar_type() == at::kInt &&
+              limits.is_contiguous() && limits.numel() == requests, "invalid copy plan source limits");
+  check_copy_plan(plan, counts.device(), requests, pieces);
+  const c10::OptionalDeviceGuard guard(device_of(counts));
+  const uint32_t cores = sparse_copy_cores(requests * row_width, pieces, true, max_aiv_cores);
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  auto *source = static_cast<uint8_t *>(counts.data_ptr());
+  auto *output = static_cast<uint8_t *>(dense_counts.data_ptr());
+  auto *valid = static_cast<uint8_t *>(limits.data_ptr());
+  auto *records = static_cast<uint8_t *>(plan.data_ptr());
+  const int32_t stride = counts.stride(0);
+  at_npu::native::OpCommand cmd;
+  cmd.Name("sparse_publish_slice_plan");
+  cmd.SetCustomHandler([=]() -> int {
+    lmc::launch_sparse_copy_plan(stream, source, output, valid, records, requests, stride, row_width, pieces, cores);
+    return 0;
+  });
+  cmd.Run();
+}
+
 void sparse_graph_kv_transfer(
     const SparseDirectDestinationState &state,
     torch::Tensor &slots, torch::Tensor &selected, torch::Tensor &counts,
     torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size, int64_t max_aiv_cores,
     int64_t pieces, const c10::optional<torch::Tensor> &gate_word,
-    const std::shared_ptr<SparsePrefetchGate> &admission) {
+    const std::shared_ptr<SparsePrefetchGate> &admission, const c10::optional<torch::Tensor> &copy_plan) {
   // Host metadata checks run at eager warmup/capture only, never on replay.
   TORCH_CHECK(selected.dim() == 2 && selected.is_contiguous(),
               "Graph selected tokens must be a contiguous matrix");
@@ -869,16 +918,13 @@ void sparse_graph_kv_transfer(
     gate = admission->word.data_ptr<int64_t>();
     token = admission->token;
   }
-  TORCH_CHECK(max_aiv_cores >= 0 && max_aiv_cores <= std::numeric_limits<uint32_t>::max(),
-              "max_aiv_cores must be zero (automatic) or a positive uint32 value");
-  // A balanced piece cannot contain more than ceil(capacity / pieces) live
-  // rows. Avoid scheduling blocks with no possible work on a small graph key.
-  const int64_t grid_rows = admission ? 1 + (selected.numel() - 1) / pieces : selected.numel();
-  uint32_t cores = direct_aiv_num(static_cast<int32_t>(grid_rows));
-  // Serial retrieval is critical-path work. Only a prefetch caller caps AIVs.
-  if (max_aiv_cores > 0) {
-    cores = std::min(cores, static_cast<uint32_t>(max_aiv_cores));
+  uint8_t *plan_ptr = nullptr;
+  if (copy_plan) {
+    TORCH_CHECK(admission && pieces > 1, "shared copy plan requires admitted pieces");
+    check_copy_plan(*copy_plan, selected.device(), requests, pieces);
+    plan_ptr = static_cast<uint8_t *>(copy_plan->data_ptr());
   }
+  const uint32_t cores = sparse_copy_cores(selected.numel(), pieces, admission != nullptr, max_aiv_cores);
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   auto *slot_ptr = static_cast<uint8_t *>(slots.data_ptr());
   auto *selected_ptr = static_cast<uint8_t *>(selected.data_ptr());
@@ -902,7 +948,7 @@ void sparse_graph_kv_transfer(
           static_cast<int32_t>(chunk_size), chunks_per_request,
           static_cast<int32_t>(requests), row_width, count_stride,
           static_cast<int32_t>(k_bytes), static_cast<int32_t>(pe_bytes), destination_slots,
-          piece, static_cast<int32_t>(pieces));
+          piece, static_cast<int32_t>(pieces), plan_ptr);
     }, token);
   });
   cmd.Run();

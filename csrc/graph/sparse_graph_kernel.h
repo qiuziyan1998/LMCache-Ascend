@@ -3,6 +3,10 @@
 #include <cstdint>
 
 namespace lmc {
+constexpr int32_t kPieceFields = 4;
+void launch_sparse_copy_plan(void *stream, uint8_t *counts, uint8_t *dense, uint8_t *limits,
+                             uint8_t *plan, int32_t requests, int32_t stride, int32_t width,
+                             int32_t pieces, int32_t cores);
 // All data pointers are fixed at capture. Counts, limits and both plane pointer
 // tables are device inputs, including the physical PE offset of a partial tail.
 void launch_sparse_graph_piece(
@@ -11,5 +15,5 @@ void launch_sparse_graph_piece(
     uint8_t *counts, uint8_t *ptrs, uint8_t *limits,
     int32_t chunk_size, int32_t chunks_per_request, int32_t requests,
     int32_t row_width, int32_t count_stride, int32_t k_bytes,
-    int32_t pe_bytes, int64_t destination_slots, int32_t piece, int32_t pieces);
+    int32_t pe_bytes, int64_t destination_slots, int32_t piece, int32_t pieces, uint8_t *plan = nullptr);
 } // namespace lmc

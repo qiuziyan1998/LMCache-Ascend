@@ -341,8 +341,15 @@ def sparse_graph_kv_transfer(
     pieces: int = 1,
     gate_word: torch.Tensor | None = None,
     admission=None,
+    copy_plan: torch.Tensor | None = None,
 ) -> None:
     """Capture a two-plane copy; all request-dependent data stays on device."""
+    if copy_plan is not None:
+        lmc_ops.sparse_graph_kv_transfer(
+            destination_state, slots, selected, counts, ptrs, limits, chunk_size,
+            max_aiv_cores, pieces, gate_word, admission, copy_plan,
+        )
+        return
     if admission is not None:
         lmc_ops.sparse_graph_kv_transfer(
             destination_state, slots, selected, counts, ptrs, limits, chunk_size,

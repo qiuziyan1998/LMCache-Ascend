@@ -276,7 +276,11 @@ void sparse_graph_kv_transfer(
     torch::Tensor &ptrs, torch::Tensor &limits, int64_t chunk_size,
     int64_t max_aiv_cores = 0, int64_t pieces = 1,
     const c10::optional<torch::Tensor> &gate_word = c10::nullopt,
-    const std::shared_ptr<SparsePrefetchGate> &admission = nullptr);
+    const std::shared_ptr<SparsePrefetchGate> &admission = nullptr,
+    const c10::optional<torch::Tensor> &copy_plan = c10::nullopt);
+void publish_sparse_copy_plan(const torch::Tensor &counts, torch::Tensor &dense_counts,
+                              const torch::Tensor &limits, torch::Tensor &plan,
+                              int64_t row_width, int64_t pieces, int64_t max_aiv_cores);
 void set_sparse_graph_prefetch_allowed(const torch::Tensor &gate_word, bool allowed);
 
 // Prepared warm path: destination state is process-owned; all request and step
